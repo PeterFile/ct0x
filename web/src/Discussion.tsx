@@ -13,7 +13,7 @@ export function Discussion({ groupId, members }: { groupId?: string; members: Re
   }, [groupId]);
   return <>
     {!groupId ? <p className="empty-panel">请先选择群组，再查看讨论和发送消息。</p> : null}
-    {visited.map(id => <div key={id} hidden={id !== groupId}>
+    {visited.map(id => <div key={id} className="discussion-scope" hidden={id !== groupId}>
       <DiscussionScope groupId={id} active={id === groupId} members={members[id] ?? emptyMembers} />
     </div>)}
   </>;
@@ -55,7 +55,11 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
     } finally { posting.current = null; }
   }
   return <div className="group-panel discussion-feed">
-    <button type="button" disabled={feed.page.pending} onClick={() => feed.loadPage()}>刷新并重置历史窗口</button>
+    <section className="message-history" aria-label="消息记录" tabIndex={0}>
+    <div className="discussion-tools">
+      <button type="button" disabled={feed.page.pending} onClick={() => feed.loadPage()}>刷新并重置历史窗口</button>
+      <a href={`#${formId}-content`}>跳至消息输入</a>
+    </div>
     <p className="feed-note">已载入 {feed.items.length} 条群组消息（含话题）。已加载片段可能存在间隔；刷新重置窗口后可重新向前加载，不代表已读完历史。</p>
     <p className="feed-note">每轮完成后等待 5 秒，再检查最新 50 条及至多 5 条已载入的待确认投递。</p>
     {feed.pollError ? <p role="status">自动刷新暂不可用：{feed.pollError} 将稍后重试。</p> : null}
@@ -76,6 +80,8 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
         {feed.details[message.id]?.error ? <p role="alert">{feed.details[message.id].error}</p> : null}
       </article>
     </li>)}</ol>
+    </section>
+    <section className="message-composer" aria-label="撰写消息" tabIndex={0}>
     <p className="feed-note">CLI接收不代表轮次完成、任务提交或结果接受。</p>
     <form aria-label="发送消息" onSubmit={submit}>
       <fieldset disabled={mutation.pending || mutation.uncertain}>
@@ -99,5 +105,6 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
       {mutation.notice ? <p role="status">{mutation.notice}</p> : null}
       <button type="submit" disabled={mutation.pending}>{mutation.pending ? "正在发送…" : mutation.uncertain ? "重试同一次发送" : "发送消息"}</button>
     </form>
+    </section>
   </div>;
 }

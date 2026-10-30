@@ -6,7 +6,7 @@ import { member } from "./test/members";
 import { delivery, message } from "./test/messages";
 const reads = vi.fn<typeof fetch>(), details = vi.fn<typeof fetch>(), writes = vi.fn<typeof fetch>();
 const main = () => screen.getByRole("main", { name: "讨论" });
-const panel = () => within(within(main()).queryByRole("form", { name: "发送消息" })?.parentElement ?? main());
+const panel = () => within(within(main()).queryByRole("form", { name: "发送消息" })?.closest(".discussion-feed") ?? main());
 const content = () => panel().getByRole("textbox", { name: "消息内容" });
 const change = (value: string) => fireEvent.change(content(), { target: { value } });
 const submit = () => fireEvent.submit(panel().getByRole("form", { name: "发送消息" }));

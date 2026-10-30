@@ -49,7 +49,7 @@ export function App() {
             {selected ? <EmptyPanel title={selected.name}>{selected.description || "此群组尚无说明。"}</EmptyPanel>
               : <p className="manifesto">先有讨论，<br />再有分工。</p>}
           </div>
-          <Discussion groupId={selected?.id} members={members} />
+          <div className="discussion-content"><Discussion groupId={selected?.id} members={members} /></div>
           <p className="discussion-note">消息持久化与模型执行分开确认。</p>
         </main>
 
