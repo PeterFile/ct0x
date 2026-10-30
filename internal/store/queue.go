@@ -117,7 +117,7 @@ func scanTurn(row scanner) (t domain.Turn, err error) {
 
 // Queue errors preserve stable categories and cancellation, never raw SQL or payloads.
 func queueError(action string, err error) error {
-	for _, known := range []error{ErrTurnBusy, ErrInvalid, ErrNotFound, context.Canceled, context.DeadlineExceeded} {
+	for _, known := range []error{ErrTurnBusy, ErrStaleClaim, ErrConflict, ErrInvalid, ErrNotFound, context.Canceled, context.DeadlineExceeded} {
 		if errors.Is(err, known) {
 			return fmt.Errorf("%s：%w", action, known)
 		}
