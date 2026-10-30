@@ -30,7 +30,16 @@ type Route struct {
 // These limits and cooperative context deadlines are for short JSON requests,
 // not streaming endpoints. Routes and listener configuration are trusted code.
 func NewServer(address string, routes ...Route) (*http.Server, error) {
-	listener, err := netip.ParseAddrPort(address)
+	return NewServerWithConfig(Config{Address: address}, routes...)
+}
+
+// NewServerWithConfig adds one explicit development proxy origin. It does not
+// enable CORS or change the Host guard; proxies must rewrite Host to the listener.
+func NewServerWithConfig(config Config, routes ...Route) (*http.Server, error) {
+	if err := ValidateDevOrigin(config.DevOrigin); err != nil {
+		return nil, err
+	}
+	listener, err := netip.ParseAddrPort(config.Address)
 	if err != nil || !listener.Addr().IsLoopback() || listener.Addr().Zone() != "" || listener.Port() == 0 {
 		return nil, errors.New("监听地址必须是带有明确非零端口的回环 IP 地址")
 	}
@@ -42,6 +51,7 @@ func NewServer(address string, routes ...Route) (*http.Server, error) {
 
 	methods := make(map[string]map[string]http.HandlerFunc)
 	routes = append([]Route{{Method: http.MethodGet, Pattern: "/healthz", Handler: func(w http.ResponseWriter, r *http.Request) {
+		// Process readiness only, not complete application or dependency health.
 		WriteJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 	}}}, routes...)
 	for _, route := range routes {
@@ -82,7 +92,7 @@ func NewServer(address string, routes ...Route) (*http.Server, error) {
 			WriteError(w, http.StatusForbidden, "invalid_host", "请求主机与本地监听地址不匹配")
 			return
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions && !sameOrigin(r, authority, defaultAuthority) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions && !sameOrigin(r, authority, defaultAuthority, config.DevOrigin) {
 			WriteError(w, http.StatusForbidden, "invalid_origin", "仅允许同源浏览器写入请求或本地客户端请求")
 			return
 		}
@@ -106,7 +116,7 @@ func NewServer(address string, routes ...Route) (*http.Server, error) {
 	}, nil
 }
 
-func sameOrigin(r *http.Request, authority, defaultAuthority string) bool {
+func sameOrigin(r *http.Request, authority, defaultAuthority, devOrigin string) bool {
 	origins := r.Header.Values("Origin")
 	if len(origins) == 0 {
 		// Only clients without browser Fetch Metadata may omit Origin. This is
@@ -119,12 +129,16 @@ func sameOrigin(r *http.Request, authority, defaultAuthority string) bool {
 		}
 		return true
 	}
+	development := devOrigin != "" && len(origins) == 1 && origins[0] == devOrigin
 	sites := r.Header.Values("Sec-Fetch-Site")
-	if len(sites) > 1 || len(sites) == 1 && sites[0] != "same-origin" && sites[0] != "none" {
+	if len(sites) > 1 {
+		return false
+	}
+	if len(sites) == 1 && sites[0] != "same-origin" && sites[0] != "none" && !(development && (sites[0] == "same-site" || sites[0] == "cross-site")) {
 		return false
 	}
 	// Exact serialized origins reject URL decorations, null, and origin lists.
-	return len(origins) == 1 && (origins[0] == "http://"+authority || origins[0] == "http://"+defaultAuthority)
+	return len(origins) == 1 && (development || origins[0] == "http://"+authority || origins[0] == "http://"+defaultAuthority)
 }
 
 func WriteError(w http.ResponseWriter, status int, code, message string) {
