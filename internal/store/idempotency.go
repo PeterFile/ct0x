@@ -39,25 +39,42 @@ func (s *Store) beginMutation(ctx context.Context, scope mutationScope, payload 
 			tx, id, replay = nil, "", false
 		}
 	}()
-	id = rand.Text()
+	id, replay, err = reserveMutation(ctx, tx, scope, payload)
+	return
+}
+
+func lookupMutation(ctx context.Context, tx *sql.Tx, scope mutationScope, payload []byte) (string, bool, error) {
 	if scope.key == "" {
-		return
+		return "", false, nil
 	}
+	var id string
 	var saved []byte
-	err = tx.QueryRowContext(ctx,
+	err := tx.QueryRowContext(ctx,
 		`SELECT payload, record_id FROM mutation_idempotency
 		 WHERE operation = ? AND actor_id = ? AND group_id = ? AND idempotency_key = ?`,
 		scope.operation, scope.actorID, scope.groupID, scope.key).Scan(&saved, &id)
 	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if !bytes.Equal(saved, payload) {
+		return "", false, ErrConflict
+	}
+	return id, true, nil
+}
+
+func reserveMutation(ctx context.Context, tx *sql.Tx, scope mutationScope, payload []byte) (id string, replay bool, err error) {
+	id, replay, err = lookupMutation(ctx, tx, scope, payload)
+	if err != nil || replay {
+		return
+	}
+	id = rand.Text()
+	if scope.key != "" {
 		_, err = tx.ExecContext(ctx,
 			`INSERT INTO mutation_idempotency(operation, actor_id, group_id, idempotency_key, payload, record_id)
 			 VALUES(?, ?, ?, ?, ?, ?)`, scope.operation, scope.actorID, scope.groupID, scope.key, payload, id)
-	} else if err == nil {
-		if !bytes.Equal(saved, payload) {
-			err = ErrConflict
-		} else {
-			replay = true
-		}
 	}
 	return
 }
