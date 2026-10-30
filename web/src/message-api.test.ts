@@ -37,9 +37,15 @@ it.each([
 });
 it.each([undefined, "", "opaque-topic /?+"])("passes topic %s through without inventing a default", async topic => {
   const input = topic === undefined ? { content } : { content, topic_id: topic };
-  transport.mockResolvedValueOnce(json(message, 201));
+  transport.mockResolvedValueOnce(json({ ...message, topic_id: topic ?? "" }, 201));
   await sendMessage(group.id, input, "topic-key");
   expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toStrictEqual(input);
+});
+it.each([undefined, "topic-A"])("rejects a 201 receipt outside requested topic %s", async topic => {
+  transport.mockResolvedValueOnce(json({ ...message, topic_id: "topic-B" }, 201));
+  const error: unknown = await sendMessage(group.id, { content, topic_id: topic }, "key").catch(error => error);
+  expect(error).toMatchObject({ status: 201, code: "invalid_response" });
+  expect(isDefinitiveRejection(error)).toBe(false);
 });
 it("preserves raw content and the same key/body on explicit caller retry, never retrying automatically", async () => {
   const input = { content, recipient_ids: [], topic_id: "" };
