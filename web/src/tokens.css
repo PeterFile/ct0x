@@ -33,6 +33,8 @@
   --rule-width: 1px;
   --border-rule: var(--rule-width) solid var(--color-rule);
   --border-accent: var(--rule-width) solid var(--color-accent);
+  --border-control: var(--rule-width) solid var(--color-muted);
+  --opacity-disabled: 0.6;
   --focus-ring: 2px solid var(--color-focus);
   --focus-offset: 4px;
   --motion-duration: 160ms;
