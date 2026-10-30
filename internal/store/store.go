@@ -160,17 +160,7 @@ func (s *Store) GetOrCreateConversation(ctx context.Context, groupID, memberID, 
 		return domain.Conversation{}, storeError("创建会话失败", err)
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO conversations(`+conversationColumns+`) SELECT ?, ?, ?, ?, ?
-		 WHERE EXISTS(SELECT 1 FROM members WHERE group_id = ? AND id = ?)
-		 ON CONFLICT(group_id, member_id, topic_id) DO NOTHING`,
-		rand.Text(), groupID, memberID, topicID, time.Now().UTC().Format(timestampLayout), groupID, memberID)
-	if err != nil {
-		return domain.Conversation{}, storeError("创建会话失败", err)
-	}
-	c, err := scanConversation(tx.QueryRowContext(ctx,
-		"SELECT "+conversationColumns+" FROM conversations WHERE group_id = ? AND member_id = ? AND topic_id = ?",
-		groupID, memberID, topicID))
+	c, err := conversationInTx(ctx, tx, groupID, memberID, topicID)
 	if err != nil {
 		return domain.Conversation{}, storeError("读取会话失败", err)
 	}
@@ -178,6 +168,20 @@ func (s *Store) GetOrCreateConversation(ctx context.Context, groupID, memberID, 
 		return domain.Conversation{}, storeError("保存会话失败", err)
 	}
 	return c, nil
+}
+
+func conversationInTx(ctx context.Context, tx *sql.Tx, groupID, memberID, topicID string) (domain.Conversation, error) {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO conversations(`+conversationColumns+`) SELECT ?, ?, ?, ?, ?
+		 WHERE EXISTS(SELECT 1 FROM members WHERE group_id = ? AND id = ?)
+		 ON CONFLICT(group_id, member_id, topic_id) DO NOTHING`,
+		rand.Text(), groupID, memberID, topicID, time.Now().UTC().Format(timestampLayout), groupID, memberID)
+	if err != nil {
+		return domain.Conversation{}, err
+	}
+	return scanConversation(tx.QueryRowContext(ctx,
+		"SELECT "+conversationColumns+" FROM conversations WHERE group_id = ? AND member_id = ? AND topic_id = ?",
+		groupID, memberID, topicID))
 }
 
 func (s *Store) GetConversation(ctx context.Context, groupID, conversationID string) (domain.Conversation, error) {

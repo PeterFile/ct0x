@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import type { Group } from "./api";
 import { Groups } from "./Groups";
+import { Members } from "./Members";
 
 function EmptyPanel({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -46,14 +47,12 @@ export function App() {
               消息尚未载入，发送功能尚未开放。
             </EmptyPanel>
           </div>
-          <p className="discussion-note">消息发送与成员操作尚未开放。</p>
+          <p className="discussion-note">消息发送功能尚未开放。</p>
         </main>
 
         <aside className="column members" aria-labelledby="members-heading">
           <h2 className="column-heading" id="members-heading">成员</h2>
-          <EmptyPanel title="尚未载入成员">
-            成员尚未载入，成员操作尚未开放。
-          </EmptyPanel>
+          <Members groupId={selected?.id} />
           <p className="column-note">不同视角，同席讨论。</p>
         </aside>
       </div>
