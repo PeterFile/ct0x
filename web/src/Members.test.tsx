@@ -106,10 +106,17 @@ it.each(["network", "server", "malformed", "wrong-group", "200", "202"])("retain
   const [first, retry] = writes.mock.calls.map(([url, init]) => ({ url, body: init?.body, key: new Headers(init?.headers).get("Idempotency-Key") }));
   expect(first.key).toMatch(/^[\da-f-]{36}$/); expect(retry).toEqual(first);
 });
-it("allows correction after a definitive validation error with a new key", async () => {
-  await open(); await draft(); writes.mockResolvedValueOnce(json({}, 400));
-  submit(); expect(await panel().findByRole("alert")).toHaveTextContent("400");
-  expect(field("成员职责")).toBeEnabled(); change("成员职责", "补充复核"); submit();
+it.each([400, 413, 415])("allows correction after a definitive validation error HTTP %s with a new key", async status => {
+  await open(); await draft();
+  const rejectedRole = status === 413 ? member.role.repeat(100) : member.role;
+  change("成员职责", rejectedRole);
+  const code = status === 413 ? "body_too_large" : status === 415 ? "unsupported_media_type" : "invalid";
+  writes.mockResolvedValueOnce(json({ error: { code, message: "请求被拒绝" } }, status));
+  submit(); const alert = await panel().findByRole("alert"); expect(alert).toHaveTextContent(String(status));
+  if (status === 413) expect(alert).toHaveTextContent("请求内容过大");
+  if (status === 415) expect(alert).toHaveTextContent("仅接受 JSON");
+  expect(field("成员职责")).toBeEnabled(); expect(field("成员职责")).toHaveValue(rejectedRole);
+  change("成员职责", "补充复核"); submit();
   await panel().findByRole("button", { name: member.name });
   expect(writes.mock.calls[1][1]?.body).toBe(JSON.stringify({ name: member.name, role: "补充复核" }));
   expect(new Headers(writes.mock.calls[1][1]?.headers).get("Idempotency-Key")).not.toBe(new Headers(writes.mock.calls[0][1]?.headers).get("Idempotency-Key"));
@@ -144,6 +151,31 @@ it("keeps a late A POST receipt and selection out of visible B", async () => {
   expect(panel().queryByRole("button", { name: member.name })).not.toBeInTheDocument();
   selectGroup(group.name); expect(panel().getByRole("button", { name: member.name })).toHaveAttribute("aria-pressed", "true");
   await act(async () => {});
+});
+it.each(["existing", "created"])("refreshes selected %s member details from a newer GET", async origin => {
+  if (origin === "existing") reads.mockResolvedValueOnce(page([member]));
+  await open();
+  if (origin === "created") { await draft(); submit(); }
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  expect(panel().getByText("在群")).toBeVisible();
+  const updated = { ...member, role: "更新后的职责", status: "left" };
+  reads.mockResolvedValueOnce(page([updated]));
+  fireEvent.click(panel().getByRole("button", { name: "刷新成员" }));
+  expect(await panel().findByText(updated.role)).toBeVisible();
+  expect(panel().getByText("已离开")).toBeVisible();
+  expect(panel().queryByText("在群")).not.toBeInTheDocument();
+  expect(panel().getByRole("button", { name: member.name })).toHaveAttribute("aria-pressed", "true");
+});
+it("does not restore a pre-creation snapshot after returning to A and refreshing it", async () => {
+  const old = deferred<Response>(); reads.mockReturnValueOnce(old.promise); await open();
+  change("成员名称", member.name); change("成员职责", member.role); submit();
+  await panel().findByRole("button", { name: member.name });
+  selectGroup(other.name); await panel().findByText("尚无成员，可创建群内成员。");
+  reads.mockResolvedValueOnce(page([{ ...member, role: "返回后的职责", status: "left" }]));
+  selectGroup(group.name); await panel().findByText("返回后的职责");
+  await act(async () => old.resolve(page([{ ...member, role: "旧职责", status: "active" }])));
+  expect(panel().getByText("返回后的职责")).toBeVisible(); expect(panel().getByText("已离开")).toBeVisible();
+  expect(panel().queryByText("旧职责")).not.toBeInTheDocument();
 });
 it("protects a confirmed creation from an older member GET", async () => {
   const delayed = deferred<Response>(); reads.mockReturnValueOnce(delayed.promise); await open();

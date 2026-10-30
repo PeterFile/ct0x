@@ -14,6 +14,8 @@ type Page<T> = { items: T[]; next_cursor: string };
 export class ApiError extends Error {
   constructor(message: string, readonly status = 0, readonly code = "disconnected") { super(message); }
 }
+export const isDefinitiveRejection = (error: unknown) => error instanceof ApiError
+  && [400, 404, 409, 413, 415].includes(error.status);
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 const isGroup = (value: unknown): value is Group => isRecord(value)
   && ["id", "name", "description", "created_at"].every(key => typeof value[key] === "string")
@@ -45,6 +47,8 @@ async function request<T>(path: string, init: RequestInit, valid: (value: unknow
     const reason = response.status === 400 ? "输入未通过验证，请检查输入信息"
       : response.status === 404 ? "未找到请求的服务或记录"
       : response.status === 409 ? "幂等键与已有请求冲突"
+      : response.status === 413 ? "请求内容过大，请缩短输入后重试"
+      : response.status === 415 ? "服务仅接受 JSON 内容，请检查请求格式"
       : "服务暂时无法完成请求";
     throw new ApiError(`${reason}（HTTP ${response.status}）。`, response.status,
       typeof error.code === "string" ? error.code : "http_error");

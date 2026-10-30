@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { ApiError, createMember, listMembers, listProviders } from "./api";
+import { ApiError, createMember, isDefinitiveRejection, listMembers, listProviders } from "./api";
 import type { Member, MemberInput, Provider } from "./api";
 
 function unique<T extends { id: string }>(items: T[]) {
@@ -50,12 +50,14 @@ export function Members({ groupId }: { groupId?: string }) {
 function MemberScope({ groupId, active, catalogue }: { groupId: string; active: boolean; catalogue: ReturnType<typeof useCatalogue> }) {
   const formId = useId();
   const [items, setItems] = useState<Member[]>([]);
-  const [selected, setSelected] = useState<Member | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = items.find(member => member.id === selectedId);
   const [draft, setDraft] = useState(emptyDraft);
   const [request, setRequest] = useState({ before: "", version: 0 });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
   const [mutation, setMutation] = useState({ pending: false, error: "", uncertain: false });
-  const confirmed = useRef<Member[]>([]);
+  const confirmed = useRef<{ member: Member; afterRead: number }[]>([]);
+  const readSequence = useRef(0);
   const operation = useRef<{ key: string; input: MemberInput } | null>(null);
   const posting = useRef<AbortController | null>(null);
   const mounted = useRef(false);
@@ -68,10 +70,18 @@ function MemberScope({ groupId, active, catalogue }: { groupId: string; active: 
     if (!active) { if (request.before) load(); return; }
     let ignore = false;
     const controller = new AbortController();
+    const read = ++readSequence.current;
     setPage(previous => ({ ...previous, pending: true, error: "" }));
     listMembers(groupId, request.before, controller.signal).then(result => {
       if (ignore) return;
-      setItems(previous => unique([...confirmed.current, ...(request.before ? previous : []), ...result.items]));
+      // A receipt only outranks reads already started when it arrived.
+      confirmed.current = confirmed.current.filter(receipt => receipt.afterRead >= read);
+      const protectedMembers = confirmed.current.map(receipt => receipt.member);
+      setItems(previous => {
+        const updates = new Map(result.items.map(member => [member.id, member]));
+        const retained = request.before ? previous.map(member => updates.get(member.id) ?? member) : [];
+        return unique([...protectedMembers, ...retained, ...result.items]);
+      });
       setPage({ pending: false, error: "", next: result.next_cursor });
     }, error => {
       if (!ignore) setPage(previous => ({ ...previous, pending: false, error: errorText(error) }));
@@ -94,13 +104,13 @@ function MemberScope({ groupId, active, catalogue }: { groupId: string; active: 
     try {
       const member = await createMember(groupId, current.input, current.key, controller.signal);
       if (!mounted.current) return;
-      confirmed.current = unique([member, ...confirmed.current]);
-      setItems(previous => unique([member, ...previous])); setSelected(member);
+      confirmed.current = [{ member, afterRead: readSequence.current }, ...confirmed.current.filter(receipt => receipt.member.id !== member.id)];
+      setItems(previous => unique([member, ...previous])); setSelectedId(member.id);
       operation.current = null; setDraft(emptyDraft);
       setMutation({ pending: false, error: "", uncertain: false });
     } catch (error) {
       if (!mounted.current) return;
-      const uncertain = !(error instanceof ApiError && [400, 404, 409].includes(error.status));
+      const uncertain = !isDefinitiveRejection(error);
       if (!uncertain) operation.current = null;
       setMutation({ pending: false, uncertain, error: uncertain ? `创建结果未确认。${errorText(error)} 请重试同一次创建。` : errorText(error) });
     } finally { posting.current = null; }
@@ -113,7 +123,7 @@ function MemberScope({ groupId, active, catalogue }: { groupId: string; active: 
       {page.error ? <div role="alert"><p>{page.error}</p><button type="button" onClick={() => load(request.before)}>重试载入成员</button></div> : null}
       {!page.pending && !page.error && !items.length ? <p>尚无成员，可创建群内成员。</p> : null}
       <ul className="group-list" aria-label="成员列表">{items.map(member => <li key={member.id}>
-        <button type="button" aria-pressed={selected?.id === member.id} onClick={() => setSelected(member)}>{member.name}</button>
+        <button type="button" aria-pressed={selectedId === member.id} onClick={() => setSelectedId(member.id)}>{member.name}</button>
       </li>)}</ul>
       {page.next ? <button type="button" disabled={page.pending} onClick={() => load(page.next)}>加载更多成员</button> : null}
     </div>

@@ -125,14 +125,19 @@ describe("workspace groups", () => {
     expect(posts()).toHaveLength(2);
   });
 
-  it("allows correction after definitive validation rejection with a new key", async () => {
+  it.each([400, 413, 415])("allows correction after definitive validation rejection HTTP %s with a new key", async status => {
     render(<App />);
     await screen.findByText("尚无群组，可在下方创建。");
-    transport.mockResolvedValueOnce(json({ error: { code: "invalid", message: "名称无效" } }, 400));
-    submit();
-    expect(await screen.findByRole("alert")).toHaveTextContent("400");
+    const rejectedName = status === 413 ? group.name.repeat(100) : group.name;
+    const code = status === 413 ? "body_too_large" : status === 415 ? "unsupported_media_type" : "invalid";
+    transport.mockResolvedValueOnce(json({ error: { code, message: "请求被拒绝" } }, status));
+    submit(rejectedName);
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(String(status));
+    if (status === 413) expect(alert).toHaveTextContent("请求内容过大");
+    if (status === 415) expect(alert).toHaveTextContent("仅接受 JSON");
     expect(nameInput()).toBeEnabled();
-    expect(nameInput()).toHaveValue(group.name);
+    expect(nameInput()).toHaveValue(rejectedName);
     transport.mockResolvedValueOnce(json(other, 201));
     submit(other.name);
     await screen.findByRole("button", { name: other.name });
