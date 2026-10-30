@@ -2,8 +2,10 @@ package platform
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -375,16 +377,18 @@ func TestMemberCapabilityRegistryIsBoundedAndRevokeFreesCapacity(t *testing.T) {
 	ctx := context.Background()
 	tools := NewMemberTools(f.db)
 	grants := MemberToolGrants{Operations: []string{"list_members"}}
-	first := ""
-	for range 1024 {
-		claim := memberCapabilityClaim(t, f, f.groupID)
-		token, err := tools.Issue(ctx, claim, grants)
-		if err != nil {
-			t.Fatal(err)
+	// Capacity is a registry policy; only the boundary Issue calls need real claims.
+	for i := range 1023 {
+		synthetic := fmt.Sprintf("synthetic-%d", i)
+		tools.capabilities[sha256.Sum256([]byte(synthetic))] = memberToolRegistration{
+			scope:  store.MemberToolScope{Claim: store.TurnClaim{TurnID: synthetic}},
+			grants: grants,
 		}
-		if first == "" {
-			first = token
-		}
+	}
+	claim := memberCapabilityClaim(t, f, f.groupID)
+	first, err := tools.Issue(ctx, claim, grants)
+	if err != nil {
+		t.Fatal(err)
 	}
 	pending := memberCapabilityClaim(t, f, f.groupID)
 	token, err := tools.Issue(ctx, pending, grants)
