@@ -351,7 +351,7 @@ VALUES('old-conversation', 'old-group', 'old-member', '2026-10-30T12:00:00.00000
 	}
 	defer s.Close()
 	var version, count int
-	if err := s.db.QueryRow("SELECT max(version), count(*) FROM schema_migrations").Scan(&version, &count); err != nil || version != 2 || count != 2 {
+	if err := s.db.QueryRow("SELECT max(version), count(*) FROM schema_migrations").Scan(&version, &count); err != nil || version != len(migrations) || count != len(migrations) {
 		t.Fatalf("v1 was not incrementally upgraded: %d, %d, %v", version, count, err)
 	}
 	if g, err := s.GetGroup(ctx, "old-group"); err != nil || g.Name != "old" {
