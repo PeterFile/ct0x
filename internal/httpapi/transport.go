@@ -36,7 +36,8 @@ func NewServer(address string, routes ...Route) (*http.Server, error) {
 // NewServerWithConfig adds one explicit development proxy origin. It does not
 // enable CORS or change the Host guard; proxies must rewrite Host to the listener.
 func NewServerWithConfig(config Config, routes ...Route) (*http.Server, error) {
-	if err := ValidateDevOrigin(config.DevOrigin); err != nil {
+	devOrigin, err := canonicalDevOrigin(config.DevOrigin)
+	if err != nil {
 		return nil, err
 	}
 	listener, err := netip.ParseAddrPort(config.Address)
@@ -92,7 +93,7 @@ func NewServerWithConfig(config Config, routes ...Route) (*http.Server, error) {
 			WriteError(w, http.StatusForbidden, "invalid_host", "请求主机与本地监听地址不匹配")
 			return
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions && !sameOrigin(r, authority, defaultAuthority, config.DevOrigin) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions && !sameOrigin(r, authority, defaultAuthority, devOrigin) {
 			WriteError(w, http.StatusForbidden, "invalid_origin", "仅允许同源浏览器写入请求或本地客户端请求")
 			return
 		}

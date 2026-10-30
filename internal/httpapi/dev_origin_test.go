@@ -24,6 +24,62 @@ func TestDevOriginConfiguration(t *testing.T) {
 	}
 }
 
+func TestDevOriginBrowserSerialization(t *testing.T) {
+	for _, tt := range []struct{ configured, serialized string }{
+		{"http://127.0.0.1:80", "http://127.0.0.1"},
+		{"http://127.0.0.1:05173", "http://127.0.0.1:5173"},
+		{"http://[0:0:0:0:0:0:0:1]:5173", "http://[::1]:5173"},
+		{"http://[0:0:0:0:0:0:0:1]:00080", "http://[::1]"},
+	} {
+		t.Run(tt.configured, func(t *testing.T) {
+			if err := ValidateDevOrigin(tt.configured); err != nil {
+				t.Fatal(err)
+			}
+			server, err := NewServerWithConfig(Config{Address: DefaultAddress, DevOrigin: tt.configured})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, site := range []string{"same-site", "cross-site"} {
+				r := httptest.NewRequest(http.MethodPost, "http://"+DefaultAddress+"/healthz", nil)
+				r.Header.Set("Origin", tt.serialized)
+				r.Header.Set("Sec-Fetch-Site", site)
+				w := httptest.NewRecorder()
+				server.Handler.ServeHTTP(w, r)
+				assertError(t, w.Code, w.Header(), w.Body.Bytes(), http.StatusMethodNotAllowed, "method_not_allowed")
+			}
+			for _, origins := range [][]string{{tt.configured}, {tt.serialized + "/"}, {tt.serialized + "?x=1"}, {tt.serialized, tt.serialized}} {
+				r := httptest.NewRequest(http.MethodPost, "http://"+DefaultAddress+"/healthz", nil)
+				r.Header["Origin"] = origins
+				r.Header.Set("Sec-Fetch-Site", "same-site")
+				w := httptest.NewRecorder()
+				server.Handler.ServeHTTP(w, r)
+				assertError(t, w.Code, w.Header(), w.Body.Bytes(), http.StatusForbidden, "invalid_origin")
+			}
+			r := httptest.NewRequest(http.MethodPost, "http://"+DefaultAddress+"/healthz", nil)
+			r.Header.Set("Origin", tt.serialized)
+			r.Header.Set("Sec-Fetch-Site", "same-site")
+			w := httptest.NewRecorder()
+			mustServer(t, DefaultAddress).Handler.ServeHTTP(w, r)
+			assertError(t, w.Code, w.Header(), w.Body.Bytes(), http.StatusForbidden, "invalid_origin")
+			r.Host = "127.0.0.1:7311"
+			w = httptest.NewRecorder()
+			server.Handler.ServeHTTP(w, r)
+			assertError(t, w.Code, w.Header(), w.Body.Bytes(), http.StatusForbidden, "invalid_host")
+		})
+	}
+}
+
+func TestDevOriginRejectsMappedIPv6(t *testing.T) {
+	for _, origin := range []string{"http://[::ffff:127.0.0.1]:5173", "http://[::ffff:7f00:1]:5173", "http://[0:0:0:0:0:ffff:7f00:1]:5173"} {
+		if err := ValidateDevOrigin(origin); err == nil || !hasChinese(err.Error()) {
+			t.Errorf("mapped dev origin must be explicitly unsupported: %q %v", origin, err)
+		}
+		if _, err := NewServerWithConfig(Config{Address: DefaultAddress, DevOrigin: origin}); err == nil {
+			t.Errorf("server accepted mapped dev origin %q", origin)
+		}
+	}
+}
+
 func TestDevOriginProxyRequests(t *testing.T) {
 	for _, configured := range []string{"", "http://127.0.0.1:5173", "http://[::1]:5173"} {
 		t.Run(configured, func(t *testing.T) {
