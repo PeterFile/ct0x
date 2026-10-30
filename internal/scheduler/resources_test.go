@@ -1,3 +1,5 @@
+//go:build linux || darwin
+
 package scheduler_test
 
 import (
