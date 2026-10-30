@@ -17,9 +17,9 @@ import (
 
 type Root struct{ ID, Path string }
 
-// Limits bound each operation. MaxEntries is per directory; MaxSkills and
-// MaxTotalBytes apply across all roots during listing, or to one snapshot.
-// Listing charges bytes actually read, including invalid entries.
+// Limits bound each operation. MaxEntries is per directory. Listing bounds
+// roots, skill candidates and total bytes (including reads of invalid entries).
+// Select bounds directories, files and total bytes, including SKILL.md/root.
 type Limits struct {
 	MaxRoots, MaxEntries, MaxSkills, MaxDirs, MaxFiles int
 	MaxHeaderBytes, MaxFileBytes, MaxTotalBytes        int64
@@ -125,8 +125,9 @@ func (c *Catalog) Close() error {
 
 // List considers only immediate directories/symlinks, ordered by root ID/name.
 // It streams whole SKILL.md files for hashes, with bounded header scratch space,
-// but never caches or discloses bodies. Invalid entries produce Problems; any
-// exhausted limit fails the entire listing rather than returning partial success.
+// but never caches or discloses bodies. Supporting files are checked by Select.
+// Invalid entries produce Problems; exhausted limits fail the entire listing
+// rather than returning partial success.
 func (c *Catalog) List() (Listing, error) {
 	out := Listing{Entries: []Entry{}, Problems: []Problem{}}
 	remaining, count := c.limits.MaxTotalBytes, 0
