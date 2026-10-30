@@ -2,13 +2,14 @@ package scheduler
 
 import (
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
-var ErrInvalidWorkspace = errors.New("工作区根必须是已存在且不重叠的绝对目录")
+var (
+	ErrInvalidWorkspace     = errors.New("工作区根必须是已存在且不重叠的绝对目录")
+	ErrWorkspaceUnsupported = errors.New("当前平台不支持工作区目录身份锁")
+)
 
 // WorkspaceResourceKeys validates the complete trusted authorized-root snapshot.
 // Keys follow input order; directory aliases share a device/inode identity.
@@ -30,9 +31,9 @@ func WorkspaceResourceKeys(roots []string) ([]string, error) {
 		if err != nil || !info.IsDir() {
 			return nil, ErrInvalidWorkspace
 		}
-		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok {
-			return nil, ErrInvalidWorkspace
+		key, err := workspaceIdentity(info)
+		if err != nil {
+			return nil, err
 		}
 		for i, previous := range infos {
 			if os.SameFile(previous, info) {
@@ -47,7 +48,7 @@ func WorkspaceResourceKeys(roots []string) ([]string, error) {
 				return nil, ErrInvalidWorkspace
 			}
 		}
-		keys = append(keys, fmt.Sprintf("workspace:%d:%d", stat.Dev, stat.Ino))
+		keys = append(keys, key)
 		paths = append(paths, resolved)
 		infos = append(infos, info)
 	}
