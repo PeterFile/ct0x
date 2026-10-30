@@ -45,11 +45,20 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if err := os.MkdirAll(config.dataDir, 0700); err != nil {
 		return fmt.Errorf("创建数据目录失败：%w", err)
 	}
+	lock, err := lockDataDir(config.dataDir)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
 	db, err := store.Open(filepath.Join(config.dataDir, "workspace.db"))
 	if err != nil {
 		return fmt.Errorf("打开工作区数据库失败：%w", err)
 	}
+	// Later scheduler shutdown/drain belongs before these store/lock defers.
 	defer func() { err = errors.Join(err, db.Close()) }()
+	if _, err := db.RecoverInFlight(ctx); err != nil {
+		return fmt.Errorf("恢复在途轮次失败：%w", err)
+	}
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", config.listen)
 	if err != nil {
 		return fmt.Errorf("监听本地地址失败：%w", err)
