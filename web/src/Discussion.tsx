@@ -57,6 +57,8 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
   return <div className="group-panel discussion-feed">
     <button type="button" disabled={feed.page.pending} onClick={() => feed.loadPage()}>刷新并重置历史窗口</button>
     <p className="feed-note">已载入 {feed.items.length} 条群组消息（含话题）。已加载片段可能存在间隔；刷新重置窗口后可重新向前加载，不代表已读完历史。</p>
+    <p className="feed-note">每轮完成后等待 5 秒，再检查最新 50 条及至多 5 条已载入的待确认投递。</p>
+    {feed.pollError ? <p role="status">自动刷新暂不可用：{feed.pollError} 将稍后重试。</p> : null}
     {feed.page.pending ? <p role="status">正在载入消息…</p> : null}
     {feed.page.error ? <div role="alert"><p>{feed.page.error}</p><button type="button" onClick={feed.retry}>重试载入消息</button></div> : null}
     {!feed.page.pending && !feed.page.error && !feed.items.length ? <p>尚无消息，可发送第一条讨论。</p> : null}

@@ -5,6 +5,7 @@ import type { Message } from "./api";
 type FeedRecord = { message: Message; source: "read" | "receipt"; dataVersion: number; presenceVersion: number };
 type Feed = { entries: Map<string, FeedRecord>; floor: number };
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请重试。";
+const hasPending = (message: Message) => message.deliveries.some(delivery => !["accepted", "failed"].includes(delivery.state));
 function merge(previous: Feed, incoming: Message[], version: number, reset = false): Feed {
   const resetting = reset && version >= previous.floor;
   const entries = new Map([...previous.entries].filter(([, record]) => !resetting || record.presenceVersion > version));
@@ -25,10 +26,12 @@ const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 export function useMessageFeed(groupId: string, active: boolean) {
   const [feed, setFeed] = useState<Feed>({ entries: new Map(), floor: 0 });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
+  const [pollError, setPollError] = useState("");
   const [details, setDetails] = useState<Record<string, { pending: boolean; error: string }>>({});
   const clock = useRef(0), epoch = useRef(0), running = useRef(false), pageBusy = useRef(false);
   const controllers = useRef(new Set<AbortController>()), detailBusy = useRef(new Set<string>());
   const lastRequest = useRef({ before: "", reset: true });
+  const windowVersion = useRef(0), detailQueue = useRef<string[]>([]);
   const beginRead = useCallback(() => {
     const controller = new AbortController(), generation = epoch.current, version = ++clock.current;
     controllers.current.add(controller);
@@ -39,6 +42,7 @@ export function useMessageFeed(groupId: string, active: boolean) {
   const loadPage = useCallback(async (before = "", reset = true) => {
     if (!running.current || pageBusy.current) return;
     pageBusy.current = true; lastRequest.current = { before, reset };
+    if (reset) ++windowVersion.current;
     const read = beginRead();
     setPage(previous => ({ ...previous, pending: true, error: "" }));
     try {
@@ -65,7 +69,7 @@ export function useMessageFeed(groupId: string, active: boolean) {
   }, [groupId, beginRead]);
   useEffect(() => {
     running.current = active; ++epoch.current;
-    pageBusy.current = false; detailBusy.current.clear(); setDetails({});
+    pageBusy.current = false; detailBusy.current.clear(); setDetails({}); setPollError("");
     if (active) void loadPage();
     return () => {
       running.current = false; ++epoch.current;
@@ -87,6 +91,45 @@ export function useMessageFeed(groupId: string, active: boolean) {
   }, []);
   const items = useMemo(() => [...feed.entries.values()].map(record => record.message)
     .sort((a, b) => compare(timeKey(a.created_at), timeKey(b.created_at)) || compare(a.id, b.id)), [feed]);
-  return { items, page, details, loadPage, refreshDetail, beginSend, confirm,
+  const loaded = useRef<Message[]>([]);
+  useEffect(() => { loaded.current = items; }, [items]);
+  useEffect(() => {
+    if (!active) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    async function cycle() {
+      try {
+        if (stopped || pageBusy.current) return;
+        const window = windowVersion.current, read = beginRead(), terminal = new Set<string>();
+        try {
+          const result = await listMessages(groupId, "", read.signal);
+          if (read.valid() && window === windowVersion.current) {
+            for (const message of result.items) if (!hasPending(message)) terminal.add(message.id);
+            setFeed(previous => merge(previous, result.items, read.version));
+            setPollError("");
+          }
+        } catch (error) {
+          if (read.valid() && window === windowVersion.current) setPollError(errorText(error));
+        } finally { read.close(); }
+        if (stopped || window !== windowVersion.current || pageBusy.current) return;
+        const pending = new Set(loaded.current.filter(message => hasPending(message) && !terminal.has(message.id)).map(message => message.id));
+        detailQueue.current = detailQueue.current.filter(id => pending.has(id));
+        const queued = new Set(detailQueue.current);
+        for (const id of pending) if (!queued.has(id)) detailQueue.current.push(id);
+        // Rotate a bounded queue so new arrivals cannot starve previously loaded pending records.
+        const batch = detailQueue.current.splice(0, 5);
+        detailQueue.current.push(...batch);
+        for (const id of batch) {
+          if (stopped || window !== windowVersion.current || pageBusy.current) break;
+          await refreshDetail(id);
+        }
+      } finally {
+        if (!stopped) timer = setTimeout(() => void cycle(), 5000);
+      }
+    }
+    timer = setTimeout(() => void cycle(), 5000);
+    return () => { stopped = true; clearTimeout(timer); };
+  }, [active, groupId, beginRead, refreshDetail]);
+  return { items, page, pollError, details, loadPage, refreshDetail, beginSend, confirm,
     retry: () => loadPage(lastRequest.current.before, lastRequest.current.reset) };
 }
