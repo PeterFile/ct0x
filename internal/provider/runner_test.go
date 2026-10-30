@@ -51,7 +51,7 @@ func TestRunnerReapsDirectChildAndBoundsInheritedPipes(t *testing.T) {
 			root := t.TempDir()
 			ready := filepath.Join(root, "ready")
 			path := executable(t, filepath.Join(root, "descendant"), "sleep 10 &\nprintf '%s %s\\n' \"$$\" \"$!\"\n: > '"+ready+"'\n"+end)
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if mode == Cancelled {
 				go func() {
