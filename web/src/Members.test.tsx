@@ -26,7 +26,8 @@ beforeEach(() => {
   catalogue.mockReset().mockImplementation(async () => page([provider]));
   vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => String(input).includes("/members")
     ? (init?.method === "POST" ? writes : reads)(input, init)
-    : String(input).startsWith("/api/v1/providers") ? catalogue(input, init) : Promise.resolve(page([group, other])));
+    : String(input).startsWith("/api/v1/providers") ? catalogue(input, init)
+    : Promise.resolve(String(input).includes("/messages") ? page() : page([group, other])));
 });
 afterEach(() => vi.unstubAllGlobals());
 
