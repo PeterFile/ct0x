@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -167,6 +168,11 @@ func startRunWithSearch(t *testing.T, search provider.Search, args ...string) (s
 		if !chinese(line) || !strings.Contains(line, "群组与成员") || !strings.Contains(line, "其他功能尚未启用") || !strings.Contains(line, "CLI 目录") || !strings.Contains(line, "仅存内存") {
 			t.Fatalf("startup must describe the group/member boundary: %s", line)
 		}
+		for _, want := range []string{"消息持久化", "历史与详情", "排队投递记录", "模型调度与执行尚未接入"} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("startup must state the queue-only message boundary: missing %q: %s", want, line)
+			}
+		}
 		for _, field := range strings.Fields(line) {
 			if strings.HasPrefix(field, "http://") {
 				return field, stop
@@ -278,6 +284,76 @@ func TestRunLifecycleAndPersistence(t *testing.T) {
 	got, err := reopened.GetGroup(context.Background(), group.ID)
 	if err != nil || got != group {
 		t.Fatalf("restart lost persistent data: %+v %v", got, err)
+	}
+}
+
+func TestRunMessageRoutesPersistWithoutExecution(t *testing.T) {
+	dir := t.TempDir()
+	url, stop := startRun(t, "--listen", "127.0.0.1:0", "--data-dir", dir)
+	client := &http.Client{Timeout: 3 * time.Second}
+	defer client.CloseIdleConnections()
+	request := func(method, path, body, key string, status int, result any) {
+		t.Helper()
+		r, err := http.NewRequest(method, url+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Content-Type", "application/json")
+		if key != "" {
+			r.Header.Set("Idempotency-Key", key)
+		}
+		response, err := client.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != status {
+			t.Fatalf("%s %s: status = %d, want %d", method, path, response.StatusCode, status)
+		}
+		if err := json.NewDecoder(response.Body).Decode(result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var group domain.Group
+	request("POST", "/api/v1/groups", `{"name":"消息接线"}`, "", 201, &group)
+	path := "/api/v1/groups/" + group.ID + "/messages"
+	body := `{"content":" 仅留存可见消息 ","recipient_ids":[],"topic_id":"topic"}`
+	var visible domain.Message
+	request("POST", path, body, "visible-message", 201, &visible)
+	if visible.ID == "" || visible.GroupID != group.ID || visible.SenderID != "user" || visible.Content != " 仅留存可见消息 " || visible.TopicID != "topic" || visible.CreatedAt.IsZero() || visible.Deliveries == nil || len(visible.Deliveries) != 0 {
+		t.Fatalf("visible message was not persisted directly without wakeups: %+v", visible)
+	}
+	var detail domain.Message
+	request("GET", path+"/"+visible.ID, "", "", 200, &detail)
+	var page struct {
+		Items      []domain.Message `json:"items"`
+		NextCursor string           `json:"next_cursor"`
+	}
+	request("GET", path, "", "", 200, &page)
+	if !reflect.DeepEqual(detail, visible) || page.Items == nil || len(page.Items) != 1 || !reflect.DeepEqual(page.Items[0], visible) || page.NextCursor != "" {
+		t.Fatal("message detail/history did not expose the persisted receipt")
+	}
+	var member domain.Member
+	request("POST", "/api/v1/groups/"+group.ID+"/members", `{"name":"未绑定成员","role":"职责"}`, "", 201, &member)
+	var queued domain.Message
+	request("POST", path, `{"content":"仅排队，不执行"}`, "", 201, &queued)
+	if len(queued.Deliveries) != 1 || queued.Deliveries[0].RecipientID != member.ID || queued.Deliveries[0].State != domain.DeliveryStateQueued || queued.Deliveries[0].TurnID != "" {
+		t.Fatalf("default routing must only queue a delivery: %+v", queued)
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	url, stop = startRun(t, "--listen", "127.0.0.1:0", "--data-dir", dir)
+	request("POST", path, body, "visible-message", 201, &detail)
+	if !reflect.DeepEqual(detail, visible) {
+		t.Fatal("runtime reopen/retry changed the visible receipt")
+	}
+	request("GET", path+"/"+queued.ID, "", "", 200, &detail)
+	if !reflect.DeepEqual(detail, queued) {
+		t.Fatal("runtime restart lost or advanced the queue-only delivery")
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
 	}
 }
 

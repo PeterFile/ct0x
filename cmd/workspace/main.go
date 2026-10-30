@@ -60,12 +60,14 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("启动已取消：%w", err)
 	}
-	routes := append(httpapi.LocalUserRoutes(platform.NewLocalUser(db)), httpapi.ProviderRoute(catalog))
+	local := platform.NewLocalUser(db)
+	routes := append(httpapi.LocalUserRoutes(local), httpapi.MessageRoutes(local)...)
+	routes = append(routes, httpapi.ProviderRoute(catalog))
 	server, err := httpapi.NewServerWithConfig(httpapi.Config{Address: listener.Addr().String(), DevOrigin: config.devOrigin}, routes...)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询及 CLI 目录；目录仅启动时探测、证据仅存内存，其他功能尚未启用）\n", listener.Addr()); err != nil {
+	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录及 CLI 目录；目录仅启动时探测、证据仅存内存；实际模型调度与执行尚未接入，其他功能尚未启用）\n", listener.Addr()); err != nil {
 		return fmt.Errorf("输出启动信息失败：%w", err)
 	}
 	return serve(ctx, server, listener, 5*time.Second)
