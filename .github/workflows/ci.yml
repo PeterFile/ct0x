@@ -1,0 +1,80 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: go test -race ./...
+      - run: go vet ./...
+      - name: Record benchmark metrics
+        run: |
+          set -euo pipefail
+          # Keep only complete standard benchmark records, never raw test output.
+          go test -run '^$' -bench . -benchmem ./... |
+            awk '
+              BEGIN { number = "^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$" }
+              $1 ~ /^Benchmark[A-Za-z0-9_.\/=+-]+$/ &&
+              $2 ~ /^[0-9]+$/ && $3 ~ number && $4 == "ns/op" {
+                if (NF == 10 && $5 ~ number && $6 == "MB/s") {
+                  bytes = 7
+                } else if (NF == 8) {
+                  bytes = 5
+                } else {
+                  next
+                }
+                if ($bytes !~ /^[0-9]+$/ || $(bytes + 1) != "B/op" ||
+                    $(bytes + 2) !~ /^[0-9]+$/ || $(bytes + 3) != "allocs/op") next
+                $1 = $1
+                print
+              }
+            ' > "$RUNNER_TEMP/go-benchmarks.txt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: go-benchmarks
+          path: ${{ runner.temp }}/go-benchmarks.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+          check-latest: true
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
