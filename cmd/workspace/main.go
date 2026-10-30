@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"agentworkspace/internal/httpapi"
+	"agentworkspace/internal/platform"
 	"agentworkspace/internal/store"
 )
 
@@ -53,11 +54,11 @@ func run(ctx context.Context, args []string, output io.Writer) (err error) {
 		return fmt.Errorf("监听本地地址失败：%w", err)
 	}
 	defer listener.Close()
-	server, err := httpapi.NewServerWithConfig(httpapi.Config{Address: listener.Addr().String(), DevOrigin: config.devOrigin})
+	server, err := httpapi.NewServerWithConfig(httpapi.Config{Address: listener.Addr().String(), DevOrigin: config.devOrigin}, httpapi.LocalUserRoutes(platform.NewLocalUser(db))...)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （目前仅提供健康检查，业务接口尚未启用）\n", listener.Addr()); err != nil {
+	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查及群组与成员创建、查询，其他功能尚未启用）\n", listener.Addr()); err != nil {
 		return fmt.Errorf("输出启动信息失败：%w", err)
 	}
 	return serve(ctx, server, listener, 5*time.Second)

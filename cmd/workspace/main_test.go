@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -15,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/httpapi"
 	"agentworkspace/internal/store"
 )
@@ -154,8 +156,8 @@ func startRun(t *testing.T, args ...string) (string, func() error) {
 	})
 	select {
 	case line := <-output.lines:
-		if !chinese(line) || !strings.Contains(line, "仅") || !strings.Contains(line, "健康检查") {
-			t.Fatalf("startup must describe the health-only boundary: %s", line)
+		if !chinese(line) || !strings.Contains(line, "群组与成员") || !strings.Contains(line, "其他功能尚未启用") {
+			t.Fatalf("startup must describe the group/member boundary: %s", line)
 		}
 		for _, field := range strings.Fields(line) {
 			if strings.HasPrefix(field, "http://") {
@@ -183,22 +185,44 @@ func TestRunLifecycleAndPersistence(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("server started without opening SQLite: %v", err)
 	}
-	db, err := store.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	group, err := db.CreateGroup(context.Background(), store.CreateGroupInput{Name: "重启后仍存在"})
-	closeErr := db.Close()
-	if err != nil || closeErr != nil {
-		t.Fatalf("seed persistent state: %v %v", err, closeErr)
-	}
 	client := &http.Client{Timeout: 3 * time.Second}
 	defer client.CloseIdleConnections()
+	post := func(path, body, key string, result any) {
+		t.Helper()
+		r, err := http.NewRequest(http.MethodPost, url+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Content-Type", "application/json")
+		r.Header.Set("Origin", "http://127.0.0.1:5173")
+		r.Header.Set("Sec-Fetch-Site", "same-site")
+		r.Header.Set("Idempotency-Key", key)
+		response, err := client.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusCreated {
+			t.Fatalf("real process create: %d", response.StatusCode)
+		}
+		if err := json.NewDecoder(response.Body).Decode(result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var group domain.Group
+	post("/api/v1/groups", `{"name":"重启后仍存在"}`, "process-group", &group)
+	var member domain.Member
+	post("/api/v1/groups/"+group.ID+"/members", `{"name":"真实成员","role":"职责"}`, "process-member", &member)
+	if group.ID == "" || member.GroupID != group.ID || member.CreatorID != "user" || member.OwnerID != "user" {
+		t.Fatalf("real process did not bind identity: %+v %+v", group, member)
+	}
 	for _, tt := range []struct {
 		path string
 		code int
 	}{
-		{"/healthz", http.StatusOK}, {"/api/v1/groups", http.StatusNotFound}, {"/api/v1/groups/group/members", http.StatusNotFound},
+		{"/healthz", http.StatusOK}, {"/api/v1/groups", http.StatusOK}, {"/api/v1/groups/" + group.ID, http.StatusOK},
+		{"/api/v1/groups/" + group.ID + "/members", http.StatusOK}, {"/api/v1/groups/" + group.ID + "/members/" + member.ID, http.StatusOK},
+		{"/api/v1/groups/group/members", http.StatusNotFound}, {"/api/v1/providers", http.StatusNotFound},
 	} {
 		response, err := client.Get(url + tt.path)
 		if err != nil {
@@ -207,7 +231,7 @@ func TestRunLifecycleAndPersistence(t *testing.T) {
 		body, err := io.ReadAll(response.Body)
 		response.Body.Close()
 		if err != nil || response.StatusCode != tt.code || strings.Contains(string(body), dir) {
-			t.Fatalf("unexpected health-only HTTP response: %d %s %v", response.StatusCode, body, err)
+			t.Fatalf("unexpected process HTTP response: %d %s %v", response.StatusCode, body, err)
 		}
 	}
 	r, _ := http.NewRequest(http.MethodGet, url+"/healthz", nil)
@@ -229,7 +253,12 @@ func TestRunLifecycleAndPersistence(t *testing.T) {
 		t.Fatalf("shutdown did not release listener: %v", err)
 	}
 	rebound.Close()
-	_, stopAgain := startRun(t, "--listen", address, "--data-dir", dir)
+	_, stopAgain := startRun(t, "--listen", address, "--data-dir", dir, "--dev-origin", "http://127.0.0.1:5173")
+	var replay domain.Group
+	post("/api/v1/groups", `{"name":"重启后仍存在"}`, "process-group", &replay)
+	if replay != group {
+		t.Fatalf("process restart lost durable retry: %+v", replay)
+	}
 	if err := stopAgain(); err != nil {
 		t.Fatal(err)
 	}
@@ -283,7 +312,7 @@ func TestServeDrainsBeforeClosingStore(t *testing.T) {
 			server.RegisterOnShutdown(func() { shutdownOnce.Do(func() { close(shuttingDown) }) })
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			grace := time.Second
+			grace := 5 * time.Second
 			if mode == "forced" {
 				grace = 50 * time.Millisecond
 			}
