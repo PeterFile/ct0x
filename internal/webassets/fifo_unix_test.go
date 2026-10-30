@@ -5,6 +5,7 @@ package webassets_test
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -38,6 +39,33 @@ func assertNoFIFOBlock(t *testing.T, fifo string, operation func()) {
 		t.Fatal("operation blocked on FIFO for 500ms; cleanup peer released and joined it")
 	case <-time.After(3 * time.Second):
 		t.Fatal("operation did not finish after opening FIFO cleanup peer")
+	}
+}
+
+func TestOpenRejectsFIFORootPromptly(t *testing.T) {
+	base := t.TempDir()
+	fifo := filepath.Join(base, "root-fifo")
+	if err := syscall.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "root-link")
+	if err := os.Symlink("root-fifo", link); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{fifo, link} {
+		t.Run(filepath.Base(dir), func(t *testing.T) {
+			var h *webassets.Handler
+			var err error
+			assertNoFIFOBlock(t, fifo, func() {
+				h, err = webassets.Open(dir)
+				if h != nil {
+					_ = h.Close()
+				}
+			})
+			if h != nil || err == nil || !hasChinese(err.Error()) || !strings.Contains(err.Error(), "npm run build") {
+				t.Fatalf("FIFO root must produce Chinese build guidance: handler=%v error=%v", h, err)
+			}
+		})
 	}
 }
 

@@ -110,6 +110,9 @@ func assertStaticHeaders(t *testing.T, w *httptest.ResponseRecorder, cache strin
 func TestOpenRejectsInvalidBuild(t *testing.T) {
 	base := t.TempDir()
 	putFile(t, base, "file", "not a directory")
+	if err := os.Symlink("file", filepath.Join(base, "file-link")); err != nil {
+		t.Fatal(err)
+	}
 	for _, dir := range []string{"empty", "directory-index"} {
 		if err := os.MkdirAll(filepath.Join(base, dir, "index.html"), 0o755); err != nil {
 			t.Fatal(err)
@@ -131,7 +134,7 @@ func TestOpenRejectsInvalidBuild(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, dir := range []string{"", filepath.Join(base, "absent"), filepath.Join(base, "file"), filepath.Join(base, "empty"), filepath.Join(base, "directory-index"), filepath.Join(base, "outside-index"), filepath.Join(base, "broken-index")} {
+	for _, dir := range []string{"", filepath.Join(base, "absent"), filepath.Join(base, "file"), filepath.Join(base, "file-link"), filepath.Join(base, "empty"), filepath.Join(base, "directory-index"), filepath.Join(base, "outside-index"), filepath.Join(base, "broken-index")} {
 		t.Run(filepath.Base(dir), func(t *testing.T) {
 			h, err := webassets.Open(dir)
 			if h != nil {
@@ -141,6 +144,22 @@ func TestOpenRejectsInvalidBuild(t *testing.T) {
 				t.Fatalf("invalid build accepted or missing startup guidance: handler=%v error=%v", h, err)
 			}
 		})
+	}
+}
+
+func TestOpenAcceptsDirectorySymlinkRoot(t *testing.T) {
+	_, dir := fixture(t)
+	link := filepath.Join(filepath.Dir(dir), "root-link")
+	if err := os.Symlink(filepath.Base(dir), link); err != nil {
+		t.Fatal(err)
+	}
+	h, err := webassets.Open(link)
+	if err != nil {
+		t.Fatalf("Open directory symlink: %v", err)
+	}
+	defer h.Close()
+	if w := request(h, http.MethodGet, "/", "", nil); w.Code != http.StatusOK || w.Body.String() != indexBody {
+		t.Fatalf("directory symlink root not served: %d %q", w.Code, w.Body.String())
 	}
 }
 
