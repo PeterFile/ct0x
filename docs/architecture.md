@@ -30,6 +30,8 @@ Use `/api/v1`, JSON snake_case, opaque string IDs, UTC RFC3339 timestamps, and e
 
 The default local address is `127.0.0.1:7310`, configurable by an explicit CLI flag. The frontend uses relative URLs and the development proxy targets this loopback port. Enforce same-origin browser mutations and JSON request bodies; do not expose wildcard CORS or bind to all interfaces by default. A local member tool transport needs a run-bound capability and must not inherit the user HTTP actor.
 
+Time-based pagination applies to records with immutable `created_at`; provider and skill catalogues instead use stable IDs. SQL reads apply the cursor predicate and `LIMIT` before materializing rows. Incremental `after` reads are oldest-first so consumers can advance a high-water mark without skipping a backlog larger than one page. A conversation is unique on `(group_id, member_id, topic_id)` with a non-null empty main topic; deliveries must match both their message topic/group and their conversation member/topic/group.
+
 Initial endpoints:
 
 | Route | Operations |
@@ -49,6 +51,8 @@ Initial endpoints:
 Initial Group fields: `id, name, description, created_at`. Member fields: `id, group_id, name, role, provider_id, model, creator_id, owner_id, status, workspace, created_at`. Message fields: `id, group_id, topic_id, sender_id, content, created_at, deliveries`. The local human sender is `user`; member messages use the member ID. An empty topic denotes the main channel. Delivery fields: `id, message_id, conversation_id, recipient_id, state, turn_id, error, created_at`. Provider fields: `id, name, path, version, installation, account, connectivity, capabilities, evidence`.
 
 The first provider implementation targets installed Pi and Codex. Capability tiers remain truthful: richer native protocols are separate slices, and PTY-only integrations do not claim machine collaboration. Live provider checks are recorded separately from fixture tests.
+
+Version and account probes cannot promote resume, append, tools, or compaction capabilities. Capability evidence is bound to the selected executable path, version, and transport. A member's selected workspace path does not by itself grant read/write access.
 
 ## Visual language
 
