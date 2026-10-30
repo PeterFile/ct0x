@@ -2,16 +2,21 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, getMessage, listMessages } from "./api";
 import type { Message } from "./api";
 
-type Feed = { entries: Map<string, { message: Message; version: number }>; floor: number };
+type FeedRecord = { message: Message; source: "read" | "receipt"; dataVersion: number; presenceVersion: number };
+type Feed = { entries: Map<string, FeedRecord>; floor: number };
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请重试。";
 function merge(previous: Feed, incoming: Message[], version: number, reset = false): Feed {
-  if (version < previous.floor) return previous;
-  const entries = new Map([...previous.entries].filter(([, record]) => !reset || record.version > version));
+  const resetting = reset && version >= previous.floor;
+  const entries = new Map([...previous.entries].filter(([, record]) => !resetting || record.presenceVersion > version));
   for (const message of incoming) {
     const current = previous.entries.get(message.id);
-    entries.set(message.id, current && current.version > version ? current : { message, version });
+    // A reset blocks old reads from resurrecting absent rows, not updating independently proven ones.
+    if (!current && version < previous.floor) continue;
+    entries.set(message.id, current && current.dataVersion > version ? current : {
+      message, source: "read", dataVersion: version, presenceVersion: Math.max(version, current?.presenceVersion ?? 0),
+    });
   }
-  return { entries, floor: reset ? version : previous.floor };
+  return { entries, floor: resetting ? version : previous.floor };
 }
 // Go UTC timestamps have variable fractional precision. Preserve all nine digits before comparing.
 const timeKey = (value: string) => value.replace(/(?:\.(\d+))?Z$/, (_match, fraction?: string) => `.${(fraction ?? "").padEnd(9, "0")}Z`);
@@ -72,9 +77,12 @@ export function useMessageFeed(groupId: string, active: boolean) {
   const confirm = useCallback((message: Message, attempt: number) => {
     const version = ++clock.current;
     setFeed(previous => {
-      const current = previous.entries.get(message.id);
-      // Reads begun after this attempt outrank its potentially delayed receipt.
-      return current && current.version > attempt ? previous : merge(previous, [message], version);
+      const current = previous.entries.get(message.id), entries = new Map(previous.entries);
+      // A POST proves presence, not a new observation of delivery state.
+      entries.set(message.id, current?.source === "read" ? { ...current, presenceVersion: version } : {
+        message, source: "receipt", dataVersion: attempt, presenceVersion: version,
+      });
+      return { ...previous, entries };
     });
   }, []);
   const items = useMemo(() => [...feed.entries.values()].map(record => record.message)

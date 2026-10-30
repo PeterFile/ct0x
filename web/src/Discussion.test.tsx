@@ -156,6 +156,40 @@ it("inserts a late 201 receipt even after an empty reset begun during its attemp
   await act(async () => olderRead.resolve(page()));
   expect(article()).toHaveTextContent("已入队"); expect(content()).toHaveValue("");
 });
+it.each([["history", "receipt-first"], ["history", "read-first"], ["detail", "receipt-first"], ["detail", "read-first"]])(
+  "arrival matrix: post-attempt %s accepted data wins with %s", async (kind, arrival) => {
+    await open(); await panel().findByText("尚无消息，可发送第一条讨论。"); change(raw);
+    const receipt = deferred<Response>(), read = deferred<Response>();
+    if (kind === "detail") {
+      writes.mockRejectedValueOnce(new TypeError("offline")); submit(); await panel().findByRole("alert");
+      reads.mockResolvedValueOnce(page([{ ...message, content: raw }]));
+      fireEvent.click(panel().getByRole("button", { name: "刷新并重置历史窗口" })); await panel().findByRole("article");
+      writes.mockReturnValueOnce(receipt.promise); fireEvent.click(panel().getByRole("button", { name: "重试同一次发送" }));
+      details.mockReturnValueOnce(read.promise);
+      fireEvent.click(panel().getByRole("button", { name: `刷新消息 ${message.id} 投递` }));
+    } else {
+      writes.mockReturnValueOnce(receipt.promise); submit(); reads.mockReturnValueOnce(read.promise);
+      fireEvent.click(panel().getByRole("button", { name: "刷新并重置历史窗口" }));
+    }
+    const accepted = { ...message, content: raw, deliveries: [{ ...delivery, state: "accepted" }] };
+    const resolveRead = () => act(async () => read.resolve(kind === "history" ? page([accepted]) : json(accepted)));
+    const resolveReceipt = () => act(async () => receipt.resolve(json({ ...message, content: raw }, 201)));
+    if (arrival === "read-first") { await resolveRead(); await resolveReceipt(); }
+    else { await resolveReceipt(); await resolveRead(); }
+    expect(article()).toHaveTextContent("CLI已接收"); expect(article()).not.toHaveTextContent("已入队");
+    expect(content()).toHaveValue(""); expect(panel().getByText(/消息已持久化/)).toBeVisible();
+  },
+);
+it("preserves an already-read accepted row when an idempotent retry returns its stale queued receipt", async () => {
+  await open(); await panel().findByText("尚无消息，可发送第一条讨论。"); change(raw);
+  writes.mockRejectedValueOnce(new TypeError("offline")); submit(); await panel().findByRole("alert");
+  reads.mockResolvedValueOnce(page([{ ...message, content: raw, deliveries: [{ ...delivery, state: "accepted" }] }]));
+  fireEvent.click(panel().getByRole("button", { name: "刷新并重置历史窗口" })); await panel().findByText(/CLI已接收/);
+  fireEvent.click(panel().getByRole("button", { name: "重试同一次发送" })); await panel().findByText(/消息已持久化/);
+  expect(article()).toHaveTextContent("CLI已接收");
+  const attempts = writes.mock.calls.map(([, init]) => [init?.body, new Headers(init?.headers).get("Idempotency-Key")]);
+  expect(attempts[1]).toEqual(attempts[0]);
+});
 it("does not resurrect a row outside a reset window from an earlier detail read", async () => {
   reads.mockResolvedValueOnce(page([message])); await open(); await panel().findByRole("article");
   const old = deferred<Response>(); details.mockReturnValueOnce(old.promise);
