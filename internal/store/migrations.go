@@ -38,6 +38,16 @@ CREATE TABLE conversations (
     FOREIGN KEY(group_id, member_id) REFERENCES members(group_id, id),
     UNIQUE(group_id, member_id, topic_id)
 );
+`, `
+CREATE TABLE mutation_idempotency (
+    operation TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL CHECK(idempotency_key <> ''),
+    payload BLOB NOT NULL,
+    record_id TEXT NOT NULL,
+    PRIMARY KEY(operation, actor_id, group_id, idempotency_key)
+);
 `}
 
 // Migration history is explicit and contiguous; never infer it from table shape.
