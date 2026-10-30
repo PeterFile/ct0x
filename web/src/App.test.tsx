@@ -11,7 +11,13 @@ function submit(name = "调研") {
   fireEvent.change(nameInput(), { target: { value: name } });
   fireEvent.submit(screen.getByRole("form", { name: "创建群组" }));
 }
-beforeEach(() => { transport.mockReset(); transport.mockImplementation(async () => page()); vi.stubGlobal("fetch", transport); });
+beforeEach(() => {
+  transport.mockReset();
+  transport.mockImplementation(async () => page());
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) =>
+    String(input).includes("/members") || String(input).startsWith("/api/v1/providers")
+      ? Promise.resolve(page()) : transport(input, init));
+});
 afterEach(() => vi.unstubAllGlobals());
 
 describe("workspace groups", () => {
