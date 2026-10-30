@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { ApiError, createGroup, listGroups } from "./api";
+import { ApiError, createGroup, isDefinitiveRejection, listGroups } from "./api";
 import type { Group, GroupInput } from "./api";
 
 function unique(groups: Group[]) {
@@ -69,7 +69,7 @@ export function Groups({ selectedId, onSelect }: { selectedId?: string; onSelect
       setMutation({ pending: false, error: "", uncertain: false });
     } catch (error) {
       if (!mounted.current) return;
-      const uncertain = !(error instanceof ApiError && [400, 404, 409].includes(error.status));
+      const uncertain = !isDefinitiveRejection(error);
       if (!uncertain) operation.current = null;
       setMutation({ pending: false, uncertain, error: uncertain
         ? `创建结果未确认。${errorText(error)} 请重试同一次创建。` : errorText(error) });
