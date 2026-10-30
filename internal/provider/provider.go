@@ -58,7 +58,7 @@ type Search struct {
 }
 
 // Discover checks only supplied paths, in explicit/PATH/common priority order.
-// The first alias wins; IDs use canonical paths, and hard links are deduplicated.
+// The first alias wins; IDs use canonical paths, and deduplication is per provider.
 func Discover(search Search) []Provider {
 	locations := append([]Location{}, search.Explicit...)
 	for _, dirs := range [][]string{search.PathDirs, search.CommonDirs} {
@@ -69,7 +69,7 @@ func Discover(search Search) []Provider {
 		}
 	}
 	providers := []Provider{}
-	seen := []os.FileInfo{}
+	seen := map[string][]os.FileInfo{}
 next:
 	for _, location := range locations {
 		if (location.Name != Pi && location.Name != Codex) || location.Path == "" {
@@ -87,12 +87,12 @@ next:
 		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
 			continue
 		}
-		for _, previous := range seen {
+		for _, previous := range seen[location.Name] {
 			if os.SameFile(info, previous) {
 				continue next
 			}
 		}
-		seen = append(seen, info)
+		seen[location.Name] = append(seen[location.Name], info)
 		providers = append(providers, Provider{
 			ID:   fmt.Sprintf("%s_%x", location.Name, sha256.Sum256([]byte(real))),
 			Name: location.Name, Path: path, Installation: Installed,

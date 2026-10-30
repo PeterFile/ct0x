@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -56,19 +57,46 @@ func TestDiscoveryPreservesPriorityAndDeduplicatesPhysicalFiles(t *testing.T) {
 	}
 }
 
+func TestDiscoveryKeepsDistinctProvidersSharingMultiplexer(t *testing.T) {
+	root := t.TempDir()
+	mux := executable(t, filepath.Join(root, "mux"), "exit 99")
+	alias := filepath.Join(root, "alias")
+	for _, path := range []string{alias, filepath.Join(root, Pi), filepath.Join(root, Codex)} {
+		if err := os.Symlink(mux, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := Discover(Search{Explicit: []Location{{Pi, alias}, {Pi, filepath.Join(root, Pi)}}, PathDirs: []string{root}})
+	if len(got) != 2 || got[0].Name != Pi || got[1].Name != Codex || got[0].Path != alias || got[1].Path != filepath.Join(root, Codex) || got[0].ID == got[1].ID {
+		t.Fatalf("provider identity must survive shared shims while same-provider aliases deduplicate: %+v", got)
+	}
+}
+
 func TestDiscoveryIsBoundedAndDoesNotInferAccountFromConfiguration(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("HOME", root)
 	t.Setenv("OPENAI_API_KEY", "fixture-not-an-account")
 	t.Setenv("PATH", root)
 	marker := filepath.Join(root, "executed")
-	body := "touch '" + marker + "'"
-	executable(t, filepath.Join(root, "pi"), body)
+	body := ": > '" + marker + "'"
+	fixture := executable(t, filepath.Join(root, "pi"), body)
 	executable(t, filepath.Join(root, "nested", "codex"), body)
 	if err := os.WriteFile(filepath.Join(root, "codex"), []byte("not executable"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Mkdir(filepath.Join(root, "auth.json"), 0700); err != nil {
+	if err := os.MkdirAll(filepath.Join(root, ".pi", "agent"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".pi", "agent", "auth.json"), []byte(`{"openai-codex":{"type":"oauth"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if result := (Runner{}).Run(context.Background(), fixture, nil, nil); result.Failure != "" {
+		t.Fatalf("fixture control failed with restricted PATH: %s", result.Failure)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("fixture control did not create marker: %v", err)
+	}
+	if err := os.Remove(marker); err != nil {
 		t.Fatal(err)
 	}
 	if got := Discover(Search{}); len(got) != 0 || got == nil {

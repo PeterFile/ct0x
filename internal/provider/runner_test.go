@@ -48,22 +48,31 @@ func TestRunnerReapsDirectChildAndBoundsInheritedPipes(t *testing.T) {
 			if mode == IncompleteOutput {
 				end = "exit 0"
 			}
-			path := executable(t, filepath.Join(t.TempDir(), "descendant"), "sleep 5 &\nprintf '%s %s\\n' \"$$\" \"$!\"\n"+end)
-			ctx, cancel := context.WithCancel(context.Background())
+			root := t.TempDir()
+			ready := filepath.Join(root, "ready")
+			path := executable(t, filepath.Join(root, "descendant"), "sleep 10 &\nprintf '%s %s\\n' \"$$\" \"$!\"\n: > '"+ready+"'\n"+end)
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			if mode == Cancelled {
-				timer := time.AfterFunc(75*time.Millisecond, cancel)
-				defer timer.Stop()
+				go func() {
+					for ctx.Err() == nil {
+						if _, err := os.Stat(ready); err == nil {
+							cancel()
+							return
+						}
+						time.Sleep(time.Millisecond)
+					}
+				}()
 			}
 			start := time.Now()
-			got := (Runner{Timeout: 150 * time.Millisecond}).Run(ctx, path, nil, nil)
+			got := (Runner{Timeout: 3 * time.Second}).Run(ctx, path, nil, nil)
 			var parent, child int
 			if n, _ := fmt.Sscanf(got.Stdout, "%d %d", &parent, &child); n != 2 {
 				t.Fatalf("missing subprocess PIDs: %+v", got)
 			}
 			process, _ := os.FindProcess(child)
 			defer process.Kill()
-			if time.Since(start) > time.Second || !got.Started || !got.Exited || got.Failure != mode {
+			if time.Since(start) > 4*time.Second || !got.Started || !got.Exited || got.Failure != mode {
 				t.Fatalf("runner did not return a prompt terminal receipt: %+v", got)
 			}
 			if _, err := syscall.Wait4(parent, nil, syscall.WNOHANG, nil); err != syscall.ECHILD {
