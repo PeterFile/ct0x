@@ -26,7 +26,11 @@ The UI does not interpret `installed` as `authenticated`, configuration presence
 
 ## HTTP contract, version 1
 
-Use `/api/v1`, JSON snake_case, opaque string IDs, UTC RFC3339 timestamps, arrays as arrays (never null), and errors shaped as `{ "error": { "code": "conflict", "message": "..." } }`. Bound all list queries with `limit` and `before`/`after` cursors. Mutation requests can supply `Idempotency-Key`.
+Use `/api/v1`, JSON snake_case, opaque string IDs, UTC RFC3339 timestamps, and errors shaped as `{ "error": { "code": "conflict", "message": "..." } }`. Every list responds with `{ "items": [], "next_cursor": "" }`; arrays are never null, and an empty cursor means the end. Bound all list queries with `limit` and an opaque `before` cursor (newest first, stable ordering by timestamp and ID); history increments may additionally accept `after`. Default limit is 50 and maximum 200. A mutation returns the created/updated object directly; creation uses 201. Mutation requests can supply `Idempotency-Key`; reusing a key with different input returns 409. Invalid inputs return 400 and missing or inaccessible records return 404.
+
+The default local address is `127.0.0.1:7310`, configurable by an explicit CLI flag. The frontend uses relative URLs and the development proxy targets this loopback port. Enforce same-origin browser mutations and JSON request bodies; do not expose wildcard CORS or bind to all interfaces by default. A local member tool transport needs a run-bound capability and must not inherit the user HTTP actor.
+
+Time-based pagination applies to records with immutable `created_at`; provider and skill catalogues instead use stable IDs. SQL reads apply the cursor predicate and `LIMIT` before materializing rows. Incremental `after` reads are oldest-first so consumers can advance a high-water mark without skipping a backlog larger than one page. A conversation is unique on `(group_id, member_id, topic_id)` with a non-null empty main topic; deliveries must match both their message topic/group and their conversation member/topic/group.
 
 Initial endpoints:
 
@@ -44,9 +48,11 @@ Initial endpoints:
 | `/api/v1/skills` | GET metadata, explicit load reads body |
 | `/api/v1/events` | GET SSE notifications; reconnect always re-reads durable state |
 
-Initial Group fields: `id, name, description, created_at`. Member fields: `id, group_id, name, role, provider_id, model, creator_id, owner_id, status, workspace, created_at`. Message fields: `id, group_id, topic_id, sender_id, content, created_at, deliveries`. Delivery fields: `id, message_id, conversation_id, recipient_id, state, turn_id, error, created_at`. Provider fields: `id, name, path, version, installation, account, connectivity, capabilities, evidence`.
+Initial Group fields: `id, name, description, created_at`. Member fields: `id, group_id, name, role, provider_id, model, creator_id, owner_id, status, workspace, created_at`. Message fields: `id, group_id, topic_id, sender_id, content, created_at, deliveries`. The local human sender is `user`; member messages use the member ID. An empty topic denotes the main channel. Delivery fields: `id, message_id, conversation_id, recipient_id, state, turn_id, error, created_at`. Provider fields: `id, name, path, version, installation, account, connectivity, capabilities, evidence`.
 
 The first provider implementation targets installed Pi and Codex. Capability tiers remain truthful: richer native protocols are separate slices, and PTY-only integrations do not claim machine collaboration. Live provider checks are recorded separately from fixture tests.
+
+Version and account probes cannot promote resume, append, tools, or compaction capabilities. Capability evidence is bound to the selected executable path, version, and transport. A member's selected workspace path does not by itself grant read/write access.
 
 ## Visual language
 
