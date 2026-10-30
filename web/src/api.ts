@@ -10,6 +10,14 @@ export type Provider = {
   capabilities: { one_shot: boolean; resume: boolean; tools: boolean };
   evidence: { at: string; type: string; reason: string }[];
 };
+export type Delivery = {
+  id: string; message_id: string; conversation_id: string; recipient_id: string;
+  state: string; turn_id: string; error: string; created_at: string;
+};
+export type Message = {
+  id: string; group_id: string; topic_id: string; sender_id: string; content: string; created_at: string; deliveries: Delivery[];
+};
+export type MessageInput = Readonly<{ content: string; recipient_ids?: readonly string[]; topic_id?: string }>;
 type Page<T> = { items: T[]; next_cursor: string };
 export class ApiError extends Error {
   constructor(message: string, readonly status = 0, readonly code = "disconnected") { super(message); }
@@ -25,6 +33,12 @@ const pageOf = <T>(valid: (value: unknown) => value is T) => (value: unknown): v
 const memberIn = (groupId: string) => (value: unknown): value is Member => isRecord(value)
   && ["id", "group_id", "name", "role", "provider_id", "model", "creator_id", "owner_id", "status", "workspace", "created_at"]
     .every(key => typeof value[key] === "string") && value.id !== "" && value.group_id === groupId;
+const messageIn = (groupId: string) => (value: unknown): value is Message => isRecord(value)
+  && ["id", "group_id", "topic_id", "sender_id", "content", "created_at"].every(key => typeof value[key] === "string")
+  && value.id !== "" && value.group_id === groupId && Array.isArray(value.deliveries)
+  && value.deliveries.every(delivery => isRecord(delivery)
+    && ["id", "message_id", "conversation_id", "recipient_id", "state", "turn_id", "error", "created_at"]
+      .every(key => typeof delivery[key] === "string") && delivery.id !== "" && delivery.message_id === value.id);
 function isProvider(value: unknown): value is Provider {
   if (!isRecord(value) || !["id", "name", "path", "version", "installation", "account", "connectivity"]
     .every(key => typeof value[key] === "string") || value.id === "") return false;
@@ -82,6 +96,11 @@ export function listMembers(groupId: string, before = "", signal?: AbortSignal) 
 }
 export function createMember(groupId: string, input: MemberInput, key: string, signal?: AbortSignal) {
   return post(membersPath(groupId), input, key, memberIn(groupId), signal);
+}
+export function sendMessage(groupId: string, input: MessageInput, key: string, signal?: AbortSignal) {
+  return post(`/api/v1/groups/${encodeURIComponent(groupId)}/messages`, {
+    content: input.content, recipient_ids: input.recipient_ids, topic_id: input.topic_id,
+  }, key, messageIn(groupId), signal);
 }
 export function listProviders(before = "", signal?: AbortSignal) {
   return request(`/api/v1/providers${pageQuery(before)}`, { signal }, pageOf(isProvider));
