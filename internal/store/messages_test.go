@@ -357,6 +357,65 @@ func TestDeliveryCompositeConstraints(t *testing.T) {
 	}
 }
 
+func TestTrustedMessageRowUsesOuterTransaction(t *testing.T) {
+	s, path := openTestStore(t)
+	g := group(t, s)
+	m := member(t, s, g.ID)
+	if _, err := s.db.Exec("UPDATE members SET status='left' WHERE id=?", m.ID); err != nil {
+		t.Fatal(err)
+	}
+	r := MessageRequest{GroupID: g.ID, ActorID: m.ID, TopicID: "historical", Content: "completed reply"}
+	if _, err := s.CreateMessage(ctx, r, nil); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("public creation allowed a left actor: %v", err)
+	}
+	if _, found, err := s.LookupMessageReceipt(ctx, r); !errors.Is(err, ErrNotFound) || found {
+		t.Fatalf("public lookup allowed a left actor: %v, %v", found, err)
+	}
+	observer, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	for _, commit := range []bool{true, false} {
+		historical := domain.Message{
+			ID: fmt.Sprintf("historical-%t", commit), GroupID: g.ID, SenderID: m.ID,
+			TopicID: r.TopicID, Content: r.Content, CreatedAt: time.Now().UTC(), Deliveries: []domain.Delivery{},
+		}
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if err := insertMessageRow(ctx, tx, historical); err != nil {
+			t.Fatal(err)
+		}
+		inside, err := messageInTx(ctx, tx, g.ID, historical.ID)
+		if err != nil || !reflect.DeepEqual(inside, historical) {
+			t.Fatalf("outer transaction cannot read its row: %+v, %v", inside, err)
+		}
+		if _, err := observer.GetMessage(ctx, g.ID, historical.ID); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("uncommitted historical reply became visible: %v", err)
+		}
+		if commit {
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			visible, err := observer.GetMessage(ctx, g.ID, historical.ID)
+			if err != nil || !reflect.DeepEqual(visible, historical) {
+				t.Fatalf("committed historical reply changed: %+v, %v", visible, err)
+			}
+		} else {
+			if err := tx.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := observer.GetMessage(ctx, g.ID, historical.ID); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("rolled-back historical reply became visible: %v", err)
+			}
+		}
+	}
+	assertMessageCounts(t, s, 1, 0, 0, 0)
+}
+
 func TestV2MessageMigrationPreservesReceipt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v2.sqlite")
 	raw, err := sql.Open("sqlite", path)
@@ -378,7 +437,7 @@ INSERT INTO groups(id,name,description,created_at) VALUES('old','group','descrip
 	}
 	defer s.Close()
 	var version, count int
-	if err := s.db.QueryRow("SELECT max(version),count(*) FROM schema_migrations").Scan(&version, &count); err != nil || version != 3 || count != 3 {
+	if err := s.db.QueryRow("SELECT max(version),count(*) FROM schema_migrations").Scan(&version, &count); err != nil || version != len(migrations) || count != len(migrations) {
 		t.Fatalf("v2 upgrade: %d, %d, %v", version, count, err)
 	}
 	if g, err := s.CreateGroup(ctx, keyedGroup()); err != nil || g.ID != "old" {

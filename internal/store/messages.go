@@ -86,6 +86,17 @@ func (s *Store) CreateMessage(ctx context.Context, request MessageRequest, resol
 	return m, nil
 }
 
+// insertMessageRow requires a fully populated row from a trusted caller: ID,
+// bound GroupID/SenderID/TopicID, content, UTC CreatedAt, and zero deliveries.
+// The caller owns authorization/fencing and the transaction; this only inserts the row.
+func insertMessageRow(ctx context.Context, tx *sql.Tx, message domain.Message) error {
+	_, err := tx.ExecContext(ctx,
+		"INSERT INTO messages("+messageColumns+") VALUES(?, ?, ?, ?, ?, ?)",
+		message.ID, message.GroupID, message.TopicID, message.SenderID, message.Content,
+		message.CreatedAt.UTC().Format(timestampLayout))
+	return err
+}
+
 func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolved []string) (domain.Message, error) {
 	// Access precedes receipt lookup, so inaccessible actors cannot probe keys or conflicts.
 	if err := requireMessageActor(ctx, tx, r.GroupID, r.ActorID); err != nil {
@@ -106,17 +117,21 @@ func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolv
 	if r.RecipientIDs != nil && !slices.Equal(recipientSet(r.RecipientIDs), resolved) {
 		return domain.Message{}, fmt.Errorf("%w：实际接收者必须与明确指定的接收者一致", ErrInvalid)
 	}
-	stamp := time.Now().UTC().Format(timestampLayout)
-	if _, err := tx.ExecContext(ctx,
-		"INSERT INTO messages("+messageColumns+") VALUES(?, ?, ?, ?, ?, ?)",
-		id, r.GroupID, r.TopicID, r.ActorID, r.Content, stamp); err != nil {
-		return domain.Message{}, err
-	}
 	for _, recipient := range resolved {
 		var active int
 		if err := tx.QueryRowContext(ctx, "SELECT 1 FROM members WHERE group_id=? AND id=? AND status='active'", r.GroupID, recipient).Scan(&active); err != nil {
 			return domain.Message{}, err
 		}
+	}
+	message := domain.Message{
+		ID: id, GroupID: r.GroupID, TopicID: r.TopicID, SenderID: r.ActorID,
+		Content: r.Content, CreatedAt: time.Now().UTC(),
+	}
+	if err := insertMessageRow(ctx, tx, message); err != nil {
+		return domain.Message{}, err
+	}
+	stamp := message.CreatedAt.Format(timestampLayout)
+	for _, recipient := range resolved {
 		c, err := conversationInTx(ctx, tx, r.GroupID, recipient, r.TopicID)
 		if err != nil {
 			return domain.Message{}, err
