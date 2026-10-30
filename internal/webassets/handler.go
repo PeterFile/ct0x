@@ -1,8 +1,9 @@
 // Package webassets serves an externally built SPA from a trusted local directory.
 // The build tree must contain only approved public files and must not be writable
-// by sandboxed members. It must not permit malicious file-type swaps between the
-// metadata precheck and open. Root confines path and symlink resolution, not
-// mounts, hard links, or special devices; this handler is not a filesystem sandbox.
+// by sandboxed members. The trusted root path and tree must not permit malicious
+// file-type swaps between metadata prechecks and their corresponding opens.
+// Root confines path and symlink resolution, not mounts, hard links, or special
+// devices; this handler is not a filesystem sandbox.
 // Mount it behind the transport's Host/Origin guards, preserving specific API
 // and health routes ahead of the GET/HEAD catchall.
 package webassets
@@ -34,6 +35,11 @@ type Handler struct {
 func Open(dir string) (*Handler, error) {
 	if dir == "" {
 		return nil, errors.New("网页构建目录不能为空，请先运行 npm run build")
+	}
+	// OpenRoot can block on a FIFO, so require a directory before opening it.
+	info, err := os.Stat(dir)
+	if err != nil || !info.IsDir() {
+		return nil, errors.New("无法打开网页构建目录，请先运行 npm run build")
 	}
 	root, err := os.OpenRoot(dir)
 	if err != nil {
