@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -84,27 +85,41 @@ type Executor interface {
 	Execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error) ExecutionReceipt
 }
 
-type piExecutor struct {
+type executionCommand struct {
 	path    string
 	timeout time.Duration
 }
+
+type piExecutor struct{ executionCommand }
 
 // NewPiExecutor binds one executable. This adapter supports only isolated plain
 // text turns; it does not advertise tools, resume, steering or compaction APIs.
 // A nonpositive timeout defaults to ten minutes; the caller's deadline also applies.
 func NewPiExecutor(path string, timeout time.Duration) (Executor, error) {
+	e, err := newExecutionCommand(path, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return piExecutor{e}, nil
+}
+
+func newExecutionCommand(path string, timeout time.Duration) (executionCommand, error) {
 	if !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
-		return nil, errors.New("可执行文件必须使用绝对路径")
+		return executionCommand{}, errors.New("可执行文件必须使用绝对路径")
 	}
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
-	return piExecutor{path: path, timeout: timeout}, nil
+	return executionCommand{path: path, timeout: timeout}, nil
 }
 
 var executionID = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$`)
 
 func (e piExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error) ExecutionReceipt {
+	return e.executionCommand.execute(ctx, request, onEvent, false)
+}
+
+func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error, codex bool) ExecutionReceipt {
 	r := ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "执行参数无效"}
 	cwd, cwdErr := os.Stat(request.CWD)
 	runtime, runtimeErr := os.Lstat(filepath.Clean(request.RuntimeDir))
@@ -141,13 +156,20 @@ func (e piExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent
 	}
 	defer stderr.Close()
 	outLog, errLog := &executionLog{file: stdout, cancel: cancel}, &executionLog{file: stderr, cancel: cancel}
-	out := &piOutput{log: outLog, receipt: &r, callback: onEvent, cancel: cancel, runID: request.RunID}
+	out := &executionOutput{log: outLog, receipt: &r, callback: onEvent, cancel: cancel, ctx: ctx, runID: request.RunID, codex: codex}
 	args := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", "--no-tools", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--session-dir", dir, "--session-id", request.RunID}
+	if codex {
+		args = []string{"--ask-for-approval", "never", "exec", "--json", "--sandbox", "read-only", "--ignore-user-config", "--ephemeral", "--cd", request.CWD, "--skip-git-repo-check", "--color", "never"}
+	}
 	if request.Model != "" {
 		args = append(args, "--model", request.Model)
 	}
+	if codex {
+		args = append(args, "-")
+	}
+	outDrain, errDrain := &executionDrain{Writer: out}, &executionDrain{Writer: errLog}
 	cmd := exec.CommandContext(ctx, e.path, args...)
-	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = request.CWD, strings.NewReader(request.Prompt), out, errLog
+	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = request.CWD, strings.NewReader(request.Prompt), outDrain, errDrain
 	// WaitDelay bounds inherited pipes, not descendants' lifetimes. Wait joins
 	// the copying goroutines before receipt inspection or callback state returns.
 	cmd.WaitDelay = 100 * time.Millisecond
@@ -163,7 +185,12 @@ func (e piExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent
 	}
 	outClose, errClose := stdout.Close(), stderr.Close()
 	r.LogsTruncated = outLog.truncated || errLog.truncated
-	r.OutputComplete = err == nil && !out.damaged && len(out.line) == 0 && !out.dropping && !outLog.failed && !errLog.failed && outClose == nil && errClose == nil
+	normalExit := err == nil
+	var exitErr *exec.ExitError
+	if codex && r.Terminal == OutcomeFailed && r.ExitCode >= 0 && errors.As(err, &exitErr) {
+		normalExit = true
+	}
+	r.OutputComplete = normalExit && outDrain.complete && errDrain.complete && !out.damaged && len(out.line) == 0 && !out.dropping && !outLog.failed && !errLog.failed && outClose == nil && errClose == nil
 	r.Reason = "执行结果未知，需对账后再重试"
 	if r.OutputComplete && ctx.Err() == nil && !r.DeliveryFailed && r.Terminal != "" {
 		r.Outcome = r.Terminal
@@ -173,4 +200,20 @@ func (e piExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent
 		r.Reason = "执行事件保存失败，交付与执行结果未知"
 	}
 	return r
+}
+
+// Wait can hide ErrWaitDelay behind ExitError. Its pipe copying uses ReaderFrom;
+// independently require clean EOF on both streams before trusting a failed turn.
+// Wait joins these copying goroutines before complete is inspected. If an exec
+// implementation bypasses ReadFrom, the zero value fails closed as unknown.
+type executionDrain struct {
+	io.Writer
+	complete bool
+}
+
+func (d *executionDrain) ReadFrom(r io.Reader) (int64, error) {
+	// Hide fast-path methods to avoid recursion and observe the actual read end.
+	n, err := io.Copy(struct{ io.Writer }{d.Writer}, struct{ io.Reader }{r})
+	d.complete = err == nil
+	return n, err
 }
