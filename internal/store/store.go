@@ -18,6 +18,7 @@ import (
 var (
 	ErrNotFound = errors.New("未找到记录")
 	ErrInvalid  = errors.New("参数无效")
+	ErrConflict = errors.New("幂等键对应的请求内容冲突")
 )
 
 // Fixed-width UTC timestamps preserve time ordering in SQLite TEXT indexes.
@@ -31,10 +32,16 @@ const (
 
 type Store struct{ db *sql.DB }
 
-type CreateGroupInput struct{ Name, Description string }
+type CreateGroupInput struct {
+	Name, Description string
+	ActorID           string `json:"-"` // Bound by trusted platform/session code.
+	IdempotencyKey    string
+}
 
 type CreateMemberInput struct {
 	GroupID, Name, Role, ProviderID, Model, CreatorID, OwnerID, Workspace string
+	ActorID                                                               string `json:"-"` // Bound by trusted platform/session code.
+	IdempotencyKey                                                        string
 }
 
 // Cursor is an exclusive timestamp/ID position; transport encoding is external.
@@ -62,7 +69,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, storeError("解析数据库路径失败", err)
 	}
-	dsn := url.URL{Scheme: "file", Path: absolute, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"}
+	dsn := url.URL{Scheme: "file", Path: absolute, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"}
 	db, err := sql.Open("sqlite", dsn.String())
 	if err != nil {
 		return nil, storeError("打开数据库失败", err)
@@ -78,13 +85,30 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return storeError("关闭数据库失败", s.db.Close()) }
 
 func (s *Store) CreateGroup(ctx context.Context, input CreateGroupInput) (domain.Group, error) {
+	scope := mutationScope{operation: "create_group", actorID: input.ActorID, key: input.IdempotencyKey}
+	tx, id, replay, err := s.beginMutation(ctx, scope, mutationPayload(input.Name, input.Description))
+	if err != nil {
+		return domain.Group{}, storeError("创建群组失败", err)
+	}
+	defer tx.Rollback()
 	if strings.TrimSpace(input.Name) == "" {
 		return domain.Group{}, fmt.Errorf("%w：群组名称不能为空", ErrInvalid)
 	}
-	g, err := scanGroup(s.db.QueryRowContext(ctx,
-		"INSERT INTO groups(id, name, description, created_at) VALUES(?, ?, ?, ?) RETURNING "+groupColumns,
-		rand.Text(), input.Name, input.Description, time.Now().UTC().Format(timestampLayout)))
-	return g, storeError("创建群组失败", err)
+	var g domain.Group
+	if replay {
+		g, err = scanGroup(tx.QueryRowContext(ctx, "SELECT "+groupColumns+" FROM groups WHERE id = ?", id))
+	} else {
+		g, err = scanGroup(tx.QueryRowContext(ctx,
+			"INSERT INTO groups(id, name, description, created_at) VALUES(?, ?, ?, ?) RETURNING "+groupColumns,
+			id, input.Name, input.Description, time.Now().UTC().Format(timestampLayout)))
+	}
+	if err != nil {
+		return domain.Group{}, storeError("创建群组失败", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Group{}, storeError("保存群组失败", err)
+	}
+	return g, nil
 }
 
 func (s *Store) GetGroup(ctx context.Context, id string) (domain.Group, error) {
@@ -93,16 +117,35 @@ func (s *Store) GetGroup(ctx context.Context, id string) (domain.Group, error) {
 }
 
 func (s *Store) CreateMember(ctx context.Context, input CreateMemberInput) (domain.Member, error) {
+	scope := mutationScope{operation: "create_member", actorID: input.ActorID, groupID: input.GroupID, key: input.IdempotencyKey}
+	payload := mutationPayload(input.GroupID, input.Name, input.Role, input.ProviderID, input.Model, input.CreatorID, input.OwnerID, input.Workspace)
+	tx, id, replay, err := s.beginMutation(ctx, scope, payload)
+	if err != nil {
+		return domain.Member{}, storeError("创建成员失败", err)
+	}
+	defer tx.Rollback()
 	if strings.TrimSpace(input.Name) == "" || strings.TrimSpace(input.Role) == "" {
 		return domain.Member{}, fmt.Errorf("%w：成员名称和职责不能为空", ErrInvalid)
 	}
-	m, err := scanMember(s.db.QueryRowContext(ctx,
-		`INSERT INTO members(`+memberColumns+`) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-		 WHERE EXISTS(SELECT 1 FROM groups WHERE id = ?) RETURNING `+memberColumns,
-		rand.Text(), input.GroupID, input.Name, input.Role, input.ProviderID, input.Model,
-		input.CreatorID, input.OwnerID, domain.MemberStatusActive, input.Workspace,
-		time.Now().UTC().Format(timestampLayout), input.GroupID))
-	return m, storeError("创建成员失败", err)
+	var m domain.Member
+	if replay {
+		m, err = scanMember(tx.QueryRowContext(ctx,
+			"SELECT "+memberColumns+" FROM members WHERE group_id = ? AND id = ?", input.GroupID, id))
+	} else {
+		m, err = scanMember(tx.QueryRowContext(ctx,
+			`INSERT INTO members(`+memberColumns+`) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			 WHERE EXISTS(SELECT 1 FROM groups WHERE id = ?) RETURNING `+memberColumns,
+			id, input.GroupID, input.Name, input.Role, input.ProviderID, input.Model,
+			input.CreatorID, input.OwnerID, domain.MemberStatusActive, input.Workspace,
+			time.Now().UTC().Format(timestampLayout), input.GroupID))
+	}
+	if err != nil {
+		return domain.Member{}, storeError("创建成员失败", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Member{}, storeError("保存成员失败", err)
+	}
+	return m, nil
 }
 
 func (s *Store) GetMember(ctx context.Context, groupID, memberID string) (domain.Member, error) {
@@ -117,17 +160,7 @@ func (s *Store) GetOrCreateConversation(ctx context.Context, groupID, memberID, 
 		return domain.Conversation{}, storeError("创建会话失败", err)
 	}
 	defer tx.Rollback()
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO conversations(`+conversationColumns+`) SELECT ?, ?, ?, ?, ?
-		 WHERE EXISTS(SELECT 1 FROM members WHERE group_id = ? AND id = ?)
-		 ON CONFLICT(group_id, member_id, topic_id) DO NOTHING`,
-		rand.Text(), groupID, memberID, topicID, time.Now().UTC().Format(timestampLayout), groupID, memberID)
-	if err != nil {
-		return domain.Conversation{}, storeError("创建会话失败", err)
-	}
-	c, err := scanConversation(tx.QueryRowContext(ctx,
-		"SELECT "+conversationColumns+" FROM conversations WHERE group_id = ? AND member_id = ? AND topic_id = ?",
-		groupID, memberID, topicID))
+	c, err := conversationInTx(ctx, tx, groupID, memberID, topicID)
 	if err != nil {
 		return domain.Conversation{}, storeError("读取会话失败", err)
 	}
@@ -135,6 +168,20 @@ func (s *Store) GetOrCreateConversation(ctx context.Context, groupID, memberID, 
 		return domain.Conversation{}, storeError("保存会话失败", err)
 	}
 	return c, nil
+}
+
+func conversationInTx(ctx context.Context, tx *sql.Tx, groupID, memberID, topicID string) (domain.Conversation, error) {
+	_, err := tx.ExecContext(ctx,
+		`INSERT INTO conversations(`+conversationColumns+`) SELECT ?, ?, ?, ?, ?
+		 WHERE EXISTS(SELECT 1 FROM members WHERE group_id = ? AND id = ?)
+		 ON CONFLICT(group_id, member_id, topic_id) DO NOTHING`,
+		rand.Text(), groupID, memberID, topicID, time.Now().UTC().Format(timestampLayout), groupID, memberID)
+	if err != nil {
+		return domain.Conversation{}, err
+	}
+	return scanConversation(tx.QueryRowContext(ctx,
+		"SELECT "+conversationColumns+" FROM conversations WHERE group_id = ? AND member_id = ? AND topic_id = ?",
+		groupID, memberID, topicID))
 }
 
 func (s *Store) GetConversation(ctx context.Context, groupID, conversationID string) (domain.Conversation, error) {

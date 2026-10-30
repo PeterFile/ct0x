@@ -289,7 +289,7 @@ func TestMigrationFailureRollsBack(t *testing.T) {
 
 func TestUnknownMigrationIsRejected(t *testing.T) {
 	s, path := openTestStore(t)
-	if _, err := s.db.Exec("UPDATE schema_migrations SET version = 99"); err != nil {
+	if _, err := s.db.Exec("UPDATE schema_migrations SET version = 99 WHERE version = (SELECT max(version) FROM schema_migrations)"); err != nil {
 		t.Fatal(err)
 	}
 	s.Close()
