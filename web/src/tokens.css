@@ -1,0 +1,51 @@
+:root {
+  color-scheme: dark;
+  --color-canvas: #131412;
+  --color-panel: #1b1c19;
+  --color-text: #eeede6;
+  --color-muted: #a5a69c;
+  --color-rule: #34362f;
+  --color-accent: #dc7958;
+  --color-focus: var(--color-accent);
+  --font-ui: "Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-display: "Iowan Old Style", "Baskerville", "Songti SC", "STSong", serif;
+  --font-mono: "SFMono-Regular", "Cascadia Mono", "Noto Sans Mono CJK SC", monospace;
+  --text-meta: 0.75rem;
+  --text-small: 0.875rem;
+  --text-body: 1rem;
+  --text-brand: 1.75rem;
+  --text-display: clamp(2.5rem, 4.5vw, 4.75rem);
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --leading-tight: 1.3;
+  --leading-body: 1.8;
+  --tracking-meta: 0.06em;
+  --tracking-display: -0.03em;
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4rem;
+  --space-9: 6rem;
+  --rule-width: 1px;
+  --border-rule: var(--rule-width) solid var(--color-rule);
+  --border-accent: var(--rule-width) solid var(--color-accent);
+  --focus-ring: 2px solid var(--color-focus);
+  --focus-offset: 4px;
+  --motion-duration: 160ms;
+  --motion-ease: ease-out;
+  --layer-skip: 10;
+  --target-min: 2.75rem;
+  --header-min: 6.5rem;
+  --column-side: clamp(13.5rem, 20vw, 18rem);
+  --measure-copy: 32rem;
+  --mark-size: 2rem;
+  --intro-space: clamp(3rem, 11vh, 8rem);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --motion-duration: 0ms; }
+}
