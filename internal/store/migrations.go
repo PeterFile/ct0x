@@ -109,6 +109,131 @@ CREATE TABLE resource_claims (
     turn_id TEXT NOT NULL REFERENCES turns(id)
 );
 CREATE INDEX resource_claims_turn ON resource_claims(turn_id);
+`, `
+CREATE UNIQUE INDEX turns_task_identity ON turns(id, group_id);
+CREATE UNIQUE INDEX turns_task_actor_identity ON turns(id, group_id, member_id);
+CREATE TABLE tasks (
+    id TEXT PRIMARY KEY NOT NULL CHECK(id <> ''),
+    group_id TEXT NOT NULL REFERENCES groups(id),
+    title TEXT NOT NULL CHECK(trim(title) <> ''),
+    description TEXT NOT NULL DEFAULT '',
+    acceptance TEXT NOT NULL CHECK(trim(acceptance) <> ''),
+    assignee_id TEXT,
+    status TEXT NOT NULL DEFAULT 'open' CHECK(status IN ('open','submitted','accepted')),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(typeof(revision)='integer' AND revision > 0),
+    active_attempt_id TEXT,
+    current_submission_id TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(id, group_id),
+    FOREIGN KEY(group_id, assignee_id) REFERENCES members(group_id, id),
+    FOREIGN KEY(active_attempt_id, id, group_id, revision)
+        REFERENCES task_attempts(id, task_id, group_id, task_revision),
+    FOREIGN KEY(current_submission_id, id, group_id, revision)
+        REFERENCES task_submissions(id, task_id, group_id, task_revision),
+    FOREIGN KEY(current_submission_id, active_attempt_id) REFERENCES task_submissions(id, attempt_id),
+    CHECK((status='open' AND current_submission_id IS NULL) OR
+        (status='submitted' AND active_attempt_id IS NOT NULL AND current_submission_id IS NOT NULL) OR
+        (status='accepted' AND active_attempt_id IS NULL AND current_submission_id IS NOT NULL))
+);
+CREATE INDEX tasks_group_created_id ON tasks(group_id, created_at DESC, id DESC);
+CREATE TABLE task_dependencies (
+    group_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    dependency_id TEXT NOT NULL,
+    PRIMARY KEY(group_id, task_id, dependency_id),
+    CHECK(task_id <> dependency_id),
+    FOREIGN KEY(task_id, group_id) REFERENCES tasks(id, group_id),
+    FOREIGN KEY(dependency_id, group_id) REFERENCES tasks(id, group_id)
+);
+CREATE TRIGGER task_dependencies_cycle BEFORE INSERT ON task_dependencies
+WHEN EXISTS (
+    WITH RECURSIVE reachable(id) AS (
+        SELECT NEW.dependency_id UNION
+        SELECT d.dependency_id FROM task_dependencies d JOIN reachable r ON d.task_id=r.id
+        WHERE d.group_id=NEW.group_id
+    ) SELECT 1 FROM reachable WHERE id=NEW.task_id
+)
+BEGIN SELECT RAISE(ABORT, '任务依赖不能形成环'); END;
+CREATE TRIGGER task_dependencies_no_update BEFORE UPDATE ON task_dependencies
+BEGIN SELECT RAISE(ABORT, '依赖边必须在事务中删除后重新插入'); END;
+CREATE TABLE task_attempts (
+    id TEXT PRIMARY KEY NOT NULL CHECK(id <> ''),
+    task_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    task_revision INTEGER NOT NULL CHECK(typeof(task_revision)='integer' AND task_revision > 0),
+    actor_id TEXT NOT NULL CHECK(trim(actor_id) <> ''),
+    turn_id TEXT CHECK(turn_id IS NULL OR turn_id <> ''),
+    -- Human references skip only the member component, never the Turn's group.
+    turn_member_id TEXT GENERATED ALWAYS AS (nullif(actor_id,'user')) VIRTUAL,
+    created_at TEXT NOT NULL,
+    CHECK(actor_id='user' OR turn_id IS NOT NULL),
+    UNIQUE(id, task_id, group_id, task_revision),
+    UNIQUE(id, task_id, group_id, task_revision, actor_id),
+    -- Historical rows reference stable task identity, not its mutable revision.
+    FOREIGN KEY(task_id, group_id) REFERENCES tasks(id, group_id),
+    FOREIGN KEY(turn_id, group_id) REFERENCES turns(id, group_id),
+    FOREIGN KEY(turn_id, group_id, turn_member_id) REFERENCES turns(id, group_id, member_id)
+);
+CREATE TRIGGER task_attempts_insert BEFORE INSERT ON task_attempts
+WHEN EXISTS(SELECT 1 FROM task_attempts WHERE id=NEW.id) OR NOT EXISTS(
+    SELECT 1 FROM tasks WHERE id=NEW.task_id AND group_id=NEW.group_id
+        AND revision=NEW.task_revision AND status='open')
+BEGIN SELECT RAISE(ABORT, '任务尝试身份或当前版本冲突'); END;
+CREATE TABLE task_submissions (
+    id TEXT PRIMARY KEY NOT NULL CHECK(id <> ''),
+    task_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    task_revision INTEGER NOT NULL CHECK(typeof(task_revision)='integer' AND task_revision > 0),
+    attempt_id TEXT NOT NULL UNIQUE,
+    summary TEXT NOT NULL CHECK(trim(summary) <> ''),
+    submitted_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(id, task_id, group_id, task_revision),
+    UNIQUE(id, attempt_id),
+    FOREIGN KEY(attempt_id, task_id, group_id, task_revision, submitted_by)
+        REFERENCES task_attempts(id, task_id, group_id, task_revision, actor_id)
+);
+CREATE TABLE task_review_decisions (
+    id TEXT PRIMARY KEY NOT NULL CHECK(id <> ''),
+    submission_id TEXT NOT NULL UNIQUE,
+    task_id TEXT NOT NULL,
+    group_id TEXT NOT NULL,
+    task_revision INTEGER NOT NULL CHECK(typeof(task_revision)='integer' AND task_revision > 0),
+    outcome TEXT NOT NULL CHECK(outcome IN ('accepted','rejected')),
+    reviewed_by TEXT NOT NULL CHECK(trim(reviewed_by) <> ''),
+    reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(submission_id, task_id, group_id, task_revision)
+        REFERENCES task_submissions(id, task_id, group_id, task_revision)
+);
+CREATE TRIGGER task_submissions_insert BEFORE INSERT ON task_submissions
+WHEN EXISTS(SELECT 1 FROM task_submissions WHERE id=NEW.id OR attempt_id=NEW.attempt_id)
+BEGIN SELECT RAISE(ABORT, '提交证据不可替换'); END;
+CREATE TRIGGER task_reviews_insert BEFORE INSERT ON task_review_decisions
+WHEN EXISTS(SELECT 1 FROM task_review_decisions WHERE id=NEW.id OR submission_id=NEW.submission_id)
+BEGIN SELECT RAISE(ABORT, '评审记录不可替换'); END;
+CREATE TRIGGER task_attempts_no_update BEFORE UPDATE ON task_attempts
+BEGIN SELECT RAISE(ABORT, '任务尝试不可修改'); END;
+CREATE TRIGGER task_attempts_no_delete BEFORE DELETE ON task_attempts
+BEGIN SELECT RAISE(ABORT, '任务尝试不可删除'); END;
+CREATE TRIGGER task_submissions_no_update BEFORE UPDATE ON task_submissions
+BEGIN SELECT RAISE(ABORT, '提交证据不可修改'); END;
+CREATE TRIGGER task_submissions_no_delete BEFORE DELETE ON task_submissions
+BEGIN SELECT RAISE(ABORT, '提交证据不可删除'); END;
+CREATE TRIGGER task_reviews_no_update BEFORE UPDATE ON task_review_decisions
+BEGIN SELECT RAISE(ABORT, '评审记录不可修改'); END;
+CREATE TRIGGER task_reviews_no_delete BEFORE DELETE ON task_review_decisions
+BEGIN SELECT RAISE(ABORT, '评审记录不可删除'); END;
+CREATE TRIGGER tasks_accept_insert BEFORE INSERT ON tasks
+WHEN NEW.status='accepted' AND NOT EXISTS(SELECT 1 FROM task_review_decisions
+    WHERE submission_id=NEW.current_submission_id AND task_id=NEW.id AND group_id=NEW.group_id
+        AND task_revision=NEW.revision AND outcome='accepted')
+BEGIN SELECT RAISE(ABORT, '接纳任务必须有明确接纳的评审'); END;
+CREATE TRIGGER tasks_accept_update BEFORE UPDATE ON tasks
+WHEN NEW.status='accepted' AND NOT EXISTS(SELECT 1 FROM task_review_decisions
+    WHERE submission_id=NEW.current_submission_id AND task_id=NEW.id AND group_id=NEW.group_id
+        AND task_revision=NEW.revision AND outcome='accepted')
+BEGIN SELECT RAISE(ABORT, '接纳任务必须有明确接纳的评审'); END;
 `}
 
 // Migration history is explicit and contiguous; never infer it from table shape.
