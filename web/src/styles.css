@@ -108,7 +108,7 @@ h1 {
   color: var(--color-muted);
   font-size: var(--text-small);
 }
-button, input, textarea {
+button, input, textarea, select {
   font: inherit;
   color: var(--color-text);
   background: var(--color-canvas);
@@ -127,7 +127,10 @@ button:disabled { cursor: not-allowed; }
 .group-panel form { border-block-start: var(--border-rule); padding-block-start: var(--space-5); }
 .group-panel fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
 .group-panel legend { padding: 0; margin-block-end: var(--space-3); }
-.group-panel input, .group-panel textarea, .group-list button { width: 100%; }
+.group-panel input, .group-panel textarea, .group-panel select, .group-list button { width: 100%; }
+.member-detail dl, .member-detail dd { margin: 0; }
+.member-detail dl { display: grid; gap: var(--space-1); margin-block-start: var(--space-3); }
+.member-detail dt { color: var(--color-muted); font-size: var(--text-small); }
 .group-panel textarea { resize: vertical; }
 .group-panel [role="alert"] { color: var(--color-accent); }
 .group-list { list-style: none; padding: 0; margin: var(--space-3) 0; display: grid; gap: var(--space-2); }

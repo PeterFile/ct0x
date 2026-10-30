@@ -50,6 +50,7 @@ func stringMap(n *yaml.Node) (map[string]*yaml.Node, error) {
 	return out, nil
 }
 
+// Unknown fields, anchors/aliases and merge keys are deliberately unsupported.
 func parseHeader(data []byte, parent string) (Metadata, error) {
 	var doc, extra yaml.Node
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
