@@ -134,6 +134,28 @@ it("does not let an older page downgrade a newer detail, nor an older detail dow
   fireEvent.click(panel().getByRole("button", { name: "刷新并重置历史窗口" })); await panel().findByText(/投递失败/);
   await act(async () => oldDetail.resolve(json(message))); expect(article()).toHaveTextContent("投递失败");
 });
+it("confirms a late POST without downgrading data read after that attempt began", async () => {
+  await open(); await panel().findByText("尚无消息，可发送第一条讨论。"); change(raw);
+  const receipt = deferred<Response>(); writes.mockReturnValueOnce(receipt.promise); submit();
+  reads.mockResolvedValueOnce(page([{ ...message, content: raw }]));
+  fireEvent.click(panel().getByRole("button", { name: "刷新并重置历史窗口" })); await panel().findByRole("article");
+  details.mockResolvedValueOnce(json({ ...message, content: raw, deliveries: [{ ...delivery, state: "accepted" }] }));
+  fireEvent.click(panel().getByRole("button", { name: `刷新消息 ${message.id} 投递` })); await panel().findByText(/CLI已接收/);
+  await act(async () => receipt.resolve(json({ ...message, content: raw }, 201)));
+  expect(article()).toHaveTextContent("CLI已接收"); expect(article()).not.toHaveTextContent("已入队");
+  expect(content()).toHaveValue(""); expect(panel().getByText(/消息已持久化/)).toBeVisible();
+});
+it("inserts a late 201 receipt even after an empty reset begun during its attempt", async () => {
+  await open(); await panel().findByText("尚无消息，可发送第一条讨论。"); change(raw);
+  const receipt = deferred<Response>(); writes.mockReturnValueOnce(receipt.promise); submit();
+  fireEvent.click(panel().getByRole("button", { name: "刷新并重置历史窗口" }));
+  await panel().findByText("尚无消息，可发送第一条讨论。");
+  const olderRead = deferred<Response>(); reads.mockReturnValueOnce(olderRead.promise);
+  fireEvent.click(panel().getByRole("button", { name: "刷新并重置历史窗口" }));
+  await act(async () => receipt.resolve(json({ ...message, content: raw }, 201)));
+  await act(async () => olderRead.resolve(page()));
+  expect(article()).toHaveTextContent("已入队"); expect(content()).toHaveValue("");
+});
 it("does not resurrect a row outside a reset window from an earlier detail read", async () => {
   reads.mockResolvedValueOnce(page([message])); await open(); await panel().findByRole("article");
   const old = deferred<Response>(); details.mockReturnValueOnce(old.promise);

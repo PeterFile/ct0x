@@ -41,10 +41,11 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
       ...(route === "default" ? {} : { recipient_ids: route === "public" ? [] : [...recipients] }) } };
     const current = operation.current, controller = new AbortController(); posting.current = controller;
     setMutation({ pending: true, uncertain: false, error: "", notice: "" });
+    const attempt = feed.beginSend();
     try {
       const receipt = await sendMessage(groupId, current.input, current.key, controller.signal);
       if (!mounted.current) return;
-      feed.confirm(receipt); operation.current = null; setContent("");
+      feed.confirm(receipt, attempt); operation.current = null; setContent("");
       setMutation({ pending: false, uncertain: false, error: "", notice: "消息已持久化；投递状态见消息记录，不代表模型已回复。" });
     } catch (error) {
       if (!mounted.current) return;

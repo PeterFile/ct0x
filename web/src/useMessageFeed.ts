@@ -68,12 +68,17 @@ export function useMessageFeed(groupId: string, active: boolean) {
       controllers.current.clear();
     };
   }, [active, loadPage]);
-  const confirm = useCallback((message: Message) => {
+  const beginSend = useCallback(() => ++clock.current, []);
+  const confirm = useCallback((message: Message, attempt: number) => {
     const version = ++clock.current;
-    setFeed(previous => merge(previous, [message], version));
+    setFeed(previous => {
+      const current = previous.entries.get(message.id);
+      // Reads begun after this attempt outrank its potentially delayed receipt.
+      return current && current.version > attempt ? previous : merge(previous, [message], version);
+    });
   }, []);
   const items = useMemo(() => [...feed.entries.values()].map(record => record.message)
     .sort((a, b) => compare(timeKey(a.created_at), timeKey(b.created_at)) || compare(a.id, b.id)), [feed]);
-  return { items, page, details, loadPage, refreshDetail, confirm,
+  return { items, page, details, loadPage, refreshDetail, beginSend, confirm,
     retry: () => loadPage(lastRequest.current.before, lastRequest.current.reset) };
 }
