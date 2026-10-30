@@ -70,9 +70,9 @@ func TestArtifactV5UpgradePreservesExistingReads(t *testing.T) {
 			t.Fatal(err)
 		}
 		artifactForeignKeys(t, s.db)
-		var version, count int
-		if err := s.db.QueryRow("SELECT max(version),count(*) FROM schema_migrations").Scan(&version, &count); err != nil || version != 6 || count != 6 {
-			t.Fatalf("v6 ledger after upgrade/reopen: %d, %d, %v", version, count, err)
+		var version, count, v6 int
+		if err := s.db.QueryRow("SELECT max(version),count(*),count(CASE WHEN version=6 THEN 1 END) FROM schema_migrations").Scan(&version, &count, &v6); err != nil || version != len(migrations) || count != len(migrations) || v6 != 1 {
+			t.Fatalf("v6 ledger after upgrade/reopen: %d, %d, v6=%d, %v", version, count, v6, err)
 		}
 		for _, check := range []struct {
 			name string
@@ -139,8 +139,9 @@ func TestArtifactV6MigrationFailureRollsBackAndRetries(t *testing.T) {
 		t.Fatalf("clean migration retry: %v", err)
 	}
 	defer s.Close()
-	if err := s.db.QueryRow("SELECT max(version),count(*) FROM schema_migrations").Scan(&version, &count); err != nil || version != 6 || count != 6 {
-		t.Fatalf("v6 retry ledger: %d, %d, %v", version, count, err)
+	var v6 int
+	if err := s.db.QueryRow("SELECT max(version),count(*),count(CASE WHEN version=6 THEN 1 END) FROM schema_migrations").Scan(&version, &count, &v6); err != nil || version != len(migrations) || count != len(migrations) || v6 != 1 {
+		t.Fatalf("v6 retry ledger: %d, %d, v6=%d, %v", version, count, v6, err)
 	}
 	seedArtifact(t, s, g.ID, "artifact", "version", "user")
 }
