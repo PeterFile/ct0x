@@ -134,6 +134,17 @@ button:disabled { cursor: not-allowed; }
 .group-panel textarea { resize: vertical; }
 .group-panel [role="alert"] { color: var(--color-accent); }
 .group-list { list-style: none; padding: 0; margin: var(--space-3) 0; display: grid; gap: var(--space-2); }
+.selected-intro { margin-block: var(--space-6) var(--space-4); }
+.discussion-feed { margin-block-end: var(--space-6); }
+.feed-note, .message-meta, .delivery-list { color: var(--color-muted); font-size: var(--text-small); }
+.message-list { list-style: none; padding: 0; margin: 0; display: grid; gap: var(--space-5); }
+.message-list article { display: grid; gap: var(--space-3); border-block-start: var(--border-rule); padding-block-start: var(--space-4); }
+.message-meta { display: flex; flex-wrap: wrap; gap: var(--space-2) var(--space-4); justify-content: space-between; }
+.message-content { white-space: pre-wrap; overflow-wrap: anywhere; }
+.delivery-list { padding-inline-start: var(--space-5); margin: 0; }
+.recipient-list { display: grid; gap: var(--space-2); }
+.recipient-list label { display: flex; align-items: center; gap: var(--space-2); }
+.recipient-list input { width: var(--space-4); flex: 0 0 var(--space-4); }
 @media (max-width: 56rem) {
   .workspace { grid-template-columns: minmax(0, 1fr); }
   .column { padding: var(--space-5); }
