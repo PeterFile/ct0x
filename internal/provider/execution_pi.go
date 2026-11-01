@@ -42,6 +42,7 @@ type executionOutput struct {
 	receipt                    *ExecutionReceipt
 	delivery                   *executionDelivery
 	codex                      bool
+	frameLimit                 int
 	runID                      string
 	line                       []byte
 	dropping, damaged, settled bool
@@ -56,7 +57,7 @@ func (o *executionOutput) Write(p []byte) (int, error) {
 		if i >= 0 {
 			part = p[:i]
 		}
-		if len(o.line)+len(part) > executionFrameLimit {
+		if len(o.line)+len(part) > o.frameLimit {
 			o.dropping, o.damaged, o.last = true, true, ""
 		}
 		if !o.dropping {
@@ -148,19 +149,28 @@ func (o *executionOutput) recordPi(line []byte) {
 			return
 		}
 		var text bytes.Buffer
+		hasText, hasToolCall := false, false
 		for _, block := range blocks {
 			if block.Type == "" || (block.Type == "text" && block.Text == nil) {
 				o.damaged = true
 				return
 			}
 			if block.Type == "text" {
+				hasText = true
 				text.WriteString(*block.Text)
+			}
+			if block.Type == "toolCall" {
+				hasToolCall = true
 			}
 		}
 		// Only a complete assistant's stop reason decides the final result.
 		// Earlier error messages must not poison a later successful retry.
 		o.last = map[string]Outcome{"stop": OutcomeSucceeded, "error": OutcomeFailed, "aborted": OutcomeAborted, "length": OutcomeTruncated}[event.Message.StopReason]
-		o.emit(Event{Kind: ResponseEvent, Text: text.String()})
+		// A tool-only assistant message has no response snapshot. Tool arguments
+		// and toolResult text never become response events; mixed text still does.
+		if hasText || !hasToolCall {
+			o.emit(Event{Kind: ResponseEvent, Text: text.String()})
+		}
 	case "agent_settled":
 		if event.Aborted == nil || !r.Accepted || r.NativeSessionID == "" || o.settled {
 			o.damaged = true
