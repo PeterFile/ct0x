@@ -23,15 +23,15 @@ function mergeMessages(previous: Message[], incoming: Message[]) {
   });
 }
 
-export function HistorySearch({ group }: { group: Group | null }) {
+export function HistorySearch({ group, active = true }: { group: Group | null; active?: boolean }) {
   return <section className="history-search" aria-label="历史消息搜索">
     <header className="history-search-heading"><h2>历史消息</h2><span>只读检索</span></header>
     <p className="history-search-note">搜索和读取原始记录，不会发送消息或启动执行。</p>
-    {group ? <SearchScope key={group.id} groupId={group.id} /> : <p className="history-search-note">请先选择群组，再搜索历史消息。</p>}
+    {group ? <SearchScope key={group.id} groupId={group.id} active={active} /> : <p className="history-search-note">请先选择群组，再搜索历史消息。</p>}
   </section>;
 }
 
-function SearchScope({ groupId }: { groupId: string }) {
+function SearchScope({ groupId, active }: { groupId: string; active: boolean }) {
   const formId = useId();
   const [keyword, setKeyword] = useState("");
   const [scope, setScope] = useState("all");
@@ -55,7 +55,7 @@ function SearchScope({ groupId }: { groupId: string }) {
   }, [scope, rejectTopicLineBreaks]);
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (scope === "topic" && topicBlocked) return;
+    if (!active || (scope === "topic" && topicBlocked)) return;
     if (!keyword.trim()) { setError("请输入关键词。"); return; }
     if (scope === "topic" && topicId === "") { setError("请输入话题 ID；主频道请从检索范围中选择。"); return; }
     setError("");
@@ -87,22 +87,31 @@ function SearchScope({ groupId }: { groupId: string }) {
       <button className="history-search-submit" type="submit">搜索历史消息</button>
     </form>
     {/* Each submission owns its cursors, results and detail, independently of the draft. */}
-    {submitted ? <SearchResults key={submitted.version} groupId={groupId} query={submitted.query} />
+    {submitted ? <SearchResults key={submitted.version} groupId={groupId} query={submitted.query} active={active} />
       : <p className="history-search-note">输入关键词并提交搜索。</p>}
   </>;
 }
 
-function SearchResults({ groupId, query: { q, topic_id: topicId } }: { groupId: string; query: HistoryQuery }) {
+function SearchResults({ groupId, query: { q, topic_id: topicId }, active }: { groupId: string; query: HistoryQuery; active: boolean }) {
   const detailId = useId();
   const [items, setItems] = useState<Message[]>([]);
   const [request, setRequest] = useState({ before: "", version: 0 });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
   const [selection, setSelection] = useState<{ source: Message; version: number } | null>(null);
-  const load = (before: string) => setRequest(previous => ({ before, version: previous.version + 1 }));
+  const load = (before: string) => {
+    if (!active) return;
+    setPage(previous => ({ ...previous, pending: true, error: "" }));
+    setRequest(previous => ({ before, version: previous.version + 1 }));
+  };
   useEffect(() => {
+    if (!active) {
+      setPage(previous => previous.pending ? { ...previous, pending: false, error: "搜索已暂停，请重试。" } : previous);
+      return;
+    }
+    // Only an explicit load makes a settled or interrupted request pending again.
+    if (!page.pending) return;
     let ignore = false;
     const controller = new AbortController();
-    setPage(previous => ({ ...previous, pending: true, error: "" }));
     searchHistory(groupId, { q, topic_id: topicId, before: request.before }, controller.signal).then(result => {
       if (ignore) return;
       setItems(previous => mergeMessages(request.before ? previous : [], result.items));
@@ -111,7 +120,7 @@ function SearchResults({ groupId, query: { q, topic_id: topicId } }: { groupId: 
       if (!ignore) setPage(previous => ({ ...previous, pending: false, error: errorText(error) }));
     });
     return () => { ignore = true; controller.abort(); };
-  }, [groupId, q, topicId, request]);
+  }, [active, groupId, q, topicId, request, page.pending]);
   return <section className="history-search-results" aria-label="历史搜索结果">
     <h3>搜索结果</h3>
     <ul className="history-search-summary" aria-label="已提交的检索条件">
@@ -134,7 +143,7 @@ function SearchResults({ groupId, query: { q, topic_id: topicId } }: { groupId: 
       </li>)}</ol>
       {page.next && !page.error ? <button type="button" disabled={page.pending} onClick={() => load(page.next)}>加载更早结果</button> : null}
     </div>
-    {selection ? <HistoryDetail key={selection.version} source={selection.source} id={detailId} />
+    {selection ? <HistoryDetail key={selection.version} source={selection.source} id={detailId} active={active} />
       : <p className="history-search-note">选择一条结果，读取完整消息。</p>}
   </section>;
 }
@@ -150,26 +159,34 @@ function MessageSource({ message }: { message: Message }) {
   </>;
 }
 
-function HistoryDetail({ source, id }: { source: Message; id: string }) {
+function HistoryDetail({ source, id, active }: { source: Message; id: string; active: boolean }) {
   const { group_id: groupId, topic_id: topicId, id: messageId } = source;
   const [version, setVersion] = useState(0);
   const [detail, setDetail] = useState<{ message: Message | null; pending: boolean; error: string }>({ message: null, pending: true, error: "" });
+  function retry() {
+    if (!active) return;
+    setDetail({ message: null, pending: true, error: "" }); setVersion(previous => previous + 1);
+  }
   useEffect(() => {
+    if (!active) {
+      setDetail(previous => previous.pending ? { ...previous, pending: false, error: "读取已暂停，请重试。" } : previous);
+      return;
+    }
+    if (!detail.pending) return;
     let ignore = false;
     const controller = new AbortController();
-    setDetail({ message: null, pending: true, error: "" });
     readHistory(groupId, messageId, topicId, controller.signal).then(message => {
       if (!ignore) setDetail({ message, pending: false, error: "" });
     }, error => {
       if (!ignore) setDetail({ message: null, pending: false, error: errorText(error) });
     });
     return () => { ignore = true; controller.abort(); };
-  }, [groupId, topicId, messageId, version]);
+  }, [active, groupId, topicId, messageId, version, detail.pending]);
   return <section className="history-search-detail" id={id} aria-label="完整消息" aria-busy={detail.pending}>
     <h3>完整消息</h3>
     <MessageSource message={detail.message ?? source} />
     {detail.pending ? <p role="status">正在读取完整消息…</p> : null}
-    {detail.error ? <div role="alert"><p>{detail.error}</p><button type="button" onClick={() => setVersion(previous => previous + 1)}>重试读取完整消息</button></div> : null}
+    {detail.error ? <div role="alert"><p>{detail.error}</p><button type="button" onClick={retry}>重试读取完整消息</button></div> : null}
     {detail.message ? <p className="history-search-copy">{detail.message.content}</p> : null}
   </section>;
 }
