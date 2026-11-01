@@ -266,6 +266,40 @@ it("keeps a late A creation receipt and selection out of visible B", async () =>
   reads.mockResolvedValueOnce(page([task])); view.rerender(<Tasks group={group} />);
   expect(row()).toHaveAttribute("aria-pressed", "true"); await detail().findByRole("heading", { name: task.title });
 });
+it.each([
+  { state: "accepted", receipt: task, latest: acceptedTask, label: "已接纳" },
+  { state: "higher-revision open", receipt: submittedTask, latest: { ...task, title: "退回后重新交付", revision: 2 }, label: "待交付" },
+].flatMap(state => ["GET first", "receipt first"].map(order => ({ ...state, order }))))(
+  "keeps later same-ID $state list content with $order", async ({ receipt, latest, label, order }) => {
+    open(); await draft(); const pending = deferred<Response>(); writes.mockReturnValueOnce(pending.promise);
+    details.mockResolvedValueOnce(json(latest)); submit();
+    const later = deferred<Response>(); reads.mockReturnValueOnce(later.promise);
+    fireEvent.click(panel().getByRole("button", { name: "刷新任务" }));
+    expect(reads).toHaveBeenCalledTimes(2); expect(writes).toHaveBeenCalledTimes(1);
+    if (order === "GET first") {
+      await act(async () => later.resolve(page([latest])));
+      expect(panel().getByRole("button", { name: `${latest.title}，${label}` })).toBeVisible();
+    }
+    await act(async () => pending.resolve(json(receipt, 201)));
+    if (order === "receipt first") await act(async () => later.resolve(page([latest])));
+    expect(panel().getByRole("button", { name: `${latest.title}，${label}` })).toHaveAttribute("aria-pressed", "true");
+    expect(panel().getByRole("list", { name: "任务列表" }).children).toHaveLength(1);
+    expect(await detail().findByText(label)).toBeVisible(); expect(detail().getByText(String(latest.revision))).toBeVisible();
+  },
+);
+it.each(["GET first", "receipt first"])("preserves confirmed existence against a post-start empty list with %s", async order => {
+  open(); await draft(); const pending = deferred<Response>(); writes.mockReturnValueOnce(pending.promise); submit();
+  const later = deferred<Response>(); reads.mockReturnValueOnce(later.promise);
+  fireEvent.click(panel().getByRole("button", { name: "刷新任务" }));
+  if (order === "GET first") await act(async () => later.resolve(page()));
+  await act(async () => pending.resolve(json(task, 201)));
+  if (order === "receipt first") await act(async () => later.resolve(page()));
+  expect(row()).toHaveAttribute("aria-pressed", "true");
+  expect(panel().queryByText("尚无任务，可创建任务并约定验收条件。")).not.toBeInTheDocument();
+  reads.mockResolvedValueOnce(page()); fireEvent.click(panel().getByRole("button", { name: "刷新任务" }));
+  await panel().findByText("尚无任务，可创建任务并约定验收条件。");
+  expect(panel().queryByRole("button", { name: `${task.title}，待交付` })).not.toBeInTheDocument();
+});
 it.each(["missing", "stale"])("protects a new confirmed receipt from an older %s list, but allows newer authoritative updates", async snapshot => {
   const old = deferred<Response>(); reads.mockReturnValueOnce(old.promise); open();
   change("任务标题", task.title); change("验收条件", task.acceptance); submit();

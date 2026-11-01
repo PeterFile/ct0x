@@ -35,8 +35,9 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
   const [detail, setDetail] = useState<{ task: Task | null; pending: boolean; error: string }>({ task: null, pending: false, error: "" });
   const [draft, setDraft] = useState(emptyDraft);
   const [mutation, setMutation] = useState({ pending: false, uncertain: false, error: "" });
-  const confirmed = useRef<{ task: Task; afterRead: number }[]>([]);
+  const confirmed = useRef<{ task: Task; startedAfterRead: number; confirmedAfterRead: number }[]>([]);
   const readSequence = useRef(0);
+  const successfulReads = useRef(new Map<string, { task: Task; read: number }>());
   const operation = useRef<{ key: string; input: TaskInput } | null>(null);
   const posting = useRef<AbortController | null>(null);
   const mounted = useRef(false);
@@ -54,8 +55,15 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
     setPage(previous => ({ ...previous, pending: true, error: "" }));
     listTasks(groupId, request.before, controller.signal).then(result => {
       if (ignore) return;
-      // Receipts outrank only list reads already started when the receipt arrived.
-      confirmed.current = confirmed.current.filter(receipt => receipt.afterRead >= read);
+      const updates = new Map(result.items.map(task => [task.id, task]));
+      if (posting.current) {
+        for (const task of updates.values()) successfulReads.current.set(task.id, { task, read });
+      }
+      // Concurrent reads can update same-ID content, but cannot disprove a new receipt's existence.
+      confirmed.current = confirmed.current.filter(receipt => receipt.confirmedAfterRead >= read).map(receipt => {
+        const update = updates.get(receipt.task.id);
+        return update && read > receipt.startedAfterRead ? { ...receipt, task: update } : receipt;
+      });
       const protectedTasks = confirmed.current.map(receipt => receipt.task);
       const protectedIds = new Set(protectedTasks.map(task => task.id));
       setItems(previous => [...protectedTasks, ...mergeTasks([...(request.before ? previous : []), ...result.items])
@@ -89,12 +97,17 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
       description: draft.description, acceptance: draft.acceptance.trim() }) };
     const current = operation.current;
     const controller = new AbortController(); posting.current = controller;
+    const startedAfterRead = readSequence.current;
     setMutation({ pending: true, uncertain: false, error: "" });
     try {
       const task = await createTask(groupId, current.input, current.key, controller.signal);
       if (!mounted.current) return;
-      confirmed.current = [{ task, afterRead: readSequence.current }, ...confirmed.current.filter(receipt => receipt.task.id !== task.id)];
-      setItems(previous => [task, ...previous.filter(item => item.id !== task.id)]); select(task.id);
+      // A same-ID read started after this POST outranks its receipt, regardless of response order.
+      const latest = successfulReads.current.get(task.id);
+      const freshTask = latest && latest.read > startedAfterRead ? latest.task : task;
+      confirmed.current = [{ task: freshTask, startedAfterRead, confirmedAfterRead: readSequence.current },
+        ...confirmed.current.filter(receipt => receipt.task.id !== task.id)];
+      setItems(previous => [freshTask, ...previous.filter(item => item.id !== task.id)]); select(task.id);
       operation.current = null; setDraft(emptyDraft);
       setMutation({ pending: false, uncertain: false, error: "" });
     } catch (error) {
@@ -102,7 +115,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
       const uncertain = !isDefinitiveRejection(error);
       if (!uncertain) operation.current = null;
       setMutation({ pending: false, uncertain, error: uncertain ? `创建结果未确认。${errorText(error)} 请重试同一次创建。` : errorText(error) });
-    } finally { posting.current = null; }
+    } finally { posting.current = null; successfulReads.current.clear(); }
   }
 
   const selected = detail.task?.id === selection.id ? detail.task : null;
