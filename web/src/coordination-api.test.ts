@@ -128,6 +128,31 @@ it.each(["", " ", " \r\n\t\x00 ", "topic".repeat(1100), "主题𐀀"])("preserve
   await expect(requestWork(groupId, request, key)).resolves.toEqual(receipt(request));
   expect(JSON.parse(String(transport.mock.calls[0][1]?.body)).topic_id).toBe(topic);
 });
+const requestTextFields = ["topic_id", "reason", "new_task.title", "new_task.description", "new_task.acceptance",
+  "new_task.assignee_id", "new_task.dependency_ids.1"];
+it.each(requestTextFields.flatMap(field => ["\ud800", "\udfff", "😀\ud800text", "text\udfff😀"].map(value => [field, value] as const)))(
+  "rejects unrepresentable UTF-16 in %s before fetch (case %#)", async (field, value) => {
+    const request = input(); changeField(request, field, value);
+    const before = structuredClone(request);
+    transport.mockResolvedValueOnce(json(receipt(), 201));
+    const error: unknown = await requestWork(groupId, request, key).catch((failure: unknown) => failure);
+    expect(transport).not.toHaveBeenCalled();
+    expect(error).toBeInstanceOf(ApiError); expect(error).toMatchObject({ status: 0, code: "invalid_input" });
+    expect(isRequestWorkDefinitiveRejection(error)).toBe(true);
+    expect(request).toEqual(before);
+  },
+);
+it.each(requestTextFields.flatMap(field => ["\ud800\udc00", "\udbff\udfff", "😀", "\\ud800\\udfff", "\ufffd", "\u0085\ufeff😀 \n"]
+  .map(value => [field, value] as const)))(
+  "preserves representable Unicode and literal escapes in %s (case %#)", async (field, value) => {
+    const request = input(); changeField(request, field, value);
+    const before = structuredClone(request), expected = receipt(request);
+    transport.mockResolvedValueOnce(json(expected, 201));
+    await expect(requestWork(groupId, request, key)).resolves.toEqual(expected);
+    expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toEqual(before);
+    expect(request).toEqual(before); expect(transport).toHaveBeenCalledTimes(1);
+  },
+);
 it("uses Go nonblank semantics without trimming BOM, NEL or any raw text", async () => {
   const request = input();
   request.reason = "\ufeff"; request.new_task.title = "\ufeff"; request.new_task.acceptance = "\ufeff";

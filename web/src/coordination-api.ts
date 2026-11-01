@@ -31,10 +31,12 @@ const exactRecord = (value: unknown, fields: readonly string[]): value is Record
 const goSpace = "[\\u0009-\\u000d \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000]";
 const goBlank = new RegExp(`^${goSpace}*$`, "u");
 const goEdgeSpace = new RegExp(`^${goSpace}|${goSpace}$`, "u");
-const nonblank = (value: unknown): value is string => typeof value === "string" && !goBlank.test(value);
+// Go JSON decoding replaces lone JS surrogates, so they cannot round-trip exact text.
+const validText = (value: unknown): value is string => typeof value === "string" && !/[\ud800-\udfff]/u.test(value);
+const nonblank = (value: unknown): value is string => validText(value) && !goBlank.test(value);
 const encoder = new TextEncoder();
-const validIdentifier = (value: unknown): value is string => typeof value === "string" && value !== ""
-  && !goEdgeSpace.test(value) && !/[\u0000\r\n\ud800-\udfff]/u.test(value) && encoder.encode(value).length <= 4096;
+const validIdentifier = (value: unknown): value is string => validText(value) && value !== ""
+  && !goEdgeSpace.test(value) && !/[\u0000\r\n]/u.test(value) && encoder.encode(value).length <= 4096;
 const validKey = (value: unknown): value is string => typeof value === "string" && value.length >= 1 && value.length <= 128
   && !/[^\x21-\x7e]|,/.test(value);
 const invalidInput = () => new ApiError("工作请求输入无效，请检查来源、任务内容及幂等键。", 0, "invalid_input");
@@ -49,9 +51,9 @@ function requestSnapshot(input: RequestWorkInput): RequestWorkInput {
       dependency_ids: Array.isArray(task.dependency_ids) ? [...task.dependency_ids] : task.dependency_ids },
   };
   const n = sent.new_task;
-  if (typeof sent.topic_id !== "string" || !validIdentifier(sent.message_id) || !nonblank(sent.reason)
+  if (!validText(sent.topic_id) || !validIdentifier(sent.message_id) || !nonblank(sent.reason)
     || !nonblank(n.title) || !nonblank(n.acceptance)
-    || (n.description !== undefined && typeof n.description !== "string")
+    || (n.description !== undefined && !validText(n.description))
     || (n.assignee_id !== undefined && n.assignee_id !== "" && !nonblank(n.assignee_id))
     || (n.dependency_ids != null && (!Array.isArray(n.dependency_ids) || !n.dependency_ids.every(nonblank)))) throw invalidInput();
   return sent;
