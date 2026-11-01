@@ -53,9 +53,14 @@ func createTaskInTx(ctx context.Context, tx *sql.Tx, input CreateTaskInput) (dom
 	if replay {
 		return taskInTx(ctx, tx, input.GroupID, id)
 	}
+	return insertTaskInTx(ctx, tx, input, id)
+}
+
+// The caller owns authorization, receipts, server-generated identity, and the transaction.
+func insertTaskInTx(ctx context.Context, tx *sql.Tx, input CreateTaskInput, id string) (domain.Task, error) {
 	task, err := domain.NewTask(domain.Task{
 		ID: id, GroupID: input.GroupID, Title: input.Title, Description: input.Description,
-		Acceptance: input.Acceptance, AssigneeID: input.AssigneeID, DependencyIDs: deps,
+		Acceptance: input.Acceptance, AssigneeID: input.AssigneeID, DependencyIDs: input.DependencyIDs,
 		Revision: 1, CreatedAt: time.Now().UTC(),
 	})
 	if err != nil {

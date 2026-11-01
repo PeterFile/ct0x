@@ -14,14 +14,18 @@ function unique(groups: Group[]) {
 }
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请重试。";
 
-export function Groups({ selectedId, onSelect }: { selectedId?: string; onSelect: (group: Group) => void }) {
+export function Groups({ selectedId, onSelect, active = true, selectionVersion = 0 }: {
+  selectedId?: string; onSelect: (group: Group) => void; active?: boolean; selectionVersion?: string | number;
+}) {
   const [groups, setGroups] = useState<Group[]>([]);
   const [request, setRequest] = useState({ before: "", version: 0 });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [mutation, setMutation] = useState({ pending: false, error: "", uncertain: false });
-  const operation = useRef<{ key: string; input: GroupInput } | null>(null);
+  const selectionGeneration = useRef(0);
+  useEffect(() => { ++selectionGeneration.current; }, [selectedId, active, selectionVersion]);
+  const operation = useRef<{ key: string; input: GroupInput; generation: number } | null>(null);
   const confirmed = useRef<Group[]>([]);
   const posting = useRef<AbortController | null>(null);
   const mounted = useRef(false);
@@ -32,6 +36,7 @@ export function Groups({ selectedId, onSelect }: { selectedId?: string; onSelect
     return () => { mounted.current = false; posting.current?.abort(); };
   }, []);
   useEffect(() => {
+    if (!active) return;
     let ignore = false;
     const controller = new AbortController();
     setPage(previous => ({ ...previous, pending: true, error: "" }));
@@ -44,7 +49,7 @@ export function Groups({ selectedId, onSelect }: { selectedId?: string; onSelect
       if (!ignore) setPage(previous => ({ ...previous, pending: false, error: errorText(error) }));
     });
     return () => { ignore = true; controller.abort(); };
-  }, [request]);
+  }, [active, request]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -53,7 +58,8 @@ export function Groups({ selectedId, onSelect }: { selectedId?: string; onSelect
       setMutation({ pending: false, error: "请输入群组名称。", uncertain: false });
       return;
     }
-    operation.current ??= { key: crypto.randomUUID(), input: { name: name.trim(), ...(description ? { description } : {}) } };
+    operation.current ??= { key: crypto.randomUUID(), input: { name: name.trim(), ...(description ? { description } : {}) },
+      generation: selectionGeneration.current };
     const current = operation.current;
     const controller = new AbortController();
     posting.current = controller;
@@ -63,7 +69,8 @@ export function Groups({ selectedId, onSelect }: { selectedId?: string; onSelect
       if (!mounted.current) return;
       confirmed.current = unique([group, ...confirmed.current]);
       setGroups(previous => unique([group, ...previous]));
-      onSelect(group);
+      // A late receipt inserts the group, but cannot undo deliberate selection or view changes.
+      if (current.generation === selectionGeneration.current) onSelect(group);
       operation.current = null;
       setName("");
       setDescription("");
@@ -87,7 +94,8 @@ export function Groups({ selectedId, onSelect }: { selectedId?: string; onSelect
         {!page.pending && !page.error && groups.length === 0 ? <p>尚无群组，可在下方创建。</p> : null}
         <ul className="group-list" aria-label="群组列表">
           {groups.map(group => <li key={group.id}>
-            <button type="button" aria-pressed={selectedId === group.id} onClick={() => onSelect(group)}>{group.name}</button>
+            <button type="button" aria-pressed={selectedId === group.id}
+              onClick={() => { ++selectionGeneration.current; onSelect(group); }}>{group.name}</button>
           </li>)}
         </ul>
         {page.next ? <button type="button" disabled={page.pending} onClick={() => load(page.next)}>加载更多群组</button> : null}

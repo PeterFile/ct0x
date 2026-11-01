@@ -34,12 +34,14 @@ function useCatalogue(enabled: boolean) {
 }
 
 type MemberListener = (groupId: string, members: Member[]) => void;
-export function Members({ groupId, onMembers }: { groupId?: string; onMembers?: MemberListener }) {
+export function Members({ groupId, onMembers, catalogueActive = true }: {
+  groupId?: string; onMembers?: MemberListener; catalogueActive?: boolean;
+}) {
   const [visited, setVisited] = useState<string[]>([]);
   useEffect(() => {
     if (groupId) setVisited(previous => previous.includes(groupId) ? previous : [...previous, groupId]);
   }, [groupId]);
-  const catalogue = useCatalogue(visited.length > 0);
+  const catalogue = useCatalogue(catalogueActive && visited.length > 0);
   return <>
     {!groupId ? <p className="empty-panel">请先选择群组，再查看成员。</p> : null}
     {/* Keep per-group operations alive across switches; hidden scopes cannot leak into the active UI. */}
