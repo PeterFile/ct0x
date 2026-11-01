@@ -7,7 +7,8 @@ import (
 
 // Limits include the in-flight callback: at most 64 events and 1 MiB of string
 // payload (identity, text, kind and terminal). Fixed event storage is separately
-// bounded by the count; each parsed JSONL frame remains capped at 64 KiB.
+// bounded by the count. JSONL frames are capped at 64 KiB for plain adapters,
+// or 1 MiB for Pi member tools, whose raw-frame queue has separate 64-frame/8-MiB limits.
 const executionDeliveryEventLimit = 64
 const executionDeliveryByteLimit = 1 << 20
 

@@ -42,6 +42,7 @@ type executionOutput struct {
 	receipt                    *ExecutionReceipt
 	delivery                   *executionDelivery
 	codex                      bool
+	frameLimit                 int
 	runID                      string
 	line                       []byte
 	dropping, damaged, settled bool
@@ -56,7 +57,7 @@ func (o *executionOutput) Write(p []byte) (int, error) {
 		if i >= 0 {
 			part = p[:i]
 		}
-		if len(o.line)+len(part) > executionFrameLimit {
+		if len(o.line)+len(part) > o.frameLimit {
 			o.dropping, o.damaged, o.last = true, true, ""
 		}
 		if !o.dropping {
@@ -160,6 +161,7 @@ func (o *executionOutput) recordPi(line []byte) {
 		// Only a complete assistant's stop reason decides the final result.
 		// Earlier error messages must not poison a later successful retry.
 		o.last = map[string]Outcome{"stop": OutcomeSucceeded, "error": OutcomeFailed, "aborted": OutcomeAborted, "length": OutcomeTruncated}[event.Message.StopReason]
+		// Empty snapshots must also replace earlier assistant text, not retain it.
 		o.emit(Event{Kind: ResponseEvent, Text: text.String()})
 	case "agent_settled":
 		if event.Aborted == nil || !r.Accepted || r.NativeSessionID == "" || o.settled {

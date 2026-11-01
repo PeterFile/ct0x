@@ -7,8 +7,17 @@ import (
 	"strings"
 	"testing"
 
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
 )
+
+func insertMemberHistoryFixture(t *testing.T, s *Store, m domain.Message) {
+	t.Helper()
+	if _, err := s.db.Exec("INSERT INTO messages("+messageColumns+") VALUES(?,?,?,?,?,?)",
+		m.ID, m.GroupID, m.TopicID, m.SenderID, m.Content, m.CreatedAt.Format(timestampLayout)); err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestMemberHistoryRejectsInvalidStoredUTF8(t *testing.T) {
 	f, scope := memberOperationFixture(t)
@@ -21,10 +30,10 @@ func TestMemberHistoryRejectsInvalidStoredUTF8(t *testing.T) {
 	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "UTF-8") || !reflect.ValueOf(fragment).IsZero() {
 		t.Fatalf("invalid bytes after the requested range were ignored: %+v, %v", fragment, err)
 	}
-	if _, err := f.s.db.Exec("UPDATE messages SET content='needle',sender_id=? WHERE id=?", "bad\xff", m.ID); err != nil {
-		t.Fatal(err)
-	}
-	if page, err := f.s.SearchHistoryForTool(ctx, scope, MemberHistorySearchInput{Query: "needle"}); !errors.Is(err, ErrInvalid) || len(page.Items) != 0 {
+	metadata := m
+	metadata.ID, metadata.SenderID, metadata.Content = "invalid-metadata", "bad\xff", "metadata"
+	insertMemberHistoryFixture(t, f.s, metadata)
+	if page, err := f.s.SearchHistoryForTool(ctx, scope, MemberHistorySearchInput{Query: "metadata"}); !errors.Is(err, ErrInvalid) || len(page.Items) != 0 || page.NextCursor != "" {
 		t.Fatalf("invalid projected metadata was silently substituted: %+v, %v", page, err)
 	}
 }
@@ -63,12 +72,13 @@ func TestMemberHistoryWholeEncodedPageBudget(t *testing.T) {
 		// Include all DTO metadata and one final newline; do not estimate content alone.
 		sender := strings.Repeat("x", 65536-len(memberHistoryJSON(t, base))+len(m.SenderID))
 		for _, extra := range []string{"", "x"} {
-			if _, err := f.s.db.Exec("UPDATE messages SET sender_id=? WHERE id=?", sender+extra, m.ID); err != nil {
-				t.Fatal(err)
-			}
-			page, err := f.s.SearchHistoryForTool(ctx, scope, input)
+			boundaryFixture, boundaryScope := memberOperationFixture(t)
+			message := m
+			message.GroupID, message.TopicID, message.SenderID = boundaryScope.Claim.GroupID, boundaryScope.TopicID, sender+extra
+			insertMemberHistoryFixture(t, boundaryFixture.s, message)
+			page, err := boundaryFixture.s.SearchHistoryForTool(ctx, boundaryScope, input)
 			if extra == "" {
-				if err != nil || len(page.Items) != 1 || len(memberHistoryJSON(t, page)) != 65536 {
+				if err != nil || len(page.Items) != 1 || page.Items[0].SenderID != message.SenderID || len(memberHistoryJSON(t, page)) != 65536 {
 					t.Fatalf("inclusive 65536-byte result rejected: %v", err)
 				}
 			} else if err != ErrToolResultTooLarge || len(page.Items) != 0 || page.NextCursor != "" {
@@ -80,12 +90,16 @@ func TestMemberHistoryWholeEncodedPageBudget(t *testing.T) {
 
 func TestMemberHistoryFencePrecedesReadsAndRollsBackOnFailure(t *testing.T) {
 	f, scope := memberOperationFixture(t)
-	m := memberHistoryMessage(t, f, scope, "fence-message", "before")
+	m := memberHistoryMessage(t, f, scope, "fence-message", "needle after-fence")
+	oversized := m
+	oversized.ID, oversized.SenderID, oversized.Content = "oversized-message", strings.Repeat("x", 65536), "oversized"
+	insertMemberHistoryFixture(t, f.s, oversized)
 	turnBefore := queueTurn(t, f.s, scope.Claim)
+	before := memberOperationCounts(t, f.s)
+	// Observe the real fence transaction without mutating immutable messages.
 	if _, err := f.s.db.Exec(`CREATE TABLE member_history_fences(n INTEGER);
 	 CREATE TRIGGER member_history_fence AFTER UPDATE OF claim_token ON turns BEGIN
-	 INSERT INTO member_history_fences VALUES(1);
-	 UPDATE messages SET content='needle after-fence' WHERE id='fence-message'; END`); err != nil {
+	 INSERT INTO member_history_fences VALUES(1); END`); err != nil {
 		t.Fatal(err)
 	}
 	fenceCount := func() int {
@@ -97,10 +111,7 @@ func TestMemberHistoryFencePrecedesReadsAndRollsBackOnFailure(t *testing.T) {
 	}
 	page, err := f.s.SearchHistoryForTool(ctx, scope, MemberHistorySearchInput{Query: "needle"})
 	if err != nil || len(page.Items) != 1 || page.Items[0].Excerpt.Content != "needle after-fence" || fenceCount() != 1 {
-		t.Fatalf("operation did not read after exactly one same-tx fence: %+v, %v", page, err)
-	}
-	if _, err := f.s.db.Exec("UPDATE messages SET content='before' WHERE id=?", m.ID); err != nil {
-		t.Fatal(err)
+		t.Fatalf("operation did not commit exactly one same-tx fence: %+v, %v", page, err)
 	}
 	fragment, err := f.s.ReadHistoryForTool(ctx, scope, MemberHistoryReadInput{MessageID: m.ID})
 	if err != nil || fragment.Content != "needle after-fence" || fenceCount() != 2 {
@@ -112,10 +123,7 @@ func TestMemberHistoryFencePrecedesReadsAndRollsBackOnFailure(t *testing.T) {
 	if _, err := f.s.ReadHistoryForTool(ctx, scope, MemberHistoryReadInput{MessageID: m.ID, Offset: 999}); !errors.Is(err, ErrInvalid) || fenceCount() != 2 {
 		t.Fatalf("invalid range committed its fence: %v", err)
 	}
-	if _, err := f.s.db.Exec("UPDATE messages SET sender_id=? WHERE id=?", strings.Repeat("x", 65536), m.ID); err != nil {
-		t.Fatal(err)
-	}
-	if page, err := f.s.SearchHistoryForTool(ctx, scope, MemberHistorySearchInput{Query: "needle"}); err != ErrToolResultTooLarge || len(page.Items) != 0 || fenceCount() != 2 {
+	if page, err := f.s.SearchHistoryForTool(ctx, scope, MemberHistorySearchInput{Query: "oversized"}); err != ErrToolResultTooLarge || len(page.Items) != 0 || page.NextCursor != "" || fenceCount() != 2 {
 		t.Fatalf("budget was checked after committing the read transaction: %v", err)
 	}
 	if !reflect.DeepEqual(turnBefore, queueTurn(t, f.s, scope.Claim)) {
@@ -134,8 +142,8 @@ func TestMemberHistoryFencePrecedesReadsAndRollsBackOnFailure(t *testing.T) {
 		_, err = f.s.ReadHistoryForTool(ctx, bad, MemberHistoryReadInput{})
 		requireMemberToolDenied(t, err)
 	}
-	if fenceCount() != 2 {
-		t.Fatal("forged scope reached the operation")
+	if fenceCount() != 2 || memberOperationCounts(t, f.s) != before {
+		t.Fatal("forged scope or read/projection changed durable state")
 	}
 }
 
