@@ -80,10 +80,12 @@ type ExecutionReceipt struct {
 	Reason            string  `json:"reason"`
 }
 
-// Callbacks run serially as records arrive, must return promptly, and must not
-// retain mutable shared state unsafely. An error cancels this invocation, disables
-// later callbacks and makes delivery/outcome unknown; Execute never retries.
-// No callbacks run after Execute returns. A nil callback discards delivery.
+// Callbacks run serially in record order, independently of native output parsing.
+// They must bound their work or observe cancellation, and must not retain mutable
+// shared state unsafely. An error or delivery queue overflow cancels this invocation,
+// disables later callbacks and makes delivery/outcome unknown; Execute never retries.
+// Execute waits for all callback work, including an in-flight callback after
+// cancellation. No callbacks run after it returns. A nil callback skips the queue.
 type Executor interface {
 	Execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error) ExecutionReceipt
 }
@@ -168,7 +170,8 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	}
 	defer stderr.Close()
 	outLog, errLog := &executionLog{file: stdout, cancel: cancel}, &executionLog{file: stderr, cancel: cancel}
-	out := &executionOutput{log: outLog, receipt: &r, callback: onEvent, cancel: cancel, ctx: ctx, runID: request.RunID, codex: codex}
+	delivery := newExecutionDelivery(ctx, cancel, onEvent)
+	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex}
 	args := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", "--no-tools", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--session-dir", dir, "--session-id", request.RunID}
 	if codex {
 		args = []string{"--ask-for-approval", "never", "exec", "--json", "--sandbox", "read-only", "--ignore-user-config", "--ephemeral", "--cd", request.CWD, "--skip-git-repo-check", "--color", "never"}
@@ -185,15 +188,19 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	outDrain, errDrain := &executionDrain{Writer: out}, &executionDrain{Writer: errLog}
 	cmd := exec.CommandContext(ctx, e.path, args...)
 	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = request.CWD, strings.NewReader(request.Prompt), outDrain, errDrain
-	// WaitDelay bounds inherited pipes, not descendants' lifetimes. Wait joins
-	// the copying goroutines before receipt inspection or callback state returns.
+	// WaitDelay bounds inherited pipes, not descendants' lifetimes or callback
+	// work. Wait joins the parser/copying goroutines; delivery is joined separately.
 	cmd.WaitDelay = 100 * time.Millisecond
 	if cmd.Start() != nil {
+		delivery.finish()
 		r.Reason = "无法启动模型进程，提示词未被接收"
 		return r
 	}
 	r.Started, r.Outcome = true, OutcomeUnknown
 	err = cmd.Wait()
+	// Only now may the queue close. Consolidate delivery failure after its sole
+	// consumer finishes, including failures racing normal native completion.
+	r.DeliveryFailed = delivery.finish()
 	r.DirectChildReaped = cmd.ProcessState != nil
 	if r.DirectChildReaped {
 		r.ExitCode = cmd.ProcessState.ExitCode()
