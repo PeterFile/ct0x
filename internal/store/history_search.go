@@ -62,18 +62,23 @@ func (s *Store) SearchHistory(ctx context.Context, groupID string, query History
 	return page, nil
 }
 
-// searchHistoryInTx owns common validation and reads, not run capability checks.
-// A member wrapper must authorize in this transaction and force the bound topic.
+// searchHistoryInTx validates the local-user topic selector before shared reads.
 func searchHistoryInTx(ctx context.Context, tx *sql.Tx, groupID string, q HistoryQuery) (HistoryPage, error) {
+	if err := validateHistoryTopic(q.TopicID); err != nil {
+		return HistoryPage{}, err
+	}
+	return searchHistoryInScopeTx(ctx, tx, groupID, q)
+}
+
+// searchHistoryInScopeTx shares query validation and SQL, not authorization.
+// Callers must validate a user-selected topic or fence and force the persisted topic.
+func searchHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, q HistoryQuery) (HistoryPage, error) {
 	if !validHistoryText(q.Query, 4096) {
 		return HistoryPage{}, fmt.Errorf("%w：搜索词须为有效 UTF-8、无 NUL 且原始长度不超过 4096 字节", ErrInvalid)
 	}
 	q.Query = strings.TrimSpace(q.Query)
 	if len(q.Query) == 0 || len(q.Query) > 1024 || utf8.RuneCountInString(q.Query) > 256 {
 		return HistoryPage{}, fmt.Errorf("%w：搜索词须为 1 到 256 个字符且不超过 1024 字节", ErrInvalid)
-	}
-	if err := validateHistoryTopic(q.TopicID); err != nil {
-		return HistoryPage{}, err
 	}
 	limit, err := listLimit(ListOptions{Limit: q.Limit})
 	if err != nil {
@@ -155,6 +160,11 @@ func readHistoryInTx(ctx context.Context, tx *sql.Tx, groupID string, topicID *s
 	if err := validateHistoryTopic(topicID); err != nil {
 		return domain.Message{}, err
 	}
+	return readHistoryInScopeTx(ctx, tx, groupID, topicID, messageID)
+}
+
+// readHistoryInScopeTx accepts only a validated selector or a fenced bound topic.
+func readHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, topicID *string, messageID string) (domain.Message, error) {
 	if topicID == nil {
 		return messageInTx(ctx, tx, groupID, messageID)
 	}

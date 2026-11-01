@@ -81,6 +81,8 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	defer listener.Close()
 	local := platform.NewLocalUser(db)
 	routes := append(httpapi.LocalUserRoutes(local), httpapi.MessageRoutes(local)...)
+	routes = append(routes, httpapi.TaskRoutes(local)...)
+	routes = append(routes, httpapi.HistoryRoutes(local)...)
 	routes = append(routes, httpapi.ProviderRoute(catalog))
 	if config.webDir != "" {
 		web, openErr := webassets.Open(config.webDir)
@@ -96,7 +98,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录及 CLI 目录；目录仅启动时探测、证据仅存内存；%s；不支持恢复、运行中追加输入或平台工具；Pi 禁用工具，Codex 可用原生只读工具；工作目录不是主机读取沙箱，数据目录及祖先必须可信且目录身份稳定；其他功能尚未启用）\n", listener.Addr(), executionStatus); err != nil {
+	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录、任务创建、列表与详情及 CLI 目录；目录仅启动时探测、证据仅存内存；%s；不支持恢复、运行中追加输入或平台工具；Pi 禁用工具，Codex 可用原生只读工具；工作目录不是主机读取沙箱，数据目录及祖先必须可信且目录身份稳定；其他功能尚未启用）\n", listener.Addr(), executionStatus); err != nil {
 		return fmt.Errorf("输出启动信息失败：%w", err)
 	}
 	return serve(ctx, server, listener, 5*time.Second, schedule)
