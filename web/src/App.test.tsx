@@ -224,12 +224,13 @@ describe("workspace groups", () => {
 describe("IM shell", () => {
   const taskReads = vi.fn<typeof fetch>(), taskDetails = vi.fn<typeof fetch>(), taskWrites = vi.fn<typeof fetch>();
   const messageReads = vi.fn<typeof fetch>(), messageWrites = vi.fn<typeof fetch>();
+  const historyReads = vi.fn<typeof fetch>(), historyDetails = vi.fn<typeof fetch>();
   const memberReads = vi.fn<typeof fetch>(), memberWrites = vi.fn<typeof fetch>(), catalogue = vi.fn<typeof fetch>();
   const main = () => screen.getByRole("main", { name: "讨论" });
-  const trigger = (name: "成员" | "任务") => within(main()).getByRole("button", { name });
-  const context = (name: "成员" | "任务") => screen.getByRole("complementary", { name });
+  const trigger = (name: "成员" | "任务" | "搜索") => within(main()).getByRole("button", { name });
+  const context = (name: "成员" | "任务" | "搜索") => screen.getByRole("complementary", { name });
   const closeContext = () => fireEvent.click(screen.getByRole("button", { name: /^(关闭详情|返回聊天)$/ }));
-  function showContext(name: "成员" | "任务") {
+  function showContext(name: "成员" | "任务" | "搜索") {
     if (screen.queryByRole("button", { name: "返回聊天" })) closeContext();
     if (trigger(name).getAttribute("aria-expanded") !== "true") fireEvent.click(trigger(name));
   }
@@ -243,6 +244,11 @@ describe("IM shell", () => {
   const tasks = () => within(screen.getByRole("region", { name: "群组任务" }));
   const detail = () => within(tasks().getByRole("region", { name: "任务详情" }));
   const taskField = (name: string) => tasks().getByRole("textbox", { name });
+  const history = () => within(screen.getByRole("region", { name: "历史消息搜索" }));
+  function search(q: string) {
+    change(history().getByRole("textbox", { name: "关键词" }), q);
+    fireEvent.submit(history().getByRole("form", { name: "搜索历史消息" }));
+  }
   const content = () => screen.getByRole("textbox", { name: "消息内容" });
   const change = (field: HTMLElement, value: string) => fireEvent.change(field, { target: { value } });
   const identity = ([url, init]: Parameters<typeof fetch>) => ({ url, body: init?.body,
@@ -267,11 +273,17 @@ describe("IM shell", () => {
     messageReads.mockReset().mockImplementation(async () => page());
     messageWrites.mockReset().mockImplementation(async (_url, init) =>
       json({ ...message, content: JSON.parse(String(init?.body)).content, deliveries: [] }, 201));
+    historyReads.mockReset().mockImplementation(async () => page());
+    historyDetails.mockReset().mockImplementation(async () => json(message));
     memberReads.mockReset().mockImplementation(async url => page(String(url).includes(other.id) ? [] : [member]));
     memberWrites.mockReset().mockImplementation(async () => json(member, 201));
     catalogue.mockReset().mockImplementation(async () => page([provider]));
     vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
+      if (url.includes("/history")) {
+        if ((init?.method ?? "GET") !== "GET") throw new Error("Unexpected history mutation");
+        return (/\/history\//.test(url) ? historyDetails : historyReads)(input, init);
+      }
       if (url.includes("/tasks")) return (init?.method === "POST" ? taskWrites : /\/tasks\//.test(url) ? taskDetails : taskReads)(input, init);
       if (url.includes("/messages")) return (init?.method === "POST" ? messageWrites : messageReads)(input, init);
       if (url.includes("/members")) return (init?.method === "POST" ? memberWrites : memberReads)(input, init);
@@ -279,6 +291,107 @@ describe("IM shell", () => {
       if (url.startsWith("/api/v1/groups")) return transport(input, init);
       return Promise.reject(new Error(`Unexpected request: ${url}`));
     });
+  });
+
+  it("opens the real search context without a group, mounts only on first visit and returns focus to its trigger", async () => {
+    render(<App />); const button = trigger("搜索");
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("只读检索")).not.toBeInTheDocument();
+    expect(document.getElementById(button.getAttribute("aria-controls")!)).toBeEmptyDOMElement();
+    showContext("搜索");
+    expect(within(context("搜索")).getByRole("heading", { name: "搜索" })).toHaveFocus();
+    expect(history().getByText("请先选择群组，再搜索历史消息。")).toBeVisible();
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    expect(history().queryByRole("form")).not.toBeInTheDocument();
+    closeContext(); expect(button).toHaveFocus(); expect(button).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByText("只读检索")).not.toBeVisible();
+    expect(historyReads).not.toHaveBeenCalled(); expect(historyDetails).not.toHaveBeenCalled();
+    await screen.findByRole("button", { name: group.name });
+  });
+
+  it.each([false, true])("uses the same search context for real scoped search/page/full reads and preserves its DOM when reopened (mobile=%s)", async mobile => {
+    const topic = " \t话题 /?+ ", q = " \u3000原词 %_\\ ", cursor = "opaque+/=?&";
+    const source = { ...message, id: "history/source", topic_id: topic, content: "历史摘录", deliveries: [] };
+    const older = { ...source, id: "history-older", content: "更早结果" }, full = { ...source, content: "完整历史原文 <b>纯文本</b>" };
+    historyReads.mockResolvedValueOnce(page([source], cursor)).mockResolvedValueOnce(page([older]));
+    historyDetails.mockResolvedValueOnce(json(full));
+    resize(mobile); render(<App />); selectGroup((await screen.findByRole("button", { name: group.name })).textContent!);
+    await screen.findByText("尚无消息，可发送第一条讨论。");
+    const oldMessages = deferred<Response>(); messageReads.mockReturnValueOnce(oldMessages.promise);
+    fireEvent.click(screen.getByRole("button", { name: "刷新并重置历史窗口" }));
+    const messageRead = messageReads.mock.calls.at(-1)!;
+    const button = trigger("搜索"), chat = main(); showContext("搜索");
+    expect(document.getElementById(button.getAttribute("aria-controls")!)).toContainElement(history().getByRole("form"));
+    expect(within(context("搜索")).getByRole("heading", { name: "搜索" })).toHaveFocus();
+    expect(button).toHaveAttribute("aria-expanded", "true"); expect(chat.closest("[hidden]") !== null).toBe(mobile);
+    expect(screen.getByRole("link", { name: mobile ? "跳至搜索详情" : "跳至讨论区" })).toHaveAttribute("href", mobile ? "#im-context" : "#im-chat");
+    expect(messageRead[1]?.signal?.aborted).toBe(mobile); expect(memberReads.mock.calls[0][1]?.signal?.aborted).toBe(false);
+    await act(async () => oldMessages.resolve(page()));
+    expect(historyReads).not.toHaveBeenCalled(); expect(historyDetails).not.toHaveBeenCalled();
+    expect(taskReads).not.toHaveBeenCalled(); expect(catalogue).not.toHaveBeenCalled();
+    const form = history().getByRole("form"), keyword = history().getByRole("textbox", { name: "关键词" });
+    fireEvent.change(history().getByRole("combobox", { name: "检索范围" }), { target: { value: "topic" } });
+    change(history().getByRole("textbox", { name: "话题 ID" }), topic); search(q);
+    fireEvent.click(await history().findByRole("button", { name: `读取完整消息 ${source.id}` }));
+    await history().findByText(full.content); change(keyword, "未提交草稿");
+    fireEvent.change(history().getByRole("combobox", { name: "检索范围" }), { target: { value: "main" } });
+    fireEvent.click(history().getByRole("button", { name: "加载更早结果" }));
+    await history().findByRole("button", { name: `读取完整消息 ${older.id}` });
+    const query = new URLSearchParams({ q, limit: "50", topic_id: topic });
+    expect(historyReads.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history?${query}`);
+    query.set("before", cursor); expect(historyReads.mock.calls[1][0]).toBe(`/api/v1/groups/${group.id}/history?${query}`);
+    expect(historyDetails.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history/history%2Fsource?${new URLSearchParams({ topic_id: topic })}`);
+    const fullRegion = history().getByRole("region", { name: "完整消息" });
+    closeContext(); expect(button).toHaveFocus(); expect(button).toHaveAttribute("aria-expanded", "false");
+    expect(form).toBeInTheDocument(); expect(form.closest("[hidden]")).not.toBeNull(); expect(form).not.toBeVisible();
+    expect(screen.queryByRole("textbox", { name: "关键词" })).not.toBeInTheDocument();
+    showContext("任务"); await tasks().findByText("尚无任务，可创建任务并约定验收条件。"); showContext("搜索");
+    expect(history().getByRole("form")).toBe(form); expect(keyword).toHaveValue("未提交草稿");
+    expect(history().getByRole("region", { name: "完整消息" })).toBe(fullRegion); expect(within(fullRegion).getByText(full.content)).toBeVisible();
+    expect(history().getByRole("list", { name: "已提交的检索条件" })).toHaveTextContent("原词");
+    expect(historyReads).toHaveBeenCalledTimes(2); expect(historyDetails).toHaveBeenCalledTimes(1);
+    expect(messageWrites).not.toHaveBeenCalled(); expect(taskWrites).not.toHaveBeenCalled(); expect(memberWrites).not.toHaveBeenCalled(); expect(posts()).toHaveLength(0);
+  });
+
+  it.each([false, true])("aborts hidden search page/full reads and requires explicit original-operation retries after returning (mobile=%s)", async mobile => {
+    historyReads.mockResolvedValueOnce(page([message], "original-cursor"));
+    resize(mobile); render(<App />); selectGroup((await screen.findByRole("button", { name: group.name })).textContent!); showContext("搜索"); search("已提交词");
+    const oldPage = deferred<Response>(), oldDetail = deferred<Response>();
+    historyDetails.mockReturnValueOnce(oldDetail.promise);
+    fireEvent.click(await history().findByRole("button", { name: `读取完整消息 ${message.id}` }));
+    historyReads.mockReturnValueOnce(oldPage.promise); fireEvent.click(history().getByRole("button", { name: "加载更早结果" }));
+    const keyword = history().getByRole("textbox", { name: "关键词" }); change(keyword, "未提交词");
+    if (mobile) { closeContext(); fireEvent.click(screen.getByRole("button", { name: "返回群组" })); }
+    else { showContext("任务"); showContext("成员"); }
+    expect(historyReads.mock.calls[1][1]?.signal?.aborted).toBe(true); expect(historyDetails.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    expect(keyword).toBeInTheDocument(); expect(keyword).not.toBeVisible();
+    await act(async () => { oldPage.resolve(page([{ ...message, id: "stale", content: "过期结果", deliveries: [] }])); oldDetail.resolve(json({}, 503)); });
+    if (mobile) selectGroup(group.name); showContext("搜索");
+    expect(historyReads).toHaveBeenCalledTimes(2); expect(historyDetails).toHaveBeenCalledTimes(1);
+    expect(history().getAllByRole("alert")).toHaveLength(2); expect(history().getAllByText(/已暂停/)).toHaveLength(2);
+    expect(history().queryByRole("status")).not.toBeInTheDocument(); expect(history().queryByText("过期结果")).not.toBeInTheDocument();
+    expect(history().getByRole("textbox", { name: "关键词" })).toBe(keyword); expect(keyword).toHaveValue("未提交词");
+    historyDetails.mockResolvedValueOnce(json({ ...message, content: "重试全文" }));
+    fireEvent.click(history().getByRole("button", { name: "重试搜索" }));
+    fireEvent.click(history().getByRole("button", { name: "重试读取完整消息" }));
+    await history().findByText("重试全文"); expect(history().queryByRole("alert")).not.toBeInTheDocument();
+    expect(historyReads.mock.calls[2][0]).toBe(historyReads.mock.calls[1][0]); expect(historyDetails.mock.calls[1][0]).toBe(historyDetails.mock.calls[0][0]);
+  });
+
+  it.each([false, true])("resets search to the real selected group even while hidden without issuing a GET (mobile=%s)", async mobile => {
+    historyReads.mockResolvedValueOnce(page([message])); resize(mobile); render(<App />);
+    selectGroup((await screen.findByRole("button", { name: group.name })).textContent!); showContext("搜索"); search("A 的词");
+    await history().findByRole("button", { name: `读取完整消息 ${message.id}` });
+    const form = history().getByRole("form"); closeContext(); selectGroup(other.name);
+    expect(form).not.toBeInTheDocument(); expect(historyReads).toHaveBeenCalledTimes(1);
+    showContext("搜索"); expect(context("搜索")).toHaveTextContent(other.name);
+    expect(history().getByRole("textbox", { name: "关键词" })).toHaveValue("");
+    expect(history().queryByRole("region", { name: "历史搜索结果" })).not.toBeInTheDocument(); expect(historyReads).toHaveBeenCalledTimes(1);
+    search("B 的词"); await history().findByText("未找到匹配的历史消息。");
+    expect(historyReads.mock.calls[1][0]).toBe(`/api/v1/groups/${other.id}/history?${new URLSearchParams({ q: "B 的词", limit: "50" })}`);
+    closeContext(); selectGroup(group.name); showContext("搜索");
+    expect(history().getByRole("textbox", { name: "关键词" })).toHaveValue(""); expect(historyReads).toHaveBeenCalledTimes(2);
+    expect(history().queryByRole("region", { name: "历史搜索结果" })).not.toBeInTheDocument();
   });
 
   it("keeps chat primary on desktop and supplies real recipients without opening members or reading hidden catalogues/tasks", async () => {
@@ -439,13 +552,13 @@ describe("IM shell", () => {
     const raw = "  切换期间保留\n原始消息  "; change(originalInput, raw);
     fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: "selected" } });
     fireEvent.click(await screen.findByRole("checkbox", { name: recipientName }));
-    showContext("任务"); expect(composer).toBeInTheDocument(); expect(composer.closest("[hidden]") !== null).toBe(mobile);
+    showContext("任务"); showContext("搜索"); expect(composer).toBeInTheDocument(); expect(composer.closest("[hidden]") !== null).toBe(mobile);
     closeContext(); selectGroup(other.name); await screen.findByText("尚无消息，可发送第一条讨论。");
     change(content(), "写作群草稿"); selectGroup(group.name);
     expect(content()).toBe(originalInput); expect(content()).toHaveValue(raw); expect(content()).toHaveAttribute("rows", "2");
     expect(await screen.findByRole("checkbox", { name: recipientName })).toBeChecked();
     const pending = deferred<Response>(); messageWrites.mockReturnValueOnce(pending.promise);
-    fireEvent.submit(screen.getByRole("form", { name: "发送消息" })); showContext("任务");
+    fireEvent.submit(screen.getByRole("form", { name: "发送消息" })); showContext("任务"); showContext("搜索");
     selectGroup(other.name); if (!mobile) closeContext();
     expect(content()).toHaveValue("写作群草稿"); expect(messageWrites.mock.calls[0][1]?.signal?.aborted).toBe(false);
     await act(async () => pending.resolve(json({}, 503)));
@@ -453,6 +566,7 @@ describe("IM shell", () => {
     expect(content()).toBe(originalInput); expect(content()).toHaveValue(raw); expect(content()).toBeDisabled();
     expect(screen.getByRole("region", { name: "撰写消息" })).toBe(composer);
     expect(screen.getByRole("alert")).toHaveTextContent("发送结果未确认");
+    showContext("搜索"); closeContext(); expect(content()).toBe(originalInput); expect(content()).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "重试同一次发送" }));
     await screen.findByText("消息已持久化；投递状态见记录。");
     expect(messageWrites).toHaveBeenCalledTimes(2); expect(identity(messageWrites.mock.calls[1])).toEqual(identity(messageWrites.mock.calls[0]));
@@ -469,10 +583,10 @@ describe("IM shell", () => {
     showContext("任务"); await tasks().findByText("尚无任务，可创建任务并约定验收条件。"); draftTask();
     const originalTitle = taskField("任务标题"), form = tasks().getByRole("form", { name: "创建任务" });
     const pending = deferred<Response>(); taskWrites.mockReturnValueOnce(pending.promise); fireEvent.submit(form);
-    closeContext(); expect(form).toBeInTheDocument(); expect(form).not.toBeVisible();
+    showContext("搜索"); expect(form).toBeInTheDocument(); expect(form).not.toBeVisible();
     showContext("任务"); expect(taskField("任务标题")).toBe(originalTitle); expect(originalTitle).toBeDisabled();
     selectGroup(other.name); showContext("任务"); await tasks().findByText("尚无任务，可创建任务并约定验收条件。");
-    expect(taskField("任务标题")).toHaveValue(""); change(taskField("任务标题"), "写作群的任务草稿"); closeContext();
+    expect(taskField("任务标题")).toHaveValue(""); change(taskField("任务标题"), "写作群的任务草稿"); showContext("搜索"); closeContext();
     await act(async () => pending.resolve(json({}, 503)));
     expect(taskWrites).toHaveBeenCalledTimes(1); expect(taskWrites.mock.calls[0][1]?.signal?.aborted).toBe(false);
     expect(within(main()).queryByRole("alert")).not.toBeInTheDocument();
@@ -480,6 +594,7 @@ describe("IM shell", () => {
     expect(taskField("任务标题")).toBe(originalTitle); expect(originalTitle).toHaveValue(task.title); expect(originalTitle).toBeDisabled();
     expect(taskField("任务描述（可选）")).toHaveValue(task.description); expect(taskField("验收条件")).toHaveValue(task.acceptance);
     expect(tasks().getByRole("alert")).toHaveTextContent("创建结果未确认");
+    showContext("搜索"); showContext("任务"); expect(taskField("任务标题")).toBe(originalTitle); expect(originalTitle).toBeDisabled();
     fireEvent.click(tasks().getByRole("button", { name: "重试同一次任务创建" }));
     await tasks().findByRole("region", { name: "任务详情" }); await detail().findByRole("heading", { name: task.title });
     expect(taskWrites).toHaveBeenCalledTimes(2); expect(identity(taskWrites.mock.calls[1])).toEqual(identity(taskWrites.mock.calls[0]));
@@ -498,14 +613,15 @@ describe("IM shell", () => {
     const field = screen.getByRole("textbox", { name: "成员名称" }), form = screen.getByRole("form", { name: "创建成员" });
     change(field, member.name); change(screen.getByRole("textbox", { name: "成员职责" }), member.role);
     fireEvent.change(screen.getByRole("combobox", { name: "运行器（可选）" }), { target: { value: provider.id } });
-    const pending = deferred<Response>(); memberWrites.mockReturnValueOnce(pending.promise); fireEvent.submit(form); closeContext();
+    const pending = deferred<Response>(); memberWrites.mockReturnValueOnce(pending.promise); fireEvent.submit(form); showContext("搜索");
     expect(form).toBeInTheDocument(); expect(form).not.toBeVisible(); expect(memberWrites.mock.calls[0][1]?.signal?.aborted).toBe(false);
-    selectGroup(other.name); openMemberForm(); change(screen.getByRole("textbox", { name: "成员名称" }), "B 的成员草稿"); closeContext();
+    selectGroup(other.name); openMemberForm(); change(screen.getByRole("textbox", { name: "成员名称" }), "B 的成员草稿"); showContext("搜索"); closeContext();
     await act(async () => pending.resolve(json({}, 503)));
     selectGroup(group.name); openMemberForm();
     expect(screen.getByRole("form", { name: "创建成员" })).toBe(form); expect(field).toHaveValue(member.name); expect(field).toBeDisabled();
     expect(screen.getByRole("combobox", { name: "运行器（可选）" })).toHaveValue(provider.id);
     expect(screen.getByRole("alert")).toHaveTextContent("创建结果未确认");
+    showContext("搜索"); openMemberForm(); expect(screen.getByRole("form", { name: "创建成员" })).toBe(form); expect(field).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "重试同一次成员创建" })); await screen.findByRole("button", { name: member.name });
     expect(memberWrites).toHaveBeenCalledTimes(2); expect(identity(memberWrites.mock.calls[1])).toEqual(identity(memberWrites.mock.calls[0]));
     expect(JSON.parse(String(identity(memberWrites.mock.calls[0]).body))).toEqual({ name: member.name, role: member.role, provider_id: provider.id });
@@ -517,22 +633,22 @@ describe("IM shell", () => {
     await screen.findByText("尚无成员，可创建群内成员。");
   });
 
-  it.each(["selection", "context", "mobile"])("inserts a late created group without hijacking a deliberate %s change or focus", async mode => {
+  it.each(["selection", "context", "search", "mobile"])("inserts a late created group without hijacking a deliberate %s change or focus", async mode => {
     resize(mode === "mobile"); render(<App />); await screen.findByRole("button", { name: group.name });
     if (mode !== "mobile") selectGroup(group.name);
     const created = { ...group, id: "created", name: "新群" }, receipt = deferred<Response>();
     transport.mockReturnValueOnce(receipt.promise); submit(created.name);
     const originalInput = nameInput();
-    if (mode === "context") showContext("任务");
-    else { selectGroup(other.name); if (mode === "mobile") showContext("成员"); }
+    if (mode === "context" || mode === "search") showContext(mode === "search" ? "搜索" : "任务");
+    else { selectGroup(other.name); if (mode === "mobile") { showContext("成员"); showContext("搜索"); } }
     const focused = document.activeElement;
     expect(posts()[0][1]?.signal?.aborted).toBe(false);
     await act(async () => receipt.resolve(json(created, 201)));
     expect(document.activeElement).toBe(focused);
     if (mode === "mobile") {
-      expect(context("成员")).toHaveTextContent(other.name); closeContext();
+      expect(context("搜索")).toHaveTextContent(other.name); closeContext();
       fireEvent.click(screen.getByRole("button", { name: "返回群组" }));
-    } else expect(within(main()).getByRole("heading", { name: mode === "context" ? group.name : other.name })).toBeVisible();
+    } else expect(within(main()).getByRole("heading", { name: mode === "context" || mode === "search" ? group.name : other.name })).toBeVisible();
     expect(screen.getByRole("button", { name: created.name })).toHaveAttribute("aria-pressed", "false");
     expect(nameInput()).toBe(originalInput); expect(originalInput).toHaveValue(""); expect(originalInput).toBeEnabled();
     fireEvent.click(screen.getByRole("button", { name: created.name }));
@@ -559,7 +675,7 @@ describe("IM shell", () => {
     resize(true); render(<App />); await screen.findByRole("button", { name: group.name });
     const pending = deferred<Response>(); transport.mockReturnValueOnce(pending.promise);
     submit("保留的群组操作"); const field = nameInput();
-    selectGroup(other.name); showContext("成员");
+    selectGroup(other.name); showContext("搜索");
     expect(posts()[0][1]?.signal?.aborted).toBe(false);
     await act(async () => pending.resolve(json({}, 503)));
     expect(screen.queryByRole("alert")).not.toBeInTheDocument(); closeContext();

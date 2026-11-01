@@ -2,11 +2,12 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import type { Group, Member } from "./api";
 import { Discussion } from "./Discussion";
 import { Groups } from "./Groups";
+import { HistorySearch } from "./HistorySearch";
 import { Members } from "./Members";
 import { Tasks } from "./Tasks";
 import "./im-shell.css";
 
-type Context = "members" | "tasks";
+type Context = "members" | "tasks" | "history";
 function useMobile() {
   const [mobile, setMobile] = useState(() => window.matchMedia?.("(max-width: 56rem)").matches ?? false);
   useEffect(() => {
@@ -24,17 +25,18 @@ export function App() {
   const [pane, setPane] = useState<"list" | "chat">("list");
   const [context, setContext] = useState<Context | null>(null);
   const [tasksVisited, setTasksVisited] = useState(false);
+  const [historyVisited, setHistoryVisited] = useState(false);
   const [viewVersion, setViewVersion] = useState(0);
   const [selected, setSelected] = useState<Group | null>(null);
   const [members, setMembers] = useState<Record<string, Member[]>>({});
   const groups = useRef<HTMLElement>(null), groupsHeading = useRef<HTMLHeadingElement>(null);
   const chatHeading = useRef<HTMLHeadingElement>(null), contextHeading = useRef<HTMLHeadingElement>(null);
-  const membersTrigger = useRef<HTMLButtonElement>(null), tasksTrigger = useRef<HTMLButtonElement>(null);
+  const membersTrigger = useRef<HTMLButtonElement>(null), tasksTrigger = useRef<HTMLButtonElement>(null), historyTrigger = useRef<HTMLButtonElement>(null);
   const focusNext = useRef<"list" | "chat" | "context" | Context | null>(null);
   const listVisible = !mobile || pane === "list";
   const contextVisible = context !== null && (!mobile || pane === "chat");
   const chatVisible = !mobile || (pane === "chat" && !contextVisible);
-  const contextLabel = context === "tasks" ? "任务" : "成员";
+  const contextLabel = context === "history" ? "搜索" : context === "tasks" ? "任务" : "成员";
   const rememberMembers = useCallback((groupId: string, items: Member[]) => {
     setMembers(previous => ({ ...previous, [groupId]: items }));
   }, []);
@@ -47,7 +49,7 @@ export function App() {
     const target = destination === "list"
       ? groups.current?.querySelector<HTMLElement>('.group-list button[aria-pressed="true"]') ?? groupsHeading.current
       : destination === "context" ? contextHeading.current : destination === "chat" ? chatHeading.current
-      : destination === "members" ? membersTrigger.current : tasksTrigger.current;
+      : destination === "members" ? membersTrigger.current : destination === "tasks" ? tasksTrigger.current : historyTrigger.current;
     target?.focus();
   }, [mobile, listVisible, chatVisible, contextVisible, context, viewVersion]);
 
@@ -65,6 +67,7 @@ export function App() {
     if (context === next) { closeContext(); return; }
     focusNext.current = "context";
     if (next === "tasks") setTasksVisited(true);
+    if (next === "history") setHistoryVisited(true);
     setContext(next); setViewVersion(previous => previous + 1);
   }
   function backToList() {
@@ -97,6 +100,8 @@ export function App() {
             {selected ? <p>{selected.description || "此群组尚无说明。"}</p> : null}
           </div>
           <div className="im-chat-actions">
+            <button type="button" ref={historyTrigger} aria-expanded={contextVisible && context === "history"}
+              aria-controls="im-history" onClick={() => openContext("history")}>搜索</button>
             <button type="button" ref={membersTrigger} aria-expanded={contextVisible && context === "members"}
               aria-controls="im-members" onClick={() => openContext("members")}>成员</button>
             <button type="button" ref={tasksTrigger} aria-expanded={contextVisible && context === "tasks"}
@@ -121,6 +126,9 @@ export function App() {
           </div>
           <div id="im-tasks" hidden={context !== "tasks"}>
             {tasksVisited ? <Tasks group={contextVisible && context === "tasks" ? selected : null} /> : null}
+          </div>
+          <div id="im-history" hidden={context !== "history"}>
+            {historyVisited ? <HistorySearch group={selected} active={contextVisible && context === "history"} /> : null}
           </div>
         </div>
       </aside>
