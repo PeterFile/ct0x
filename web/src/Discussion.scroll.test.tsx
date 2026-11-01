@@ -503,6 +503,77 @@ it.each(["send", "reset"].flatMap(operation => ["track", "drag", "overlay-moveme
   },
 );
 
+it.each(["send", "reset"])("review: native compensation during an unmoved message press cannot cancel %s", async operation => {
+  await open(); readAt(history(), 230); const pending = deferred<Response>();
+  if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }
+  else { reads.mockReturnValueOnce(pending.promise); fireEvent.click(button("刷新并重置历史窗口")); }
+  const target = item(row(3).id), point = { pointerId: 1, clientX: 100, clientY: 180 };
+  expect(offset(row(2).id)).toBe(-50);
+  fireEvent.pointerDown(target, point);
+  await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+  header += 30; tops.set(history(), 260); fireEvent.scroll(history());
+  expect(offset(row(2).id)).toBe(-50);
+  fireEvent.pointerUp(target, point); fireEvent.click(target, point);
+  await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(initial)));
+  if (operation === "send") expectVisible(row(9).id);
+  else expectTail();
+  expectRequests(operation === "send" ? [latestURL(), `/api/v1/groups/${group.id}/messages`] : [latestURL(), latestURL()]);
+});
+
+it.each(["send", "reset"])("compares the original pressed anchor, not a different first-visible message, during %s", async operation => {
+  gutterWidth = 0; await open(); readAt(history(), 230); const pending = deferred<Response>();
+  if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }
+  else { reads.mockReturnValueOnce(pending.promise); fireEvent.click(button("刷新并重置历史窗口")); }
+  const container = history(), point = { pointerId: 1, clientX: 312, clientY: 180 };
+  expect(offset(row(2).id)).toBe(-50); fireEvent.pointerDown(container, point);
+  container.scrollTop = 330; fireEvent.scroll(container);
+  expect(offset(row(3).id)).toBe(-50); expect(offset(row(2).id)).toBe(-150);
+  fireEvent.pointerUp(container, point);
+  await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(initial)));
+  expect(container.scrollTop).toBe(330); expect(offset(row(2).id)).toBe(-150);
+  expectRequests(operation === "send" ? [latestURL(), `/api/v1/groups/${group.id}/messages`] : [latestURL(), latestURL()]);
+});
+
+it("does not invent pointer evidence when no real message was visible at press", async () => {
+  header = 500; gutterWidth = 0; await open(); readAt(history(), 0);
+  const pending = deferred<Response>(); writes.mockReturnValueOnce(pending.promise); send();
+  const container = history(), point = { pointerId: 1, clientX: 290, clientY: 180 };
+  expect(item(row(1).id).getBoundingClientRect().top).toBeGreaterThan(container.getBoundingClientRect().bottom);
+  fireEvent.pointerDown(container, point);
+  header += 30; tops.set(container, 30); fireEvent.scroll(container); fireEvent.pointerUp(container, point);
+  header += 10; tops.set(container, 40); fireEvent.scroll(container);
+  await act(async () => pending.resolve(json({ ...row(9), content: raw }, 201)));
+  expectVisible(row(9).id); expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages`]);
+});
+
+it("does not substitute another anchor when the pressed message leaves the current window", async () => {
+  await open(); readAt(history(), 230);
+  const reset = deferred<Response>(), receipt = deferred<Response>(); reads.mockReturnValueOnce(reset.promise);
+  fireEvent.click(button("刷新并重置历史窗口")); writes.mockReturnValueOnce(receipt.promise); send();
+  const point = { pointerId: 1, clientX: 100, clientY: 180 };
+  fireEvent.pointerDown(item(row(3).id), point);
+  const sent = { ...row(9), content: raw };
+  await act(async () => reset.resolve(page([...initial.slice(2), sent, row(10), row(11), row(12)])));
+  expect(screen.queryByRole("article", { name: `消息 ${row(2).id}` })).not.toBeInTheDocument();
+  expectTail(); expect(item(sent.id).getBoundingClientRect().bottom).toBeLessThan(history().getBoundingClientRect().top);
+  fireEvent.pointerUp(history(), point);
+  await act(async () => receipt.resolve(json(sent, 201)));
+  expectVisible(sent.id); expect(screen.getAllByRole("article")).toHaveLength(10);
+  expectRequests([latestURL(), latestURL(), `/api/v1/groups/${group.id}/messages`]);
+});
+
+it("requires valid release geometry before treating an unmoved pointer as reading", async () => {
+  await open(); readAt(history(), 230); const pending = deferred<Response>(); writes.mockReturnValueOnce(pending.promise); send();
+  const point = { pointerId: 1, clientX: 100, clientY: 180 }, target = item(row(3).id);
+  fireEvent.pointerDown(target, point);
+  header += 30; tops.set(history(), 260); fireEvent.scroll(history());
+  const invalid = vi.spyOn(item(row(2).id), "getBoundingClientRect").mockReturnValue(rect(0, 0));
+  fireEvent.pointerUp(target, point); invalid.mockRestore();
+  header += 10; tops.set(history(), 270); fireEvent.scroll(history());
+  await act(async () => pending.resolve(json({ ...row(9), content: raw }, 201)));
+  expectVisible(row(9).id); expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages`]);
+});
+
 it.each(["send", "reset"])("keeps moved pointer input for scrolling delivered just after release during %s", async operation => {
   await open(); const pending = deferred<Response>();
   if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }

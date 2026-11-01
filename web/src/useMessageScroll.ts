@@ -4,7 +4,9 @@ import type { Message } from "./api";
 
 type Anchor = { id: string; offset: number };
 type PageIntent = { kind: "older" | "reset" | "restore"; anchor: Anchor | null; revision: number; started: boolean };
-type PointerInput = { id: number; x: number; y: number; top: number; moved: boolean; scrollbar: boolean };
+type PointerInput = {
+  id: number; x: number; y: number; top: number; anchor: Anchor | null; moved: boolean; scrollbar: boolean;
+};
 const tailTolerance = 16;
 const inputLifetime = 250;
 
@@ -27,7 +29,8 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
   function capture() {
     const history = historyRef.current, children = listRef.current?.children;
     if (!history || !history.clientHeight || !children?.length) return null;
-    const top = history.getBoundingClientRect().top;
+    const viewport = history.getBoundingClientRect(), top = viewport.top;
+    if (!viewport.height) return null;
     // Message order is already the feed's order. Binary search bounds layout reads on scroll.
     let low = 0, high = children.length;
     while (low < high) {
@@ -38,7 +41,8 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     const node = children[low] as HTMLElement | undefined;
     if (!node) return null;
     const box = node.getBoundingClientRect();
-    return box.top < top + history.clientHeight && node.dataset.messageId
+    return box.height > 0 && Number.isFinite(box.top - top)
+      && box.top < top + history.clientHeight && node.dataset.messageId
       ? { id: node.dataset.messageId, offset: box.top - top } : null;
   }
   function remember() {
@@ -123,7 +127,7 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
         && event.clientY < box.top + history.clientTop + history.clientHeight;
     }
     pointer.current = { id: event.pointerId, x: event.clientX, y: event.clientY,
-      top: history.scrollTop, moved: false, scrollbar };
+      top: history.scrollTop, anchor: capture(), moved: false, scrollbar };
     inputUntil.current = scrollbar ? performance.now() + inputLifetime : 0;
   }
   function onPointerMove(event: PointerEvent<HTMLElement>) {
@@ -137,8 +141,20 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     const current = pointer.current, history = historyRef.current;
     if (!current || current.id !== event.pointerId) return;
     pointer.current = null;
-    // Overlay scrollbars may expose no gutter; observed viewport movement is still evidence.
-    const shifted = Boolean(active && history?.clientHeight && history.scrollTop !== current.top);
+    let shifted = false;
+    if (active && history?.clientHeight) {
+      if (current.moved || current.scrollbar) shifted = history.scrollTop !== current.top;
+      else if (current.anchor) {
+        const node = nodeFor(current.anchor.id);
+        if (node) {
+          // Native compensation preserves this original message's viewport offset, not scrollTop.
+          const box = node.getBoundingClientRect(), viewport = history.getBoundingClientRect();
+          const offset = box.top - viewport.top;
+          shifted = box.height > 0 && viewport.height > 0 && Number.isFinite(offset)
+            && Math.abs(offset - current.anchor.offset) > 0.5;
+        }
+      }
+    }
     if (!current.moved && !current.scrollbar && !shifted) { inputUntil.current = 0; return; }
     inputUntil.current = performance.now() + inputLifetime;
     if (shifted) {
