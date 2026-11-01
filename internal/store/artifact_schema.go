@@ -23,8 +23,10 @@ CREATE TABLE artifact_versions (
     blob_hash TEXT NOT NULL CHECK(typeof(blob_hash)='text' AND length(blob_hash)=64
         AND length(CAST(blob_hash AS BLOB))=64 AND blob_hash NOT GLOB '*[^0-9a-f]*'),
     size INTEGER NOT NULL CHECK(typeof(size)='integer' AND size >= 0),
-    expected_version_id TEXT CHECK(expected_version_id IS NULL OR expected_version_id <> ''),
-    observed_version_id TEXT CHECK(observed_version_id IS NULL OR observed_version_id <> ''),
+    expected_version_id TEXT CHECK(expected_version_id IS NULL OR
+        (expected_version_id <> '' AND expected_version_id <> id)),
+    observed_version_id TEXT CHECK(observed_version_id IS NULL OR
+        (observed_version_id <> '' AND observed_version_id <> id)),
     applied INTEGER NOT NULL CHECK(typeof(applied)='integer' AND applied IN (0,1)),
     created_at TEXT NOT NULL,
     UNIQUE(id, artifact_id, group_id),

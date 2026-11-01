@@ -217,6 +217,28 @@ func TestArtifactVersionBindingsAndValues(t *testing.T) {
 	}
 }
 
+func TestArtifactVersionRejectsSelfReferences(t *testing.T) {
+	s, _ := openTestStore(t)
+	artifactForeignKeys(t, s.db)
+	g := group(t, s)
+	_, base := seedArtifact(t, s, g.ID, "artifact", "base", "user")
+	for _, field := range []string{"expected", "observed"} {
+		t.Run(field, func(t *testing.T) {
+			candidate := base
+			candidate.ID, candidate.Applied = "self-"+field, false
+			candidate.ExpectedVersionID, candidate.ObservedVersionID = base.ID, base.ID
+			if field == "expected" {
+				candidate.ExpectedVersionID = candidate.ID
+			} else {
+				candidate.ObservedVersionID = candidate.ID
+			}
+			if err := insertArtifactVersionRow(s.db, candidate); err == nil {
+				t.Fatalf("self-referencing %s version was accepted: %+v", field, candidate)
+			}
+		})
+	}
+}
+
 func TestArtifactImmutableRowsResistReplace(t *testing.T) {
 	s, _ := openTestStore(t)
 	g := group(t, s)
