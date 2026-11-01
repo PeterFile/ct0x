@@ -234,7 +234,7 @@ WHEN NEW.status='accepted' AND NOT EXISTS(SELECT 1 FROM task_review_decisions
     WHERE submission_id=NEW.current_submission_id AND task_id=NEW.id AND group_id=NEW.group_id
         AND task_revision=NEW.revision AND outcome='accepted')
 BEGIN SELECT RAISE(ABORT, '接纳任务必须有明确接纳的评审'); END;
-`, artifactSchemaV6, taskArtifactSchemaV7}
+`, artifactSchemaV6, taskArtifactSchemaV7, messageSequenceSchemaV8}
 
 // Migration history is explicit and contiguous; never infer it from table shape.
 func migrate(db *sql.DB) error {
