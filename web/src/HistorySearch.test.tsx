@@ -1,3 +1,4 @@
+import { StrictMode } from "react";
 import { act, createEvent, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { HistorySearch } from "./HistorySearch";
@@ -319,6 +320,88 @@ it("retries a failed complete read for its original result without using the sea
   await detail().findByText("重试读取的完整原文");
   expect(details.mock.calls[1][0]).toBe(details.mock.calls[0][0]); expect(reads).toHaveBeenCalledTimes(1);
 });
+const interruptions = (["search", "page", "detail"] as const).flatMap(operation =>
+  ([200, 503, "network"] as const).flatMap(outcome => [false, true].map(reopened => ({ operation, outcome, reopened }))));
+it.each(interruptions)("pauses $operation, ignores late $outcome (reopened=$reopened) and explicitly retries its original identity", async ({ operation, outcome, reopened }) => {
+  const q = " \u3000原始词 %_\\ ", topic = " \t话题 /?+ ", cursor = "opaque+/=?&";
+  const source = row("original", "原始摘录", topic), older = row("older", "更早的结果", topic);
+  const full = { ...source, content: "已确认的完整原文" }, stale = deferred<Response>();
+  const staleResponse = stale.promise.then(response => {
+    if (outcome === "network") throw new TypeError("English late network failure");
+    return response;
+  });
+  if (operation === "search") reads.mockReturnValueOnce(staleResponse);
+  else reads.mockResolvedValueOnce(page([source], cursor));
+  const view = open(); scope("topic"); change("话题 ID", topic); search(q);
+  if (operation !== "search") {
+    if (operation === "detail") details.mockReturnValueOnce(staleResponse);
+    else details.mockResolvedValueOnce(json(full));
+    fireEvent.click(await panel().findByRole("button", { name: `读取完整消息 ${source.id}` }));
+    if (operation === "page") {
+      await detail().findByText(full.content); reads.mockReturnValueOnce(staleResponse);
+      fireEvent.click(results().getByRole("button", { name: "加载更早结果" }));
+    }
+  }
+  const reader = operation === "detail" ? details : reads, interrupted = reader.mock.calls.at(-1)!;
+  const form = panel().getByRole("form"), keyword = panel().getByRole("textbox", { name: "关键词" });
+  const submitted = results().getByRole("list", { name: "已提交的检索条件" });
+  change("关键词", "尚未提交的新词"); scope("main");
+  view.rerender(<HistorySearch group={group} active={false} />);
+  expect(interrupted[1]?.signal?.aborted).toBe(true);
+  expect(panel().getByRole("alert")).toHaveTextContent("已暂停");
+  expect(panel().queryByRole("status")).not.toBeInTheDocument();
+  expect(panel().queryByText("未找到匹配的历史消息。")).not.toBeInTheDocument();
+  expect(panel().getByRole("form")).toBe(form); expect(keyword).toHaveValue("尚未提交的新词");
+  expect(within(submitted).getByText(q, { normalizer: text => text })).toBeInTheDocument();
+  expect(within(submitted).getByText(topic, { normalizer: text => text })).toBeInTheDocument();
+  if (operation === "page") expect(detail().getByText(full.content)).toBeVisible();
+  const calls = transport.mock.calls.length, current = deferred<Response>();
+  const retry = () => {
+    view.rerender(<HistorySearch group={{ ...group, name: "同一群组的新名称" }} active />);
+    expect(transport).toHaveBeenCalledTimes(calls);
+    reader.mockReturnValueOnce(current.promise);
+    fireEvent.click(panel().getByRole("button", { name: operation === "detail" ? "重试读取完整消息" : "重试搜索" }));
+    expect(reader.mock.calls.at(-1)?.[0]).toBe(interrupted[0]);
+    expect(reader.mock.calls.at(-1)?.[1]?.signal?.aborted).toBe(false);
+  };
+  if (reopened) retry();
+  await act(async () => stale.resolve(outcome === 503 ? json({}, 503)
+    : operation === "detail" ? json({ ...source, content: "过期完整原文" }) : page([row("stale", "过期搜索结果", topic)], "stale-cursor")));
+  expect(panel().queryByText(/过期/)).not.toBeInTheDocument();
+  if (reopened) { expect(panel().queryByRole("alert")).not.toBeInTheDocument(); expect(panel().getByRole("status")).toBeVisible(); }
+  else { expect(panel().getByRole("alert")).toHaveTextContent("已暂停"); expect(transport).toHaveBeenCalledTimes(calls); retry(); }
+  await act(async () => current.resolve(operation === "detail" ? json(full) : page(operation === "page" ? [older] : [source])));
+  if (operation === "detail") expect(detail().getByText(full.content)).toBeVisible();
+  else expect(read(operation === "page" ? older.id : source.id)).toBeVisible();
+  if (operation === "page") { expect(read(source.id)).toBeVisible(); expect(detail().getByText(full.content)).toBeVisible(); }
+  const completedCalls = transport.mock.calls.length;
+  view.rerender(<HistorySearch group={group} active={false} />); view.rerender(<HistorySearch group={group} active />);
+  expect(transport).toHaveBeenCalledTimes(completedCalls); expect(panel().getByRole("form")).toBe(form);
+  expect(results().getByRole("list", { name: "已提交的检索条件" })).toBe(submitted);
+  expect(keyword).toHaveValue("尚未提交的新词"); expect(panel().queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("resets the keyed group while inactive without hidden reads or a per-group query cache", async () => {
+  reads.mockResolvedValueOnce(page([message])); const view = open(); search("A 的关键词");
+  fireEvent.click(await panel().findByRole("button", { name: `读取完整消息 ${message.id}` })); await detail().findByText(message.content);
+  change("关键词", "A 的未提交草稿"); const form = panel().getByRole("form");
+  view.rerender(<HistorySearch group={group} active={false} />);
+  view.rerender(<HistorySearch group={other} active={false} />);
+  expect(form).not.toBeInTheDocument(); expect(panel().getByRole("textbox", { name: "关键词" })).toHaveValue("");
+  expect(panel().queryByRole("region", { name: "历史搜索结果" })).not.toBeInTheDocument();
+  expect(panel().queryByRole("region", { name: "完整消息" })).not.toBeInTheDocument();
+  view.rerender(<HistorySearch group={group} active={false} />); view.rerender(<HistorySearch group={group} active />);
+  expect(panel().getByRole("textbox", { name: "关键词" })).toHaveValue("");
+  expect(reads).toHaveBeenCalledTimes(1); expect(details).toHaveBeenCalledTimes(1);
+});
+
+it("keeps the default active behavior through StrictMode effect replay", async () => {
+  render(<StrictMode><HistorySearch group={group} /></StrictMode>); expect(transport).not.toHaveBeenCalled();
+  search(); await results().findByText("未找到匹配的历史消息。");
+  expect(reads).toHaveBeenCalledTimes(2); expect(reads.mock.calls[0][1]?.signal?.aborted).toBe(true);
+  expect(results().queryByRole("alert")).not.toBeInTheDocument();
+});
+
 it("aborts page and detail on unmount and ignores late responses when transport does not honor abort", async () => {
   reads.mockResolvedValueOnce(page([message], "next")); const view = open(); search();
   const pendingDetail = deferred<Response>(); details.mockReturnValueOnce(pendingDetail.promise);
