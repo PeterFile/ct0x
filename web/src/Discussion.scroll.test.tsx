@@ -574,6 +574,20 @@ it("requires valid release geometry before treating an unmoved pointer as readin
   expectVisible(row(9).id); expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages`]);
 });
 
+it.each(["send", "reset"])("review: layout-only change without any viewport scroll cannot cancel %s on pointer release", async operation => {
+  await open(); readAt(history(), 230); const pending = deferred<Response>();
+  if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }
+  else { reads.mockReturnValueOnce(pending.promise); fireEvent.click(button("刷新并重置历史窗口")); }
+  const target = item(row(3).id), point = { pointerId: 1, clientX: 100, clientY: 180 };
+  fireEvent.pointerDown(target, point);
+  header += 30;
+  expect(history().scrollTop).toBe(230);
+  fireEvent.pointerUp(target, point); fireEvent.click(target, point);
+  await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(initial)));
+  if (operation === "send") expectVisible(row(9).id);
+  else expectTail();
+});
+
 it.each(["send", "reset"])("keeps moved pointer input for scrolling delivered just after release during %s", async operation => {
   await open(); const pending = deferred<Response>();
   if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }

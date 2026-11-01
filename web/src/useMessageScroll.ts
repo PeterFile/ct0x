@@ -144,7 +144,7 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     let shifted = false;
     if (active && history?.clientHeight) {
       if (current.moved || current.scrollbar) shifted = history.scrollTop !== current.top;
-      else if (current.anchor) {
+      else if (history.scrollTop !== current.top && current.anchor) {
         const node = nodeFor(current.anchor.id);
         if (node) {
           // Native compensation preserves this original message's viewport offset, not scrollTop.
