@@ -118,7 +118,15 @@ func (s *Store) GetTaskReview(ctx context.Context, groupID, taskID, decisionID s
 }
 
 func taskReviewInTx(ctx context.Context, tx *sql.Tx, groupID, taskID, decisionID string) (domain.ReviewDecision, error) {
-	return scanTaskReview(tx.QueryRowContext(ctx, "SELECT "+taskReviewColumns+" FROM task_review_decisions WHERE group_id=? AND task_id=? AND id=?", groupID, taskID, decisionID))
+	decision, err := scanTaskReview(tx.QueryRowContext(ctx, "SELECT "+taskReviewColumns+" FROM task_review_decisions WHERE group_id=? AND task_id=? AND id=?", groupID, taskID, decisionID))
+	if err != nil {
+		return domain.ReviewDecision{}, err
+	}
+	refs, err := taskArtifactRefsInTx(ctx, tx, groupID, taskID, []string{decision.SubmissionID})
+	if err == nil {
+		decision.ArtifactVersions = refs[decision.SubmissionID]
+	}
+	return decision, err
 }
 
 func scanTaskReview(row scanner) (decision domain.ReviewDecision, err error) {
@@ -176,6 +184,17 @@ func (s *Store) ListTaskReviews(ctx context.Context, groupID, taskID string, opt
 		page.Items = page.Items[:limit]
 		last := page.Items[limit-1]
 		page.NextCursor = &Cursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	ids := make([]string, len(page.Items))
+	for i, decision := range page.Items {
+		ids[i] = decision.SubmissionID
+	}
+	refs, err := taskArtifactRefsInTx(ctx, tx, groupID, taskID, ids)
+	if err != nil {
+		return Page[domain.ReviewDecision]{}, taskError("读取评审成果引用失败", err)
+	}
+	for i := range page.Items {
+		page.Items[i].ArtifactVersions = refs[page.Items[i].SubmissionID]
 	}
 	if err := tx.Commit(); err != nil {
 		return Page[domain.ReviewDecision]{}, taskError("列出任务评审失败", err)

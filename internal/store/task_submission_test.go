@@ -119,8 +119,9 @@ func TestTaskSubmissionInvalidInputDoesNotBurnReceipt(t *testing.T) {
 	s, _, task, _, input := taskSubmissionHuman(t)
 	for _, change := range []func(*SubmitTaskInput){
 		func(i *SubmitTaskInput) { i.Summary = " \t" },
+		// Complete missing refs now use real scoped lookup; TaskArtifact tests cover ErrNotFound.
 		func(i *SubmitTaskInput) {
-			i.ArtifactVersions = []domain.ArtifactVersionRef{{ArtifactID: "fake", VersionID: "opaque-version"}}
+			i.ArtifactVersions = []domain.ArtifactVersionRef{{ArtifactID: "fake", VersionID: ""}}
 		},
 		func(i *SubmitTaskInput) { i.ArtifactVersions = []domain.ArtifactVersionRef{{}} },
 	} {

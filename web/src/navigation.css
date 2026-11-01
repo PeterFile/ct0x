@@ -1,0 +1,17 @@
+.workspace-navigation {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.workspace-navigation button[aria-pressed="true"] { background: var(--color-panel); }
+.workspace-main .discussion-page:not([hidden]) {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.workspace-main .tasks-page { padding-block-start: var(--space-4); }
+@media (max-width: 56rem) {
+  .workspace-main .discussion-page:not([hidden]) { flex: none; }
+}
