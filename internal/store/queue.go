@@ -18,12 +18,14 @@ const turnColumns = `id,group_id,delivery_id,conversation_id,member_id,claim_tok
 
 type PendingDelivery struct {
 	GroupID  string          `json:"group_id"`
+	SenderID string          `json:"sender_id"`
 	Delivery domain.Delivery `json:"delivery"`
 }
 
 type PendingOptions struct {
 	Limit int // Zero selects 50; maximum 200.
 	After *Cursor
+	Lane  string // Empty scans all; "human" selects sender_id=user; "work" selects all other senders.
 }
 
 type ClaimTurnInput struct {
@@ -38,11 +40,21 @@ func (s *Store) ListPendingDeliveries(ctx context.Context, options PendingOption
 	if err != nil {
 		return Page[PendingDelivery]{}, err
 	}
-	query := `SELECT d.group_id,d.id,d.message_id,d.conversation_id,d.recipient_id,d.state,d.turn_id,d.error,d.created_at
+	if options.Lane != "" && options.Lane != "human" && options.Lane != "work" {
+		return Page[PendingDelivery]{}, queueError("扫描待投递失败", ErrInvalid)
+	}
+	query := `SELECT d.group_id,msg.sender_id,d.id,d.message_id,d.conversation_id,d.recipient_id,d.state,d.turn_id,d.error,d.created_at
 	 FROM deliveries d JOIN members m ON m.id=d.recipient_id AND m.group_id=d.group_id
+	 JOIN messages msg ON msg.id=d.message_id AND msg.group_id=d.group_id
 	 WHERE d.state='queued' AND d.turn_id='' AND m.status='active'
 	 AND NOT EXISTS(SELECT 1 FROM turns WHERE (conversation_id=d.conversation_id OR member_id=d.recipient_id) AND ` + activeTurnPredicate + `)`
 	args := []any{}
+	switch options.Lane {
+	case "human":
+		query += " AND msg.sender_id='user'"
+	case "work":
+		query += " AND msg.sender_id<>'user'"
+	}
 	if c := options.After; c != nil {
 		query += " AND (d.created_at,d.id)>(?,?)"
 		args = append(args, c.CreatedAt.UTC().Format(timestampLayout), c.ID)
@@ -58,7 +70,7 @@ func (s *Store) ListPendingDeliveries(ctx context.Context, options PendingOption
 		var pending PendingDelivery
 		var stamp string
 		d := &pending.Delivery
-		err := rows.Scan(&pending.GroupID, &d.ID, &d.MessageID, &d.ConversationID, &d.RecipientID, &d.State, &d.TurnID, &d.Error, &stamp)
+		err := rows.Scan(&pending.GroupID, &pending.SenderID, &d.ID, &d.MessageID, &d.ConversationID, &d.RecipientID, &d.State, &d.TurnID, &d.Error, &stamp)
 		if err == nil {
 			d.CreatedAt, err = time.Parse(timestampLayout, stamp)
 		}
