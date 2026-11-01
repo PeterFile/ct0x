@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { ApiError, createGroup, listGroups } from "./api";
+import { ApiError, createGroup, isDefinitiveRejection, listGroups } from "./api";
 import type { Group, GroupInput } from "./api";
+import { CreationDisclosure } from "./CreationDisclosure";
 
 function unique(groups: Group[]) {
   const seen = new Set<string>();
@@ -69,7 +70,7 @@ export function Groups({ selectedId, onSelect }: { selectedId?: string; onSelect
       setMutation({ pending: false, error: "", uncertain: false });
     } catch (error) {
       if (!mounted.current) return;
-      const uncertain = !(error instanceof ApiError && [400, 404, 409].includes(error.status));
+      const uncertain = !isDefinitiveRejection(error);
       if (!uncertain) operation.current = null;
       setMutation({ pending: false, uncertain, error: uncertain
         ? `创建结果未确认。${errorText(error)} 请重试同一次创建。` : errorText(error) });
@@ -91,7 +92,7 @@ export function Groups({ selectedId, onSelect }: { selectedId?: string; onSelect
         </ul>
         {page.next ? <button type="button" disabled={page.pending} onClick={() => load(page.next)}>加载更多群组</button> : null}
       </div>
-      <form aria-label="创建群组" onSubmit={submit}>
+      <CreationDisclosure label="创建群组" pending={mutation.pending} error={mutation.error} onSubmit={submit}>
         <fieldset disabled={mutation.pending || mutation.uncertain}>
           <legend>创建群组</legend>
           <label htmlFor="group-name">群组名称</label>
@@ -103,7 +104,7 @@ export function Groups({ selectedId, onSelect }: { selectedId?: string; onSelect
         <button type="submit" disabled={mutation.pending}>
           {mutation.pending ? "正在创建…" : mutation.uncertain ? "重试同一次创建" : "创建群组"}
         </button>
-      </form>
+      </CreationDisclosure>
     </div>
   );
 }
