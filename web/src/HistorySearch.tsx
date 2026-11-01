@@ -1,4 +1,4 @@
-import { useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError } from "./api";
 import type { Group, Message } from "./api";
@@ -36,10 +36,26 @@ function SearchScope({ groupId }: { groupId: string }) {
   const [keyword, setKeyword] = useState("");
   const [scope, setScope] = useState("all");
   const [topicId, setTopicId] = useState("");
+  const [topicBlocked, setTopicBlocked] = useState(false);
+  const topicInput = useRef<HTMLInputElement>(null);
   const [error, setError] = useState("");
   const [submitted, setSubmitted] = useState<{ query: HistoryQuery; version: number } | null>(null);
+  const rejectTopicLineBreaks = useCallback((event: { preventDefault(): void }, text: string) => {
+    if (!/[\r\n]/.test(text)) return;
+    event.preventDefault();
+    setTopicId(""); setTopicBlocked(true); setError("");
+  }, []);
+  useEffect(() => {
+    const input = topicInput.current;
+    if (!input) return;
+    // React's synthetic onBeforeInput does not subscribe to native beforeinput.
+    const beforeInput = (event: InputEvent) => rejectTopicLineBreaks(event, event.data ?? event.dataTransfer?.getData("text/plain") ?? "");
+    input.addEventListener("beforeinput", beforeInput);
+    return () => input.removeEventListener("beforeinput", beforeInput);
+  }, [scope, rejectTopicLineBreaks]);
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (scope === "topic" && topicBlocked) return;
     if (!keyword.trim()) { setError("请输入关键词。"); return; }
     if (scope === "topic" && topicId === "") { setError("请输入话题 ID；主频道请从检索范围中选择。"); return; }
     setError("");
@@ -53,16 +69,21 @@ function SearchScope({ groupId }: { groupId: string }) {
           <input id={`${formId}-keyword`} required value={keyword} onChange={event => setKeyword(event.target.value)} />
         </label>
         <label htmlFor={`${formId}-scope`}>检索范围
-          <select id={`${formId}-scope`} value={scope} onChange={event => setScope(event.target.value)}>
+          <select id={`${formId}-scope`} value={scope} onChange={event => { setScope(event.target.value); setTopicBlocked(false); setError(""); }}>
             <option value="all">整个群组</option><option value="main">主频道</option><option value="topic">指定话题 ID</option>
           </select>
         </label>
         {scope === "topic" ? <label htmlFor={`${formId}-topic`}>话题 ID
-          <input id={`${formId}-topic`} required aria-describedby={`${formId}-topic-note`} value={topicId} onChange={event => setTopicId(event.target.value)} />
+          <input ref={topicInput} id={`${formId}-topic`} required aria-invalid={topicBlocked || undefined}
+            aria-describedby={`${formId}-topic-note${topicBlocked ? ` ${formId}-topic-error` : ""}`} value={topicId}
+            onPaste={event => rejectTopicLineBreaks(event, event.clipboardData.getData("text/plain"))}
+            onDrop={event => rejectTopicLineBreaks(event, event.dataTransfer.getData("text/plain"))}
+            onChange={event => { setTopicId(event.target.value); setTopicBlocked(false); }} />
         </label> : null}
       </div>
-      {scope === "topic" ? <p id={`${formId}-topic-note`} className="history-search-note">按原始 ID 精确匹配，保留空白。</p> : null}
-      {error ? <p role="alert">{error}</p> : null}
+      {scope === "topic" ? <p id={`${formId}-topic-note`} className="history-search-note">ID 精确匹配；含回车或换行的话题请用整个群组搜索。</p> : null}
+      {topicBlocked ? <p id={`${formId}-topic-error`} role="alert">话题 ID 手动输入不支持回车或换行。请重新输入，或搜索整个群组，找到消息后读取完整消息。</p>
+        : error ? <p role="alert">{error}</p> : null}
       <button className="history-search-submit" type="submit">搜索历史消息</button>
     </form>
     {/* Each submission owns its cursors, results and detail, independently of the draft. */}

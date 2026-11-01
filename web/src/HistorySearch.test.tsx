@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, createEvent, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { HistorySearch } from "./HistorySearch";
 import { deferred, group, json, other, page } from "./test/groups";
@@ -16,6 +16,15 @@ const read = (id = message.id) => panel().getByRole("button", { name: `读取完
 const open = () => render(<HistorySearch group={group} />);
 const row = (id: string, content: string, topic = "") => ({ ...message, id, content, topic_id: topic, deliveries: [] });
 const params = (index: number) => new URL(String(reads.mock.calls[index][0]), "http://localhost").searchParams;
+const topicEntryMethods = ["paste", "beforeinput", "drop"] as const;
+function topicEntry(input: HTMLElement, method: typeof topicEntryMethods[number], text: string) {
+  const transfer = { getData: (format: string) => format === "text/plain" || format === "text" ? text : "" };
+  const event = method === "beforeinput"
+    ? new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertText", data: text })
+    : method === "paste" ? createEvent.paste(input, { clipboardData: transfer }) : createEvent.drop(input, { dataTransfer: transfer });
+  fireEvent(input, event);
+  return event;
+}
 
 beforeEach(() => {
   reads.mockReset().mockImplementation(async () => page());
@@ -60,6 +69,90 @@ it.each([
   expect(params(0).has("topic_id")).toBe(spec.topic !== undefined); expect(params(0).get("topic_id")).toBe(spec.topic ?? null);
   expect(params(0).get("limit")).toBe("50"); expect(params(0).has("before")).toBe(false);
   expect(transport.mock.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+});
+
+it("reproduces native single-line CR/LF stripping before onChange and textarea CRLF normalization", () => {
+  open(); scope("topic");
+  for (const newline of ["\r", "\n", "\r\n"]) {
+    change("话题 ID", ` section${newline}line `);
+    expect(panel().getByRole("textbox", { name: "话题 ID" })).toHaveValue(" sectionline ");
+  }
+  const textarea = document.createElement("textarea"); textarea.value = " section\r\nline ";
+  expect(textarea.value).toBe(" section\nline "); expect(transport).not.toHaveBeenCalled();
+});
+it.each(topicEntryMethods.flatMap(method => ["\r", "\n", "\r\n"].map(newline => ({ method, newline }))))(
+  "rejects raw $method newline $newline before normalization and blocks the old topic across submissions", ({ method, newline }) => {
+    open(); change("关键词", "关键词"); scope("topic"); change("话题 ID", " previous-valid-topic ");
+    const input = panel().getByRole("textbox", { name: "话题 ID" });
+    expect(topicEntry(input, method, ` section${newline}line `).defaultPrevented).toBe(true);
+    expect(input).toHaveValue("");
+    expect(panel().getByRole("alert")).toHaveTextContent(/话题 ID.*不支持.*回车.*换行/);
+    expect(panel().getByRole("alert")).toHaveTextContent(/整个群组.*完整消息/);
+    submit(); submit(); change("关键词", "只修改关键词不能修复话题"); submit();
+    expect(transport).not.toHaveBeenCalled();
+    expect(panel().getByRole("alert")).toHaveTextContent(/话题 ID.*不支持.*回车.*换行/);
+  },
+);
+it.each(topicEntryMethods)("allows an intentional replacement through %s without treating literal backslash-r/backslash-n as line breaks", async method => {
+  open(); change("关键词", "关键词"); scope("topic"); change("话题 ID", "old-valid-topic");
+  const input = panel().getByRole("textbox", { name: "话题 ID" });
+  topicEntry(input, method, " section\r\nline "); submit(); expect(transport).not.toHaveBeenCalled();
+  const replacement = " \\r\\n话题 /?+ \t ";
+  expect(topicEntry(input, method, replacement).defaultPrevented).toBe(false);
+  // JSDOM dispatches entry events but does not perform their default text insertion.
+  change("话题 ID", replacement); expect(panel().queryByRole("alert")).not.toBeInTheDocument(); submit();
+  await results().findByText("未找到匹配的历史消息。"); expect(params(0).get("topic_id")).toBe(replacement);
+});
+it.each(["all", "main"])("allows explicit %s fallback but cannot reuse the old target when returning to specified-topic", async fallback => {
+  open(); change("关键词", "关键词"); scope("topic"); change("话题 ID", "old-valid-topic");
+  topicEntry(panel().getByRole("textbox", { name: "话题 ID" }), "paste", " section\r\nline ");
+  scope(fallback); expect(panel().queryByRole("alert")).not.toBeInTheDocument(); submit();
+  await results().findByText("未找到匹配的历史消息。");
+  expect(params(0).has("topic_id")).toBe(fallback === "main"); expect(params(0).get("topic_id")).toBe(fallback === "main" ? "" : null);
+  scope("topic"); expect(panel().getByRole("textbox", { name: "话题 ID" })).toHaveValue(""); submit();
+  expect(reads).toHaveBeenCalledTimes(1); expect(panel().getByRole("alert")).toHaveTextContent("请输入话题 ID");
+  change("话题 ID", "deliberately-repaired"); submit(); await results().findByText("未找到匹配的历史消息。");
+  expect(params(1).get("topic_id")).toBe("deliberately-repaired");
+});
+it("rejects raw native beforeinput transfer text even when InputEvent.data is null", () => {
+  open(); change("关键词", "关键词"); scope("topic"); change("话题 ID", "old-valid-topic");
+  const input = panel().getByRole("textbox", { name: "话题 ID" });
+  const event = new InputEvent("beforeinput", { bubbles: true, cancelable: true, inputType: "insertFromPaste", data: null });
+  Object.defineProperty(event, "dataTransfer", { value: { getData: (format: string) => format === "text/plain" ? " section\r\nline " : "" } });
+  fireEvent(input, event); expect(event.defaultPrevented).toBe(true); submit(); expect(transport).not.toHaveBeenCalled();
+});
+it("cleans up the native beforeinput listener on scope changes and unmount", () => {
+  const view = open(); scope("topic"); const first = panel().getByRole("textbox", { name: "话题 ID" });
+  expect(topicEntry(first, "beforeinput", "bad\r\ntopic").defaultPrevented).toBe(true);
+  scope("all"); expect(topicEntry(first, "beforeinput", "bad\r\ntopic").defaultPrevented).toBe(false);
+  scope("topic"); const second = panel().getByRole("textbox", { name: "话题 ID" });
+  expect(topicEntry(second, "beforeinput", "bad\r\ntopic").defaultPrevented).toBe(true);
+  view.unmount(); expect(topicEntry(second, "beforeinput", "bad\r\ntopic").defaultPrevented).toBe(false);
+});
+it("keeps submitted results, pending pagination and complete detail unchanged by a rejected topic draft", async () => {
+  const topic = " original-topic ", source = row("original", "原始搜索结果", topic), older = row("older", "更早结果", topic);
+  reads.mockResolvedValueOnce(page([source], "original-cursor")); details.mockResolvedValueOnce(json({ ...source, content: "原始完整消息" }));
+  open(); scope("topic"); change("话题 ID", topic); search("已提交词");
+  fireEvent.click(await panel().findByRole("button", { name: `读取完整消息 ${source.id}` })); await detail().findByText("原始完整消息");
+  const pending = deferred<Response>(); reads.mockReturnValueOnce(pending.promise); fireEvent.click(results().getByRole("button", { name: "加载更早结果" }));
+  topicEntry(panel().getByRole("textbox", { name: "话题 ID" }), "beforeinput", " section\r\nline ");
+  change("关键词", "无效草稿的新词"); submit();
+  expect(reads).toHaveBeenCalledTimes(2); expect(reads.mock.calls[1][1]?.signal?.aborted).toBe(false);
+  expect(read(source.id)).toBeVisible(); expect(detail().getByText("原始完整消息")).toBeVisible();
+  expect(within(results().getByRole("list", { name: "已提交的检索条件" })).getByText(topic, { normalizer: text => text })).toBeVisible();
+  await act(async () => pending.resolve(page([older])));
+  expect(read(older.id)).toBeVisible(); expect(params(1).get("topic_id")).toBe(topic); expect(params(1).get("before")).toBe("original-cursor");
+  expect(detail().getByText("原始完整消息")).toBeVisible(); expect(details).toHaveBeenCalledTimes(1);
+});
+it("finds a raw CRLF topic through entire-group fallback and retains its exact server topic in the full-read URL", async () => {
+  const topic = " section\r\nline ", source = row("raw-topic-message", "含换行话题的搜索结果", topic);
+  reads.mockResolvedValueOnce(page([source])); details.mockResolvedValueOnce(json({ ...source, content: "含换行话题的完整原文" }));
+  open(); scope("topic"); change("话题 ID", "previous-valid-topic");
+  topicEntry(panel().getByRole("textbox", { name: "话题 ID" }), "drop", topic); search("关键词"); expect(reads).not.toHaveBeenCalled();
+  scope("all"); submit(); fireEvent.click(await panel().findByRole("button", { name: `读取完整消息 ${source.id}` }));
+  await detail().findByText("含换行话题的完整原文"); expect(params(0).has("topic_id")).toBe(false);
+  expect(details.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history/${source.id}?topic_id=+section%0D%0Aline+`);
+  expect(new URL(String(details.mock.calls[0][0]), "http://localhost").searchParams.get("topic_id")).toBe(topic);
 });
 
 it("rejects blank keywords and missing specified IDs locally, but leaves nonblank length validation to the backend", async () => {
