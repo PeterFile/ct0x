@@ -49,7 +49,8 @@ type ExecuteRequest struct {
 // Response events are completed assistant text snapshots, replacing earlier
 // snapshots (including failed retry responses), not streaming deltas or thoughts.
 // Terminal is native evidence, not permission to release external resources.
-// JSONL frames are capped at 64 KiB; oversized/invalid output makes the outcome
+// JSONL frames are capped at 64 KiB (1 MiB for opt-in Pi member tools), excluding
+// LF but including an optional CR. Oversized/invalid output makes the outcome
 // unknown while draining continues. Response text is bounded by that frame size.
 type Event struct {
 	Kind            EventKind `json:"kind"`
@@ -91,8 +92,9 @@ type Executor interface {
 }
 
 type executionCommand struct {
-	path    string
-	timeout time.Duration
+	path        string
+	timeout     time.Duration
+	memberTools *piMemberToolOptions
 }
 
 type piExecutor struct{ executionCommand }
@@ -171,8 +173,15 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	defer stderr.Close()
 	outLog, errLog := &executionLog{file: stdout, cancel: cancel}, &executionLog{file: stderr, cancel: cancel}
 	delivery := newExecutionDelivery(ctx, cancel, onEvent)
-	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex}
-	args := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", "--no-tools", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--session-dir", dir, "--session-id", request.RunID}
+	frameLimit, toolFlag := executionFrameLimit, "--no-tools"
+	if e.memberTools != nil {
+		frameLimit, toolFlag = piMemberToolFrameLimit, "--no-builtin-tools"
+	}
+	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex, frameLimit: frameLimit}
+	args := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", toolFlag, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--session-dir", dir, "--session-id", request.RunID}
+	if e.memberTools != nil {
+		args = append(args, "--tools", piMemberToolNames, "--extension", e.memberTools.extensionPath)
+	}
 	if codex {
 		args = []string{"--ask-for-approval", "never", "exec", "--json", "--sandbox", "read-only", "--ignore-user-config", "--ephemeral", "--cd", request.CWD, "--skip-git-repo-check", "--color", "never"}
 	}
@@ -185,20 +194,32 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	if codex {
 		args = append(args, "-")
 	}
-	outDrain, errDrain := &executionDrain{Writer: out}, &executionDrain{Writer: errLog}
+	var frames *executionFrames
+	var output io.Writer = out
+	if e.memberTools != nil {
+		frames = newExecutionFrames(outLog, cancel, out.recordFrame)
+		output = frames
+	}
+	outDrain, errDrain := &executionDrain{Writer: output}, &executionDrain{Writer: errLog}
 	cmd := exec.CommandContext(ctx, e.path, args...)
 	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = request.CWD, strings.NewReader(request.Prompt), outDrain, errDrain
-	// WaitDelay bounds inherited pipes, not descendants' lifetimes or callback
-	// work. Wait joins the parser/copying goroutines; delivery is joined separately.
+	if e.memberTools != nil {
+		cmd.Env = piMemberToolEnvironment(os.Environ(), e.memberTools.configPath)
+	}
+	// WaitDelay bounds inherited pipes, not descendants' lifetimes or callbacks.
+	// Tools mode keeps JSON parsing off the copier; plain adapters stay synchronous.
+	// Wait joins pipe readers, then tools parsing and finally event delivery join.
 	cmd.WaitDelay = 100 * time.Millisecond
 	if cmd.Start() != nil {
+		frames.finish()
 		delivery.finish()
 		r.Reason = "无法启动模型进程，提示词未被接收"
 		return r
 	}
 	r.Started, r.Outcome = true, OutcomeUnknown
 	err = cmd.Wait()
-	// Only now may the queue close. Consolidate delivery failure after its sole
+	frames.finish()
+	// Only now may the event queue close. Consolidate delivery failure after its sole
 	// consumer finishes, including failures racing normal native completion.
 	r.DeliveryFailed = delivery.finish()
 	r.DirectChildReaped = cmd.ProcessState != nil
