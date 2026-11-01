@@ -7,11 +7,22 @@ import { deferred, group, json, other, page } from "./test/groups";
 const transport = vi.fn<typeof fetch>();
 const posts = () => transport.mock.calls.filter(([, init]) => init?.method === "POST");
 const nameInput = () => screen.getByRole("textbox", { name: "群组名称" });
+function openCreateGroup() {
+  const toggle = screen.queryByRole("button", { name: "展开创建群组" });
+  if (toggle) fireEvent.click(toggle);
+}
 function submit(name = "调研") {
+  openCreateGroup();
   fireEvent.change(nameInput(), { target: { value: name } });
   fireEvent.submit(screen.getByRole("form", { name: "创建群组" }));
 }
-beforeEach(() => { transport.mockReset(); transport.mockImplementation(async () => page()); vi.stubGlobal("fetch", transport); });
+beforeEach(() => {
+  transport.mockReset();
+  transport.mockImplementation(async () => page());
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) =>
+    String(input).includes("/members") || String(input).includes("/messages") || String(input).startsWith("/api/v1/providers")
+      ? Promise.resolve(page()) : transport(input, init));
+});
 afterEach(() => vi.unstubAllGlobals());
 
 describe("workspace groups", () => {
@@ -42,8 +53,9 @@ describe("workspace groups", () => {
     render(<App />);
     expect(screen.getByText("正在载入群组…")).toBeVisible();
     await screen.findByText("尚无群组，可在下方创建。");
+    openCreateGroup();
     expect(nameInput()).toBeRequired();
-    expect(within(screen.getByRole("main")).getByText("消息尚未载入，发送功能尚未开放。")).toBeVisible();
+    expect(within(screen.getByRole("main")).getByText("请先选择群组，再查看讨论和发送消息。")).toBeVisible();
     expect(within(screen.getByRole("main")).queryByRole("textbox")).not.toBeInTheDocument();
     expect(within(screen.getByRole("complementary", { name: "成员" })).queryByRole("button")).not.toBeInTheDocument();
   });
@@ -82,6 +94,7 @@ describe("workspace groups", () => {
     await screen.findByText("尚无群组，可在下方创建。");
     const response = deferred<Response>();
     transport.mockReturnValueOnce(response.promise);
+    openCreateGroup();
     fireEvent.change(screen.getByRole("textbox", { name: "群组说明（可选）" }), { target: { value: group.description } });
     submit();
     fireEvent.submit(screen.getByRole("form", { name: "创建群组" }));
@@ -119,14 +132,19 @@ describe("workspace groups", () => {
     expect(posts()).toHaveLength(2);
   });
 
-  it("allows correction after definitive validation rejection with a new key", async () => {
+  it.each([400, 413, 415])("allows correction after definitive validation rejection HTTP %s with a new key", async status => {
     render(<App />);
     await screen.findByText("尚无群组，可在下方创建。");
-    transport.mockResolvedValueOnce(json({ error: { code: "invalid", message: "名称无效" } }, 400));
-    submit();
-    expect(await screen.findByRole("alert")).toHaveTextContent("400");
+    const rejectedName = status === 413 ? group.name.repeat(100) : group.name;
+    const code = status === 413 ? "body_too_large" : status === 415 ? "unsupported_media_type" : "invalid";
+    transport.mockResolvedValueOnce(json({ error: { code, message: "请求被拒绝" } }, status));
+    submit(rejectedName);
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(String(status));
+    if (status === 413) expect(alert).toHaveTextContent("请求内容过大");
+    if (status === 415) expect(alert).toHaveTextContent("仅接受 JSON");
     expect(nameInput()).toBeEnabled();
-    expect(nameInput()).toHaveValue(group.name);
+    expect(nameInput()).toHaveValue(rejectedName);
     transport.mockResolvedValueOnce(json(other, 201));
     submit(other.name);
     await screen.findByRole("button", { name: other.name });
