@@ -16,6 +16,7 @@ const change = (name: string, value: string) => fireEvent.change(field(name), { 
 const submit = () => fireEvent.submit(panel().getByRole("form", { name: "创建成员" }));
 function selectGroup(name: string) {
   fireEvent.click(screen.getByRole("button", { name }));
+  if (!screen.queryByRole("complementary", { name: "成员" })) fireEvent.click(screen.getByRole("button", { name: "成员" }));
   const toggle = within(screen.getByRole("complementary", { name: "成员" })).queryByRole("button", { name: "展开创建成员" });
   if (toggle) fireEvent.click(toggle);
 }
@@ -36,7 +37,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 it("does not load members or enable creation before a group is selected", async () => {
-  render(<App />);
+  render(<App />); fireEvent.click(screen.getByRole("button", { name: "成员" }));
   await screen.findByRole("button", { name: group.name });
   expect(panel().getByText("请先选择群组，再查看成员。")).toBeVisible();
   expect(panel().queryByRole("form")).not.toBeInTheDocument();
