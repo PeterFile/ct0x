@@ -21,7 +21,7 @@ export function App() {
     setMembers(previous => ({ ...previous, [groupId]: items }));
   }, []);
   return (
-    <div className="app">
+    <div className={`app${selected ? " has-discussion" : ""}`}>
       <a className="skip-link" href="#discussion">跳至讨论区</a>
       <header className="masthead">
         <div className="identity">
@@ -44,13 +44,15 @@ export function App() {
         <main className="column discussion" id="discussion" tabIndex={-1}
           aria-labelledby="discussion-heading">
           <h2 className="column-heading" id="discussion-heading">讨论</h2>
-          <div className={`discussion-intro${selected ? " selected-intro" : ""}`}>
-            <p className="eyebrow accent">让想法在此相遇</p>
+          <div className={`discussion-intro${selected ? " selected-intro" : ""}`}
+            role={selected ? "region" : undefined} aria-label={selected ? "群组简介" : undefined}
+            tabIndex={selected ? 0 : undefined}>
+            {!selected ? <p className="eyebrow accent">让想法在此相遇</p> : null}
             {selected ? <EmptyPanel title={selected.name}>{selected.description || "此群组尚无说明。"}</EmptyPanel>
               : <p className="manifesto">先有讨论，<br />再有分工。</p>}
           </div>
-          <Discussion groupId={selected?.id} members={members} />
-          <p className="discussion-note">消息持久化与模型执行分开确认。</p>
+          <div className="discussion-content"><Discussion groupId={selected?.id} members={members} /></div>
+          {!selected ? <p className="discussion-note">消息持久化与模型执行分开确认。</p> : null}
         </main>
 
         <aside className="column members" aria-labelledby="members-heading">

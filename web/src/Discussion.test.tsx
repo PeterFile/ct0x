@@ -6,7 +6,7 @@ import { member } from "./test/members";
 import { delivery, message } from "./test/messages";
 const reads = vi.fn<typeof fetch>(), details = vi.fn<typeof fetch>(), writes = vi.fn<typeof fetch>();
 const main = () => screen.getByRole("main", { name: "讨论" });
-const panel = () => within(within(main()).queryByRole("form", { name: "发送消息" })?.parentElement ?? main());
+const panel = () => within(within(main()).queryByRole("form", { name: "发送消息" })?.closest(".discussion-feed") ?? main());
 const content = () => panel().getByRole("textbox", { name: "消息内容" });
 const change = (value: string) => fireEvent.change(content(), { target: { value } });
 const submit = () => fireEvent.submit(panel().getByRole("form", { name: "发送消息" }));
@@ -49,8 +49,8 @@ it("renders raw text, topic, sender and honest delivery labels without executing
   expect(article().querySelector(".message-content")?.textContent).toBe(received);
   expect(article().querySelector("script")).toBeNull(); expect(article()).toHaveTextContent("话题消息 · topic-A");
   for (const label of ["发送者：user", "已入队", "CLI已接收", "投递失败", "状态未知"]) expect(article()).toHaveTextContent(label);
-  expect(panel().getByText(/CLI接收不代表轮次完成、任务提交或结果接受/)).toBeVisible();
-  expect(panel().getByText(/已加载片段可能存在间隔/)).toBeVisible();
+  expect(panel().getByText("自动更新")).toBeVisible();
+  expect(panel().getByText("已载入 1 条（含话题，片段可能有间隔）。")).toBeVisible();
 });
 it("pages only explicitly, deduplicates and updates server values, sorts nanoseconds, and resets the history window", async () => {
   const earlier = { ...message, id: "z-earlier", content: "纳秒较早", created_at: "2026-10-30T12:00:00.000000001Z", deliveries: [] };
@@ -86,7 +86,11 @@ it.each(["network", 503, 200, 202, "malformed", "foreign", "topic"])("freezes un
   fireEvent.click(await panel().findByRole("checkbox", { name: `${member.name} · ${member.role} · ${member.id}` }));
   if (failure === "network") writes.mockRejectedValueOnce(new TypeError("offline"));
   else writes.mockResolvedValueOnce(json(failure === "malformed" ? {} : failure === "foreign" ? { ...message, group_id: other.id } : failure === "topic" ? { ...message, topic_id: "wrong" } : message, typeof failure === "number" ? failure : 201));
-  submit(); expect(await panel().findByRole("alert")).toHaveTextContent("发送结果未确认"); expect(content()).toBeDisabled();
+  submit(); expect(await panel().findByRole("alert")).toHaveTextContent("发送结果未确认，消息可能已保存"); expect(content()).toBeDisabled();
+  expect(panel().getByRole("combobox", { name: "接收方式" })).toBeDisabled();
+  expect(panel().getByRole("checkbox", { name: `${member.name} · ${member.role} · ${member.id}` })).toBeDisabled();
+  expect(panel().getByRole("button", { name: "重试同一次发送" })).toBeEnabled();
+  expect(panel().getByText(/重载会丢失/)).toBeVisible();
   select(other.name); await panel().findByText("尚无消息，可发送第一条讨论。"); change("B 的草稿"); route("public");
   expect(panel().queryByRole("alert")).not.toBeInTheDocument(); select(group.name);
   expect(content()).toHaveValue(raw); fireEvent.click(panel().getByRole("button", { name: "重试同一次发送" }));

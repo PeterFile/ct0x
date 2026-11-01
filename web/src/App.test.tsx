@@ -7,7 +7,12 @@ import { deferred, group, json, other, page } from "./test/groups";
 const transport = vi.fn<typeof fetch>();
 const posts = () => transport.mock.calls.filter(([, init]) => init?.method === "POST");
 const nameInput = () => screen.getByRole("textbox", { name: "群组名称" });
+function openCreateGroup() {
+  const toggle = screen.queryByRole("button", { name: "展开创建群组" });
+  if (toggle) fireEvent.click(toggle);
+}
 function submit(name = "调研") {
+  openCreateGroup();
   fireEvent.change(nameInput(), { target: { value: name } });
   fireEvent.submit(screen.getByRole("form", { name: "创建群组" }));
 }
@@ -48,6 +53,7 @@ describe("workspace groups", () => {
     render(<App />);
     expect(screen.getByText("正在载入群组…")).toBeVisible();
     await screen.findByText("尚无群组，可在下方创建。");
+    openCreateGroup();
     expect(nameInput()).toBeRequired();
     expect(within(screen.getByRole("main")).getByText("请先选择群组，再查看讨论和发送消息。")).toBeVisible();
     expect(within(screen.getByRole("main")).queryByRole("textbox")).not.toBeInTheDocument();
@@ -88,6 +94,7 @@ describe("workspace groups", () => {
     await screen.findByText("尚无群组，可在下方创建。");
     const response = deferred<Response>();
     transport.mockReturnValueOnce(response.promise);
+    openCreateGroup();
     fireEvent.change(screen.getByRole("textbox", { name: "群组说明（可选）" }), { target: { value: group.description } });
     submit();
     fireEvent.submit(screen.getByRole("form", { name: "创建群组" }));

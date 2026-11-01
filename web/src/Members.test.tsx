@@ -9,13 +9,17 @@ const catalogue = vi.fn<typeof fetch>();
 const panel = () => {
   const landmark = screen.getByRole("complementary", { name: "成员" });
   const form = within(landmark).queryByRole("form", { name: "创建成员" });
-  return within(form?.parentElement ?? landmark);
+  return within(form?.closest(".group-panel") ?? landmark);
 };
 const field = (name: string) => panel().getByRole("textbox", { name });
 const change = (name: string, value: string) => fireEvent.change(field(name), { target: { value } });
 const submit = () => fireEvent.submit(panel().getByRole("form", { name: "创建成员" }));
-const selectGroup = (name: string) => fireEvent.click(screen.getByRole("button", { name }));
-async function open() { render(<App />); fireEvent.click(await screen.findByRole("button", { name: group.name })); }
+function selectGroup(name: string) {
+  fireEvent.click(screen.getByRole("button", { name }));
+  const toggle = within(screen.getByRole("complementary", { name: "成员" })).queryByRole("button", { name: "展开创建成员" });
+  if (toggle) fireEvent.click(toggle);
+}
+async function open() { render(<App />); selectGroup((await screen.findByRole("button", { name: group.name })).textContent!); }
 async function draft() {
   await panel().findByText("尚无成员，可创建群内成员。");
   change("成员名称", member.name); change("成员职责", member.role);
