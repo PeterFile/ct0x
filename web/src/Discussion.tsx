@@ -82,13 +82,15 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
   }
   return <div className="group-panel discussion-feed">
     <section className="message-history" aria-label="消息记录" tabIndex={0} ref={scroll.historyRef} onScroll={scroll.onScroll}
-      onWheel={scroll.onReadingIntent} onTouchMove={scroll.onReadingIntent} onPointerDown={scroll.onPointerDown} onKeyDown={scroll.onKeyDown}>
+      onWheel={scroll.onReadingIntent} onTouchMove={scroll.onReadingIntent} onKeyDown={scroll.onKeyDown}
+      onPointerDown={scroll.onPointerDown} onPointerMove={scroll.onPointerMove} onPointerUp={scroll.onPointerEnd}
+      onPointerCancel={scroll.onPointerEnd} onPointerLeave={scroll.onPointerEnd}>
     <div className="discussion-tools">
       <button type="button" disabled={feed.page.pending} onClick={() => { scroll.beforeReset(); void feed.loadPage(); }}>刷新并重置历史窗口</button>
       <a href={`#${formId}-content`}>跳至消息输入</a>
       <span className="feed-note">自动更新</span>
     </div>
-    <p className="feed-note">{scroll.windowReset ? "历史窗口已更新，可加载更早消息" : `已载入 ${feed.items.length} 条（含话题，片段可能有间隔）。`}</p>
+    <p className="feed-note">已载入 {feed.items.length} 条（含话题，片段可能有间隔）。</p>
     {feed.pollError ? <p role="status">自动刷新暂不可用：{feed.pollError} 将稍后重试。</p> : null}
     {feed.page.pending ? <p role="status">正在载入消息…</p> : null}
     {feed.page.error ? <div role="alert"><p>{feed.page.error}</p><button type="button" onClick={feed.retry}>重试载入消息</button></div> : null}
@@ -124,6 +126,7 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
     </section>
     <section className="message-composer" aria-label="撰写消息" tabIndex={0}>
     <form aria-label="发送消息" onSubmit={submit}>
+      {scroll.windowReset ? <p className="feed-note">历史窗口已更新，可加载更早消息</p> : null}
       <fieldset disabled={mutation.pending || mutation.uncertain}>
         <label htmlFor={`${formId}-content`}>消息内容</label>
         <textarea id={`${formId}-content`} required rows={2} value={content} onChange={event => setContent(event.target.value)} />

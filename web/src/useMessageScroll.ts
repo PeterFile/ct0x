@@ -4,7 +4,9 @@ import type { Message } from "./api";
 
 type Anchor = { id: string; offset: number };
 type PageIntent = { kind: "older" | "reset" | "restore"; anchor: Anchor | null; revision: number; started: boolean };
+type PointerInput = { id: number; x: number; y: number; top: number; moved: boolean; scrollbar: boolean };
 const tailTolerance = 16;
+const inputLifetime = 250;
 
 export function useMessageScroll(active: boolean, items: Message[], page: { pending: boolean; error: string }) {
   const historyRef = useRef<HTMLElement>(null), listRef = useRef<HTMLOListElement>(null);
@@ -14,9 +16,14 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
   const confirmed = useRef<{ id: string; revision: number } | null>(null);
   const revision = useRef(0), initialized = useRef(false), wasActive = useRef(false), atTail = useRef(true);
   const previousIDs = useRef(new Set<string>()), lastTop = useRef(0), expectedTop = useRef<number | null>(null);
-  const previousNote = useRef(windowReset), readingInput = useRef(false);
+  const previousNote = useRef(windowReset), inputUntil = useRef(0);
+  const pointer = useRef<PointerInput | null>(null);
   const isTail = (history: HTMLElement) => history.scrollHeight - history.clientHeight - history.scrollTop <= tailTolerance;
 
+  function clearInput() {
+    inputUntil.current = 0;
+    pointer.current = null;
+  }
   function capture() {
     const history = historyRef.current, children = listRef.current?.children;
     if (!history || !history.clientHeight || !children?.length) return null;
@@ -67,7 +74,7 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
   }
   function beforePage(kind: "older" | "reset") {
     const anchor = remember() ?? null;
-    readingInput.current = false;
+    clearInput();
     pageIntent.current = { kind, anchor, revision: ++revision.current, started: false };
     confirmed.current = null; setWindowReset(false);
   }
@@ -78,27 +85,61 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     if (top === expectedTop.current || top === lastTop.current) return;
     expectedTop.current = null;
     remember();
+    if (performance.now() < inputUntil.current) recordReading();
     const intent = pageIntent.current;
-    // Native anchoring also emits scroll; a click without movement is not new reading intent.
-    if (readingInput.current) {
-      ++revision.current; confirmed.current = null; setWindowReset(false);
-      if (intent) { intent.kind = intent.kind === "older" ? "older" : "restore"; intent.revision = revision.current; }
-    }
     if (intent && intent.kind !== "reset") intent.anchor = saved.current;
   }
+  function recordReading() {
+    ++revision.current;
+    confirmed.current = null;
+    setWindowReset(false);
+    const intent = pageIntent.current;
+    if (intent) {
+      intent.kind = intent.kind === "older" ? "older" : "restore";
+      intent.revision = revision.current;
+      intent.anchor = saved.current;
+    }
+  }
   function onReadingIntent() {
-    if (active && historyRef.current?.clientHeight) readingInput.current = true;
+    if (!active || !historyRef.current?.clientHeight) return;
+    inputUntil.current = performance.now() + inputLifetime;
+    if (pointer.current) pointer.current.moved = true;
   }
   function onPointerDown(event: PointerEvent<HTMLElement>) {
-    const target = event.target;
-    if (target === event.currentTarget || target instanceof Element && target.closest(".message-list")) onReadingIntent();
+    const history = historyRef.current, target = event.target;
+    if (!active || !history?.clientHeight) return;
+    const scrollbar = target === event.currentTarget;
+    if (!scrollbar && !(target instanceof Element && target.closest(".message-list"))) return;
+    pointer.current = { id: event.pointerId, x: event.clientX, y: event.clientY,
+      top: history.scrollTop, moved: false, scrollbar };
+    inputUntil.current = scrollbar ? performance.now() + inputLifetime : 0;
+  }
+  function onPointerMove(event: PointerEvent<HTMLElement>) {
+    const current = pointer.current;
+    if (!current || current.id !== event.pointerId) return;
+    if (!event.buttons) { onPointerEnd(event); return; }
+    if (Math.abs(event.clientX - current.x) + Math.abs(event.clientY - current.y) > 2) current.moved = true;
+    if (current.moved) inputUntil.current = performance.now() + inputLifetime;
+  }
+  function onPointerEnd(event: PointerEvent<HTMLElement>) {
+    const current = pointer.current, history = historyRef.current;
+    if (!current || current.id !== event.pointerId) return;
+    pointer.current = null;
+    // Close click-only input immediately; moved gestures retain a bounded late-event window.
+    if (!current.moved && !current.scrollbar) { inputUntil.current = 0; return; }
+    inputUntil.current = performance.now() + inputLifetime;
+    if (active && history?.clientHeight && history.scrollTop !== current.top && history.scrollTop !== lastTop.current) {
+      // The viewport may have moved before its scroll event is delivered.
+      remember();
+      recordReading();
+    }
   }
   function onKeyDown(event: KeyboardEvent<HTMLElement>) {
     if (event.key === " " && event.target instanceof Element && event.target.closest("button, a, input, select, textarea, summary")) return;
     if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) onReadingIntent();
   }
   function beginSend(id: number) {
-    readingInput.current = false;
+    clearInput();
     attempt.current = { id, revision: revision.current }; confirmed.current = null;
   }
   function confirmSend(id: string, sendAttempt: number) {
@@ -114,9 +155,9 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     previousIDs.current = new Set(items.map(message => message.id));
     const noteChanged = previousNote.current !== windowReset;
     previousNote.current = windowReset;
-    if (!active) { pageIntent.current = null; readingInput.current = false; return; }
+    if (!active) { pageIntent.current = null; clearInput(); return; }
     if (!history?.clientHeight) return;
-    if (entering) readingInput.current = false;
+    if (entering) clearInput();
     if (entering && initialized.current) {
       pageIntent.current = { kind: "restore", anchor: saved.current, revision: revision.current, started: page.pending };
       restore(saved.current);
@@ -150,13 +191,13 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     }
     if (!positioned && arrived && initialized.current && atTail.current && !page.pending && !pageIntent.current) latest();
     if (noteChanged && initialized.current) {
-      if (windowReset && atTail.current) latest();
+      if (atTail.current) latest();
       else restore(saved.current);
     }
     if (!arrived && !page.pending) atTail.current = isTail(history);
   }, [active, items, page.pending, page.error, windowReset]);
 
-  return { historyRef, listRef, onScroll, onReadingIntent, onPointerDown, onKeyDown,
+  return { historyRef, listRef, onScroll, onReadingIntent, onPointerDown, onPointerMove, onPointerEnd, onKeyDown,
     beforeOlder: () => beforePage("older"), beforeReset: () => beforePage("reset"),
     beginSend, confirmSend, windowReset };
 }

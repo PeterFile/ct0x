@@ -13,6 +13,7 @@ const initial = Array.from({ length: 8 }, (_, index) => row(index + 1));
 const latestURL = (id = group.id) => `/api/v1/groups/${id}/messages?limit=50`;
 const olderURL = `${latestURL()}&before=older%2B%2F`;
 const raw = "  公开原文\n保留空白  ";
+const resetNotice = "历史窗口已更新，可加载更早消息";
 const flush = () => act(async () => { await vi.advanceTimersByTimeAsync(0); });
 const poll = () => act(async () => { await vi.advanceTimersByTimeAsync(5000); });
 const scope = (id = group.id) => {
@@ -34,6 +35,9 @@ let nativeShift: { count: number; delta: number } | undefined;
 const hidden = (element: Element) => Boolean(element.closest("[hidden]"));
 const rows = (element: HTMLElement) => [...element.querySelectorAll(".message-list > li")];
 const heightOf = (element: Element) => heights.get(recordId(element)) ?? 100;
+const hasComposerNotice = (element: HTMLElement) => [...(element.closest(".discussion-scope")?.querySelectorAll(".message-composer .feed-note") ?? [])]
+  .some(note => note.textContent === resetNotice);
+const viewportHeight = (element: HTMLElement) => 200 - (hasComposerNotice(element) ? 40 : 0);
 const extent = (element: HTMLElement) => header + rows(element).reduce((sum, child) => sum + heightOf(child), 0) + footer;
 function readAt(element: HTMLElement, top: number) {
   fireEvent.wheel(element, { deltaY: top - element.scrollTop });
@@ -62,6 +66,25 @@ async function open(items = initial, next = "older+/") {
   await flush();
   return view;
 }
+function startReading(input: string, container = history()) {
+  if (input === "wheel") fireEvent.wheel(container, { deltaY: -470 });
+  else if (input === "keyboard") fireEvent.keyDown(container, { key: "PageUp" });
+  else if (input === "touch") fireEvent.touchMove(container);
+  else fireEvent.pointerDown(container, { pointerId: 1, clientX: 319, clientY: 180 });
+}
+function endReading(input: string, container = history()) {
+  if (input === "keyboard") fireEvent.keyUp(container, { key: "PageUp" });
+  else if (input === "touch") fireEvent.touchEnd(container);
+  else if (input === "scrollbar") fireEvent.pointerUp(container, { pointerId: 1, clientX: 319, clientY: 150 });
+}
+async function openFallback() {
+  const current = initial.slice(2), view = await open(current);
+  reads.mockResolvedValueOnce(page(initial.slice(0, 2), "older+/")); fireEvent.click(button("加载更早消息")); await flush();
+  readAt(history(), 100);
+  view.rerender(<Discussion groupId={undefined} members={{}} />);
+  reads.mockResolvedValueOnce(page(current, "older+/")); view.rerender(<Discussion groupId={group.id} members={{}} />); await flush();
+  return view;
+}
 function send() {
   const panel = within(scope());
   fireEvent.change(panel.getByRole("textbox", { name: "消息内容" }), { target: { value: raw } });
@@ -80,7 +103,7 @@ beforeEach(() => {
     return (init?.method === "POST" ? writes : /\/messages\//.test(String(input)) ? details : reads)(input, init);
   }));
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
-    return this.matches(".message-history") && !hidden(this) ? 200 : 0;
+    return this.matches(".message-history") && !hidden(this) ? viewportHeight(this) : 0;
   });
   vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
     return this.matches(".message-history") && !hidden(this) ? extent(this) : 0;
@@ -94,11 +117,17 @@ beforeEach(() => {
   });
   vi.spyOn(Element.prototype, "scrollTop", "set").mockImplementation(function (this: HTMLElement, value: number) {
     ++scrollWrites;
-    tops.set(this, Math.max(0, Math.min(value, extent(this) - 200)));
+    tops.set(this, Math.max(0, Math.min(value, extent(this) - viewportHeight(this))));
   });
   vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
     if (hidden(this)) return rect(0, 0);
-    if (this.matches(".message-history")) return rect(100, 200);
+    if (this.matches(".message-history")) return rect(100, viewportHeight(this));
+    const composer = this.closest<HTMLElement>(".message-composer");
+    if (composer) {
+      const container = composer.closest(".discussion-scope")!.querySelector<HTMLElement>(".message-history")!;
+      const top = 100 + viewportHeight(container);
+      return this === composer ? rect(top, hasComposerNotice(container) ? 140 : 100) : rect(top + 8, 32);
+    }
     const node = this.matches(".message-list > li") ? this : this.closest<HTMLElement>(".message-list > li");
     if (!node) return rect(0, 0);
     ++measurements;
@@ -158,7 +187,11 @@ it("does not treat delivery-only polling or detail patches as arrivals or remeas
   await open(); const container = history(), top = container.scrollTop;
   footer += 40; measurements = 0; scrollWrites = 0;
   reads.mockResolvedValueOnce(page(initial.map(record => ({ ...record, content: `${record.content} 更新` })))); await poll();
-  fireEvent.click(button(`刷新消息 ${row(8).id} 投递`)); await flush();
+  const disclosure = item(row(8).id).querySelector("details")!;
+  expect(disclosure).not.toHaveAttribute("open"); fireEvent.click(disclosure.querySelector("summary")!);
+  expect(disclosure).toHaveAttribute("open");
+  const refresh = within(disclosure).getByRole("button", { name: `刷新消息 ${row(8).id} 投递` });
+  expect(refresh).toBeVisible(); fireEvent.click(refresh); await flush();
   expect(container.scrollTop).toBe(top); expect(scrollWrites).toBe(0); expect(measurements).toBe(0);
   expectRequests([latestURL(), latestURL(), `/api/v1/groups/${group.id}/messages/${row(8).id}`]);
 });
@@ -195,11 +228,8 @@ it("presents the confirmed ID even if polling already inserted it, without jumpi
 
 it.each(["wheel", "keyboard", "touch", "scrollbar"])("lets newer %s reading intent outrank a late successful send receipt", async input => {
   await open(); const pending = deferred<Response>(); writes.mockReturnValueOnce(pending.promise); send();
-  if (input === "wheel") fireEvent.wheel(history(), { deltaY: -470 });
-  else if (input === "keyboard") fireEvent.keyDown(history(), { key: "PageUp" });
-  else if (input === "touch") fireEvent.touchMove(history());
-  else fireEvent.pointerDown(history());
-  history().scrollTop = 230; fireEvent.scroll(history()); const before = offset(row(2).id);
+  startReading(input); history().scrollTop = 230; endReading(input);
+  fireEvent.scroll(history()); const before = offset(row(2).id);
   await act(async () => pending.resolve(json({ ...row(9), content: raw }, 201)));
   expect(history().scrollTop).toBe(230); expect(offset(row(2).id)).toBe(before);
   expect(screen.getByText(/消息已持久化/)).toBeVisible(); expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages`]);
@@ -295,18 +325,34 @@ it("defers inactive A's confirmed presentation without moving or focusing B", as
   expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages`, latestURL(other.id), latestURL()]);
 });
 
-it("honestly falls back to latest when reactivation resets away an older anchor, then silences the note on navigation", async () => {
-  const current = initial.slice(2), view = await open(current);
-  reads.mockResolvedValueOnce(page(initial.slice(0, 2), "older+/")); fireEvent.click(button("加载更早消息")); await flush();
-  readAt(history(), 100); expectVisible(row(2).id);
-  view.rerender(<Discussion groupId={undefined} members={{}} />);
-  reads.mockResolvedValueOnce(page(current, "older+/")); view.rerender(<Discussion groupId={group.id} members={{}} />); await flush();
-  expectTail(); expect(screen.queryByRole("article", { name: `消息 ${row(1).id}` })).not.toBeInTheDocument();
-  const notice = screen.getByText(/历史窗口已更新，可加载更早消息/);
+it("keeps the history statement and a bounded composer notice visible at fallback, following tail through its height changes", async () => {
+  await openFallback();
+  const container = history(), notice = screen.getByText(resetNotice);
+  expect(within(container).getByText("已载入 6 条（含话题，片段可能有间隔）。")).toBeInTheDocument();
+  const composer = within(scope()).getByRole("region", { name: "撰写消息" });
+  expect(notice.closest(".message-composer")).toBe(composer); expect(notice.closest(".message-history")).toBeNull();
   expect(notice).toHaveClass("feed-note"); expect(notice).not.toHaveAttribute("role");
-  reads.mockResolvedValueOnce(page(initial.slice(0, 2))); fireEvent.click(button("加载更早消息")); await flush();
-  expect(screen.queryByText(/历史窗口已更新，可加载更早消息/)).not.toBeInTheDocument();
-  expectRequests([latestURL(), olderURL, latestURL(), olderURL]);
+  const noticeBox = notice.getBoundingClientRect(), composerBox = composer.getBoundingClientRect();
+  expect(noticeBox.top).toBeGreaterThanOrEqual(composerBox.top); expect(noticeBox.bottom).toBeLessThanOrEqual(composerBox.bottom);
+  expect(container.getBoundingClientRect().bottom).toBe(composerBox.top);
+  expect(container.clientHeight).toBe(160); expectTail(); expectVisible(row(8).id);
+  expect(screen.queryByRole("article", { name: `消息 ${row(1).id}` })).not.toBeInTheDocument();
+  const pending = deferred<Response>(); reads.mockReturnValueOnce(pending.promise);
+  fireEvent.click(button("加载更早消息")); await flush();
+  expect(screen.queryByText(resetNotice)).not.toBeInTheDocument();
+  expect(container.clientHeight).toBe(200); expectTail(); expectVisible(row(8).id);
+  await act(async () => pending.resolve(page(initial.slice(0, 2))));
+  expectTail(); expectRequests([latestURL(), olderURL, latestURL(), olderURL]);
+});
+
+it("keeps a real reading anchor when dismissing the composer notice expands history away from tail", async () => {
+  await openFallback(); const container = history(); expect(container.clientHeight).toBe(160);
+  startReading("wheel"); container.scrollTop = 230; const before = offset(row(5).id);
+  fireEvent.scroll(container); await flush();
+  expect(screen.queryByText(resetNotice)).not.toBeInTheDocument(); expect(container.clientHeight).toBe(200);
+  expect(container.scrollTop).toBe(230); expect(offset(row(5).id)).toBe(before);
+  expect(within(container).getByText("已载入 6 条（含话题，片段可能有间隔）。")).toBeInTheDocument();
+  expectRequests([latestURL(), olderURL, latestURL()]);
 });
 
 it("does not apply a saved reactivation anchor after the user chooses a newer reading position", async () => {
@@ -347,4 +393,59 @@ it("bounds visible-anchor measurements on scroll and does no row geometry work f
   measurements = 0; readAt(history(), 2430); expect(measurements).toBeLessThanOrEqual(16);
   measurements = 0; reads.mockResolvedValueOnce(page(many)); await poll();
   expect(measurements).toBe(0); expect(history().scrollTop).toBe(2430); expectRequests([latestURL(), latestURL()]);
+});
+
+it("review: a completed message click cannot turn later native compensation into send-canceling reading", async () => {
+  await open(); readAt(history(), 230); const pending = deferred<Response>(); writes.mockReturnValueOnce(pending.promise); send();
+  const clicked = item(row(3).id);
+  fireEvent.pointerDown(clicked); fireEvent.pointerUp(clicked); fireEvent.click(clicked);
+  header += 30; tops.set(history(), 260); fireEvent.scroll(history());
+  await act(async () => pending.resolve(json({ ...row(9), content: raw }, 201)));
+  expectVisible(row(9).id);
+  expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages`]);
+});
+
+it("review: a completed message click cannot make native compensation cancel an explicit reset", async () => {
+  await open(); readAt(history(), 230); const pending = deferred<Response>(); reads.mockReturnValueOnce(pending.promise);
+  fireEvent.click(button("刷新并重置历史窗口"));
+  const clicked = item(row(3).id);
+  fireEvent.pointerDown(clicked); fireEvent.pointerUp(clicked); fireEvent.click(clicked);
+  header += 30; tops.set(history(), 260); fireEvent.scroll(history());
+  await act(async () => pending.resolve(page(initial)));
+  expectTail(); expectRequests([latestURL(), latestURL()]);
+});
+
+it.each(["wheel", "keyboard", "touch", "scrollbar"])("keeps newer %s reading through an explicit reset and input release", async input => {
+  await open(); const pending = deferred<Response>(); reads.mockReturnValueOnce(pending.promise);
+  fireEvent.click(button("刷新并重置历史窗口"));
+  startReading(input); history().scrollTop = 230; endReading(input); fireEvent.scroll(history());
+  const before = offset(row(2).id); await act(async () => pending.resolve(page(initial)));
+  expect(history().scrollTop).toBe(230); expect(offset(row(2).id)).toBe(before);
+  expectRequests([latestURL(), latestURL()]);
+});
+
+it.each(["send", "reset"])("reconciles scrollbar movement at release before a late scroll event and %s receipt", async operation => {
+  await open(); const pending = deferred<Response>();
+  if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }
+  else { reads.mockReturnValueOnce(pending.promise); fireEvent.click(button("刷新并重置历史窗口")); }
+  startReading("scrollbar"); history().scrollTop = 230; endReading("scrollbar");
+  const before = offset(row(2).id);
+  await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(initial)));
+  fireEvent.scroll(history());
+  expect(history().scrollTop).toBe(230); expect(offset(row(2).id)).toBe(before);
+  expectRequests(operation === "send" ? [latestURL(), `/api/v1/groups/${group.id}/messages`] : [latestURL(), latestURL()]);
+});
+
+it.each(["send", "reset"])("keeps moved pointer input for scrolling delivered just after release during %s", async operation => {
+  await open(); const pending = deferred<Response>();
+  if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }
+  else { reads.mockReturnValueOnce(pending.promise); fireEvent.click(button("刷新并重置历史窗口")); }
+  const target = item(row(7).id);
+  fireEvent.pointerDown(target, { pointerId: 1, clientX: 100, clientY: 200 });
+  fireEvent.pointerMove(target, { pointerId: 1, clientX: 100, clientY: 160, buttons: 1 });
+  fireEvent.pointerUp(target, { pointerId: 1, clientX: 100, clientY: 160 });
+  history().scrollTop = 230; fireEvent.scroll(history()); const before = offset(row(2).id);
+  await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(initial)));
+  expect(history().scrollTop).toBe(230); expect(offset(row(2).id)).toBe(before);
+  expectRequests(operation === "send" ? [latestURL(), `/api/v1/groups/${group.id}/messages`] : [latestURL(), latestURL()]);
 });
