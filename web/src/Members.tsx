@@ -32,7 +32,8 @@ function useCatalogue(enabled: boolean) {
   return { ...state, load: (before = request.before) => setRequest(previous => ({ before, version: previous.version + 1 })) };
 }
 
-export function Members({ groupId }: { groupId?: string }) {
+type MemberListener = (groupId: string, members: Member[]) => void;
+export function Members({ groupId, onMembers }: { groupId?: string; onMembers?: MemberListener }) {
   const [visited, setVisited] = useState<string[]>([]);
   useEffect(() => {
     if (groupId) setVisited(previous => previous.includes(groupId) ? previous : [...previous, groupId]);
@@ -42,14 +43,15 @@ export function Members({ groupId }: { groupId?: string }) {
     {!groupId ? <p className="empty-panel">请先选择群组，再查看成员。</p> : null}
     {/* Keep per-group operations alive across switches; hidden scopes cannot leak into the active UI. */}
     {visited.map(id => <div key={id} hidden={id !== groupId}>
-      <MemberScope groupId={id} active={id === groupId} catalogue={catalogue} />
+      <MemberScope groupId={id} active={id === groupId} catalogue={catalogue} onMembers={onMembers} />
     </div>)}
   </>;
 }
 
-function MemberScope({ groupId, active, catalogue }: { groupId: string; active: boolean; catalogue: ReturnType<typeof useCatalogue> }) {
+function MemberScope({ groupId, active, catalogue, onMembers }: { groupId: string; active: boolean; catalogue: ReturnType<typeof useCatalogue>; onMembers?: MemberListener }) {
   const formId = useId();
   const [items, setItems] = useState<Member[]>([]);
+  useEffect(() => { onMembers?.(groupId, items); }, [groupId, items, onMembers]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selected = items.find(member => member.id === selectedId);
   const [draft, setDraft] = useState(emptyDraft);
