@@ -21,8 +21,9 @@ func TestNewExecutorBindsExactSupportedProviderWithoutProbing(t *testing.T) {
 	}{
 		{Pi, "1.4.0", 0},
 		{Codex, "0.162.1", 3 * time.Second},
+		{Codex, "0.166.0", 3 * time.Second},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(tc.name+"/"+tc.version, func(t *testing.T) {
 			selected := Provider{ID: "exact-id", Name: tc.name, Version: tc.version, Path: path,
 				Installation: Installed, Account: AccountUnknown, Connectivity: Unchecked,
 				Capabilities: Capabilities{Resume: true, Tools: true}, Evidence: []Evidence{{Reason: "unchanged"}}}
@@ -80,10 +81,16 @@ func TestNewExecutorRejectsUnverifiedConfiguration(t *testing.T) {
 		{"CLI alias", func(p *Provider) { p.Name = "codex-cli" }},
 		{"blank name", func(p *Provider) { p.Name = "" }},
 		{"missing version", func(p *Provider) { p.Version = "" }},
-		{"unnormalized version", func(p *Provider) { p.Version = "v1.4.0" }},
-		{"unsupported Pi", func(p *Provider) { p.Version = "1.4.1" }},
-		{"unsupported Codex", func(p *Provider) { p.Name, p.Version = Codex, "0.162.0" }},
-		{"version output not version", func(p *Provider) { p.Name, p.Version = Codex, "codex-cli 0.162.1" }},
+		{"unnormalized Pi v1.4.0", func(p *Provider) { p.Version = "v1.4.0" }},
+		{"unsupported Pi 1.4.1", func(p *Provider) { p.Version = "1.4.1" }},
+		{"unsupported Codex 0.162.0", func(p *Provider) { p.Name, p.Version = Codex, "0.162.0" }},
+		{"unsupported Codex 0.165.0", func(p *Provider) { p.Name, p.Version = Codex, "0.165.0" }},
+		{"unsupported Codex 0.166.1", func(p *Provider) { p.Name, p.Version = Codex, "0.166.1" }},
+		{"newer Codex 0.167.0", func(p *Provider) { p.Name, p.Version = Codex, "0.167.0" }},
+		{"prerelease Codex 0.166.0-rc.1", func(p *Provider) { p.Name, p.Version = Codex, "0.166.0-rc.1" }},
+		{"unnormalized Codex v0.166.0", func(p *Provider) { p.Name, p.Version = Codex, "v0.166.0" }},
+		{"version output Codex 0.162.1", func(p *Provider) { p.Name, p.Version = Codex, "codex-cli 0.162.1" }},
+		{"version output Codex 0.166.0", func(p *Provider) { p.Name, p.Version = Codex, "codex-cli 0.166.0" }},
 		{"missing installation", func(p *Provider) { p.Installation = "" }},
 		{"absent installation", func(p *Provider) { p.Installation = "absent" }},
 		{"missing path", func(p *Provider) { p.Path = "" }},
