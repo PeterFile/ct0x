@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"agentworkspace/internal/httpapi"
+	"agentworkspace/internal/platform"
+	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
 )
 
@@ -29,7 +31,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, args []string, output io.Writer) (err error) {
+func runWithSearch(ctx context.Context, args []string, output io.Writer, search provider.Search) (err error) {
 	config, err := parseConfig(args, output)
 	if errors.Is(err, flag.ErrHelp) {
 		return nil
@@ -43,21 +45,38 @@ func run(ctx context.Context, args []string, output io.Writer) (err error) {
 	if err := os.MkdirAll(config.dataDir, 0700); err != nil {
 		return fmt.Errorf("创建数据目录失败：%w", err)
 	}
+	lock, err := lockDataDir(config.dataDir)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
 	db, err := store.Open(filepath.Join(config.dataDir, "workspace.db"))
 	if err != nil {
 		return fmt.Errorf("打开工作区数据库失败：%w", err)
 	}
+	// Later scheduler shutdown/drain belongs before these store/lock defers.
 	defer func() { err = errors.Join(err, db.Close()) }()
+	if _, err := db.RecoverInFlight(ctx); err != nil {
+		return fmt.Errorf("恢复在途轮次失败：%w", err)
+	}
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", config.listen)
 	if err != nil {
 		return fmt.Errorf("监听本地地址失败：%w", err)
 	}
 	defer listener.Close()
-	server, err := httpapi.NewServerWithConfig(httpapi.Config{Address: listener.Addr().String(), DevOrigin: config.devOrigin})
+	search.Explicit = append([]provider.Location{{Name: provider.Pi, Path: config.piPath}, {Name: provider.Codex, Path: config.codexPath}}, search.Explicit...)
+	catalog := platform.DiscoverProviders(ctx, search, provider.Runner{Timeout: 2 * time.Second, OutputLimit: 4096})
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("启动已取消：%w", err)
+	}
+	local := platform.NewLocalUser(db)
+	routes := append(httpapi.LocalUserRoutes(local), httpapi.MessageRoutes(local)...)
+	routes = append(routes, httpapi.ProviderRoute(catalog))
+	server, err := httpapi.NewServerWithConfig(httpapi.Config{Address: listener.Addr().String(), DevOrigin: config.devOrigin}, routes...)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （目前仅提供健康检查，业务接口尚未启用）\n", listener.Addr()); err != nil {
+	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录及 CLI 目录；目录仅启动时探测、证据仅存内存；实际模型调度与执行尚未接入，其他功能尚未启用）\n", listener.Addr()); err != nil {
 		return fmt.Errorf("输出启动信息失败：%w", err)
 	}
 	return serve(ctx, server, listener, 5*time.Second)

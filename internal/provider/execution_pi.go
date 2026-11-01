@@ -37,18 +37,18 @@ func (l *executionLog) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-type piOutput struct {
+type executionOutput struct {
 	log                        *executionLog
 	receipt                    *ExecutionReceipt
-	callback                   func(Event) error
-	cancel                     context.CancelFunc
+	delivery                   *executionDelivery
+	codex                      bool
 	runID                      string
 	line                       []byte
 	dropping, damaged, settled bool
 	last                       Outcome
 }
 
-func (o *piOutput) Write(p []byte) (int, error) {
+func (o *executionOutput) Write(p []byte) (int, error) {
 	n, _ := o.log.Write(p)
 	for len(p) > 0 {
 		i := bytes.IndexByte(p, '\n')
@@ -66,7 +66,12 @@ func (o *piOutput) Write(p []byte) (int, error) {
 			break
 		}
 		if !o.dropping {
-			o.record(bytes.TrimSuffix(o.line, []byte{'\r'}))
+			line := bytes.TrimSuffix(o.line, []byte{'\r'})
+			if o.codex {
+				o.recordCodex(line)
+			} else {
+				o.recordPi(line)
+			}
 		}
 		o.line, o.dropping = o.line[:0], false
 		p = p[i+1:]
@@ -74,20 +79,15 @@ func (o *piOutput) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func (o *piOutput) emit(event Event) {
-	if o.callback != nil && !o.receipt.DeliveryFailed {
-		event.NativeSessionID = o.receipt.NativeSessionID
-		if o.callback(event) != nil {
-			o.receipt.DeliveryFailed = true
-			o.cancel()
-		}
-	}
+func (o *executionOutput) emit(event Event) {
+	event.NativeSessionID = o.receipt.NativeSessionID
+	o.delivery.enqueue(event)
 }
 
 // Pi 1.4.0 print-mode.js emits the header before prompt(). agent_start is
 // therefore the adapter's acceptance rule, not a native acknowledgement.
 // agent-session.js settles only after retries/recovery/queued work finish.
-func (o *piOutput) record(line []byte) {
+func (o *executionOutput) recordPi(line []byte) {
 	var event struct {
 		Type, ID, CWD string
 		Version       int
