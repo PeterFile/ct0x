@@ -21,7 +21,7 @@ func NewExecutor(selected Provider, timeout time.Duration) (Executor, error) {
 		return nil, errExecutorConfiguration
 	}
 	if (selected.Name != Pi || selected.Version != "1.4.0") &&
-		(selected.Name != Codex || selected.Version != "0.162.1") {
+		(selected.Name != Codex || selected.Version != "0.162.1" && selected.Version != "0.166.0") {
 		return nil, errExecutorConfiguration
 	}
 	info, err := os.Stat(selected.Path)
