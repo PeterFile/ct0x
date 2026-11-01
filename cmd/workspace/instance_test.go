@@ -6,6 +6,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -32,7 +35,7 @@ func TestInstanceProcessHelper(t *testing.T) {
 		if arg != "--" {
 			continue
 		}
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		go func() {
 			_, _ = io.Copy(io.Discard, os.Stdin)
 			cancel()
@@ -65,7 +68,7 @@ type instanceProcess struct {
 	err    error
 }
 
-func launchInstance(t *testing.T, dir, address string) *instanceProcess {
+func launchInstance(t *testing.T, dir, address string, args ...string) *instanceProcess {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
@@ -73,7 +76,8 @@ func launchInstance(t *testing.T, dir, address string) *instanceProcess {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	p := &instanceProcess{ready: make(chan string, 1), done: make(chan struct{})}
-	p.cmd = exec.CommandContext(ctx, executable, "-test.run=^TestInstanceProcessHelper$", "--", "--data-dir", dir, "--listen", address)
+	args = append([]string{"-test.run=^TestInstanceProcessHelper$", "--", "--data-dir", dir, "--listen", address}, args...)
+	p.cmd = exec.CommandContext(ctx, executable, args...)
 	p.cmd.Env = append(os.Environ(), "AGENT_WORKSPACE_F1_HELPER=1")
 	p.cmd.Stderr = &p.stderr
 	p.cmd.WaitDelay = time.Second
@@ -212,6 +216,8 @@ func TestInstanceOwnershipAcrossProcesses(t *testing.T) {
 
 func TestInstanceStartupRecoveryIsFencedByOwnership(t *testing.T) {
 	dir := t.TempDir()
+	fixture := newExecutionFixture(t, "1.4.0")
+	selected := provider.Discover(provider.Search{Explicit: []provider.Location{{Name: provider.Pi, Path: fixture.path}}})[0]
 	ctx := context.Background()
 	db, err := store.Open(filepath.Join(dir, "workspace.db"))
 	if err != nil {
@@ -224,7 +230,7 @@ func TestInstanceStartupRecoveryIsFencedByOwnership(t *testing.T) {
 	}
 	var deliveries []domain.Delivery
 	for range 2 {
-		member, err := db.CreateMember(ctx, store.CreateMemberInput{GroupID: group.ID, Name: "member", Role: "role", ActorID: "user"})
+		member, err := db.CreateMember(ctx, store.CreateMemberInput{GroupID: group.ID, Name: "member", Role: "role", ActorID: "user", ProviderID: selected.ID})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -263,11 +269,19 @@ func TestInstanceStartupRecoveryIsFencedByOwnership(t *testing.T) {
 		t.Fatal("HTTP access or a failed second owner refenced the turn")
 	}
 	owner.stop(t, false)
-	restarted := launchInstance(t, dir, "127.0.0.1:0")
+	restarted := launchInstance(t, dir, "127.0.0.1:0", "--enable-execution", "--pi-path", fixture.path)
 	restarted.url(t)
 	again, err := db.GetTurn(ctx, group.ID, initial.ID)
 	if err != nil || again.State != domain.TurnStateUnknown || again.ClaimToken == recovered.ClaimToken {
 		t.Fatal("new owned startup did not keep unknown work fenced")
+	}
+	time.Sleep(250 * time.Millisecond)
+	stable, err := db.GetTurn(ctx, group.ID, initial.ID)
+	if err != nil || stable.ClaimToken != again.ClaimToken || stable.UpdatedAt != again.UpdatedAt {
+		t.Fatalf("scheduler repeated startup recovery: %+v %v", stable, err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.root, "calls")); !os.IsNotExist(err) {
+		t.Fatalf("enabled restart blindly re-executed unknown work or bypassed capacity: %v", err)
 	}
 	for _, input := range []store.ClaimTurnInput{
 		{GroupID: group.ID, DeliveryID: deliveries[1].ID, MaxActive: 1},
@@ -320,6 +334,120 @@ func TestInstanceRejectsUnsafeFilesBeforeOpeningDatabase(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExecutionSignalDrainsReceiptsAndHTTPBeforeOwnershipRelease(t *testing.T) {
+	f, dir := newExecutionFixture(t, "1.4.0"), t.TempDir()
+	if err := os.WriteFile(filepath.Join(f.root, "hold"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	owner := launchInstance(t, dir, "127.0.0.1:0", "--enable-execution", "--pi-path", f.path)
+	url := owner.url(t)
+	_, _, message := enqueueExecution(t, url, executionProvider(t, url).ID, "")
+	observer, err := sql.Open("sqlite", filepath.Join(dir, "workspace.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer observer.Close()
+	var turnID string
+	awaitExecution(t, func() bool {
+		var state string
+		err := observer.QueryRow("SELECT turn_id,state FROM deliveries WHERE id=?", message.Deliveries[0].ID).Scan(&turnID, &state)
+		return err == nil && state == "accepted"
+	})
+	tx, err := observer.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("UPDATE groups SET name=name WHERE id=?", message.GroupID); err != nil {
+		t.Fatal(err)
+	}
+	connection, err := net.DialTimeout("tcp", strings.TrimPrefix(url, "http://"), time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connection.Close()
+	if err := connection.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"name":"drain 后提交"}`
+	if _, err := fmt.Fprintf(connection, "POST /api/v1/groups HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nExpect: 100-continue\r\n\r\n", strings.TrimPrefix(url, "http://"), len(body)); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(connection)
+	response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodPost})
+	if err != nil || response.StatusCode != http.StatusContinue {
+		t.Fatalf("HTTP handler did not enter its body read: %v %v", response, err)
+	}
+	response.Body.Close()
+	if err := owner.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-owner.done:
+		t.Fatalf("signal released ownership before receipt and HTTP drain: %v %s", owner.err, &owner.stderr)
+	case <-time.After(20 * time.Millisecond):
+	}
+	assertLocked := func() {
+		t.Helper()
+		if lock, err := lockDataDir(dir); err == nil {
+			lock.Close()
+			t.Fatal("process released its data-dir lock during drain")
+		}
+	}
+	assertLocked()
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	var receipt provider.ExecutionReceipt
+	awaitExecution(t, func() bool {
+		var raw string
+		err := observer.QueryRow("SELECT receipt_json FROM turns WHERE id=?", turnID).Scan(&raw)
+		return err == nil && raw != "" && json.Unmarshal([]byte(raw), &receipt) == nil
+	})
+	if !receipt.Started || !receipt.Accepted || !receipt.DirectChildReaped || receipt.Outcome != provider.OutcomeUnknown {
+		t.Fatalf("signal did not cancel, reap and persist the real fixture execution: %+v", receipt)
+	}
+	select {
+	case <-owner.done:
+		t.Fatalf("HTTP handler was not drained after the execution receipt: %v", owner.err)
+	default:
+	}
+	assertLocked()
+	if _, err := io.WriteString(connection, body); err != nil {
+		t.Fatal(err)
+	}
+	response, err = http.ReadResponse(reader, &http.Request{Method: http.MethodPost})
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusCreated {
+		t.Fatalf("DB closed before active HTTP handler committed: %d", response.StatusCode)
+	}
+	select {
+	case <-owner.done:
+		if owner.err != nil {
+			t.Fatalf("normal signal shutdown failed: %v %s", owner.err, &owner.stderr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("process did not finish after both drains")
+	}
+	lock, err := lockDataDir(dir)
+	if err != nil {
+		t.Fatalf("fully drained process retained ownership: %v", err)
+	}
+	defer lock.Close()
+	var state string
+	var committed int
+	if err := observer.QueryRow("SELECT state FROM turns WHERE id=?", turnID).Scan(&state); err != nil || state != "unknown" {
+		t.Fatalf("cancelled unknown outcome was lost: state=%s err=%v", state, err)
+	}
+	if err := observer.QueryRow("SELECT count(*) FROM groups WHERE name=?", "drain 后提交").Scan(&committed); err != nil || committed != 1 {
+		t.Fatalf("HTTP drain lost its commit: count=%d err=%v", committed, err)
+	}
+	t.Logf("SIGTERM: receipt reaped=%t outcome=%s; HTTP committed=%d; ownership retained until both drains", receipt.DirectChildReaped, receipt.Outcome, committed)
 }
 
 func TestInstanceDescriptorIsCloseOnExec(t *testing.T) {
