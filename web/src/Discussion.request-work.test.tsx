@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Message } from "./api";
 import type { AdmissionReceipt, RequestWorkInput } from "./coordination-api";
@@ -287,7 +287,7 @@ it.each(["Enter", " "] as const)("connects native message-button %j activation, 
   keyboardActivate(work().getByRole("button", { name: "收起" }), key); expect(trigger).toHaveFocus();
   keyboardActivate(trigger, key); expect(field()).toBe(title); expect(title).toHaveFocus();
   feedReads.mockResolvedValueOnce(page([agent])); reset(); await screen.findByRole("article", { name: `消息 ${agent.id}` });
-  expect(trigger).not.toBeInTheDocument();
+  await waitFor(() => expect(trigger).not.toBeInTheDocument());
   keyboardActivate(work().getByRole("button", { name: "收起" }), key);
   const restore = screen.getByRole("button", { name: "继续任务草稿" }); expect(restore).toHaveFocus();
   keyboardActivate(restore, key); expect(field()).toBe(title); expect(title).toHaveValue("保留的任务草稿"); expect(title).toHaveFocus();
