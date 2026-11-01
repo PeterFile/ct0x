@@ -97,6 +97,10 @@ func (s *MemberTools) withAuthorized(ctx context.Context, token, operation strin
 		return store.ErrMemberToolDenied
 	}
 	if err := s.db.ValidateMemberTool(ctx, entry.scope); err != nil {
+		// Store preflight sanitizes failures; preserve context only after registry authorization.
+		if contextErr := ctx.Err(); contextErr != nil {
+			return contextErr
+		}
 		return err
 	}
 	grants := entry.grants

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
@@ -280,5 +281,66 @@ func TestMemberToolHTTPRealNativeListenerPreservesOuterGuard(t *testing.T) {
 	}
 	if f.counts(t) != ([6]int{3, 2, 1, 1, 1, 1}) {
 		t.Fatal("rejected listener requests duplicated the native mutation")
+	}
+}
+
+func TestMemberToolHTTPRequestContextClassification(t *testing.T) {
+	for _, credential := range []string{"valid", "invalid", "revoked", "missing-grant"} {
+		t.Run(credential, func(t *testing.T) {
+			operations := []string{"send_message", "create_member"}
+			if credential == "missing-grant" {
+				operations = []string{"read_channel"}
+			}
+			f := newMemberToolHTTP(t, operations...)
+			token := f.token
+			if credential == "invalid" {
+				token = "unknown-capability"
+			} else if credential == "revoked" {
+				f.tools.Revoke(token)
+			}
+			for _, state := range []string{"canceled", "deadline"} {
+				requestCtx, cancel := context.WithCancel(context.Background())
+				wantStatus, wantCode := http.StatusRequestTimeout, "request_canceled"
+				if state == "deadline" {
+					cancel()
+					requestCtx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+					wantStatus, wantCode = http.StatusGatewayTimeout, "deadline_exceeded"
+				}
+				cancel()
+				if credential != "valid" {
+					wantStatus, wantCode = http.StatusForbidden, "forbidden"
+				}
+				for _, request := range memberToolHTTPRequests[2:] {
+					t.Run(state+"/"+request.operation, func(t *testing.T) {
+						key := "same-" + request.operation
+						r := f.newRequest(request.operation, request.body, key).WithContext(requestCtx)
+						r.Header.Set("Authorization", "Bearer "+token)
+						before := f.counts(t)
+						w := httptest.NewRecorder()
+						f.handler.ServeHTTP(w, r)
+						f.safeResponse(t, w.Code, w.Header(), w.Body.Bytes(), true)
+						if f.counts(t) != before {
+							t.Fatal("failed authorization or request context left durable effects")
+						}
+						assertError(t, w.Code, w.Header(), w.Body.Bytes(), wantStatus, wantCode)
+						if credential != "valid" {
+							if strings.Contains(w.Body.String(), "原幂等键") {
+								t.Fatal("invalid capability was classified as an unknown write")
+							}
+							return
+						}
+						if !strings.Contains(w.Body.String(), "操作结果尚未确认") || !strings.Contains(w.Body.String(), "原幂等键") {
+							t.Fatal("context error omitted Chinese unknown-result and same-key retry guidance")
+						}
+						recovered := f.request(t, request.operation, request.body, key)
+						after := f.counts(t)
+						replay := f.request(t, request.operation, request.body, key)
+						if recovered.Code != 201 || replay.Code != 201 || !bytes.Equal(recovered.Body.Bytes(), replay.Body.Bytes()) || f.counts(t) != after {
+							t.Fatal("same-key retry after a context failure did not preserve its stored outcome")
+						}
+					})
+				}
+			}
+		})
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"agentworkspace/internal/platform"
+	"agentworkspace/internal/store"
 )
 
 func TestMemberToolHTTPRequestCapCountsAllUTF8AndTrailingBytes(t *testing.T) {
@@ -97,7 +98,7 @@ func TestMemberToolHTTPWriteProjectionsNeverRejectLargeCommittedResults(t *testi
 	content := strings.Repeat("<", 30000)
 	send := f.request(t, "send_message", `{"content":"`+content+`"}`, "large-send")
 	projection := decoded[memberToolHTTPSendResult](t, send, 201)
-	memberToolHTTPKeys(t, send, "message_id", "topic_id", "created_at", "delivery_count", "content_omitted")
+	memberToolHTTPKeys(t, send, "message_id", "created_at", "delivery_count", "content_omitted")
 	stored, err := f.db.GetMessage(ctx, f.groupID, projection.MessageID)
 	if err != nil || stored.Content != content || !projection.ContentOmitted {
 		t.Fatalf("small send projection changed durable content: %v", err)
@@ -122,5 +123,52 @@ func TestMemberToolHTTPWriteProjectionsNeverRejectLargeCommittedResults(t *testi
 	fullCreate, _ := json.Marshal(platform.MemberCreateResult{Member: member, JoinMessage: &join})
 	if len(fullCreate) <= 64*1024 || f.counts(t) != ([6]int{4, 3, 2, 2, 2, 1}) {
 		t.Fatal("projection failed after commit or duplicated durable effects")
+	}
+}
+
+func TestMemberToolHTTPSendReceiptOmitsLongBoundTopic(t *testing.T) {
+	f := newMemberToolHTTP(t)
+	ctx := context.Background()
+	topic := strings.Repeat("<", 12000)
+	encodedTopic, err := json.Marshal(topic)
+	if err != nil || len(encodedTopic) <= 64*1024 {
+		t.Fatal("test requires a valid topic whose escaped JSON exceeds 64 KiB")
+	}
+	question, err := platform.NewLocalUser(f.db).CreateMessage(ctx, f.groupID, platform.MessageInput{
+		Content: "question", TopicID: topic, RecipientIDs: []string{f.peer.ID},
+	}, "long-topic-question")
+	if err != nil || question.TopicID != topic {
+		t.Fatalf("local-user messages must retain long valid topics: %v", err)
+	}
+	turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.groupID, DeliveryID: question.Deliveries[0].ID, MaxActive: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.claim = store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	f.token, err = f.tools.Issue(ctx, f.claim, platform.MemberToolGrants{Operations: []string{"send_message"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := f.counts(t)
+	first := f.request(t, "send_message", `{"content":"reply"}`, "long-topic-send")
+	result := decoded[memberToolHTTPSendResult](t, first, 201)
+	memberToolHTTPKeys(t, first, "message_id", "created_at", "delivery_count", "content_omitted")
+	if first.Body.Len() > 512 || result.MessageID == "" || result.CreatedAt.IsZero() || result.DeliveryCount != 0 || !result.ContentOmitted {
+		t.Fatal("send must return a small exact-field receipt without the bound topic")
+	}
+	t.Logf("escaped_topic_bytes=%d receipt_bytes=%d", len(encodedTopic), first.Body.Len())
+	stored, err := f.db.GetMessage(ctx, f.groupID, result.MessageID)
+	if err != nil || stored.TopicID != topic || stored.SenderID != f.peer.ID || stored.Content != "reply" || !stored.CreatedAt.Equal(result.CreatedAt) {
+		t.Fatalf("small receipt changed the complete durable message: %v", err)
+	}
+	want := before
+	want[1]++
+	want[4]++
+	if f.counts(t) != want {
+		t.Fatal("send must commit exactly one message and idempotency receipt")
+	}
+	replay := f.request(t, "send_message", `{"content":"reply"}`, "long-topic-send")
+	if replay.Code != 201 || replay.Body.String() != first.Body.String() || f.counts(t) != want {
+		t.Fatal("long-topic replay changed the receipt or duplicated durable effects")
 	}
 }

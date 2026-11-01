@@ -21,7 +21,6 @@ import (
 
 type memberToolHTTPSendResult struct {
 	MessageID      string    `json:"message_id"`
-	TopicID        string    `json:"topic_id"`
 	CreatedAt      time.Time `json:"created_at"`
 	DeliveryCount  int       `json:"delivery_count"`
 	ContentOmitted bool      `json:"content_omitted"`
@@ -187,12 +186,12 @@ func TestMemberToolHTTPDurableOperationsAndStoredReplay(t *testing.T) {
 	body, _ := json.Marshal(input)
 	first := f.request(t, "send_message", string(body), "Key/Exact:1")
 	message := decoded[memberToolHTTPSendResult](t, first, 201)
-	memberToolHTTPKeys(t, first, "message_id", "topic_id", "created_at", "delivery_count", "content_omitted")
-	if message.MessageID == "" || message.TopicID != "trusted-topic" || message.DeliveryCount != 2 || !message.ContentOmitted {
+	memberToolHTTPKeys(t, first, "message_id", "created_at", "delivery_count", "content_omitted")
+	if message.MessageID == "" || message.DeliveryCount != 2 || !message.ContentOmitted {
 		t.Fatalf("send projection lost its durable reference: %+v", message)
 	}
 	stored, err := f.db.GetMessage(ctx, f.groupID, message.MessageID)
-	if err != nil || stored.SenderID != f.caller.ID || stored.GroupID != f.groupID || stored.TopicID != message.TopicID || stored.Content != content || !stored.CreatedAt.Equal(message.CreatedAt) || len(stored.Deliveries) != message.DeliveryCount {
+	if err != nil || stored.SenderID != f.caller.ID || stored.GroupID != f.groupID || stored.TopicID != "trusted-topic" || stored.Content != content || !stored.CreatedAt.Equal(message.CreatedAt) || len(stored.Deliveries) != message.DeliveryCount {
 		t.Fatalf("projection changed the full durable message or bound identity: %v", err)
 	}
 	for _, d := range stored.Deliveries {

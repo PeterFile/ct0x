@@ -207,11 +207,10 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 	// Only fixed projections follow writes; never fail a committed write on result size.
 	WriteJSON(w, http.StatusCreated, struct {
 		MessageID      string    `json:"message_id"`
-		TopicID        string    `json:"topic_id"`
 		CreatedAt      time.Time `json:"created_at"`
 		DeliveryCount  int       `json:"delivery_count"`
 		ContentOmitted bool      `json:"content_omitted"`
-	}{message.ID, message.TopicID, message.CreatedAt, len(message.Deliveries), true})
+	}{message.ID, message.CreatedAt, len(message.Deliveries), true})
 }
 
 func (a memberToolAPI) createMember(w http.ResponseWriter, r *http.Request, token string) {
