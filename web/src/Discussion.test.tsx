@@ -15,7 +15,11 @@ const article = (id = message.id) => panel().getByRole("article", { name: `消�
 const route = (value: string) => fireEvent.change(panel().getByRole("combobox", { name: "接收方式" }), { target: { value } });
 // Native textarea values use LF; received records may still contain CRLF.
 const raw = "  <script>window.bad = true</script>\n@研究员\n原文尾部  ";
-async function open() { render(<App />); select((await screen.findByRole("button", { name: group.name })).textContent!); }
+async function open() {
+  render(<App />); select((await screen.findByRole("button", { name: group.name })).textContent!);
+  fireEvent.click(screen.getByRole("button", { name: "成员" }));
+  fireEvent.click(screen.getByRole("button", { name: "关闭详情" }));
+}
 beforeEach(() => {
   reads.mockReset().mockImplementation(async () => page());
   details.mockReset().mockImplementation(async () => json(message));
