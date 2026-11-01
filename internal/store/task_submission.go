@@ -56,9 +56,6 @@ func submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (dom
 	if replay {
 		return taskSubmissionInTx(ctx, tx, input.GroupID, input.TaskID, id)
 	}
-	if len(input.ArtifactVersions) != 0 {
-		return domain.Submission{}, fmt.Errorf("%w：成果版本尚未接入登记与关联校验，目前仅支持文本提交", ErrInvalid)
-	}
 	task, err := taskInTx(ctx, tx, input.GroupID, input.TaskID)
 	if err != nil {
 		return domain.Submission{}, err
@@ -75,7 +72,8 @@ func submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (dom
 	}
 	next, submission, err := task.Submit(domain.Submission{
 		ID: id, TaskID: task.ID, GroupID: task.GroupID, TaskRevision: task.Revision,
-		AttemptID: attempt.ID, Summary: input.Summary, SubmittedBy: actorID, CreatedAt: time.Now().UTC(),
+		AttemptID: attempt.ID, Summary: input.Summary, SubmittedBy: actorID,
+		ArtifactVersions: input.ArtifactVersions, CreatedAt: time.Now().UTC(),
 	})
 	if err != nil {
 		return domain.Submission{}, err
@@ -83,6 +81,9 @@ func submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (dom
 	if _, err := tx.ExecContext(ctx, `INSERT INTO task_submissions(id,task_id,group_id,task_revision,attempt_id,summary,submitted_by,created_at)
 		VALUES(?,?,?,?,?,?,?,?)`, submission.ID, submission.TaskID, submission.GroupID, submission.TaskRevision,
 		submission.AttemptID, submission.Summary, submission.SubmittedBy, submission.CreatedAt.Format(timestampLayout)); err != nil {
+		return domain.Submission{}, err
+	}
+	if err := insertTaskArtifactRefs(ctx, tx, submission); err != nil {
 		return domain.Submission{}, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE tasks SET status=?,current_submission_id=?
@@ -102,7 +103,7 @@ func submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (dom
 	return submission, nil
 }
 
-// Canonicalize even unsupported refs before validation so keyed conflicts stay exact.
+// Canonicalize refs before validation so keyed conflicts retain their original semantics.
 func taskSubmissionPayload(input SubmitTaskInput) []byte {
 	refs := slices.Clone(input.ArtifactVersions)
 	slices.SortFunc(refs, func(a, b domain.ArtifactVersionRef) int {
@@ -138,7 +139,15 @@ func (s *Store) GetTaskSubmission(ctx context.Context, groupID, taskID, submissi
 }
 
 func taskSubmissionInTx(ctx context.Context, tx *sql.Tx, groupID, taskID, submissionID string) (domain.Submission, error) {
-	return scanTaskSubmission(tx.QueryRowContext(ctx, "SELECT "+taskSubmissionColumns+" FROM task_submissions WHERE group_id=? AND task_id=? AND id=?", groupID, taskID, submissionID))
+	submission, err := scanTaskSubmission(tx.QueryRowContext(ctx, "SELECT "+taskSubmissionColumns+" FROM task_submissions WHERE group_id=? AND task_id=? AND id=?", groupID, taskID, submissionID))
+	if err != nil {
+		return domain.Submission{}, err
+	}
+	refs, err := taskArtifactRefsInTx(ctx, tx, groupID, taskID, []string{submission.ID})
+	if err == nil {
+		submission.ArtifactVersions = refs[submission.ID]
+	}
+	return submission, err
 }
 
 func scanTaskSubmission(row scanner) (submission domain.Submission, err error) {
@@ -196,6 +205,17 @@ func (s *Store) ListTaskSubmissions(ctx context.Context, groupID, taskID string,
 		page.Items = page.Items[:limit]
 		last := page.Items[limit-1]
 		page.NextCursor = &Cursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	ids := make([]string, len(page.Items))
+	for i, submission := range page.Items {
+		ids[i] = submission.ID
+	}
+	refs, err := taskArtifactRefsInTx(ctx, tx, groupID, taskID, ids)
+	if err != nil {
+		return Page[domain.Submission]{}, taskError("读取提交成果引用失败", err)
+	}
+	for i := range page.Items {
+		page.Items[i].ArtifactVersions = refs[page.Items[i].ID]
 	}
 	if err := tx.Commit(); err != nil {
 		return Page[domain.Submission]{}, taskError("列出任务提交失败", err)
