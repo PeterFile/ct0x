@@ -194,23 +194,32 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	if codex {
 		args = append(args, "-")
 	}
-	outDrain, errDrain := &executionDrain{Writer: out}, &executionDrain{Writer: errLog}
+	var frames *executionFrames
+	var output io.Writer = out
+	if e.memberTools != nil {
+		frames = newExecutionFrames(outLog, cancel, out.recordFrame)
+		output = frames
+	}
+	outDrain, errDrain := &executionDrain{Writer: output}, &executionDrain{Writer: errLog}
 	cmd := exec.CommandContext(ctx, e.path, args...)
 	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = request.CWD, strings.NewReader(request.Prompt), outDrain, errDrain
 	if e.memberTools != nil {
 		cmd.Env = piMemberToolEnvironment(os.Environ(), e.memberTools.configPath)
 	}
-	// WaitDelay bounds inherited pipes, not descendants' lifetimes or callback
-	// work. Wait joins the parser/copying goroutines; delivery is joined separately.
+	// WaitDelay bounds inherited pipes, not descendants' lifetimes or callbacks.
+	// Tools mode keeps JSON parsing off the copier; plain adapters stay synchronous.
+	// Wait joins pipe readers, then tools parsing and finally event delivery join.
 	cmd.WaitDelay = 100 * time.Millisecond
 	if cmd.Start() != nil {
+		frames.finish()
 		delivery.finish()
 		r.Reason = "无法启动模型进程，提示词未被接收"
 		return r
 	}
 	r.Started, r.Outcome = true, OutcomeUnknown
 	err = cmd.Wait()
-	// Only now may the queue close. Consolidate delivery failure after its sole
+	frames.finish()
+	// Only now may the event queue close. Consolidate delivery failure after its sole
 	// consumer finishes, including failures racing normal native completion.
 	r.DeliveryFailed = delivery.finish()
 	r.DirectChildReaped = cmd.ProcessState != nil
