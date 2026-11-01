@@ -1,0 +1,69 @@
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import { Value } from "typebox/value";
+import { createClient } from "./bridge.mjs";
+
+const pagination = Type.Object({
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: "每页条数，范围 1 至 200。" })),
+  before: Type.Optional(Type.String({ description: "上一页返回的不透明游标。" })),
+}, { additionalProperties: false });
+
+const tools = [
+  {
+    name: "list_members",
+    label: "查看群组成员",
+    description: "分页查看当前执行所属群组的成员；群组与调用者由服务端绑定。",
+    parameters: pagination,
+  },
+  {
+    name: "read_channel",
+    label: "读取频道消息",
+    description: "分页读取当前执行绑定频道的消息；结果超过 64 KiB 时需缩小页数。",
+    parameters: pagination,
+  },
+  {
+    name: "send_message",
+    label: "发送群组消息",
+    description: "在当前执行绑定的频道保存消息，可指定群内接收成员；保存不代表投递已确认。",
+    parameters: Type.Object({
+      content: Type.String({ description: "消息正文。" }),
+      recipient_ids: Type.Optional(Type.Array(Type.String(), { description: "接收成员标识；省略时由服务端路由。" })),
+    }, { additionalProperties: false }),
+  },
+  {
+    name: "create_member",
+    label: "创建协作成员",
+    description: "按职责与加入原因创建或复用群内成员；运行配置、权限与容量由服务端决定。",
+    parameters: Type.Object({
+      name: Type.String({ description: "成员名称。" }),
+      role: Type.String({ description: "成员职责。" }),
+      reason: Type.String({ description: "需要该成员加入的原因。" }),
+    }, { additionalProperties: false }),
+  },
+] as const;
+
+export default function piBridge(pi: ExtensionAPI) {
+  const invoke = createClient(process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG);
+  for (const tool of tools) {
+    pi.registerTool<typeof tool.parameters>({
+      ...tool,
+      async execute(toolCallId, params, signal, _onUpdate, _ctx) {
+        let valid = false;
+        let payload: unknown;
+        try {
+          if (Value.Check(tool.parameters, params)) {
+            const encoded = JSON.stringify(params, (_key, value: unknown) => {
+              if (value === undefined) throw new Error();
+              return value;
+            });
+            payload = JSON.parse(encoded);
+            valid = Value.Check(tool.parameters, payload);
+          }
+        } catch { /* Reject unsafe runtime values without exposing their errors. */ }
+        if (!valid) throw new Error("成员工具参数无效，未发送请求。");
+        const result = await invoke(tool.name, payload, toolCallId, signal);
+        return { content: [{ type: "text", text: result.text }], details: result.json };
+      },
+    });
+  }
+}
