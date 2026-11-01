@@ -19,6 +19,7 @@ import (
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
+	"agentworkspace/internal/webassets"
 )
 
 func main() {
@@ -45,33 +46,65 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if err := os.MkdirAll(config.dataDir, 0700); err != nil {
 		return fmt.Errorf("创建数据目录失败：%w", err)
 	}
+	lock, err := lockDataDir(config.dataDir)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
 	db, err := store.Open(filepath.Join(config.dataDir, "workspace.db"))
 	if err != nil {
 		return fmt.Errorf("打开工作区数据库失败：%w", err)
 	}
+	// serve joins scheduler and HTTP drains before store and lock closure.
 	defer func() { err = errors.Join(err, db.Close()) }()
-	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", config.listen)
-	if err != nil {
-		return fmt.Errorf("监听本地地址失败：%w", err)
+	if _, err := db.RecoverInFlight(ctx); err != nil {
+		return fmt.Errorf("恢复在途轮次失败：%w", err)
 	}
-	defer listener.Close()
 	search.Explicit = append([]provider.Location{{Name: provider.Pi, Path: config.piPath}, {Name: provider.Codex, Path: config.codexPath}}, search.Explicit...)
 	catalog := platform.DiscoverProviders(ctx, search, provider.Runner{Timeout: 2 * time.Second, OutputLimit: 4096})
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("启动已取消：%w", err)
 	}
-	routes := append(httpapi.LocalUserRoutes(platform.NewLocalUser(db)), httpapi.ProviderRoute(catalog))
+	var schedule func(context.Context) error
+	executionStatus := "执行已禁用，投递仅排队"
+	if config.enableExecution {
+		schedule, err = executionRunner(config.dataDir, db, catalog)
+		if err != nil {
+			return err
+		}
+		executionStatus = "全新单轮执行已启用，最大并发 1"
+	}
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", config.listen)
+	if err != nil {
+		return fmt.Errorf("监听本地地址失败：%w", err)
+	}
+	defer listener.Close()
+	local := platform.NewLocalUser(db)
+	routes := append(httpapi.LocalUserRoutes(local), httpapi.MessageRoutes(local)...)
+	routes = append(routes, httpapi.ProviderRoute(catalog))
+	if config.webDir != "" {
+		web, openErr := webassets.Open(config.webDir)
+		if openErr != nil {
+			return openErr
+		}
+		defer func() { err = errors.Join(err, web.Close()) }()
+		routes = append(routes,
+			httpapi.Route{Method: http.MethodGet, Pattern: "/", Handler: web.ServeHTTP},
+			httpapi.Route{Method: http.MethodHead, Pattern: "/", Handler: web.ServeHTTP})
+	}
 	server, err := httpapi.NewServerWithConfig(httpapi.Config{Address: listener.Addr().String(), DevOrigin: config.devOrigin}, routes...)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询及 CLI 目录；目录仅启动时探测、证据仅存内存，其他功能尚未启用）\n", listener.Addr()); err != nil {
+	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录及 CLI 目录；目录仅启动时探测、证据仅存内存；%s；不支持恢复、运行中追加输入或平台工具；Pi 禁用工具，Codex 可用原生只读工具；工作目录不是主机读取沙箱，数据目录及祖先必须可信且目录身份稳定；其他功能尚未启用）\n", listener.Addr(), executionStatus); err != nil {
 		return fmt.Errorf("输出启动信息失败：%w", err)
 	}
-	return serve(ctx, server, listener, 5*time.Second)
+	return serve(ctx, server, listener, 5*time.Second, schedule)
 }
 
-func serve(ctx context.Context, server *http.Server, listener net.Listener, grace time.Duration) error {
+func serve(parent context.Context, server *http.Server, listener net.Listener, grace time.Duration, schedule func(context.Context) error) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
 	var active sync.WaitGroup
 	var admission sync.Mutex
 	stopping := false
@@ -88,6 +121,15 @@ func serve(ctx context.Context, server *http.Server, listener net.Listener, grac
 		defer active.Done()
 		handler.ServeHTTP(w, r)
 	})
+	var schedulerDone chan error
+	if schedule != nil {
+		schedulerDone = make(chan error, 1)
+		go func() {
+			err := schedule(ctx)
+			cancel()
+			schedulerDone <- err
+		}()
+	}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 	var serveErr error
@@ -98,10 +140,12 @@ func serve(ctx context.Context, server *http.Server, listener net.Listener, grac
 		received = true
 	}
 
+	// Stop claims and cancel executors immediately, before waiting for HTTP drain.
+	cancel()
 	// Serve returns ErrServerClosed before Shutdown has drained active requests.
 	// Do not derive this grace period from the already-cancelled process context.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
-	defer cancel()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), grace)
+	defer shutdownCancel()
 	shutdownErr := server.Shutdown(shutdownCtx)
 	if shutdownErr != nil {
 		shutdownErr = fmt.Errorf("HTTP 服务关闭失败：%w", errors.Join(shutdownErr, server.Close()))
@@ -115,10 +159,14 @@ func serve(ctx context.Context, server *http.Server, listener net.Listener, grac
 		serveErr = <-done
 	}
 	active.Wait()
-	if errors.Is(serveErr, http.ErrServerClosed) {
+	var schedulerErr error
+	if schedulerDone != nil {
+		schedulerErr = <-schedulerDone // No timeout may release DB/lock before receipts drain.
+	}
+	if serveErr == http.ErrServerClosed {
 		serveErr = nil
 	} else if serveErr != nil {
 		serveErr = fmt.Errorf("HTTP 服务异常停止：%w", serveErr)
 	}
-	return errors.Join(serveErr, shutdownErr)
+	return shutdownError(errors.Join(serveErr, shutdownErr, schedulerErr, parent.Err()))
 }
