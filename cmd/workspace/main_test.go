@@ -35,7 +35,7 @@ func TestConfigDefaultsAndHelp(t *testing.T) {
 		t.Fatal(err)
 	}
 	config, err := parseConfig(nil, io.Discard)
-	if err != nil || config.listen != httpapi.DefaultAddress || config.dataDir != filepath.Join(root, "agent-workspace") || config.devOrigin != "" || config.piPath != "" || config.codexPath != "" {
+	if err != nil || config.listen != httpapi.DefaultAddress || config.dataDir != filepath.Join(root, "agent-workspace") || config.webDir != "" || config.enableExecution || config.devOrigin != "" || config.piPath != "" || config.codexPath != "" {
 		t.Fatalf("unsafe or non-durable defaults: %+v %v", config, err)
 	}
 	for _, flag := range []string{"-h", "--help"} {
@@ -43,7 +43,7 @@ func TestConfigDefaultsAndHelp(t *testing.T) {
 		if err := runWithSearch(context.Background(), []string{flag}, &output, provider.Search{}); err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range []string{"用法", "--listen", "127.0.0.1:7310", "--data-dir", "--dev-origin", "禁用", "--pi-path", "--codex-path", "绝对"} {
+		for _, want := range []string{"用法", "--listen", "127.0.0.1:7310", "--data-dir", "--web-dir", "网页构建目录（默认禁用", "--dev-origin", "禁用", "--pi-path", "--codex-path", "绝对"} {
 			if !strings.Contains(output.String(), want) {
 				t.Errorf("help missing %q: %s", want, &output)
 			}
@@ -168,9 +168,17 @@ func startRunWithSearch(t *testing.T, search provider.Search, args ...string) (s
 		if !chinese(line) || !strings.Contains(line, "群组与成员") || !strings.Contains(line, "其他功能尚未启用") || !strings.Contains(line, "CLI 目录") || !strings.Contains(line, "仅存内存") {
 			t.Fatalf("startup must describe the group/member boundary: %s", line)
 		}
-		for _, want := range []string{"消息持久化", "历史与详情", "排队投递记录", "模型调度与执行尚未接入"} {
+		parsed, err := parseConfig(args, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		executionStatus := "执行已禁用，投递仅排队"
+		if parsed.enableExecution {
+			executionStatus = "全新单轮执行已启用，最大并发 1"
+		}
+		for _, want := range []string{"消息持久化", "历史与详情", "排队投递记录", executionStatus, "不支持恢复", "平台工具", "不是主机读取沙箱", "祖先必须可信"} {
 			if !strings.Contains(line, want) {
-				t.Fatalf("startup must state the queue-only message boundary: missing %q: %s", want, line)
+				t.Fatalf("startup must state execution boundaries: missing %q: %s", want, line)
 			}
 		}
 		for _, field := range strings.Fields(line) {
@@ -186,6 +194,91 @@ func startRunWithSearch(t *testing.T, search provider.Search, args ...string) (s
 		t.Fatal("startup timed out")
 	}
 	return "", stop
+}
+
+func TestRunWebDir(t *testing.T) {
+	const index = "<!doctype html><title>Workspace entry</title>"
+	const asset = "console.log('web-entry');\n"
+	webDir := t.TempDir()
+	for name, body := range map[string]string{"index.html": index, "app.js": asset} {
+		if err := os.WriteFile(filepath.Join(webDir, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, mode := range []struct {
+		name string
+		args []string
+	}{
+		{"api-only", nil},
+		{"empty-web-dir", []string{"--web-dir", ""}},
+		{"web-dir", []string{"--web-dir", webDir}},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			url, _ := startRun(t, append([]string{"--listen", "127.0.0.1:0", "--data-dir", t.TempDir()}, mode.args...)...)
+			client := &http.Client{Timeout: 3 * time.Second}
+			defer client.CloseIdleConnections()
+			type responseCase struct {
+				method, path, media, body string
+				status                    int
+			}
+			cases := []responseCase{
+				{"GET", "/api/v1/groups", "application/json", "", http.StatusOK},
+				{"GET", "/api", "application/json", "", http.StatusNotFound},
+				{"GET", "/api/", "application/json", "", http.StatusNotFound},
+				{"GET", "/api/v1/unknown", "application/json", "", http.StatusNotFound},
+				{"GET", "/healthz/unknown", "application/json", "", http.StatusNotFound},
+			}
+			if mode.name == "web-dir" {
+				cases = append(cases,
+					responseCase{"GET", "/", "text/html", index, http.StatusOK},
+					responseCase{"GET", "/app.js", "", asset, http.StatusOK},
+					responseCase{"GET", "/groups/example", "text/html", index, http.StatusOK},
+					responseCase{"HEAD", "/", "text/html", "", http.StatusOK})
+			} else {
+				cases = append(cases, responseCase{"GET", "/", "application/json", "", http.StatusNotFound})
+			}
+			for _, tt := range cases {
+				request, err := http.NewRequest(tt.method, url+tt.path, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				request.Header.Set("Accept", "text/html")
+				response, err := client.Do(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body, err := io.ReadAll(response.Body)
+				response.Body.Close()
+				if err != nil || response.StatusCode != tt.status || !strings.HasPrefix(response.Header.Get("Content-Type"), tt.media) {
+					t.Fatalf("%s %s: status=%d type=%q body=%s err=%v", tt.method, tt.path, response.StatusCode, response.Header.Get("Content-Type"), body, err)
+				}
+				if tt.media == "application/json" {
+					if !json.Valid(body) || tt.status >= 400 && !chinese(string(body)) {
+						t.Fatalf("%s must remain JSON with Chinese errors: %s", tt.path, body)
+					}
+				} else if string(body) != tt.body {
+					t.Fatalf("%s %s: body=%q, want %q", tt.method, tt.path, body, tt.body)
+				}
+			}
+		})
+	}
+}
+
+func TestWebDirStartupFailures(t *testing.T) {
+	for _, dir := range []string{filepath.Join(t.TempDir(), "missing"), t.TempDir()} {
+		t.Run(filepath.Base(dir), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			var output bytes.Buffer
+			err := runWithSearch(ctx, []string{"--listen", "127.0.0.1:0", "--data-dir", t.TempDir(), "--web-dir", dir}, &output, provider.Search{})
+			if err == nil || !chinese(err.Error()) || errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("missing root/build must fail startup in Chinese: %v", err)
+			}
+			if output.Len() != 0 {
+				t.Fatalf("invalid web directory printed startup success: %s", &output)
+			}
+		})
+	}
 }
 
 func TestRunLifecycleAndPersistence(t *testing.T) {
@@ -402,7 +495,7 @@ func TestServeDrainsBeforeClosingStore(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			go func() {
-				err := serve(ctx, server, listener, grace)
+				err := serve(ctx, server, listener, grace, nil)
 				done <- errors.Join(err, db.Close())
 			}()
 			requestDone := make(chan error, 1)
