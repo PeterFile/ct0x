@@ -63,13 +63,25 @@ func engineLocalRows(t *testing.T, db *sql.DB, query string) [][]any {
 	return result
 }
 
+func engineLocalTableRows(t *testing.T, db *sql.DB, table string) [][]any {
+	t.Helper()
+	columns := engineLocalRows(t, db, "SELECT name FROM pragma_table_xinfo('"+strings.ReplaceAll(table, "'", "''")+"') WHERE hidden<>1 ORDER BY cid")
+	var order []string
+	for _, column := range columns {
+		quoted := `"` + strings.ReplaceAll(column[0].(string), `"`, `""`) + `"`
+		// Types distinguish equal numeric values; BINARY avoids collation-dependent ties.
+		order = append(order, "typeof("+quoted+")", quoted+" COLLATE BINARY")
+	}
+	return engineLocalRows(t, db, `SELECT * FROM "`+strings.ReplaceAll(table, `"`, `""`)+`" ORDER BY `+strings.Join(order, ","))
+}
+
 func engineLocalSnapshot(t *testing.T, db *sql.DB) map[string][][]any {
 	t.Helper()
 	names := engineLocalRows(t, db, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'coordination_triggers' ORDER BY name")
 	result := make(map[string][][]any, len(names))
 	for _, name := range names {
 		table := name[0].(string)
-		result[table] = engineLocalRows(t, db, `SELECT * FROM "`+strings.ReplaceAll(table, `"`, `""`)+`" ORDER BY rowid`)
+		result[table] = engineLocalTableRows(t, db, table)
 	}
 	return result
 }
