@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +19,7 @@ import (
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/httpapi"
+	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
 )
 
@@ -33,15 +35,15 @@ func TestConfigDefaultsAndHelp(t *testing.T) {
 		t.Fatal(err)
 	}
 	config, err := parseConfig(nil, io.Discard)
-	if err != nil || config.listen != httpapi.DefaultAddress || config.dataDir != filepath.Join(root, "agent-workspace") || config.devOrigin != "" {
+	if err != nil || config.listen != httpapi.DefaultAddress || config.dataDir != filepath.Join(root, "agent-workspace") || config.devOrigin != "" || config.piPath != "" || config.codexPath != "" {
 		t.Fatalf("unsafe or non-durable defaults: %+v %v", config, err)
 	}
 	for _, flag := range []string{"-h", "--help"} {
 		var output bytes.Buffer
-		if err := run(context.Background(), []string{flag}, &output); err != nil {
+		if err := runWithSearch(context.Background(), []string{flag}, &output, provider.Search{}); err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range []string{"用法", "--listen", "127.0.0.1:7310", "--data-dir", "--dev-origin", "禁用"} {
+		for _, want := range []string{"用法", "--listen", "127.0.0.1:7310", "--data-dir", "--dev-origin", "禁用", "--pi-path", "--codex-path", "绝对"} {
 			if !strings.Contains(output.String(), want) {
 				t.Errorf("help missing %q: %s", want, &output)
 			}
@@ -58,13 +60,15 @@ func TestInvalidConfigurationCreatesNoRuntimeState(t *testing.T) {
 		{"--listen", "[::]:7310"}, {"--listen", "192.168.1.1:7310"}, {"--listen", "[::1%lo0]:7310"},
 		{"--listen", "127.0.0.1"}, {"--listen", "127.0.0.1:65536"}, {"--listen", ""},
 		{"--unknown"}, {"--listen"}, {"unexpected"}, {"--data-dir", ""},
+		{"--pi-path", ""}, {"--pi-path", "relative/pi"}, {"--codex-path", "codex"},
+		{"--pi-path", "/missing/pi", "--pi-path", "/missing/pi"}, {"--codex-path", ""},
 		{"--dev-origin", "http://localhost:5173"}, {"--dev-origin", "https://127.0.0.1:5173"},
 		{"--dev-origin", ""}, {"--dev-origin", "http://127.0.0.1:5173", "--dev-origin", "http://127.0.0.1:5173"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "must-not-exist")
 			var output bytes.Buffer
-			err := run(context.Background(), append([]string{"--data-dir", dir}, args...), &output)
+			err := runWithSearch(context.Background(), append([]string{"--data-dir", dir}, args...), &output, provider.Search{})
 			if err == nil || !chinese(err.Error()) {
 				t.Fatalf("invalid config must fail in Chinese: %v", err)
 			}
@@ -104,7 +108,7 @@ func TestStartupFailures(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var output bytes.Buffer
-			if err := run(context.Background(), []string{"--listen", tt.listen, "--data-dir", tt.dir}, &output); err == nil || !chinese(err.Error()) {
+			if err := runWithSearch(context.Background(), []string{"--listen", tt.listen, "--data-dir", tt.dir}, &output, provider.Search{}); err == nil || !chinese(err.Error()) {
 				t.Fatalf("expected startup error, got %v", err)
 			}
 			if output.Len() != 0 {
@@ -115,7 +119,7 @@ func TestStartupFailures(t *testing.T) {
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 	unused := filepath.Join(base, "cancelled")
-	if err := run(cancelled, []string{"--listen", "127.0.0.1:0", "--data-dir", unused}, io.Discard); !errors.Is(err, context.Canceled) {
+	if err := runWithSearch(cancelled, []string{"--listen", "127.0.0.1:0", "--data-dir", unused}, io.Discard, provider.Search{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("pre-cancelled startup must stop: %v", err)
 	}
 	if _, err := os.Stat(unused); !os.IsNotExist(err) {
@@ -132,10 +136,15 @@ func (w startupWriter) Write(body []byte) (int, error) {
 
 func startRun(t *testing.T, args ...string) (string, func() error) {
 	t.Helper()
+	return startRunWithSearch(t, provider.Search{}, args...)
+}
+
+func startRunWithSearch(t *testing.T, search provider.Search, args ...string) (string, func() error) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	output := startupWriter{lines: make(chan string, 4)}
 	done := make(chan error, 1)
-	go func() { done <- run(ctx, args, output) }()
+	go func() { done <- runWithSearch(ctx, args, output, search) }()
 	var once sync.Once
 	var result error
 	stop := func() error {
@@ -156,8 +165,13 @@ func startRun(t *testing.T, args ...string) (string, func() error) {
 	})
 	select {
 	case line := <-output.lines:
-		if !chinese(line) || !strings.Contains(line, "群组与成员") || !strings.Contains(line, "其他功能尚未启用") {
+		if !chinese(line) || !strings.Contains(line, "群组与成员") || !strings.Contains(line, "其他功能尚未启用") || !strings.Contains(line, "CLI 目录") || !strings.Contains(line, "仅存内存") {
 			t.Fatalf("startup must describe the group/member boundary: %s", line)
+		}
+		for _, want := range []string{"消息持久化", "历史与详情", "排队投递记录", "模型调度与执行尚未接入"} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("startup must state the queue-only message boundary: missing %q: %s", want, line)
+			}
 		}
 		for _, field := range strings.Fields(line) {
 			if strings.HasPrefix(field, "http://") {
@@ -222,7 +236,7 @@ func TestRunLifecycleAndPersistence(t *testing.T) {
 	}{
 		{"/healthz", http.StatusOK}, {"/api/v1/groups", http.StatusOK}, {"/api/v1/groups/" + group.ID, http.StatusOK},
 		{"/api/v1/groups/" + group.ID + "/members", http.StatusOK}, {"/api/v1/groups/" + group.ID + "/members/" + member.ID, http.StatusOK},
-		{"/api/v1/groups/group/members", http.StatusNotFound}, {"/api/v1/providers", http.StatusNotFound},
+		{"/api/v1/groups/group/members", http.StatusNotFound}, {"/api/v1/providers", http.StatusOK},
 	} {
 		response, err := client.Get(url + tt.path)
 		if err != nil {
@@ -270,6 +284,76 @@ func TestRunLifecycleAndPersistence(t *testing.T) {
 	got, err := reopened.GetGroup(context.Background(), group.ID)
 	if err != nil || got != group {
 		t.Fatalf("restart lost persistent data: %+v %v", got, err)
+	}
+}
+
+func TestRunMessageRoutesPersistWithoutExecution(t *testing.T) {
+	dir := t.TempDir()
+	url, stop := startRun(t, "--listen", "127.0.0.1:0", "--data-dir", dir)
+	client := &http.Client{Timeout: 3 * time.Second}
+	defer client.CloseIdleConnections()
+	request := func(method, path, body, key string, status int, result any) {
+		t.Helper()
+		r, err := http.NewRequest(method, url+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Header.Set("Content-Type", "application/json")
+		if key != "" {
+			r.Header.Set("Idempotency-Key", key)
+		}
+		response, err := client.Do(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != status {
+			t.Fatalf("%s %s: status = %d, want %d", method, path, response.StatusCode, status)
+		}
+		if err := json.NewDecoder(response.Body).Decode(result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var group domain.Group
+	request("POST", "/api/v1/groups", `{"name":"消息接线"}`, "", 201, &group)
+	path := "/api/v1/groups/" + group.ID + "/messages"
+	body := `{"content":" 仅留存可见消息 ","recipient_ids":[],"topic_id":"topic"}`
+	var visible domain.Message
+	request("POST", path, body, "visible-message", 201, &visible)
+	if visible.ID == "" || visible.GroupID != group.ID || visible.SenderID != "user" || visible.Content != " 仅留存可见消息 " || visible.TopicID != "topic" || visible.CreatedAt.IsZero() || visible.Deliveries == nil || len(visible.Deliveries) != 0 {
+		t.Fatalf("visible message was not persisted directly without wakeups: %+v", visible)
+	}
+	var detail domain.Message
+	request("GET", path+"/"+visible.ID, "", "", 200, &detail)
+	var page struct {
+		Items      []domain.Message `json:"items"`
+		NextCursor string           `json:"next_cursor"`
+	}
+	request("GET", path, "", "", 200, &page)
+	if !reflect.DeepEqual(detail, visible) || page.Items == nil || len(page.Items) != 1 || !reflect.DeepEqual(page.Items[0], visible) || page.NextCursor != "" {
+		t.Fatal("message detail/history did not expose the persisted receipt")
+	}
+	var member domain.Member
+	request("POST", "/api/v1/groups/"+group.ID+"/members", `{"name":"未绑定成员","role":"职责"}`, "", 201, &member)
+	var queued domain.Message
+	request("POST", path, `{"content":"仅排队，不执行"}`, "", 201, &queued)
+	if len(queued.Deliveries) != 1 || queued.Deliveries[0].RecipientID != member.ID || queued.Deliveries[0].State != domain.DeliveryStateQueued || queued.Deliveries[0].TurnID != "" {
+		t.Fatalf("default routing must only queue a delivery: %+v", queued)
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	url, stop = startRun(t, "--listen", "127.0.0.1:0", "--data-dir", dir)
+	request("POST", path, body, "visible-message", 201, &detail)
+	if !reflect.DeepEqual(detail, visible) {
+		t.Fatal("runtime reopen/retry changed the visible receipt")
+	}
+	request("GET", path+"/"+queued.ID, "", "", 200, &detail)
+	if !reflect.DeepEqual(detail, queued) {
+		t.Fatal("runtime restart lost or advanced the queue-only delivery")
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
 	}
 }
 

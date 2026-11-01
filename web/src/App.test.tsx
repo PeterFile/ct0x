@@ -15,7 +15,7 @@ beforeEach(() => {
   transport.mockReset();
   transport.mockImplementation(async () => page());
   vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) =>
-    String(input).includes("/members") || String(input).startsWith("/api/v1/providers")
+    String(input).includes("/members") || String(input).includes("/messages") || String(input).startsWith("/api/v1/providers")
       ? Promise.resolve(page()) : transport(input, init));
 });
 afterEach(() => vi.unstubAllGlobals());
@@ -49,7 +49,7 @@ describe("workspace groups", () => {
     expect(screen.getByText("正在载入群组…")).toBeVisible();
     await screen.findByText("尚无群组，可在下方创建。");
     expect(nameInput()).toBeRequired();
-    expect(within(screen.getByRole("main")).getByText("消息尚未载入，发送功能尚未开放。")).toBeVisible();
+    expect(within(screen.getByRole("main")).getByText("请先选择群组，再查看讨论和发送消息。")).toBeVisible();
     expect(within(screen.getByRole("main")).queryByRole("textbox")).not.toBeInTheDocument();
     expect(within(screen.getByRole("complementary", { name: "成员" })).queryByRole("button")).not.toBeInTheDocument();
   });
