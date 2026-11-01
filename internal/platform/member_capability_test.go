@@ -100,7 +100,7 @@ func TestMemberCapabilityGrantValidationAndImmutableCopies(t *testing.T) {
 	for _, grants := range []MemberToolGrants{
 		{},
 		{Operations: []string{}},
-		{Operations: []string{"list_members", "search_history"}},
+		{Operations: []string{"list_members", "unknown_operation"}},
 		{Operations: []string{"list_members "}},
 		{Operations: []string{""}},
 		{Operations: []string{"create_member"}, ProviderID: "pi", Model: "selected"},
