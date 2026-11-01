@@ -30,7 +30,7 @@ const rect = (top: number, height: number) => ({ top, bottom: top + height, left
 // These are controlled coordinates, not jsdom layout or real-browser acceptance.
 const tops = new WeakMap<HTMLElement, number>();
 const heights = new Map<string, number>();
-let header = 80, footer = 20, measurements = 0, scrollWrites = 0;
+let header = 80, footer = 20, measurements = 0, scrollWrites = 0, gutterWidth = 16;
 let nativeShift: { count: number; delta: number } | undefined;
 const hidden = (element: Element) => Boolean(element.closest("[hidden]"));
 const rows = (element: HTMLElement) => [...element.querySelectorAll(".message-list > li")];
@@ -70,12 +70,15 @@ function startReading(input: string, container = history()) {
   if (input === "wheel") fireEvent.wheel(container, { deltaY: -470 });
   else if (input === "keyboard") fireEvent.keyDown(container, { key: "PageUp" });
   else if (input === "touch") fireEvent.touchMove(container);
-  else fireEvent.pointerDown(container, { pointerId: 1, clientX: 319, clientY: 180 });
+  else {
+    expect(container.offsetWidth).toBe(320); expect(container.clientLeft).toBe(0); expect(container.clientWidth).toBe(304);
+    fireEvent.pointerDown(container, { pointerId: 1, clientX: 312, clientY: 180 });
+  }
 }
 function endReading(input: string, container = history()) {
   if (input === "keyboard") fireEvent.keyUp(container, { key: "PageUp" });
   else if (input === "touch") fireEvent.touchEnd(container);
-  else if (input === "scrollbar") fireEvent.pointerUp(container, { pointerId: 1, clientX: 319, clientY: 150 });
+  else if (input === "scrollbar") fireEvent.pointerUp(container, { pointerId: 1, clientX: 312, clientY: 180 });
 }
 async function openFallback() {
   const current = initial.slice(2), view = await open(current);
@@ -93,7 +96,7 @@ function send() {
 }
 
 beforeEach(() => {
-  vi.useFakeTimers(); heights.clear(); header = 80; footer = 20; measurements = 0; scrollWrites = 0; nativeShift = undefined;
+  vi.useFakeTimers(); heights.clear(); header = 80; footer = 20; measurements = 0; scrollWrites = 0; gutterWidth = 16; nativeShift = undefined;
   reads.mockReset().mockImplementation(async url => page(String(url).includes(other.id)
     ? initial.map((_, index) => row(index + 1, other.id)) : initial, "older+/"));
   details.mockReset().mockResolvedValue(json({ ...initial[7], deliveries: [{ ...delivery, message_id: initial[7].id, state: "accepted" }] }));
@@ -104,6 +107,13 @@ beforeEach(() => {
   }));
   vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(function (this: HTMLElement) {
     return this.matches(".message-history") && !hidden(this) ? viewportHeight(this) : 0;
+  });
+  vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
+    return this.matches(".message-history") && !hidden(this) ? 320 - gutterWidth : 0;
+  });
+  vi.spyOn(HTMLElement.prototype, "clientLeft", "get").mockReturnValue(0);
+  vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockImplementation(function (this: HTMLElement) {
+    return this.matches(".message-history") && !hidden(this) ? 320 : 0;
   });
   vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(function (this: HTMLElement) {
     return this.matches(".message-history") && !hidden(this) ? extent(this) : 0;
@@ -435,6 +445,63 @@ it.each(["send", "reset"])("reconciles scrollbar movement at release before a la
   expect(history().scrollTop).toBe(230); expect(offset(row(2).id)).toBe(before);
   expectRequests(operation === "send" ? [latestURL(), `/api/v1/groups/${group.id}/messages`] : [latestURL(), latestURL()]);
 });
+
+it.each(["send", "reset"])("review: a completed container-padding click cannot cancel %s on later native compensation", async operation => {
+  await open(); readAt(history(), 230); const pending = deferred<Response>();
+  if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }
+  else { reads.mockReturnValueOnce(pending.promise); fireEvent.click(button("刷新并重置历史窗口")); }
+  const container = history();
+  fireEvent.pointerDown(container, { pointerId: 1, clientX: 4, clientY: 105 });
+  fireEvent.pointerUp(container, { pointerId: 1, clientX: 4, clientY: 105 });
+  fireEvent.click(container, { clientX: 4, clientY: 105 });
+  await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+  header += 30; tops.set(container, 260); fireEvent.scroll(container);
+  await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(initial)));
+  if (operation === "send") expectVisible(row(9).id);
+  else expectTail();
+  expectRequests(operation === "send" ? [latestURL(), `/api/v1/groups/${group.id}/messages`] : [latestURL(), latestURL()]);
+});
+
+it.each(["send", "reset"])("does not mistake side whitespace inside the client viewport for a scrollbar during %s", async operation => {
+  await open(); readAt(history(), 230); const pending = deferred<Response>();
+  if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }
+  else { reads.mockReturnValueOnce(pending.promise); fireEvent.click(button("刷新并重置历史窗口")); }
+  const container = history(), point = { pointerId: 1, clientX: 290, clientY: 180 };
+  expect(point.clientX).toBeLessThan(container.clientLeft + container.clientWidth);
+  fireEvent.pointerDown(container, point); fireEvent.pointerUp(container, point); fireEvent.click(container, point);
+  await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+  header += 30; tops.set(container, 260); fireEvent.scroll(container);
+  await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(initial)));
+  if (operation === "send") expectVisible(row(9).id);
+  else expectTail();
+  expectRequests(operation === "send" ? [latestURL(), `/api/v1/groups/${group.id}/messages`] : [latestURL(), latestURL()]);
+});
+
+it.each(["send", "reset"].flatMap(operation => ["track", "drag", "overlay-movement", "overlay-drag"].map(kind => ({ operation, kind }))))(
+  "preserves real $kind geometry/movement priority over a late $operation receipt", async ({ operation, kind }) => {
+    if (kind.startsWith("overlay")) gutterWidth = 0;
+    await open(); const pending = deferred<Response>();
+    if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }
+    else { reads.mockReturnValueOnce(pending.promise); fireEvent.click(button("刷新并重置历史窗口")); }
+    const container = history(), point = { pointerId: 1, clientX: 312, clientY: 180 };
+    expect(container.offsetWidth).toBe(320); expect(container.clientLeft).toBe(0);
+    expect(container.clientWidth).toBe(kind.startsWith("overlay") ? 320 : 304);
+    if (kind.startsWith("overlay")) expect(point.clientX).toBeLessThan(container.clientWidth);
+    else expect(point.clientX).toBeGreaterThanOrEqual(container.clientLeft + container.clientWidth);
+    fireEvent.pointerDown(container, point);
+    const release = kind.endsWith("drag") ? { ...point, clientY: 150 } : point;
+    if (kind.endsWith("drag")) fireEvent.pointerMove(container, { ...release, buttons: 1 });
+    if (kind === "drag" || kind === "overlay-movement") container.scrollTop = 230;
+    if (kind === "overlay-movement") fireEvent.scroll(container);
+    fireEvent.pointerUp(container, release);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    if (kind === "track" || kind === "overlay-drag") container.scrollTop = 230;
+    fireEvent.scroll(container); const before = offset(row(2).id);
+    await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(initial)));
+    expect(container.scrollTop).toBe(230); expect(offset(row(2).id)).toBe(before);
+    expectRequests(operation === "send" ? [latestURL(), `/api/v1/groups/${group.id}/messages`] : [latestURL(), latestURL()]);
+  },
+);
 
 it.each(["send", "reset"])("keeps moved pointer input for scrolling delivered just after release during %s", async operation => {
   await open(); const pending = deferred<Response>();

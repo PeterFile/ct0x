@@ -108,8 +108,20 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
   function onPointerDown(event: PointerEvent<HTMLElement>) {
     const history = historyRef.current, target = event.target;
     if (!active || !history?.clientHeight) return;
-    const scrollbar = target === event.currentTarget;
-    if (!scrollbar && !(target instanceof Element && target.closest(".message-list"))) return;
+    const containerTarget = target === event.currentTarget;
+    if (!containerTarget && !(target instanceof Element && target.closest(".message-list"))) return;
+    let scrollbar = false;
+    if (containerTarget) {
+      const box = history.getBoundingClientRect(), style = getComputedStyle(history);
+      const x = event.clientX - box.left;
+      const borderLeft = Number.parseFloat(style.borderLeftWidth) || 0;
+      const borderRight = Number.parseFloat(style.borderRightWidth) || 0;
+      const inGutter = (x >= borderLeft && x < history.clientLeft)
+        || (x >= history.clientLeft + history.clientWidth && x < history.offsetWidth - borderRight);
+      scrollbar = inGutter && history.scrollHeight > history.clientHeight
+        && event.clientY >= box.top + history.clientTop
+        && event.clientY < box.top + history.clientTop + history.clientHeight;
+    }
     pointer.current = { id: event.pointerId, x: event.clientX, y: event.clientY,
       top: history.scrollTop, moved: false, scrollbar };
     inputUntil.current = scrollbar ? performance.now() + inputLifetime : 0;
@@ -125,11 +137,12 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     const current = pointer.current, history = historyRef.current;
     if (!current || current.id !== event.pointerId) return;
     pointer.current = null;
-    // Close click-only input immediately; moved gestures retain a bounded late-event window.
-    if (!current.moved && !current.scrollbar) { inputUntil.current = 0; return; }
+    // Overlay scrollbars may expose no gutter; observed viewport movement is still evidence.
+    const shifted = Boolean(active && history?.clientHeight && history.scrollTop !== current.top);
+    if (!current.moved && !current.scrollbar && !shifted) { inputUntil.current = 0; return; }
     inputUntil.current = performance.now() + inputLifetime;
-    if (active && history?.clientHeight && history.scrollTop !== current.top && history.scrollTop !== lastTop.current) {
-      // The viewport may have moved before its scroll event is delivered.
+    if (shifted) {
+      // Reconcile even if a scroll event already updated lastTop without a measurable gutter.
       remember();
       recordReading();
     }
