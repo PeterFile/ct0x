@@ -45,6 +45,20 @@ func TestMemberToolHTTPCompleteEncodedPageCapIncludesNewline(t *testing.T) {
 	for _, operation := range []string{"list_members", "read_channel"} {
 		t.Run(operation, func(t *testing.T) {
 			f := newMemberToolHTTP(t)
+			seedMessage := func(id, content string) {
+				t.Helper()
+				scope, err := f.db.BindMemberTool(context.Background(), f.claim)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.raw.Exec(`INSERT INTO messages(id,group_id,topic_id,sender_id,content,created_at)
+				 VALUES(?,?,?,'user',?,'2100-01-02T03:04:05.123456789Z')`, id, f.groupID, scope.TopicID, content); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if operation == "read_channel" {
+				seedMessage("encoded-page-0", "baseline")
+			}
 			baseline := f.request(t, operation, `{"limit":1}`)
 			page := decoded[listResult[json.RawMessage]](t, baseline, 200)
 			var item struct {
@@ -55,9 +69,9 @@ func TestMemberToolHTTPCompleteEncodedPageCapIncludesNewline(t *testing.T) {
 			if len(page.Items) != 1 || json.Unmarshal(page.Items[0], &item) != nil {
 				t.Fatal("page fixture lacks one ordinary item")
 			}
-			table, column, original := "members", "role", item.Role
+			original := item.Role
 			if operation == "read_channel" {
-				table, column, original = "messages", "content", item.Content
+				original = item.Content
 			}
 			encodedLength := maximum - (baseline.Body.Len() - len(original))
 			// '<' expands to six JSON bytes, proving the cap measures encoding, not raw text.
@@ -67,7 +81,14 @@ func TestMemberToolHTTPCompleteEncodedPageCapIncludesNewline(t *testing.T) {
 				if overflow {
 					text += "x"
 				}
-				if _, err := f.raw.Exec("UPDATE "+table+" SET "+column+"=? WHERE id=?", text, item.ID); err != nil {
+				if operation == "read_channel" {
+					// Equal-length IDs and fixed timestamps keep the measured metadata/cursor budget exact.
+					id := "encoded-page-1"
+					if overflow {
+						id = "encoded-page-2"
+					}
+					seedMessage(id, text)
+				} else if _, err := f.raw.Exec("UPDATE members SET role=? WHERE id=?", text, item.ID); err != nil {
 					t.Fatal(err)
 				}
 				before := f.counts(t)
