@@ -15,14 +15,21 @@ var skillName = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 // splitHeader only delimits frontmatter. YAML values are parsed by yaml.v3.
 func splitHeader(data []byte, limit int64) ([]byte, int, error) {
+	if limit < 0 {
+		return nil, 0, ErrLimit
+	}
+	// Bound the search itself, even when the next delimiter/line is missing.
+	if int64(len(data)) > limit {
+		data = data[:limit+1]
+	}
 	offset, start := 0, 0
-	for n, line := range bytes.SplitAfter(data, []byte("\n")) {
+	for line := range bytes.SplitAfterSeq(data, []byte("\n")) {
 		end := offset + len(line)
 		if int64(end) > limit {
 			return nil, 0, ErrLimit
 		}
 		marker := bytes.TrimSuffix(bytes.TrimSuffix(line, []byte("\n")), []byte("\r"))
-		if n == 0 {
+		if offset == 0 {
 			if string(marker) != "---" {
 				return nil, 0, invalid("缺少 YAML 头部")
 			}
