@@ -19,6 +19,7 @@ import (
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
+	"agentworkspace/internal/webassets"
 )
 
 func main() {
@@ -72,6 +73,16 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	local := platform.NewLocalUser(db)
 	routes := append(httpapi.LocalUserRoutes(local), httpapi.MessageRoutes(local)...)
 	routes = append(routes, httpapi.ProviderRoute(catalog))
+	if config.webDir != "" {
+		web, openErr := webassets.Open(config.webDir)
+		if openErr != nil {
+			return openErr
+		}
+		defer func() { err = errors.Join(err, web.Close()) }()
+		routes = append(routes,
+			httpapi.Route{Method: http.MethodGet, Pattern: "/", Handler: web.ServeHTTP},
+			httpapi.Route{Method: http.MethodHead, Pattern: "/", Handler: web.ServeHTTP})
+	}
 	server, err := httpapi.NewServerWithConfig(httpapi.Config{Address: listener.Addr().String(), DevOrigin: config.devOrigin}, routes...)
 	if err != nil {
 		return err
