@@ -138,6 +138,72 @@ func memberToolExecuteNative(t *testing.T, stream string) (ExecutionReceipt, []E
 	return got, events
 }
 
+func TestPiMemberToolsEmptyAssistantSnapshotReplacesPreviousText(t *testing.T) {
+	const earlier = "earlier assistant text must not be published"
+	for _, tools := range []bool{false, true} {
+		for _, tc := range []struct {
+			name, reason string
+			aborted      bool
+			outcome      Outcome
+		}{
+			{"native-abort-after-toolUse", "toolUse", true, OutcomeAborted},
+			{"terminal-tool-only", "stop", false, OutcomeSucceeded},
+		} {
+			t.Run(fmt.Sprintf("tools=%t/%s", tools, tc.name), func(t *testing.T) {
+				call := func(id string) map[string]any {
+					return map[string]any{"type": "toolCall", "id": id, "name": "send_message", "arguments": map[string]any{"content": "PRIVATE-TOOL-ARGS"}}
+				}
+				previous := memberToolAssistantMessage(t, []any{map[string]any{"type": "text", "text": earlier}, call("previous-call")}, "toolUse")
+				toolOnly := memberToolAssistantMessage(t, []any{call("last-call")}, tc.reason)
+				result := map[string]any{"role": "toolResult", "toolCallId": "previous-call", "toolName": "send_message",
+					"content": []any{map[string]any{"type": "text", "text": "{\"content\":\"PRIVATE-TOOL-RESULT\"}\n"}}, "isError": false, "timestamp": 1, "durationMs": 1}
+				records := []string{executionStart,
+					memberToolJSON(t, map[string]any{"type": "message_end", "message": previous}),
+					memberToolJSON(t, map[string]any{"type": "message_end", "message": result}),
+					memberToolJSON(t, map[string]any{"type": "message_end", "message": toolOnly}),
+					memberToolJSON(t, map[string]any{"type": "agent_settled", "aborted": tc.aborted})}
+				body := "set -eu\n" + executionHeader + executionEmit(records...) + ": > drained\n"
+				var executor Executor
+				var request ExecuteRequest
+				if tools {
+					executor, request, _, _ = memberToolFixture(t, body)
+				} else {
+					executor, request = executionFixture(t, body)
+				}
+				// Model native settlement, not caller cancellation or a damaged pipe.
+				ctx := context.Background()
+				candidate, candidateAtTerminal, terminals := "", "", 0
+				var snapshots []string
+				got := executor.Execute(ctx, request, func(event Event) error {
+					if event.NativeSessionID != request.RunID {
+						t.Errorf("unbound snapshot: %+v", event)
+					}
+					switch event.Kind {
+					case ResponseEvent:
+						candidate = event.Text // Same replacement rule as store.RecordTurnEvent.
+						snapshots = append(snapshots, candidate)
+					case TerminalEvent:
+						candidateAtTerminal, terminals = candidate, terminals+1
+						if event.Terminal != tc.outcome {
+							t.Errorf("unexpected native terminal: %+v", event)
+						}
+					}
+					return nil
+				})
+				if got.Outcome != tc.outcome || got.Terminal != tc.outcome || !got.Started || !got.Accepted || !got.DirectChildReaped || !got.OutputComplete || got.ExitCode != 0 || got.DeliveryFailed || got.LogsTruncated || ctx.Err() != nil {
+					t.Fatalf("clean native settlement must retain its authoritative outcome: %+v", got)
+				}
+				if _, err := os.Stat(filepath.Join(request.CWD, "drained")); err != nil {
+					t.Fatalf("child did not finish writing through clean EOF: %v", err)
+				}
+				if !reflect.DeepEqual(snapshots, []string{earlier, ""}) || candidate != "" || terminals != 1 || candidateAtTerminal != "" {
+					t.Fatalf("complete empty snapshot did not clear the earlier candidate before terminal publication: snapshots=%q candidate=%q terminal_candidate=%q terminals=%d", snapshots, candidate, candidateAtTerminal, terminals)
+				}
+			})
+		}
+	}
+}
+
 func TestPiMemberToolsMaximumNativeJSONAndIndependentLogCap(t *testing.T) {
 	// The bridge serializes request objects without LF. HTTP responses include LF;
 	// the latter's 65536-byte budget includes that byte before native re-escaping.
@@ -184,9 +250,24 @@ func TestPiMemberToolsMaximumNativeJSONAndIndependentLogCap(t *testing.T) {
 		t.Fatalf("fixture does not exercise independent frame/log/HTTP budgets: stream=%d largest=%d", len(stream), largest)
 	}
 	got, events := memberToolExecuteNative(t, stream)
-	want := []Event{{Kind: SessionEvent, NativeSessionID: "run1"}, {Kind: AcceptedEvent, NativeSessionID: "run1"},
-		{Kind: ResponseEvent, NativeSessionID: "run1", Text: memberToolFinalText}, {Kind: TerminalEvent, NativeSessionID: "run1", Terminal: OutcomeSucceeded}}
-	if got.Outcome != OutcomeSucceeded || !got.OutputComplete || !got.LogsTruncated || !reflect.DeepEqual(events, want) {
+	var snapshots []string
+	var lifecycle []Event
+	for _, event := range events {
+		if event.Kind == ResponseEvent {
+			if event.NativeSessionID != "run1" {
+				t.Fatalf("unbound response snapshot: %+v", event)
+			}
+			snapshots = append(snapshots, event.Text)
+		} else {
+			lifecycle = append(lifecycle, event)
+		}
+	}
+	// Each tool-only assistant clears the candidate before the final text replaces it.
+	wantSnapshots := make([]string, len(turns)+1)
+	wantSnapshots[len(turns)] = memberToolFinalText
+	wantLifecycle := []Event{{Kind: SessionEvent, NativeSessionID: "run1"}, {Kind: AcceptedEvent, NativeSessionID: "run1"},
+		{Kind: TerminalEvent, NativeSessionID: "run1", Terminal: OutcomeSucceeded}}
+	if got.Outcome != OutcomeSucceeded || got.Terminal != OutcomeSucceeded || !got.OutputComplete || !got.LogsTruncated || !reflect.DeepEqual(snapshots, wantSnapshots) || !reflect.DeepEqual(lifecycle, wantLifecycle) {
 		t.Fatalf("tool args/results became candidates, or log truncation damaged valid protocol: %+v, events=%+v", got, events)
 	}
 	info, err := os.Stat(got.StdoutPath)
@@ -310,7 +391,13 @@ func TestPiMemberToolsFinalAssistantStopReasonIsAuthoritative(t *testing.T) {
 		t.Run(reason, func(t *testing.T) {
 			run := memberToolNativeRun(t, [][]memberToolNativeCall{{{"list_members", map[string]any{}, "{\"items\":[],\"next_cursor\":\"\"}\n"}}}, reason, memberToolFinalText, false)
 			got, events := memberToolExecuteNative(t, strings.Join(append(run, executionSettled), "\n")+"\n")
-			if got.Outcome != want || got.Terminal != want || !got.OutputComplete || len(events) != 4 || events[2].Text != memberToolFinalText {
+			var snapshots []string
+			for _, event := range events {
+				if event.Kind == ResponseEvent {
+					snapshots = append(snapshots, event.Text)
+				}
+			}
+			if got.Outcome != want || got.Terminal != want || !got.OutputComplete || !reflect.DeepEqual(snapshots, []string{"", memberToolFinalText}) {
 				t.Fatalf("tool completion replaced the final assistant's native stop reason: %+v, events=%+v", got, events)
 			}
 		})

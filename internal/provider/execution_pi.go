@@ -149,28 +149,20 @@ func (o *executionOutput) recordPi(line []byte) {
 			return
 		}
 		var text bytes.Buffer
-		hasText, hasToolCall := false, false
 		for _, block := range blocks {
 			if block.Type == "" || (block.Type == "text" && block.Text == nil) {
 				o.damaged = true
 				return
 			}
 			if block.Type == "text" {
-				hasText = true
 				text.WriteString(*block.Text)
-			}
-			if block.Type == "toolCall" {
-				hasToolCall = true
 			}
 		}
 		// Only a complete assistant's stop reason decides the final result.
 		// Earlier error messages must not poison a later successful retry.
 		o.last = map[string]Outcome{"stop": OutcomeSucceeded, "error": OutcomeFailed, "aborted": OutcomeAborted, "length": OutcomeTruncated}[event.Message.StopReason]
-		// A tool-only assistant message has no response snapshot. Tool arguments
-		// and toolResult text never become response events; mixed text still does.
-		if hasText || !hasToolCall {
-			o.emit(Event{Kind: ResponseEvent, Text: text.String()})
-		}
+		// Empty snapshots must also replace earlier assistant text, not retain it.
+		o.emit(Event{Kind: ResponseEvent, Text: text.String()})
 	case "agent_settled":
 		if event.Aborted == nil || !r.Accepted || r.NativeSessionID == "" || o.settled {
 			o.damaged = true
