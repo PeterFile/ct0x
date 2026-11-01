@@ -4,6 +4,8 @@ import type { Group, Member } from "./api";
 import { Discussion } from "./Discussion";
 import { Groups } from "./Groups";
 import { Members } from "./Members";
+import { Tasks } from "./Tasks";
+import "./navigation.css";
 
 function EmptyPanel({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -15,6 +17,10 @@ function EmptyPanel({ title, children }: { title: string; children: ReactNode })
 }
 
 export function App() {
+  const [page, setPage] = useState<"discussion" | "tasks">("discussion");
+  const [tasksVisited, setTasksVisited] = useState(false);
+  const showingDiscussion = page === "discussion";
+  const pageLabel = showingDiscussion ? "讨论" : "任务";
   const [selected, setSelected] = useState<Group | null>(null);
   const [members, setMembers] = useState<Record<string, Member[]>>({});
   const rememberMembers = useCallback((groupId: string, items: Member[]) => {
@@ -22,7 +28,7 @@ export function App() {
   }, []);
   return (
     <div className={`app${selected ? " has-discussion" : ""}`}>
-      <a className="skip-link" href="#discussion">跳至讨论区</a>
+      <a className="skip-link" href={`#${page}`}>跳至{pageLabel}区</a>
       <header className="masthead">
         <div className="identity">
           <span className="brand-mark" aria-hidden="true" />
@@ -31,7 +37,13 @@ export function App() {
             <p className="eyebrow">协作工作台</p>
           </div>
         </div>
-        <p className="preview-label">群组工作台 · 群内讨论</p>
+        <nav className="workspace-navigation" aria-label="工作区页面">
+          <button type="button" aria-pressed={showingDiscussion} aria-controls="discussion-page"
+            onClick={() => setPage("discussion")}>讨论</button>
+          <button type="button" aria-pressed={!showingDiscussion} aria-controls="tasks-page"
+            onClick={() => { setTasksVisited(true); setPage("tasks"); }}>任务</button>
+        </nav>
+        <p className="preview-label">群组工作台 · {showingDiscussion ? "群内讨论" : "群组任务"}</p>
       </header>
 
       <div className="workspace">
@@ -41,18 +53,25 @@ export function App() {
           <p className="column-note">一处共同的语境。</p>
         </aside>
 
-        <main className="column discussion" id="discussion" tabIndex={-1}
-          aria-labelledby="discussion-heading">
-          <h2 className="column-heading" id="discussion-heading">讨论</h2>
-          <div className={`discussion-intro${selected ? " selected-intro" : ""}`}
-            role={selected ? "region" : undefined} aria-label={selected ? "群组简介" : undefined}
-            tabIndex={selected ? 0 : undefined}>
-            {!selected ? <p className="eyebrow accent">让想法在此相遇</p> : null}
-            {selected ? <EmptyPanel title={selected.name}>{selected.description || "此群组尚无说明。"}</EmptyPanel>
-              : <p className="manifesto">先有讨论，<br />再有分工。</p>}
+        <main className="column discussion workspace-main" id={page} tabIndex={-1}
+          aria-labelledby={`${page}-heading`}>
+          <h2 className="column-heading" id={`${page}-heading`}>{pageLabel}</h2>
+          <div className="discussion-page" id="discussion-page" hidden={!showingDiscussion}>
+            <div className={`discussion-intro${selected ? " selected-intro" : ""}`}
+              role={selected ? "region" : undefined} aria-label={selected ? "群组简介" : undefined}
+              tabIndex={selected ? 0 : undefined}>
+              {!selected ? <p className="eyebrow accent">让想法在此相遇</p> : null}
+              {selected ? <EmptyPanel title={selected.name}>{selected.description || "此群组尚无说明。"}</EmptyPanel>
+                : <p className="manifesto">先有讨论，<br />再有分工。</p>}
+            </div>
+            <div className="discussion-content">
+              <Discussion groupId={showingDiscussion ? selected?.id : undefined} members={members} />
+            </div>
+            {!selected ? <p className="discussion-note">消息持久化与模型执行分开确认。</p> : null}
           </div>
-          <div className="discussion-content"><Discussion groupId={selected?.id} members={members} /></div>
-          {!selected ? <p className="discussion-note">消息持久化与模型执行分开确认。</p> : null}
+          <div className="tasks-page" id="tasks-page" hidden={showingDiscussion}>
+            {tasksVisited ? <Tasks group={showingDiscussion ? null : selected} /> : null}
+          </div>
         </main>
 
         <aside className="column members" aria-labelledby="members-heading">
