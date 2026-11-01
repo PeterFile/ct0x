@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -184,7 +185,7 @@ func TestTaskLifecycleHTTPHumanRejectRetryAcceptAndDurableReplays(t *testing.T) 
 	taskLifecycleState(t, reopened, path, domain.TaskStatusAccepted, 2, "", secondSubmission.ID)
 }
 
-func TestTaskLifecycleHTTPRejectsInvalidInputAndUnsupportedRefsWithoutWrites(t *testing.T) {
+func TestTaskLifecycleHTTPRejectsInvalidInputAndMissingRefsWithoutWrites(t *testing.T) {
 	a := openTaskLifecycleAPI(t, "")
 	g := newGroup(t, a, "group")
 	_, path := newTaskLifecycleTask(t, a, g.ID)
@@ -234,10 +235,130 @@ func TestTaskLifecycleHTTPRejectsInvalidInputAndUnsupportedRefsWithoutWrites(t *
 	taskLifecycleError(t, w, 415, "unsupported_media_type")
 	taskLifecycleError(t, a.request("POST", path+"/submissions", strings.Replace(inputs[1].body, " exact summary ", " ", 1), "retry"), 400, "invalid_input")
 	refs := strings.TrimSuffix(inputs[1].body, "}") + `,"artifact_versions":[{"artifact_id":"opaque-artifact","version_id":"opaque-version"}]}`
-	taskLifecycleError(t, a.request("POST", path+"/submissions", refs, "retry"), 400, "invalid_input")
+	taskLifecycleError(t, a.request("POST", path+"/submissions", refs, "retry"), 404, "not_found")
 	taskLifecycleState(t, a, path, domain.TaskStatusOpen, 1, attempt.ID, "")
 	taskLifecycleCounts(t, messageSQL(t, a), map[string]int{"task_attempts": 1, "task_submissions": 0, "task_review_decisions": 0, "mutation_idempotency": 0, "turns": 0, "deliveries": 0})
 	decoded[domain.Submission](t, a.request("POST", path+"/submissions", inputs[1].body, "retry"), 201)
+}
+
+// These trusted registry metadata fixtures do not publish or validate blob bytes.
+func taskLifecyclePublishMetadata(t *testing.T, db *store.Store, input store.PublishArtifactInput) domain.ArtifactVersion {
+	t.Helper()
+	input.ActorID, input.BlobHash, input.Size = "user", strings.Repeat("a", 64), 42
+	version, err := db.PublishArtifact(context.Background(), input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return version
+}
+
+func TestTaskLifecycleHTTPArtifactEvidenceSurvivesReviewAndHeadChanges(t *testing.T) {
+	a := openTaskLifecycleAPI(t, "")
+	g, otherGroup := newGroup(t, a, "group"), newGroup(t, a, "other")
+	task, path := newTaskLifecycleTask(t, a, g.ID)
+	source, _ := newTaskLifecycleTask(t, a, g.ID)
+	attempt := decoded[domain.TaskAttempt](t, a.request("POST", path+"/attempts", taskLifecycleAttemptBody(1, "")), 201)
+	ctx := context.Background()
+	base := taskLifecyclePublishMetadata(t, a.db, store.PublishArtifactInput{GroupID: g.ID, Name: "metadata fixture", SourceTaskID: source.ID})
+	update := store.PublishArtifactInput{GroupID: g.ID, ArtifactID: base.ArtifactID, ExpectedVersionID: base.ID, SourceTaskID: source.ID}
+	applied := taskLifecyclePublishMetadata(t, a.db, update)
+	candidate := taskLifecyclePublishMetadata(t, a.db, update)
+	other := taskLifecyclePublishMetadata(t, a.db, store.PublishArtifactInput{GroupID: g.ID, Name: "other metadata"})
+	foreign := taskLifecyclePublishMetadata(t, a.db, store.PublishArtifactInput{GroupID: otherGroup.ID, Name: "foreign metadata"})
+	head, err := a.db.GetArtifact(ctx, g.ID, base.ArtifactID)
+	if err != nil || head.CurrentVersionID != applied.ID || !applied.Applied || candidate.Applied || base.SourceTaskID != source.ID || source.ID == task.ID || candidate.SourceTaskID != source.ID {
+		t.Fatalf("historical/candidate/cross-task fixture: %+v, %+v, %v", head, candidate, err)
+	}
+	wantRefs := []domain.ArtifactVersionRef{
+		{ArtifactID: base.ArtifactID, VersionID: base.ID},
+		{ArtifactID: base.ArtifactID, VersionID: candidate.ID},
+		{ArtifactID: other.ArtifactID, VersionID: other.ID},
+	}
+	slices.SortFunc(wantRefs, func(a, b domain.ArtifactVersionRef) int {
+		if order := strings.Compare(a.ArtifactID, b.ArtifactID); order != 0 {
+			return order
+		}
+		return strings.Compare(a.VersionID, b.VersionID)
+	})
+	body := func(refs []domain.ArtifactVersionRef) string {
+		t.Helper()
+		data, err := json.Marshal(refs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSuffix(taskLifecycleSubmissionBody(1, attempt.ID), "}") + `,"artifact_versions":` + string(data) + `}`
+	}
+	raw := messageSQL(t, a)
+	for _, test := range []struct {
+		name   string
+		ref    domain.ArtifactVersionRef
+		status int
+		code   string
+	}{
+		{"missing-artifact-field", domain.ArtifactVersionRef{VersionID: base.ID}, 400, "invalid_input"},
+		{"missing-version-field", domain.ArtifactVersionRef{ArtifactID: base.ArtifactID}, 400, "invalid_input"},
+		{"missing-version", domain.ArtifactVersionRef{ArtifactID: base.ArtifactID, VersionID: "missing"}, 404, "not_found"},
+		{"foreign-group", domain.ArtifactVersionRef{ArtifactID: foreign.ArtifactID, VersionID: foreign.ID}, 404, "not_found"},
+		{"wrong-pair", domain.ArtifactVersionRef{ArtifactID: base.ArtifactID, VersionID: other.ID}, 404, "not_found"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// A mixed valid/invalid set must not leave partial associations.
+			taskLifecycleError(t, a.request("POST", path+"/submissions", body([]domain.ArtifactVersionRef{wantRefs[0], test.ref}), "artifact-evidence"), test.status, test.code)
+			taskLifecycleState(t, a, path, domain.TaskStatusOpen, 1, attempt.ID, "")
+			taskLifecycleCounts(t, raw, map[string]int{"task_submissions": 0, "task_submission_artifacts": 0, "mutation_idempotency": 0})
+		})
+	}
+	submitResponse := a.request("POST", path+"/submissions", body([]domain.ArtifactVersionRef{wantRefs[2], wantRefs[1], wantRefs[0], wantRefs[1]}), "artifact-evidence")
+	submission := decoded[domain.Submission](t, submitResponse, 201)
+	if !slices.Equal(submission.ArtifactVersions, wantRefs) || submission.SubmittedBy != "user" || submission.AttemptID != attempt.ID {
+		t.Fatalf("corrected submission dropped or rewrote concrete refs: %+v", submission)
+	}
+	taskLifecycleState(t, a, path, domain.TaskStatusSubmitted, 1, attempt.ID, submission.ID)
+	update.ExpectedVersionID = applied.ID
+	later := taskLifecyclePublishMetadata(t, a.db, update)
+	head, err = a.db.GetArtifact(ctx, g.ID, base.ArtifactID)
+	if err != nil || !later.Applied || head.CurrentVersionID != later.ID {
+		t.Fatalf("head did not advance before review: %+v, %v", head, err)
+	}
+	taskLifecycleState(t, a, path, domain.TaskStatusSubmitted, 1, attempt.ID, submission.ID)
+	reviewBody := taskLifecycleReviewBody(1, submission.ID, domain.ReviewOutcomeAccepted)
+	latestRef := domain.ArtifactVersionRef{ArtifactID: later.ArtifactID, VersionID: later.ID}
+	replacement, err := json.Marshal([]domain.ArtifactVersionRef{latestRef})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{`"artifact_versions":` + string(replacement), `"reviewed_by":"forged"`} {
+		forged := strings.TrimSuffix(reviewBody, "}") + `,` + field + `}`
+		taskLifecycleError(t, a.request("POST", path+"/reviews", forged, "artifact-review"), 400, "invalid_json")
+	}
+	taskLifecycleState(t, a, path, domain.TaskStatusSubmitted, 1, attempt.ID, submission.ID)
+	taskLifecycleCounts(t, raw, map[string]int{"task_review_decisions": 0, "mutation_idempotency": 1})
+	reviewResponse := a.request("POST", path+"/reviews", reviewBody, "artifact-review")
+	decision := decoded[domain.ReviewDecision](t, reviewResponse, 201)
+	if !slices.Equal(decision.ArtifactVersions, wantRefs) || decision.ReviewedBy != "user" || decision.SubmissionID != submission.ID {
+		t.Fatalf("review did not derive immutable submission refs: %+v", decision)
+	}
+	retry := a.request("POST", path+"/submissions", body([]domain.ArtifactVersionRef{wantRefs[1], wantRefs[2], wantRefs[0], wantRefs[0]}), "artifact-evidence")
+	if retry.Code != 201 || !bytes.Equal(retry.Body.Bytes(), submitResponse.Body.Bytes()) {
+		t.Fatalf("canonical submission replay after review/head change: %d %s", retry.Code, retry.Body)
+	}
+	taskLifecycleError(t, a.request("POST", path+"/submissions", body(append(slices.Clone(wantRefs), latestRef)), "artifact-evidence"), 409, "conflict")
+	retry = a.request("POST", path+"/reviews", reviewBody, "artifact-review")
+	if retry.Code != 201 || !bytes.Equal(retry.Body.Bytes(), reviewResponse.Body.Bytes()) {
+		t.Fatalf("review replay after head change: %d %s", retry.Code, retry.Body)
+	}
+	gotSubmission := decoded[domain.Submission](t, a.request("GET", path+"/submissions/"+submission.ID, ""), 200)
+	submissions := decoded[listResult[domain.Submission]](t, a.request("GET", path+"/submissions", ""), 200)
+	if !reflect.DeepEqual(gotSubmission, submission) || !reflect.DeepEqual(submissions.Items, []domain.Submission{submission}) || submissions.NextCursor != "" {
+		t.Fatalf("submission detail/list followed the head: %+v, %+v", gotSubmission, submissions)
+	}
+	gotReview := decoded[domain.ReviewDecision](t, a.request("GET", path+"/reviews/"+decision.ID, ""), 200)
+	reviews := decoded[listResult[domain.ReviewDecision]](t, a.request("GET", path+"/reviews", ""), 200)
+	if !reflect.DeepEqual(gotReview, decision) || !reflect.DeepEqual(reviews.Items, []domain.ReviewDecision{decision}) || reviews.NextCursor != "" {
+		t.Fatalf("review detail/list followed the head: %+v, %+v", gotReview, reviews)
+	}
+	taskLifecycleState(t, a, path, domain.TaskStatusAccepted, 1, "", submission.ID)
+	taskLifecycleCounts(t, raw, map[string]int{"artifacts": 3, "artifact_versions": 6, "task_submissions": 1, "task_submission_artifacts": 3, "task_review_decisions": 1, "mutation_idempotency": 2, "messages": 0, "turns": 0, "resource_claims": 0})
 }
 
 func TestTaskLifecycleHTTPReadIsolationAndForeignBodyPointers(t *testing.T) {
