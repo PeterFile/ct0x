@@ -117,7 +117,7 @@ func memberToolGrantsValid(grants MemberToolGrants) bool {
 	}
 	for _, operation := range grants.Operations {
 		switch operation {
-		case "list_members", "read_channel", "send_message":
+		case "list_members", "read_channel", "send_message", "search_history", "read_history":
 		case "create_member":
 			if grants.MaxGroupMembers < 1 {
 				return false
