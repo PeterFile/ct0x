@@ -75,6 +75,40 @@ CREATE TABLE deliveries (
     FOREIGN KEY(conversation_id, group_id, recipient_id, topic_id) REFERENCES conversations(id, group_id, member_id, topic_id),
     UNIQUE(message_id, recipient_id)
 );
+`, `
+CREATE UNIQUE INDEX deliveries_turn_identity ON deliveries(id, group_id, conversation_id, recipient_id);
+CREATE INDEX deliveries_pending_created_id ON deliveries(created_at, id)
+    WHERE state='queued' AND turn_id='';
+CREATE TABLE turns (
+    id TEXT PRIMARY KEY NOT NULL,
+    group_id TEXT NOT NULL,
+    delivery_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    claim_token TEXT NOT NULL CHECK(claim_token <> ''),
+    state TEXT NOT NULL CHECK(state IN ('starting','running','cancel_requested','unknown',
+        'not_started','succeeded','failed','aborted','truncated')),
+    native_session_id TEXT NOT NULL DEFAULT '',
+    accepted_at TEXT,
+    cancel_requested_at TEXT,
+    candidate_text TEXT NOT NULL DEFAULT '',
+    candidate_terminal TEXT NOT NULL DEFAULT '' CHECK(candidate_terminal IN ('','succeeded','failed','aborted','truncated')),
+    reply_message_id TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    receipt_json TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(delivery_id, group_id, conversation_id, member_id) REFERENCES deliveries(id, group_id, conversation_id, recipient_id)
+);
+CREATE UNIQUE INDEX turns_active_conversation ON turns(conversation_id)
+    WHERE state IN ('starting','running','cancel_requested','unknown');
+CREATE UNIQUE INDEX turns_active_member ON turns(member_id)
+    WHERE state IN ('starting','running','cancel_requested','unknown');
+CREATE TABLE resource_claims (
+    resource_key TEXT PRIMARY KEY NOT NULL CHECK(resource_key <> ''),
+    turn_id TEXT NOT NULL REFERENCES turns(id)
+);
+CREATE INDEX resource_claims_turn ON resource_claims(turn_id);
 `}
 
 // Migration history is explicit and contiguous; never infer it from table shape.

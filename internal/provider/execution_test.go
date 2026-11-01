@@ -103,6 +103,67 @@ printf '{"type":"session","version":3,"id":"%s","cwd":"%s"}\n' "$2" "$PWD"
 	}
 }
 
+func TestExecutionThinkingLiteralArguments(t *testing.T) {
+	for _, thinking := range []string{"", "off", "minimal", "low", "medium", "high", "xhigh", "max"} {
+		t.Run("thinking="+thinking, func(t *testing.T) {
+			e, r := executionFixture(t, "printf '%s\\n' \"$@\" > argv\n"+executionHeader+executionEmit(executionStart, executionAssistant("stop"), executionSettled))
+			r.Thinking = thinking
+			if got := e.Execute(context.Background(), r, nil); got.Outcome != OutcomeSucceeded {
+				t.Fatalf("thinking execution failed: %+v", got)
+			}
+			args, err := os.ReadFile(filepath.Join(r.CWD, "argv"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", "--no-tools", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--session-dir", filepath.Join(r.RuntimeDir, r.RunID), "--session-id", r.RunID, "--model", r.Model}
+			if thinking != "" {
+				want = append(want, "--thinking", thinking)
+			}
+			if !reflect.DeepEqual(strings.Split(strings.TrimSuffix(string(args), "\n"), "\n"), want) {
+				t.Fatalf("thinking was not passed literally or default argv changed: %s", args)
+			}
+		})
+	}
+}
+
+func TestExecutionRejectsInvalidThinkingBeforeStart(t *testing.T) {
+	for _, thinking := range []string{"invalid", "MAX", " max", "max ", "max\n--model other", "max\x00", "max;$(touch thinking-marker)"} {
+		t.Run(thinking, func(t *testing.T) {
+			e, r := executionFixture(t, "echo invoked > invoked\n"+executionHeader+executionEmit(executionStart, executionAssistant("stop"), executionSettled))
+			r.Thinking = thinking
+			callbacks := 0
+			got := e.Execute(context.Background(), r, func(Event) error { callbacks++; return nil })
+			if got.Outcome != OutcomeNotStarted || got.Started || got.Accepted || got.NativeSessionID != "" || got.Reason == "" || callbacks != 0 {
+				t.Errorf("invalid thinking was not rejected before start: %+v", got)
+			}
+			for _, path := range []string{filepath.Join(r.CWD, "invoked"), filepath.Join(r.CWD, "thinking-marker"), filepath.Join(r.RuntimeDir, r.RunID)} {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Error("invalid thinking created state or invoked the executable")
+				}
+			}
+		})
+	}
+}
+
+func TestCodexExecutionRejectsUnsupportedThinkingBeforeStart(t *testing.T) {
+	for _, thinking := range []string{"max", "off", "invalid"} {
+		t.Run(thinking, func(t *testing.T) {
+			e, r := codexFixture(t, "echo invoked > invoked\n"+executionEmit(codexHeader, codexStart, codexResponse, codexCompleted))
+			r.Thinking = thinking
+			callbacks := 0
+			got := e.Execute(context.Background(), r, func(Event) error { callbacks++; return nil })
+			if got.Outcome != OutcomeNotStarted || got.Started || got.Accepted || got.NativeSessionID != "" || got.Reason != "Codex 暂不支持 thinking 参数" || callbacks != 0 {
+				t.Errorf("unsupported Codex thinking was not explicitly rejected: %+v", got)
+			}
+			for _, path := range []string{filepath.Join(r.CWD, "invoked"), filepath.Join(r.RuntimeDir, r.RunID)} {
+				if _, err := os.Lstat(path); !os.IsNotExist(err) {
+					t.Error("unsupported Codex thinking created state or invoked the executable")
+				}
+			}
+		})
+	}
+}
+
 func TestExecutionExistingRunDirectoryRequiresReconciliation(t *testing.T) {
 	for _, state := range []string{"empty", "unreconciled-logs"} {
 		t.Run(state, func(t *testing.T) {
