@@ -2,6 +2,8 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection, sendMessage } from "./api";
 import type { Delivery, Member, MessageInput } from "./api";
+import { RequestWork } from "./RequestWork";
+import type { RequestWorkHandle } from "./RequestWork";
 import { useMessageFeed } from "./useMessageFeed";
 import { useMessageScroll } from "./useMessageScroll";
 import "./discussion-presentation.css";
@@ -45,6 +47,7 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
   const [content, setContent] = useState("");
   const [route, setRoute] = useState("default"), [recipients, setRecipients] = useState<string[]>([]);
   const [mutation, setMutation] = useState({ pending: false, uncertain: false, error: "", notice: "" });
+  const requestWork = useRef<RequestWorkHandle>(null);
   const operation = useRef<{ key: string; input: MessageInput } | null>(null);
   const posting = useRef<AbortController | null>(null), mounted = useRef(false);
   const eligible = members.filter(member => member.group_id === groupId && member.status === "active");
@@ -82,7 +85,11 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
   }
   return <div className="group-panel discussion-feed">
     <section className="message-history" aria-label="消息记录" tabIndex={0} ref={scroll.historyRef} onScroll={scroll.onScroll}
-      onWheel={scroll.onReadingIntent} onTouchMove={scroll.onReadingIntent} onKeyDown={scroll.onKeyDown}
+      onWheel={scroll.onReadingIntent} onTouchMove={scroll.onReadingIntent} onKeyDown={event => {
+        const target = event.target;
+        if (target instanceof HTMLElement && (target.closest("input, textarea, select") || target.isContentEditable)) return;
+        scroll.onKeyDown(event);
+      }}
       onPointerDown={scroll.onPointerDown} onPointerMove={scroll.onPointerMove} onPointerUp={scroll.onPointerEnd}
       onPointerCancel={scroll.onPointerEnd} onPointerLeave={scroll.onPointerEnd}>
     <div className="discussion-tools">
@@ -96,11 +103,14 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
     {feed.page.error ? <div role="alert"><p>{feed.page.error}</p><button type="button" onClick={feed.retry}>重试载入消息</button></div> : null}
     {!feed.page.pending && !feed.page.error && !feed.items.length ? <p>尚无消息，可发送第一条讨论。</p> : null}
     {feed.page.next ? <button type="button" disabled={feed.page.pending} onClick={() => { scroll.beforeOlder(); void feed.loadPage(feed.page.next, false); }}>加载更早消息</button> : null}
+    <RequestWork groupId={groupId} active={active} members={members} ref={requestWork} />
     <ol className="message-list" aria-label="群组消息" ref={scroll.listRef}>{feed.items.map(message => <li key={message.id} data-message-id={message.id}>
       <article className={message.sender_id === "user" ? "message-local" : undefined} aria-label={`消息 ${message.id}`}>
         <header className="message-meta"><strong>{authorName(message.sender_id)}</strong><time dateTime={message.created_at}>{shortTime(message.created_at)}</time></header>
         {message.topic_id ? <p className="eyebrow accent">话题消息</p> : null}
         <p className="message-content">{message.content}</p>
+        <button type="button" aria-label={`转为任务，消息 ${message.id}`}
+          onClick={event => requestWork.current?.open(message, event.currentTarget)}>转为任务</button>
         <details className="message-details">
           <summary className={message.deliveries.some(delivery => !["queued", "accepted"].includes(delivery.state) || Boolean(delivery.error)) ? "delivery-warning" : undefined}>
             投递详情 · {deliverySummary(message.deliveries)}
