@@ -41,6 +41,9 @@ type ExecuteRequest struct {
 	RuntimeDir string `json:"runtime_dir"`
 	Prompt     string `json:"prompt"`
 	Model      string `json:"model"`
+	// Thinking is Pi-only: off, minimal, low, medium, high, xhigh, or max.
+	// The default empty value leaves CLI settings unchanged; Codex rejects nonempty values.
+	Thinking string `json:"thinking,omitempty"`
 }
 
 // Response events are completed assistant text snapshots, replacing earlier
@@ -121,6 +124,15 @@ func (e piExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent
 
 func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error, codex bool) ExecutionReceipt {
 	r := ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "执行参数无效"}
+	if codex && request.Thinking != "" {
+		r.Reason = "Codex 暂不支持 thinking 参数"
+		return r
+	}
+	switch request.Thinking {
+	case "", "off", "minimal", "low", "medium", "high", "xhigh", "max":
+	default:
+		return r
+	}
 	cwd, cwdErr := os.Stat(request.CWD)
 	runtime, runtimeErr := os.Lstat(filepath.Clean(request.RuntimeDir))
 	if !filepath.IsAbs(request.CWD) || !filepath.IsAbs(request.RuntimeDir) ||
@@ -163,6 +175,9 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	}
 	if request.Model != "" {
 		args = append(args, "--model", request.Model)
+	}
+	if request.Thinking != "" {
+		args = append(args, "--thinking", request.Thinking)
 	}
 	if codex {
 		args = append(args, "-")
