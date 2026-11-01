@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/httpapi"
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/provider"
@@ -86,9 +87,12 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		toolStatus = "平台工具已配置：仅已验证 Pi 1.4.0 且显式指定模型时可用四项基础成员工具；Codex 仅原生只读工具且无平台令牌；不授予 Coordinator、Assignment 或 RequestWork 权限"
 	}
 	local := platform.NewLocalUser(db)
+	engine := coordination.New(db)
+	coordinations := platform.NewCoordinations(engine)
 	routes := append(httpapi.LocalUserRoutes(local), httpapi.MessageRoutes(local)...)
 	routes = append(routes, httpapi.TaskRoutes(local)...)
 	routes = append(routes, httpapi.HistoryRoutes(local)...)
+	routes = append(routes, httpapi.CoordinationRoutes(coordinations)...)
 	routes = append(routes, httpapi.ProviderRoute(catalog))
 	if memberTools != nil {
 		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)
