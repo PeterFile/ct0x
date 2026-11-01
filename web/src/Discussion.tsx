@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection, sendMessage } from "./api";
 import type { Delivery, Member, MessageInput } from "./api";
 import { useMessageFeed } from "./useMessageFeed";
+import { useMessageScroll } from "./useMessageScroll";
 import "./discussion-presentation.css";
 const emptyMembers: Member[] = [];
 const deliveryLabel = (state: string) => state === "queued" ? "已入队" : state === "accepted" ? "CLI已接收" : state === "failed" ? "投递失败" : "状态未知";
@@ -40,6 +41,7 @@ export function Discussion({ groupId, members }: { groupId?: string; members: Re
 }
 function DiscussionScope({ groupId, active, members }: { groupId: string; active: boolean; members: Member[] }) {
   const formId = useId(), feed = useMessageFeed(groupId, active);
+  const scroll = useMessageScroll(active, feed.items, feed.page);
   const [content, setContent] = useState("");
   const [route, setRoute] = useState("default"), [recipients, setRecipients] = useState<string[]>([]);
   const [mutation, setMutation] = useState({ pending: false, uncertain: false, error: "", notice: "" });
@@ -64,10 +66,12 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
     const current = operation.current, controller = new AbortController(); posting.current = controller;
     setMutation({ pending: true, uncertain: false, error: "", notice: "" });
     const attempt = feed.beginSend();
+    scroll.beginSend(attempt);
     try {
       const receipt = await sendMessage(groupId, current.input, current.key, controller.signal);
       if (!mounted.current) return;
       feed.confirm(receipt, attempt); operation.current = null; setContent("");
+      scroll.confirmSend(receipt.id, attempt);
       setMutation({ pending: false, uncertain: false, error: "", notice: "消息已持久化；投递状态见记录。" });
     } catch (error) {
       if (!mounted.current) return;
@@ -77,19 +81,20 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
     } finally { posting.current = null; }
   }
   return <div className="group-panel discussion-feed">
-    <section className="message-history" aria-label="消息记录" tabIndex={0}>
+    <section className="message-history" aria-label="消息记录" tabIndex={0} ref={scroll.historyRef} onScroll={scroll.onScroll}
+      onWheel={scroll.onReadingIntent} onTouchMove={scroll.onReadingIntent} onPointerDown={scroll.onPointerDown} onKeyDown={scroll.onKeyDown}>
     <div className="discussion-tools">
-      <button type="button" disabled={feed.page.pending} onClick={() => feed.loadPage()}>刷新并重置历史窗口</button>
+      <button type="button" disabled={feed.page.pending} onClick={() => { scroll.beforeReset(); void feed.loadPage(); }}>刷新并重置历史窗口</button>
       <a href={`#${formId}-content`}>跳至消息输入</a>
       <span className="feed-note">自动更新</span>
     </div>
-    <p className="feed-note">已载入 {feed.items.length} 条（含话题，片段可能有间隔）。</p>
+    <p className="feed-note">{scroll.windowReset ? "历史窗口已更新，可加载更早消息" : `已载入 ${feed.items.length} 条（含话题，片段可能有间隔）。`}</p>
     {feed.pollError ? <p role="status">自动刷新暂不可用：{feed.pollError} 将稍后重试。</p> : null}
     {feed.page.pending ? <p role="status">正在载入消息…</p> : null}
     {feed.page.error ? <div role="alert"><p>{feed.page.error}</p><button type="button" onClick={feed.retry}>重试载入消息</button></div> : null}
     {!feed.page.pending && !feed.page.error && !feed.items.length ? <p>尚无消息，可发送第一条讨论。</p> : null}
-    {feed.page.next ? <button type="button" disabled={feed.page.pending} onClick={() => feed.loadPage(feed.page.next, false)}>加载更早消息</button> : null}
-    <ol className="message-list" aria-label="群组消息">{feed.items.map(message => <li key={message.id}>
+    {feed.page.next ? <button type="button" disabled={feed.page.pending} onClick={() => { scroll.beforeOlder(); void feed.loadPage(feed.page.next, false); }}>加载更早消息</button> : null}
+    <ol className="message-list" aria-label="群组消息" ref={scroll.listRef}>{feed.items.map(message => <li key={message.id} data-message-id={message.id}>
       <article className={message.sender_id === "user" ? "message-local" : undefined} aria-label={`消息 ${message.id}`}>
         <header className="message-meta"><strong>{authorName(message.sender_id)}</strong><time dateTime={message.created_at}>{shortTime(message.created_at)}</time></header>
         {message.topic_id ? <p className="eyebrow accent">话题消息</p> : null}
