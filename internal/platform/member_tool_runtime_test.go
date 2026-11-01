@@ -404,8 +404,10 @@ func TestMemberToolRuntimeRevokeDrainsAfterCancellation(t *testing.T) {
 	select {
 	case <-result:
 		t.Fatal("wrapper bypassed revocation drain after cancellation")
-	case <-time.After(30 * time.Millisecond):
+	case <-time.After(6 * time.Second):
+		// Revocation must still join after the independent verification window.
 	}
+	f.requireUnsettled(t, domain.TurnStateStarting)
 	if _, err := os.Lstat(path); err != nil {
 		t.Error("config disappeared before authorized operations drained")
 	}

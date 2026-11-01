@@ -5,9 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
-	"net"
-	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
@@ -49,10 +47,13 @@ type MemberToolRuntime struct {
 	maxGroupMembers          int
 }
 
+const memberToolRuntimeVerificationTimeout = 5 * time.Second
+
 var (
-	errMemberToolRuntimeConfig  = errors.New("成员工具运行配置无效")
-	errMemberToolRuntimeBinding = errors.New("成员工具执行身份绑定无效")
-	memberToolRuntimeRunID      = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$`)
+	errMemberToolRuntimeConfig       = errors.New("成员工具运行配置无效")
+	errMemberToolRuntimeBinding      = errors.New("成员工具执行身份绑定无效")
+	memberToolRuntimeRunID           = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$`)
+	memberToolRuntimeEndpointPattern = regexp.MustCompile(`^http://(?:127\.0\.0\.1|\[::1\]):([0-9]{1,5})/api/v1/member-tools$`)
 )
 
 func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*MemberToolRuntime, error) {
@@ -84,15 +85,12 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 }
 
 func memberToolRuntimeEndpoint(endpoint string) bool {
-	u, err := url.Parse(endpoint)
-	if err != nil || u.Scheme != "http" || u.User != nil || u.Opaque != "" || u.Path != "/api/v1/member-tools" ||
-		u.RawPath != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.String() != endpoint {
+	match := memberToolRuntimeEndpointPattern.FindStringSubmatch(endpoint)
+	if match == nil {
 		return false
 	}
-	host, port, err := net.SplitHostPort(u.Host)
-	ip, ipErr := netip.ParseAddr(host)
-	number, portErr := strconv.ParseUint(port, 10, 16)
-	return err == nil && ipErr == nil && ip.IsLoopback() && ip.Zone() == "" && portErr == nil && number != 0
+	number, err := strconv.ParseUint(match[1], 10, 16)
+	return err == nil && number != 0
 }
 
 func (r *MemberToolRuntime) Tools() *MemberTools { return r.tools }
@@ -185,9 +183,10 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 func (e *memberToolRuntimeRun) preflight(ctx context.Context, request provider.ExecuteRequest, claim store.TurnClaim, token string, config *memberToolRuntimeConfigFile) *provider.ExecutionReceipt {
 	r := e.runtime
 	outcome, reason := provider.OutcomeUnknown, "成员工具执行归属或历史结果未知，需对账后再处理"
-	// Read current generation even if cancellation arrived after successful Issue.
-	// This never settles a turn and never turns recovered/unknown work into not_started.
-	checkCtx := context.WithoutCancel(ctx)
+	// Bound reconciliation independently of caller cancellation, including SQL pool
+	// waits. This never settles a turn; failure or expiry must remain unknown.
+	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), memberToolRuntimeVerificationTimeout)
+	defer cancel()
 	turn, err := r.tools.db.GetTurn(checkCtx, claim.GroupID, claim.TurnID)
 	if err == nil && e.fresh(turn) && turn.ClaimToken == claim.Token && r.clearRunDirectory(request) &&
 		r.tools.withAuthorized(checkCtx, token, r.operations[0], func(scope store.MemberToolScope, _ MemberToolGrants) error {
@@ -195,7 +194,7 @@ func (e *memberToolRuntimeRun) preflight(ctx context.Context, request provider.E
 				return store.ErrMemberToolDenied
 			}
 			return nil
-		}) == nil {
+		}) == nil && checkCtx.Err() == nil {
 		outcome, reason = provider.OutcomeNotStarted, "成员工具凭证目录或文件已变更，执行未启动"
 		if ctx.Err() != nil {
 			reason = "执行在启动前已取消或超时"

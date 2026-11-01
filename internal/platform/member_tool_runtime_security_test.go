@@ -15,31 +15,40 @@ import (
 
 func TestMemberToolRuntimeOptionValidation(t *testing.T) {
 	f := setupMemberToolRuntime(t)
-	for _, endpoint := range []string{
-		"http://127.0.0.1:1/api/v1/member-tools",
-		"http://127.0.0.2:65535/api/v1/member-tools",
-		"http://[::1]:7310/api/v1/member-tools",
-	} {
-		options := f.options
-		options.Endpoint = endpoint
-		if _, err := NewMemberToolRuntime(f.db, options); err != nil {
-			t.Errorf("valid numeric loopback endpoint rejected: %s", endpoint)
+	for _, host := range []string{"127.0.0.1", "[::1]"} {
+		for _, port := range []string{"1", "80", "7310", "65535", "00001", "00080"} {
+			endpoint := "http://" + host + ":" + port + "/api/v1/member-tools"
+			options := f.options
+			options.Endpoint = endpoint
+			runtime, err := NewMemberToolRuntime(f.db, options)
+			if err != nil {
+				t.Errorf("valid bridge endpoint rejected: %q", endpoint)
+			} else if runtime.endpoint != endpoint {
+				t.Errorf("supplied endpoint authority was normalized: %q", endpoint)
+			}
 		}
 	}
 	for _, endpoint := range []string{
 		"", " http://127.0.0.1:7310/api/v1/member-tools", "https://127.0.0.1:7310/api/v1/member-tools",
 		"http://localhost:7310/api/v1/member-tools", "http://0.0.0.0:7310/api/v1/member-tools", "http://192.0.2.1:7310/api/v1/member-tools",
+		"http://127.0.0.2:65535/api/v1/member-tools", "http://127.255.255.255:7310/api/v1/member-tools",
 		"http://[::]:7310/api/v1/member-tools", "http://[::1%25lo0]:7310/api/v1/member-tools",
+		"http://[0:0:0:0:0:0:0:1]:7310/api/v1/member-tools", "http://[::0001]:7310/api/v1/member-tools",
+		"http://[::ffff:127.0.0.1]:7310/api/v1/member-tools", "http://[::ffff:7f00:1]:7310/api/v1/member-tools",
 		"http://127.0.0.1/api/v1/member-tools", "http://127.0.0.1:0/api/v1/member-tools", "http://127.0.0.1:65536/api/v1/member-tools",
+		"http://127.0.0.1:00000/api/v1/member-tools", "http://[::1]:65536/api/v1/member-tools",
+		"http://127.0.0.1:007310/api/v1/member-tools", "http://127.0.0.1:000001/api/v1/member-tools", "http://[::1]:000080/api/v1/member-tools",
 		"http://127.0.0.1:+7310/api/v1/member-tools", "http://user@127.0.0.1:7310/api/v1/member-tools",
 		"http://127.0.0.1:7310/api/v1/member-tools/", "http://127.0.0.1:7310/api/v1/member-tools?", "http://127.0.0.1:7310/api/v1/member-tools?x=1",
 		"http://127.0.0.1:7310/api/v1/member-tools#", "http://127.0.0.1:7310/api/v1/member-tools#fragment",
 		"http://127.0.0.1:7310/api/v1/%6dember-tools", "http://127.0.0.1:7310/other", "http:127.0.0.1:7310/api/v1/member-tools",
+		"http://127.0.0.1:7310/api/v1/member-tools\r", "http://127.0.0.1:7310/api/v1/member-tools\n", "http://[::1]:7310/api/v1/member-tools\r\n",
+		"http://127.0.0.1:7310\n/api/v1/member-tools", "http://[::1]:7310/api/v1/member-\rtools",
 	} {
 		options := f.options
 		options.Endpoint = endpoint
 		if runtime, err := NewMemberToolRuntime(f.db, options); err == nil || runtime != nil {
-			t.Errorf("unsafe endpoint accepted: %s", endpoint)
+			t.Errorf("unsafe endpoint accepted: %q", endpoint)
 		}
 	}
 	for _, operations := range [][]string{nil, {}, {""}, {"list_members", "list_members"}, {"list_members", "search_history"}, {"read_channel "}} {
