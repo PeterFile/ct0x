@@ -97,10 +97,18 @@ export function listMembers(groupId: string, before = "", signal?: AbortSignal) 
 export function createMember(groupId: string, input: MemberInput, key: string, signal?: AbortSignal) {
   return post(membersPath(groupId), input, key, memberIn(groupId), signal);
 }
+const messagesPath = (groupId: string) => `/api/v1/groups/${encodeURIComponent(groupId)}/messages`;
 export function sendMessage(groupId: string, input: MessageInput, key: string, signal?: AbortSignal) {
-  return post(`/api/v1/groups/${encodeURIComponent(groupId)}/messages`, {
+  return post(messagesPath(groupId), {
     content: input.content, recipient_ids: input.recipient_ids, topic_id: input.topic_id,
   }, key, messageIn(groupId, input.topic_id ?? ""), signal);
+}
+export function listMessages(groupId: string, before = "", signal?: AbortSignal) {
+  return request(`${messagesPath(groupId)}${pageQuery(before)}`, { signal }, pageOf(messageIn(groupId)));
+}
+export function getMessage(groupId: string, id: string, signal?: AbortSignal) {
+  return request(`${messagesPath(groupId)}/${encodeURIComponent(id)}`, { signal },
+    (value): value is Message => messageIn(groupId)(value) && value.id === id);
 }
 export function listProviders(before = "", signal?: AbortSignal) {
   return request(`/api/v1/providers${pageQuery(before)}`, { signal }, pageOf(isProvider));
