@@ -96,16 +96,19 @@ func (s *MemberTools) withAuthorized(ctx context.Context, token, operation strin
 	if !found || !slices.Contains(entry.grants.Operations, operation) {
 		return store.ErrMemberToolDenied
 	}
-	if err := s.db.ValidateMemberTool(ctx, entry.scope); err != nil {
-		// Store preflight sanitizes failures; preserve context only after registry authorization.
+	err := s.db.ValidateMemberTool(ctx, entry.scope)
+	if err == nil {
+		grants := entry.grants
+		grants.Operations = slices.Clone(grants.Operations)
+		err = use(entry.scope, grants)
+	}
+	// Both preflight and callback can sanitize context errors; preserve successful results.
+	if err != nil {
 		if contextErr := ctx.Err(); contextErr != nil {
 			return contextErr
 		}
-		return err
 	}
-	grants := entry.grants
-	grants.Operations = slices.Clone(grants.Operations)
-	return use(entry.scope, grants)
+	return err
 }
 
 func memberToolGrantsValid(grants MemberToolGrants) bool {
