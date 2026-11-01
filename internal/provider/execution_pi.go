@@ -40,9 +40,7 @@ func (l *executionLog) Write(p []byte) (int, error) {
 type executionOutput struct {
 	log                        *executionLog
 	receipt                    *ExecutionReceipt
-	callback                   func(Event) error
-	cancel                     context.CancelFunc
-	ctx                        context.Context
+	delivery                   *executionDelivery
 	codex                      bool
 	runID                      string
 	line                       []byte
@@ -82,13 +80,8 @@ func (o *executionOutput) Write(p []byte) (int, error) {
 }
 
 func (o *executionOutput) emit(event Event) {
-	if o.callback != nil && !o.receipt.DeliveryFailed && o.ctx.Err() == nil {
-		event.NativeSessionID = o.receipt.NativeSessionID
-		if o.callback(event) != nil {
-			o.receipt.DeliveryFailed = true
-			o.cancel()
-		}
-	}
+	event.NativeSessionID = o.receipt.NativeSessionID
+	o.delivery.enqueue(event)
 }
 
 // Pi 1.4.0 print-mode.js emits the header before prompt(). agent_start is
