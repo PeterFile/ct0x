@@ -80,6 +80,10 @@ it("preserves per-group disclosure state and B's open draft while retrying colla
 });
 it("keeps history controls and composer in named focusable regions with a direct input link and no selected manifesto", async () => {
   await open("member"); const main = within(screen.getByRole("main", { name: "讨论" }));
+  const intro = main.getByRole("region", { name: "群组简介" });
+  expect(within(intro).getByRole("heading", { name: group.name })).toBeVisible();
+  expect(within(intro).getByText(group.description)).toBeVisible();
+  expect(intro.tabIndex).toBe(0); intro.focus(); expect(intro).toHaveFocus();
   const history = main.getByRole("region", { name: "消息记录" }), composer = main.getByRole("region", { name: "撰写消息" });
   expect(history.tabIndex).toBe(0); expect(composer.tabIndex).toBe(0);
   expect(await within(history).findByRole("button", { name: "加载更早消息" })).toBeVisible();
