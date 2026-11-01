@@ -109,7 +109,8 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
         <header className="message-meta"><strong>{authorName(message.sender_id)}</strong><time dateTime={message.created_at}>{shortTime(message.created_at)}</time></header>
         {message.topic_id ? <p className="eyebrow accent">话题消息</p> : null}
         <p className="message-content">{message.content}</p>
-        <button type="button" aria-label={`转为任务，消息 ${message.id}`}
+        <div className="message-actions">
+        <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
           onClick={event => requestWork.current?.open(message, event.currentTarget)}>转为任务</button>
         <details className="message-details">
           <summary className={message.deliveries.some(delivery => !["queued", "accepted"].includes(delivery.state) || Boolean(delivery.error)) ? "delivery-warning" : undefined}>
@@ -130,6 +131,7 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
           <button type="button" aria-label={`刷新消息 ${message.id} 投递`} disabled={feed.details[message.id]?.pending}
             onClick={() => feed.refreshDetail(message.id)}>刷新投递</button>
         </details>
+        </div>
         {feed.details[message.id]?.error ? <p role="alert">{feed.details[message.id].error}</p> : null}
       </article>
     </li>)}</ol>
