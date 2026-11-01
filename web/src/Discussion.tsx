@@ -1,10 +1,31 @@
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection, sendMessage } from "./api";
-import type { Member, MessageInput } from "./api";
+import type { Delivery, Member, MessageInput } from "./api";
 import { useMessageFeed } from "./useMessageFeed";
+import { useMessageScroll } from "./useMessageScroll";
+import "./discussion-presentation.css";
 const emptyMembers: Member[] = [];
 const deliveryLabel = (state: string) => state === "queued" ? "已入队" : state === "accepted" ? "CLI已接收" : state === "failed" ? "投递失败" : "状态未知";
+function deliverySummary(deliveries: Delivery[]) {
+  if (!deliveries.length) return "暂无投递记录";
+  const counts = new Map<string, number>();
+  let errors = 0;
+  for (const delivery of deliveries) {
+    const label = deliveryLabel(delivery.state);
+    counts.set(label, (counts.get(label) ?? 0) + 1);
+    if (delivery.error) ++errors;
+  }
+  const labels = [...counts].map(([label, count]) => `${label} ${count}`);
+  if (errors) labels.push(`投递错误 ${errors}`);
+  return labels.join(" · ");
+}
+function shortTime(value: string) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString("zh-CN", {
+    month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+  });
+}
 
 export function Discussion({ groupId, members }: { groupId?: string; members: Record<string, Member[]> }) {
   const [visited, setVisited] = useState<string[]>([]);
@@ -20,12 +41,15 @@ export function Discussion({ groupId, members }: { groupId?: string; members: Re
 }
 function DiscussionScope({ groupId, active, members }: { groupId: string; active: boolean; members: Member[] }) {
   const formId = useId(), feed = useMessageFeed(groupId, active);
+  const scroll = useMessageScroll(active, feed.items, feed.page);
   const [content, setContent] = useState("");
   const [route, setRoute] = useState("default"), [recipients, setRecipients] = useState<string[]>([]);
   const [mutation, setMutation] = useState({ pending: false, uncertain: false, error: "", notice: "" });
   const operation = useRef<{ key: string; input: MessageInput } | null>(null);
   const posting = useRef<AbortController | null>(null), mounted = useRef(false);
   const eligible = members.filter(member => member.group_id === groupId && member.status === "active");
+  const memberNames = new Map(members.filter(member => member.group_id === groupId).map(member => [member.id, member.name]));
+  const authorName = (id: string) => id === "user" ? "我" : memberNames.get(id) ?? "未载入成员";
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; posting.current?.abort(); };
@@ -42,10 +66,12 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
     const current = operation.current, controller = new AbortController(); posting.current = controller;
     setMutation({ pending: true, uncertain: false, error: "", notice: "" });
     const attempt = feed.beginSend();
+    scroll.beginSend(attempt);
     try {
       const receipt = await sendMessage(groupId, current.input, current.key, controller.signal);
       if (!mounted.current) return;
       feed.confirm(receipt, attempt); operation.current = null; setContent("");
+      scroll.confirmSend(receipt.id, attempt);
       setMutation({ pending: false, uncertain: false, error: "", notice: "消息已持久化；投递状态见记录。" });
     } catch (error) {
       if (!mounted.current) return;
@@ -55,9 +81,12 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
     } finally { posting.current = null; }
   }
   return <div className="group-panel discussion-feed">
-    <section className="message-history" aria-label="消息记录" tabIndex={0}>
+    <section className="message-history" aria-label="消息记录" tabIndex={0} ref={scroll.historyRef} onScroll={scroll.onScroll}
+      onWheel={scroll.onReadingIntent} onTouchMove={scroll.onReadingIntent} onKeyDown={scroll.onKeyDown}
+      onPointerDown={scroll.onPointerDown} onPointerMove={scroll.onPointerMove} onPointerUp={scroll.onPointerEnd}
+      onPointerCancel={scroll.onPointerEnd} onPointerLeave={scroll.onPointerEnd}>
     <div className="discussion-tools">
-      <button type="button" disabled={feed.page.pending} onClick={() => feed.loadPage()}>刷新并重置历史窗口</button>
+      <button type="button" disabled={feed.page.pending} onClick={() => { scroll.beforeReset(); void feed.loadPage(); }}>刷新并重置历史窗口</button>
       <a href={`#${formId}-content`}>跳至消息输入</a>
       <span className="feed-note">自动更新</span>
     </div>
@@ -66,23 +95,38 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
     {feed.page.pending ? <p role="status">正在载入消息…</p> : null}
     {feed.page.error ? <div role="alert"><p>{feed.page.error}</p><button type="button" onClick={feed.retry}>重试载入消息</button></div> : null}
     {!feed.page.pending && !feed.page.error && !feed.items.length ? <p>尚无消息，可发送第一条讨论。</p> : null}
-    {feed.page.next ? <button type="button" disabled={feed.page.pending} onClick={() => feed.loadPage(feed.page.next, false)}>加载更早消息</button> : null}
-    <ol className="message-list" aria-label="群组消息">{feed.items.map(message => <li key={message.id}>
-      <article aria-label={`消息 ${message.id}`}>
-        <header className="message-meta"><span>发送者：{message.sender_id}</span><time dateTime={message.created_at}>{message.created_at}</time></header>
-        {message.topic_id ? <p className="eyebrow accent">话题消息 · {message.topic_id}</p> : <p className="eyebrow">主频道消息</p>}
+    {feed.page.next ? <button type="button" disabled={feed.page.pending} onClick={() => { scroll.beforeOlder(); void feed.loadPage(feed.page.next, false); }}>加载更早消息</button> : null}
+    <ol className="message-list" aria-label="群组消息" ref={scroll.listRef}>{feed.items.map(message => <li key={message.id} data-message-id={message.id}>
+      <article className={message.sender_id === "user" ? "message-local" : undefined} aria-label={`消息 ${message.id}`}>
+        <header className="message-meta"><strong>{authorName(message.sender_id)}</strong><time dateTime={message.created_at}>{shortTime(message.created_at)}</time></header>
+        {message.topic_id ? <p className="eyebrow accent">话题消息</p> : null}
         <p className="message-content">{message.content}</p>
-        {message.deliveries.length ? <ul className="delivery-list">{message.deliveries.map(delivery => <li key={delivery.id}>
-          {delivery.recipient_id} · {deliveryLabel(delivery.state)}{delivery.error ? ` · 投递错误：${delivery.error}` : ""}
-        </li>)}</ul> : <p className="feed-note">暂无投递记录。</p>}
-        <button type="button" aria-label={`刷新消息 ${message.id} 投递`} disabled={feed.details[message.id]?.pending}
-          onClick={() => feed.refreshDetail(message.id)}>刷新投递</button>
+        <details className="message-details">
+          <summary className={message.deliveries.some(delivery => !["queued", "accepted"].includes(delivery.state) || Boolean(delivery.error)) ? "delivery-warning" : undefined}>
+            投递详情 · {deliverySummary(message.deliveries)}
+          </summary>
+          <dl className="message-technical">
+            <div><dt>消息 ID</dt><dd>{message.id}</dd></div>
+            <div><dt>发送者 ID</dt><dd>{message.sender_id}</dd></div>
+            {message.topic_id ? <div><dt>话题 ID</dt><dd>{message.topic_id}</dd></div> : null}
+            <div><dt>完整时间</dt><dd><time dateTime={message.created_at}>{message.created_at}</time></dd></div>
+          </dl>
+          {message.deliveries.length ? <ul className="delivery-list">{message.deliveries.map(delivery => <li key={delivery.id}>
+            <p><strong>{authorName(delivery.recipient_id)}</strong> · <span>{delivery.recipient_id}</span></p>
+            <p>{deliveryLabel(delivery.state)}（{delivery.state}）</p>
+            {delivery.error ? <p className="delivery-warning">投递错误：{delivery.error}</p> : null}
+            <p>投递 ID：{delivery.id}</p>
+          </li>)}</ul> : null}
+          <button type="button" aria-label={`刷新消息 ${message.id} 投递`} disabled={feed.details[message.id]?.pending}
+            onClick={() => feed.refreshDetail(message.id)}>刷新投递</button>
+        </details>
         {feed.details[message.id]?.error ? <p role="alert">{feed.details[message.id].error}</p> : null}
       </article>
     </li>)}</ol>
     </section>
     <section className="message-composer" aria-label="撰写消息" tabIndex={0}>
     <form aria-label="发送消息" onSubmit={submit}>
+      {scroll.windowReset ? <p className="feed-note">历史窗口已更新，可加载更早消息</p> : null}
       <fieldset disabled={mutation.pending || mutation.uncertain}>
         <label htmlFor={`${formId}-content`}>消息内容</label>
         <textarea id={`${formId}-content`} required rows={2} value={content} onChange={event => setContent(event.target.value)} />
@@ -98,10 +142,10 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
       </div>
       {route === "selected" ? <fieldset disabled={mutation.pending || mutation.uncertain}>
         <div className="recipient-list">
-          <p className="feed-note">仅列出已载入的在群成员；更多成员请在右栏加载。</p>
+          <p className="feed-note">仅列出已载入的在群成员；更多成员请打开成员详情加载。</p>
           {eligible.map(member => <label key={member.id}><input type="checkbox" checked={recipients.includes(member.id)}
             onChange={event => setRecipients(previous => event.target.checked ? [...previous, member.id] : previous.filter(id => id !== member.id))} />
-            {member.name} · {member.role} · {member.id}</label>)}
+            <span>{member.name} · {member.role} · {member.id}</span></label>)}
           <button type="button" onClick={() => setRecipients([])}>清除所选成员</button>
         </div>
       </fieldset> : null}

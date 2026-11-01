@@ -2,12 +2,15 @@
 
 The product is a local, single-user collaboration workspace. An empty group can begin a discussion without a profile, task, Git repository, or external working directory. The backend is one Go process with SQLite. The web client is React with TypeScript and Vite, served locally by the backend in the packaged build.
 
+The architecture direction selected on 2026-11-01 follows the pinned dsh-superagent-prototype's coordination model and uses an IM interface. [Conversation-led orchestration](orchestration.md) defines the mapping, role-scoped Engine, migration sequence, and compatibility rules. It distinguishes target design from implemented behavior. Existing storage and execution invariants below remain in force.
+
 ## Boundaries
 
 - `internal/domain`: shared value types and explicit states.
 - `internal/store`: SQLite transactions, migrations, indexed bounded reads, identity and resource constraints.
 - `internal/provider`: CLI discovery, capability contracts, native/one-shot transport, execution receipts. No group-specific routing.
 - `internal/platform`: shared operations, actor binding, discussion routing, task lifecycle, artifacts, skills, and context.
+- Coordination Engine (planned): source intake, versioned admission, Mandates, Assignment bindings, follow-up ownership, and structured attention through one transactional module. It reuses the existing scheduler and Store rather than introducing a parallel execution system.
 - `internal/scheduler`: durable claims, fair inbox/work scheduling, cancellation, and recovery.
 - `internal/httpapi`, `cmd/workspace`: loopback HTTP, SSE, process lifecycle, and platform CLI entry.
 - `web`: design tokens, accessible interaction, and server-backed views.
@@ -30,7 +33,7 @@ Use `/api/v1`, JSON snake_case, opaque string IDs, UTC RFC3339 timestamps, and e
 
 The default local address is `127.0.0.1:7310`, configurable by an explicit CLI flag. The frontend uses relative URLs and the development proxy targets this loopback port. Enforce same-origin browser mutations and JSON request bodies; do not expose wildcard CORS or bind to all interfaces by default. A local member tool transport needs a run-bound capability and must not inherit the user HTTP actor.
 
-Time-based pagination applies to records with immutable `created_at`; provider and skill catalogues instead use stable IDs. SQL reads apply the cursor predicate and `LIMIT` before materializing rows. Incremental `after` reads are oldest-first so consumers can advance a high-water mark without skipping a backlog larger than one page. A conversation is unique on `(group_id, member_id, topic_id)` with a non-null empty main topic; deliveries must match both their message topic/group and their conversation member/topic/group.
+Time-based pagination is a display contract; provider and skill catalogues instead use stable IDs. SQL reads apply the cursor predicate and `LIMIT` before materializing rows. A timestamp/ID cursor is not a committed high-water mark. Durable incremental processing uses a separately defined committed sequence and a captured upper bound; a future `after` transport must preserve that distinction. A conversation is unique on `(group_id, member_id, topic_id)` with a non-null empty main topic; deliveries must match both their message topic/group and their conversation member/topic/group.
 
 Initial endpoints:
 
@@ -60,10 +63,11 @@ Reference inspected on 2026-10-30: [claude.dev](https://claude.dev/). Borrow its
 
 Central CSS tokens own all colors, typography, spacing, borders, focus, status, and motion. Initial direction: canvas `#131412`, panel `#1b1c19`, text `#eeede6`, muted `#a5a69c`, line `#34362f`, accent `#dc7958`, success `#9eaf87`. Use a serif display accent, a readable sans UI stack, and a monospace metadata stack with local fallbacks. Support keyboard navigation, visible focus, reduced motion, and a usable narrow layout.
 
-The primary screen puts groups on the left, discussion in the center, and members/activity on the right. Tasks, artifacts, skills, and connections are real server-backed destinations. Empty, loading, disconnected, error, queued, and unknown states must be explicit. Never show fabricated activity or pretend a button succeeded.
+The primary screen is an IM: conversations on the left, messages and a persistent composer in the center, and contextual details when opened. Members, Tasks, artifacts, skills, and connections use real server-backed panels rather than replacing the conversation with administrative pages. Empty, loading, disconnected, error, queued, and unknown states must be explicit. Never show fabricated activity or pretend a button succeeded.
 
 ## Verified design sources
 
+- [DSH Super-agent prototype, pinned architecture](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/6337fc823ce20251c8de8085948165c81aaa701e/docs/007-architecture.md): the primary coordination reference; adaptations and deliberate safety differences are recorded in [orchestration.md](orchestration.md).
 - [OpenBot channel context](https://github.com/nightly-labs/openbot/blob/f3e3f8ade9c146e96d9d68d65770d2a9126a7856/docs/architecture/channels-and-messaging.md): shared channel history and independent member sessions.
 - [Orca durable mailbox](https://github.com/stablyai/orca/blob/9470b4618c7a494254ab9e1ec81c52bd5994256b/src/main/runtime/orchestration/db/messages/role-mailbox-delivery.ts): FIFO claims, replay, idempotent acknowledgement, and consumer-generation fencing. Atomic message-plus-recipient creation is our PRD requirement, not a claim inferred from this file.
 - [Paseo](https://github.com/getpaseo/paseo): adapter-owned runtime and uncertain-start reconciliation; exact contracts are checked against the installed/source version before use.
@@ -72,6 +76,6 @@ The primary screen puts groups on the left, discussion in the center, and member
 
 ## Delivery and regression gates
 
-Deliver independently reviewable contracts, storage, provider discovery, execution, UI, scheduler, resources, context, and acceptance slices. Aim for 300–500 effective lines per review; record justified exceptions. Each slice needs behavior-specific tests, independent review, and a rollback commit. No remote PR exists until a remote is selected.
+Deliver independently reviewable contracts, storage, provider discovery, execution, UI, scheduler, resources, context, and acceptance slices. Aim for 300–500 effective lines per review; record justified exceptions. Each slice needs behavior-specific tests, independent review, and a rollback commit. Publish small PRs to the configured repository and merge only after independent review and the applicable checks pass.
 
 Required validation grows with the slice: Go tests and race detector, web type checks/unit tests/build, database reopen/recovery tests, real browser flows, and two real CLI executions. Benchmark durable message insertion and bounded history retrieval before optimization. Store raw evidence locally; do not replace evidence with successful mocks.

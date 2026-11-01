@@ -1,0 +1,81 @@
+.discussion-feed { --discussion-reading-width: 52rem; }
+.discussion-feed .message-history > *,
+.discussion-feed .message-composer form {
+  max-inline-size: var(--discussion-reading-width);
+  margin-inline: auto;
+}
+.discussion-feed .message-list { gap: var(--space-4); }
+.discussion-feed .message-list > li { min-inline-size: 0; }
+.discussion-feed .message-list article {
+  inline-size: fit-content;
+  max-inline-size: 100%;
+  min-inline-size: 0;
+  gap: var(--space-1);
+  padding: 0;
+  border: 0;
+}
+.discussion-feed .message-local { margin-inline-start: auto; }
+.discussion-feed .message-meta {
+  justify-content: flex-start;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-3);
+  line-height: var(--leading-tight);
+}
+.discussion-feed .message-meta strong {
+  color: var(--color-text);
+  font-weight: var(--weight-medium);
+}
+.discussion-feed .message-local .message-meta { justify-content: flex-end; }
+.discussion-feed .message-content {
+  min-inline-size: 0;
+  padding: var(--space-2) var(--space-3);
+  border-inline-start: var(--border-rule);
+  background: var(--color-panel);
+  font-size: var(--text-body);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.discussion-feed .message-local .message-content {
+  border-inline-start: 0;
+  border-inline-end: var(--border-accent);
+}
+.discussion-feed .message-details {
+  min-inline-size: 0;
+  color: var(--color-muted);
+  font-size: var(--text-small);
+  overflow-wrap: anywhere;
+}
+.discussion-feed .message-local .message-details:not([open]) { justify-self: end; }
+.discussion-feed .message-details summary {
+  min-block-size: var(--target-min);
+  padding-block: var(--space-2);
+  cursor: pointer;
+}
+.discussion-feed .message-details summary:hover { color: var(--color-text); }
+.discussion-feed .delivery-warning { color: var(--color-accent); }
+.discussion-feed .message-technical {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-3);
+  padding-block: var(--space-3);
+  border-block: var(--border-rule);
+}
+.discussion-feed .message-technical dt { font-size: var(--text-meta); }
+.discussion-feed .message-technical dd { margin: 0; color: var(--color-text); }
+.discussion-feed .delivery-list {
+  display: grid;
+  gap: var(--space-3);
+  padding-inline-start: var(--space-4);
+  margin-block-end: var(--space-3);
+}
+.discussion-feed .delivery-list strong { font-weight: var(--weight-medium); color: var(--color-text); }
+.discussion-feed .message-composer form { gap: var(--space-1); }
+.discussion-feed .composer-actions fieldset {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+}
+.discussion-feed .composer-actions select { flex: 1 1 12rem; width: auto; }
+.discussion-feed .recipient-list { gap: var(--space-1); }
+.discussion-feed .recipient-list label > span { min-inline-size: 0; overflow-wrap: anywhere; }

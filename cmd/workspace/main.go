@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/httpapi"
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/provider"
@@ -65,25 +66,37 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("启动已取消：%w", err)
 	}
-	var schedule func(context.Context) error
-	executionStatus := "执行已禁用，投递仅排队"
-	if config.enableExecution {
-		schedule, err = executionRunner(config.dataDir, db, catalog)
-		if err != nil {
-			return err
-		}
-		executionStatus = "全新单轮执行已启用，最大并发 1"
-	}
+	// Reserve only: no HTTP admission or scheduler claims before composition succeeds.
 	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", config.listen)
 	if err != nil {
 		return fmt.Errorf("监听本地地址失败：%w", err)
 	}
 	defer listener.Close()
+	var schedule func(context.Context) error
+	var memberTools *platform.MemberToolRuntime
+	executionStatus := "执行已禁用，投递仅排队"
+	toolStatus := "平台工具已禁用；Pi 禁用工具，Codex 仅原生只读工具且无平台令牌"
+	if config.enableExecution {
+		schedule, memberTools, err = executionRunner(config, db, catalog, "http://"+listener.Addr().String()+"/api/v1/member-tools")
+		if err != nil {
+			return err
+		}
+		executionStatus = "全新单轮执行已启用，最大并发 1"
+	}
+	if memberTools != nil {
+		toolStatus = "平台工具已配置：仅已验证 Pi 1.4.0 且显式指定模型时可用四项基础成员工具；Codex 仅原生只读工具且无平台令牌；不授予 Coordinator、Assignment 或 RequestWork 权限"
+	}
 	local := platform.NewLocalUser(db)
+	engine := coordination.New(db)
+	coordinations := platform.NewCoordinations(engine)
 	routes := append(httpapi.LocalUserRoutes(local), httpapi.MessageRoutes(local)...)
 	routes = append(routes, httpapi.TaskRoutes(local)...)
 	routes = append(routes, httpapi.HistoryRoutes(local)...)
+	routes = append(routes, httpapi.CoordinationRoutes(coordinations)...)
 	routes = append(routes, httpapi.ProviderRoute(catalog))
+	if memberTools != nil {
+		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)
+	}
 	if config.webDir != "" {
 		web, openErr := webassets.Open(config.webDir)
 		if openErr != nil {
@@ -98,7 +111,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录、任务创建、列表与详情及 CLI 目录；目录仅启动时探测、证据仅存内存；%s；不支持恢复、运行中追加输入或平台工具；Pi 禁用工具，Codex 可用原生只读工具；工作目录不是主机读取沙箱，数据目录及祖先必须可信且目录身份稳定；其他功能尚未启用）\n", listener.Addr(), executionStatus); err != nil {
+	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录、任务创建、列表与详情及 CLI 目录；目录仅启动时探测、证据仅存内存；%s；不支持恢复或运行中追加输入；%s；工作目录不是主机读取沙箱，数据目录及祖先必须可信且目录身份稳定；其他功能尚未启用）\n", listener.Addr(), executionStatus, toolStatus); err != nil {
 		return fmt.Errorf("输出启动信息失败：%w", err)
 	}
 	return serve(ctx, server, listener, 5*time.Second, schedule)
