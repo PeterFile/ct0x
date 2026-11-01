@@ -5,7 +5,26 @@
 - `MemberTools *MemberToolRuntime`
 - `PiMemberToolsExtension string`
 
-二者必须同时为空或同时提供。默认关闭；本片不增加命令行开关、HTTP 路由、队列或运行时启用接线。
+二者必须同时为空或同时提供。默认关闭；`cmd/workspace` 可显式把同一个 Store 上的唯一 runtime 同时交给 Prepare 和私有 HTTP 路由，不增加队列或调度器。
+
+## 本地进程入口（C2）
+
+```sh
+workspace --listen 127.0.0.1:0 --data-dir /absolute/private/data \
+  --enable-execution --enable-member-tools \
+  --pi-member-tools-extension /absolute/trusted/pi-bridge/index.ts \
+  --member-tools-max-members 4
+```
+
+- `--enable-member-tools` 默认 `false`。启用必须同时开启 `--enable-execution`，并显式提供绝对、可读的普通扩展文件；不从 CWD、仓库或个人配置自动发现扩展。保留已审查 artifact 中相邻的 `index.ts`、`bridge.mjs`，其代码、依赖和祖先须在整个运行期间可信稳定。入口校验不认证 artifact 内容。
+- `--member-tools-max-members` 默认 `4`，显式范围 `1..200`。工具关闭时显式传入扩展或容量参数会报错，不静默忽略。
+- 开启工具时监听 IP 只接受 `127.0.0.1` 或 `::1`，规范化为 `127.0.0.1:<port>` / `[::1]:<port>`；显式端口 `0` 使用实际预留监听器的非零端口。配置 endpoint 精确为 `http://<actual-address>/api/v1/member-tools`。关闭工具时保留原有回环地址兼容范围。
+- `data/member-tools` 是独立的 `0700` 凭证根，与 `data/runtime`、`data/workspaces` 分离。已有不安全条目被拒绝，不自动 chmod；不预建 RunID 日志目录。关闭工具时不创建凭证根、runtime registry、工具路由或 token。
+- 启动顺序仍为独占锁、打开 SQLite、恢复一次、只读 provider catalog 与私有根准备、全部构造/路由验证、启动调度及 HTTP。允许先预留监听器取得端口，但完成组合前不 Serve、不 claim。原有 IM、Task、History 路由保留；不注册 TaskLifecycle、Coordination 或 RequestWork 工具。
+- 仅 C1 已验证的 Pi 1.4.0 分支获得四基础平台工具，且成员必须配置显式规范模型；缺模型保持 queued/not_ready。Codex 保持原生只读 baseline，没有平台令牌。提供方凭据仍由原 CLI 持有，子进程仅经专用环境变量收到临时配置路径。
+- 关闭先停止 claim 并取消执行，再加入 HTTP handlers、native Execute、runtime 撤销的已授权操作及事件/receipt 排空，最后关闭 DB 和锁。HTTP grace 到期可关闭连接，但不能提前放弃 handler、Revoke 或回执；不增加业务自动重试。unknown 保留资源，native 成功不能证明某个未知 HTTP 操作成功。
+
+回滚接线时去掉三个工具专属参数（或显式设置 `--enable-member-tools=false` 且不传扩展/容量），保留普通执行开关；正常退出负责撤销令牌和清理配置。未知执行仍须单独对账，不能通过回滚或重启释放资源。
 
 ## 构造与信任边界
 
@@ -35,4 +54,6 @@ Prepare 继续核验数据库中的 queued delivery、群组、活跃成员、�
 
 某次 HTTP 工具结果 unknown 与物理 Turn succeeded 可以并存。模型最终文本或 Turn 成功不证明该 HTTP 操作成功，不生成虚假的业务成功凭据，也不触发自动业务重试；原有幂等/对账语义保持权威。
 
-本片的临时假 CLI 测试验证准备、真实 claim 后包装、原生事件、能力清理及最终文本边界；不证明实际 HTTP/bridge 组合、真实 CLI 或模型已经验收。相关领域边界见 [架构](architecture.md) 与 [编排契约](orchestration.md)。
+C1 的临时假 CLI 测试验证准备、真实 claim 后包装、原生事件、能力清理及最终文本边界。C2 的 cmd 测试用临时 Go HTTP 服务、SQLite 与假 native CLI（调用 Go test helper，无 Node/Python 运行依赖），验证真实四工具路由、身份/话题隔离、幂等小收据、容量、继承模型、撤销、unknown/cancel 及关闭排空。fixture 主动丢弃一次 HTTP 响应并保留 unknown 工具结果，即使之后 native final 成功也不生成工具成功证据。
+
+这些是本地组合及合成协议证据，不是实际 Pi/bridge loader 或模型验收；不探测真实提供方、不读取认证、不宣称 Coordinator/Assignment/RequestWork 已接通。既有桥加载验证独立维护，真实验收仍需冻结产物经独立审核后另行批准。相关领域边界见 [架构](architecture.md) 与 [编排契约](orchestration.md)。
