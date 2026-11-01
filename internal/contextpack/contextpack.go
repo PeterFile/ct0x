@@ -17,7 +17,7 @@ type Scope struct {
 	ConversationID string `json:"conversation_id"`
 }
 
-// Kind is supplied provenance, never inferred from message or summary text.
+// Kind classifies supplied provenance or statements, never inferred from text.
 type Kind string
 
 const (
@@ -25,6 +25,9 @@ const (
 	ConfirmedDecision Kind = "confirmed_decision"
 	Suggestion        Kind = "suggestion"
 	Dispute           Kind = "dispute"
+	// Observation is an ordinary factual paraphrase with no authority or decision
+	// meaning. It is valid only for statements, never Message or Source provenance.
+	Observation Kind = "observation"
 )
 
 type Source struct {
@@ -45,13 +48,16 @@ type Statement struct {
 	Sources []Source `json:"sources"`
 }
 
-// Summary sources must be strictly sequence ordered within each statement,
-// not exceed CoveredThrough, and include its frontier. Versions start at one.
+// Summary sources must be strictly sequence ordered within each statement and
+// not exceed CoveredThrough. CoverageAnchor, when present, identifies that
+// frontier; otherwise a statement source must do so. Only anchored summaries may
+// have no statements. Versions start at one.
 // Confirmed decisions require exclusively confirmed-decision sources.
 type Summary struct {
 	Scope          Scope       `json:"scope"`
 	Version        uint64      `json:"version"`
 	CoveredThrough uint64      `json:"covered_through"`
+	CoverageAnchor *Source     `json:"coverage_anchor,omitempty"`
 	Statements     []Statement `json:"statements"`
 }
 
@@ -89,7 +95,10 @@ type packet struct {
 // Build returns compact JSON without a trailing newline. All material must match
 // both scope IDs. Sequences are positive and unique across message identities;
 // duplicate messages (even across pending/history) are rejected. Matching source
-// references may recur across statements or refer to supplied messages.
+// references may recur across the anchor and statements or refer to supplied
+// messages. Validation checks supplied structural provenance only, not source
+// existence, authentication, or topic membership; callers must enforce those
+// boundaries.
 // Pending/history are copied and sorted by ascending sequence; other order is
 // preserved. Covered history alone is removed. The complete supplied summary,
 // responsibility, permissions, pending bodies and all uncovered history refs
@@ -187,12 +196,20 @@ func validate(in Input) error {
 	if s == nil {
 		return nil
 	}
-	if s.Scope != in.Scope || s.Version == 0 || s.CoveredThrough == 0 || len(s.Statements) == 0 {
+	if s.Scope != in.Scope || s.Version == 0 || s.CoveredThrough == 0 || (len(s.Statements) == 0 && s.CoverageAnchor == nil) {
 		return invalid("摘要范围、版本或覆盖信息无效")
+	}
+	if s.CoverageAnchor != nil {
+		if err := checkSource(*s.CoverageAnchor); err != nil {
+			return err
+		}
+		if s.CoverageAnchor.Sequence != s.CoveredThrough {
+			return invalid("摘要覆盖锚点与覆盖终点不一致")
+		}
 	}
 	var frontier uint64
 	for _, statement := range s.Statements {
-		if !validKind(statement.Kind) || statement.Kind == MessageKind || !validText(statement.Text) || len(statement.Sources) == 0 {
+		if (!validKind(statement.Kind) && statement.Kind != Observation) || statement.Kind == MessageKind || !validText(statement.Text) || len(statement.Sources) == 0 {
 			return invalid("摘要陈述必须有类型、内容和来源")
 		}
 		var previous uint64
@@ -212,7 +229,7 @@ func validate(in Input) error {
 			}
 		}
 	}
-	if frontier != s.CoveredThrough {
+	if s.CoverageAnchor == nil && frontier != s.CoveredThrough {
 		return invalid("摘要覆盖终点缺少来源")
 	}
 	return nil
