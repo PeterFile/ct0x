@@ -40,10 +40,13 @@
   --motion-duration: 160ms;
   --motion-ease: ease-out;
   --layer-skip: 10;
+  --layer-heading: 1;
   --target-min: 2.75rem;
   --header-min: 6.5rem;
   --column-side: clamp(13.5rem, 20vw, 18rem);
   --measure-copy: 32rem;
+  --discussion-min-height: 20rem;
+  --history-mobile-max: 60svh;
   --mark-size: 2rem;
   --intro-space: clamp(3rem, 11vh, 8rem);
 }

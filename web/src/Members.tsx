@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, createMember, isDefinitiveRejection, listMembers, listProviders } from "./api";
 import type { Member, MemberInput, Provider } from "./api";
+import { CreationDisclosure } from "./CreationDisclosure";
 
 function unique<T extends { id: string }>(items: T[]) {
   const seen = new Set<string>();
@@ -32,7 +33,8 @@ function useCatalogue(enabled: boolean) {
   return { ...state, load: (before = request.before) => setRequest(previous => ({ before, version: previous.version + 1 })) };
 }
 
-export function Members({ groupId }: { groupId?: string }) {
+type MemberListener = (groupId: string, members: Member[]) => void;
+export function Members({ groupId, onMembers }: { groupId?: string; onMembers?: MemberListener }) {
   const [visited, setVisited] = useState<string[]>([]);
   useEffect(() => {
     if (groupId) setVisited(previous => previous.includes(groupId) ? previous : [...previous, groupId]);
@@ -42,14 +44,15 @@ export function Members({ groupId }: { groupId?: string }) {
     {!groupId ? <p className="empty-panel">请先选择群组，再查看成员。</p> : null}
     {/* Keep per-group operations alive across switches; hidden scopes cannot leak into the active UI. */}
     {visited.map(id => <div key={id} hidden={id !== groupId}>
-      <MemberScope groupId={id} active={id === groupId} catalogue={catalogue} />
+      <MemberScope groupId={id} active={id === groupId} catalogue={catalogue} onMembers={onMembers} />
     </div>)}
   </>;
 }
 
-function MemberScope({ groupId, active, catalogue }: { groupId: string; active: boolean; catalogue: ReturnType<typeof useCatalogue> }) {
+function MemberScope({ groupId, active, catalogue, onMembers }: { groupId: string; active: boolean; catalogue: ReturnType<typeof useCatalogue>; onMembers?: MemberListener }) {
   const formId = useId();
   const [items, setItems] = useState<Member[]>([]);
+  useEffect(() => { onMembers?.(groupId, items); }, [groupId, items, onMembers]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selected = items.find(member => member.id === selectedId);
   const [draft, setDraft] = useState(emptyDraft);
@@ -133,7 +136,7 @@ function MemberScope({ groupId, active, catalogue }: { groupId: string; active: 
         <dt>运行器配置</dt><dd>{selected.provider_id ? catalogue.items.find(provider => provider.id === selected.provider_id)?.name || "已有配置，目录未验证" : "未绑定"}</dd>
         <dt>模型配置</dt><dd>{selected.model || "未指定"}</dd><dt>工作目录配置</dt><dd>{selected.workspace || "未配置"}</dd></dl>
     </section> : null}
-    <form aria-label="创建成员" onSubmit={submit}>
+    <CreationDisclosure label="创建成员" pending={mutation.pending} error={mutation.error} onSubmit={submit}>
       <fieldset disabled={mutation.pending || mutation.uncertain}>
         <legend>创建成员</legend>
         {fields.map(([key, label]) => <div key={key}><label htmlFor={`${formId}-${key}`}>{label}</label>
@@ -154,6 +157,6 @@ function MemberScope({ groupId, active, catalogue }: { groupId: string; active: 
       <p>工作目录配置不代表已授予读写权限。</p>
       {mutation.error ? <p role="alert">{mutation.error}</p> : null}
       <button type="submit" disabled={mutation.pending}>{mutation.pending ? "正在创建成员…" : mutation.uncertain ? "重试同一次成员创建" : "创建成员"}</button>
-    </form>
+    </CreationDisclosure>
   </div>;
 }
