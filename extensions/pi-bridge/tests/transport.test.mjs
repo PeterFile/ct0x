@@ -11,7 +11,7 @@ const isWrite = name => name === "send_message" || name === "create_member";
 const payloads = [{ limit: 200, before: "opaque" }, {}, { content: "消息", recipient_ids: ["member-a"] },
   { name: "研究员", role: "调研", reason: "查证资料" }];
 const receipts = [{ items: [{ id: "a" }], next_cursor: "opaque" }, { items: [], next_cursor: "" },
-  { message_id: "m", topic_id: "", created_at: "2026-11-01T00:00:00Z", delivery_count: 1, content_omitted: true },
+  { message_id: "m", created_at: "2026-11-01T00:00:00Z", delivery_count: 1, content_omitted: true },
   { member_id: "b", reused: false, join_message_id: "join" }];
 
 async function clientFor(t, handler) {
@@ -136,8 +136,51 @@ test("HTTP 413 tool_result_too_large is explicit, never truncated or retried", a
   const server = await clientFor(t, (_, response) => json(response, {
     error: { code: "tool_result_too_large", message: `untrusted: ${TOKEN}` }, extra: TOKEN,
   }, 413));
-  await assert.rejects(server.invoke("list_members", {}, "oversized-server"),
-    error => safeFailure(error, /tool_result_too_large/));
+  await assert.rejects(server.invoke("list_members", {}, "oversized-server"), error => {
+    safeFailure(error, /tool_result_too_large/);
+    assert.match(error.message, /减小 limit/);
+    assert.match(error.message, /不会截断/);
+    return true;
+  });
+  assert.equal(server.requests.length, 1);
+});
+
+test("HTTP cancellation and deadline errors retain unknown outcomes and the original replay identity", async t => {
+  for (const [code, status, token] of [
+    ["request_canceled", 408, TOKEN], ["deadline_exceeded", 504, TOKEN],
+    ["request_canceled", 408, "request_canceled"],
+  ]) {
+    const server = await loopback(t, (_, response) => json(response, {
+      error: { code, message: `untrusted operationError: ${token}` }, extra: token,
+    }, status));
+    const invoke = createClient(await privateConfig(t, { endpoint: server.endpoint, token }));
+    const callId = "uncertain-write";
+    await assert.rejects(invoke("send_message", payloads[2], callId), error => {
+      safeFailure(error, /结果未知/, [token]);
+      assert.match(error.message, /先对账/);
+      assert.match(error.message, /不要自动重试/);
+      assert.match(error.message, /保留.*调用标识.*幂等键/);
+      if (token !== code) assert.ok(error.message.includes(code));
+      assert.ok(!error.message.includes("untrusted operationError"));
+      return true;
+    });
+    assert.equal(server.requests.length, 1);
+    assert.equal(server.requests[0].headers["idempotency-key"],
+      createHash("sha256").update("send_message" + callId).digest("hex"));
+  }
+});
+
+test("HTTP member_capacity errors allow retry only after capacity becomes available", async t => {
+  const server = await clientFor(t, (_, response) => json(response, {
+    error: { code: "member_capacity", message: `untrusted capacity advice: ${TOKEN}` },
+  }, 409));
+  await assert.rejects(server.invoke("create_member", payloads[3], "capacity"), error => {
+    safeFailure(error, /容量已满/);
+    assert.match(error.message, /仅.*空余容量.*重试/);
+    assert.match(error.message, /member_capacity/);
+    assert.ok(!error.message.includes("untrusted capacity advice"));
+    return true;
+  });
   assert.equal(server.requests.length, 1);
 });
 

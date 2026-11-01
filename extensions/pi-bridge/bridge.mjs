@@ -11,6 +11,12 @@ export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel",
 /** @typedef {{ text: string, json: unknown }} Reply */
 /** @typedef {(toolName: string, params: unknown, toolCallId: string, signal?: AbortSignal) => Promise<Reply>} Client */
 const CONFIG_ERROR = "成员工具配置无效，未启用任何成员工具。";
+const SERVER_ERROR_MESSAGES = new Map([
+  ["request_canceled", "成员工具请求已取消，执行结果未知；请先对账，保留原工具调用标识及幂等键，不要自动重试"],
+  ["deadline_exceeded", "成员工具请求已超时，执行结果未知；请先对账，保留原工具调用标识及幂等键，不要自动重试"],
+  ["member_capacity", "群组成员容量已满；请仅在有空余容量后重试"],
+  ["tool_result_too_large", "工具结果超过 64 KiB 限制；请减小 limit 后重新读取，结果不会截断"],
+]);
 
 /** @param {unknown} value @returns {value is Record<string, unknown>} */
 function isRecord(value) {
@@ -86,7 +92,7 @@ function serverError(value, token) {
   const raw = value.error.code;
   let code = /^[a-z][a-z0-9_]{0,63}$/.test(raw) && !raw.includes(token) ? raw : "request_failed";
   if (code.includes(token)) code = "";
-  const message = code === "tool_result_too_large" ? "工具结果超过 64 KiB 限制" : "成员工具请求失败";
+  const message = SERVER_ERROR_MESSAGES.get(raw) || "成员工具请求失败";
   return code ? `${message}（${code}）。` : `${message}。`;
 }
 

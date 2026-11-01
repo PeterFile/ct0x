@@ -27,7 +27,7 @@ const tools = [
     description: "在当前执行绑定的频道保存消息，可指定群内接收成员；保存不代表投递已确认。",
     parameters: Type.Object({
       content: Type.String({ description: "消息正文。" }),
-      recipient_ids: Type.Optional(Type.Array(Type.String(), { description: "接收成员标识；省略时由服务端路由。" })),
+      recipient_ids: Type.Optional(Type.Array(Type.String(), { description: "接收成员标识；省略或空数组表示公开消息，不创建投递、不唤醒成员；仅显式列出的成员会进入投递队列。" })),
     }, { additionalProperties: false }),
   },
   {
@@ -62,7 +62,7 @@ export default function piBridge(pi: ExtensionAPI) {
         } catch { /* Reject unsafe runtime values without exposing their errors. */ }
         if (!valid) throw new Error("成员工具参数无效，未发送请求。");
         const result = await invoke(tool.name, payload, toolCallId, signal);
-        return { content: [{ type: "text", text: result.text }], details: result.json };
+        return { content: [{ type: "text", text: result.text }], details: undefined };
       },
     });
   }

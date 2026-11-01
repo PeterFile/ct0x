@@ -84,10 +84,10 @@ test("invalid or absent initialization config registers no usable tools and expo
   }
 });
 
-test("every registered native execute dispatches via real HTTP and returns exact content and safe details", async t => {
+test("every registered native execute dispatches via real HTTP and returns exact content without duplicate details", async t => {
   const receipts = [
     { items: [{ id: "m1" }], next_cursor: "" }, { items: [], next_cursor: "" },
-    { message_id: "m2", topic_id: "topic", created_at: "2026-11-01T00:00:00Z", delivery_count: 0, content_omitted: true },
+    { message_id: "m2", created_at: "2026-11-01T00:00:00Z", delivery_count: 0, content_omitted: true },
     { member_id: "m3", reused: true, join_message_id: "" },
   ];
   const { tools, requests } = await toolsFor(t, (request, response) => {
@@ -98,7 +98,7 @@ test("every registered native execute dispatches via real HTTP and returns exact
     { name: "成员", role: "校对", reason: "检查" }];
   for (const [index, name] of names.entries()) {
     const result = await execute(tools.get(name), payloads[index]);
-    assert.deepEqual(result, { content: [{ type: "text", text: JSON.stringify(receipts[index]) }], details: receipts[index] });
+    assert.deepEqual(result, { content: [{ type: "text", text: JSON.stringify(receipts[index]) }], details: undefined });
     assert.deepEqual(JSON.parse(requests[index].body), payloads[index]);
   }
   assert.equal(requests.length, 4);
