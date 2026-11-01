@@ -90,13 +90,25 @@ func coordinationHTTPRows(t *testing.T, raw *sql.DB, query string) [][]any {
 	return result
 }
 
+func coordinationHTTPTableRows(t *testing.T, raw *sql.DB, table string) [][]any {
+	t.Helper()
+	columns := coordinationHTTPRows(t, raw, "SELECT name FROM pragma_table_xinfo('"+strings.ReplaceAll(table, "'", "''")+"') WHERE hidden<>1 ORDER BY cid")
+	var order []string
+	for _, column := range columns {
+		quoted := `"` + strings.ReplaceAll(column[0].(string), `"`, `""`) + `"`
+		// Types distinguish equal numeric values; BINARY avoids collation-dependent ties.
+		order = append(order, "typeof("+quoted+")", quoted+" COLLATE BINARY")
+	}
+	return coordinationHTTPRows(t, raw, `SELECT * FROM "`+strings.ReplaceAll(table, `"`, `""`)+`" ORDER BY `+strings.Join(order, ","))
+}
+
 func coordinationHTTPSnapshot(t *testing.T, raw *sql.DB) map[string][][]any {
 	t.Helper()
 	names := coordinationHTTPRows(t, raw, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 	result := make(map[string][][]any, len(names))
 	for _, name := range names {
 		table := name[0].(string)
-		result[table] = coordinationHTTPRows(t, raw, `SELECT * FROM "`+strings.ReplaceAll(table, `"`, `""`)+`" ORDER BY rowid`)
+		result[table] = coordinationHTTPTableRows(t, raw, table)
 	}
 	return result
 }
