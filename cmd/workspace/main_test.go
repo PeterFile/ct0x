@@ -35,7 +35,7 @@ func TestConfigDefaultsAndHelp(t *testing.T) {
 		t.Fatal(err)
 	}
 	config, err := parseConfig(nil, io.Discard)
-	if err != nil || config.listen != httpapi.DefaultAddress || config.dataDir != filepath.Join(root, "agent-workspace") || config.webDir != "" || config.devOrigin != "" || config.piPath != "" || config.codexPath != "" {
+	if err != nil || config.listen != httpapi.DefaultAddress || config.dataDir != filepath.Join(root, "agent-workspace") || config.webDir != "" || config.enableExecution || config.devOrigin != "" || config.piPath != "" || config.codexPath != "" {
 		t.Fatalf("unsafe or non-durable defaults: %+v %v", config, err)
 	}
 	for _, flag := range []string{"-h", "--help"} {
@@ -168,9 +168,17 @@ func startRunWithSearch(t *testing.T, search provider.Search, args ...string) (s
 		if !chinese(line) || !strings.Contains(line, "群组与成员") || !strings.Contains(line, "其他功能尚未启用") || !strings.Contains(line, "CLI 目录") || !strings.Contains(line, "仅存内存") {
 			t.Fatalf("startup must describe the group/member boundary: %s", line)
 		}
-		for _, want := range []string{"消息持久化", "历史与详情", "排队投递记录", "模型调度与执行尚未接入"} {
+		parsed, err := parseConfig(args, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		executionStatus := "执行已禁用，投递仅排队"
+		if parsed.enableExecution {
+			executionStatus = "全新单轮执行已启用，最大并发 1"
+		}
+		for _, want := range []string{"消息持久化", "历史与详情", "排队投递记录", executionStatus, "不支持恢复", "平台工具", "不是主机读取沙箱", "祖先必须可信"} {
 			if !strings.Contains(line, want) {
-				t.Fatalf("startup must state the queue-only message boundary: missing %q: %s", want, line)
+				t.Fatalf("startup must state execution boundaries: missing %q: %s", want, line)
 			}
 		}
 		for _, field := range strings.Fields(line) {
@@ -487,7 +495,7 @@ func TestServeDrainsBeforeClosingStore(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			go func() {
-				err := serve(ctx, server, listener, grace)
+				err := serve(ctx, server, listener, grace, nil)
 				done <- errors.Join(err, db.Close())
 			}()
 			requestDone := make(chan error, 1)
