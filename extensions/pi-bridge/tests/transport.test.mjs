@@ -16,7 +16,8 @@ const receipts = [{ items: [{ id: "a" }], next_cursor: "opaque" }, { items: [], 
 
 async function clientFor(t, handler) {
   const server = await loopback(t, handler);
-  return { ...server, invoke: createClient(await privateConfig(t, { endpoint: server.endpoint })) };
+  const config = await privateConfig(t, { endpoint: server.endpoint });
+  return { ...server, config, invoke: createClient(config) };
 }
 
 function sizedJSON(bytes, prefix = '{"items":["', suffix = '"],"next_cursor":""}') {
@@ -191,7 +192,8 @@ test("valid error JSON retains only bounded stable code and a local Chinese safe
     error: { code: codes[index++], message: `secret detail ${TOKEN}` }, token: TOKEN,
   }, 409));
   for (const code of codes) {
-    await assert.rejects(server.invoke("send_message", payloads[2], "error"), error => {
+    const invoke = createClient(server.config);
+    await assert.rejects(invoke("send_message", payloads[2], "error"), error => {
       safeFailure(error, code === "conflict" ? /conflict/ : /请求失败/);
       assert.ok(error.message.length < 200);
       return true;
@@ -245,7 +247,8 @@ test("malformed, HTML, unsafe JSON and unexpected-status failures never expose b
     response.end(body);
   });
   for (const _ of cases) {
-    await assert.rejects(server.invoke("send_message", payloads[2], "malformed"),
+    const invoke = createClient(server.config);
+    await assert.rejects(invoke("send_message", payloads[2], "malformed"),
       error => safeFailure(error, /无效响应|敏感数据/));
   }
   assert.equal(server.requests.length, cases.length);
