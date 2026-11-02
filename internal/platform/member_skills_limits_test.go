@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -153,5 +154,87 @@ func TestMemberSkillCatalogFileLimitDoesNotAdmitPartialSnapshot(t *testing.T) {
 	memberSkillZeroError(t, got, err, skills.ErrLimit)
 	if len(f.state(t).snapshots) != 0 || f.state(t).captured != 0 {
 		t.Fatal("per-file overflow admitted a partial snapshot")
+	}
+}
+
+func TestMemberSkillArgumentBoundsBeforeCatalog(t *testing.T) {
+	f := setupMemberSkills(t, "demo")
+	id := f.search(t, MemberSkillSearchInput{}).Items[0].Identity
+	gate, _ := memberSkillGate(t, &f, "none")
+	for _, field := range []string{"root", "name", "hash-short", "hash-long", "resource", "handle"} {
+		t.Run(field, func(t *testing.T) {
+			bad := id
+			input := MemberSkillLoadInput{Identity: &bad}
+			switch field {
+			case "root":
+				bad.RootID = strings.Repeat("a", 129)
+			case "name":
+				bad.Name = strings.Repeat("a", 65)
+			case "hash-short":
+				bad.SkillSHA256 = strings.Repeat("0", 63)
+			case "hash-long":
+				bad.SkillSHA256 = strings.Repeat("0", 65)
+			case "resource":
+				input.Resource = strings.Repeat("x", 65537)
+			case "handle":
+				input.Identity, input.Handle = nil, strings.Repeat("x", 129)
+			}
+			before := gate.selectCalls.Load()
+			got, err := f.tools.LoadSkill(context.Background(), f.token, input)
+			memberSkillZeroError(t, got, err, skills.ErrInvalid)
+			if gate.selectCalls.Load() != before || len(f.state(t).snapshots) != 0 || f.state(t).captured != 0 {
+				t.Fatal("oversized argument reached Catalog.Select or admitted state")
+			}
+		})
+	}
+	for _, input := range []MemberSkillSearchInput{{Query: strings.Repeat("x", 257)}, {Query: strings.Repeat("x", 4<<20)}, {Before: strings.Repeat("x", 1025)}} {
+		before := gate.listCalls.Load()
+		got, err := f.tools.SearchSkills(context.Background(), f.token, input)
+		memberSkillZeroError(t, got, err, skills.ErrInvalid)
+		if gate.listCalls.Load() != before {
+			t.Fatal("oversized search argument reached Catalog.List")
+		}
+	}
+	// The resource bound is 65536, not a narrower filesystem-name policy.
+	before := gate.selectCalls.Load()
+	got, err := f.tools.LoadSkill(context.Background(), f.token, MemberSkillLoadInput{Identity: &id, Resource: strings.Repeat("x", 65536)})
+	memberSkillZeroError(t, got, err, skills.ErrInvalid)
+	if gate.selectCalls.Load() != before+1 {
+		t.Fatal("resource at the explicit bound was rejected before snapshot lookup")
+	}
+	root, name := t.TempDir(), strings.Repeat("a", 64)
+	memberSkillPut(t, root, name+"/SKILL.md", memberSkillRaw(name, "boundary"))
+	catalog := memberSkillCatalog(t, []skills.Root{{ID: strings.Repeat("r", 128), Path: root}})
+	token := memberSkillIssue(t, f.tools, memberCapabilityClaim(t, f.localMessageFixture, f.groupID), catalog, "search_skills", "load_skill")
+	page, err := f.tools.SearchSkills(context.Background(), token, MemberSkillSearchInput{})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("valid identity boundary listing failed: %v", err)
+	}
+	loaded, err := f.tools.LoadSkill(context.Background(), token, MemberSkillLoadInput{Identity: &page.Items[0].Identity})
+	if err != nil || loaded.Identity != page.Items[0].Identity || !loaded.ContentComplete {
+		t.Fatalf("valid root/name/hash boundary was tightened: %+v, %v", loaded, err)
+	}
+}
+
+func TestMemberSkillOversizedHashBoundedAllocation(t *testing.T) {
+	f := setupMemberSkills(t, "demo")
+	id := f.search(t, MemberSkillSearchInput{}).Items[0].Identity
+	gate, _ := memberSkillGate(t, &f, "none")
+	// Construct the attacker-controlled input outside the measured API call.
+	id.SkillSHA256 = strings.Repeat("0", 4<<20)
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	got, err := f.tools.LoadSkill(context.Background(), f.token, MemberSkillLoadInput{Identity: &id})
+	runtime.ReadMemStats(&after)
+	runtime.KeepAlive(id.SkillSHA256)
+	memberSkillZeroError(t, got, err, skills.ErrInvalid)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("LoadSkill rejected 4 MiB hash: %d allocated bytes; ceiling %d", allocated, 1<<20)
+	if allocated > 1<<20 {
+		t.Errorf("oversized hash caused input-proportional allocation: %d", allocated)
+	}
+	if gate.selectCalls.Load() != 0 || len(f.state(t).snapshots) != 0 || f.state(t).captured != 0 {
+		t.Error("oversized hash reached Catalog.Select or consumed admission budget")
 	}
 }

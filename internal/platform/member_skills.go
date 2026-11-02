@@ -47,7 +47,7 @@ func NewMemberSkillCatalog(roots []skills.Root, limits skills.Limits) (*MemberSk
 	roots = slices.Clone(roots)
 	seen := make(map[string]bool)
 	for _, root := range roots {
-		if !memberSkillPath(root.ID) || strings.Contains(root.ID, "/") || len(root.ID) > 128 || strings.TrimSpace(root.ID) != root.ID || seen[root.ID] {
+		if len(root.ID) > 128 || !memberSkillPath(root.ID) || strings.Contains(root.ID, "/") || strings.TrimSpace(root.ID) != root.ID || seen[root.ID] {
 			return nil, skills.ErrInvalid
 		}
 		seen[root.ID] = true
@@ -155,7 +155,15 @@ func (s *MemberTools) withMemberSkills(ctx context.Context, token, operation str
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return use(scope, grants.Skills.source, state)
+		err := use(scope, grants.Skills.source, state)
+		if err != nil {
+			// Failures can reveal data too. Success is fenced before admission;
+			// never move that authorization point after the cache mutation.
+			if authErr := s.db.ValidateMemberTool(ctx, scope); authErr != nil {
+				return authErr
+			}
+		}
+		return err
 	})
 }
 
@@ -179,7 +187,7 @@ func (s *MemberTools) SearchSkills(ctx context.Context, token string, input Memb
 		if input.Limit == 0 {
 			input.Limit = 20
 		}
-		if !utf8.ValidString(input.Query) || strings.ContainsRune(input.Query, 0) || len(input.Query) > 256 || input.Limit < 1 || input.Limit > 50 || len(input.Before) > 1024 {
+		if len(input.Query) > 256 || len(input.Before) > 1024 || input.Limit < 1 || input.Limit > 50 || !utf8.ValidString(input.Query) || strings.ContainsRune(input.Query, 0) {
 			return skills.ErrInvalid
 		}
 		listing, err := catalog.List()
@@ -239,7 +247,13 @@ func (s *MemberTools) LoadSkill(ctx context.Context, token string, input MemberS
 		if input.MaxBytes == 0 {
 			input.MaxBytes = 8192
 		}
-		if (input.Identity == nil) == (input.Handle == "") || len(input.Handle) > 128 || !memberSkillPath(input.Resource) || input.Offset < 0 || input.MaxBytes < 1 || input.MaxBytes > 16384 {
+		if len(input.Handle) > 128 || len(input.Resource) > 65536 || (input.Identity == nil) == (input.Handle == "") || input.Offset < 0 || input.MaxBytes < 1 || input.MaxBytes > 16384 {
+			return skills.ErrInvalid
+		}
+		if id := input.Identity; id != nil && (len(id.RootID) > 128 || len(id.Name) > 64 || len(id.SkillSHA256) != 2*sha256.Size) {
+			return skills.ErrInvalid
+		}
+		if !memberSkillPath(input.Resource) {
 			return skills.ErrInvalid
 		}
 		handle := input.Handle
