@@ -103,6 +103,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
     operation.current ??= { key: crypto.randomUUID(), input: Object.freeze({ title: draft.title.trim(),
       description: draft.description, acceptance: draft.acceptance.trim() }) };
     const current = operation.current;
+    const wasUncertain = mutation.uncertain;
     const controller = new AbortController(); posting.current = controller;
     const startedAfterRead = readSequence.current;
     setMutation({ pending: true, uncertain: false, error: "" });
@@ -119,7 +120,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
       setMutation({ pending: false, uncertain: false, error: "" });
     } catch (error) {
       if (!mounted.current) return;
-      const uncertain = !isDefinitiveRejection(error);
+      const uncertain = wasUncertain || !isDefinitiveRejection(error);
       if (!uncertain) operation.current = null;
       setMutation({ pending: false, uncertain, error: uncertain ? `创建结果未确认。${errorText(error)} 请重试同一次创建。` : errorText(error) });
     } finally { posting.current = null; successfulReads.current.clear(); }
@@ -245,7 +246,7 @@ function TaskLifecycle({ groupId, taskId, task, onReceipt }: {
       if (kind === "attempt" && task.status === "open" && !task.active_attempt_id) {
         operation.current = { key: crypto.randomUUID(), kind, input: Object.freeze({ expected_revision: task.revision, expected_active_attempt_id: "" }) };
       } else if (kind === "submission" && task.status === "open" && attempt?.turn_id === "") {
-        if (!summary.trim()) { setMutation({ pending: false, uncertain: false, error: "请输入交付摘要。", receipt: null }); return; }
+        if (!/\P{White_Space}/u.test(summary)) { setMutation({ pending: false, uncertain: false, error: "请输入交付摘要。", receipt: null }); return; }
         operation.current = { key: crypto.randomUUID(), kind, input: Object.freeze({ expected_revision: task.revision, attempt_id: attempt.id, summary }) };
       } else if (kind === "review" && task.status === "submitted" && submission && outcome) {
         const evidence = { ...submission, artifact_versions: submission.artifact_versions.map(ref => Object.freeze({ ...ref })) };
@@ -256,6 +257,8 @@ function TaskLifecycle({ groupId, taskId, task, onReceipt }: {
       Object.freeze(operation.current);
     }
     const current = operation.current;
+    // A retry rejection cannot disprove an earlier write with an unknown outcome.
+    const wasUncertain = mutation.uncertain;
     posting.current = true;
     setMutation({ pending: true, uncertain: false, error: "", receipt: null });
     try {
@@ -271,7 +274,7 @@ function TaskLifecycle({ groupId, taskId, task, onReceipt }: {
       onReceipt(taskId);
     } catch (error) {
       if (!mounted.current) return;
-      const uncertain = !isDefinitiveRejection(error);
+      const uncertain = wasUncertain || !isDefinitiveRejection(error);
       if (!uncertain) operation.current = null;
       setMutation({ pending: false, uncertain, receipt: null, error: uncertain
         ? `操作结果未确认。${errorText(error)} 请重试同一次操作。` : errorText(error) });

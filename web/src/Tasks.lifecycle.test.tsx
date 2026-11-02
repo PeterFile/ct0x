@@ -5,7 +5,7 @@ import { Tasks } from "./Tasks";
 import type { Group } from "./api";
 import type { Task, TaskAttempt, TaskSubmission, TaskReview } from "./task-api";
 import { deferred, group, json, other, page } from "./test/groups";
-import { acceptedTask, secondTask, submittedTask, task } from "./test/tasks";
+import { acceptedTask, secondTask, submittedTask, task, taskInput } from "./test/tasks";
 
 const humanAttempt: TaskAttempt = { id: "attempt-1", group_id: group.id, task_id: task.id, task_revision: 1,
   turn_id: "", created_at: task.created_at };
@@ -65,6 +65,56 @@ beforeEach(() => {
       : String(input).includes("/tasks?") ? reads : details)(input, init));
 });
 afterEach(() => vi.unstubAllGlobals());
+
+it.each([404, 400, 409])("retains unknown creation identity after retry HTTP %s across task/group/hidden switches", async status => {
+  let aItems = [secondTask];
+  const bTask = { ...secondTask, group_id: other.id, title: "B 的任务" };
+  reads.mockImplementation(async url => page(String(url).includes(other.id) ? [bTask] : aItems));
+  details.mockImplementation(async url => json(String(url).includes(other.id) ? bTask : String(url).endsWith(secondTask.id) ? secondTask : task));
+  writes.mockRejectedValueOnce(new TypeError("Lost creation receipt"));
+  const view = render(ui(group));
+  await panel().findByRole("button", { name: `${secondTask.title}，待交付` });
+  const form = panel().getByRole("form", { name: "创建任务" });
+  const title = within(form).getByRole("textbox", { name: "任务标题" });
+  const description = within(form).getByRole("textbox", { name: "任务描述（可选）" });
+  const acceptance = within(form).getByRole("textbox", { name: "验收条件" });
+  fireEvent.change(title, { target: { value: ` ${task.title} ` } });
+  fireEvent.change(description, { target: { value: task.description } });
+  fireEvent.change(acceptance, { target: { value: ` ${task.acceptance} ` } });
+  fireEvent.submit(form);
+  expect(await panel().findByRole("alert")).toHaveTextContent("创建结果未确认");
+  const original = captured(0);
+  expect(original.url).toBe(`/api/v1/groups/${group.id}/tasks`);
+  expect(JSON.parse(String(original.body))).toEqual(taskInput);
+  const rejection = deferred<Response>(); writes.mockReturnValueOnce(rejection.promise);
+  fireEvent.submit(form); fireEvent.submit(form);
+  expect(writes).toHaveBeenCalledTimes(2); expect(captured(1)).toEqual(original);
+  fireEvent.click(row(secondTask.title)); await detail().findByRole("heading", { name: secondTask.title });
+  view.rerender(ui(other));
+  await panel().findByRole("button", { name: `${bTask.title}，待交付` });
+  const bTitle = panel().getByRole("textbox", { name: "任务标题" });
+  fireEvent.change(bTitle, { target: { value: "B 的独立草稿" } });
+  view.rerender(ui(null));
+  expect(writes.mock.calls[1][1]?.signal?.aborted).toBe(false);
+  await act(async () => rejection.resolve(json({ error: { code: "unavailable" } }, status)));
+  // Continue through UI checks so RED also proves the old implementation allocates a replacement key.
+  for (const field of [title, description, acceptance]) expect.soft(field).toBeDisabled();
+  expect.soft(form.querySelector('[role="alert"]')).toHaveTextContent("创建结果未确认");
+  expect(writes).toHaveBeenCalledTimes(2);
+  aItems = [task, secondTask]; view.rerender(ui(group));
+  await panel().findByRole("button", { name: `${task.title}，待交付` });
+  // Even a list GET containing the created Task cannot confirm the original POST.
+  expect.soft(title).toBeDisabled(); expect(title).toHaveValue(` ${task.title} `);
+  expect.soft(panel().queryByRole("button", { name: "重试同一次任务创建" })).toBeEnabled();
+  const receipt = deferred<Response>(); writes.mockReturnValueOnce(receipt.promise);
+  fireEvent.submit(form); fireEvent.submit(form);
+  await act(async () => receipt.resolve(json(task, 201)));
+  expect(writes).toHaveBeenCalledTimes(3); expect(captured(2)).toEqual(original);
+  expect(title).toBeEnabled(); expect(title).toHaveValue(""); expect(acceptance).toHaveValue("");
+  await detail().findByRole("heading", { name: task.title });
+  view.rerender(ui(other));
+  expect(panel().getByRole("textbox", { name: "任务标题" })).toHaveValue("B 的独立草稿");
+});
 
 it.each(["accepted", "rejected"] as const)("registers a human attempt, submits raw text and explicitly reviews %s using authoritative GETs", async outcome => {
   await open();
@@ -126,6 +176,30 @@ it.each(["accepted", "rejected"] as const)("registers a human attempt, submits r
   expect(reads).toHaveBeenCalledTimes(4); expect(details).toHaveBeenCalledTimes(4);
   expect(new Set(writes.mock.calls.map((_, index) => captured(index).key)).size).toBe(3);
   expect(writes.mock.calls.every(([, init]) => init?.redirect === "error")).toBe(true);
+});
+
+it("submits a FEFF-only human summary without trimming the valid original text", async () => {
+  const actual = { ...delivery, summary: "\uFEFF" };
+  evidence.mockImplementation(async url => json(String(url).includes("/attempts/") ? humanAttempt : actual));
+  writes.mockResolvedValueOnce(json(actual, 201));
+  await open(activeTask); await detail().findByRole("textbox", { name: "交付摘要" });
+  change("交付摘要", actual.summary); current = submittedTask;
+  fireEvent.submit(detail().getByRole("form", { name: "提交交付" }));
+  expect(writes).toHaveBeenCalledTimes(1);
+  expect(JSON.parse(String(captured(0).body))).toEqual({ expected_revision: 1, attempt_id: humanAttempt.id, summary: "\uFEFF" });
+  await detail().findByText(`已确认操作回执：${actual.id}。`);
+  expect(await detail().findByText(actual.summary, { normalizer: text => text })).toBeVisible();
+  expect(detail().queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("rejects a U+0085-only human summary locally without changing the original draft", async () => {
+  await open(activeTask); await detail().findByRole("textbox", { name: "交付摘要" });
+  change("交付摘要", "\u0085");
+  fireEvent.submit(detail().getByRole("form", { name: "提交交付" }));
+  expect(writes).not.toHaveBeenCalled();
+  expect(detail().getByRole("alert")).toHaveTextContent("请输入交付摘要");
+  expect(detail().getByRole("textbox", { name: "交付摘要" })).toHaveValue("\u0085");
+  expect(detail().getByRole("textbox", { name: "交付摘要" })).toBeEnabled();
 });
 
 it.each([
@@ -296,6 +370,70 @@ it.each(kinds.flatMap(kind => ["network", "408", "503", "200", "202", "malformed
   },
 );
 
+it.each(kinds.flatMap(kind => [404, 400, 409].map(status => ({ kind, status }))))(
+  "retains an unknown $kind after retry HTTP $status until its original 201 despite newer GETs", async ({ kind, status }) => {
+    const originalReason = "  原始审查说明  ";
+    if (kind === "review") evidence.mockResolvedValueOnce(json({ ...delivery, artifact_versions: frozenRefs }));
+    writes.mockRejectedValueOnce(new TypeError("Lost original response"));
+    await open(initialState(kind));
+    if (kind === "review") {
+      await detail().findByText(summary, { normalizer: text => text });
+      change("验收说明（可选）", originalReason);
+      for (const ref of frozenRefs) expect(detail().getByText(`${ref.artifact_id} / ${ref.version_id}`)).toBeVisible();
+    }
+    await perform(kind);
+    expect(await detail().findByRole("alert")).toHaveTextContent("操作结果未确认");
+    const original = captured(0);
+    writes.mockResolvedValueOnce(json({ error: { code: "unavailable", message: "English diagnostic" } }, status));
+    fireEvent.click(detail().getByRole("button", { name: "重试同一次操作" }));
+    const alert = await detail().findByRole("alert");
+    expect(alert).toHaveTextContent(String(status));
+    expect(alert).toHaveTextContent("操作结果未确认");
+    expect(alert).not.toHaveTextContent("English");
+    expect(detail().getByRole("button", { name: "重试同一次操作" })).toBeEnabled();
+    if (kind === "attempt") expect(detail().getByRole("button", { name: "登记人工尝试" })).toBeDisabled();
+    else {
+      expect(detail().getByRole("textbox", { name: kind === "submission" ? "交付摘要" : "验收说明（可选）" })).toBeDisabled();
+      expect(detail().getByRole("button", { name: kind === "submission" ? "提交交付" : "退回修改" })).toBeDisabled();
+    }
+    expect(writes).toHaveBeenCalledTimes(2); expect(captured(1)).toEqual(original);
+
+    const latestRefs = frozenRefs.map(ref => ({ ...ref, version_id: `new-${ref.version_id}` }));
+    current = { ...initialState(kind), revision: 7, active_attempt_id: kind === "attempt" ? "" : "next-attempt",
+      current_submission_id: kind === "review" ? "next-submission" : "" };
+    evidence.mockImplementation(async url => json(String(url).includes("/attempts/")
+      ? { ...humanAttempt, id: "next-attempt", task_revision: 7 }
+      : { ...delivery, id: "next-submission", attempt_id: "next-attempt", task_revision: 7,
+        summary: "新的真实交付", artifact_versions: latestRefs }));
+    refresh(); await detail().findByText("7");
+    expect(detail().getByRole("button", { name: "重试同一次操作" })).toBeEnabled();
+    if (kind === "attempt") expect(detail().getByRole("button", { name: "登记人工尝试" })).toBeDisabled();
+    else if (kind === "submission") expect(await detail().findByRole("textbox", { name: "交付摘要" })).toBeDisabled();
+    else {
+      await detail().findByText("新的真实交付"); noUsableReview();
+      expect(detail().getByRole("textbox", { name: "验收说明（可选）" })).toHaveValue(originalReason);
+      for (const ref of latestRefs) expect(detail().getByText(`${ref.artifact_id} / ${ref.version_id}`)).toBeVisible();
+      // Only the first Submission's refs may validate the retried Review, not the newer evidence above.
+      writes.mockResolvedValueOnce(json({ ...decision, reason: originalReason, artifact_versions: latestRefs }, 201));
+      fireEvent.click(detail().getByRole("button", { name: "重试同一次操作" }));
+      expect(await detail().findByRole("alert")).toHaveTextContent("操作结果未确认");
+      expect(detail().queryByRole("region", { name: "审查回执" })).not.toBeInTheDocument();
+      expect(captured(2)).toEqual(original); noUsableReview();
+    }
+    const receipt = kind === "review" ? { ...decision, reason: originalReason, artifact_versions: frozenRefs } : receiptFor(kind);
+    writes.mockResolvedValueOnce(json(receipt, 201));
+    const finalIndex = writes.mock.calls.length;
+    fireEvent.click(detail().getByRole("button", { name: "重试同一次操作" }));
+    await detail().findByText(`已确认操作回执：${receipt.id}。`);
+    expect(captured(finalIndex)).toEqual(original);
+    expect(JSON.parse(String(captured(finalIndex).body)).expected_revision).toBe(1);
+    expect(detail().queryByRole("button", { name: "重试同一次操作" })).not.toBeInTheDocument();
+    await detail().findByText("7");
+    if (kind === "review") expect(within(detail().getByRole("region", { name: "审查回执" }))
+      .getByText(originalReason, { normalizer: text => text })).toBeVisible();
+  },
+);
+
 it.each(kinds.flatMap(kind => [400, 404, 409].map(status => ({ kind, status }))))(
   "allows a new $kind key only after definitive HTTP $status and an explicit corrected action", async ({ kind, status }) => {
     writes.mockResolvedValueOnce(json({ error: { code: "conflict", message: "English diagnostic" } }, status));
@@ -422,6 +560,7 @@ it("keeps a real native-Fetch 307 Review unknown without forwarding, and freezes
   const sourceResponse = json(actual); vi.spyOn(sourceResponse, "json").mockResolvedValue(actual);
   evidence.mockResolvedValueOnce(sourceResponse);
   const requests: { url: string; method: string; body: string; key: string | undefined }[] = [];
+  const posts: Promise<Response>[] = [];
   let receiptRefs = frozenRefs;
   const server = createServer(async (request, response) => {
     const chunks: Buffer[] = [];
@@ -436,11 +575,20 @@ it("keeps a real native-Fetch 307 Review unknown without forwarding, and freezes
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
     const address = server.address();
     if (address === null || typeof address === "string") throw new Error("Missing fixture port");
-    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => init?.method === "POST"
-      ? nativeFetch(new URL(String(input), `http://127.0.0.1:${address.port}`), init)
-      : (/\/(attempts|submissions)\//.test(String(input)) ? evidence : String(input).includes("/tasks?") ? reads : details)(input, init));
+    vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        const post = nativeFetch(new URL(String(input), `http://127.0.0.1:${address.port}`), init);
+        posts.push(post); return post;
+      }
+      return (/\/(attempts|submissions)\//.test(String(input)) ? evidence : String(input).includes("/tasks?") ? reads : details)(input, init);
+    });
     await open(submittedTask); await perform("review");
-    expect(await detail().findByRole("alert")).toHaveTextContent("操作结果未确认");
+    // Event dispatch does not await the native transport or its React state updates.
+    await act(async () => {
+      expect(posts).toHaveLength(1);
+      await expect(posts[0]).rejects.toThrow();
+    });
+    expect(detail().getByRole("alert")).toHaveTextContent("操作结果未确认");
     expect(requests).toHaveLength(1); expect(requests[0].method).toBe("POST");
     expect(requests[0].url).toBe(`/api/v1/groups/${group.id}/tasks/${task.id}/reviews`);
     expect(JSON.parse(requests[0].body)).toEqual({ expected_revision: 1, submission_id: delivery.id, outcome: "accepted", reason: "" });
