@@ -85,7 +85,7 @@ describe("load-time shell entry", () => {
     expect(navigation().getAllByRole("button").map(button => button.getAttribute("aria-label"))).toEqual([
       "群组列表", "聊天", "搜索", "成员", "任务",
     ]);
-    const license = screen.getByRole("link", { name: "开源许可" });
+    const license = screen.getByRole("link", { name: "来源与许可" });
     expect(license).toHaveAttribute("href", "/licenses/openbot/index.html");
     window.history.replaceState({}, "", "/");
     fireEvent.click(rail("聊天"));

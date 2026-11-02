@@ -35,7 +35,7 @@ export function PageRail(props: Pick<AppShellProps, "pane" | "context" | "onList
         expanded={props.context === "tasks"} buttonRef={props.contextTriggers.tasks} onClick={() => props.onContext("tasks")} />
     </div>
     <div className="window-rail-group">
-      <a className="shell-license" href="/licenses/openbot/index.html" target="_blank" rel="noopener noreferrer">开源许可</a>
+      <a className="shell-license" href="/licenses/openbot/index.html" target="_blank" rel="noopener noreferrer">来源与许可</a>
     </div>
   </nav>;
 }
