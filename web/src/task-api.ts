@@ -41,9 +41,22 @@ const taskIn = (groupId: string) => (value: unknown): value is Task => isRecord(
   && typeof value.revision === "number" && Number.isSafeInteger(value.revision) && value.revision > 0
   && Array.isArray(value.dependency_ids) && value.dependency_ids.every(id => typeof id === "string");
 
-const nonblank = (value: unknown): value is string => typeof value === "string" && value.trim() !== "";
+// Match Go strings.TrimSpace (Unicode White_Space), not JavaScript trim.
+const nonblank = (value: unknown): value is string => typeof value === "string" && /\P{White_Space}/u.test(value);
+function validEvidenceTime(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  // Evidence is normalized to UTC; Go JSON preserves up to nine fractional digits.
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/.exec(value);
+  if (!match || match[0] !== value) return false;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return year >= 1 && month >= 1 && month <= 12 && day >= 1 && day <= daysInMonth[month - 1]
+    && hour < 24 && minute < 60 && second < 60
+    && !(year === 1 && month === 1 && day === 1 && hour === 0 && minute === 0 && second === 0 && Number(match[7] ?? 0) === 0);
+}
 const evidenceIn = (groupId: string, taskId: string) => (value: unknown): value is Record<string, unknown> => isRecord(value)
-  && nonblank(value.id) && value.group_id === groupId && value.task_id === taskId && nonblank(value.created_at)
+  && nonblank(value.id) && value.group_id === groupId && value.task_id === taskId && validEvidenceTime(value.created_at)
   && typeof value.task_revision === "number" && Number.isSafeInteger(value.task_revision) && value.task_revision > 0;
 const validRefs = (value: unknown): value is ArtifactVersionRef[] => Array.isArray(value)
   && value.every(ref => isRecord(ref) && nonblank(ref.artifact_id) && nonblank(ref.version_id));

@@ -361,3 +361,97 @@ it("uses canonical pair equivalence without collapsing different versions of one
   await expect(taskApi.submitTask(group.id, task.id, input, "original-key")).resolves.toMatchObject({ artifact_versions: [...refs].reverse() });
   expect(JSON.parse(String(transport.mock.calls[0][1]?.body)).artifact_versions).toEqual(input.artifact_versions);
 });
+
+const goSpaceCodePoints = [
+  0x0009, 0x000a, 0x000b, 0x000c, 0x000d, 0x0020, 0x0085, 0x00a0, 0x1680,
+  0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
+  0x2028, 0x2029, 0x202f, 0x205f, 0x3000,
+];
+const blankSummaries = [
+  ...goSpaceCodePoints.map(point => [`U+${point.toString(16).toUpperCase().padStart(4, "0")}`, String.fromCodePoint(point)]),
+  ["mixed Unicode whitespace", String.fromCodePoint(...goSpaceCodePoints)], ["empty", ""],
+];
+it.each(blankSummaries)("P2 Unicode: treats %s as blank in matching Submission POST and GET receipts", async (_name, summary) => {
+  const receipt = { ...submission, summary };
+  transport.mockResolvedValueOnce(json(receipt, 201)).mockResolvedValueOnce(json(receipt));
+  await expectUnknown(taskApi.submitTask(group.id, task.id, { ...submissionInput, summary }, "original-key"));
+  await expectUnknown(taskApi.getTaskSubmission(group.id, task.id, submission.id), 200);
+});
+
+it.each([
+  ["U+FEFF", "\uFEFF"], ["U+180E", "\u180E"], ["U+200B", "\u200B"], ["U+2060", "\u2060"],
+  ["U+001C", "\u001C"], ["FEFF surrounded by Go whitespace", "\u0085 \uFEFF\u3000"],
+  ["raw text surrounded by Go whitespace", " \t\u0085已核对来源\u3000 "],
+])("P2 Unicode: preserves %s in human Submission POST, GET and original-key replay", async (_name, summary) => {
+  const input = Object.freeze({ ...submissionInput, summary });
+  const receipt = { ...submission, summary };
+  transport.mockRejectedValueOnce(new TypeError("lost receipt"))
+    .mockResolvedValueOnce(json(receipt, 201)).mockResolvedValueOnce(json(receipt)).mockResolvedValueOnce(json(receipt, 201));
+  await expectUnknown(taskApi.submitTask(group.id, task.id, input, "original-key"), 0, "disconnected");
+  expect(await taskApi.submitTask(group.id, task.id, input, "original-key")).toEqual(receipt);
+  expect(await taskApi.getTaskSubmission(group.id, task.id, submission.id)).toEqual(receipt);
+  expect(await taskApi.submitTask(group.id, task.id, input, "original-key")).toEqual(receipt);
+  const posts = transport.mock.calls.filter(([, init]) => init?.method === "POST");
+  expect(posts).toHaveLength(3);
+  expect(posts[1]).toEqual(posts[0]); expect(posts[2]).toEqual(posts[0]);
+  expect(JSON.parse(String(posts[0][1]?.body)).summary).toBe(summary);
+  expect(new Headers(posts[0][1]?.headers).get("Idempotency-Key")).toBe("original-key");
+  expect(input.summary).toBe(summary);
+});
+
+it.each(kinds)("P2 Unicode: applies Go nonblank semantics to %s record identities", async kind => {
+  const receipt = { ...receiptFor(kind), id: "\uFEFF" };
+  transport.mockResolvedValueOnce(json(receipt, 201));
+  expect(await write(kind)).toEqual(receipt);
+  transport.mockResolvedValueOnce(json({ ...receipt, id: "\u0085" }, 201));
+  await expectUnknown(write(kind));
+});
+
+const timestampRequests = [
+  { name: "Attempt POST", receipt: attempt, status: 201, run: () => write("attempt") },
+  { name: "Submission POST", receipt: submission, status: 201, run: () => write("submission") },
+  { name: "Review POST", receipt: review, status: 201, run: () => write("review") },
+  { name: "Attempt GET", receipt: attempt, status: 200, run: () => taskApi.getTaskAttempt(group.id, task.id, attempt.id) },
+  { name: "Submission GET", receipt: submission, status: 200, run: () => taskApi.getTaskSubmission(group.id, task.id, submission.id) },
+];
+const invalidEvidenceTimes = [
+  ["nonsense", "not-a-date"], ["date without time", "2026-10-30"],
+  ["zero time", "0001-01-01T00:00:00Z"], ["zero time with fraction", "0001-01-01T00:00:00.000000000Z"],
+  ["year zero", "0000-01-02T00:00:00Z"], ["year beyond domain", "10000-01-01T00:00:00Z"],
+  ["negative year", "-0001-01-01T00:00:00Z"], ["signed year", "+2026-10-30T12:00:00Z"],
+  ["month zero", "2026-00-01T00:00:00Z"], ["month thirteen", "2026-13-01T00:00:00Z"],
+  ["day zero", "2026-10-00T00:00:00Z"], ["day thirty-two", "2026-01-32T00:00:00Z"],
+  ["April thirty-one", "2026-04-31T00:00:00Z"], ["February thirty", "2024-02-30T00:00:00Z"],
+  ["non-leap February", "2026-02-29T00:00:00Z"], ["non-leap century", "1900-02-29T00:00:00Z"],
+  ["another non-leap century", "2100-02-29T00:00:00Z"], ["early non-leap century", "0100-02-29T00:00:00Z"],
+  ["hour twenty-four", "2026-10-30T24:00:00Z"], ["minute sixty", "2026-10-30T12:60:00Z"],
+  ["leap second", "2026-10-30T12:00:60Z"], ["empty fraction", "2026-10-30T12:00:00.Z"],
+  ["beyond nanosecond precision", "2026-10-30T12:00:00.1234567891Z"],
+  ["comma fraction", "2026-10-30T12:00:00,123Z"], ["missing UTC zone", "2026-10-30T12:00:00"],
+  ["non-UTC serialization", "2026-10-30T12:00:00+08:00"], ["non-server zero offset", "2026-10-30T12:00:00+00:00"],
+  ["lowercase zone", "2026-10-30T12:00:00z"], ["space separator", "2026-10-30 12:00:00Z"],
+  ["unpadded month", "2026-1-30T12:00:00Z"], ["trailing newline", "2026-10-30T12:00:00Z\n"],
+  ["leading space", " 2026-10-30T12:00:00Z"], ["trailing data", "2026-10-30T12:00:00Zextra"],
+];
+it.each(invalidEvidenceTimes)("P2 timestamp: keeps %s invalid in all lifecycle POST and GET receipts", async (_name, created_at) => {
+  for (const request of timestampRequests) {
+    transport.mockResolvedValueOnce(json({ ...request.receipt, created_at }, request.status));
+    await expectUnknown(request.run(), request.status);
+  }
+});
+
+const validEvidenceTimes = [
+  "2026-10-30T12:00:00Z",
+  ...Array.from({ length: 9 }, (_, index) => `2026-10-30T12:00:00.${"123456789".slice(0, index + 1)}Z`),
+  "2026-10-30T12:00:00.000000001Z", "0001-01-01T00:00:00.000000001Z", "0001-01-01T00:00:01Z",
+  "0099-12-31T23:59:59.999999999Z", "0100-03-01T00:00:00Z", "1900-02-28T23:59:59Z",
+  "2000-02-29T12:34:56.123456789Z", "2024-02-29T00:00:00Z", "2400-02-29T23:59:59Z",
+  "2026-04-30T23:59:59Z", "9999-12-31T23:59:59.999999999Z",
+];
+it.each(validEvidenceTimes)("P2 timestamp: preserves valid Go UTC time %s in all lifecycle POST and GET receipts", async created_at => {
+  for (const request of timestampRequests) {
+    const receipt = { ...request.receipt, created_at };
+    transport.mockResolvedValueOnce(json(receipt, request.status));
+    expect(await request.run(), request.name).toEqual(receipt);
+  }
+});
