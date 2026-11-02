@@ -372,3 +372,14 @@ func TestMemberToolsHistoryStartupCapabilities(t *testing.T) {
 		t.Fatalf("startup capability description is stale: %s", &output)
 	}
 }
+
+func TestMemberToolsHistoryHelpCapabilities(t *testing.T) {
+	var help bytes.Buffer
+	if err := runWithSearch(context.Background(), []string{"--help"}, &help, provider.Search{}); err != nil {
+		t.Fatal(err)
+	}
+	const want = "  --enable-member-tools  启用 Pi 六项基础平台工具（含只读历史搜索与分段读取；默认禁用，须启用执行）\n"
+	if !strings.Contains(help.String(), want) || strings.Contains(help.String(), "启用 Pi 四项基础平台工具") {
+		t.Fatalf("help capability description is stale: %s", &help)
+	}
+}
