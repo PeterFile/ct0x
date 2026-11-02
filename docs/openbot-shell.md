@@ -1,6 +1,8 @@
-# Openbot 衍生外壳（可选入口）
+# Openbot 衍生外壳（默认入口）
 
-在页面加载时使用 `?shell=openbot` 选择；其他值或未指定时保留默认 IM。不会监听 URL 变化或提供运行中换壳按钮。首次加载可选 JS/CSS 后才挂载 App；分块载入失败会显示中文错误及默认入口链接，不自动创建另一个 App。
+页面默认使用 Openbot 衍生外壳。只有 `shell` 参数值精确为 `classic` 时选择原有经典兼容布局（`/?shell=classic`）；显式 `?shell=openbot`、其他值或未指定时均使用 Openbot。重复参数沿用原生 `URLSearchParams` 的首值行为，不做大小写或空白归一化。
+
+入口执行时只选择一次，只创建一个 root 并调用一次入口渲染；不会监听 URL/history 变化或提供运行中换壳按钮。StrictMode 的开发检查不代表第二次应用启动。默认入口先加载 Openbot JS/CSS 再挂载 App；分块载入失败会显示中文错误及 **打开经典界面** 链接（`/?shell=classic`），不自动挂载另一个 App，也不链接到会再次加载失败外壳的 `/`。经典入口不导入 Openbot 模块，分块不可用时仍可使用。
 
 ## 来源与许可
 
@@ -31,20 +33,20 @@ NOTICE 是保守保留的完整上游包声明，不是此外壳的依赖清单�
 ## 状态与动作边界
 
 - `App.tsx` 仍是 selected group、pane/context、lazy visits、read activity、focus recovery 的唯一控制器。`AppShellProps` 只传 typed React slots、真实动作及 refs；可选模块不请求 API，不持有第二套状态，不查询或点击 DOM 代替动作。
-- 默认布局保留原有结构与 header actions；可选布局将同一动作接到 PageRail，复用同一 Groups、Discussion/composer、Members、Tasks、HistorySearch。手机从列表打开详情时，仍由 App 设置 chat pane。轨道“聊天”关闭详情并恢复现有聊天；“群组列表”关闭详情并恢复当前群组按钮焦点。
+- 经典布局保留原有结构与 header actions；默认 Openbot 布局将同一动作接到 PageRail，复用同一 Groups、Discussion/composer、Members、Tasks、HistorySearch。手机从列表打开详情时，仍由 App 设置 chat pane。轨道“聊天”关闭详情并恢复现有聊天；“群组列表”关闭详情并恢复当前群组按钮焦点。
 - Shell 组件类型与 slot 位置在 pane/group 切换时稳定；不使用以 pane/group 为 key 的 shell，不重新挂载 DiscussionScope 或 mutation。关闭详情恢复到轨道的实际触发器。隐藏区域保留 DOM，但从键盘与可访问树移除；读取仍由原组件的 active 参数暂停，未完成写操作不会因布局切换 abort 或自动重试。
 - 网络契约、轮询周期、幂等身份和未知结果分类均未改动。原始输入与 key 仅经用户显式同次重试再次发送；界面不把持久化说成 CLI 接收，也不把提交说成验收。
-- 不添加依赖、Solid runtime、品牌或第三方资产、假账号/设置/主机/队列操作。Openbot 外壳保持为可选入口，不替代默认 IM。
+- 不添加依赖、Solid runtime、品牌或第三方资产、假账号/设置/主机/队列操作。Openbot 外壳为默认入口；原 IM 布局保留为显式经典兼容入口，业务组件与状态逻辑不变。
 
 ## 可复现检查
 
-`web/src/openbot-shell/OpenbotShell.test.tsx` 从真实 main 入口载入，检查默认/可选/加载时选择、分块错误、桌面/手机轨道导航下的分群草稿、接收者、composer DOM 和 pending/unknown 消息/任务操作及同次 key/input 重试，以及断点与焦点恢复。只替换 fetch/viewport，记录真实 createRoot 便于卸载；不 mock App 或其业务组件。相关 App、Discussion.request-work 和 RequestWork 测试还覆盖消息转任务、原始来源与未确认授权请求的状态保持。
+`web/src/openbot-shell/OpenbotShell.test.tsx` 从真实 main 入口载入，检查默认/经典/显式 Openbot/未知值选择、重复参数首值、URL/history 变化后布局与草稿 DOM 保持、每次启动只创建一个 root 并调用一次入口渲染、默认分块失败及经典恢复链接、分块不可用时的经典启动。既有桌面/手机轨道测试继续覆盖分群草稿、接收者、composer DOM、pending/unknown 消息/任务操作及同次 key/input 重试，以及断点与焦点恢复。fetch/viewport 使用测试替身，包装真实 createRoot/render 以计数和卸载，并在失败用例中阻断可选模块；不 mock App 或其业务组件。相关 App、Discussion.request-work 和 RequestWork 测试还覆盖消息转任务、原始来源与未确认授权请求的状态保持。
 
 运行以下定向检查，保持默认 5s 超时和单 worker：
 
 ```sh
 cd web
-npm test -- --maxWorkers=1 src/openbot-shell/OpenbotShell.test.tsx src/App.test.tsx src/Discussion.request-work.test.tsx src/RequestWork.test.tsx
+npm test -- --maxWorkers=1 src/openbot-shell/OpenbotShell.test.tsx
 npm run typecheck
 npm run build
 cmp public/licenses/openbot/LICENSE dist/licenses/openbot/LICENSE
@@ -52,6 +54,6 @@ cmp public/licenses/openbot/NOTICE dist/licenses/openbot/NOTICE
 cmp public/licenses/openbot/SOURCE.json dist/licenses/openbot/SOURCE.json
 ```
 
-构建结果位于 `web/dist/`。默认 HTML 只引用默认样式表，可选 JS/CSS 由加载时的 opt-in 分支导入。来源页面位于 `/licenses/openbot/index.html`，完整法律文件及源码清单从同一目录提供；上述 `cmp` 命令核对分发副本与 public 源文件逐字节一致。
+构建结果位于 `web/dist/`。HTML 仍只静态引用共享 JS/CSS；经典入口仅使用共享资源，默认入口还会下载 Openbot JS/CSS 分块。因此默认总下载量包括共享资源与 Openbot 分块，不能只按 HTML 的静态引用计算。比较体积时分别记录 raw 与同一 Node `gzipSync` 方法下的逐资源 gzip 大小；包体积不代表运行时耗时。来源页面位于 `/licenses/openbot/index.html`，完整法律文件及源码清单从同一目录提供；上述 `cmp` 命令核对分发副本与 public 源文件逐字节一致。
 
-回退：去掉 `?shell=openbot` 并重新加载即可恢复默认入口；重载前应处理当前页草稿与未确认操作，不把重载当成取消或重试。
+兼容入口：使用 `/?shell=classic` 并重新加载；去掉该参数则回到默认 Openbot 外壳。重载前应处理当前页草稿与未确认操作，不把重载当成取消或重试。

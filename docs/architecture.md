@@ -59,6 +59,8 @@ Version and account probes cannot promote resume, append, tools, or compaction c
 
 ## Visual language
 
+Current shell direction: [reuse the pinned Openbot source](openbot-shell.md), superseding the early claude.dev direction below. Applicable color and central-token constraints, keyboard navigation, visible focus, reduced motion, and narrow-screen usability remain in force.
+
 Reference inspected on 2026-10-30: [claude.dev](https://claude.dev/). Borrow its restrained charcoal canvas, warm off-white text, vermilion highlights, monospaced navigation, thin rules, and generous editorial spacing. Create original product identity; do not copy logos or illustrations.
 
 Central CSS tokens own all colors, typography, spacing, borders, focus, status, and motion. Initial direction: canvas `#131412`, panel `#1b1c19`, text `#eeede6`, muted `#a5a69c`, line `#34362f`, accent `#dc7958`, success `#9eaf87`. Use a serif display accent, a readable sans UI stack, and a monospace metadata stack with local fallbacks. Support keyboard navigation, visible focus, reduced motion, and a usable narrow layout.
