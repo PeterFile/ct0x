@@ -84,6 +84,9 @@ func (s *Store) MaterializeDispatchRequest(ctx context.Context, requestID string
 			return out, fmt.Errorf("%w：分派状态回执未保存", ErrConflict)
 		}
 		if state.Delivery != nil {
+			if err := coordinationDispatchMaterializedInTx(ctx, tx, r, *state.Delivery, body); err != nil {
+				return out, err
+			}
 			if code, err := coordinationDispatchEligibility(ctx, tx, r); err != nil || code != "" {
 				return out, coordinationDispatchFenceError(code, err)
 			}
@@ -93,6 +96,23 @@ func (s *Store) MaterializeDispatchRequest(ctx context.Context, requestID string
 		return out, storeError("保存分派物化失败", err)
 	}
 	return domain.DispatchMaterialization{Disposition: string(state.Status), Generation: state.Generation, Delivery: state.Delivery, HeldReason: state.HeldReason}, nil
+}
+
+// Read after the receipt write, only for new materializations; historical replays may be claimed.
+func coordinationDispatchMaterializedInTx(ctx context.Context, tx *sql.Tx, r domain.DispatchRequest, receipt domain.DispatchDeliveryReceipt, body string) error {
+	m, err := messageInTx(ctx, tx, r.GroupID, receipt.MessageID)
+	if err != nil {
+		return err
+	}
+	if m.ID != receipt.MessageID || m.GroupID != r.GroupID || m.TopicID != r.TopicID || m.SenderID != "user" || m.Content != body || len(m.Deliveries) != 1 {
+		return fmt.Errorf("%w：分派消息或单一投递未保存", ErrConflict)
+	}
+	d := m.Deliveries[0]
+	if d.ID != receipt.DeliveryID || d.MessageID != m.ID || d.ConversationID != receipt.ConversationID || d.RecipientID != receipt.CoordinatorMemberID ||
+		d.RecipientID != r.CoordinatorMemberID || d.State != domain.DeliveryStateQueued || d.TurnID != "" || d.Error != "" {
+		return fmt.Errorf("%w：分派投递身份或排队状态不匹配", ErrConflict)
+	}
+	return nil
 }
 
 func coordinationDispatchInput(id string, generation int64, at time.Time) (string, error) {

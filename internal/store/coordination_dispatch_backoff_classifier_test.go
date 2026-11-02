@@ -193,3 +193,27 @@ func TestDeferDispatchHeldNeverRetriesAfterMembershipRestored(t *testing.T) {
 	}
 	messageSequencePreserved(t, reopened, before)
 }
+
+func TestDispatchTransientTypedNilSQLiteErrorNoPanic(t *testing.T) {
+	var cause *sqlite.Error
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"direct", cause},
+		{"wrapped", fmt.Errorf("storage failure: %w", cause)},
+		{"cancelled", errors.Join(cause, context.Canceled)},
+		{"deadline", errors.Join(cause, context.DeadlineExceeded)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Errorf("typed-nil *sqlite.Error must not panic: %v", recovered)
+				}
+			}()
+			if code, ok := ClassifyDispatchTransient(tc.err); ok || code != "" {
+				t.Fatalf("typed nil is not an actual SQLite failure: %q, %t", code, ok)
+			}
+		})
+	}
+}

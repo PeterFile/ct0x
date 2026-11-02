@@ -254,3 +254,125 @@ func TestMaterializeDispatchSameGenerationReceiptPrecedesLiveEligibility(t *test
 	}
 	messageSequencePreserved(t, f.s, before)
 }
+
+func TestMaterializeDispatchRejectsSubstitutedMessageContent(t *testing.T) {
+	f, r := materializePending(t)
+	observer := queueHandle(t, f.path, false)
+	if _, err := f.s.db.Exec(`PRAGMA recursive_triggers=OFF;
+	 CREATE TRIGGER materialize_substitute_message BEFORE INSERT ON messages BEGIN
+	  INSERT INTO messages(id,group_id,topic_id,sender_id,content,created_at)
+	  VALUES(NEW.id,NEW.group_id,NEW.topic_id,NEW.sender_id,'substituted authority text',NEW.created_at);
+	  SELECT RAISE(IGNORE);
+	 END;`); err != nil {
+		t.Fatal(err)
+	}
+	before := messageSequenceSnapshot(t, observer)
+	before["schema_migrations"] = messageSequenceTableRows(t, observer, "schema_migrations")
+	before["sqlite_sequence"] = messageSequenceTableRows(t, observer, "sqlite_sequence")
+	got, err := materializeAPI(t, f.s).MaterializeDispatchRequest(ctx, r.ID, 1, materializeAt)
+	want := materializeWantBody(r, f.admission.Mandate.Scope.Objective, f.admission.Mandate.Scope.Acceptance)
+	if err == nil && got.Delivery != nil {
+		m, readErr := observer.GetMessage(ctx, r.GroupID, got.Delivery.MessageID)
+		t.Fatalf("substituted message committed: stored=%q, want=%q, receipt=%+v, read_err=%v", m.Content, want, got, readErr)
+	}
+	requestDispatchZero(t, got, err, ErrConflict)
+	messageSequencePreserved(t, observer, before)
+	messageSequencePreserved(t, f.s, before)
+	if _, err := f.s.db.Exec("DROP TRIGGER materialize_substitute_message"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = materializeAPI(t, observer).MaterializeDispatchRequest(ctx, r.ID, 1, materializeAt)
+	if err != nil {
+		t.Fatalf("substitution rollback made original request unretryable: %v", err)
+	}
+	materializeAssertReceipt(t, observer, r, got, 1, materializeAt)
+	m, err := observer.GetMessage(ctx, r.GroupID, got.Delivery.MessageID)
+	if err != nil || m.Content != want || m.Deliveries[0].State != domain.DeliveryStateQueued || m.Deliveries[0].TurnID != "" {
+		t.Fatalf("retry did not persist the complete queued authority message: %+v, %v", m, err)
+	}
+}
+
+func TestMaterializeDispatchRejectsDeliveryDeactivatedDuringStateWrite(t *testing.T) {
+	f, r := materializePending(t)
+	observer := queueHandle(t, f.path, false)
+	if _, err := f.s.db.Exec(`CREATE TRIGGER materialize_deactivate_delivery AFTER UPDATE ON coordination_dispatch_state
+	 WHEN NEW.status='enqueued' BEGIN
+	  UPDATE deliveries SET state='failed',error='injected before commit' WHERE id=NEW.delivery_id;
+	 END;`); err != nil {
+		t.Fatal(err)
+	}
+	before := messageSequenceSnapshot(t, observer)
+	before["schema_migrations"] = messageSequenceTableRows(t, observer, "schema_migrations")
+	before["sqlite_sequence"] = messageSequenceTableRows(t, observer, "sqlite_sequence")
+	got, err := materializeAPI(t, f.s).MaterializeDispatchRequest(ctx, r.ID, 1, materializeAt)
+	if err == nil && got.Delivery != nil {
+		m, readErr := observer.GetMessage(ctx, r.GroupID, got.Delivery.MessageID)
+		t.Fatalf("deactivated delivery committed: message=%+v, receipt=%+v, read_err=%v", m, got, readErr)
+	}
+	requestDispatchZero(t, got, err, ErrConflict)
+	messageSequencePreserved(t, observer, before)
+	messageSequencePreserved(t, f.s, before)
+	if _, err := f.s.db.Exec("DROP TRIGGER materialize_deactivate_delivery"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = materializeAPI(t, observer).MaterializeDispatchRequest(ctx, r.ID, 1, materializeAt)
+	if err != nil {
+		t.Fatalf("delivery rollback made original request unretryable: %v", err)
+	}
+	materializeAssertReceipt(t, observer, r, got, 1, materializeAt)
+	m, err := observer.GetMessage(ctx, r.GroupID, got.Delivery.MessageID)
+	if err != nil || m.Content != materializeWantBody(r, f.admission.Mandate.Scope.Objective, f.admission.Mandate.Scope.Acceptance) || m.Deliveries[0].State != domain.DeliveryStateQueued || m.Deliveries[0].TurnID != "" {
+		t.Fatalf("retry did not persist the complete queued authority message: %+v, %v", m, err)
+	}
+}
+
+func TestMaterializeDispatchRejectsQueuedDeliveryErrorDuringStateWrite(t *testing.T) {
+	f, r := materializePending(t)
+	observer := queueHandle(t, f.path, false)
+	if _, err := f.s.db.Exec(`CREATE TRIGGER materialize_delivery_error AFTER UPDATE ON coordination_dispatch_state
+	 WHEN NEW.status='enqueued' BEGIN
+	  UPDATE deliveries SET error='injected during state write' WHERE id=NEW.delivery_id;
+	 END;`); err != nil {
+		t.Fatal(err)
+	}
+	before := messageSequenceSnapshot(t, observer)
+	before["schema_migrations"] = messageSequenceTableRows(t, observer, "schema_migrations")
+	before["sqlite_sequence"] = messageSequenceTableRows(t, observer, "sqlite_sequence")
+	got, err := materializeAPI(t, f.s).MaterializeDispatchRequest(ctx, r.ID, 1, materializeAt)
+	if err == nil && got.Delivery != nil {
+		materializeAssertReceipt(t, observer, r, got, 1, materializeAt)
+		m, readErr := observer.GetMessage(ctx, r.GroupID, got.Delivery.MessageID)
+		t.Fatalf("queued delivery with initial error committed: message=%+v, receipt=%+v, read_err=%v", m, got, readErr)
+	}
+	requestDispatchZero(t, got, err, ErrConflict)
+	messageSequencePreserved(t, observer, before)
+	messageSequencePreserved(t, f.s, before)
+	if _, err := f.s.db.Exec("DROP TRIGGER materialize_delivery_error"); err != nil {
+		t.Fatal(err)
+	}
+	original, err := materializeAPI(t, observer).MaterializeDispatchRequest(ctx, r.ID, 1, materializeAt)
+	if err != nil {
+		t.Fatalf("initial delivery error rollback made original request unretryable: %v", err)
+	}
+	materializeAssertReceipt(t, observer, r, original, 1, materializeAt)
+	m, err := observer.GetMessage(ctx, r.GroupID, original.Delivery.MessageID)
+	if err != nil || m.Content != materializeWantBody(r, f.admission.Mandate.Scope.Objective, f.admission.Mandate.Scope.Acceptance) || m.Deliveries[0].State != domain.DeliveryStateQueued || m.Deliveries[0].TurnID != "" || m.Deliveries[0].Error != "" {
+		t.Fatalf("retry did not persist the complete clean queued authority message: %+v, %v", m, err)
+	}
+	if _, err := f.s.db.Exec("UPDATE deliveries SET error='later runtime error' WHERE id=?", original.Delivery.DeliveryID); err != nil {
+		t.Fatal(err)
+	}
+	m, err = observer.GetMessage(ctx, r.GroupID, original.Delivery.MessageID)
+	if err != nil || len(m.Deliveries) != 1 || m.Deliveries[0].Error != "later runtime error" || m.Deliveries[0].State != domain.DeliveryStateQueued || m.Deliveries[0].TurnID != "" {
+		t.Fatalf("postcommit error-only mutation was not persisted: %+v, %v", m, err)
+	}
+	after := messageSequenceSnapshot(t, observer)
+	after["schema_migrations"] = messageSequenceTableRows(t, observer, "schema_migrations")
+	after["sqlite_sequence"] = messageSequenceTableRows(t, observer, "sqlite_sequence")
+	replay, err := materializeAPI(t, f.s).MaterializeDispatchRequest(ctx, r.ID, 1, materializeAt.Add(time.Hour))
+	if err != nil || !reflect.DeepEqual(replay, original) {
+		t.Fatalf("historical receipt rejected by a later delivery error: %+v, %v", replay, err)
+	}
+	messageSequencePreserved(t, observer, after)
+	messageSequencePreserved(t, f.s, after)
+}

@@ -26,7 +26,7 @@ func ClassifyDispatchTransient(err error) (DispatchTransientCode, bool) {
 		return "", false
 	}
 	var cause *sqlite.Error
-	if errors.As(err, &cause) {
+	if errors.As(err, &cause) && cause != nil {
 		switch cause.Code() & 0xff {
 		case sqlite3.SQLITE_BUSY:
 			return DispatchTransientSQLiteBusy, true
