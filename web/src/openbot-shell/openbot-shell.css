@@ -1,0 +1,197 @@
+/* Openbot ac99196, PolyForm Noncommercial 1.0.0. See /licenses/openbot/index.html.
+ * Extracted ranges and React integration changes: docs/openbot-shell.md.
+ * All selectors are scoped; the default entry never imports this sheet.
+ */
+
+/* src/renderer/src/styles/app-shell.css:24-46 — frame geometry, without the resizer column. */
+.openbot-shell.app-frame {
+  --left-header-height: 4rem;
+  --page-rail-width: 4rem;
+  --left-panel-width: clamp(15rem, 22vw, 19rem);
+  position: relative;
+  display: grid;
+  container-type: inline-size;
+  width: 100%;
+  height: 100svh;
+  margin: 0;
+  grid-template-columns: var(--page-rail-width) var(--left-panel-width) minmax(0, 1fr);
+  overflow: hidden;
+  border: 0;
+  border-radius: 0;
+  background: var(--color-canvas);
+  box-shadow: none;
+}
+
+/* app-shell.css:848-854,867-887 — child bounds, edge, and sidebar surface/top row, in source order. */
+.openbot-shell.app-frame > * { min-height: 0; }
+.openbot-shell .panel-edge { border-right: 1px solid var(--color-rule); }
+.openbot-shell .sidebar {
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+  flex-direction: column;
+  background: var(--color-panel);
+  color: var(--color-text);
+  container-type: inline-size;
+  grid-column: 2;
+  grid-row: 1;
+}
+.openbot-shell .im-brand {
+  display: flex;
+  min-height: var(--left-header-height);
+  flex: 0 0 auto;
+  align-items: center;
+  gap: var(--space-2);
+  border-bottom: 1px solid var(--color-rule);
+  padding: var(--space-2) var(--space-4);
+}
+
+/* app-shell.css:3347-3350 — retained final sidebar palette assignment, after its structure. */
+.openbot-shell .sidebar { background: var(--color-panel); }
+
+/* packages/ui/src/features/window/page-rail.css:1-14,47-92 — rail, groups, buttons, hover/current/focus. */
+.openbot-shell .window-rail {
+  position: relative;
+  display: flex;
+  width: var(--page-rail-width);
+  min-height: 0;
+  flex-direction: column;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-3) var(--space-2);
+  overflow-y: auto;
+  gap: var(--space-4);
+  grid-column: 1;
+  grid-row: 1;
+}
+.openbot-shell .window-rail-group {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.375rem;
+}
+.openbot-shell .window-rail-button {
+  position: relative;
+  display: flex;
+  width: var(--target-min);
+  height: var(--target-min);
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 0.75rem;
+  background: transparent;
+  padding: 0;
+  color: var(--color-muted);
+  font: inherit;
+  font-size: var(--text-small);
+  cursor: pointer;
+}
+@media (hover: hover) and (pointer: fine) {
+  .openbot-shell .window-rail-button:hover { background: var(--color-panel); color: var(--color-text); border: 0; }
+}
+.openbot-shell .window-rail-button[aria-current="page"],
+.openbot-shell .window-rail-button[aria-current="page"]:hover:not(:disabled) {
+  background: var(--color-panel);
+  color: var(--color-text);
+  box-shadow: inset 0 0 0 1px var(--color-rule);
+}
+.openbot-shell .window-rail-button:focus-visible {
+  outline: 0;
+  box-shadow: inset 0 0 0 2px var(--color-focus);
+}
+
+/* Local slot integration: reuse the existing list, Discussion/composer, and contextual components. */
+.openbot-shell .shell-license {
+  display: flex;
+  width: var(--target-min);
+  min-height: var(--target-min);
+  align-items: center;
+  padding: var(--space-1);
+  color: var(--color-muted);
+  font-size: var(--text-meta);
+  text-align: center;
+  text-underline-offset: 0.2em;
+}
+.openbot-shell .shell-license:hover { color: var(--color-text); }
+.openbot-shell .im-list-heading {
+  flex-shrink: 0;
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--text-small);
+  font-weight: var(--weight-normal);
+  color: var(--color-muted);
+}
+.openbot-shell :is(.im-group-body, .im-context-body) {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: var(--space-4);
+  scroll-padding-block: var(--space-4);
+}
+.openbot-shell .im-group-body > .group-panel { margin: 0; }
+.openbot-shell .group-list button { border-radius: 0.5rem; }
+.openbot-shell .group-list button[aria-pressed="true"] { background: var(--color-canvas); }
+.openbot-shell .app-frame-panes {
+  min-width: 0;
+  overflow: hidden;
+  grid-column: 3;
+  grid-row: 1;
+}
+.openbot-shell .app-frame-content {
+  display: grid;
+  height: 100%;
+  min-height: 0;
+  grid-template-columns: minmax(0, 1fr);
+}
+.openbot-shell[data-context="true"] .app-frame-content {
+  grid-template-columns: minmax(0, 1fr) clamp(16rem, 25vw, 22rem);
+}
+.openbot-shell :is(.im-chat, .im-context) {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.openbot-shell .im-chat { padding: var(--space-4); gap: var(--space-3); }
+.openbot-shell :is(.im-chat-header, .im-context-header) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  flex-shrink: 0;
+  padding-block-end: var(--space-3);
+  border-block-end: var(--border-rule);
+}
+.openbot-shell .im-chat-summary { flex: 1 1 10rem; min-width: 0; max-height: var(--space-9); overflow: auto; }
+.openbot-shell :is(.im-chat-header, .im-context-header) h2 { font-size: var(--text-body); font-weight: var(--weight-medium); }
+.openbot-shell .im-chat-summary h2 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.openbot-shell :is(.im-chat-summary, .im-context-header) p { font-size: var(--text-small); color: var(--color-muted); }
+.openbot-shell .discussion-content { flex: 1; min-width: 0; min-height: 0; }
+.openbot-shell :is(.discussion-scope:not([hidden]), .discussion-feed) { height: 100%; min-height: 0; }
+.openbot-shell .discussion-feed { grid-template-rows: minmax(0, 1fr) auto; }
+.openbot-shell .message-history { max-height: none; }
+.openbot-shell .message-composer { max-height: min(55svh, 26rem); overflow-y: auto; overflow-x: hidden; }
+.openbot-shell .im-context { border-inline-start: var(--border-rule); background: var(--color-panel); }
+.openbot-shell .im-context-header { margin: var(--space-4) var(--space-4) 0; }
+.openbot-shell .im-context-header > div { flex: 1 1 6rem; min-width: 0; }
+.openbot-shell .im-context-header p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* src/renderer/src/features/web-client/web-client.css:61-97,112-130 — one phone pane, no resizer.
+ * Use App's existing 56rem breakpoint/hidden attributes, keep the action rail reachable in every pane.
+ */
+@media (max-width: 56rem) {
+  .openbot-shell.app-frame { grid-template-columns: var(--page-rail-width) minmax(0, 1fr); }
+  .openbot-shell .app-frame-panes { grid-column: 2; }
+  .openbot-shell[data-mobile-pane="list"] > .app-frame-panes { display: none; }
+  .openbot-shell .app-frame-content,
+  .openbot-shell[data-context="true"] .app-frame-content { grid-template-columns: minmax(0, 1fr); }
+  .openbot-shell .im-chat { padding: var(--space-3); }
+  .openbot-shell .im-context { border-inline-start: 0; }
+}
+.openbot-shell [hidden] { display: none !important; }
+
+/* web-client.css:274-278 — no navigation motion when reduced motion is requested. */
+@media (prefers-reduced-motion: reduce) {
+  .openbot-shell, .openbot-shell * { transition: none; animation: none; scroll-behavior: auto; }
+}
