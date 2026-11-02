@@ -40,9 +40,9 @@ function execute(tool, params, signal, callId = "native-call") {
   });
 }
 
-test("actual Pi 1.4.0 loader registers exactly four native tools with the frozen schemas", async t => {
+test("actual Pi 1.4.0 loader registers exactly six native tools with the frozen schemas", async t => {
   const { tools } = await toolsFor(t);
-  assert.deepEqual([...tools.keys()], names);
+  assert.deepEqual([...tools.keys()], [...names, "search_history", "read_history"]);
   for (const tool of tools.values()) {
     assert.match(tool.label, /[\u3400-\u9fff]/u);
     assert.match(tool.description, /[\u3400-\u9fff]/u);

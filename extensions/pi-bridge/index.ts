@@ -40,6 +40,26 @@ const tools = [
       reason: Type.String({ description: "需要该成员加入的原因。" }),
     }, { additionalProperties: false }),
   },
+  {
+    name: "search_history",
+    label: "搜索历史消息",
+    description: "按关键词检索当前执行的群组和话题历史；身份与话题由服务端绑定，excerpt 仅为消息前缀，不保证包含命中词或完整正文。",
+    parameters: Type.Object({
+      query: Type.String({ description: "搜索关键词。" }),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "每页条数，范围 1 至 50；省略为 20。" })),
+      before: Type.Optional(Type.String({ description: "上一页返回的不透明历史游标；省略或空字符串表示起始页。" })),
+    }, { additionalProperties: false }),
+  },
+  {
+    name: "read_history",
+    label: "读取历史片段",
+    description: "读取当前执行绑定话题内指定消息的 Unicode 片段 [offset,next_offset)；身份与话题由服务端绑定，片段不等于完整正文。",
+    parameters: Type.Object({
+      message_id: Type.String({ description: "当前绑定群组和话题内的消息标识。" }),
+      offset: Type.Optional(Type.Integer({ minimum: 0, description: "起始 Unicode rune 偏移；省略为 0。" })),
+      length: Type.Optional(Type.Integer({ minimum: 1, maximum: 4096, description: "读取的 Unicode rune 数，范围 1 至 4096；省略为 1024。" })),
+    }, { additionalProperties: false }),
+  },
 ] as const;
 
 export default function piBridge(pi: ExtensionAPI) {

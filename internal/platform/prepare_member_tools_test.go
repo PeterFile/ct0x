@@ -152,6 +152,10 @@ func TestPrepareMemberToolsAuthoritativeContextWithoutPreclaimAuthority(t *testi
 		t.Fatal("trigger body replaced authoritative context")
 	}
 	permissions := strings.Join(packet.Permissions, "\n")
+	if packet.Permissions[1] != "基础平台工具仅有 list_members、read_channel、send_message、create_member；调用者、群组、会话和话题由服务端绑定，模型不能改选身份或授权。" ||
+		strings.Contains(permissions, "search_history") || strings.Contains(permissions, "read_history") {
+		t.Fatal("legacy unordered-four profile changed exact canonical permission text or enabled history")
+	}
 	for _, term := range []string{"list_members", "read_channel", "send_message", "create_member", "服务端绑定", "话题", "不授予", "Coordinator", "Assignment", "Mandate", "RequestWork", "任务提交", "评审", "外部 CWD", "不是", "主机文件沙箱", "65536", "UTF-8", "1 MiB", "未知", "自动重试"} {
 		if !strings.Contains(permissions, term) {
 			t.Errorf("tool permissions missing %q", term)
