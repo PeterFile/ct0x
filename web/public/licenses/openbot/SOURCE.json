@@ -1,0 +1,113 @@
+{
+  "repository": "https://github.com/nightly-labs/openbot",
+  "commit": "ac99196e66fe8f9d426433aa5e79d6e999d1c818",
+  "retrieved": "2026-11-02",
+  "method": "GitHub get_file_contents at pinned ref; exact Git blob SHA verified",
+  "files": [
+    {
+      "path": "LICENSE",
+      "bytes": 4732,
+      "sha256": "ffe034ecf735f296ca53cbd856c944849f0c80c7e1490ce162038a99ad89c728",
+      "github_blob_sha": "424bbe3cadbd960f5ddad1b87f21279c9be575e2",
+      "github_blob_verified": true
+    },
+    {
+      "path": "NOTICE",
+      "bytes": 5173,
+      "sha256": "3995ad096839d696f4ff70227ac56c89b3c25e6b549bb87cf9d98dce901b75f7",
+      "github_blob_sha": "53ed0f9159e24ac49d1705a6636210c6c9372629",
+      "github_blob_verified": true
+    },
+    {
+      "path": "docs/web-client.md",
+      "bytes": 34933,
+      "sha256": "9afec4a64bcd0b39b8d9e6c71dafa56b11cd81abca618ca4030db1910ed3ba0e",
+      "github_blob_sha": "633ccb4cfa21586899b13e6ff813129b01aeeeb7",
+      "github_blob_verified": true
+    },
+    {
+      "path": "package.json",
+      "bytes": 29946,
+      "sha256": "7ce13582fcee09e55e4bee63bd61e0d87266e11c3d51566a3fe79b8bd01555e2",
+      "github_blob_sha": "7c4a8085f420f6862e0d52c2bc7bc014c39ed043",
+      "github_blob_verified": true
+    },
+    {
+      "path": "src/renderer/src/WorkspaceFrame.tsx",
+      "bytes": 3973,
+      "sha256": "67df809844439354666bac685405433bc41735c7b559e98b951b5e40e177f169",
+      "github_blob_sha": "0c541352b9a9c7d0bc5c077aadf357229a283464",
+      "github_blob_verified": true
+    },
+    {
+      "path": "src/renderer/src/WorkspaceShell.tsx",
+      "bytes": 16080,
+      "sha256": "dc10e9d9deb495b4f149d3fc186f5a7d562ca73324d6bed773b4d47f473216fc",
+      "github_blob_sha": "e962df007c08c4c806b1b2addc37e511671b778e",
+      "github_blob_verified": true
+    },
+    {
+      "path": "src/renderer/src/layout-constants.ts",
+      "bytes": 1135,
+      "sha256": "44c0609eb2aeafe0d348a2bc133c89333cf6e0dc03866c4ffb30f04a62a71a12",
+      "github_blob_sha": "f8afda49673fad8b0f4df96ecbf196165a0b7efb",
+      "github_blob_verified": true
+    },
+    {
+      "path": "src/renderer/src/styles/app-shell.css",
+      "bytes": 85164,
+      "sha256": "a773f8dfb48176941192a7a6785e3d7684732d9d5b170dcb0f64a8091d0d6f4a",
+      "github_blob_sha": "acac44200c985475f5551d6dc152027468c8c92a",
+      "github_blob_verified": true
+    },
+    {
+      "path": "src/renderer/src/features/web-client/web-client.css",
+      "bytes": 11879,
+      "sha256": "61b902c5ff540838af400a41489267ade7acedb8d5804014d6f95b41ee6796e3",
+      "github_blob_sha": "eb24f341192be1ce97298732a4baac302ff9b50a",
+      "github_blob_verified": true
+    },
+    {
+      "path": "src/renderer/src/features/web-client/WebMobileNavigation.tsx",
+      "bytes": 1909,
+      "sha256": "efce1fd53ad3f54f880a11bb8c1573788b38d27f27c955816ac8126749827a4d",
+      "github_blob_sha": "dd8e3aece06620e529475df150da1826b3f76ba2",
+      "github_blob_verified": true
+    },
+    {
+      "path": "packages/ui/src/features/window/PageRail.tsx",
+      "bytes": 16388,
+      "sha256": "3e303c7b3296b32bf9dd8e04a8d66ea7a8a86f174ee049171456d35857088a90",
+      "github_blob_sha": "a1767cee78ca0d452247b8fd22db058891cf055d",
+      "github_blob_verified": true
+    },
+    {
+      "path": "packages/ui/src/features/window/page-rail.css",
+      "bytes": 7080,
+      "sha256": "0b0b899ad769ee63a919b3872aff641a881477ef53bd18162441a107cb88855c",
+      "github_blob_sha": "d18d55d663612ef7818b6c9aa5ddb5df0090f153",
+      "github_blob_verified": true
+    },
+    {
+      "path": "packages/ui/src/features/sidebar/SidebarFrame.tsx",
+      "bytes": 492,
+      "sha256": "335e52e9ef7b646cc7f3ec85e9828a68d09a8b35dcf46cc5966b3e8e658d672e",
+      "github_blob_sha": "918a64f3d9bb7b8e39cd2505841915888684da59",
+      "github_blob_verified": true
+    },
+    {
+      "path": "packages/ui/src/features/sidebar/Sidebar.tsx",
+      "bytes": 972,
+      "sha256": "e9f007c0e7936e4a6c23ff2aaa2ea30283b7125bbeace8f4ca779eb405623aed",
+      "github_blob_sha": "b7b15c1cdd77f0d483919c59e68947b2e5f6f8c4",
+      "github_blob_verified": true
+    },
+    {
+      "path": "packages/ui/src/features/conversation/ConversationHeader.tsx",
+      "bytes": 5305,
+      "sha256": "96c7353981fffc683a1ebbf349846dc23ca74e7cee3bd82ca6d0760cbc7a1e6a",
+      "github_blob_sha": "ced2adce8eafa28e7eb2364124bb30e7b731e1bc",
+      "github_blob_verified": true
+    }
+  ]
+}
