@@ -390,6 +390,32 @@ it("does not infer a trusted rejection from arbitrary errors or a reserved-looki
 });
 
 type Observation = { path: string | undefined; method: string | undefined; body: string; key: string | string[] | undefined };
+async function withRawResponse(status: number, body: string | Uint8Array, check: (requests: Observation[]) => Promise<void>) {
+  const requests: Observation[] = [];
+  const server = createServer((req, res) => {
+    let sent = "";
+    req.setEncoding("utf8");
+    req.on("data", chunk => { sent += chunk; });
+    req.on("end", () => {
+      requests.push({ path: req.url, method: req.method, body: sent, key: req.headers["idempotency-key"] });
+      res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" }).end(body);
+    });
+  });
+  try {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string" || [55594, 7310].includes(address.port)) throw new Error("Unexpected fixture address");
+    const base = `http://127.0.0.1:${address.port}`;
+    vi.stubGlobal("fetch", (url: RequestInfo | URL, init?: RequestInit) => nativeFetch(new URL(String(url), base), init));
+    await check(requests);
+  } finally {
+    if (server.listening) await new Promise<void>((resolve, reject) => {
+      server.close(error => error ? reject(error) : resolve());
+      server.closeAllConnections();
+    });
+  }
+}
 it.each(routes.flatMap(route => [303, 307].map(status => ({ ...route, status })) ))(
   "$method $resource blocks native HTTP $status redirects and never forwards the key or body", async route => {
     const source: Observation[] = [], target: Observation[] = [];
@@ -441,3 +467,146 @@ it.each(routes.flatMap(route => [303, 307].map(status => ({ ...route, status }))
     }
   },
 );
+
+function rawReceipt(resource: (typeof resources)[number], revision: string): string {
+  const fields = resource.resource === "coordinator" ? `"member_id":${JSON.stringify(binding.member_id)}`
+    : `"allowed_worker_ids":${JSON.stringify(policy.allowed_worker_ids)}`;
+  // Insert the original numeric token, never a JSON.stringify-rounded number.
+  return `{"group_id":${JSON.stringify(groupId)},${fields},"revision":${revision}}`;
+}
+const rawRevisionCases = [
+  { revision: "1.0000000000000001", expected: 0 },
+  { revision: "0.99999999999999999", expected: 0 },
+  { revision: "9007199254740991.1", expected: Number.MAX_SAFE_INTEGER - 1 },
+  { revision: "9007199254740990.9", expected: Number.MAX_SAFE_INTEGER - 1 },
+  { revision: "1.0", expected: 0 },
+  { revision: "1e0", expected: 0 },
+  { revision: "10000000000000001e-16", expected: 0 },
+  { revision: "9007199254740992", expected: Number.MAX_SAFE_INTEGER - 1 },
+  { revision: "9223372036854775807", expected: Number.MAX_SAFE_INTEGER - 1 },
+];
+it.each(resources.flatMap(resource => rawRevisionCases.map(value => ({ ...resource, ...value })) ))(
+  "$resource rejects raw revision $revision before lossy number conversion", async resource => {
+    const raw = rawReceipt(resource, resource.revision);
+    transport.mockResolvedValueOnce(new Response(raw, { status: 200 }));
+    expectUnknown(await failure(resource.read(groupId)), 200, "invalid_response");
+    transport.mockResolvedValueOnce(new Response(raw, { status: 200 }));
+    expectUnknown(await failure(resource.save(groupId, { ...resource.input, expected_revision: resource.expected }, key)), 200, "invalid_response");
+    expect(transport).toHaveBeenCalledTimes(2);
+  },
+);
+it.each(["0.00000000000000000001", "1e-400", "-0", "0.0"])("rejects non-Go-integer raw default policy revision %s", async revision => {
+  transport.mockResolvedValueOnce(new Response(`{"group_id":${JSON.stringify(groupId)},"revision":${revision},"allowed_worker_ids":[]}`));
+  expectUnknown(await failure(getDispatchPolicy(groupId)), 200, "invalid_response");
+});
+it.each(resources.flatMap(resource => [rawRevisionCases[0], rawRevisionCases[2]].map(value => ({ ...resource, ...value })) ))(
+  "$resource rejects raw HTTP revision $revision without confirming the write", async resource => {
+    await withRawResponse(200, rawReceipt(resource, resource.revision), async requests => {
+      const input = { ...resource.input, expected_revision: resource.expected };
+      const error = await failure(resource.save(groupId, input, key));
+      expect(requests).toEqual([{
+        path: `/api/v1/groups/${encodeURIComponent(groupId)}/coordination/${resource.resource}`,
+        method: "PUT", body: JSON.stringify(input), key,
+      }]);
+      expectUnknown(error, 200, "invalid_response");
+    });
+  },
+);
+it.each(resources.flatMap(resource => ["1", "9007199254740991"].map(revision => ({ ...resource, revision })) ))(
+  "$resource accepts exact integer wire revision $revision even with an escaped property name", async resource => {
+    const raw = rawReceipt(resource, resource.revision).replace('"revision"', '"revi\\u0073ion"');
+    const receipt = { ...resource.receipt, revision: Number(resource.revision) };
+    transport.mockResolvedValueOnce(new Response(raw));
+    await expect(resource.read(groupId)).resolves.toEqual(receipt);
+    transport.mockResolvedValueOnce(new Response(raw));
+    await expect(resource.save(groupId, { ...resource.input, expected_revision: receipt.revision - 1 }, key)).resolves.toEqual(receipt);
+  },
+);
+it("keeps numeric-looking string contents opaque, including escaped quotes, backslashes and valid U+FFFD", async () => {
+  const id = 'id/1.0000000000000001/9007199254740991.1/1e400/"revision":1.0/\\123/\\u0031/�';
+  const coordinator = { group_id: id, member_id: id, revision: 1 };
+  const dispatch = { group_id: id, revision: 1, allowed_worker_ids: [id] };
+  const rawBinding = `{"group_id":${JSON.stringify(id)},"member_id":${JSON.stringify(id)},"revision":1}`;
+  const rawPolicy = `{"group_id":${JSON.stringify(id)},"revision":1,"allowed_worker_ids":[${JSON.stringify(id)}]}`;
+  transport.mockResolvedValueOnce(new Response(rawBinding)).mockResolvedValueOnce(new Response(rawBinding))
+    .mockResolvedValueOnce(new Response(rawPolicy)).mockResolvedValueOnce(new Response(rawPolicy));
+  await expect(getCoordinator(id)).resolves.toEqual(coordinator);
+  await expect(setCoordinator(id, { member_id: id, expected_revision: 0 }, key)).resolves.toEqual(coordinator);
+  await expect(getDispatchPolicy(id)).resolves.toEqual(dispatch);
+  await expect(setDispatchPolicy(id, { allowed_worker_ids: [id], expected_revision: 0 }, key)).resolves.toEqual(dispatch);
+  const code = 'code/1.0000000000000001/9007199254740991.1/1e400/"revision":1/\\123';
+  const rawError = `{"error":{"code":${JSON.stringify(code)},"message":${JSON.stringify(id)}}}`;
+  transport.mockResolvedValueOnce(new Response(rawError, { status: 409 }));
+  const error = await failure(setCoordinator(id, { member_id: id, expected_revision: 0 }, key));
+  expect(error).toMatchObject({ status: 409, code });
+  expect(isCoordinatorConfigurationDefinitiveRejection(error)).toBe(true);
+});
+
+function invalidUtf8Error(bytes: readonly number[]): Buffer<ArrayBuffer> {
+  return Buffer.concat([Buffer.from('{"error":{"code":"conflict","message":"'), Buffer.from(bytes), Buffer.from('"}}')]);
+}
+const malformedUtf8 = [
+  [0xff], [0x80], [0xc0, 0xaf], [0xed, 0xa0, 0x80], [0xe2, 0x82], [0xe2, 0x28, 0xa1], [0xf4, 0x90, 0x80, 0x80],
+];
+it.each(routes.flatMap(route => [400, 404, 409, 413, 415, 500].map(status => ({ ...route, status })) ))(
+  "$method $resource rejects malformed UTF-8 at HTTP $status before trusting any envelope", async route => {
+    for (const bytes of malformedUtf8) {
+      transport.mockResolvedValueOnce(new Response(invalidUtf8Error(bytes), { status: route.status }));
+      expectUnknown(await failure(invoke(route)), route.status, "invalid_response");
+    }
+    expect(transport).toHaveBeenCalledTimes(malformedUtf8.length);
+  },
+);
+it.each(resources.flatMap(resource => [400, 404, 409].map(status => ({ ...resource, status })) ))(
+  "$resource keeps raw HTTP $status with byte ff unknown", async resource => {
+    await withRawResponse(resource.status, invalidUtf8Error([0xff]), async requests => {
+      const error = await failure(resource.save(groupId, resource.input, key));
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ method: "PUT", body: JSON.stringify(resource.input), key });
+      expectUnknown(error, resource.status, "invalid_response");
+    });
+  },
+);
+it.each(routes)("$method $resource rejects a corrupted 200 identity rather than accepting UTF-8 replacement", async route => {
+  const raw = rawReceipt(route, String(route.receipt.revision));
+  const expectedGroup = `group-${String.fromCharCode(0xfffd)}`;
+  const bytes = Buffer.from(raw.replace(JSON.stringify(groupId), '"group-!"'));
+  bytes[bytes.indexOf(Buffer.from("group-!")) + 6] = 0xff;
+  transport.mockResolvedValueOnce(new Response(bytes));
+  const operation = route.method === "GET" ? route.read(expectedGroup) : route.save(expectedGroup, route.input, key);
+  expectUnknown(await failure(operation), 200, "invalid_response");
+});
+
+it.each(routes.flatMap(route => [".", ".."].map(group => ({ ...route, group })) ))(
+  "$method $resource rejects exact dot group $group before native fetch can normalize its path", async route => {
+    await withRawResponse(404, '{"error":{"code":"not_found","message":"记录不存在或不可访问"}}', async requests => {
+      const operation = route.method === "GET" ? route.read(route.group) : route.save(route.group, route.input, key);
+      const error = await failure(operation);
+      expect.soft(requests, "Local dot-group rejection must send no HTTP request").toEqual([]);
+      expectLocalRejection(error);
+    });
+  },
+);
+it.each(resources.flatMap(resource => ["%2E", "%2e%2e", "a.b", "...", "a/../b"].map(group => ({ ...resource, group })) ))(
+  "$resource preserves addressable group $group on the actual native HTTP path", async resource => {
+    const receipt = { ...resource.receipt, group_id: resource.group };
+    await withRawResponse(200, JSON.stringify(receipt), async requests => {
+      await expect(resource.read(resource.group)).resolves.toEqual(receipt);
+      await expect(resource.save(resource.group, resource.input, key)).resolves.toEqual(receipt);
+      expect(requests.map(request => request.path)).toEqual(Array(2).fill(
+        `/api/v1/groups/${encodeURIComponent(resource.group)}/coordination/${resource.resource}`,
+      ));
+      expect(requests.map(request => request.method)).toEqual(["GET", "PUT"]);
+    });
+  },
+);
+it.each([".", ".."])('keeps non-path member ID "%s" under the existing domain validator', async member_id => {
+  const coordinator = { ...binding, member_id, revision: 1 };
+  const dispatch = { ...policy, allowed_worker_ids: [member_id], revision: 1 };
+  transport.mockResolvedValueOnce(json(coordinator)).mockResolvedValueOnce(json(coordinator))
+    .mockResolvedValueOnce(json(dispatch)).mockResolvedValueOnce(json(dispatch));
+  await expect(getCoordinator(groupId)).resolves.toEqual(coordinator);
+  await expect(setCoordinator(groupId, { member_id, expected_revision: 0 }, key)).resolves.toEqual(coordinator);
+  await expect(getDispatchPolicy(groupId)).resolves.toEqual(dispatch);
+  await expect(setDispatchPolicy(groupId, { allowed_worker_ids: [member_id], expected_revision: 0 }, key)).resolves.toEqual(dispatch);
+});

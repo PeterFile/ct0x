@@ -30,6 +30,8 @@ const goEdgeSpace = new RegExp(`^${goSpace}|${goSpace}$`, "u");
 const encoder = new TextEncoder();
 const validIdentifier = (value: unknown): value is string => validText(value) && value !== ""
   && !goEdgeSpace.test(value) && !/[\0\r\n]/u.test(value) && encoder.encode(value).length <= 4096;
+// Exact dot groups are not addressable through fetch; member IDs keep the domain rule.
+const validGroupIdentifier = (value: unknown): value is string => validIdentifier(value) && value !== "." && value !== "..";
 const validKey = (value: unknown): value is string => typeof value === "string" && value.length >= 1
   && value.length <= 128 && !/[^\x21-\x7e]|,/.test(value);
 const validRevision = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
@@ -50,6 +52,26 @@ function isErrorEnvelope(value: unknown): value is { error: { code: string; mess
   if (!exactRecord(value, ["error"]) || !exactRecord(value.error, ["code", "message"])) return false;
   return validText(value.error.code) && value.error.code.trim() !== ""
     && validText(value.error.message) && value.error.message.trim() !== "";
+}
+
+function decodeResponse(buffer: ArrayBuffer): unknown {
+  const source = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+  const maximum = String(Number.MAX_SAFE_INTEGER);
+  // These DTOs have only one numeric field, revision; error envelopes contain only strings.
+  // Sticky tokens consume whole strings and fail incomplete quotes without rescanning suffixes.
+  const tokens = /"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/uy;
+  for (let index = 0; index < source.length; index++) {
+    if (!/["\d-]/u.test(source[index])) continue;
+    tokens.lastIndex = index;
+    const token = tokens.exec(source)?.[0];
+    if (token === undefined) return null;
+    index = tokens.lastIndex - 1;
+    if (token.startsWith('"')) continue;
+    // Go encodes int64 as integer tokens. Check syntax/range before JSON.parse can round.
+    if (!/^(?:0|[1-9]\d*)$/.test(token) || token.length > maximum.length
+      || (token.length === maximum.length && token > maximum)) return null;
+  }
+  return JSON.parse(source);
 }
 
 const rejectionMessages: Readonly<Record<number, string>> = {
@@ -82,7 +104,7 @@ async function request<T>(
     const canceled = init.signal?.aborted || (isRecord(error) && error.name === "AbortError");
     throw new ApiError(`${unknownResult}。`, 0, canceled ? "request_canceled" : "disconnected");
   }
-  const data: unknown = await response.json().catch(() => null);
+  const data: unknown = await response.arrayBuffer().then(decodeResponse).catch(() => null);
   if (response.status === 200 && valid(data)) return data;
   if (response.status !== 200 && isErrorEnvelope(data)) {
     const ErrorType = Object.hasOwn(rejectionMessages, response.status) ? ConfigurationRejection : ApiError;
@@ -93,18 +115,18 @@ async function request<T>(
 }
 
 export async function getCoordinator(groupId: string, signal?: AbortSignal): Promise<CoordinatorBinding> {
-  if (!validIdentifier(groupId)) throw invalidInput();
+  if (!validGroupIdentifier(groupId)) throw invalidInput();
   return request(groupId, "coordinator", { signal }, (value): value is CoordinatorBinding => isBinding(value, groupId));
 }
 export async function getDispatchPolicy(groupId: string, signal?: AbortSignal): Promise<DispatchPolicy> {
-  if (!validIdentifier(groupId)) throw invalidInput();
+  if (!validGroupIdentifier(groupId)) throw invalidInput();
   return request(groupId, "dispatch-policy", { signal }, (value): value is DispatchPolicy => isPolicy(value, groupId));
 }
 
 export async function setCoordinator(
   groupId: string, input: CoordinatorInput, key: string, signal?: AbortSignal,
 ): Promise<CoordinatorBinding> {
-  if (!validIdentifier(groupId) || !validKey(key) || !isRecord(input)) throw invalidInput();
+  if (!validGroupIdentifier(groupId) || !validKey(key) || !isRecord(input)) throw invalidInput();
   const sent: CoordinatorInput = { member_id: input.member_id, expected_revision: input.expected_revision };
   if (!validIdentifier(sent.member_id) || !validExpectedRevision(sent.expected_revision)) throw invalidInput();
   return request(groupId, "coordinator", {
@@ -116,7 +138,7 @@ export async function setCoordinator(
 export async function setDispatchPolicy(
   groupId: string, input: DispatchPolicyInput, key: string, signal?: AbortSignal,
 ): Promise<DispatchPolicy> {
-  if (!validIdentifier(groupId) || !validKey(key) || !isRecord(input)) throw invalidInput();
+  if (!validGroupIdentifier(groupId) || !validKey(key) || !isRecord(input)) throw invalidInput();
   const workers = input.allowed_worker_ids;
   // Copy the actual sent DTO before fetch; caller-owned arrays never participate in receipt matching.
   const sent: DispatchPolicyInput = {
