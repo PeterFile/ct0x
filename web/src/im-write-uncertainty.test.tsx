@@ -347,3 +347,37 @@ it.each(kinds)("%s still permits a corrected new-key operation after its first d
   expect(f.attempts[1].key).not.toBe(f.attempts[0].key); expect(f.attempts[1].body).not.toBe(f.attempts[0].body);
   expect(f.effects.size).toBe(1);
 });
+
+it.each(["Groups", "Members", "Discussion"] as const)("%s rejects an unrelated 201 after unknown and same-key 404 until the exact receipt arrives", async kind => {
+  const f = fixture(kind), onSelect = vi.fn();
+  let formName: string, primary: string, retryLabel: string;
+  switch (kind) {
+    case "Groups": render(<Groups onSelect={onSelect} />); await fillGroups(); formName = "创建群组"; primary = "群组名称"; retryLabel = "重试同一次创建"; break;
+    case "Members": render(<Members groupId={group.id} />); await fillMembers(); formName = "创建成员"; primary = "成员名称"; retryLabel = "重试同一次成员创建"; break;
+    case "Discussion": render(<Discussion groupId={group.id} members={{ [group.id]: [member] }} />); await fillDiscussion(); formName = "发送消息"; primary = "消息内容"; retryLabel = "重试同一次发送"; break;
+  }
+  const originalValues = within(form(formName)).getAllByRole("textbox").map(control => (control as HTMLInputElement).value);
+  submit(formName); await unknown(formName); frozen(formName, retryLabel);
+  f.reply({ status: 404, code: "not_found" }); fireEvent.click(retry(formName, retryLabel));
+  await unknown(formName, 404); frozen(formName, retryLabel);
+  const unrelated = {
+    Groups: { ...group, id: "unrelated-group", name: "另一个群组", description: "不匹配" },
+    Members: { ...member, id: "unrelated-member", name: "另一个成员", role: "不匹配" },
+    Discussion: { ...message, id: "unrelated-message", content: "完全不同的消息", deliveries: [] },
+  }[kind];
+  f.reply(Promise.resolve(json(unrelated, 201)));
+  await act(async () => { fireEvent.click(retry(formName, retryLabel)); });
+  frozen(formName, retryLabel); await unknown(formName, 201);
+  expect(within(form(formName)).getAllByRole("textbox").map(control => (control as HTMLInputElement).value)).toEqual(originalValues);
+  expect(onSelect).not.toHaveBeenCalled();
+  expect(screen.queryByRole("button", { name: "另一个成员" })).not.toBeInTheDocument();
+  expect(screen.queryByText("完全不同的消息")).not.toBeInTheDocument();
+  identical(f.attempts, 3); expect(f.effects.size).toBe(1);
+  f.reply("receipt"); fireEvent.click(retry(formName, retryLabel));
+  await waitFor(() => expect(field(primary)).toBeEnabled()); expect(field(primary)).toHaveValue("");
+  expect(within(form(formName)).queryByRole("alert")).not.toBeInTheDocument();
+  if (kind === "Groups") expect(onSelect).toHaveBeenCalledExactlyOnceWith({ ...group, ...JSON.parse(f.attempts[0].body) as GroupInput });
+  if (kind === "Members") expect(screen.getByRole("button", { name: "保留成员" })).toHaveAttribute("aria-pressed", "true");
+  if (kind === "Discussion") expect(screen.getByText(/消息已持久化/)).toBeVisible();
+  identical(f.attempts, 4); expect(f.effects.size).toBe(1);
+});
