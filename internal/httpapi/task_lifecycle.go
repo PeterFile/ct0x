@@ -4,7 +4,6 @@ import (
 	"errors"
 	"net/http"
 
-	"agentworkspace/internal/domain"
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/store"
 )
@@ -28,10 +27,6 @@ func (a localAPI) activateTaskAttempt(w http.ResponseWriter, r *http.Request) {
 	var input platform.TaskAttemptInput
 	key, ok := requestKey(w, r)
 	if !ok || !DecodeJSON(w, r, &input) {
-		return
-	}
-	if input.ExpectedRevision < 1 {
-		operationError(w, store.ErrInvalid)
 		return
 	}
 	attempt, err := a.local.ActivateTaskAttempt(r.Context(), r.PathValue("group"), r.PathValue("task"), input, key)
@@ -61,10 +56,6 @@ func (a localAPI) submitTask(w http.ResponseWriter, r *http.Request) {
 	if !ok || !DecodeJSON(w, r, &input) {
 		return
 	}
-	if input.ExpectedRevision < 1 {
-		operationError(w, store.ErrInvalid)
-		return
-	}
 	submission, err := a.local.SubmitTask(r.Context(), r.PathValue("group"), r.PathValue("task"), input, key)
 	taskLifecycleResult(w, http.StatusCreated, submission, err)
 }
@@ -90,10 +81,6 @@ func (a localAPI) reviewTask(w http.ResponseWriter, r *http.Request) {
 	var input platform.TaskReviewInput
 	key, ok := requestKey(w, r)
 	if !ok || !DecodeJSON(w, r, &input) {
-		return
-	}
-	if input.ExpectedRevision < 1 || (input.Outcome != domain.ReviewOutcomeAccepted && input.Outcome != domain.ReviewOutcomeRejected) {
-		operationError(w, store.ErrInvalid)
 		return
 	}
 	decision, err := a.local.ReviewTask(r.Context(), r.PathValue("group"), r.PathValue("task"), input, key)

@@ -185,6 +185,83 @@ func TestTaskLifecycleHTTPHumanRejectRetryAcceptAndDurableReplays(t *testing.T) 
 	taskLifecycleState(t, reopened, path, domain.TaskStatusAccepted, 2, "", secondSubmission.ID)
 }
 
+func TestTaskLifecycleHTTPSemanticValidationFollowsIdempotency(t *testing.T) {
+	a := openTaskLifecycleAPI(t, "")
+	g := newGroup(t, a, "group")
+	_, path := newTaskLifecycleTask(t, a, g.ID)
+	raw := messageSQL(t, a)
+	counts := map[string]int{"tasks": 1, "task_attempts": 0, "task_submissions": 0, "task_review_decisions": 0, "mutation_idempotency": 0}
+	type invalidPayload struct{ name, body string }
+	type receipt struct {
+		collection, body string
+		invalid          []invalidPayload
+		response         *httptest.ResponseRecorder
+	}
+	var receipts []receipt
+	previousID := ""
+	for _, operation := range []struct {
+		collection, table string
+		body              func(string) string
+	}{
+		{"attempts", "task_attempts", func(string) string { return taskLifecycleAttemptBody(1, "") }},
+		{"submissions", "task_submissions", func(id string) string { return taskLifecycleSubmissionBody(1, id) }},
+		{"reviews", "task_review_decisions", func(id string) string {
+			return taskLifecycleReviewBody(1, id, domain.ReviewOutcomeRejected)
+		}},
+	} {
+		body := operation.body(previousID)
+		invalid := []invalidPayload{{"revision", strings.Replace(body, `"expected_revision":1`, `"expected_revision":0`, 1)}}
+		if operation.collection == "reviews" {
+			invalid = append(invalid, invalidPayload{"outcome", strings.Replace(body, `"outcome":"rejected"`, `"outcome":"invalid"`, 1)})
+		}
+		before := decoded[domain.Task](t, a.request("GET", path, ""), 200)
+		for _, bad := range invalid {
+			taskLifecycleError(t, a.request("POST", path+"/"+operation.collection, bad.body, "semantic"), 400, "invalid_input")
+			if after := decoded[domain.Task](t, a.request("GET", path, ""), 200); !reflect.DeepEqual(after, before) {
+				t.Fatalf("fresh invalid %s/%s changed task: %+v", operation.collection, bad.name, after)
+			}
+			taskLifecycleCounts(t, raw, counts)
+		}
+		response := a.request("POST", path+"/"+operation.collection, body, "semantic")
+		previousID = decoded[struct{ ID string }](t, response, 201).ID
+		counts[operation.table]++
+		counts["mutation_idempotency"]++
+		receipts = append(receipts, receipt{operation.collection, body, invalid, response})
+	}
+	// Rejection advances the revision and clears both current pointers.
+	taskLifecycleState(t, a, path, domain.TaskStatusOpen, 2, "", "")
+	before := decoded[domain.Task](t, a.request("GET", path, ""), 200)
+	taskLifecycleCounts(t, raw, counts)
+	for _, r := range receipts {
+		target := path + "/" + r.collection
+		for _, bad := range r.invalid {
+			t.Run(r.collection+"/used-key-"+bad.name, func(t *testing.T) {
+				taskLifecycleError(t, a.request("POST", target, bad.body, "semantic"), 409, "conflict")
+			})
+		}
+		t.Run(r.collection+"/invalid-json", func(t *testing.T) {
+			for _, body := range []string{
+				`{`,
+				strings.Replace(r.body, `"expected_revision":1`, `"expected_revision":"1"`, 1),
+				strings.TrimSuffix(r.body, "}") + `,"actor_id":"forged"}`,
+				strings.TrimSuffix(r.body, "}") + `,"expected_revision":1}`,
+			} {
+				for _, keys := range [][]string{nil, {"fresh-json"}, {"semantic"}} {
+					taskLifecycleError(t, a.request("POST", target, body, keys...), 400, "invalid_json")
+				}
+			}
+		})
+		replay := a.request("POST", target, r.body, "semantic")
+		if replay.Code != 201 || !bytes.Equal(replay.Body.Bytes(), r.response.Body.Bytes()) {
+			t.Fatalf("%s historical replay changed: %d %s", r.collection, replay.Code, replay.Body)
+		}
+	}
+	if after := decoded[domain.Task](t, a.request("GET", path, ""), 200); !reflect.DeepEqual(after, before) {
+		t.Fatalf("conflicts, decode errors or replays changed task: %+v", after)
+	}
+	taskLifecycleCounts(t, raw, counts)
+}
+
 func TestTaskLifecycleHTTPRejectsInvalidInputAndMissingRefsWithoutWrites(t *testing.T) {
 	a := openTaskLifecycleAPI(t, "")
 	g := newGroup(t, a, "group")
