@@ -11,7 +11,7 @@ const inputName = (kind: "group" | "member") => kind === "group" ? "群组名称
 const select = (name: string) => fireEvent.click(screen.getByRole("button", { name }));
 async function open(kind: "group" | "member") {
   render(<App />); await screen.findByRole("button", { name: group.name });
-  if (kind === "member") select(group.name);
+  if (kind === "member") { select(group.name); fireEvent.click(screen.getByRole("button", { name: "成员" })); }
 }
 function fill(kind: "group" | "member", value: string) {
   fireEvent.change(sidebar(kind).getByRole("textbox", { name: inputName(kind) }), { target: { value } });
@@ -79,7 +79,8 @@ it("preserves per-group disclosure state and B's open draft while retrying colla
   expect(panel.getByRole("textbox", { name: "成员名称" })).toHaveValue("B 的草稿");
 });
 it("keeps history controls and composer in named focusable regions with a direct input link and no selected manifesto", async () => {
-  await open("member"); const main = within(screen.getByRole("main", { name: "讨论" }));
+  await open("member"); fireEvent.click(screen.getByRole("button", { name: "关闭详情" }));
+  const main = within(screen.getByRole("main", { name: "讨论" }));
   const intro = main.getByRole("region", { name: "群组简介" });
   expect(within(intro).getByRole("heading", { name: group.name })).toBeVisible();
   expect(within(intro).getByText(group.description)).toBeVisible();
