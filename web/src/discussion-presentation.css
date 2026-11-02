@@ -39,13 +39,33 @@
   border-inline-start: 0;
   border-inline-end: var(--border-accent);
 }
+.discussion-feed .message-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-1) var(--space-2);
+  min-inline-size: 0;
+}
+.discussion-feed .message-actions > .message-task-action,
+.discussion-feed .message-actions > .message-details > summary {
+  min-block-size: var(--space-6);
+  padding: var(--space-1) var(--space-2);
+}
+.discussion-feed .message-actions > .message-task-action {
+  border: 0;
+  background: transparent;
+  color: var(--color-muted);
+  font-size: var(--text-small);
+}
+.discussion-feed .message-actions > .message-task-action:hover { color: var(--color-accent); }
+.discussion-feed .message-actions > .message-details[open] { flex-basis: 100%; }
 .discussion-feed .message-details {
   min-inline-size: 0;
   color: var(--color-muted);
   font-size: var(--text-small);
   overflow-wrap: anywhere;
 }
-.discussion-feed .message-local .message-details:not([open]) { justify-self: end; }
+.discussion-feed .message-local .message-actions { justify-content: flex-end; }
 .discussion-feed .message-details summary {
   min-block-size: var(--target-min);
   padding-block: var(--space-2);
