@@ -1,6 +1,6 @@
 /* Openbot ac99196, PolyForm Noncommercial 1.0.0. See /licenses/openbot/index.html.
  * Extracted ranges and React integration changes: docs/openbot-shell.md.
- * All selectors are scoped; the default entry never imports this sheet.
+ * All selectors are scoped; the classic entry never imports this sheet.
  */
 
 /* src/renderer/src/styles/app-shell.css:24-46 — frame geometry, without the resizer column. */

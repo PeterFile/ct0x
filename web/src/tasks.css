@@ -63,3 +63,7 @@
 .tasks-panel input, .tasks-panel textarea { width: 100%; }
 .tasks-panel textarea { resize: vertical; min-height: calc(var(--target-min) * 2); }
 .tasks-panel [role="alert"] { color: var(--color-accent); }
+.tasks-panel .tasks-lifecycle, .tasks-panel .tasks-delivery { display: grid; gap: var(--space-3); min-width: 0; }
+.tasks-panel .tasks-delivery { border-block-start: var(--border-rule); padding-block-start: var(--space-3); }
+.tasks-panel .tasks-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.tasks-panel .tasks-artifact-refs { margin: 0; padding-inline-start: var(--space-5); }
