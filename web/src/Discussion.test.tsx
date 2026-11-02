@@ -300,10 +300,12 @@ it.each([["history", "receipt-first"], ["history", "read-first"], ["detail", "re
 it("preserves an already-read accepted row when an idempotent retry returns its stale queued receipt", async () => {
   await open(); await panel().findByText("尚无消息，可发送第一条讨论。"); change(raw);
   writes.mockRejectedValueOnce(new TypeError("offline")); submit(); await panel().findByRole("alert");
-  reads.mockResolvedValueOnce(page([{ ...message, content: raw, deliveries: [{ ...delivery, state: "accepted" }] }]));
-  fireEvent.click(panel().getByRole("button", { name: "刷新并重置历史窗口" })); await panel().findByText(/投递详情.*CLI已接收/);
+  reads.mockImplementation(async () => page([{ ...message, content: raw, deliveries: [{ ...delivery, state: "accepted" }] }]));
+  fireEvent.click(panel().getByRole("button", { name: "刷新并重置历史窗口" }));
+  await within(await panel().findByRole("article", { name: `消息 ${message.id}` })).findByText(/投递详情.*CLI已接收/);
   fireEvent.click(panel().getByRole("button", { name: "重试同一次发送" })); await panel().findByText(/消息已持久化/);
-  expect(article()).toHaveTextContent("CLI已接收");
+  expect(article()).toHaveTextContent("CLI已接收"); expect(article()).not.toHaveTextContent("已入队");
+  expect(writes).toHaveBeenCalledTimes(2);
   const attempts = writes.mock.calls.map(([, init]) => [init?.body, new Headers(init?.headers).get("Idempotency-Key")]);
   expect(attempts[1]).toEqual(attempts[0]);
 });

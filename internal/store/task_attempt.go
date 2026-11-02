@@ -77,6 +77,9 @@ func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTask
 		attempt, _, err := taskAttemptInTx(ctx, tx, input.GroupID, input.TaskID, id)
 		return attempt, err
 	}
+	if input.ExpectedRevision < 1 {
+		return domain.TaskAttempt{}, fmt.Errorf("%w：预期任务版本必须大于零", domain.ErrTaskInvalid)
+	}
 	task, err := taskInTx(ctx, tx, input.GroupID, input.TaskID)
 	if err != nil {
 		return domain.TaskAttempt{}, err
