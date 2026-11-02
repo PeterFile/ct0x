@@ -119,7 +119,7 @@ export async function requestWork(groupId: string, input: RequestWorkInput, key:
   let response: Response;
   try {
     response = await fetch(`/api/v1/groups/${encodeURIComponent(groupId)}/coordination/requests`, {
-      method: "POST", signal, headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body: JSON.stringify(sent),
+      method: "POST", redirect: "error", signal, headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body: JSON.stringify(sent),
     });
   } catch (error) {
     const canceled = signal?.aborted || (isRecord(error) && error.name === "AbortError");
