@@ -204,6 +204,7 @@ it.each(["network", 503, 408, 504, "malformed", "mismatched"])("locks unknown %s
   expect(field("验收条件")).toHaveValue(input.acceptance);
   fireEvent.click(panel().getByRole("button", { name: "重试同一次创建" }));
   await panel().findByText(successText); expect(attempt(1)).toEqual(original);
+  await current().findByText("当前任务标题");
   expect(writes).toHaveBeenCalledTimes(2); expect(reads).toHaveBeenCalledTimes(1);
 });
 it("protects a pending source across second-source clicks, close/reopen and source removal", async () => {

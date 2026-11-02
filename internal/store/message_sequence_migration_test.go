@@ -142,13 +142,25 @@ func messageSequenceRows(t *testing.T, db *sql.DB, query string) [][]any {
 	return values
 }
 
+func messageSequenceTableRows(t *testing.T, s *Store, table string) [][]any {
+	t.Helper()
+	columns := messageSequenceRows(t, s.db, "SELECT name FROM pragma_table_xinfo('"+strings.ReplaceAll(table, "'", "''")+"') WHERE hidden<>1 ORDER BY cid")
+	var order []string
+	for _, column := range columns {
+		quoted := `"` + strings.ReplaceAll(column[0].(string), `"`, `""`) + `"`
+		// Types distinguish equal numeric values; BINARY avoids collation-dependent ties.
+		order = append(order, "typeof("+quoted+")", quoted+" COLLATE BINARY")
+	}
+	return messageSequenceRows(t, s.db, `SELECT * FROM "`+strings.ReplaceAll(table, `"`, `""`)+`" ORDER BY `+strings.Join(order, ","))
+}
+
 func messageSequenceSnapshot(t *testing.T, s *Store) map[string][][]any {
 	t.Helper()
 	names := messageSequenceRows(t, s.db, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name<>'schema_migrations' ORDER BY name")
 	snapshot := make(map[string][][]any, len(names))
 	for _, name := range names {
 		table := name[0].(string)
-		snapshot[table] = messageSequenceRows(t, s.db, `SELECT * FROM "`+strings.ReplaceAll(table, `"`, `""`)+`" ORDER BY rowid`)
+		snapshot[table] = messageSequenceTableRows(t, s, table)
 	}
 	return snapshot
 }
@@ -156,7 +168,7 @@ func messageSequenceSnapshot(t *testing.T, s *Store) map[string][][]any {
 func messageSequencePreserved(t *testing.T, s *Store, snapshot map[string][][]any) {
 	t.Helper()
 	for table, want := range snapshot {
-		got := messageSequenceRows(t, s.db, `SELECT * FROM "`+strings.ReplaceAll(table, `"`, `""`)+`" ORDER BY rowid`)
+		got := messageSequenceTableRows(t, s, table)
 		if !reflect.DeepEqual(got, want) {
 			t.Fatalf("migration changed original %s rows: %+v; want %+v", table, got, want)
 		}
