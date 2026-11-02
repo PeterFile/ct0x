@@ -4,19 +4,22 @@
 
 ```go
 provider.NewPiMemberToolExecutor(selected Provider, extensionPath, configPath string, timeout time.Duration) (Executor, error)
+provider.NewPiMemberToolExecutorWithTools(selected Provider, extensionPath, configPath string, toolNames []string, timeout time.Duration) (Executor, error)
 ```
+
+旧构造器委托新接口，仍只启用原四项。新接口只接收可信 runtime 名单：六个精确名称 `list_members/read_channel/send_message/create_member/search_history/read_history` 的非空、无重复子集；拒绝空白、大小写变体及未知名。构造时生成独立规范快照（原四项后接 search/read history），调用方随后修改 slice 无效；不新增模型/HTTP profile 选择器。Prepare 进一步只接受完整四项或完整六项。
 
 仅接受已确认安装、版本严格为 `1.4.0` 的 Pi；复用 `NewExecutor` 的 ID、可执行路径、版本和超时校验，不启动探针，不修改所选 Provider 元数据或能力声明。Codex、未知提供方及其他版本均拒绝。超时为零仍默认十分钟，负数拒绝。
 
 调用方必须提供并维护可信文件：
 
-- `extensionPath`：非空绝对本地文件路径，目标是可读普通文件；应指向已审查、仅注册四项成员工具的入口。
+- `extensionPath`：非空绝对本地文件路径，目标是可读普通文件；应指向已审查的成员工具入口；当前注册六项 schema，实际启用项由精确 allowlist 决定。
 - `configPath`：绝对路径、非符号链接的普通文件，权限严格为 `0600`，JSON 对象恰有 `endpoint`、`token` 两个字段。调用方负责正确内容、与 CLI 一致的文件所有者，以及文件、扩展依赖和所有祖先路径在执行器生命周期内的可信性与不可变性。这不是针对恶意调用方的路径竞态防护。
-- provider 只检查文件元数据，不读取或解析配置内容；bridge 在子进程内读取、校验 JSON 一次。构造器只保存路径字符串；失败返回固定中文错误，不回显路径、底层错误或配置内容。
+- provider 只检查文件元数据，不读取或解析配置内容；bridge 在子进程内读取、校验 JSON 一次。构造器只保存路径字符串及冻结的规范工具名单；失败返回固定中文错误，不回显路径、底层错误或配置内容。
 
 仅把配置的绝对路径注入子进程的 `AGENT_WORKSPACE_MEMBER_TOOL_CONFIG`；移除继承环境中该键的所有重复值后追加唯一值，不修改父进程环境。token 不进入 argv、提示词、日志、模型可见 schema、响应或回执。其保密还依赖可信入口及服务端拒绝回显敏感数据；provider 不读 token，不能替不可信扩展做内容脱敏。
 
-本 slice **不签发 token，不做 postclaim 授权，不接调度或运行时路由**；调用方的执行身份、群组、权限和生命周期绑定仍由服务端负责。四项工具只能执行服务端授权的平台操作，但扩展代码与 Pi 拥有相同的宿主机权限；禁用内置工具不是文件系统沙箱，也不意味着平台操作只读。
+本 slice **不签发 token，不做 postclaim 授权，不接调度或运行时路由**；调用方的执行身份、群组、权限和生命周期绑定仍由服务端负责。启用的工具只能执行服务端授权的平台操作，但扩展代码与 Pi 拥有相同的宿主机权限；禁用内置工具不是文件系统沙箱，也不意味着平台操作只读。
 
 ## 启动参数与默认兼容
 
@@ -27,7 +30,7 @@ provider.NewPiMemberToolExecutor(selected Provider, extensionPath, configPath st
 --extension <trusted absolute entrypoint>
 ```
 
-Pi 1.4.0 的 `--no-extensions` 仍允许显式 `--extension`。`ExecuteRequest`、现有构造器和 factory 不变；普通 Pi 保持禁用工具，普通 Pi/Codex 的 argv 和原始行预算不变。`--offline` 禁止启动时的自动联网，不禁止显式模型请求或这些工具的授权 HTTP 请求。
+六工具 profile 仅把上述 `--tools` 值替换为 `list_members,read_channel,send_message,create_member,search_history,read_history`；其他 argv 不变。Pi 1.4.0 的 `--no-extensions` 仍允许显式 `--extension`。`ExecuteRequest`、旧构造器签名和 factory 类型不变；普通 Pi 保持禁用工具，普通 Pi/Codex 的 argv 和原始行预算不变。`--offline` 禁止启动时的自动联网，不禁止显式模型请求或这些工具的授权 HTTP 请求。
 
 ## 独立的帧、队列与日志预算
 
@@ -57,7 +60,9 @@ Pi 1.4.0 的 `--no-extensions` 仍允许显式 `--extension`。`ExecuteRequest`�
 
 只读核对安装版 Pi 1.4.0：`pi-coding-agent/dist/modes/print-mode.js:84–86` 对事件直接 `JSON.stringify` 加 LF；`json-event.js:16–18` 只转换 `message_update`。`pi-agent-core/dist/types.d.ts:452–497`、`agent-loop.js:48–55,170–185,654+`，以及 `pi-ai/dist/types.d.ts:271,368,420` 定义对象参数、结果文本及累计事件；`agent-session.js:753` 添加 `willRetry`。bridge `ee1ee4f` 的 `details: undefined` 在 JSON 中省略。显式扩展加载的既有 help 证据位于本地 `.local/evidence/live-loop-20261101/logs/pi-help.txt`。
 
-新增测试前缀为 `TestPiMemberTools`、`TestExecutionFrames`，仅使用临时假 CLI、合成凭据及程序生成的原生 JSONL，无模型、认证、服务或真实 HTTP 调用。测试分别覆盖构造/argv/env、原生协议和帧队列；额外篇幅用于完整原生重复事件，而非提交大数据文件：
+H2 的 `TestPiMemberToolsHistory*` 额外覆盖新接口校验/零进程构造、调用后 slice 篡改、规范四/六/subset argv 及原四项兼容。实际六 schema 与四/六 active/callable 的真实 Pi 1.4 SDK 无 prompt 会话证据位于 bridge 包；不使用个人凭据或模型发现，不代表产品 H3 接线或 provider 验收。
+
+原有测试前缀为 `TestPiMemberTools`、`TestExecutionFrames`，仅使用临时假 CLI、合成凭据及程序生成的原生 JSONL，无模型、认证、服务或真实 HTTP 调用。测试分别覆盖构造/argv/env、原生协议和帧队列；额外篇幅用于完整原生重复事件，而非提交大数据文件：
 
 - 65536 字节紧凑请求对象、65536 字节含 LF 的结果 JSON，四种工具的完整多轮序列；生成约 1.58 MB 输出、最大帧 330026 字节，证明日志截断与完整成功互不混淆。
 - 八项合法 HTTP 结果构成整批 `turn_end` 和累计 `agent_end`，仅调节最后一项结果正文，使原始帧精确命中 1048576 / 1048577 字节及 CRLF 边界。约 5.24 MB 的临时流来自原生事件对结果的多次重复，不是任意巨大填充；覆盖后续响应、EOF、未知结果和直接子进程回收。

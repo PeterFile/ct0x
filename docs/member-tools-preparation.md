@@ -28,7 +28,7 @@ workspace --listen 127.0.0.1:0 --data-dir /absolute/private/data \
 
 ## 构造与信任边界
 
-`MemberTools` 必须是通过 `NewMemberToolRuntime` 构造的运行时，并借用与 `NewPreparer` **同一个 `*store.Store` 实例**；打开同一个数据库路径的另一个实例也不符合要求。运行时必须使用完整的 `list_members/read_channel/send_message/create_member` 四工具集合，顺序不限。原生适配器固定暴露四项，不能将较窄授权误报为完整工具能力。
+`MemberTools` 必须是通过 `NewMemberToolRuntime` 构造的运行时，并借用与 `NewPreparer` **同一个 `*store.Store` 实例**；打开同一个数据库路径的另一个实例也不符合要求。运行时必须使用两个完整 profile 之一：`list_members/read_channel/send_message/create_member` 原四项，或再加 `search_history/read_history` 的六项；顺序不限，窄集合、只追加一项 history 或未知/重复项仍拒绝。prompt 和 argv 都按原四项后接 search/read history 的规范顺序，只声明实际启用集合；旧 unordered-four 的精确文本和 argv 不变。H2 不修改 cmd，产品入口仍为原四项，六工具产品组合属后续 H3。
 
 扩展入口必须是绝对路径、无 NUL、可读的普通文件；与原生适配器一致，可经受信任的符号链接访问。组合根须保证扩展、相邻依赖和祖先在所有已准备执行结束前可信且稳定。此校验不认证扩展内容，也不是主机文件沙箱。运行时凭证根仍受其原有私有目录及稳定身份约束。
 
@@ -42,11 +42,11 @@ Prepare 继续核验数据库中的 queued delivery、群组、活跃成员、�
 
 包装器捕获权威 `GroupID/MemberID/ConversationID/DeliveryID/ProviderID/Model`。Prepare 不 claim、不生成 RunID、不签发 token，也不创建配置或 RunID 日志目录；已有工作区授权、目录身份检查以及私有 CWD 的创建/复用行为不变。
 
-调度器随后真实 `ClaimTurn` 并提供 RunID 与 RuntimeDir。B 在 Execute 内核验全新物理 Turn，签发绑定能力并写入已关闭的 0600 配置文件后，才通过可信 factory 调用 `provider.NewPiMemberToolExecutor`。只有配置路径进入子进程专用环境；token、凭证路径不进入提示词。B 返回前撤销能力、排空已授权调用并清理私有配置；不在此片复制其生命周期实现。
+调度器随后真实 `ClaimTurn` 并提供 RunID 与 RuntimeDir。B 在 Execute 内核验全新物理 Turn，签发绑定能力并写入已关闭的 0600 配置文件后，才通过可信 factory 把收到的 `toolNames` 原样交给 `provider.NewPiMemberToolExecutorWithTools`，由构造器验证并冻结规范快照。只有配置路径进入子进程专用环境；token、凭证路径不进入提示词。B 返回前撤销能力、排空已授权调用并清理私有配置；不在此片复制其生命周期实现。
 
 ## 能力与结果语义
 
-四工具仅在服务端绑定的群组、成员、会话、话题和物理 Turn 内执行基础操作。创建成员继承可信 provider/model，不授予外部 CWD。姓名、职责文本及创建成员不授予 Coordinator、Assignment、Mandate、RequestWork、工作准入、任务提交/接纳或评审权限；也不会自动调度授权工作。
+实际启用的四/六工具仅在服务端绑定的群组、成员、会话、话题和物理 Turn 内执行基础操作。可选 history 搜索返回前缀 excerpt，读取返回 Unicode rune 片段；不是默认全文读取，也不扩大范围。创建成员继承可信 provider/model，不授予外部 CWD。姓名、职责文本及创建成员不授予 Coordinator、Assignment、Mandate、RequestWork、工作准入、任务提交/接纳或评审权限；也不会自动调度授权工作。
 
 文件授权和 CWD 行为不变：未授予文件写入权限，CWD 不提供主机文件读取隔离。这里只支持全新单轮及已验证的原生能力，不新增恢复或运行中追加输入。
 
@@ -56,4 +56,4 @@ Prepare 继续核验数据库中的 queued delivery、群组、活跃成员、�
 
 C1 的临时假 CLI 测试验证准备、真实 claim 后包装、原生事件、能力清理及最终文本边界。C2 的 cmd 测试用临时 Go HTTP 服务、SQLite 与假 native CLI（调用 Go test helper，无 Node/Python 运行依赖），验证真实四工具路由、身份/话题隔离、幂等小收据、容量、继承模型、撤销、unknown/cancel 及关闭排空。fixture 主动丢弃一次 HTTP 响应并保留 unknown 工具结果，即使之后 native final 成功也不生成工具成功证据。
 
-这些是本地组合及合成协议证据，不是实际 Pi/bridge loader 或模型验收；不探测真实提供方、不读取认证、不宣称 Coordinator/Assignment/RequestWork 已接通。既有桥加载验证独立维护，真实验收仍需冻结产物经独立审核后另行批准。相关领域边界见 [架构](architecture.md) 与 [编排契约](orchestration.md)。
+上述 Go 测试是本地组合及合成协议证据；H2 另用真实 Pi 1.4 loader 与无 prompt 的 SDK 内存会话验证四/六 active/callable allowlist，不能以 session API 扩权，见 [bridge 验证](../extensions/pi-bridge/README.md)。均不是模型验收或 H3 产品六工具接通证据；不探测真实提供方、不读取认证、不宣称 Coordinator/Assignment/RequestWork 已接通。既有桥加载验证独立维护，真实验收仍需冻结产物经独立审核后另行批准。相关领域边界见 [架构](architecture.md) 与 [编排契约](orchestration.md)。
