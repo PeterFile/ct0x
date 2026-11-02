@@ -55,6 +55,9 @@ func reviewTaskInTx(ctx context.Context, tx *sql.Tx, input ReviewTaskInput) (dom
 	if replay {
 		return taskReviewInTx(ctx, tx, input.GroupID, input.TaskID, id)
 	}
+	if input.ExpectedRevision < 1 || (input.Outcome != domain.ReviewOutcomeAccepted && input.Outcome != domain.ReviewOutcomeRejected) {
+		return domain.ReviewDecision{}, fmt.Errorf("%w：预期任务版本或评审结论无效", domain.ErrTaskInvalid)
+	}
 	task, err := taskInTx(ctx, tx, input.GroupID, input.TaskID)
 	if err != nil {
 		return domain.ReviewDecision{}, err

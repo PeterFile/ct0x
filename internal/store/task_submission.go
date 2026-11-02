@@ -56,6 +56,9 @@ func submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (dom
 	if replay {
 		return taskSubmissionInTx(ctx, tx, input.GroupID, input.TaskID, id)
 	}
+	if input.ExpectedRevision < 1 {
+		return domain.Submission{}, fmt.Errorf("%w：预期任务版本必须大于零", domain.ErrTaskInvalid)
+	}
 	task, err := taskInTx(ctx, tx, input.GroupID, input.TaskID)
 	if err != nil {
 		return domain.Submission{}, err
