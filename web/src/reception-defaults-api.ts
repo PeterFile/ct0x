@@ -64,7 +64,7 @@ function rejectionText(status: number, code: string) {
 }
 async function request<T>(init: RequestInit, valid: (value: unknown) => value is T): Promise<T> {
   let response: Response;
-  try { response = await fetch(endpoint, init); }
+  try { response = await fetch(endpoint, { ...init, redirect: "error" }); }
   catch (error) {
     if (init.signal?.aborted) throw error;
     throw new ApiError("无法连接本地服务，请确认服务已启动。");

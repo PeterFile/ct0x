@@ -1,11 +1,14 @@
+import { once } from "node:events";
+import { createServer } from "node:http";
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ReceptionDefaults } from "./ReceptionDefaults";
-import type { ReceptionDefaultsInput } from "./reception-defaults-api";
+import type { ReceptionConfiguration, ReceptionDefaultsInput } from "./reception-defaults-api";
 import { deferred, json, page } from "./test/groups";
 import { provider } from "./test/members";
 import { endpoint, saved, settings } from "./test/reception-defaults";
 
+const nativeFetch = globalThis.fetch;
 const reads = vi.fn<typeof fetch>(), writes = vi.fn<typeof fetch>(), catalogue = vi.fn<typeof fetch>();
 const runtime = { ...provider, account: "unknown", version: "future-version", connectivity: "unchecked" };
 const model = () => screen.getByRole("textbox", { name: "模型" });
@@ -138,6 +141,64 @@ it.each(["network", "server", "malformed200", "201"])("locks the exact operation
   expect(summary().queryByText(saved.model)).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "重试同一次保存" })); await screen.findByText("版本 1");
   expect(attempt(1)).toEqual(attempt(0)); expect(model()).toBeEnabled();
+});
+it.each([303, 307])("keeps a real HTTP %s save redirect unknown without contacting its target and retries the exact operation", async status => {
+  type Request = { method: string | undefined; body: string; key: string | string[] | undefined };
+  const originals: Request[] = [], targets: Request[] = [];
+  let committed: ReceptionConfiguration | undefined;
+  const server = createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", chunk => { body += chunk; });
+    request.on("end", () => {
+      const received = { method: request.method, body, key: request.headers["idempotency-key"] };
+      if (request.url === endpoint && request.method === "PUT") {
+        originals.push(received);
+        if (originals.length === 1) {
+          const input = JSON.parse(body) as ReceptionDefaultsInput;
+          committed = { ...saved, id: "defaults-2", revision: input.expected_revision + 1,
+            provider_id: input.provider_id, model: input.model, role: input.role };
+          response.writeHead(status, { Location: "/redirect-target" }).end();
+        } else {
+          response.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(committed));
+        }
+      } else {
+        targets.push(received);
+        response.writeHead(404, { "Content-Type": "application/json" }).end(JSON.stringify({ error: { code: "not_found", message: "Not found" } }));
+      }
+    });
+  });
+  try {
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Expected a loopback TCP address");
+    writes.mockImplementation((_url, init) => nativeFetch(`http://127.0.0.1:${address.port}${endpoint}`, init));
+    reads.mockResolvedValueOnce(settings(saved));
+    render(<ReceptionDefaults />); await screen.findByText("版本 1"); await draft();
+    const exact = { provider_id: runtime.id, model: " 自选模型 ", role: " 保留职责\n ", expected_revision: saved.revision };
+    change("模型", exact.model); change("职责", exact.role); submit();
+    const alert = await screen.findByRole("alert");
+    expect(originals).toHaveLength(1);
+    expect(originals[0].method).toBe("PUT"); expect(originals[0].body).toBe(JSON.stringify(exact));
+    expect(originals[0].key).toMatch(/^[\da-f-]{36}$/);
+    expect(targets).toEqual([]);
+    expect(alert).toHaveTextContent("保存结果未确认");
+    expect(model()).toBeDisabled(); expect(role()).toBeDisabled(); expect(selection()).toBeDisabled();
+    expect(model()).toHaveValue(exact.model); expect(role()).toHaveValue(exact.role);
+    expect(summary().getByText("版本 1")).toBeVisible(); expect(summary().queryByText("版本 2")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重试同一次保存" })); await screen.findByText("版本 2");
+    expect(originals).toHaveLength(2); expect(originals[1]).toEqual(originals[0]); expect(attempt(1)).toEqual(attempt(0));
+    expect(targets).toEqual([]); expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(model()).toBeEnabled(); expect(role()).toBeEnabled(); expect(selection()).toBeEnabled();
+    expect(summary().getByText(exact.model.trim())).toBeVisible();
+    expect(screen.queryByRole("button", { name: "重试同一次保存" })).not.toBeInTheDocument();
+  } finally {
+    if (server.listening) await new Promise<void>((resolve, reject) => {
+      server.close(error => error ? reject(error) : resolve());
+      server.closeAllConnections();
+    });
+  }
 });
 it("does not reconcile an unknown save by GET or replace its draft, revision or key", async () => {
   await open(); await draft(); writes.mockRejectedValueOnce(new TypeError("offline")); submit(); await screen.findByRole("alert");

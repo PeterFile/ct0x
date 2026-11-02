@@ -15,7 +15,7 @@ it("reads the live settings endpoint with a signal and preserves the not-configu
   transport.mockResolvedValueOnce(settings());
   expect(await getReceptionDefaults(signal)).toEqual({ configuration: null,
     availability: { code: "not_configured", message: "服务提供的状态说明。" }, execution_enabled: false });
-  expect(transport).toHaveBeenCalledExactlyOnceWith(endpoint, { signal });
+  expect(transport).toHaveBeenCalledExactlyOnceWith(endpoint, { signal, redirect: "error" });
 });
 it.each(["configured", "provider_unavailable"])("accepts a saved snapshot with %s availability, independently of execution", async code => {
   transport.mockResolvedValueOnce(json({ configuration: saved, availability: { code, message: "状态说明" }, execution_enabled: false }));
@@ -29,6 +29,7 @@ it("sends only the four input fields with an exact, untrimmed body, key, JSON co
   await setReceptionDefaults(untrusted, "same-save-key", signal);
   const [url, init] = transport.mock.calls[0];
   expect(url).toBe(endpoint); expect(init?.method).toBe("PUT"); expect(init?.signal).toBe(signal);
+  expect(init?.redirect).toBe("error");
   expect(init?.body).toBe(JSON.stringify(exact));
   expect(Object.fromEntries(new Headers(init?.headers))).toEqual({ "content-type": "application/json", "idempotency-key": "same-save-key" });
 });
