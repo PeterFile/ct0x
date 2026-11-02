@@ -2,8 +2,8 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection } from "./api";
 import type { Group } from "./api";
-import { createTask, getTask, listTasks } from "./task-api";
-import type { Task, TaskInput } from "./task-api";
+import { createTask, getTask, getTaskAttempt, getTaskSubmission, listTasks, registerTaskAttempt, reviewTask, submitTask } from "./task-api";
+import type { Task, TaskAttempt, TaskAttemptInput, TaskInput, TaskReview, TaskReviewInput, TaskSubmission, TaskSubmissionInput } from "./task-api";
 import "./tasks.css";
 
 const statusText = { open: "待交付", submitted: "待验收", accepted: "已接纳" };
@@ -33,6 +33,13 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
   const [selection, setSelection] = useState<{ id: string | null; version: number }>({ id: null, version: 0 });
   const [detail, setDetail] = useState<{ task: Task | null; pending: boolean; error: string }>({ task: null, pending: false, error: "" });
+  const [openedTasks, setOpenedTasks] = useState<string[]>([]);
+  const visible = useRef({ active, taskId: selection.id });
+  visible.current = { active, taskId: selection.id };
+  useEffect(() => {
+    const id = selection.id;
+    if (id) setOpenedTasks(previous => previous.includes(id) ? previous : [...previous, id]);
+  }, [selection.id]);
   const [draft, setDraft] = useState(emptyDraft);
   const [mutation, setMutation] = useState({ pending: false, uncertain: false, error: "" });
   const confirmed = useRef<{ task: Task; startedAfterRead: number; confirmedAfterRead: number }[]>([]);
@@ -75,7 +82,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
     return () => { ignore = true; controller.abort(); };
   }, [active, groupId, request]);
   useEffect(() => {
-    if (!active || !selection.id) return;
+    if (!active || !selection.id) { setDetail({ task: null, pending: false, error: "" }); return; }
     let ignore = false;
     const controller = new AbortController();
     setDetail({ task: null, pending: true, error: "" });
@@ -118,6 +125,9 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
     } finally { posting.current = null; successfulReads.current.clear(); }
   }
 
+  const refreshAfterReceipt = (taskId: string) => {
+    if (visible.current.active && visible.current.taskId === taskId) { load(); select(taskId); }
+  };
   const selected = detail.task?.id === selection.id ? detail.task : null;
   return <section className="tasks-scope" aria-label="群组任务">
     <header className="tasks-toolbar"><h2>任务</h2><button type="button" onClick={() => { load(); select(); }}>刷新任务</button></header>
@@ -151,6 +161,10 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
             <dt>创建时间</dt><dd className="tasks-meta"><time dateTime={selected.created_at}>{selected.created_at}</time></dd>
           </dl>
         </> : null}
+        {/* Retain each task's drafts and immutable operation without reading hidden tasks. */}
+        {openedTasks.map(id => <div key={id} hidden={id !== selection.id}>
+          <TaskLifecycle groupId={groupId} taskId={id} task={active && selected?.id === id ? selected : null} onReceipt={refreshAfterReceipt} />
+        </div>)}
       </section> : <p className="tasks-note">选择任务以读取最新详情。</p>}
     </div>
     <form aria-label="创建任务" onSubmit={submit}>
@@ -168,4 +182,151 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
       <button type="submit" disabled={mutation.pending}>{mutation.pending ? "正在创建任务…" : mutation.uncertain ? "重试同一次任务创建" : "创建任务"}</button>
     </form>
   </section>;
+}
+
+type LifecycleOperation = { key: string } & (
+  { kind: "attempt"; input: TaskAttemptInput } | { kind: "submission"; input: TaskSubmissionInput }
+  | { kind: "review"; input: TaskReviewInput; evidence: Readonly<TaskSubmission> }
+);
+type LifecycleReceipt = TaskAttempt | TaskSubmission | TaskReview;
+
+function TaskLifecycle({ groupId, taskId, task, onReceipt }: {
+  groupId: string; taskId: string; task: Task | null; onReceipt: (taskId: string) => void;
+}) {
+  const formId = useId();
+  const [summary, setSummary] = useState("");
+  const [reason, setReason] = useState("");
+  const [content, setContent] = useState<{
+    task: Task | null; attempt: TaskAttempt | null; submission: TaskSubmission | null; pending: boolean; error: string;
+  }>({ task: null, attempt: null, submission: null, pending: false, error: "" });
+  const [mutation, setMutation] = useState<{ pending: boolean; uncertain: boolean; error: string; receipt: LifecycleReceipt | null }>(
+    { pending: false, uncertain: false, error: "", receipt: null });
+  const operation = useRef<LifecycleOperation | null>(null);
+  const posting = useRef(false);
+  const mounted = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
+  useEffect(() => {
+    let ignore = false;
+    const controller = new AbortController();
+    const empty = { task, attempt: null, submission: null, pending: false, error: "" };
+    setContent(empty);
+    if (!task) return;
+    const load = async () => {
+      if (task.status === "open" && task.active_attempt_id) {
+        const attempt = await getTaskAttempt(groupId, taskId, task.active_attempt_id, controller.signal);
+        if (ignore) return;
+        if (attempt.task_revision !== task.revision) throw new ApiError("当前尝试与任务详情不匹配，请刷新详情。");
+        setContent({ ...empty, attempt });
+      } else if (task.current_submission_id) {
+        const submission = await getTaskSubmission(groupId, taskId, task.current_submission_id, controller.signal);
+        if (ignore) return;
+        if (submission.task_revision !== task.revision || (task.status === "submitted" && submission.attempt_id !== task.active_attempt_id)) {
+          throw new ApiError("当前交付与任务详情不匹配，请刷新详情。");
+        }
+        setContent({ ...empty, submission });
+      }
+    };
+    if (task.active_attempt_id || task.current_submission_id) setContent({ ...empty, pending: true });
+    void load().catch(error => { if (!ignore) setContent({ ...empty, error: errorText(error) }); });
+    return () => { ignore = true; controller.abort(); };
+  }, [groupId, taskId, task]);
+
+  // Each authoritative Task object is a read epoch, also fencing the render before effects run.
+  const loaded = content.task === task ? content : null;
+  const attempt = loaded?.attempt, submission = loaded?.submission;
+  const blocked = mutation.pending || mutation.uncertain;
+  async function mutate(kind?: LifecycleOperation["kind"], outcome?: TaskReview["outcome"]) {
+    if (posting.current || (operation.current && kind)) return;
+    if (!operation.current) {
+      if (!task) return;
+      if (kind === "attempt" && task.status === "open" && !task.active_attempt_id) {
+        operation.current = { key: crypto.randomUUID(), kind, input: Object.freeze({ expected_revision: task.revision, expected_active_attempt_id: "" }) };
+      } else if (kind === "submission" && task.status === "open" && attempt?.turn_id === "") {
+        if (!summary.trim()) { setMutation({ pending: false, uncertain: false, error: "请输入交付摘要。", receipt: null }); return; }
+        operation.current = { key: crypto.randomUUID(), kind, input: Object.freeze({ expected_revision: task.revision, attempt_id: attempt.id, summary }) };
+      } else if (kind === "review" && task.status === "submitted" && submission && outcome) {
+        const evidence = { ...submission, artifact_versions: submission.artifact_versions.map(ref => Object.freeze({ ...ref })) };
+        Object.freeze(evidence.artifact_versions);
+        operation.current = { key: crypto.randomUUID(), kind, evidence: Object.freeze(evidence),
+          input: Object.freeze({ expected_revision: task.revision, submission_id: submission.id, outcome, reason }) };
+      } else return;
+      Object.freeze(operation.current);
+    }
+    const current = operation.current;
+    posting.current = true;
+    setMutation({ pending: true, uncertain: false, error: "", receipt: null });
+    try {
+      const receipt = current.kind === "attempt" ? await registerTaskAttempt(groupId, taskId, current.input, current.key)
+        : current.kind === "submission" ? await submitTask(groupId, taskId, current.input, current.key)
+          : await reviewTask(groupId, taskId, current.input, current.evidence, current.key);
+      if (!mounted.current) return;
+      operation.current = null;
+      if (current.kind === "submission") setSummary("");
+      if (current.kind === "review") setReason("");
+      setMutation({ pending: false, uncertain: false, error: "", receipt });
+      // A receipt is immutable evidence, never the current Task or a navigation instruction.
+      onReceipt(taskId);
+    } catch (error) {
+      if (!mounted.current) return;
+      const uncertain = !isDefinitiveRejection(error);
+      if (!uncertain) operation.current = null;
+      setMutation({ pending: false, uncertain, receipt: null, error: uncertain
+        ? `操作结果未确认。${errorText(error)} 请重试同一次操作。` : errorText(error) });
+    } finally { posting.current = false; }
+  }
+
+  const review = mutation.receipt && "outcome" in mutation.receipt ? mutation.receipt : null;
+  return <div className="tasks-lifecycle">
+    {mutation.pending ? <p role="status">正在保存操作，请等待回执…</p> : null}
+    {mutation.receipt ? <p role="status" className="tasks-meta">已确认操作回执：{mutation.receipt.id}。</p> : null}
+    {review ? <section className="tasks-delivery" aria-label="审查回执">
+      <h3>实际审查决定</h3>
+      <dl><dt>决定</dt><dd>{review.outcome === "accepted" ? "接纳交付" : "退回修改"}</dd>
+        <dt>说明</dt><dd className="tasks-copy">{review.reason || "未填写说明"}</dd>
+        <dt>审查标识</dt><dd className="tasks-meta">{review.id}</dd></dl>
+      <p className="tasks-note">此回执记录原始决定；当前任务状态以最新详情为准。</p>
+    </section> : null}
+    {mutation.error ? <p role="alert">{mutation.error}</p> : null}
+    {mutation.uncertain ? <button type="button" onClick={() => void mutate()}>重试同一次操作</button> : null}
+    {loaded?.error ? <p role={task?.status === "accepted" ? "status" : "alert"}>{loaded.error}</p> : null}
+    {task?.status === "open" ? <>
+      {!task.active_attempt_id ? <>
+        <button type="button" disabled={blocked} onClick={() => void mutate("attempt")}>登记人工尝试</button>
+        <p className="tasks-note">登记只记录人工尝试，不会启动成员执行。</p>
+      </> : !loaded || loaded.pending ? <p role="status">正在载入当前尝试…</p>
+        : attempt?.turn_id ? <>
+          <p className="tasks-note">该尝试属于成员，不能人工替换或提交交付。</p><p className="tasks-meta">{attempt.turn_id}</p>
+        </> : attempt ? <form aria-label="提交交付" onSubmit={event => { event.preventDefault(); void mutate("submission"); }}>
+          <fieldset disabled={blocked}>
+            <legend>提交交付</legend><p className="tasks-note">仅文本成果，不附加文件或成果版本</p>
+            <label htmlFor={`${formId}-summary`}>交付摘要</label>
+            <textarea id={`${formId}-summary`} required value={summary} onChange={event => setSummary(event.target.value)} />
+            <button type="submit">提交交付</button>
+          </fieldset>
+        </form> : null}
+    </> : null}
+    {task && task.status !== "open" ? <>
+      <section className="tasks-delivery" aria-label="当前交付" aria-busy={!loaded || loaded.pending}>
+        <h3>当前交付</h3>
+        {!loaded || loaded.pending ? <p role="status">正在载入当前交付…</p> : null}
+        {submission ? <>
+          <p className="tasks-copy">{submission.summary}</p><p className="tasks-meta">提交者：{submission.submitted_by}</p>
+          {submission.artifact_versions.length ? <ul className="tasks-artifact-refs" aria-label="冻结成果版本">
+            {submission.artifact_versions.map(ref => <li key={JSON.stringify([ref.artifact_id, ref.version_id])} className="tasks-meta">{ref.artifact_id} / {ref.version_id}</li>)}
+          </ul> : <p className="tasks-note">无冻结成果版本，仅文本交付。</p>}
+        </> : null}
+      </section>
+      {task.status === "submitted" ? <fieldset disabled={blocked || !submission}>
+        <legend>人工验收</legend><label htmlFor={`${formId}-reason`}>验收说明（可选）</label>
+        <textarea id={`${formId}-reason`} value={reason} onChange={event => setReason(event.target.value)} />
+        <div className="tasks-actions">
+          <button type="button" onClick={() => void mutate("review", "accepted")}>接纳交付</button>
+          <button type="button" onClick={() => void mutate("review", "rejected")}>退回修改</button>
+        </div>
+      </fieldset> : null}
+    </> : null}
+  </div>;
 }
