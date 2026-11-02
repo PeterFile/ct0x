@@ -289,14 +289,112 @@ func assignmentV12Fixture(t *testing.T) (*Store, string, func(*Store)) {
 	}
 }
 
+type assignmentOriginalTableSnapshot struct {
+	columns [][]any // Original names and declared types, in column order.
+	rows    [][]any // Every original value paired with its SQLite storage type.
+}
+
+func assignmentOriginalColumns(t *testing.T, s *Store, table string) [][]any {
+	t.Helper()
+	return messageSequenceRows(t, s.db, "SELECT name,type FROM pragma_table_xinfo('"+strings.ReplaceAll(table, "'", "''")+"') WHERE hidden<>1 ORDER BY cid")
+}
+
+func assignmentOriginalRows(t *testing.T, s *Store, table string, columns [][]any) [][]any {
+	t.Helper()
+	var projection, order []string
+	for _, column := range columns {
+		quoted := `"` + strings.ReplaceAll(column[0].(string), `"`, `""`) + `"`
+		projection = append(projection, "typeof("+quoted+")", quoted)
+		// Match the shared snapshot's type-aware, collation-independent ordering.
+		order = append(order, "typeof("+quoted+")", quoted+" COLLATE BINARY")
+	}
+	return messageSequenceRows(t, s.db, `SELECT `+strings.Join(projection, ",")+` FROM "`+strings.ReplaceAll(table, `"`, `""`)+`" ORDER BY `+strings.Join(order, ","))
+}
+
+func assignmentSnapshotOriginalTables(t *testing.T, s *Store, original map[string][][]any) map[string]assignmentOriginalTableSnapshot {
+	t.Helper()
+	snapshot := make(map[string]assignmentOriginalTableSnapshot, len(original))
+	for table := range original {
+		columns := assignmentOriginalColumns(t, s, table)
+		snapshot[table] = assignmentOriginalTableSnapshot{columns: columns, rows: assignmentOriginalRows(t, s, table, columns)}
+	}
+	return snapshot
+}
+
+func assignmentCheckOriginalTables(t *testing.T, s *Store, snapshot map[string]assignmentOriginalTableSnapshot) error {
+	t.Helper()
+	tables := messageSequenceRows(t, s.db, "SELECT name FROM sqlite_master WHERE type='table'")
+	for table, want := range snapshot {
+		if !slices.ContainsFunc(tables, func(row []any) bool { return row[0] == table }) {
+			return fmt.Errorf("future migration removed original %s table", table)
+		}
+		columns := assignmentOriginalColumns(t, s, table)
+		for _, column := range want.columns {
+			if !slices.ContainsFunc(columns, func(got []any) bool { return reflect.DeepEqual(got, column) }) {
+				return fmt.Errorf("future migration changed or removed original %s column: %v", table, column)
+			}
+		}
+		if got := assignmentOriginalRows(t, s, table, want.columns); !reflect.DeepEqual(got, want.rows) {
+			return fmt.Errorf("future migration changed original %s rows (including SQLite types): %+v; want %+v", table, got, want.rows)
+		}
+	}
+	return nil
+}
+
+func TestCoordinationAssignmentV13MigrationOriginalProjectionRejectsCorruption(t *testing.T) {
+	for _, tc := range []struct {
+		name, sql, want string
+	}{
+		{"value", "UPDATE assignment_projection_fixture SET label='changed' WHERE id=1", "original assignment_projection_fixture rows"},
+		{"missing-row", "DELETE FROM assignment_projection_fixture WHERE id=1", "original assignment_projection_fixture rows"},
+		{"extra-row", "INSERT INTO assignment_projection_fixture VALUES(6,1,'extra')", "original assignment_projection_fixture rows"},
+		{"storage-type", "UPDATE assignment_projection_fixture SET value=CAST(value AS REAL) WHERE id=1", "original assignment_projection_fixture rows"},
+		{"declared-type-empty-table", "DROP TABLE assignment_projection_empty; CREATE TABLE assignment_projection_empty(id TEXT,value TEXT)", "original assignment_projection_empty column"},
+		{"missing-column", "ALTER TABLE assignment_projection_fixture DROP COLUMN label", "original assignment_projection_fixture column"},
+		{"missing-table", "DROP TABLE assignment_projection_fixture", "original assignment_projection_fixture table"},
+		{"empty-table-row", "INSERT INTO assignment_projection_empty VALUES('unexpected',X'31')", "original assignment_projection_empty rows"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := assignmentV13Store(t)
+			coordinatorMustCommit(t, s, coordinatorSQL{`CREATE TABLE assignment_projection_fixture(id INTEGER PRIMARY KEY,value,label TEXT COLLATE NOCASE);
+			 INSERT INTO assignment_projection_fixture VALUES(1,1,'A'),(2,1.0,'a'),(3,'1','A'),(4,X'31','a'),(5,NULL,'z');
+			 CREATE TABLE assignment_projection_empty(id TEXT,value BLOB);`, nil})
+			before := assignmentSnapshotOriginalTables(t, s, messageSequenceSnapshot(t, s))
+			if err := assignmentCheckOriginalTables(t, s, before); err != nil {
+				t.Fatal(err)
+			}
+			coordinatorMustCommit(t, s, coordinatorSQL{tc.sql, nil})
+			err := assignmentCheckOriginalTables(t, s, before)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("did not detect %s corruption: %v; want %q", tc.name, err, tc.want)
+			}
+			t.Logf("rejected %s: %v", tc.name, err)
+		})
+	}
+}
+
 const assignmentSchemaQuery = "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name"
 
 func TestCoordinationAssignmentV13MigrationPopulatedUpgradeReopenAndAppend(t *testing.T) {
+	assignmentV13PopulatedUpgradeReopenAndAppend(t)
+}
+
+func TestCoordinationAssignmentV13MigrationFutureNullableColumn(t *testing.T) {
+	original := migrations
+	defer func() { migrations = original }()
+	// This synthetic extension proves compatibility, not a real N3a2 migration.
+	migrations = append(slices.Clone(original), `ALTER TABLE coordination_dispatch_state ADD COLUMN assignment_test_nullable TEXT;`)
+	assignmentV13PopulatedUpgradeReopenAndAppend(t)
+}
+
+func assignmentV13PopulatedUpgradeReopenAndAppend(t *testing.T) {
+	t.Helper()
 	allMigrations := migrations
 	defer func() { migrations = allMigrations }()
 	migrations = allMigrations[:13]
 	old, path, check := assignmentV12Fixture(t)
 	before := messageSequenceSnapshot(t, old)
+	originalTables := assignmentSnapshotOriginalTables(t, old, before)
 	objects := messageSequenceRows(t, old.db, assignmentSchemaQuery)
 	if err := migrate(old.db); err != nil {
 		t.Fatal(err)
@@ -367,7 +465,9 @@ func TestCoordinationAssignmentV13MigrationPopulatedUpgradeReopenAndAppend(t *te
 	for i := range 2 {
 		reopened := queueHandle(t, path, false)
 		messageSequenceLedger(t, reopened, len(migrations))
-		messageSequencePreserved(t, reopened, before)
+		if err := assignmentCheckOriginalTables(t, reopened, originalTables); err != nil {
+			t.Fatal(err)
+		}
 		check(reopened)
 		assignmentEmpty(t, reopened)
 		if got := messageSequenceTableRows(t, reopened, "assignment_future_fixture"); !reflect.DeepEqual(got, [][]any{{"applied", "future fixture ran"}}) {
