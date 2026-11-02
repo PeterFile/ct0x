@@ -79,7 +79,7 @@ function pageQuery(before: string) {
 }
 function post<T>(path: string, input: object, key: string, valid: (value: unknown) => value is T, signal?: AbortSignal) {
   return request(path, {
-    method: "POST", signal,
+    method: "POST", redirect: "error", signal,
     headers: { "Content-Type": "application/json", "Idempotency-Key": key },
     body: JSON.stringify(input),
   }, valid, 201);

@@ -21,7 +21,7 @@ it("encodes the group, sends only the JSON DTO, and returns a direct 201 receipt
   const signal = new AbortController().signal;
   expect(await sendMessage(groupId, input, "opaque-key /+", signal)).toEqual(receipt);
   expect(transport).toHaveBeenCalledExactlyOnceWith("/api/v1/groups/%E7%BE%A4%2F%E7%BB%84%3F%2B/messages", {
-    method: "POST", signal, headers: { "Content-Type": "application/json", "Idempotency-Key": "opaque-key /+" },
+    method: "POST", redirect: "error", signal, headers: { "Content-Type": "application/json", "Idempotency-Key": "opaque-key /+" },
     body: JSON.stringify({ content, recipient_ids: input.recipient_ids, topic_id: input.topic_id }),
   });
 });
