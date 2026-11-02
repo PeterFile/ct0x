@@ -53,7 +53,7 @@ const tools = [
   {
     name: "read_history",
     label: "读取历史片段",
-    description: "读取当前执行绑定话题内指定消息的 Unicode 片段 [offset,next_offset)；身份与话题由服务端绑定，片段不等于完整正文。",
+    description: "读取当前执行绑定话题内指定消息的 Unicode 片段 [offset,next_offset)；身份与话题由服务端绑定，片段不保证是完整正文；依据 content_complete 判断是否覆盖完整消息。",
     parameters: Type.Object({
       message_id: Type.String({ description: "当前绑定群组和话题内的消息标识。" }),
       offset: Type.Optional(Type.Integer({ minimum: 0, description: "起始 Unicode rune 偏移；省略为 0。" })),
