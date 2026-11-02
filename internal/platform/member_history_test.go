@@ -184,30 +184,28 @@ func TestMemberHistoryPreservesBudgetAndSafeStoreErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	message, err := f.local.CreateMessage(ctx, f.groupID, MessageInput{Content: "needle", TopicID: scope.TopicID, RecipientIDs: []string{}}, "")
-	if err != nil {
-		t.Fatal(err)
+	seedMessage := func(id, sender, content, stamp string) {
+		t.Helper()
+		if _, err := f.raw.Exec(`INSERT INTO messages(id,group_id,topic_id,sender_id,content,created_at)
+		 VALUES(?,?,?,?,?,?)`, id, f.groupID, scope.TopicID, sender, content, stamp); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if _, err := f.raw.Exec("UPDATE messages SET sender_id=? WHERE id=?", strings.Repeat("x", 65536), message.ID); err != nil {
-		t.Fatal(err)
-	}
+	const stamp = "2025-01-02T03:04:05.123456789Z"
+	seedMessage("budget-evidence", strings.Repeat("x", 65536), "needle", stamp)
 	page, err := tools.SearchHistory(ctx, token, MemberHistorySearchInput{Query: "needle"})
 	if err != store.ErrToolResultTooLarge || len(page.Items) != 0 || page.NextCursor != "" {
 		t.Fatalf("platform lost overflow identity or returned partial values: %+v, %v", page, err)
 	}
-	if _, err := f.raw.Exec("UPDATE messages SET content=? WHERE id=?", "PRIVATE\xff", message.ID); err != nil {
-		t.Fatal(err)
-	}
-	fragment, err := tools.ReadHistory(ctx, token, MemberHistoryReadInput{MessageID: message.ID})
+	seedMessage("invalid-evidence", "user", "PRIVATE\xff", stamp)
+	fragment, err := tools.ReadHistory(ctx, token, MemberHistoryReadInput{MessageID: "invalid-evidence"})
 	if !errors.Is(err, store.ErrInvalid) || !strings.Contains(err.Error(), "UTF-8") || strings.Contains(err.Error(), "PRIVATE") || !reflect.ValueOf(fragment).IsZero() {
 		t.Fatalf("platform corrupted invalid evidence or leaked its body: %+v, %v", fragment, err)
 	}
-	if _, err := f.raw.Exec("UPDATE messages SET content='needle',created_at='PRIVATE' WHERE id=?", message.ID); err != nil {
-		t.Fatal(err)
-	}
-	fragment, err = tools.ReadHistory(ctx, token, MemberHistoryReadInput{MessageID: message.ID})
+	seedMessage("scanner-evidence", "user", "needle", "PRIVATE")
+	fragment, err = tools.ReadHistory(ctx, token, MemberHistoryReadInput{MessageID: "scanner-evidence"})
 	if err == nil || strings.Contains(err.Error(), "PRIVATE") || !reflect.ValueOf(fragment).IsZero() {
 		t.Fatalf("store scanner error leaked through wrapper: %+v, %v", fragment, err)
 	}
-	f.counts(t, 2, 1, 1, 0)
+	f.counts(t, 4, 1, 1, 0)
 }

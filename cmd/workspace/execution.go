@@ -13,31 +13,45 @@ import (
 	"agentworkspace/internal/store"
 )
 
-func executionRunner(dataDir string, db *store.Store, catalog *platform.ProviderCatalog) (func(context.Context) error, error) {
-	runtime, err := privateExecutionRoot(dataDir, "runtime")
+func executionRunner(config config, db *store.Store, catalog *platform.ProviderCatalog, endpoint string) (func(context.Context) error, *platform.MemberToolRuntime, error) {
+	runtime, err := privateExecutionRoot(config.dataDir, "runtime")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	workspaces, err := privateExecutionRoot(dataDir, "workspaces")
+	workspaces, err := privateExecutionRoot(config.dataDir, "workspaces")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	providers, err := providerSnapshot(catalog)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// No external workspace grants: member preferences cannot authorize access.
-	preparer, err := platform.NewPreparer(db, platform.PrepareOptions{
-		Providers: providers, PrivateWorkspaceRoot: workspaces,
-	})
+	options := platform.PrepareOptions{Providers: providers, PrivateWorkspaceRoot: workspaces}
+	var tools *platform.MemberToolRuntime
+	if config.enableMemberTools {
+		root, err := privateExecutionRoot(config.dataDir, "member-tools")
+		if err != nil {
+			return nil, nil, err
+		}
+		tools, err = platform.NewMemberToolRuntime(db, platform.MemberToolRuntimeOptions{
+			ConfigRoot: root, Endpoint: endpoint, MaxGroupMembers: config.memberToolsMaxMembers,
+			Operations: []string{"list_members", "read_channel", "send_message", "create_member"},
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		options.MemberTools, options.PiMemberToolsExtension = tools, config.piMemberToolsExtension
+	}
+	preparer, err := platform.NewPreparer(db, options)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	return func(ctx context.Context) error {
 		return scheduler.Run(ctx, db, scheduler.Options{
 			MaxActive: 1, Recovered: true, RuntimeDir: runtime,
 		}, preparer.Prepare)
-	}, nil
+	}, tools, nil
 }
 
 func privateExecutionRoot(dataDir, name string) (string, error) {
