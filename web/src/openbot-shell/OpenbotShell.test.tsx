@@ -12,7 +12,11 @@ const identity = ([url, init]: Parameters<typeof fetch>) => ({ url, body: init?.
   key: new Headers(init?.headers).get("Idempotency-Key") });
 vi.mock("react-dom/client", async importOriginal => {
   const actual = await importOriginal<typeof ReactDOMClient>();
-  return { ...actual, createRoot: vi.fn(actual.createRoot) };
+  return { ...actual, createRoot: vi.fn((...args: Parameters<typeof actual.createRoot>) => {
+    const root = actual.createRoot(...args);
+    root.render = vi.fn(root.render.bind(root));
+    return root;
+  }) };
 });
 let entrySequence = 0;
 let resize: (mobile: boolean) => void;
@@ -51,12 +55,19 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function start(search = "?shell=openbot") {
+async function loadEntry(search = "") {
   window.history.replaceState({}, "", `/${search}`);
   // A fresh entry module, but shared React/App modules, for each simulated page load.
   const entry = `../main.tsx?openbot-entry-test=${++entrySequence}`;
   await act(async () => { await import(/* @vite-ignore */ entry); });
+}
+async function start(search = "") {
+  await loadEntry(search);
   await screen.findByRole("button", { name: group.name });
+}
+function expectSingleEntryRender() {
+  expect(ReactDOMClient.createRoot).toHaveBeenCalledTimes(1);
+  expect(vi.mocked(ReactDOMClient.createRoot).mock.results[0].value.render).toHaveBeenCalledTimes(1);
 }
 const navigation = () => within(screen.getByRole("navigation", { name: "工作区导航" }));
 const rail = (name: string) => navigation().getByRole("button", { name });
@@ -69,25 +80,37 @@ const change = (field: HTMLElement, value: string) => fireEvent.change(field, { 
 const taskPanel = () => within(screen.getByRole("region", { name: "群组任务" }));
 
 describe("load-time shell entry", () => {
-  it.each(["", "?shell=other", "?shell=Openbot"])("preserves the default entry for %s", async search => {
+  it.each(["", "?shell=openbot", "?shell=other", "?shell=Openbot", "?shell=Classic", "?shell=", "?shell=openbot&shell=classic"])("loads Openbot by default for %s", async search => {
+    await start(search);
+    expect(navigation().getAllByRole("button")).toHaveLength(5);
+    expect(screen.getByRole("banner")).toHaveTextContent("ct0x");
+    expect(screen.getByRole("main", { name: "讨论" })).toBeVisible();
+    expectSingleEntryRender();
+  });
+
+  it.each(["?shell=classic", "?other=1&shell=classic&shell=openbot"])("keeps the classic entry and its draft after history changes for %s", async search => {
     await start(search);
     expect(screen.queryByRole("navigation", { name: "工作区导航" })).not.toBeInTheDocument();
     expect(screen.getByRole("banner")).toHaveTextContent("ct0x");
     expect(screen.getByRole("main", { name: "讨论" })).toBeVisible();
-    window.history.replaceState({}, "", "/?shell=openbot");
     fireEvent.click(screen.getByRole("button", { name: group.name }));
     await screen.findByText("尚无消息，可发送第一条讨论。");
+    const input = content(); change(input, "经典入口草稿");
+    expectSingleEntryRender();
+    window.history.replaceState({}, "", "/?shell=openbot");
+    fireEvent(window, new PopStateEvent("popstate"));
     expect(screen.queryByRole("navigation", { name: "工作区导航" })).not.toBeInTheDocument();
+    expect(content()).toBe(input); expect(input).toHaveValue("经典入口草稿");
+    expectSingleEntryRender();
   });
 
-  it("loads the opt-in entry once and keeps its controls after the URL changes", async () => {
-    await start("?other=1&shell=openbot");
+  it("loads the default entry once and keeps its controller after history changes", async () => {
+    await start();
     expect(navigation().getAllByRole("button").map(button => button.getAttribute("aria-label"))).toEqual([
       "群组列表", "聊天", "搜索", "成员", "任务",
     ]);
     const license = screen.getByRole("link", { name: "来源与许可" });
     expect(license).toHaveAttribute("href", "/licenses/openbot/index.html");
-    window.history.replaceState({}, "", "/");
     fireEvent.click(rail("聊天"));
     expect(screen.getByRole("main", { name: "讨论" })).toHaveTextContent("请先选择群组");
     fireEvent.click(rail("任务"));
@@ -97,16 +120,41 @@ describe("load-time shell entry", () => {
     expect(rail("任务")).toHaveFocus();
     expect(writes()).toHaveLength(0);
     expect(transport.mock.calls.filter(([url]) => String(url).includes("/tasks"))).toHaveLength(0);
+    selectGroup(group.name); await screen.findByText("尚无消息，可发送第一条讨论。");
+    const input = content(); change(input, "默认入口草稿");
+    expectSingleEntryRender();
+    window.history.pushState({}, "", "/?shell=classic");
+    fireEvent(window, new PopStateEvent("popstate"));
+    expect(navigation().getAllByRole("button")).toHaveLength(5);
+    expect(content()).toBe(input); expect(input).toHaveValue("默认入口草稿");
+    expectSingleEntryRender();
   });
 
-  it("reports an optional chunk failure in Chinese before mounting any live App state", async () => {
+  it("reports a failed default chunk in Chinese with an explicit classic recovery link before mounting App", async () => {
     vi.doMock("./OpenbotShell", () => { throw new Error("fixture chunk unavailable"); });
-    window.history.replaceState({}, "", "/?shell=openbot");
-    const entry = `../main.tsx?openbot-entry-test=${++entrySequence}`;
-    await act(async () => { await import(/* @vite-ignore */ entry); });
-    expect(await screen.findByRole("alert")).toHaveTextContent("界面未能载入");
-    expect(screen.getByRole("link", { name: "返回默认界面" })).toHaveAttribute("href", "/");
+    await loadEntry();
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("界面未能载入");
+    expect(screen.getByRole("link", { name: "打开经典界面" })).toHaveAttribute("href", "/?shell=classic");
     expect(transport).not.toHaveBeenCalled();
+    expectSingleEntryRender();
+    window.history.replaceState({}, "", "/?shell=classic");
+    fireEvent(window, new PopStateEvent("popstate"));
+    expect(screen.getByRole("alert")).toBe(alert);
+    expect(transport).not.toHaveBeenCalled();
+    expectSingleEntryRender();
+  });
+
+  it("starts the real classic App while the optional Openbot module is unavailable", async () => {
+    vi.doMock("./OpenbotShell", () => { throw new Error("fixture chunk unavailable"); });
+    await start("?shell=classic");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByRole("navigation", { name: "工作区导航" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: group.name }));
+    await screen.findByText("尚无消息，可发送第一条讨论。");
+    change(content(), "兼容界面仍可撰写");
+    expect(content()).toHaveValue("兼容界面仍可撰写");
+    expectSingleEntryRender();
   });
 });
 
