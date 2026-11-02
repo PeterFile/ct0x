@@ -105,15 +105,24 @@ function serverError(value, token) {
   return code ? `${message}（${code}）。` : `${message}。`;
 }
 
+/** @param {unknown} value */
+function validReceiptTime(value) {
+  if (typeof value !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value) ||
+      !Number.isFinite(Date.parse(value))) return false;
+  // Check wall-clock fields without shifting offsets or rounding fractional seconds.
+  const wall = value.slice(0, 19);
+  const date = new Date(`${wall}Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 19) === wall;
+}
+
 /** @param {string} toolName @param {number} status @param {unknown} value */
 function validWriteReceipt(toolName, status, value) {
   if (toolName !== "send_message" && toolName !== "create_member") return true;
   if (!isRecord(value)) return false;
   if (toolName === "send_message") {
     return status === 201 && typeof value.message_id === "string" && value.message_id.length > 0 &&
-      typeof value.created_at === "string" &&
-      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value.created_at) &&
-      Number.isFinite(Date.parse(value.created_at)) &&
+      validReceiptTime(value.created_at) &&
       typeof value.delivery_count === "number" && Number.isSafeInteger(value.delivery_count) &&
       value.delivery_count >= 0 && value.content_omitted === true;
   }

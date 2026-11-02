@@ -178,6 +178,47 @@ for (const [index, [tool, status, receipt]] of invalidReceipts.entries()) {
   });
 }
 
+for (const created_at of [
+  "2026-02-30T00:00:00Z", "2025-02-29T23:59:59.123456789Z", "1900-02-29T00:30:00+05:45",
+  "0001-02-29T00:00:00Z", "0099-02-29T00:00:00Z", "2024-02-30T00:00:00Z",
+  "2026-04-31T23:30:00-03:30", "2026-02-30T00:30:00.123456789+01:00",
+  "2026-02-30T23:30:00.1-01:00", "2026-11-01T24:00:00Z", "2026-11-01T24:00:00.000000001+08:00",
+  "2026-00-01T00:00:00Z", "2026-13-01T00:00:00Z", "2026-01-00T00:00:00Z", "2026-01-32T00:00:00Z",
+  "2026-11-01T23:60:00Z", "2026-11-01T23:59:60Z", "2026-11-01T00:00:00+24:00", "2026-11-01T00:00:00-00:60",
+]) {
+  test(`invalid calendar timestamp latches: ${created_at}`, async t => {
+    let first = true;
+    const server = await clientFor(t, (request, response) => {
+      if (first) { first = false; json(response, { ...message, created_at }, 201); }
+      else success(request, response);
+    });
+    const original = await server.invoke("send_message", payloads.send_message, "original").catch(error => error);
+    const next = await server.invoke("send_message", payloads.send_message, "after-invalid-date").catch(error => error);
+    assert.equal(server.requests.length, 1, "invalid calendar receipt must block a native-new-ID second write");
+    safeFailure(original, /结果未知.*对账/);
+    safeFailure(next, /结果未知.*对账/);
+    await latched(server, original);
+  });
+}
+
+for (const created_at of [
+  "0000-02-29T23:30:00.123456789-01:00", "0000-01-01T00:00:00+23:59", "0099-03-01T00:30:00+01:00",
+  "0096-02-29T23:30:00.1-01:00", "1900-02-28T23:59:59Z", "2000-02-29T00:30:00+05:45",
+  "2024-03-01T00:30:00+01:00", "9999-12-31T23:59:59.999999999-23:59",
+  ...Array.from({ length: 9 }, (_, index) => `2024-02-29T00:30:00.${"123456789".slice(0, index + 1)}+05:45`),
+]) {
+  test(`valid calendar timestamp remains writable: ${created_at}`, async t => {
+    const receipt = { ...message, created_at };
+    const server = await clientFor(t, (_, response) => json(response, receipt, 201));
+    for (const id of ["original", "next-native-id"]) {
+      const result = await server.invoke("send_message", payloads.send_message, id);
+      assert.equal(result.text, JSON.stringify(receipt));
+      assert.deepEqual(result.json, receipt);
+    }
+    assert.equal(server.requests.length, 2);
+  });
+}
+
 test("valid write receipts allow safe additive fields without text projection or an unnecessary date policy", async t => {
   const replies = [
     ["send_message", 201, { ...message, created_at: "2026-11-01T08:00:00+08:00", extra: { version: 2 } }],
