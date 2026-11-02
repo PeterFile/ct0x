@@ -30,6 +30,16 @@ func MemberToolRoutes(tools *platform.MemberTools) []Route {
 	}
 }
 
+// MemberHistoryToolRoutes opts into history reads under NewServer's loopback Host/deadline guard.
+// Use the same trusted post-claim MemberTools registry as MemberToolRoutes.
+func MemberHistoryToolRoutes(tools *platform.MemberTools) []Route {
+	a := memberToolAPI{tools}
+	return []Route{
+		{http.MethodPost, "/api/v1/member-tools/search_history", memberToolNative(a.searchHistory)},
+		{http.MethodPost, "/api/v1/member-tools/read_history", memberToolNative(a.readHistory)},
+	}
+}
+
 func memberToolNative(next func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
