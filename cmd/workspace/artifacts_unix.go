@@ -19,7 +19,11 @@ import (
 
 const artifactReadLimit = 64 << 20
 
-func artifactReadRoutes(dataDir string, db *store.Store) (routes []httpapi.Route, closer io.Closer, err error) {
+func artifactReadRoutes(dataDir string, db *store.Store) ([]httpapi.Route, io.Closer, error) {
+	return artifactReadRoutesWithSync(dataDir, db, (*os.File).Sync)
+}
+
+func artifactReadRoutesWithSync(dataDir string, db *store.Store, syncFile func(*os.File) error) (routes []httpapi.Route, closer io.Closer, err error) {
 	path, err := privateExecutionRoot(dataDir, "artifacts")
 	if err != nil {
 		return nil, nil, fmt.Errorf("准备成果私有根失败：%w", err)
@@ -38,8 +42,16 @@ func artifactReadRoutes(dataDir string, db *store.Store) (routes []httpapi.Route
 			err = fmt.Errorf("构造成果读取入口失败：%w", err)
 		}
 	}()
-	if err := artifactReadPolicy(root); err != nil {
+	if err := artifactReadPolicy(root, syncFile); err != nil {
 		return nil, nil, err
+	}
+	// Retry on reopen too: a failed parent sync leaves the root in place.
+	parent, err := os.Open(dataDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := errors.Join(syncFile(parent), parent.Close()); err != nil {
+		return nil, nil, fmt.Errorf("同步成果根父目录失败：%w", err)
 	}
 	blobs, err := artifactfs.New(root, artifactReadLimit)
 	if err != nil {
@@ -53,7 +65,7 @@ func artifactReadRoutes(dataDir string, db *store.Store) (routes []httpapi.Route
 	return httpapi.ArtifactRoutes(service), closer, nil
 }
 
-func artifactReadPolicy(root *os.Root) (err error) {
+func artifactReadPolicy(root *os.Root, syncFile func(*os.File) error) (err error) {
 	blobs, err := root.Lstat("blobs")
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -75,13 +87,14 @@ func artifactReadPolicy(root *os.Root) (err error) {
 		if marker.Mode() != 0600 {
 			return errors.New("成果读取上限标记必须是非符号链接的 0600 普通文件，未覆盖原标记")
 		}
-		file, err := root.OpenFile("read-limit", os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-		if err != nil {
-			return err
+		file, openErr := root.OpenFile("read-limit", os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		if openErr != nil {
+			return openErr
 		}
+		defer func() { err = errors.Join(err, file.Close()) }()
 		data, readErr := io.ReadAll(io.LimitReader(file, 32))
-		if err := errors.Join(readErr, file.Close()); err != nil {
-			return err
+		if readErr != nil {
+			return readErr
 		}
 		limit, parseErr := strconv.ParseUint(strings.TrimSuffix(string(data), "\n"), 10, 64)
 		if parseErr != nil || string(data) != strconv.FormatUint(limit, 10)+"\n" {
@@ -89,6 +102,9 @@ func artifactReadPolicy(root *os.Root) (err error) {
 		}
 		if limit != artifactReadLimit {
 			return fmt.Errorf("成果读取上限不兼容：已记录 %d，应用要求 %d；未更改成果或标记", limit, artifactReadLimit)
+		}
+		if err := syncFile(file); err != nil {
+			return fmt.Errorf("同步成果读取上限标记失败，保留原标记：%w", err)
 		}
 	}
 	// Only two names are supported; three entries suffice to detect unknown layouts.
@@ -140,7 +156,7 @@ func artifactReadPolicy(root *os.Root) (err error) {
 		return fmt.Errorf("初始化成果读取上限失败，未覆盖已有标记：%w", err)
 	}
 	_, writeErr := file.WriteString("67108864\n")
-	if err := errors.Join(writeErr, file.Chmod(0600), file.Sync(), file.Close(), dir.Sync()); err != nil {
+	if err := errors.Join(writeErr, file.Chmod(0600), syncFile(file), file.Close(), syncFile(dir)); err != nil {
 		return fmt.Errorf("成果读取上限初始化未完成，保留标记供诊断：%w", err)
 	}
 	return nil

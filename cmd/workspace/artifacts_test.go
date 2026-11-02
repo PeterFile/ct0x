@@ -138,6 +138,100 @@ func artifactUnchanged(t *testing.T, path string, before artifactEntrySnapshot) 
 	}
 }
 
+func TestArtifactReadSyncFailureRestart(t *testing.T) {
+	for _, barrier := range []string{"marker", "parent"} {
+		t.Run(barrier, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "workspace.db")
+			db, err := store.Open(dbPath)
+			artifactCmdMust(t, err)
+			defer db.Close()
+			_, err = db.CreateGroup(context.Background(), store.CreateGroupInput{Name: "preserved metadata"})
+			artifactCmdMust(t, err)
+			business := artifactBusinessSnapshot(t, dbPath)
+			root := filepath.Join(dir, "artifacts")
+			marker, blobs := filepath.Join(root, "read-limit"), filepath.Join(root, "blobs")
+			target := marker
+			if barrier == "parent" {
+				target = dir
+			}
+			failure := errors.New("injected " + barrier + " sync failure")
+			var markerBefore, rootBefore, parentBefore artifactEntrySnapshot
+			for attempt := range 2 {
+				routes, closer, err := artifactReadRoutesWithSync(dir, db, func(file *os.File) error {
+					if filepath.Clean(file.Name()) == target {
+						if attempt == 1 { // Also verify that cleanup errors retain both leaves.
+							artifactCmdMust(t, file.Close())
+						}
+						return failure
+					}
+					return file.Sync()
+				})
+				if closer != nil {
+					artifactCmdMust(t, closer.Close())
+				}
+				if !errors.Is(err, failure) || routes != nil || closer != nil {
+					t.Fatalf("attempt %d accepted an unsynced %s: routes=%d owner=%T err=%v", attempt+1, barrier, len(routes), closer, err)
+				}
+				if attempt == 1 && !errors.Is(err, os.ErrClosed) {
+					t.Fatalf("cleanup lost the close error alongside the sync failure: %v", err)
+				}
+				if attempt == 0 {
+					markerBefore, rootBefore, parentBefore = artifactSnapshot(t, marker), artifactSnapshot(t, root), artifactSnapshot(t, dir)
+					if markerBefore.info.Mode() != 0600 || markerBefore.data != "67108864\n" {
+						t.Fatalf("failure did not leave a complete private marker: %+v", markerBefore)
+					}
+				} else {
+					artifactUnchanged(t, marker, markerBefore)
+					artifactUnchanged(t, root, rootBefore)
+					artifactUnchanged(t, dir, parentBefore)
+				}
+				if _, err := os.Lstat(blobs); !os.IsNotExist(err) {
+					t.Fatalf("blob construction preceded the required sync barrier: %v", err)
+				}
+				artifactNoFDs(t, dir, root, marker)
+				if after := artifactBusinessSnapshot(t, dbPath); !reflect.DeepEqual(business, after) {
+					t.Fatal("sync failure changed existing business metadata")
+				}
+			}
+			markerSynced, parentSynced := false, false
+			routes, closer, err := artifactReadRoutesWithSync(dir, db, func(file *os.File) error {
+				artifactUnchanged(t, marker, markerBefore)
+				if _, err := os.Lstat(blobs); !os.IsNotExist(err) {
+					t.Fatalf("recovery constructed blobs before sync: %v", err)
+				}
+				path := filepath.Clean(file.Name())
+				if path == dir && !markerSynced {
+					t.Fatal("parent sync preceded the successful marker sync")
+				}
+				if err := file.Sync(); err != nil {
+					return err
+				}
+				switch path {
+				case marker:
+					markerSynced = true
+				case dir:
+					parentSynced = true
+				}
+				return nil
+			})
+			artifactCmdMust(t, err)
+			defer closer.Close()
+			if _, ok := closer.(*artifactfs.Store); !ok || len(routes) != 5 || !markerSynced || !parentSynced {
+				t.Fatalf("recovery omitted a barrier or real construction: owner=%T routes=%d marker=%t parent=%t", closer, len(routes), markerSynced, parentSynced)
+			}
+			artifactUnchanged(t, marker, markerBefore)
+			artifactUnchanged(t, dir, parentBefore)
+			artifactNoFDs(t, dir, root, marker)
+			artifactCmdMust(t, closer.Close())
+			artifactNoFDs(t, blobs)
+			if after := artifactBusinessSnapshot(t, dbPath); !reflect.DeepEqual(business, after) {
+				t.Fatal("recovery changed existing business metadata")
+			}
+		})
+	}
+}
+
 func TestArtifactReadRejectsUnsafeState(t *testing.T) {
 	type fixture struct {
 		name, want string
@@ -591,7 +685,7 @@ func TestArtifactReadMarkerWriteFailureHelper(t *testing.T) {
 	artifactCmdMust(t, syscall.Getrlimit(syscall.RLIMIT_FSIZE, &saved))
 	signal.Ignore(syscall.SIGXFSZ)
 	artifactCmdMust(t, syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{Cur: 4, Max: saved.Max}))
-	err = artifactReadPolicy(root)
+	err = artifactReadPolicy(root, (*os.File).Sync)
 	restoreErr := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &saved)
 	artifactCmdMust(t, restoreErr)
 	if err == nil || !strings.Contains(err.Error(), "初始化未完成") || !errors.Is(err, io.ErrShortWrite) && !errors.Is(err, syscall.EFBIG) {
