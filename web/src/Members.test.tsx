@@ -95,7 +95,7 @@ it("requires a nonblank role and posts only the exact configuration DTO once pen
   expect(writes.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/members`);
   expect(new Headers(writes.mock.calls[0][1]?.headers).get("Content-Type")).toBe("application/json");
   expect(panel().queryByRole("button", { name: member.name })).not.toBeInTheDocument();
-  await act(async () => receipt.resolve(json(member, 201)));
+  await act(async () => receipt.resolve(json({ ...member, provider_id: provider.id, model: "my-model", workspace: "/work/research" }, 201)));
   expect(panel().getByRole("button", { name: member.name })).toHaveAttribute("aria-pressed", "true");
   expect(field("成员名称")).toHaveValue("");
 });
@@ -122,7 +122,7 @@ it.each([400, 413, 415])("allows correction after a definitive validation error 
   if (status === 413) expect(alert).toHaveTextContent("请求内容过大");
   if (status === 415) expect(alert).toHaveTextContent("仅接受 JSON");
   expect(field("成员职责")).toBeEnabled(); expect(field("成员职责")).toHaveValue(rejectedRole);
-  change("成员职责", "补充复核"); submit();
+  change("成员职责", "补充复核"); writes.mockResolvedValueOnce(json({ ...member, role: "补充复核" }, 201)); submit();
   await panel().findByRole("button", { name: member.name });
   expect(writes.mock.calls[1][1]?.body).toBe(JSON.stringify({ name: member.name, role: "补充复核" }));
   expect(new Headers(writes.mock.calls[1][1]?.headers).get("Idempotency-Key")).not.toBe(new Headers(writes.mock.calls[0][1]?.headers).get("Idempotency-Key"));

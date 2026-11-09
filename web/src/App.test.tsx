@@ -148,7 +148,7 @@ describe("workspace groups", () => {
     expect(nameInput()).toHaveValue(group.name);
     expect(screen.queryByRole("button", { name: group.name })).not.toBeInTheDocument();
     expect(within(screen.getByRole("main")).queryByText(group.name)).not.toBeInTheDocument();
-    transport.mockResolvedValueOnce(json(group, 201));
+    transport.mockResolvedValueOnce(json({ ...group, description: "" }, 201));
     fireEvent.click(screen.getByRole("button", { name: "重试同一次创建" }));
     await screen.findByRole("button", { name: group.name });
     const [first, retry] = posts().map(([, init]) => ({ body: init?.body, key: new Headers(init?.headers).get("Idempotency-Key") }));
@@ -169,7 +169,7 @@ describe("workspace groups", () => {
     if (status === 415) expect(alert).toHaveTextContent("仅接受 JSON");
     expect(nameInput()).toBeEnabled();
     expect(nameInput()).toHaveValue(rejectedName);
-    transport.mockResolvedValueOnce(json(other, 201));
+    transport.mockResolvedValueOnce(json({ ...other, description: "" }, 201));
     submit(other.name);
     await screen.findByRole("button", { name: other.name });
     expect(posts()[1][1]?.body).toBe(JSON.stringify({ name: other.name }));
@@ -190,7 +190,7 @@ describe("workspace groups", () => {
 
   it("does not remove or overwrite a confirmed creation with an older GET", async () => {
     const old = deferred<Response>();
-    transport.mockReturnValueOnce(old.promise).mockResolvedValueOnce(json(group, 201));
+    transport.mockReturnValueOnce(old.promise).mockResolvedValueOnce(json({ ...group, description: "" }, 201));
     render(<App />);
     submit();
     await screen.findByRole("button", { name: group.name });
@@ -622,6 +622,7 @@ describe("IM shell", () => {
     expect(screen.getByRole("combobox", { name: "运行器（可选）" })).toHaveValue(provider.id);
     expect(screen.getByRole("alert")).toHaveTextContent("创建结果未确认");
     showContext("搜索"); openMemberForm(); expect(screen.getByRole("form", { name: "创建成员" })).toBe(form); expect(field).toBeDisabled();
+    memberWrites.mockResolvedValueOnce(json({ ...member, provider_id: provider.id }, 201));
     fireEvent.click(screen.getByRole("button", { name: "重试同一次成员创建" })); await screen.findByRole("button", { name: member.name });
     expect(memberWrites).toHaveBeenCalledTimes(2); expect(identity(memberWrites.mock.calls[1])).toEqual(identity(memberWrites.mock.calls[0]));
     expect(JSON.parse(String(identity(memberWrites.mock.calls[0]).body))).toEqual({ name: member.name, role: member.role, provider_id: provider.id });
@@ -636,7 +637,7 @@ describe("IM shell", () => {
   it.each(["selection", "context", "search", "mobile"])("inserts a late created group without hijacking a deliberate %s change or focus", async mode => {
     resize(mode === "mobile"); render(<App />); await screen.findByRole("button", { name: group.name });
     if (mode !== "mobile") selectGroup(group.name);
-    const created = { ...group, id: "created", name: "新群" }, receipt = deferred<Response>();
+    const created = { ...group, id: "created", name: "新群", description: "" }, receipt = deferred<Response>();
     transport.mockReturnValueOnce(receipt.promise); submit(created.name);
     const originalInput = nameInput();
     if (mode === "context" || mode === "search") showContext(mode === "search" ? "搜索" : "任务");
@@ -659,7 +660,7 @@ describe("IM shell", () => {
 
   it("does not auto-open a late created group after a breakpoint moves the user to the mobile list", async () => {
     render(<App />); await screen.findByRole("button", { name: group.name }); showContext("任务");
-    const receipt = deferred<Response>(), created = { ...group, id: "created", name: "断点前创建" };
+    const receipt = deferred<Response>(), created = { ...group, id: "created", name: "断点前创建", description: "" };
     transport.mockReturnValueOnce(receipt.promise); submit(created.name);
     resize(true); screen.getByRole("button", { name: "刷新群组" }).focus();
     const focused = document.activeElement;
@@ -681,7 +682,7 @@ describe("IM shell", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument(); closeContext();
     fireEvent.click(screen.getByRole("button", { name: "返回群组" })); await screen.findByRole("alert");
     expect(nameInput()).toBe(field); expect(field).toBeDisabled(); expect(field).toHaveValue("保留的群组操作");
-    const created = { ...group, id: "created", name: "保留的群组操作" };
+    const created = { ...group, id: "created", name: "保留的群组操作", description: "" };
     transport.mockResolvedValueOnce(json(created, 201));
     const retry = screen.getByRole("button", { name: "重试同一次创建" }); retry.focus(); fireEvent.click(retry);
     await screen.findByRole("button", { name: created.name });

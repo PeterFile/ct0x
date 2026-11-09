@@ -213,7 +213,7 @@ func TestMemberToolsNativeHelper(t *testing.T) {
 		call("list_members", map[string]any{"caller_id": "user"}, "", 400, "invalid_json")
 		call("list_members", map[string]any{"group_id": "foreign-group"}, "", 400, "invalid_json")
 		call("send_message", map[string]any{"content": "cross-group", "recipient_ids": []string{expected.ForeignID}}, memberToolsKey("send_message", "foreign"), 404, "not_found")
-		for _, operation := range []string{"request_work", "assign", "coordinate", "submit_task", "search_history", "read_history"} {
+		for _, operation := range []string{"request_work", "assign", "coordinate", "submit_task"} {
 			call(operation, map[string]any{}, "", 405, "method_not_allowed")
 		}
 		list := call("list_members", map[string]any{}, "", 200, "")
@@ -324,7 +324,7 @@ func memberToolsExactArgs(t *testing.T, f executionFixture, report memberToolsRe
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(f.root, "args-"+report.RunID))
 	want := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", "--no-builtin-tools", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
-		"--session-dir", filepath.Join(dataDir, "runtime", report.RunID), "--session-id", report.RunID, "--tools", "list_members,read_channel,send_message,create_member", "--extension", entry, "--model", "fixture-model"}
+		"--session-dir", filepath.Join(dataDir, "runtime", report.RunID), "--session-id", report.RunID, "--tools", "list_members,read_channel,send_message,create_member,search_history,read_history", "--extension", entry, "--model", "fixture-model"}
 	if err != nil || !reflect.DeepEqual(strings.Split(strings.TrimSpace(string(data)), "\n"), want) {
 		t.Fatal("native argv broadened tools, contexts or extension policy")
 	}

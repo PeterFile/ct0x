@@ -84,7 +84,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		executionStatus = "全新单轮执行已启用，最大并发 1"
 	}
 	if memberTools != nil {
-		toolStatus = "平台工具已配置：仅已验证 Pi 1.4.0 且显式指定模型时可用四项基础成员工具；Codex 仅原生只读工具且无平台令牌；不授予 Coordinator、Assignment 或 RequestWork 权限"
+		toolStatus = "平台工具已配置：仅已验证 Pi 1.4.0 且显式指定模型时可用六项成员工具（含只读历史搜索与分段读取）；Codex 仅原生只读工具且无平台令牌；不授予 Coordinator、Assignment 或 RequestWork 权限"
 	}
 	local := platform.NewLocalUser(db)
 	engine := coordination.New(db)
@@ -105,6 +105,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	routes = append(routes, artifactRoutes...)
 	if memberTools != nil {
 		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)
+		routes = append(routes, httpapi.MemberHistoryToolRoutes(memberTools.Tools())...)
 	}
 	if config.webDir != "" {
 		web, openErr := webassets.Open(config.webDir)

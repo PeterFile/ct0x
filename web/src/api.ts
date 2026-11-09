@@ -88,20 +88,26 @@ export function listGroups(before = "", signal?: AbortSignal) {
   return request(`/api/v1/groups${pageQuery(before)}`, { signal }, pageOf(isGroup));
 }
 export function createGroup(input: GroupInput, key: string, signal?: AbortSignal) {
-  return post("/api/v1/groups", input, key, isGroup, signal);
+  const sent = Object.freeze({ ...input });
+  return post("/api/v1/groups", sent, key, (value): value is Group => isGroup(value)
+    && value.name === sent.name && value.description === (sent.description ?? ""), signal);
 }
 const membersPath = (groupId: string) => `/api/v1/groups/${encodeURIComponent(groupId)}/members`;
 export function listMembers(groupId: string, before = "", signal?: AbortSignal) {
   return request(`${membersPath(groupId)}${pageQuery(before)}`, { signal }, pageOf(memberIn(groupId)));
 }
 export function createMember(groupId: string, input: MemberInput, key: string, signal?: AbortSignal) {
-  return post(membersPath(groupId), input, key, memberIn(groupId), signal);
+  const sent = Object.freeze({ ...input });
+  return post(membersPath(groupId), sent, key, (value): value is Member => memberIn(groupId)(value)
+    && value.name === sent.name && value.role === sent.role && value.provider_id === (sent.provider_id ?? "")
+    && value.model === (sent.model ?? "") && value.workspace === (sent.workspace ?? ""), signal);
 }
 const messagesPath = (groupId: string) => `/api/v1/groups/${encodeURIComponent(groupId)}/messages`;
 export function sendMessage(groupId: string, input: MessageInput, key: string, signal?: AbortSignal) {
-  return post(messagesPath(groupId), {
-    content: input.content, recipient_ids: input.recipient_ids, topic_id: input.topic_id,
-  }, key, messageIn(groupId, input.topic_id ?? ""), signal);
+  const sent = Object.freeze({ content: input.content,
+    recipient_ids: Array.isArray(input.recipient_ids) ? Object.freeze([...input.recipient_ids]) : input.recipient_ids, topic_id: input.topic_id });
+  return post(messagesPath(groupId), sent, key, (value): value is Message => messageIn(groupId, sent.topic_id ?? "")(value)
+    && value.content === sent.content, signal);
 }
 export function listMessages(groupId: string, before = "", signal?: AbortSignal) {
   return request(`${messagesPath(groupId)}${pageQuery(before)}`, { signal }, pageOf(messageIn(groupId)));
