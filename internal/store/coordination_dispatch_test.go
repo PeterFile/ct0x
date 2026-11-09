@@ -94,12 +94,12 @@ func requestDispatchOnlyRows(t *testing.T, before, after map[string][][]any) {
 func requestDispatchSavedRows(t *testing.T, s *Store, id string) dispatchSQLRows {
 	t.Helper()
 	var result dispatchSQLRows
-	for _, row := range messageSequenceTableRows(t, s, "coordination_dispatch_requests") {
+	for _, row := range messageSequenceRows(t, s.db, "SELECT "+dispatchRequestColumns+" FROM coordination_dispatch_requests") {
 		if row[0] == id {
 			result.request = row
 		}
 	}
-	for _, row := range messageSequenceTableRows(t, s, "coordination_dispatch_state") {
+	for _, row := range messageSequenceRows(t, s.db, "SELECT "+dispatchStateColumns+" FROM coordination_dispatch_state") {
 		if row[0] == id {
 			result.state = row
 		}
