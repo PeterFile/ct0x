@@ -137,12 +137,10 @@ def verify(path, package, selected):
               "测试事件名称过长或含非法字符")
         root = name.split("/", 1)[0]
         check(root in selected, f"未列出或不属于此分片的顶层项：{name}")
-        # Slash can occur inside a subtest label; only recorded prefixes are parents.
-        parents = [name[:index] for index, char in enumerate(name) if char == "/" and name[:index] in states]
-        check(name == root or parents, f"子项缺少父项 run：{name}")
-        check(all(states[parent] != "done" for parent in parents), f"子项属于已结束父项：{name}")
-        if action in ("run", "pause", "cont", "pass"):
-            check(all(states[parent] == "running" for parent in parents), f"子项的父项未活动：{name}")
+        # Slash labels do not identify direct parents; only the root is unambiguous.
+        # Background output does not imply that Parallel has resumed.
+        root_states = ("running", "paused") if action in ("output", "attr", "artifacts") else ("running",)
+        check(name == root or states.get(root) in root_states, f"子项缺少活动顶层：{name}")
         if action == "run":
             check(name not in states, f"重复 run：{name}")
             states[name] = "running"
@@ -156,8 +154,9 @@ def verify(path, package, selected):
             check(states.get(name) == "paused", f"cont 缺少 pause 或重复：{name}")
             states[name] = "running"
         elif action == "pass":
-            check(states.get(name) == "running" and not any(child.startswith(name + "/") for child in active),
-                  f"pass 缺少活动 run/cont、重复或仍有未完成子项：{name}")
+            check(states.get(name) == "running" and
+                  (name != root or not any(item.startswith(root + "/") for item in active)),
+                  f"pass 缺少活动 run/cont、重复或顶层仍有未完成条目：{name}")
             states[name] = "done"
             active.remove(name)
             if name == root:

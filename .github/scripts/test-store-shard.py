@@ -93,6 +93,26 @@ class VerifierTests(unittest.TestCase):
         rows += [event("pass", name) for name in [nested, child, ROOT]]
         self.success(self.verify(rows))
 
+    def test_child_output_while_root_and_child_paused(self):
+        child = ROOT + "/child"
+        # Parallel blocks the test function, not goroutines it already spawned.
+        self.success(self.verify([event("run", ROOT), event("run", child), event("pause", child),
+                                  event("pause", ROOT), event("output", child, Output="background log\n"),
+                                  event("cont", ROOT), event("cont", child), event("pass", child), event("pass", ROOT)]))
+
+    def test_child_output_does_not_resume_or_outlive_entries(self):
+        child = ROOT + "/child"
+        output = event("output", child, Output="background log\n")
+        paused = [event("run", ROOT), event("run", child), event("pause", child), event("pause", ROOT), output]
+        completed = [event("run", ROOT), event("run", child), event("pass", child)]
+        for rows in [[*paused, event("cont", child), event("pass", child), event("pass", ROOT)],
+                     [*paused, event("cont", ROOT), event("pass", child), event("pass", ROOT)],
+                     [output, *completed, event("pass", ROOT)],
+                     [event("run", ROOT), output, event("run", child), event("pass", child), event("pass", ROOT)],
+                     [*completed, output, event("pass", ROOT)], [*completed, event("pass", ROOT), output]]:
+            with self.subTest(rows=rows):
+                self.reject(self.verify(rows))
+
     def test_fuzz_seed_and_example_top_counters(self):
         root, seed = "FuzzBytes", "FuzzBytes/seed#0"
         summary = self.success(self.verify([event("run", root), event("run", seed), event("pass", seed), event("pass", root)],
@@ -118,11 +138,32 @@ class VerifierTests(unittest.TestCase):
     def test_cont_without_pause_rejected(self):
         self.reject(self.verify([event("run", ROOT), event("cont", ROOT), event("pass", ROOT)]))
 
-    def test_inactive_parent_rejected(self):
+    def test_sequential_slash_siblings(self):
+        first, second = ROOT + "/a", ROOT + "/a/b"
+        self.success(self.verify([event("run", ROOT), event("run", first), event("pass", first),
+                                  event("run", second), event("pass", second), event("pass", ROOT)]))
+
+    def test_parallel_slash_siblings(self):
+        first, second = ROOT + "/a", ROOT + "/a/b"
+        self.success(self.verify([event("run", ROOT), event("run", first), event("pause", first),
+                                  event("run", second), event("pass", second), event("cont", first),
+                                  event("pass", first), event("pass", ROOT)]))
+
+    def test_slash_sibling_pass_while_prefixed_sibling_paused(self):
+        first, second = ROOT + "/a/b", ROOT + "/a"
+        self.success(self.verify([event("run", ROOT), event("run", first), event("pause", first),
+                                  event("run", second), event("pass", second), event("cont", first),
+                                  event("pass", first), event("pass", ROOT)]))
+
+    def test_inactive_root_rejected(self):
         child = ROOT + "/child"
-        grandchild = child + "/nested"
-        self.reject(self.verify([event("run", ROOT), event("run", child), event("pass", child),
-                                 event("run", grandchild), event("pass", grandchild), event("pass", ROOT)]))
+        # JSON proves top-level ownership, not direct parents of slash labels.
+        for rows in [[event("run", child), event("pass", child), event("run", ROOT), event("pass", ROOT)],
+                     [event("run", ROOT), event("pause", ROOT), event("run", child), event("pass", child),
+                      event("cont", ROOT), event("pass", ROOT)],
+                     [event("run", ROOT), event("pass", ROOT), event("run", child), event("pass", child)]]:
+            with self.subTest(rows=rows):
+                self.reject(self.verify(rows))
 
     def test_duplicate_subtest_run_rejected(self):
         child = ROOT + "/child"
