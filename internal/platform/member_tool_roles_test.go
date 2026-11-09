@@ -713,15 +713,13 @@ func TestMemberRoleInvalidClaimsDenyNewCommandsAndHistoricalReplay(t *testing.T)
 			for _, presented := range []string{token, scope.Member.Claim.Token, "unknown-token", ""} {
 				if scope.Provenance.Kind == store.CoordinationRoleCoordinator {
 					got, err := f.tools.DecideDispatch(ctx, presented, decisionInput, "command")
-					requireCapabilityDenied(t, err)
-					if !reflect.ValueOf(got).IsZero() {
-						t.Fatal("invalid claim disclosed/persisted a decision")
+					if !errors.Is(err, store.ErrMemberToolDenied) || !reflect.ValueOf(got).IsZero() || strings.Contains(err.Error(), scope.Member.Claim.Token) {
+						t.Fatalf("invalid claim lost denial/zero DTO/sanitization: %v", err)
 					}
 				} else {
 					got, err := f.tools.SubmitAssignmentResult(ctx, presented, resultInput, "command")
-					requireCapabilityDenied(t, err)
-					if !reflect.ValueOf(got).IsZero() {
-						t.Fatal("invalid claim disclosed/persisted a submission")
+					if !errors.Is(err, store.ErrMemberToolDenied) || !reflect.ValueOf(got).IsZero() || strings.Contains(err.Error(), scope.Member.Claim.Token) {
+						t.Fatalf("invalid claim lost denial/zero DTO/sanitization: %v", err)
 					}
 				}
 			}
@@ -807,11 +805,119 @@ func TestMemberRoleCommandsRevalidateFrozenProvenanceBeforeReplay(t *testing.T) 
 			}
 			before := memberRoleSnapshot(t, f.localMessageFixture)
 			got, err := call()
-			requireCapabilityDenied(t, err)
-			if !reflect.ValueOf(got).IsZero() {
-				t.Fatal("damaged provenance disclosed a historical receipt")
+			if !errors.Is(err, store.ErrMemberToolDenied) || !reflect.ValueOf(got).IsZero() || strings.Contains(err.Error(), scope.Member.Claim.Token) {
+				t.Fatalf("damaged provenance lost denial/zero DTO/sanitization: %v", err)
 			}
 			memberRolePreserved(t, f.localMessageFixture, before)
+		})
+	}
+}
+
+func TestMemberRoleCommandCommitFailurePreservesError(t *testing.T) {
+	for _, role := range []store.CoordinationRoleKind{store.CoordinationRoleCoordinator, store.CoordinationRoleWorker} {
+		t.Run(string(role), func(t *testing.T) {
+			f := memberRoleCoordinatorFixture(t)
+			scope, operation, table := f.coordinatorScope, "decide_dispatch", "coordination_decisions"
+			if role == store.CoordinationRoleWorker {
+				scope, operation, table = f.assignWorker(t, true), "submit_result", "task_submissions"
+			}
+			token := memberRoleIssue(t, f.tools, scope)
+			if _, err := f.raw.Exec("CREATE TABLE role_commit_guard(id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED)"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.raw.Exec("CREATE TRIGGER role_commit_fault AFTER INSERT ON " + table + " BEGIN INSERT INTO role_commit_guard VALUES('PRIVATE-ROLE-MISSING-GROUP'); END"); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var result any
+			var storeErr error
+			err := f.tools.withCoordinationRole(ctx, token, operation, role, func(frozen store.CoordinationToolScope) error {
+				if role == store.CoordinationRoleCoordinator {
+					result, storeErr = f.db.DecideDispatch(ctx, frozen, store.CoordinatorDecisionInput{Kind: "decline", Reason: "暂不分配"}, "commit-failure")
+				} else {
+					result, storeErr = f.db.SubmitAssignmentResult(ctx, frozen, store.AssignmentResultInput{Summary: "结果"}, "commit-failure")
+				}
+				// Cancel only after the real Store COMMIT failure, before wrapper handling.
+				cancel()
+				return storeErr
+			})
+			var storeCause *sqlite.Error
+			if storeErr == nil || !reflect.ValueOf(result).IsZero() || !errors.As(storeErr, &storeCause) || storeCause.Code() != 787 ||
+				errors.Is(storeErr, context.Canceled) || ctx.Err() != context.Canceled {
+				t.Fatalf("expected zero DTO and an actual deferred foreign-key COMMIT failure before cancellation: %v", storeErr)
+			}
+			if role == store.CoordinationRoleWorker {
+				var outcome interface {
+					CommitOutcomeUnknown() bool
+					RollbackConfirmed() bool
+				}
+				if !errors.As(storeErr, &outcome) || !outcome.CommitOutcomeUnknown() || outcome.RollbackConfirmed() {
+					t.Fatalf("Store COMMIT failure lost its unknown outcome: %v", storeErr)
+				}
+				var returnedOutcome interface {
+					CommitOutcomeUnknown() bool
+					RollbackConfirmed() bool
+				}
+				if !errors.As(err, &returnedOutcome) || !returnedOutcome.CommitOutcomeUnknown() || returnedOutcome.RollbackConfirmed() {
+					t.Errorf("command wrapper erased the actual unknown outcome: %v", err)
+				}
+			}
+			// The coordinator's unknown marker is private; preserve the entire original object.
+			if err != storeErr || !errors.Is(err, storeErr) || !errors.Is(err, storeCause) {
+				t.Errorf("command wrapper replaced the original Store COMMIT error: got %v, want original %v", err, storeErr)
+			}
+			var returnedCause *sqlite.Error
+			if !errors.As(err, &returnedCause) || returnedCause != storeCause || returnedCause.Code() != 787 {
+				t.Errorf("command wrapper lost the original SQLite 787 cause: %v", err)
+			}
+			t.Logf("real Store COMMIT failure: sqlite_code=%d; canceled after Store returned", storeCause.Code())
+		})
+	}
+}
+
+func TestMemberRoleCommandPostWriteDenialPreservesRollback(t *testing.T) {
+	for _, cancelAfterStore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cancel_after_store=%t", cancelAfterStore), func(t *testing.T) {
+			f := memberRoleCoordinatorFixture(t)
+			worker := f.assignWorker(t, true)
+			token := memberRoleIssue(t, f.tools, worker)
+			query := fmt.Sprintf("CREATE TRIGGER role_rotate_claim AFTER INSERT ON task_submissions BEGIN UPDATE turns SET claim_token='PRIVATE-ROLE-ROTATED' WHERE id='%s'; END", worker.Member.Claim.TurnID)
+			if _, err := f.raw.Exec(query); err != nil {
+				t.Fatal(err)
+			}
+			before := memberRoleSnapshot(t, f.localMessageFixture)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var result domain.Submission
+			var storeErr error
+			err := f.tools.withCoordinationRole(ctx, token, "submit_result", store.CoordinationRoleWorker, func(frozen store.CoordinationToolScope) error {
+				result, storeErr = f.db.SubmitAssignmentResult(ctx, frozen, store.AssignmentResultInput{Summary: "结果"}, "post-write-denial")
+				if cancelAfterStore {
+					cancel()
+				}
+				return storeErr
+			})
+			var proof interface {
+				RollbackConfirmed() bool
+				CommitOutcomeUnknown() bool
+			}
+			if !reflect.ValueOf(result).IsZero() || !errors.Is(storeErr, store.ErrMemberToolDenied) ||
+				!errors.As(storeErr, &proof) || !proof.RollbackConfirmed() || proof.CommitOutcomeUnknown() {
+				t.Fatalf("expected an actual post-write denial with confirmed rollback and zero DTO: %v", storeErr)
+			}
+			memberRolePreserved(t, f.localMessageFixture, before)
+			if err != storeErr || !errors.Is(err, storeErr) || !errors.Is(err, store.ErrMemberToolDenied) || errors.Is(err, context.Canceled) {
+				t.Errorf("command wrapper replaced the original post-write denial: got %v, want original %v", err, storeErr)
+			}
+			var returnedProof interface {
+				RollbackConfirmed() bool
+				CommitOutcomeUnknown() bool
+			}
+			if !errors.As(err, &returnedProof) || !returnedProof.RollbackConfirmed() || returnedProof.CommitOutcomeUnknown() {
+				t.Errorf("command wrapper erased confirmed rollback evidence: %v", err)
+			}
+			t.Logf("real post-write denial: rollback_confirmed=%t; no residual writes", proof.RollbackConfirmed())
 		})
 	}
 }
