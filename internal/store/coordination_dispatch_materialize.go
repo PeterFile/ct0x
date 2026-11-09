@@ -112,6 +112,14 @@ func coordinationDispatchMaterializedInTx(ctx context.Context, tx *sql.Tx, r dom
 		d.RecipientID != r.CoordinatorMemberID || d.State != domain.DeliveryStateQueued || d.TurnID != "" || d.Error != "" {
 		return fmt.Errorf("%w：分派投递身份或排队状态不匹配", ErrConflict)
 	}
+	var logged bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM message_log
+	 WHERE message_id=? AND group_id=? AND topic_id=? AND sequence>0)`, receipt.MessageID, r.GroupID, r.TopicID).Scan(&logged); err != nil {
+		return err
+	}
+	if !logged {
+		return fmt.Errorf("%w：分派消息序号映射未保存或不匹配", ErrConflict)
+	}
 	return nil
 }
 
