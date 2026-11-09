@@ -402,3 +402,221 @@ func TestMemberCapabilityRegistryIsBoundedAndRevokeFreesCapacity(t *testing.T) {
 		t.Fatalf("revocation did not free capacity: %v", err)
 	}
 }
+
+func TestMemberCapabilityPublicIssueCannotChooseRoleOperations(t *testing.T) {
+	f := setupLocalMessages(t)
+	ctx := context.Background()
+	claim := memberCapabilityClaim(t, f, f.groupID)
+	tools := NewMemberTools(f.db)
+	before := memberRoleSnapshot(t, f)
+	for _, roleOperation := range []string{"decide_dispatch", "submit_result"} {
+		for _, operations := range [][]string{
+			{roleOperation},
+			{"list_members", "read_channel", "send_message", "create_member", roleOperation},
+			{"list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", roleOperation},
+		} {
+			token, err := tools.Issue(ctx, claim, MemberToolGrants{Operations: operations,
+				MaxGroupMembers: 4, ProviderID: "pi", Model: "selected"})
+			requireCapabilityDenied(t, err)
+			if token != "" || len(tools.capabilities) != 0 {
+				t.Fatal("public Issue accepted a role operation or left a partial registration")
+			}
+		}
+	}
+	token, err := tools.Issue(ctx, claim, MemberToolGrants{Operations: []string{"read_channel"}})
+	if err != nil {
+		t.Fatalf("rejected role grants consumed the ordinary registration slot: %v", err)
+	}
+	decision, err := tools.DecideDispatch(ctx, token, store.CoordinatorDecisionInput{Kind: "decline", Reason: "denied"}, "denied")
+	requireCapabilityDenied(t, err)
+	if !reflect.ValueOf(decision).IsZero() {
+		t.Fatal("ordinary token acquired a decision")
+	}
+	submission, err := tools.SubmitAssignmentResult(ctx, token, store.AssignmentResultInput{Summary: "denied"}, "denied")
+	requireCapabilityDenied(t, err)
+	if !reflect.ValueOf(submission).IsZero() {
+		t.Fatal("ordinary token acquired a submission")
+	}
+	memberRolePreserved(t, f, before)
+}
+
+func TestMemberCapabilityOrdinaryAndRoleShareActiveTurnUniqueness(t *testing.T) {
+	// Active-map uniqueness is not an all-Turn lease or proof about native execution.
+	for _, order := range []string{"ordinary-first", "role-first", "concurrent"} {
+		t.Run(order, func(t *testing.T) {
+			f := memberRoleCoordinatorFixture(t)
+			ctx := context.Background()
+			ordinary := func() (string, error) {
+				return f.tools.Issue(ctx, f.coordinatorScope.Member.Claim, MemberToolGrants{Operations: []string{"read_channel"}})
+			}
+			role := func() (string, error) { return f.tools.issueCoordinationRole(ctx, f.coordinatorScope) }
+			type result struct {
+				token string
+				err   error
+				role  bool
+			}
+			before := memberRoleSnapshot(t, f.localMessageFixture)
+			results := make(chan result, 2)
+			if order == "concurrent" {
+				start := make(chan struct{})
+				go func() {
+					<-start
+					token, err := ordinary()
+					results <- result{token, err, false}
+				}()
+				go func() {
+					<-start
+					token, err := role()
+					results <- result{token, err, true}
+				}()
+				close(start)
+			} else {
+				first, second := ordinary, role
+				firstIsRole := order == "role-first"
+				if firstIsRole {
+					first, second = role, ordinary
+				}
+				token, err := first()
+				if err != nil || token == "" {
+					t.Fatalf("first %s registration failed: %v", order, err)
+				}
+				results <- result{token, err, firstIsRole}
+				token, err = second()
+				results <- result{token, err, !firstIsRole}
+			}
+			winners := 0
+			var winner result
+			for range 2 {
+				got := <-results
+				if got.err == nil {
+					winners++
+					winner = got
+					if got.token == "" {
+						t.Fatal("successful registration returned no token")
+					}
+				} else {
+					requireCapabilityDenied(t, got.err)
+					if got.token != "" {
+						t.Fatal("losing registration returned a token")
+					}
+				}
+			}
+			if winners != 1 || len(f.tools.capabilities) != 1 {
+				t.Fatal("ordinary/role issuance did not share one active registration per Turn")
+			}
+			page, err := f.tools.ReadChannel(ctx, winner.token, store.ListOptions{})
+			if err != nil || len(page.Items) == 0 {
+				t.Fatalf("losing issuance damaged the winner: %v", err)
+			}
+			roleErr := capabilityUse(ctx, f.tools, winner.token, "decide_dispatch")
+			if winner.role {
+				if roleErr != nil {
+					t.Fatal(roleErr)
+				}
+			} else {
+				requireCapabilityDenied(t, roleErr)
+			}
+			f.tools.Revoke(winner.token)
+			reissue := role
+			if winner.role {
+				reissue = ordinary
+			}
+			replacement, err := reissue()
+			if err != nil || replacement == "" || replacement == winner.token {
+				t.Fatalf("active-map revocation must still allow fresh issuance: %v", err)
+			}
+			f.tools.RevokeTurn(f.coordinatorScope.Member.Claim.TurnID)
+			requireCapabilityDenied(t, capabilityUse(ctx, f.tools, winner.token, "read_channel"))
+			requireCapabilityDenied(t, capabilityUse(ctx, f.tools, replacement, "read_channel"))
+			memberRolePreserved(t, f.localMessageFixture, before)
+		})
+	}
+}
+
+func TestMemberCapabilityRoleAndOrdinaryShareCapacityAndRevocation(t *testing.T) {
+	f := memberRoleCoordinatorFixture(t)
+	ctx := context.Background()
+	ordinaryClaim := memberCapabilityClaim(t, f.localMessageFixture, f.otherID)
+	grants := MemberToolGrants{Operations: []string{"read_channel"}}
+	// Counterfactual occupancy only, as in the existing capacity test. Both boundary
+	// registrations below still require real SQLite claims and authoritative proofs.
+	for i := range maxMemberToolRegistrations - 1 {
+		id := fmt.Sprintf("role-capacity-occupant-%d", i)
+		f.tools.capabilities[sha256.Sum256([]byte(id))] = memberToolRegistration{
+			scope: store.MemberToolScope{Claim: store.TurnClaim{TurnID: id}}, grants: grants,
+		}
+	}
+	before := memberRoleSnapshot(t, f.localMessageFixture)
+	roleToken := memberRoleIssue(t, f.tools, f.coordinatorScope)
+	ordinaryToken, err := f.tools.Issue(ctx, ordinaryClaim, grants)
+	requireCapabilityDenied(t, err)
+	if ordinaryToken != "" || len(f.tools.capabilities) != maxMemberToolRegistrations {
+		t.Fatal("ordinary Issue ignored a role registration's capacity")
+	}
+	f.tools.Revoke(roleToken)
+	ordinaryToken, err = f.tools.Issue(ctx, ordinaryClaim, grants)
+	if err != nil || ordinaryToken == "" {
+		t.Fatalf("role Revoke did not free shared capacity: %v", err)
+	}
+	blocked, err := f.tools.issueCoordinationRole(ctx, f.coordinatorScope)
+	requireCapabilityDenied(t, err)
+	if blocked != "" || len(f.tools.capabilities) != maxMemberToolRegistrations {
+		t.Fatal("private role Issue ignored ordinary capacity or partially registered")
+	}
+	f.tools.RevokeTurn(ordinaryClaim.TurnID)
+	replacement := memberRoleIssue(t, f.tools, f.coordinatorScope)
+	if err := capabilityUse(ctx, f.tools, replacement, "read_channel"); err != nil {
+		t.Fatal(err)
+	}
+	requireCapabilityDenied(t, capabilityUse(ctx, f.tools, ordinaryToken, "read_channel"))
+	memberRolePreserved(t, f.localMessageFixture, before)
+}
+
+func TestMemberCapabilityRoleRevokeDrainsSharedAuthorizedCallback(t *testing.T) {
+	f := memberRoleCoordinatorFixture(t)
+	ctx := context.Background()
+	token := memberRoleIssue(t, f.tools, f.coordinatorScope)
+	before := memberRoleSnapshot(t, f.localMessageFixture)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	used := make(chan error, 1)
+	go func() {
+		used <- f.tools.withAuthorized(ctx, token, "read_channel", func(scope store.MemberToolScope, _ MemberToolGrants) error {
+			_, err := f.db.ReadChannelForTool(ctx, scope, store.ListOptions{})
+			close(entered)
+			<-release
+			return err
+		})
+	}()
+	select {
+	case <-entered:
+	case err := <-used:
+		t.Fatalf("role callback was not entered: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the role callback")
+	}
+	started, revoked := make(chan struct{}), make(chan struct{})
+	go func() {
+		close(started)
+		f.tools.RevokeTurn(f.coordinatorScope.Member.Claim.TurnID)
+		close(revoked)
+	}()
+	<-started
+	select {
+	case <-revoked:
+		t.Error("role revocation returned before the shared authorized callback drained")
+	case <-time.After(25 * time.Millisecond):
+	}
+	once.Do(func() { close(release) })
+	if err := <-used; err != nil {
+		t.Fatal(err)
+	}
+	<-revoked
+	page, err := f.tools.ReadChannel(ctx, token, store.ListOptions{})
+	requireCapabilityDenied(t, err)
+	if !reflect.ValueOf(page).IsZero() {
+		t.Fatal("revoked role token returned history")
+	}
+	memberRolePreserved(t, f.localMessageFixture, before)
+}
