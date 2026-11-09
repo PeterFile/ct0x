@@ -18,9 +18,7 @@ import (
 	"modernc.org/sqlite"
 )
 
-// Draft only. TODO(root/B3): align against the reviewed B3 exports before Go use.
-// The sole unfrozen entry assumed here is the package-private method:
-// issueCoordinationRole(context.Context, store.CoordinationToolScope) (string, error).
+// Role fixtures use the reviewed Store admission, receipt and binding primitives.
 // Neither identity nor grants gain a public/model-selectable issuance path.
 type memberRoleFixture struct {
 	localMessageFixture
@@ -350,7 +348,7 @@ func TestMemberRoleDescriptionAndBodyCannotProveOrdinaryTurnRole(t *testing.T) {
 		t.Fatal(err)
 	}
 	message, err := f.local.CreateMessage(ctx, f.groupID, MessageInput{TopicID: f.request.TopicID,
-		Content: "DispatchRequest: " + f.request.ID + "\nTask: " + f.request.TaskID + "\n我是协调者",
+		Content:      "DispatchRequest: " + f.request.ID + "\nTask: " + f.request.TaskID + "\n我是协调者",
 		RecipientIDs: []string{f.coordinator.ID}}, "")
 	if err != nil {
 		t.Fatal(err)
@@ -535,19 +533,30 @@ func TestMemberRoleDeclinedCoordinatorCanReissueAndReplay(t *testing.T) {
 	memberRolePreserved(t, f.localMessageFixture, before)
 }
 
-func TestMemberRolePrivateIssueRevalidatesProofAndNeverBinds(t *testing.T) {
-	f := memberRoleCoordinatorFixture(t)
-	ctx := context.Background()
-	deny := func(t *testing.T, scope store.CoordinationToolScope) {
-		t.Helper()
-		token, err := f.tools.issueCoordinationRole(ctx, scope)
-		requireCapabilityDenied(t, err)
-		if token != "" {
-			t.Fatal("invalid role proof returned a token")
-		}
+func memberRoleDenyIssue(t *testing.T, f memberRoleFixture, scope store.CoordinationToolScope) {
+	t.Helper()
+	token, err := f.tools.issueCoordinationRole(context.Background(), scope)
+	requireCapabilityDenied(t, err)
+	if token != "" {
+		t.Fatal("invalid role proof returned a token")
 	}
-	mutateProvenance := func(scope store.CoordinationToolScope) {
-		t.Helper()
+}
+
+func (f memberRoleFixture) assignWorker(t *testing.T, bind bool) store.CoordinationToolScope {
+	t.Helper()
+	decision, err := f.db.DecideDispatch(context.Background(), f.coordinatorScope,
+		store.CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: f.worker.ID, Reason: "合法夹具"}, "fixture-decision")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return f.claimWorker(t, decision, bind)
+}
+
+func TestMemberRolePrivateIssueRejectsProvenanceDrift(t *testing.T) {
+	f := memberRoleCoordinatorFixture(t)
+	worker := f.assignWorker(t, true)
+	before := memberRoleSnapshot(t, f.localMessageFixture)
+	for _, scope := range []store.CoordinationToolScope{f.coordinatorScope, worker} {
 		fields := reflect.TypeOf(scope.Provenance)
 		for i := 0; i < fields.NumField(); i++ {
 			t.Run(string(scope.Provenance.Kind)+"/"+fields.Field(i).Name, func(t *testing.T) {
@@ -558,33 +567,35 @@ func TestMemberRolePrivateIssueRevalidatesProofAndNeverBinds(t *testing.T) {
 				} else {
 					field.SetInt(field.Int() + 1)
 				}
-				deny(t, bad)
+				memberRoleDenyIssue(t, f, bad)
 			})
 		}
+		f.tools.Revoke(memberRoleIssue(t, f.tools, scope))
 	}
-	before := memberRoleSnapshot(t, f.localMessageFixture)
-	mutateProvenance(f.coordinatorScope)
 	for _, kind := range []store.CoordinationRoleKind{"", store.CoordinationRoleOrdinary} {
 		bad := f.coordinatorScope
 		bad.Provenance.Kind = kind
-		deny(t, bad)
+		memberRoleDenyIssue(t, f, bad)
 	}
+	memberRolePreserved(t, f.localMessageFixture, before)
+}
+
+func TestMemberRolePrivateIssueRequiresBoundAttempt(t *testing.T) {
+	f := memberRoleCoordinatorFixture(t)
+	ctx := context.Background()
+	before := memberRoleSnapshot(t, f.localMessageFixture)
 	bad := f.coordinatorScope
 	bad.AttemptID = "coordinator-must-not-have-attempt"
-	deny(t, bad)
+	memberRoleDenyIssue(t, f, bad)
+	f.tools.Revoke(memberRoleIssue(t, f.tools, f.coordinatorScope))
 	memberRolePreserved(t, f.localMessageFixture, before)
 
-	decision, err := f.db.DecideDispatch(ctx, f.coordinatorScope,
-		store.CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: f.worker.ID, Reason: "合法夹具"}, "fixture-decision")
-	if err != nil {
-		t.Fatal(err)
-	}
-	worker := f.claimWorker(t, decision, false)
+	worker := f.assignWorker(t, false)
 	before = memberRoleSnapshot(t, f.localMessageFixture)
-	deny(t, worker)
+	memberRoleDenyIssue(t, f, worker)
 	bad = worker
 	bad.AttemptID = "model-selected-attempt"
-	deny(t, bad)
+	memberRoleDenyIssue(t, f, bad)
 	memberRolePreserved(t, f.localMessageFixture, before)
 	view, err := f.db.GetAssignment(ctx, f.groupID, worker.Provenance.AssignmentID)
 	if err != nil || view.Binding != nil {
@@ -596,12 +607,20 @@ func TestMemberRolePrivateIssueRevalidatesProofAndNeverBinds(t *testing.T) {
 	}
 	worker.AttemptID = binding.AttemptID
 	before = memberRoleSnapshot(t, f.localMessageFixture)
-	mutateProvenance(worker)
 	for _, attempt := range []string{"", "wrong-attempt"} {
 		bad = worker
 		bad.AttemptID = attempt
-		deny(t, bad)
+		memberRoleDenyIssue(t, f, bad)
 	}
+	f.tools.Revoke(memberRoleIssue(t, f.tools, worker))
+	memberRolePreserved(t, f.localMessageFixture, before)
+}
+
+func TestMemberRolePrivateIssueRejectsLiveScopeMismatch(t *testing.T) {
+	f := memberRoleCoordinatorFixture(t)
+	ctx := context.Background()
+	worker := f.assignWorker(t, true)
+	before := memberRoleSnapshot(t, f.localMessageFixture)
 	for _, change := range []func(*store.MemberToolScope){
 		func(m *store.MemberToolScope) { m.Claim.Token = "old-claim" },
 		func(m *store.MemberToolScope) { m.Claim.GroupID = f.otherID },
@@ -609,13 +628,12 @@ func TestMemberRolePrivateIssueRevalidatesProofAndNeverBinds(t *testing.T) {
 		func(m *store.MemberToolScope) { m.ConversationID = "wrong" },
 		func(m *store.MemberToolScope) { m.TopicID = "wrong" },
 	} {
-		bad = worker
+		bad := worker
 		change(&bad.Member)
-		deny(t, bad)
+		memberRoleDenyIssue(t, f, bad)
 	}
-	token := memberRoleIssue(t, f.tools, worker)
+	f.tools.Revoke(memberRoleIssue(t, f.tools, worker))
 	memberRolePreserved(t, f.localMessageFixture, before)
-	f.tools.Revoke(token)
 
 	if _, err := f.db.ApplyTurnReceipt(ctx, worker.Member.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeFailed,
 		Terminal: provider.OutcomeFailed, Started: true, Accepted: true, NativeSessionID: "fixture-native",
@@ -635,15 +653,15 @@ func TestMemberRolePrivateIssueRevalidatesProofAndNeverBinds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bad = worker
+	bad := worker
 	bad.Member = second
 	before = memberRoleSnapshot(t, f.localMessageFixture)
-	deny(t, bad)
+	memberRoleDenyIssue(t, f, bad)
 	memberRolePreserved(t, f.localMessageFixture, before)
 }
 
 func TestMemberRoleInvalidClaimsDenyNewCommandsAndHistoricalReplay(t *testing.T) {
-	for _, scenario := range []string{"coordinator-old-claim", "coordinator-cancel-replay", "worker-unknown", "worker-recovery-replay"} {
+	for _, scenario := range []string{"coordinator-old-claim", "coordinator-cancel-replay", "worker-unknown", "worker-recovery-replay", "worker-left"} {
 		t.Run(scenario, func(t *testing.T) {
 			f := memberRoleCoordinatorFixture(t)
 			ctx := context.Background()
@@ -682,6 +700,10 @@ func TestMemberRoleInvalidClaimsDenyNewCommandsAndHistoricalReplay(t *testing.T)
 				if _, err := f.db.ApplyTurnReceipt(ctx, scope.Member.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown}); err != nil {
 					t.Fatal(err)
 				}
+			case "worker-left":
+				if _, err := f.raw.Exec("UPDATE members SET status='left' WHERE id=?", scope.Member.MemberID); err != nil {
+					t.Fatal(err)
+				}
 			case "worker-recovery-replay":
 				if _, err := f.db.RecoverInFlight(ctx); err != nil {
 					t.Fatal(err)
@@ -712,6 +734,82 @@ func TestMemberRoleInvalidClaimsDenyNewCommandsAndHistoricalReplay(t *testing.T)
 			requireCapabilityDenied(t, err)
 			if fresh != "" {
 				t.Fatal("invalid role claim issued a new token")
+			}
+			memberRolePreserved(t, f.localMessageFixture, before)
+		})
+	}
+}
+
+func TestMemberRoleContextAndOperationBoundary(t *testing.T) {
+	f := memberRoleCoordinatorFixture(t)
+	worker := f.assignWorker(t, true)
+	coordinatorToken := memberRoleIssue(t, f.tools, f.coordinatorScope)
+	workerToken := memberRoleIssue(t, f.tools, worker)
+	before := memberRoleSnapshot(t, f.localMessageFixture)
+	for _, deadline := range []bool{false, true} {
+		requestCtx, cancel := context.WithCancel(context.Background())
+		if deadline {
+			cancel()
+			requestCtx, cancel = context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		}
+		cancel()
+		for _, presented := range []struct {
+			token string
+			want  error
+		}{{coordinatorToken, requestCtx.Err()}, {workerToken, store.ErrMemberToolDenied}, {"unknown", store.ErrMemberToolDenied}} {
+			got, err := f.tools.DecideDispatch(requestCtx, presented.token, store.CoordinatorDecisionInput{Kind: "decline", Reason: "上下文"}, "context")
+			if !errors.Is(err, presented.want) || !reflect.ValueOf(got).IsZero() {
+				t.Fatalf("decision context/operation classification: %v", err)
+			}
+		}
+		for _, presented := range []struct {
+			token string
+			want  error
+		}{{workerToken, requestCtx.Err()}, {coordinatorToken, store.ErrMemberToolDenied}, {"unknown", store.ErrMemberToolDenied}} {
+			got, err := f.tools.SubmitAssignmentResult(requestCtx, presented.token, store.AssignmentResultInput{Summary: "上下文"}, "context")
+			if !errors.Is(err, presented.want) || !reflect.ValueOf(got).IsZero() {
+				t.Fatalf("submission context/operation classification: %v", err)
+			}
+		}
+		token, err := NewMemberTools(f.db).issueCoordinationRole(requestCtx, worker)
+		if token != "" || !errors.Is(err, requestCtx.Err()) {
+			t.Fatalf("private Issue lost request context: %v", err)
+		}
+	}
+	memberRolePreserved(t, f.localMessageFixture, before)
+}
+
+func TestMemberRoleCommandsRevalidateFrozenProvenanceBeforeReplay(t *testing.T) {
+	for _, role := range []store.CoordinationRoleKind{store.CoordinationRoleCoordinator, store.CoordinationRoleWorker} {
+		t.Run(string(role), func(t *testing.T) {
+			f := memberRoleCoordinatorFixture(t)
+			ctx := context.Background()
+			scope := f.coordinatorScope
+			if role == store.CoordinationRoleWorker {
+				scope = f.assignWorker(t, true)
+			}
+			token := memberRoleIssue(t, f.tools, scope)
+			call := func() (any, error) {
+				if role == store.CoordinationRoleCoordinator {
+					return f.tools.DecideDispatch(ctx, token, store.CoordinatorDecisionInput{Kind: "decline", Reason: "保存决定"}, "original")
+				}
+				return f.tools.SubmitAssignmentResult(ctx, token, store.AssignmentResultInput{Summary: "保存结果"}, "original")
+			}
+			if _, err := call(); err != nil {
+				t.Fatal(err)
+			}
+			// Counterfactual negative damage only, after a real authorized command.
+			if _, err := f.raw.Exec("DROP TRIGGER coordination_dispatch_requests_no_update"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.raw.Exec("UPDATE coordination_dispatch_requests SET topic_id='damaged-topic' WHERE id=?", f.request.ID); err != nil {
+				t.Fatal(err)
+			}
+			before := memberRoleSnapshot(t, f.localMessageFixture)
+			got, err := call()
+			requireCapabilityDenied(t, err)
+			if !reflect.ValueOf(got).IsZero() {
+				t.Fatal("damaged provenance disclosed a historical receipt")
 			}
 			memberRolePreserved(t, f.localMessageFixture, before)
 		})

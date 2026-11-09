@@ -572,6 +572,125 @@ func TestMemberCapabilityRoleAndOrdinaryShareCapacityAndRevocation(t *testing.T)
 	memberRolePreserved(t, f.localMessageFixture, before)
 }
 
+func TestMemberCapabilityRoleConcurrentSnapshotsAreFrozen(t *testing.T) {
+	f := memberRoleCoordinatorFixture(t)
+	ctx := context.Background()
+	token := memberRoleIssue(t, f.tools, f.coordinatorScope)
+	want := []string{"list_members", "read_channel", "search_history", "read_history", "decide_dispatch"}
+	before := memberRoleSnapshot(t, f.localMessageFixture)
+	start, done := make(chan struct{}), make(chan error, 8)
+	for range 8 {
+		go func() {
+			<-start
+			err := f.tools.withAuthorized(ctx, token, "read_channel", func(scope store.MemberToolScope, grants MemberToolGrants) error {
+				if scope != f.coordinatorScope.Member || !reflect.DeepEqual(grants.Operations, want) {
+					return errors.New("concurrent read changed a frozen scope/profile")
+				}
+				grants.Operations[0], scope.TopicID = "submit_result", "forged"
+				return nil
+			})
+			if err == nil {
+				err = f.tools.withCoordinationRole(ctx, token, "decide_dispatch", store.CoordinationRoleCoordinator, func(scope store.CoordinationToolScope) error {
+					if scope != f.coordinatorScope {
+						return errors.New("concurrent command changed frozen role provenance")
+					}
+					scope.Provenance.RequestID, scope.Member.Claim.Token, scope.AttemptID = "forged", "forged", "forged"
+					return nil
+				})
+			}
+			done <- err
+		}()
+	}
+	close(start)
+	for range 8 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	memberRolePreserved(t, f.localMessageFixture, before)
+	result, err := f.tools.DecideDispatch(ctx, token, store.CoordinatorDecisionInput{Kind: "decline", Reason: "冻结副本"}, "frozen")
+	if err != nil || result.Decision.RequestID != f.request.ID {
+		t.Fatalf("snapshot mutation redirected the actual command: %v", err)
+	}
+}
+
+func TestMemberCapabilityRoleCommandRevokeDrainsCallback(t *testing.T) {
+	for _, role := range []store.CoordinationRoleKind{store.CoordinationRoleCoordinator, store.CoordinationRoleWorker} {
+		t.Run(string(role), func(t *testing.T) {
+			f := memberRoleCoordinatorFixture(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			scope, operation := f.coordinatorScope, "decide_dispatch"
+			if role == store.CoordinationRoleWorker {
+				scope, operation = f.assignWorker(t, true), "submit_result"
+			}
+			token := memberRoleIssue(t, f.tools, scope)
+			entered, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			t.Cleanup(func() { once.Do(func() { close(release) }) })
+			used := make(chan error, 1)
+			go func() {
+				used <- f.tools.withCoordinationRole(ctx, token, operation, role, func(frozen store.CoordinationToolScope) error {
+					var err error
+					if role == store.CoordinationRoleCoordinator {
+						_, err = f.db.DecideDispatch(ctx, frozen, store.CoordinatorDecisionInput{Kind: "decline", Reason: "排空"}, "drain")
+					} else {
+						_, err = f.db.SubmitAssignmentResult(ctx, frozen, store.AssignmentResultInput{Summary: "排空"}, "drain")
+					}
+					if err != nil {
+						return err
+					}
+					// A canceled context after a successful commit must not turn
+					// the successful callback into a false zero/error result.
+					cancel()
+					close(entered)
+					<-release
+					return nil
+				})
+			}()
+			select {
+			case <-entered:
+			case err := <-used:
+				t.Fatalf("real role command did not enter the drain boundary: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("timed out waiting for the role command")
+			}
+			committed := memberRoleSnapshot(t, f.localMessageFixture)
+			started, revoked := make(chan struct{}), make(chan struct{})
+			go func() {
+				close(started)
+				if role == store.CoordinationRoleCoordinator {
+					f.tools.Revoke(token)
+				} else {
+					f.tools.RevokeTurn(scope.Member.Claim.TurnID)
+				}
+				close(revoked)
+			}()
+			<-started
+			select {
+			case <-revoked:
+				t.Error("revocation escaped the complete role command callback")
+			case <-time.After(25 * time.Millisecond):
+			}
+			once.Do(func() { close(release) })
+			if err := <-used; err != nil {
+				t.Fatalf("cancellation hid an already committed command: %v", err)
+			}
+			<-revoked
+			called := false
+			err := f.tools.withCoordinationRole(context.Background(), token, operation, role, func(store.CoordinationToolScope) error {
+				called = true
+				return nil
+			})
+			requireCapabilityDenied(t, err)
+			if called {
+				t.Fatal("revoked role token entered a command callback")
+			}
+			memberRolePreserved(t, f.localMessageFixture, committed)
+		})
+	}
+}
+
 func TestMemberCapabilityRoleRevokeDrainsSharedAuthorizedCallback(t *testing.T) {
 	f := memberRoleCoordinatorFixture(t)
 	ctx := context.Background()

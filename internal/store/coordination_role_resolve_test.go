@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,9 +16,7 @@ import (
 	"modernc.org/sqlite"
 )
 
-// Draft against the N4a interface, not acceptance of the B3 WIP implementation.
-// TODO(root/B3): mechanically align helpers and readiness classifications with
-// the reviewed B3 baseline before compiling or obtaining the first real RED.
+// Positive fixtures use the reviewed Store admission and immutable receipts.
 func coordinationRoleQueued(t *testing.T, kind CoordinationRoleKind) (requestDispatchFixture, domain.DispatchRequest, CoordinationRoleProvenance) {
 	t.Helper()
 	if kind == CoordinationRoleCoordinator {
@@ -67,6 +66,7 @@ func coordinationRoleReadOnlyQueries(t *testing.T, s *Store, queries []assignmen
 	if len(queries) == 0 || postclaim && !strings.HasPrefix(strings.TrimSpace(queries[0].query), fence) {
 		t.Fatal("resolver did not execute SQL, or postclaim live scope was not the first SQL")
 	}
+	indexedReceipts := map[string]bool{}
 	for _, q := range queries {
 		statement := strings.TrimSpace(q.query)
 		if postclaim && strings.HasPrefix(statement, fence) {
@@ -77,6 +77,18 @@ func coordinationRoleReadOnlyQueries(t *testing.T, s *Store, queries []assignmen
 			t.Fatal("resolver attempted a write other than the postclaim live scope fence")
 		}
 		plan := resolutionPlan(t, s, q.query, q.args...)
+		for _, line := range strings.Split(plan, "\n") {
+			// p is the at-most-two raw receipt candidates; json_each reads only
+			// the captured policy. Neither is a scan of persisted history.
+			if strings.HasPrefix(line, "SCAN ") && line != "SCAN p" && line != "SCAN CONSTANT ROW" && !strings.HasPrefix(line, "SCAN json_each ") {
+				t.Fatalf("resolver scanned a persisted table: %s", line)
+			}
+			for _, table := range []string{"coordination_dispatch_state", "coordination_assignment_dispatch"} {
+				if strings.Contains(line, "sqlite_autoindex_"+table+"_") && strings.Contains(line, "(delivery_id=?)") {
+					indexedReceipts[table] = true
+				}
+			}
+		}
 		if strings.Contains(plan, "task_attempts_group_task_created_id") ||
 			strings.Contains(plan, "messages_group_created_id") ||
 			strings.Contains(strings.ToLower(q.query), "message_log") {
@@ -94,6 +106,9 @@ func coordinationRoleReadOnlyQueries(t *testing.T, s *Store, queries []assignmen
 				t.Fatalf("resolver accessed %s without an exact identity index lookup", table)
 			}
 		}
+	}
+	if len(indexedReceipts) != 2 {
+		t.Fatal("resolver did not inspect both unique delivery receipt indexes, including before ordinary fallback")
 	}
 }
 
@@ -346,7 +361,7 @@ func TestResolveCoordinationDeliveryCorruptionNeverBecomesOrdinary(t *testing.T)
 }
 
 func TestResolveCoordinationExecutionDamagedRelationCannotDowngrade(t *testing.T) {
-	for _, fault := range []string{"backpointer", "receipt-removed", "binding-other-turn"} {
+	for _, fault := range []string{"backpointer", "receipt-removed", "binding-other-turn", "receipt-held", "coordinator-conversation"} {
 		t.Run(fault, func(t *testing.T) {
 			f, _, scope := assignmentBoundWorker(t)
 			p := scope.Provenance
@@ -359,6 +374,13 @@ func TestResolveCoordinationExecutionDamagedRelationCannotDowngrade(t *testing.T
 				coordinationDecideExec(t, f.s, "DROP TRIGGER coordination_assignment_dispatch_no_delete")
 				coordinationDecideExec(t, f.s, "PRAGMA foreign_keys=OFF")
 				coordinationDecideExec(t, f.s, "DELETE FROM coordination_assignment_dispatch WHERE assignment_id=?", p.AssignmentID)
+				coordinationDecideExec(t, f.s, "PRAGMA foreign_keys=ON")
+			case "receipt-held":
+				coordinationDecideExec(t, f.s, "DROP TRIGGER coordination_assignment_dispatch_update")
+				coordinationDecideExec(t, f.s, "UPDATE coordination_assignment_dispatch SET status='held',held_reason='task_stale' WHERE assignment_id=?", p.AssignmentID)
+			case "coordinator-conversation":
+				coordinationDecideExec(t, f.s, "PRAGMA foreign_keys=OFF")
+				coordinationDecideExec(t, f.s, "UPDATE conversations SET topic_id='wrong-topic' WHERE member_id=?", f.coord)
 				coordinationDecideExec(t, f.s, "PRAGMA foreign_keys=ON")
 			case "binding-other-turn":
 				other := member(t, f.s, f.groupID).ID
@@ -449,6 +471,123 @@ func TestResolveCoordinationIdentityDoesNotDenyHistoricalDecisionReplay(t *testi
 				t.Fatalf("startup readiness blocked historical replay: %v", err)
 			}
 			coordinationDecidePreserved(t, f.s, before)
+		})
+	}
+}
+
+func TestResolveCoordinationWorkerBoundHistoryAndCurrentSelection(t *testing.T) {
+	f, _, scope := assignmentBoundWorker(t)
+	p := scope.Provenance
+	coordinationDecideExec(t, f.s, "UPDATE members SET provider_id='current-provider',model='current-model' WHERE id=?", p.MemberID)
+	check := func(code CoordinationReadinessCode) {
+		t.Helper()
+		before := coordinationDecideSnapshot(t, f.s)
+		recorder := assignmentQueryStore(t, f.path)
+		got, err := recorder.s.ResolveCoordinationExecution(ctx, scope.Member, p)
+		want := CoordinationRoleState{Provenance: p, AttemptID: scope.AttemptID,
+			ProviderID: "current-provider", Model: "current-model", Blocked: code}
+		if err != nil || got != want {
+			t.Fatalf("current readiness/selection rewrote historical binding: %+v, %v", got, err)
+		}
+		coordinationRoleReadOnlyQueries(t, f.s, recorder.queries, true)
+		coordinationDecidePreserved(t, f.s, before)
+	}
+	check(CoordinationReady)
+	// A current pointer is not the source of the historical Attempt identity.
+	coordinationDecideExec(t, f.s, "UPDATE tasks SET active_attempt_id=NULL WHERE id=?", p.TaskID)
+	check(CoordinationAttemptConflict)
+	coordinationDecideExec(t, f.s, "UPDATE tasks SET active_attempt_id=? WHERE id=?", scope.AttemptID, p.TaskID)
+	result, err := f.s.SubmitAssignmentResult(ctx, scope, AssignmentResultInput{Summary: "保存的工作结果"}, "bound-history")
+	if err != nil || result.AttemptID != scope.AttemptID {
+		t.Fatalf("real bound submission: %v", err)
+	}
+	check(CoordinationTaskStale)
+}
+
+func TestResolveCoordinationWorkerCurrentAuthorityKeepsRole(t *testing.T) {
+	for _, tc := range []struct {
+		change string
+		code   CoordinationReadinessCode
+	}{{"authority", CoordinationAuthorityStale}, {"binding", CoordinationBindingStale},
+		{"policy", CoordinationPolicyStale}, {"coordinator-left", CoordinationMemberInactive}} {
+		t.Run(tc.change, func(t *testing.T) {
+			f, _, scope := assignmentBoundWorker(t)
+			materializeChangeEligibility(t, f, tc.change)
+			before := coordinationDecideSnapshot(t, f.s)
+			got, err := f.s.ResolveCoordinationExecution(ctx, scope.Member, scope.Provenance)
+			if err != nil || got.Provenance != scope.Provenance || got.AttemptID != scope.AttemptID || got.Blocked != tc.code {
+				t.Fatalf("startup change erased a bound worker: %+v, %v", got, err)
+			}
+			coordinationDecidePreserved(t, f.s, before)
+		})
+	}
+}
+
+func TestResolveCoordinationDeliveryMissingParentsRemainDenied(t *testing.T) {
+	for _, parent := range []string{"task", "mandate", "assignment"} {
+		t.Run(parent, func(t *testing.T) {
+			f, r, p := coordinationRoleQueued(t, CoordinationRoleWorker)
+			coordinationDecideExec(t, f.s, "PRAGMA foreign_keys=OFF")
+			switch parent {
+			case "task":
+				coordinationDecideExec(t, f.s, "DELETE FROM tasks WHERE id=?", r.TaskID)
+			case "mandate":
+				coordinationDecideExec(t, f.s, "DROP TRIGGER mandates_no_delete")
+				coordinationDecideExec(t, f.s, "DELETE FROM mandates WHERE id=?", r.MandateID)
+			case "assignment":
+				coordinationDecideExec(t, f.s, "DROP TRIGGER coordination_assignments_no_delete")
+				coordinationDecideExec(t, f.s, "DELETE FROM coordination_assignments WHERE id=?", p.AssignmentID)
+			}
+			coordinationDecideExec(t, f.s, "PRAGMA foreign_keys=ON")
+			before := coordinationDecideSnapshot(t, f.s)
+			got, err := f.s.ResolveCoordinationDelivery(ctx, p.GroupID, p.DeliveryID)
+			requestDispatchZero(t, got, err, ErrMemberToolDenied)
+			coordinationDecidePreserved(t, f.s, before)
+		})
+	}
+}
+
+func TestResolveCoordinationContextAndCommitFailuresReturnZero(t *testing.T) {
+	for _, postclaim := range []bool{false, true} {
+		t.Run(fmt.Sprintf("postclaim=%t", postclaim), func(t *testing.T) {
+			f, _, p := coordinationRoleQueued(t, CoordinationRoleCoordinator)
+			var scope CoordinationToolScope
+			if postclaim {
+				scope = coordinationRoleClaim(t, f, p)
+			}
+			resolve := func(s *Store, requestCtx context.Context) (CoordinationRoleState, error) {
+				if postclaim {
+					return s.ResolveCoordinationExecution(requestCtx, scope.Member, p)
+				}
+				return s.ResolveCoordinationDelivery(requestCtx, p.GroupID, p.DeliveryID)
+			}
+			before := coordinationDecideSnapshot(t, f.s)
+			cancelled, cancel := context.WithCancel(ctx)
+			cancel()
+			got, err := resolve(f.s, cancelled)
+			requestDispatchZero(t, got, err, context.Canceled)
+			deadline, cancel := context.WithDeadline(ctx, time.Now().Add(-time.Second))
+			defer cancel()
+			got, err = resolve(f.s, deadline)
+			requestDispatchZero(t, got, err, context.DeadlineExceeded)
+			for _, mode := range []string{"refuse", "ack-error"} {
+				// Real SQLite transactions, with only the Commit acknowledgment
+				// boundary injected; not evidence of a physical SQLite I/O fault.
+				cause := errors.Join(sql.ErrNoRows, errors.New("PRIVATE resolver acknowledgment"))
+				wrapped, observed := coordinationDecideWrapped(t, f.path, mode, cause)
+				got, err := resolve(wrapped, ctx)
+				requestDispatchZero(t, got, err, cause)
+				var failure *assignmentTransactionError
+				if !errors.As(err, &failure) || !failure.CommitOutcomeUnknown() || failure.RollbackConfirmed() ||
+					errors.Is(err, ErrNotFound) || strings.Contains(err.Error(), "PRIVATE") {
+					t.Fatalf("Commit uncertainty/cause was changed: %v", err)
+				}
+				if len(observed.begins) != 1 || observed.begins[0].ReadOnly == postclaim {
+					t.Fatal("preclaim must use a read transaction, execution a write-fenced transaction")
+				}
+				t.Logf("injected Commit boundary=%s, actual ReadOnly=%t, zero result, cause preserved, outcome unknown", mode, observed.begins[0].ReadOnly)
+				coordinationDecidePreserved(t, f.s, before)
+			}
 		})
 	}
 }
