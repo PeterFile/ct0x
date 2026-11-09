@@ -10,7 +10,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"agentworkspace/internal/contextpack"
 	"agentworkspace/internal/domain"
@@ -36,6 +35,8 @@ type PrepareOptions struct {
 	PiMemberToolsExtension string
 	HistoryLimit           int           // Zero defaults to 50; explicit range is 1..200.
 	MaxContextBytes        int           // Zero defaults to 16 KiB; maximum is 1 MiB.
+	RoleHistoryLimit       int           // Zero defaults to 50; explicit range is 1..200.
+	RoleMaxContextBytes    int           // Zero defaults to 256 KiB; maximum is 1 MiB.
 	ExecutionTimeout       time.Duration // Zero uses the provider default.
 }
 
@@ -52,6 +53,8 @@ type Preparer struct {
 	roots, rootKeys        []string
 	historyLimit           int
 	maxContextBytes        int
+	roleHistoryLimit       int
+	roleMaxContextBytes    int
 	executionTimeout       time.Duration
 	memberTools            *MemberToolRuntime
 	piMemberToolsExtension string
@@ -70,17 +73,25 @@ var (
 // even if no current member uses it. Provider readiness is checked by Prepare.
 func NewPreparer(s *store.Store, opts PrepareOptions) (*Preparer, error) {
 	if s == nil || opts.HistoryLimit < 0 || opts.HistoryLimit > 200 ||
-		opts.MaxContextBytes < 0 || opts.MaxContextBytes > 1<<20 || opts.ExecutionTimeout < 0 {
+		opts.MaxContextBytes < 0 || opts.MaxContextBytes > 1<<20 || opts.ExecutionTimeout < 0 ||
+		opts.RoleHistoryLimit < 0 || opts.RoleHistoryLimit > 200 || opts.RoleMaxContextBytes < 0 || opts.RoleMaxContextBytes > 1<<20 {
 		return nil, errPrepareConfig
 	}
 	p := &Preparer{store: s, providers: make(map[string]provider.Provider),
 		grants: make(map[preparationRecipient]int), historyLimit: opts.HistoryLimit,
-		maxContextBytes: opts.MaxContextBytes, executionTimeout: opts.ExecutionTimeout}
+		maxContextBytes: opts.MaxContextBytes, executionTimeout: opts.ExecutionTimeout,
+		roleHistoryLimit: opts.RoleHistoryLimit, roleMaxContextBytes: opts.RoleMaxContextBytes}
 	if p.historyLimit == 0 {
 		p.historyLimit = 50
 	}
 	if p.maxContextBytes == 0 {
 		p.maxContextBytes = 16 << 10
+	}
+	if p.roleHistoryLimit == 0 {
+		p.roleHistoryLimit = 50
+	}
+	if p.roleMaxContextBytes == 0 {
+		p.roleMaxContextBytes = 256 << 10
 	}
 	for _, selected := range opts.Providers {
 		if _, duplicate := p.providers[selected.ID]; duplicate || strings.TrimSpace(selected.ID) == "" {
@@ -193,7 +204,17 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	if !found {
 		return empty, errPrepareBinding
 	}
-	if member.Status != domain.MemberStatusActive || len(member.Model) > 256 || strings.ContainsAny(member.Model, "\x00\r\n") {
+	state, err := p.store.ResolveCoordinationDelivery(ctx, group.ID, d.ID)
+	if err != nil {
+		return empty, preparationResolutionError(ctx, err)
+	}
+	if err := validatePreparationRole(state, group, member, conversation, trigger, d); err != nil {
+		return empty, err
+	}
+	if state.Provenance.Kind != store.CoordinationRoleOrdinary {
+		return p.prepareCoordinationRole(ctx, state, group, member, conversation, trigger)
+	}
+	if state.Blocked != store.CoordinationReady || member.Status != domain.MemberStatusActive || len(member.Model) > 256 || strings.ContainsAny(member.Model, "\x00\r\n") {
 		return empty, scheduler.ErrNotReady
 	}
 	selected, ok := p.providers[member.ProviderID]
@@ -300,28 +321,11 @@ func (p *Preparer) buildContext(group domain.Group, member domain.Member, conver
 			"HTTP 工具结果未知时，模型最终文本或 Turn 成功均不能证明该操作成功；不自动重试业务操作，须保留幂等身份并对账。",
 		}
 	}
-	for i, message := range append(slices.Clone(history), trigger) {
-		if message.GroupID != group.ID || message.TopicID != conversation.TopicID || !utf8.ValidString(message.Content) {
-			return nil, errPrepareBinding
-		}
-		body, err := json.Marshal(struct {
-			ID        string    `json:"id"`
-			GroupID   string    `json:"group_id"`
-			TopicID   string    `json:"topic_id"`
-			SenderID  string    `json:"sender_id"`
-			CreatedAt time.Time `json:"created_at"`
-			Content   string    `json:"content"`
-		}{message.ID, message.GroupID, message.TopicID, message.SenderID, message.CreatedAt, message.Content})
-		if err != nil {
+	if err := appendPreparationMessages(&in, conversation.TopicID, trigger, history); err != nil {
+		if errors.Is(err, errPrepareRead) {
 			return nil, errPrepareRead
 		}
-		item := contextpack.Message{Source: contextpack.Source{Scope: scope, ID: message.ID,
-			Sequence: uint64(i + 1), Kind: contextpack.MessageKind}, Content: string(body)}
-		if i < len(history) {
-			in.History = append(in.History, item)
-		} else {
-			in.Pending = []contextpack.Message{item}
-		}
+		return nil, err
 	}
 	packet, err := contextpack.Build(in)
 	var budget *contextpack.BudgetError
