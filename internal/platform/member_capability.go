@@ -29,6 +29,7 @@ type memberToolRegistration struct {
 	scope  store.MemberToolScope
 	grants MemberToolGrants
 	skills *memberSkillState
+	role   store.CoordinationToolScope
 }
 
 // MemberTools owns process-local capabilities; durable claims authorize every use.
