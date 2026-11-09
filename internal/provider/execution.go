@@ -180,7 +180,7 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex, frameLimit: frameLimit}
 	args := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", toolFlag, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--session-dir", dir, "--session-id", request.RunID}
 	if e.memberTools != nil {
-		args = append(args, "--tools", piMemberToolNames, "--extension", e.memberTools.extensionPath)
+		args = append(args, "--tools", strings.Join(e.memberTools.toolNames, ","), "--extension", e.memberTools.extensionPath)
 	}
 	if codex {
 		args = []string{"--ask-for-approval", "never", "exec", "--json", "--sandbox", "read-only", "--ignore-user-config", "--ephemeral", "--cd", request.CWD, "--skip-git-repo-check", "--color", "never"}

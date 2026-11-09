@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Openbot 衍生界面 · 来源与许可</title>
+</head>
+<body>
+  <main>
+    <h1>Openbot 衍生界面 · 来源与许可</h1>
+    <p>本可选界面提取并以 React JSX 适配 OpenBot 的窗口框架、侧栏、导航轨道及相关样式。原作者为 Synthetify Labs spółka z ograniczoną odpowiedzialnością。</p>
+    <p>来源：<a href="https://github.com/nightly-labs/openbot/tree/ac99196e66fe8f9d426433aa5e79d6e999d1c818">nightly-labs/openbot，固定提交 ac99196e66fe8f9d426433aa5e79d6e999d1c818</a>。</p>
+    <p>上游代码使用 <strong>PolyForm Noncommercial 1.0.0</strong>，不是 MIT。当前复用用于已授权的个人研究及非商业用途；商业许可请联系 licenses@openbot.run。</p>
+    <ul>
+      <li><a href="./LICENSE">完整上游 LICENSE（含两条 Required Notice）</a></li>
+      <li><a href="./NOTICE">完整、未经修改的上游 NOTICE</a></li>
+      <li><a href="./SOURCE.json">固定源码的 SHA-256 清单</a></li>
+    </ul>
+    <pre>Required Notice: Copyright 2026 Synthetify Labs spółka z ograniczoną odpowiedzialnością.
+Required Notice: For a commercial license, contact licenses@openbot.run.</pre>
+    <h2>本地适配范围</h2>
+    <ul>
+      <li><a href="https://github.com/nightly-labs/openbot/blob/ac99196e66fe8f9d426433aa5e79d6e999d1c818/src/renderer/src/WorkspaceFrame.tsx#L11-L103">WorkspaceFrame.tsx：11–39、62–103 行</a>：保留左区、面板和内容槽位的绘制次序；改为 React 类型化属性，移除 Solid、Electron、远程连接及新页面运行时。</li>
+      <li><a href="https://github.com/nightly-labs/openbot/blob/ac99196e66fe8f9d426433aa5e79d6e999d1c818/packages/ui/src/features/sidebar/SidebarFrame.tsx#L1-L16">SidebarFrame.tsx：1–16 行</a>：保留 aside 及 sidebar/panel-edge 结构，接入原有群组和中文标题。</li>
+      <li><a href="https://github.com/nightly-labs/openbot/blob/ac99196e66fe8f9d426433aa5e79d6e999d1c818/packages/ui/src/features/window/PageRail.tsx#L24-L434">PageRail.tsx：24–43、381–434 行</a>：保留按钮属性及导航分组，用原生按钮和中文文字替换上游 UI 库、品牌与图标；仅连接真实群组、聊天、搜索、成员、任务操作。</li>
+      <li><a href="https://github.com/nightly-labs/openbot/blob/ac99196e66fe8f9d426433aa5e79d6e999d1c818/packages/ui/src/features/window/page-rail.css#L1-L92">page-rail.css：1–14、47–92 行</a>、<a href="https://github.com/nightly-labs/openbot/blob/ac99196e66fe8f9d426433aa5e79d6e999d1c818/src/renderer/src/styles/app-shell.css#L24-L46">app-shell.css：24–46、848–854、867–887、3347–3350 行</a>、<a href="https://github.com/nightly-labs/openbot/blob/ac99196e66fe8f9d426433aa5e79d6e999d1c818/src/renderer/src/features/web-client/web-client.css#L61-L130">web-client.css：61–97、112–130、274–278 行</a>：提取使用到的结构、表面、交互与单面板规则；作用域限定为 .openbot-shell，映射本产品色彩与字体，使用现有 56rem 断点与可见性状态。</li>
+    </ul>
+    <p>消息、输入框、任务、成员和历史搜索仍由本产品原有 React 组件与 App 管理，没有引入 Solid 运行时或新增依赖。完整改动映射见源码仓库中的 docs/openbot-shell.md。</p>
+    <h2>保留声明与实际包含内容的区别</h2>
+    <p>为完整保留来源声明，本包随附未经删改的上游 NOTICE；这不表示本界面包含其中列出的所有软件。未复制上游品牌标志、头像、字体、第三方图标、Blobatar、图表、可选模型运行时、Docker 配置、光标动效或分析代码。SOURCE.json 是上游参考文件清单，不是本包逐文件收录清单。</p>
+    <p><a href="/">返回默认界面</a>（重载会丢失当前页草稿；请确认未完成操作后再返回）。</p>
+  </main>
+</body>
+</html>
