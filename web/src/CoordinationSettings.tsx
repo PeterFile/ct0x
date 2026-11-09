@@ -55,6 +55,7 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
   const [entries, setEntries] = useState(() => ({ coordinator: empty(), policy: empty() }));
   const state = useRef(entries);
   const readRound = useRef(0);
+  const explicitRecovery = useRef<readonly Kind[]>([]);
   const mounted = useRef(false);
   const enabled = active && expanded;
   // Synchronous ownership also closes the double-submit window before React commits.
@@ -111,12 +112,17 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
     if (!enabled) { setBefore(""); return; }
     let ignore = false;
     const controller = new AbortController();
-    setRoster(previous => ({ ...previous, pending: true, error: "" }));
+    // Consume recovery on this explicit head request, never on a later page or reopen.
+    const recovering = before ? [] : explicitRecovery.current;
+    if (!before) explicitRecovery.current = [];
+    setRoster(previous => ({ ...previous, pending: true, error: before ? previous.error : "" }));
     listMembers(groupId, before, controller.signal).then(result => {
-      if (!ignore) setRoster(previous => ({
+      if (ignore) return;
+      setRoster(previous => ({
         items: [...new Map([...(before ? previous.items : []), ...result.items].map(member => [member.id, member])).values()],
-        pending: false, error: "", next: result.next_cursor,
+        pending: false, error: before ? previous.error : "", next: result.next_cursor,
       }));
+      for (const kind of recovering) update(kind, previous => ({ ...previous, needsRefresh: false }));
     }, error => {
       if (!ignore) setRoster(previous => ({ ...previous, pending: false, error: errorText(error) }));
     });
@@ -135,7 +141,7 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
     if (!enabled) return "请在当前群组展开协调配置。";
     if (entry.operation) return entry.operation.pending ? "正在等待原操作结果。" : "";
     if (other.operation) return "另一项保存尚未确认，不能开始新的保存。";
-    if (kinds.some(key => state.current[key].needsRefresh)) return "保存被拒绝后，请显式刷新配置并保留草稿，核对群组、成员和版本后再保存。";
+    if (kinds.some(key => state.current[key].needsRefresh)) return "保存被拒绝后，成员首页待刷新；请显式刷新配置并保留草稿，核对群组、成员和版本后再保存。";
     if (kinds.some(key => state.current[key].currentRead.status !== "ready")) return "当前配置尚未重新确认，请刷新配置。";
     if (entry.currentRead.value!.revision >= Number.MAX_SAFE_INTEGER) return "版本已达到安全整数上限，不能继续保存。";
     if (kind === "coordinator" && !entry.draft.length) return "请选择协调员；不支持清空绑定。";
@@ -147,10 +153,12 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
     return "";
   }
   function editDraft(kind: Kind, ids: readonly string[]) {
-    update(kind, previous => previous.operation ? previous : { ...previous, draft: [...ids], dirty: true, error: "" });
+    update(kind, previous => previous.operation || (kind === "policy" && !previous.currentRead.value)
+      ? previous : { ...previous, draft: [...ids], dirty: true, error: "" });
   }
   function refreshExplicitly() {
-    for (const kind of kinds) update(kind, previous => ({ ...previous, needsRefresh: false,
+    explicitRecovery.current = kinds.filter(kind => state.current[kind].needsRefresh);
+    for (const kind of kinds) update(kind, previous => ({ ...previous,
       currentRead: { ...previous.currentRead, status: "pending", error: "" } }));
     setBefore("");
     setRefresh(previous => previous + 1);
@@ -222,7 +230,7 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
             </p> : <p>暂无可信当前值。</p>}
             {entry.currentRead.status !== "ready" ? <p role="status">当前配置尚未重新确认。{entry.currentRead.error}</p> : null}
           </section>
-          <fieldset disabled={Boolean(entry.operation)}>
+          <fieldset disabled={Boolean(entry.operation) || (kind === "policy" && !value)}>
             <legend>{labels[kind]}</legend>
             <label htmlFor={`${bodyId}-${kind}`}>{kind === "coordinator" ? "协调员成员" : "新增分派成员"}</label>
             <select id={`${bodyId}-${kind}`} value={selected} disabled={roster.pending || Boolean(roster.error)}

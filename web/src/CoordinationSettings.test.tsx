@@ -713,6 +713,200 @@ it("records a resolved coordinator GET independently of a hanging policy read an
   expect(current("coordinator").queryByText(/尚未绑定协调员/)).not.toBeInTheDocument();
 });
 
+it("does not let an early policy addition replace the first trusted worker baseline", async () => {
+  const firstRead = deferred<Response>();
+  reads.policy.mockReturnValueOnce(firstRead.promise);
+  await open();
+  const initiallyDisabled = within(form("policy")).getByRole("combobox").matches(":disabled");
+  // Deliver the event even to a disabled control to exercise the action guard.
+  choose("policy", "C");
+  await act(async () => firstRead.resolve(json(policy())));
+  confirm("policy", policy(["B"], 2));
+  fireEvent.click(within(form("policy")).getByRole("button", { name: "保存分派策略" }));
+  await flush();
+  expect(JSON.parse(String(attempts("policy")[0].body))).toEqual({ allowed_worker_ids: ["B"], expected_revision: 1 });
+  expect(initiallyDisabled).toBe(true);
+  expect(within(form("policy")).getByRole("button", { name: "移除 B" })).toBeVisible();
+  expect(within(form("policy")).queryByRole("button", { name: "移除 C" })).not.toBeInTheDocument();
+  choose("policy", "C");
+  confirm("policy", policy(["B", "C"], 3));
+  save("policy");
+  await flush();
+  expect(JSON.parse(String(attempts("policy")[1].body))).toEqual({ allowed_worker_ids: ["B", "C"], expected_revision: 2 });
+});
+
+it("waits for the first trusted policy baseline after an initial read failure", async () => {
+  reads.policy.mockImplementationOnce(async () => errorResponse(503, "unavailable"));
+  await open();
+  choose("policy", "C");
+  save("policy");
+  expect(puts.policy).not.toHaveBeenCalled();
+  const recovered = deferred<Response>();
+  reads.policy.mockReturnValueOnce(recovered.promise);
+  refresh();
+  await flush();
+  choose("policy", "D");
+  await act(async () => recovered.resolve(json(policy(["B"], 4))));
+  expect(within(form("policy")).queryByRole("button", { name: "移除 B" })).toBeVisible();
+  expect(within(form("policy")).queryByRole("button", { name: "移除 C" })).not.toBeInTheDocument();
+  expect(within(form("policy")).queryByRole("button", { name: "移除 D" })).not.toBeInTheDocument();
+  choose("policy", "C");
+  confirm("policy", policy(["B", "C"], 5));
+  save("policy");
+  await flush();
+  expect(JSON.parse(String(attempts("policy")[0].body))).toEqual({ allowed_worker_ids: ["B", "C"], expected_revision: 4 });
+});
+
+it("keeps an established policy draft editable during refresh without applying returned workers", async () => {
+  await open();
+  choose("policy", "C");
+  const delayed = deferred<Response>();
+  reads.policy.mockReturnValueOnce(delayed.promise);
+  refresh();
+  await flush();
+  expect(within(form("policy")).getByRole("combobox")).toBeEnabled();
+  choose("policy", "D");
+  await act(async () => delayed.resolve(json(policy(["D"], 4))));
+  expect(current("policy").getByText(/版本 4.*D成员/)).toBeVisible();
+  for (const id of ["B", "C", "D"]) expect(within(form("policy")).getByRole("button", { name: `移除 ${id}` })).toBeVisible();
+  confirm("policy", policy(["B", "C", "D"], 5));
+  save("policy");
+  await flush();
+  expect(JSON.parse(String(attempts("policy")[0].body))).toEqual({ allowed_worker_ids: ["B", "C", "D"], expected_revision: 4 });
+});
+
+it("keeps a failed directory head stale through successful old-cursor pages until head recovery", async () => {
+  members.mockImplementationOnce(async () => page(["A", "B", "C"].map(id => rosterMember(id)), "old-cursor"));
+  await open();
+  choose("coordinator", "C");
+  members.mockImplementationOnce(async () => errorResponse(503, "unavailable"));
+  refresh();
+  await flush();
+  expect(screen.getByText(/成员目录未确认，已有目录已过期/)).toBeVisible();
+  members.mockImplementationOnce(async () => page([rosterMember("D")]));
+  fireEvent.click(screen.getByRole("button", { name: "加载更多成员" }));
+  await flush();
+  save("coordinator");
+  await flush();
+  expect(puts.coordinator).not.toHaveBeenCalled();
+  expect(screen.getByText(/成员目录未确认，已有目录已过期/)).toBeVisible();
+  expect(within(form("coordinator")).getByRole("combobox")).toBeDisabled();
+  expect(String(members.mock.calls[2][0])).toBe("/api/v1/groups/group-A/members?limit=50&before=old-cursor");
+
+  // A successful fresh window must not silently discard the selected old-page ID.
+  members.mockImplementationOnce(async () => page([rosterMember("A"), rosterMember("B")], "fresh-cursor"));
+  refresh();
+  await flush();
+  expect(screen.queryByText(/成员目录未确认，已有目录已过期/)).not.toBeInTheDocument();
+  expect(within(form("coordinator")).getByRole("combobox")).toHaveValue("C");
+  expect(within(form("coordinator")).getByRole("option", { name: /C.*成员未载入/ })).toBeDisabled();
+  save("coordinator");
+  expect(puts.coordinator).not.toHaveBeenCalled();
+  members.mockImplementationOnce(async () => page([rosterMember("C")]));
+  fireEvent.click(screen.getByRole("button", { name: "加载更多成员" }));
+  await flush();
+  expect(String(members.mock.calls[4][0])).toBe("/api/v1/groups/group-A/members?limit=50&before=fresh-cursor");
+  confirm("coordinator", binding("C", 2));
+  save("coordinator");
+  await flush();
+  expect(JSON.parse(String(attempts("coordinator")[0].body))).toEqual({ member_id: "C", expected_revision: 1 });
+});
+
+it.each([
+  ["coordinator", 404], ["coordinator", 409], ["policy", 404], ["policy", 409],
+] as const)("requires a successful explicit member head after first %s HTTP %s even for an empty policy", async (kind, status) => {
+  members.mockImplementationOnce(async () => page(["A", "B", "C"].map(id => rosterMember(id)), "old-cursor-1"));
+  await open();
+  remove("B");
+  if (kind === "coordinator") choose(kind, "C");
+  puts[kind].mockImplementationOnce(async () => errorResponse(status, status === 404 ? "not_found" : "conflict"));
+  save(kind);
+  await flush();
+  const first = attempts(kind)[0];
+  const policyCount = puts.policy.mock.calls.length;
+  const failedHead = deferred<Response>();
+  members.mockReturnValueOnce(failedHead.promise);
+  reads.policy.mockImplementation(async () => json(policy(["B"], 4)));
+  refresh();
+  await flush();
+  expect(current("policy").getByText(/版本 4/)).toBeVisible();
+  await act(async () => failedHead.resolve(errorResponse(503, "unavailable")));
+  save("policy");
+  await flush();
+  expect(puts.policy).toHaveBeenCalledTimes(policyCount);
+  expect(within(form("policy")).getByRole("button", { name: /保存空策略/ })).toBeDisabled();
+
+  // Neither a successful nor a failed old-cursor page can satisfy head recovery.
+  members.mockImplementationOnce(async () => page([rosterMember("D")], "old-cursor-2"));
+  fireEvent.click(screen.getByRole("button", { name: "加载更多成员" }));
+  await flush();
+  expect(screen.getByText(/成员目录未确认，已有目录已过期/)).toBeVisible();
+  save("policy");
+  expect(puts.policy).toHaveBeenCalledTimes(policyCount);
+  members.mockImplementationOnce(async () => errorResponse(503, "unavailable"));
+  fireEvent.click(screen.getByRole("button", { name: "加载更多成员" }));
+  await flush();
+  save("policy");
+  expect(puts.policy).toHaveBeenCalledTimes(policyCount);
+
+  // Automatic head reads on reopen do not replace the required explicit action.
+  fireEvent.click(screen.getByRole("button", { name: "收起协调配置" }));
+  fireEvent.click(screen.getByRole("button", { name: "展开协调配置" }));
+  await flush();
+  expect(screen.queryByText(/成员目录未确认，已有目录已过期/)).not.toBeInTheDocument();
+  save("policy");
+  expect(puts.policy).toHaveBeenCalledTimes(policyCount);
+  refresh();
+  await flush();
+  expect(puts.policy).toHaveBeenCalledTimes(policyCount);
+  expect(within(form("policy")).getByRole("button", { name: /保存空策略/ })).toBeEnabled();
+  confirm("policy", policy([], 5));
+  fireEvent.click(within(form("policy")).getByRole("button", { name: /保存空策略/ }));
+  await flush();
+  expect(puts.policy).toHaveBeenCalledTimes(policyCount + 1);
+  const next = attempts("policy").at(-1)!;
+  expect(next.key).not.toBe(first.key);
+  expect(JSON.parse(String(next.body))).toEqual({ allowed_worker_ids: [], expected_revision: 4 });
+});
+
+it("allows an ordinary empty policy without a confirmed member directory", async () => {
+  members.mockImplementation(async () => errorResponse(503, "unavailable"));
+  await open();
+  remove("B");
+  expect(screen.getByText(/成员目录未确认，已有目录已过期/)).toBeVisible();
+  confirm("policy", policy([], 2));
+  fireEvent.click(within(form("policy")).getByRole("button", { name: /保存空策略/ }));
+  await flush();
+  expect(JSON.parse(String(attempts("policy")[0].body))).toEqual({ allowed_worker_ids: [], expected_revision: 1 });
+  expect(history("policy").getByText(/本次保存已确认（版本 2）/)).toBeVisible();
+});
+
+it("retries an unknown empty policy unchanged despite failed configuration and member reads", async () => {
+  await open();
+  remove("B");
+  save("policy");
+  await flush();
+  const first = attempts("policy")[0];
+  reads.coordinator.mockImplementation(async () => errorResponse(404));
+  reads.policy.mockImplementation(async () => errorResponse(404));
+  members.mockImplementation(async () => errorResponse(503, "unavailable"));
+  refresh();
+  await flush();
+  for (const status of [404, 409]) {
+    puts.policy.mockImplementationOnce(async () => errorResponse(status, status === 404 ? "not_found" : "conflict"));
+    fireEvent.click(screen.getByRole("button", { name: "重试同一次分派策略保存" }));
+    await flush();
+    expect(screen.getByText("分派策略：结果未知，请保留原操作。")).toBeVisible();
+  }
+  puts.policy.mockImplementationOnce(async () => json(policy([], 2)));
+  fireEvent.click(screen.getByRole("button", { name: "重试同一次分派策略保存" }));
+  await flush();
+  expect(attempts("policy")).toHaveLength(4);
+  expect(attempts("policy").every(attempt => JSON.stringify(attempt) === JSON.stringify(first))).toBe(true);
+  expect(JSON.parse(String(first.body))).toEqual({ allowed_worker_ids: [], expected_revision: 1 });
+  expect(history("policy").getByText(/本次保存已确认（版本 2）/)).toBeVisible();
+});
+
 it("does not initialize over a user draft edited while the initial GET is pending", async () => {
   const delayed = deferred<Response>();
   reads.coordinator.mockReturnValueOnce(delayed.promise);
