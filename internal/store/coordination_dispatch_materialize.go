@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -11,19 +12,54 @@ import (
 	"agentworkspace/internal/domain"
 )
 
+// Keep the legacy N2 display separate from transaction evidence and rollback causes.
+type dispatchTransactionError struct {
+	cause          error
+	message, phase string
+	rolledBack     bool
+}
+
+func (e *dispatchTransactionError) Error() string              { return e.message }
+func (e *dispatchTransactionError) Unwrap() error              { return e.cause }
+func (e *dispatchTransactionError) Phase() string              { return e.phase }
+func (e *dispatchTransactionError) RollbackConfirmed() bool    { return e.rolledBack }
+func (e *dispatchTransactionError) CommitOutcomeUnknown() bool { return e.phase == "commit" }
+
+func coordinationDispatchFinish(tx *sql.Tx, phase string, err error) error {
+	confirmed := tx == nil
+	var rollback error
+	if tx != nil {
+		rollback = tx.Rollback()
+		confirmed = rollback == nil
+	}
+	if err == nil {
+		return nil
+	}
+	// Normalize NoRows before wrapping evidence; never normalize a joined rollback error.
+	legacy := storeError("物化分派请求失败", err)
+	cause := legacy
+	if rollback != nil {
+		cause = errors.Join(cause, rollback)
+	}
+	return &dispatchTransactionError{cause: cause, message: legacy.Error(), phase: phase, rolledBack: confirmed && phase != "commit"}
+}
+
 // MaterializeDispatchRequest is trusted composition, not a model or HTTP command.
 // Its receipt, not the user-controlled create_message namespace, provides idempotency.
 func (s *Store) MaterializeDispatchRequest(ctx context.Context, requestID string, expectedGeneration int64, at time.Time) (out domain.DispatchMaterialization, err error) {
-	defer func() { err = storeError("物化分派请求失败", err) }()
+	phase := "input"
+	var tx *sql.Tx
+	defer func() { err = coordinationDispatchFinish(tx, phase, err) }()
 	stamp, err := coordinationDispatchInput(requestID, expectedGeneration, at)
 	if err != nil {
 		return out, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	phase = "begin"
+	tx, err = s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return out, err
 	}
-	defer tx.Rollback()
+	phase = "source"
 	r, state, err := coordinationDispatchLoadInTx(ctx, tx, requestID)
 	if err != nil {
 		return out, err
@@ -32,12 +68,14 @@ func (s *Store) MaterializeDispatchRequest(ctx context.Context, requestID string
 		if err := coordinationDispatchPending(state, expectedGeneration); err != nil {
 			return out, err
 		}
+		phase = "eligibility"
 		held, err := coordinationDispatchEligibility(ctx, tx, r)
 		if err != nil {
 			return out, err
 		}
 		var body string
 		if held == "" {
+			phase = "payload"
 			body, held, err = coordinationDispatchBody(ctx, tx, r)
 			if err != nil {
 				return out, err
@@ -46,10 +84,12 @@ func (s *Store) MaterializeDispatchRequest(ctx context.Context, requestID string
 		state.Generation++
 		state.LastErrorCode, state.HeldReason = "", held
 		if held != "" {
+			phase = "held"
 			state.Status = domain.DispatchStatusHeld
 			err = coordinationDispatchWrite(ctx, tx, `UPDATE coordination_dispatch_state SET generation=generation+1,
 			 status='held',held_reason=?,last_error_code='',updated_at=? WHERE request_id=? AND generation=? AND status='pending'`, held, stamp, r.ID, expectedGeneration)
 		} else {
+			phase = "message"
 			m, createErr := createMessageInTx(ctx, tx, MessageRequest{GroupID: r.GroupID, TopicID: r.TopicID,
 				ActorID: "user", Content: body, RecipientIDs: []string{r.CoordinatorMemberID}}, []string{r.CoordinatorMemberID})
 			if createErr != nil {
@@ -68,6 +108,7 @@ func (s *Store) MaterializeDispatchRequest(ctx context.Context, requestID string
 			state.Status = domain.DispatchStatusEnqueued
 			state.Delivery = &domain.DispatchDeliveryReceipt{MessageID: m.ID, DeliveryID: d.ID, ConversationID: d.ConversationID,
 				CoordinatorMemberID: d.RecipientID, MaterializedFromGeneration: expectedGeneration, CreatedAt: at.UTC()}
+			phase = "receipt"
 			err = coordinationDispatchWrite(ctx, tx, `UPDATE coordination_dispatch_state SET generation=generation+1,
 			 status='enqueued',last_error_code='',held_reason='',updated_at=?,message_id=?,delivery_id=?,conversation_id=?,
 			 delivered_member_id=?,materialized_from_generation=?,materialized_at=?
@@ -76,6 +117,7 @@ func (s *Store) MaterializeDispatchRequest(ctx context.Context, requestID string
 		if err != nil {
 			return out, err
 		}
+		phase = "readback"
 		actual, err := coordinationDispatchStateInTx(ctx, tx, r)
 		if err != nil {
 			return out, err
@@ -92,6 +134,7 @@ func (s *Store) MaterializeDispatchRequest(ctx context.Context, requestID string
 			}
 		}
 	}
+	phase = "commit"
 	if err := tx.Commit(); err != nil {
 		return out, storeError("保存分派物化失败", err)
 	}
