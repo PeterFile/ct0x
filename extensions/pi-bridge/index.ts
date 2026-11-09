@@ -60,6 +60,28 @@ const tools = [
       length: Type.Optional(Type.Integer({ minimum: 1, maximum: 4096, description: "读取的 Unicode rune 数，范围 1 至 4096；省略为 1024。" })),
     }, { additionalProperties: false }),
   },
+  {
+    name: "decide_dispatch",
+    label: "决定任务分派",
+    description: "为当前绑定任务记录分派或拒绝决定；调用者、群组、任务及权限由服务端绑定。结果未知时须先对账，不要自动重试或更换幂等键。",
+    parameters: Type.Object({
+      kind: Type.Union([Type.Literal("assign"), Type.Literal("decline")], { description: "assign 表示分派，decline 表示拒绝。" }),
+      reason: Type.String({ description: "分派或拒绝的理由。" }),
+      worker_member_id: Type.Optional(Type.String({ minLength: 1, description: "assign 时必须提供非空的工作成员标识；decline 时禁止提供此字段。" })),
+    }, { additionalProperties: false }),
+  },
+  {
+    name: "submit_result",
+    label: "提交任务结果",
+    description: "为当前绑定的工作尝试提交结果摘要及可选产物版本引用；调用者、群组、任务、尝试及权限由服务端绑定。提交不代表审查通过；结果未知时须先对账，不要自动重试或更换幂等键。",
+    parameters: Type.Object({
+      summary: Type.String({ description: "任务结果摘要。" }),
+      artifact_versions: Type.Optional(Type.Array(Type.Object({
+        artifact_id: Type.String({ description: "产物标识。" }),
+        version_id: Type.String({ description: "产物版本标识。" }),
+      }, { additionalProperties: false }), { description: "可选的产物版本引用列表。" })),
+    }, { additionalProperties: false }),
+  },
 ] as const;
 
 export default function piBridge(pi: ExtensionAPI) {
@@ -78,6 +100,11 @@ export default function piBridge(pi: ExtensionAPI) {
             });
             payload = JSON.parse(encoded);
             valid = Value.Check(tool.parameters, payload);
+            if (valid && tool.name === "decide_dispatch") {
+              // Keep an object schema for Pi; check the conditional field on the safe snapshot.
+              const decision = payload as { kind: string; worker_member_id?: string };
+              valid = Object.hasOwn(decision, "worker_member_id") === (decision.kind === "assign");
+            }
           }
         } catch { /* Reject unsafe runtime values without exposing their errors. */ }
         if (!valid) throw new Error("成员工具参数无效，未发送请求。");

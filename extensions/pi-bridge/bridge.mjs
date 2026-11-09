@@ -6,7 +6,7 @@ import { request } from "node:http";
 const CONFIG_LIMIT = 4096;
 const BYTE_LIMIT = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 25_000;
-export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history"]);
+export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result"]);
 
 /** @typedef {{ text: string, json: unknown }} Reply */
 /** @typedef {(toolName: string, params: unknown, toolCallId: string, signal?: AbortSignal) => Promise<Reply>} Client */
@@ -14,7 +14,7 @@ export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel",
 /** @typedef {{ unknown?: { toolName: string, toolCallId: string, fingerprint: string, error: Error } }} WriteState */
 const REJECTION_CODES = new Map([
   [400, ["invalid_input", "invalid_json"]], [403, ["forbidden", "invalid_host", "invalid_origin"]],
-  [404, ["not_found"]], [405, ["method_not_allowed"]], [409, ["conflict", "member_capacity"]],
+  [404, ["not_found"]], [405, ["method_not_allowed"]], [409, ["conflict"]],
   [413, ["body_too_large"]], [415, ["unsupported_media_type"]],
 ]);
 const CONFIG_ERROR = "成员工具配置无效，未启用任何成员工具。";
@@ -95,13 +95,14 @@ function parseJSON(buffer) {
   return { text, json };
 }
 
-/** @param {unknown} value @param {string} token */
-function serverError(value, token) {
+/** @param {unknown} value @param {string} token @param {boolean} roleWrite */
+function serverError(value, token, roleWrite) {
   if (!isRecord(value) || !isRecord(value.error) || typeof value.error.code !== "string") return undefined;
   const raw = value.error.code;
   let code = /^[a-z][a-z0-9_]{0,63}$/.test(raw) && !raw.includes(token) ? raw : "request_failed";
   if (code.includes(token)) code = "";
-  const message = SERVER_ERROR_MESSAGES.get(raw) || "成员工具请求失败";
+  const message = (!roleWrite || raw === "request_canceled" || raw === "deadline_exceeded" ?
+    SERVER_ERROR_MESSAGES.get(raw) : undefined) || "成员工具请求失败";
   return code ? `${message}（${code}）。` : `${message}。`;
 }
 
@@ -116,8 +117,22 @@ function validReceiptTime(value) {
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 19) === wall;
 }
 
-/** @param {string} toolName @param {number} status @param {unknown} value */
-function validWriteReceipt(toolName, status, value) {
+/** @param {string} toolName @param {number} status @param {unknown} value @param {unknown} requestKind */
+function validWriteReceipt(toolName, status, value, requestKind) {
+  // Role receipts are fixed projections; ordinary receipts remain additive.
+  if (toolName === "decide_dispatch" || toolName === "submit_result") {
+    if (status !== 201 || !isRecord(value) || !validReceiptTime(value.created_at)) return false;
+    if (toolName === "decide_dispatch") {
+      return Object.keys(value).sort().join(",") === "assignment_id,created_at,decision_id,kind" &&
+        typeof value.decision_id === "string" && value.decision_id.length > 0 && value.kind === requestKind &&
+        (value.kind === "assign" ? typeof value.assignment_id === "string" && value.assignment_id.length > 0 :
+          value.kind === "decline" && value.assignment_id === "");
+    }
+    return Object.keys(value).sort().join(",") === "artifact_version_count,created_at,submission_id,summary_omitted" &&
+      typeof value.submission_id === "string" && value.submission_id.length > 0 &&
+      typeof value.artifact_version_count === "number" && Number.isSafeInteger(value.artifact_version_count) &&
+      value.artifact_version_count >= 0 && value.summary_omitted === true;
+  }
   if (toolName !== "send_message" && toolName !== "create_member") return true;
   if (!isRecord(value)) return false;
   if (toolName === "send_message") {
@@ -149,15 +164,22 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
   if (!TOOL_NAMES.some(name => name === toolName)) throw safeError("成员工具名称无效，未发送请求。");
   if (typeof toolCallId !== "string" || !toolCallId.trim()) throw safeError("工具调用标识无效，未发送请求。");
   let body;
+  /** @type {unknown} */
+  let requestKind;
   try {
     const text = JSON.stringify(params);
     if (typeof text !== "string" || text.includes(token)) throw new Error();
     body = Buffer.from(text, "utf8");
+    if (toolName === "decide_dispatch") {
+      const snapshot = JSON.parse(text);
+      if (isRecord(snapshot)) requestKind = snapshot.kind;
+    }
   } catch {
     throw safeError("成员工具参数无效，未发送请求。");
   }
   if (body.length > BYTE_LIMIT) throw safeError("工具请求超过 64 KiB 限制，未发送请求。");
-  const write = toolName === "send_message" || toolName === "create_member";
+  const roleWrite = toolName === "decide_dispatch" || toolName === "submit_result";
+  const write = roleWrite || toolName === "send_message" || toolName === "create_member";
   const fingerprint = write ? createHash("sha256").update(body).digest("hex") : "";
   if (write && writes.unknown) {
     const previous = writes.unknown;
@@ -231,20 +253,20 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
           if (settled) return;
           let result;
           try { result = parseJSON(Buffer.concat(chunks, size)); } catch { return fail(invalidResponse); }
-          const success = toolName === "send_message" ? status === 201 :
+          const success = roleWrite || toolName === "send_message" ? status === 201 :
             toolName === "create_member" ? status === 200 || status === 201 : status === 200;
           const sensitive = result.text.includes(token) || JSON.stringify(result.json)?.includes(token);
           if (!success) {
-            const message = status >= 400 && status <= 599 ? serverError(result.json, token) : undefined;
+            const message = status >= 400 && status <= 599 ? serverError(result.json, token, roleWrite) : undefined;
             const error = isRecord(result.json) && isRecord(result.json.error) ? result.json.error : undefined;
             const code = error?.code;
             const rejected = !sensitive && typeof code === "string" && typeof error?.message === "string" &&
-              REJECTION_CODES.get(status)?.includes(code);
+              (REJECTION_CODES.get(status)?.includes(code) || (!roleWrite && status === 409 && code === "member_capacity"));
             const suffix = rejected || code === "request_canceled" || code === "deadline_exceeded" ? "" : ` ${unknown}`;
             return fail(message ? message + suffix : invalidResponse, rejected ? "rejected" : "unknown");
           }
           if (sensitive) return fail(`成员工具返回了敏感数据，已拒绝显示；${unknown}`);
-          if (!validWriteReceipt(toolName, status, result.json)) return fail(invalidResponse);
+          if (!validWriteReceipt(toolName, status, result.json, requestKind)) return fail(invalidResponse);
           settled = true;
           cleanup();
           resolve(result);
