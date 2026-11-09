@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection } from "./api";
 import type { Group } from "./api";
 import { CoordinationSettings } from "./CoordinationSettings";
+import { TaskDispatch } from "./TaskDispatch";
 import { createTask, getTask, getTaskAttempt, getTaskSubmission, listTasks, registerTaskAttempt, reviewTask, submitTask } from "./task-api";
 import type { Task, TaskAttempt, TaskAttemptInput, TaskInput, TaskReview, TaskReviewInput, TaskSubmission, TaskSubmissionInput } from "./task-api";
 import "./tasks.css";
@@ -167,6 +168,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
         {/* Retain each task's drafts and immutable operation without reading hidden tasks. */}
         {openedTasks.map(id => <div key={id} hidden={id !== selection.id}>
           <TaskLifecycle groupId={groupId} taskId={id} task={active && selected?.id === id ? selected : null} onReceipt={refreshAfterReceipt} />
+          <TaskDispatch groupId={groupId} taskId={id} active={active && selection.id === id} />
         </div>)}
       </section> : <p className="tasks-note">选择任务以读取最新详情。</p>}
     </div>
