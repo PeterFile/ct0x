@@ -14,10 +14,10 @@ SCRIPT = Path(__file__).with_name("verify-store-shard.py")
 PACKAGE = "agentworkspace/internal/store"
 ROOT = "TestCoordination"
 IDENTITY = ["--run-id", "42566516008", "--sha", "a" * 40, "--tree", "b" * 40]
-# Fixed SHA-256 first-eight-byte big-endian mod-4 vectors, not a second selector.
-SLOTS = {"TestCoordination": 3, "TestAlpha": 3, "TestBeta": 3, "TestGamma": 0,
-         "TestDelta": 3, "TestNewPrefix": 2, "Test新入口": 2, "TestÉclair": 1,
-         "Example": 1, "ExampleWidget_suffix": 1, "FuzzBytes": 0}
+# Fixed SHA-256 first-eight-byte big-endian mod-6 vectors, not a second selector.
+SLOTS = {"TestCoordination": 5, "TestAlpha": 1, "TestBeta": 5, "TestGamma": 2,
+         "TestDelta": 1, "TestNewPrefix": 4, "Test新入口": 4, "TestÉclair": 1,
+         "Example": 5, "ExampleWidget_suffix": 3, "FuzzBytes": 4, "TestZero": 0}
 
 
 def event(action, name="", **fields):
@@ -46,7 +46,7 @@ class VerifierTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)], text=True,
                               capture_output=True, timeout=10)
 
-    def verify(self, rows, names=(ROOT,), slot=3):
+    def verify(self, rows, names=(ROOT,), slot=5):
         listed = self.inventory(names)
         run = self.json_lines("run.json", [event("start"), *rows, event("pass")])
         return self.invoke("verify", slot, PACKAGE, listed, run, *IDENTITY)
@@ -57,7 +57,7 @@ class VerifierTests(unittest.TestCase):
 
     def artifacts(self, names=tuple(SLOTS)):
         directory = self.directory / "summaries"
-        for slot in range(4):
+        for slot in range(6):
             selected = [name for name in names if SLOTS[name] == slot]
             rows = [row for name in selected for row in (event("run", name), event("pass", name))]
             summary = self.success(self.verify(rows, names, slot))
@@ -116,10 +116,10 @@ class VerifierTests(unittest.TestCase):
     def test_fuzz_seed_and_example_top_counters(self):
         root, seed = "FuzzBytes", "FuzzBytes/seed#0"
         summary = self.success(self.verify([event("run", root), event("run", seed), event("pass", seed), event("pass", root)],
-                                           names=[root, "Example"], slot=0))
+                                           names=[root, "Example"], slot=4))
         self.assertEqual(summary["runs"], {root: 1})
         self.assertEqual(summary["passes"], {root: 1})
-        self.success(self.verify([event("run", "Example"), event("pass", "Example")], names=[root, "Example"], slot=1))
+        self.success(self.verify([event("run", "Example"), event("pass", "Example")], names=[root, "Example"], slot=5))
 
     def test_top_skip_rejected(self):
         self.reject(self.verify([event("run", ROOT), event("skip", ROOT)]))
@@ -171,8 +171,9 @@ class VerifierTests(unittest.TestCase):
                                  event("run", child), event("pass", child), event("pass", ROOT)]))
 
     def test_fixed_hash_vectors_and_safe_union(self):
+        self.assertEqual(set(SLOTS.values()), set(range(6)))
         listed = self.inventory(SLOTS)
-        for slot in range(4):
+        for slot in range(6):
             with self.subTest(slot=slot):
                 result = self.invoke("select", slot, PACKAGE, listed)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -182,6 +183,16 @@ class VerifierTests(unittest.TestCase):
                 for name, expected in SLOTS.items():
                     self.assertEqual(re.fullmatch(pattern, name) is not None, slot == expected)
                     self.assertIsNone(re.fullmatch(pattern, name + "Extra"))
+
+    def test_slot_bounds_rejected(self):
+        listed = self.inventory([ROOT])
+        run = self.json_lines("run.json", [event("start"), event("run", ROOT), event("pass", ROOT), event("pass")])
+        for command, args in [("select", [listed]), ("verify", [listed, run, *IDENTITY])]:
+            for slot in [-1, 6]:
+                with self.subTest(command=command, slot=slot):
+                    result = self.invoke(command, slot, PACKAGE, *args)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("invalid choice", result.stderr)
 
     def test_empty_slot_not_empty_inventory(self):
         listed = self.inventory([ROOT])
@@ -195,7 +206,7 @@ class VerifierTests(unittest.TestCase):
         self.reject(self.invoke("select", 0, PACKAGE, self.inventory([])))
 
     def test_compiled_duplicates_are_not_hidden_by_a_set(self):
-        self.reject(self.invoke("select", 3, PACKAGE, self.inventory([ROOT, ROOT])))
+        self.reject(self.invoke("select", 5, PACKAGE, self.inventory([ROOT, ROOT])))
         rows = [event("run", ROOT), event("pass", ROOT)] * 2
         self.reject(self.verify(rows, names=[ROOT, ROOT]))
 
@@ -205,7 +216,7 @@ class VerifierTests(unittest.TestCase):
             with self.subTest(name=repr(name)):
                 self.reject(self.invoke("select", 0, PACKAGE, self.inventory([name])))
         for boundary in ["Test" + "A" * 4092, "Test" + "界" * 1364]:
-            for slot in range(4):
+            for slot in range(6):
                 result = self.invoke("select", slot, PACKAGE, self.inventory([boundary]))
                 self.assertEqual(result.returncode, 0, result.stderr)
         for text in [ROOT, ROOT + "\ntrailing junk\n", ROOT + "\r\n", ROOT + "\nok  \twrong/package\t0.001s\n"]:
@@ -217,8 +228,8 @@ class VerifierTests(unittest.TestCase):
 
     def test_large_inventory_fails_closed_instead_of_truncating(self):
         for label in ["A" * 296, "界" * 98]:
-            listed = self.inventory(["Test" + label + str(index) for index in range(1000)])
-            results = [self.invoke("select", slot, PACKAGE, listed) for slot in range(4)]
+            listed = self.inventory(["Test" + label + str(index) for index in range(1500)])
+            results = [self.invoke("select", slot, PACKAGE, listed) for slot in range(6)]
             self.assertTrue(any(result.returncode != 0 for result in results))
             for result in results:
                 if result.returncode != 0:
@@ -239,9 +250,9 @@ class VerifierTests(unittest.TestCase):
             with self.subTest(row=bad):
                 run = self.directory / "run.json"
                 run.write_text(json.dumps(valid[0]) + "\n" + bad + "\n" + "\n".join(json.dumps(row) for row in valid[2:]) + "\n", encoding="utf-8")
-                self.reject(self.invoke("verify", 3, PACKAGE, listed, run, *IDENTITY))
+                self.reject(self.invoke("verify", 5, PACKAGE, listed, run, *IDENTITY))
         listed.write_text('{"Action":"start","Package":"x","Package":"' + PACKAGE + '"}\n', encoding="utf-8")
-        self.reject(self.invoke("select", 3, PACKAGE, listed))
+        self.reject(self.invoke("select", 5, PACKAGE, listed))
 
     def test_package_lifecycle_and_inventory_events(self):
         listed = self.inventory([ROOT])
@@ -251,9 +262,9 @@ class VerifierTests(unittest.TestCase):
                      [event("start"), event("run"), event("pass")]]:
             with self.subTest(rows=rows):
                 run = self.json_lines("run.json", rows)
-                self.reject(self.invoke("verify", 3, PACKAGE, listed, run, *IDENTITY))
+                self.reject(self.invoke("verify", 5, PACKAGE, listed, run, *IDENTITY))
         listed = self.json_lines("list.json", [event("start"), event("run", ROOT), event("pass", ROOT), event("pass")])
-        self.reject(self.invoke("select", 3, PACKAGE, listed))
+        self.reject(self.invoke("select", 5, PACKAGE, listed))
 
     def test_top_and_child_event_integrity(self):
         child = ROOT + "/child"
@@ -279,7 +290,7 @@ class VerifierTests(unittest.TestCase):
                                             event("output", child, Output="hello\n"),
                                             event("attr", child, Key="key", Value="value"),
                                             event("artifacts", child), event("pass", child), event("pass", ROOT)]))
-        self.assertEqual(summary, {"schema": 1, "slot": 3, "total": 4, "run_id": IDENTITY[1],
+        self.assertEqual(summary, {"schema": 1, "slot": 5, "total": 6, "run_id": IDENTITY[1],
                                    "checkout_sha": IDENTITY[3], "checkout_tree": IDENTITY[5], "package": PACKAGE,
                                    "compiled": {ROOT: 1}, "selected": {ROOT: 1}, "runs": {ROOT: 1},
                                    "passes": {ROOT: 1}, "skips": {}})
@@ -288,21 +299,36 @@ class VerifierTests(unittest.TestCase):
             identity[index] = value
             listed = self.inventory([ROOT])
             run = self.json_lines("run.json", [event("start"), event("run", ROOT), event("pass", ROOT), event("pass")])
-            self.reject(self.invoke("verify", 3, PACKAGE, listed, run, *identity))
+            self.reject(self.invoke("verify", 5, PACKAGE, listed, run, *identity))
 
     def test_aggregate_good_all_kinds_and_empty_slots(self):
         directory = self.artifacts()
-        self.success(self.aggregate(directory))
+        summary = self.success(self.aggregate(directory))
+        self.assertEqual(summary["total"], 6)
+        for field in ["compiled", "runs", "passes"]:
+            self.assertEqual(summary[field], {name: 1 for name in SLOTS})
+        self.assertEqual(summary["skips"], {})
         # Same-run partial retry replaces only this artifact, without attempt coupling.
         path = directory / "store-shard-v1-0" / "store-summary.json"
         path.write_text(json.dumps(json.loads(path.read_text()), sort_keys=True), encoding="utf-8")
         self.success(self.aggregate(directory))
         other = self.directory / "empty-slots"
         directory.rename(other)
-        self.success(self.aggregate(self.artifacts(names=[ROOT])))
+        directory = self.artifacts(names=[ROOT])
+        self.success(self.aggregate(directory))
+        # An empty selection still needs its own current-run artifact.
+        (directory / "store-shard-v1-4").rename(self.directory / "empty-slot")
+        self.reject(self.aggregate(directory))
 
     def test_aggregate_missing_duplicate_extra_and_unsafe_files(self):
         directory = self.artifacts()
+        for slot in [5, 4]:
+            artifact = directory / f"store-shard-v1-{slot}"
+            artifact.rename(self.directory / artifact.name)
+            self.reject(self.aggregate(directory))
+        for slot in [4, 5]:
+            artifact = self.directory / f"store-shard-v1-{slot}"
+            artifact.rename(directory / artifact.name)
         path = directory / "store-shard-v1-0" / "store-summary.json"
         data = path.read_bytes()
         path.unlink()
@@ -331,12 +357,23 @@ class VerifierTests(unittest.TestCase):
         self.mutate(directory, 0, lambda summary: summary["compiled"].pop(ROOT))
         self.reject(self.aggregate(directory))
 
+    def test_aggregate_per_slot_multiset_rejected(self):
+        directory = self.artifacts()
+        for slot in range(6):
+            name = next(name for name in SLOTS if SLOTS[name] == slot)
+            for field in ["selected", "runs", "passes"]:
+                with self.subTest(slot=slot, field=field):
+                    self.mutate(directory, slot, lambda summary: summary[field].update({name: 2}))
+                    self.reject(self.aggregate(directory))
+                    self.mutate(directory, slot, lambda summary: summary[field].update({name: 1}))
+
     def test_aggregate_counter_and_schema_validation(self):
         directory = self.artifacts()
-        path = directory / "store-shard-v1-3" / "store-summary.json"
+        path = directory / "store-shard-v1-5" / "store-summary.json"
         original = path.read_text(encoding="utf-8")
-        changes = [("schema", False), ("schema", True), ("schema", 0), ("schema", 1.0), ("total", True), ("total", 3), ("total", 4.0),
-                   ("slot", False), ("slot", -1), ("slot", 4), ("slot", 3.0), ("run_id", 42566516008),
+        changes = [("schema", False), ("schema", True), ("schema", 0), ("schema", 1.0),
+                   ("total", True), ("total", 3), ("total", 4), ("total", 4.0), ("total", 6.0),
+                   ("slot", False), ("slot", -1), ("slot", 4), ("slot", 6), ("slot", 5.0), ("run_id", 42566516008),
                    ("compiled", {}), ("selected", {}), ("runs", {}), ("passes", {}), ("skips", {ROOT: 1})]
         for field in ["compiled", "selected", "runs", "passes", "skips"]:
             for value in [True, False, -1, 0, 1.0, "1", 2]:
@@ -347,11 +384,11 @@ class VerifierTests(unittest.TestCase):
         for field, value in changes:
             with self.subTest(field=field, value=value):
                 path.write_text(original, encoding="utf-8")
-                self.mutate(directory, 3, lambda summary: summary.update({field: value}))
+                self.mutate(directory, 5, lambda summary: summary.update({field: value}))
                 self.reject(self.aggregate(directory))
         for change in [lambda summary: summary.update(extra=True), lambda summary: summary.pop("schema")]:
             path.write_text(original, encoding="utf-8")
-            self.mutate(directory, 3, change)
+            self.mutate(directory, 5, change)
             self.reject(self.aggregate(directory))
         for raw in [original.replace('"schema": 1', '"schema": 1, "schema": 1'),
                     original.replace('"' + ROOT + '": 1', '"' + ROOT + '": 1, "' + ROOT + '": 1', 1),
@@ -361,7 +398,7 @@ class VerifierTests(unittest.TestCase):
 
     def test_aggregate_hash_recomputed_not_just_coverage(self):
         directory = self.artifacts()
-        for slot in [0, 3]:
+        for slot in [0, 5]:
             def move(summary, slot=slot):
                 for field in ["selected", "runs", "passes"]:
                     if slot == 0:
@@ -411,11 +448,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('--run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"', job)
         self.assertIn('package=$(go list ./internal/store)', job)
 
-    def test_workflow_four_slots_real_uncached_runs_and_artifact_isolation(self):
+    def test_workflow_six_slots_real_uncached_runs_and_artifact_isolation(self):
         store = self.workflow.split("\n  go-store:\n", 1)
         self.assertEqual(len(store), 2)
         store = store[1].split("\n  go:\n", 1)[0]
-        for text in ["fail-fast: false", "slot: [0, 1, 2, 3]", "timeout-minutes: 15",
+        for text in ["fail-fast: false", "slot: [0, 1, 2, 3, 4, 5]", "timeout-minutes: 15",
                      "go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/store",
                      'go test -count=1 -race -json -run "$pattern" ./internal/store',
                      'package=$(go list ./internal/store)', 'git rev-parse HEAD', 'git rev-parse HEAD^{tree}',
