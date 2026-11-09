@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box Store shard gate regressions; never invokes Go."""
+"""Black-box Store/Platform shard gate regressions; never invokes Go."""
 import json
 import os
 from pathlib import Path
@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 
@@ -21,6 +22,10 @@ SLOTS = {"TestCoordination": 11, "TestAlpha": 1, "TestBeta": 17, "TestGamma": 2,
          "TestTheta": 0, "TestIota": 4, "TestOne": 1, "TestThree": 3,
          "TestVector77": 6, "TestVector5": 8, "TestSeven": 9, "TestVector2": 10,
          "TestFifteen": 13, "TestFive": 14}
+PLATFORM_PACKAGE = "agentworkspace/internal/platform"
+# Fixed SHA-256 first-eight-byte big-endian mod-4 vectors.
+PLATFORM_SLOTS = {"TestCoordination": 3, "TestAlpha": 3, "TestBeta": 3, "TestGamma": 0,
+                  "Test新入口": 2, "Example": 1, "FuzzBytes": 0}
 
 
 def event(action, name="", **fields):
@@ -28,6 +33,10 @@ def event(action, name="", **fields):
     if name:
         row["Test"] = name
     return row
+
+
+def platform_event(action, name="", **fields):
+    return event(action, name, Package=PLATFORM_PACKAGE, **fields)
 
 
 class VerifierTests(unittest.TestCase):
@@ -41,42 +50,52 @@ class VerifierTests(unittest.TestCase):
         path.write_text("".join(json.dumps(row, ensure_ascii=True) + "\n" for row in rows), encoding="utf-8")
         return path
 
-    def inventory(self, names):
-        return self.json_lines("list.json", [event("start"), event("output", Output="".join(name + "\n" for name in names)),
-                                             event("output", Output=f"ok  \t{PACKAGE}\t0.001s\n"), event("pass")])
+    def inventory(self, names, package=PACKAGE):
+        return self.json_lines("list.json", [event("start", Package=package),
+                                             event("output", Package=package, Output="".join(name + "\n" for name in names)),
+                                             event("output", Package=package, Output=f"ok  \t{package}\t0.001s\n"),
+                                             event("pass", Package=package)])
 
     def invoke(self, *args):
         return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)], text=True,
                               capture_output=True, timeout=10)
 
-    def verify(self, rows, names=(ROOT,), slot=11):
-        listed = self.inventory(names)
-        run = self.json_lines("run.json", [event("start"), *rows, event("pass")])
-        return self.invoke("verify", slot, PACKAGE, listed, run, *IDENTITY)
+    def verify(self, rows, names=(ROOT,), slot=11, profile=None):
+        package = PLATFORM_PACKAGE if profile == "platform" else PACKAGE
+        listed = self.inventory(names, package)
+        run = self.json_lines("run.json", [event("start", Package=package), *rows, event("pass", Package=package)])
+        options = ["--profile", profile] if profile else []
+        return self.invoke("verify", slot, package, listed, run, *IDENTITY, *options)
 
     def success(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
-    def artifacts(self, names=tuple(SLOTS)):
+    def artifacts(self, names=tuple(SLOTS), profile=None):
         directory = self.directory / "summaries"
-        for slot in range(18):
-            selected = [name for name in names if SLOTS[name] == slot]
-            rows = [row for name in selected for row in (event("run", name), event("pass", name))]
-            summary = self.success(self.verify(rows, names, slot))
-            path = directory / f"store-shard-v1-{slot}" / "store-summary.json"
+        suite = profile or "store"
+        slots, total = (PLATFORM_SLOTS, 4) if profile == "platform" else (SLOTS, 18)
+        make_event = platform_event if profile == "platform" else event
+        for slot in range(total):
+            selected = [name for name in names if slots[name] == slot]
+            rows = [row for name in selected for row in (make_event("run", name), make_event("pass", name))]
+            summary = self.success(self.verify(rows, names, slot, profile))
+            path = directory / f"{suite}-shard-v1-{slot}" / f"{suite}-summary.json"
             path.parent.mkdir(parents=True)
             path.write_text(json.dumps(summary), encoding="utf-8")
         return directory
 
-    def mutate(self, directory, slot, change):
-        path = directory / f"store-shard-v1-{slot}" / "store-summary.json"
+    def mutate(self, directory, slot, change, profile=None):
+        suite = profile or "store"
+        path = directory / f"{suite}-shard-v1-{slot}" / f"{suite}-summary.json"
         summary = json.loads(path.read_text(encoding="utf-8"))
         change(summary)
         path.write_text(json.dumps(summary), encoding="utf-8")
 
-    def aggregate(self, directory, identity=IDENTITY, package=PACKAGE):
-        return self.invoke("aggregate", package, directory, *identity)
+    def aggregate(self, directory, identity=IDENTITY, package=None, profile=None):
+        package = package if package is not None else (PLATFORM_PACKAGE if profile == "platform" else PACKAGE)
+        options = ["--profile", profile] if profile else []
+        return self.invoke("aggregate", package, directory, *identity, *options)
 
     def reject(self, result):
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -426,6 +445,151 @@ class VerifierTests(unittest.TestCase):
             self.mutate(directory, 0, lambda summary: summary.update({field: {"run_id": IDENTITY[1], "checkout_sha": IDENTITY[3],
                                                                             "checkout_tree": IDENTITY[5], "package": PACKAGE}[field]}))
 
+    def test_profile_package_binding_even_when_all_evidence_agrees(self):
+        # The default Store CLI must not accept another package's consistent evidence.
+        for package in [PLATFORM_PACKAGE, "other/internal/store"]:
+            listed = self.inventory([ROOT], package)
+            run = self.json_lines("run.json", [event("start", Package=package), event("run", ROOT, Package=package),
+                                                event("pass", ROOT, Package=package), event("pass", Package=package)])
+            for command, args in [("select", [listed]), ("verify", [listed, run, *IDENTITY])]:
+                with self.subTest(package=package, command=command):
+                    self.reject(self.invoke(command, 11, package, *args))
+        directory = self.artifacts()
+        for slot in range(18):
+            self.mutate(directory, slot, lambda summary: summary.update(package=PLATFORM_PACKAGE))
+        self.reject(self.aggregate(directory, package=PLATFORM_PACKAGE))
+
+    def test_platform_fixed_vectors_full_coverage_and_empty_slots(self):
+        listed = self.inventory(PLATFORM_SLOTS, PLATFORM_PACKAGE)
+        for slot in range(4):
+            result = self.invoke("select", slot, PLATFORM_PACKAGE, listed, "--profile", "platform")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = sorted(name for name, assigned in PLATFORM_SLOTS.items() if assigned == slot)
+            self.assertEqual(result.stdout.strip(), "^(" + "|".join(expected) + ")$")
+            self.assertIsNone(re.fullmatch(result.stdout.strip(), expected[0] + "Extra"))
+        directory = self.artifacts(PLATFORM_SLOTS, "platform")
+        summary = self.success(self.aggregate(directory, profile="platform"))
+        self.assertEqual((summary["schema"], summary["total"], summary["package"]), (1, 4, PLATFORM_PACKAGE))
+        for field in ["compiled", "runs", "passes"]:
+            self.assertEqual(summary[field], {name: 1 for name in PLATFORM_SLOTS})
+        self.assertEqual(summary["skips"], {})
+        directory.rename(self.directory / "full-slots")
+        directory = self.artifacts([ROOT], "platform")
+        self.success(self.aggregate(directory, profile="platform"))
+        empty = json.loads((directory / "platform-shard-v1-0/platform-summary.json").read_text())
+        self.assertEqual(empty["compiled"], {ROOT: 1})
+        for field in ["selected", "runs", "passes", "skips"]:
+            self.assertEqual(empty[field], {})
+        (directory / "platform-shard-v1-0").rename(self.directory / "empty-slot")
+        self.reject(self.aggregate(directory, profile="platform"))
+
+    def test_profiles_are_bounded_and_cross_package_select_verify_fail(self):
+        listed = self.inventory([ROOT], PLATFORM_PACKAGE)
+        run = self.json_lines("run.json", [platform_event("start"), platform_event("run", ROOT),
+                                            platform_event("pass", ROOT), platform_event("pass")])
+        for command, args in [("select", [listed]), ("verify", [listed, run, *IDENTITY])]:
+            for slot in [-1, 4, 18]:
+                with self.subTest(command=command, slot=slot):
+                    result = self.invoke(command, slot, PLATFORM_PACKAGE, *args, "--profile", "platform")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("invalid choice", result.stderr)
+            for profile, package in [("store", PLATFORM_PACKAGE), ("platform", PACKAGE)]:
+                with self.subTest(command=command, profile=profile):
+                    listed = self.inventory([ROOT], package)
+                    run = self.json_lines("run.json", [event("start", Package=package), event("run", ROOT, Package=package),
+                                                        event("pass", ROOT, Package=package), event("pass", Package=package)])
+                    evidence = [listed] if command == "select" else [listed, run, *IDENTITY]
+                    self.reject(self.invoke(command, 3, package, *evidence, "--profile", profile))
+        listed = self.inventory([ROOT])
+        for options in [("--profile", "other"), ("--total", "4"), ("--profile", "platform", "--total", "18")]:
+            result = self.invoke("select", 0, PACKAGE, listed, *options)
+            self.assertEqual(result.returncode, 2, result.stderr)
+        explicit = self.invoke("select", 11, PACKAGE, listed, "--profile", "store")
+        legacy = self.invoke("select", 11, PACKAGE, listed)
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        self.assertEqual(explicit.stdout, legacy.stdout)
+
+    def test_platform_nested_lifecycle_and_bad_execution_evidence(self):
+        child = ROOT + "/child"
+        rows = [platform_event("run", ROOT), platform_event("run", child), platform_event("pause", child),
+                platform_event("cont", child), platform_event("pass", child), platform_event("pass", ROOT)]
+        summary = self.success(self.verify(rows, slot=3, profile="platform"))
+        self.assertEqual(summary["selected"], {ROOT: 1})
+        good = [platform_event("run", ROOT), platform_event("pass", ROOT)]
+        cases = [[], good * 2, [platform_event("run", ROOT)], [platform_event("pass", ROOT)]]
+        for action in ["skip", "fail"]:
+            cases.extend([[platform_event("run", ROOT), platform_event(action, ROOT)],
+                          [platform_event("run", ROOT), platform_event("run", child), platform_event(action, child),
+                           platform_event("pass", ROOT)]])
+        for rows in cases:
+            with self.subTest(rows=rows):
+                self.reject(self.verify(rows, slot=3, profile="platform"))
+        listed = self.inventory([ROOT], PLATFORM_PACKAGE)
+        for rows in [[platform_event("start"), *good], [platform_event("start"), platform_event("skip")],
+                     [platform_event("start"), platform_event("fail")]]:
+            run = self.json_lines("run.json", rows)
+            self.reject(self.invoke("verify", 3, PLATFORM_PACKAGE, listed, run, *IDENTITY, "--profile", "platform"))
+        run = self.json_lines("run.json", [platform_event("start"), *good, platform_event("pass")])
+        run.write_bytes(run.read_bytes()[:-1])
+        self.reject(self.invoke("verify", 3, PLATFORM_PACKAGE, listed, run, *IDENTITY, "--profile", "platform"))
+        listed.write_bytes(listed.read_bytes()[:-1])
+        self.reject(self.invoke("select", 3, PLATFORM_PACKAGE, listed, "--profile", "platform"))
+        self.reject(self.invoke("select", 0, PLATFORM_PACKAGE, self.inventory([], PLATFORM_PACKAGE), "--profile", "platform"))
+
+    def test_platform_aggregate_identity_profile_and_prefix_binding(self):
+        directory = self.artifacts(PLATFORM_SLOTS, "platform")
+        for index, value in [(1, "42566516009"), (3, "c" * 40), (5, "d" * 40)]:
+            identity = list(IDENTITY)
+            identity[index] = value
+            self.reject(self.aggregate(directory, identity=identity, profile="platform"))
+        for field, value, original in [("run_id", "42566516009", IDENTITY[1]), ("checkout_sha", "c" * 40, IDENTITY[3]),
+                                       ("checkout_tree", "d" * 40, IDENTITY[5]), ("package", PACKAGE, PLATFORM_PACKAGE)]:
+            for slot in range(4):
+                self.mutate(directory, slot, lambda summary: summary.update({field: value}), "platform")
+            self.reject(self.aggregate(directory, profile="platform"))
+            if field == "package":
+                self.reject(self.aggregate(directory, package=PACKAGE, profile="platform"))
+            for slot in range(4):
+                self.mutate(directory, slot, lambda summary: summary.update({field: original}), "platform")
+        self.reject(self.aggregate(directory))
+        path = directory / "platform-shard-v1-0/platform-summary.json"
+        path.rename(path.with_name("store-summary.json"))
+        self.reject(self.aggregate(directory, profile="platform"))
+        path.with_name("store-summary.json").rename(path)
+        for slot in range(4):
+            (directory / f"platform-shard-v1-{slot}").rename(directory / f"store-shard-v1-{slot}")
+        self.reject(self.aggregate(directory, profile="platform"))
+
+    def test_platform_aggregate_missing_duplicate_extra_and_compiled_inventory(self):
+        directory = self.artifacts(PLATFORM_SLOTS, "platform")
+        artifact = directory / "platform-shard-v1-1"
+        artifact.rename(self.directory / "missing")
+        self.reject(self.aggregate(directory, profile="platform"))
+        (self.directory / "missing").rename(artifact)
+        self.mutate(directory, 1, lambda summary: summary.update(slot=0), "platform")
+        self.reject(self.aggregate(directory, profile="platform"))
+        self.mutate(directory, 1, lambda summary: summary.update(slot=1), "platform")
+        extra = directory / "platform-shard-v1-4"
+        extra.mkdir()
+        self.reject(self.aggregate(directory, profile="platform"))
+        extra.rmdir()
+        self.mutate(directory, 0, lambda summary: summary["compiled"].pop(ROOT), "platform")
+        self.reject(self.aggregate(directory, profile="platform"))
+        for slot in range(4):
+            self.mutate(directory, slot, lambda summary: summary.update(compiled={}, selected={}, runs={}, passes={}), "platform")
+        self.reject(self.aggregate(directory, profile="platform"))
+
+    def test_platform_aggregate_recomputes_hash_despite_complete_union(self):
+        directory = self.artifacts(PLATFORM_SLOTS, "platform")
+        # Both wrong assignments still partition the complete inventory exactly once.
+        assignments = [{name: SLOTS[name] % 4 for name in PLATFORM_SLOTS},
+                       {name: (slot + 1) % 4 for name, slot in PLATFORM_SLOTS.items()}]
+        for assigned in assignments:
+            for slot in range(4):
+                selected = {name: 1 for name in assigned if assigned[name] == slot}
+                self.mutate(directory, slot, lambda summary: summary.update(selected=selected, runs=selected, passes=selected), "platform")
+            self.reject(self.aggregate(directory, profile="platform"))
+
 
 class WorkflowTests(unittest.TestCase):
     @classmethod
@@ -437,16 +601,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNotNone(match)
         job = match.group("job")
         self.assertIn("name: Go\n", job)
-        self.assertIn("needs: [go-store]", job)
+        self.assertIn("needs: [go-store, go-platform]", job)
         self.assertIn("if: ${{ always() }}", job)
-        gate = re.search(r"steps:\n      - name: Check Store shards\n        env:\n          STORE_RESULT: \$\{\{ needs.go-store.result \}\}\n        run: ([^\n]+)", job)
-        self.assertIsNotNone(gate, "matrix result check must be the first step")
-        for state in ["success", "failure", "cancelled", "skipped", "", "unknown"]:
-            with self.subTest(state=state):
-                result = subprocess.run(["bash", "-c", gate.group(1)], env={**os.environ, "STORE_RESULT": state}, capture_output=True, timeout=5)
-                self.assertEqual(result.returncode == 0, state == "success")
-        positions = [job.index(text) for text in ["Check Store shards", "actions/checkout@v7", "actions/download-artifact@v7",
-                                                 "verify-store-shard.py aggregate", "Race test all other packages", "go vet ./...", "Record benchmark metrics"]]
+        gate = re.search(r"steps:\n      - name: Check Store and Platform shards\n        env:\n          STORE_RESULT: \$\{\{ needs.go-store.result \}\}\n          PLATFORM_RESULT: \$\{\{ needs.go-platform.result \}\}\n        run: ([^\n]+)", job)
+        self.assertIsNotNone(gate, "both matrix results must be checked in the first step")
+        states = ["success", "failure", "cancelled", "skipped", "", "unknown"]
+        for store_state in states:
+            for platform_state in states:
+                with self.subTest(store=store_state, platform=platform_state):
+                    result = subprocess.run(["bash", "-c", gate.group(1)],
+                                            env={**os.environ, "STORE_RESULT": store_state, "PLATFORM_RESULT": platform_state},
+                                            capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode == 0, store_state == platform_state == "success")
+        positions = [job.index(text) for text in ["Check Store and Platform shards", "actions/checkout@v7", "actions/download-artifact@v7",
+                                                 "Verify Store shard coverage", "Verify Platform shard coverage",
+                                                 "Race test all other packages", "go vet ./...", "Record benchmark metrics"]]
         self.assertEqual(positions, sorted(positions))
         self.assertIn('--run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"', job)
         self.assertIn('package=$(go list ./internal/store)', job)
@@ -454,7 +623,7 @@ class WorkflowTests(unittest.TestCase):
     def test_workflow_eighteen_slots_real_uncached_runs_and_artifact_isolation(self):
         store = self.workflow.split("\n  go-store:\n", 1)
         self.assertEqual(len(store), 2)
-        store = store[1].split("\n  go:\n", 1)[0]
+        store = store[1].split("\n  go-platform:\n", 1)[0]
         for text in ["fail-fast: false", "slot: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]", "timeout-minutes: 15",
                      "go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/store",
                      'go test -count=1 -race -json -run "$pattern" ./internal/store',
@@ -470,6 +639,72 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.workflow.count("python3 .github/scripts/test-store-shard.py"), 1)
         self.assertIn("name: go-benchmarks", self.workflow)
         self.assertNotIn("fixture", self.workflow.lower())
+
+    def test_platform_matrix_and_independent_aggregate(self):
+        platform = re.search(r"\n  go-platform:\n(.*?)(?=\n  go:)", self.workflow, re.S)
+        self.assertIsNotNone(platform)
+        for text in ["fail-fast: false", "slot: [0, 1, 2, 3]", "timeout-minutes: 15",
+                     "go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/platform",
+                     'go test -count=1 -race -json -run "$pattern" ./internal/platform',
+                     'package=$(go list ./internal/platform)', 'git rev-parse HEAD', 'git rev-parse HEAD^{tree}',
+                     '"$GITHUB_RUN_ID"', 'verify-store-shard.py select --profile platform "$PLATFORM_SLOT"',
+                     'verify-store-shard.py verify --profile platform "$PLATFORM_SLOT"',
+                     "name: platform-shard-v1-${{ matrix.slot }}", "overwrite: true", "if-no-files-found: error",
+                     "path: ${{ runner.temp }}/platform-summary.json"]:
+            self.assertIn(text, platform.group(1))
+        self.assertNotIn("-timeout", platform.group(1))
+        for suite in ["store", "platform"]:
+            download = re.search(rf"pattern: {suite}-shard-v1-\*\n          path: \$\{{\{{ runner.temp \}}\}}/{suite}-shards\n          merge-multiple: false", self.workflow)
+            self.assertIsNotNone(download)
+            aggregate = re.search(rf"- name: Verify {suite.title()} shard coverage\n        run: \|\n(.*?)(?=\n      -)", self.workflow, re.S)
+            self.assertIsNotNone(aggregate)
+            for text in [f'package=$(go list ./internal/{suite})', f'"$RUNNER_TEMP/{suite}-shards"',
+                         '--run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"']:
+                self.assertIn(text, aggregate.group(1))
+            self.assertIn("verify-store-shard.py aggregate" + (" --profile platform" if suite == "platform" else ""), aggregate.group(1))
+
+    def test_remaining_package_exclusion_executes_actual_shell_without_go(self):
+        match = re.search(r"- name: Race test all other packages\n        run: \|\n(.*?)(?=\n      -)", self.workflow, re.S)
+        self.assertIsNotNone(match)
+        script = textwrap.dedent(match.group(1))
+        # PATH is empty, and every go invocation is handled here or rejected.
+        stub = '''go() {
+          if [[ "$#" -eq 2 && "$1" == list ]]; then
+            case "$2" in
+              ./internal/store) printf '%s\\n' "$STUB_STORE" ;;
+              ./internal/platform) printf '%s\\n' "$STUB_PLATFORM" ;;
+              ./...) printf '%s\\n' "$STUB_ALL" ;;
+              *) return 90 ;;
+            esac
+          elif [[ "$#" -gt 2 && "$1" == test && "$2" == -race ]]; then
+            printf 'race:%s\\n' "${@:3}"
+          else
+            return 90
+          fi
+        }
+        readonly -f go
+        '''
+        remainder = ["agentworkspace/other", PACKAGE + "extra", PLATFORM_PACKAGE + "/child"]
+        valid = "\n".join([PACKAGE, *remainder, PLATFORM_PACKAGE])
+        cases = [("valid", PACKAGE, PLATFORM_PACKAGE, valid, True),
+                 ("empty-store", "", PLATFORM_PACKAGE, valid, False),
+                 ("empty-platform", PACKAGE, "", valid, False),
+                 ("multiline-store", PACKAGE + "\nother", PLATFORM_PACKAGE, valid, False),
+                 ("multiline-platform", PACKAGE, PLATFORM_PACKAGE + "\nother", valid, False),
+                 ("equal", PACKAGE, PACKAGE, valid, False),
+                 ("missing-store", PACKAGE, PLATFORM_PACKAGE, PLATFORM_PACKAGE + "\nother", False),
+                 ("missing-platform", PACKAGE, PLATFORM_PACKAGE, PACKAGE + "\nother", False),
+                 ("duplicate-store", PACKAGE, PLATFORM_PACKAGE, valid + "\n" + PACKAGE, False),
+                 ("duplicate-platform", PACKAGE, PLATFORM_PACKAGE, valid + "\n" + PLATFORM_PACKAGE, False),
+                 ("empty-remainder", PACKAGE, PLATFORM_PACKAGE, PACKAGE + "\n" + PLATFORM_PACKAGE, False),
+                 ("blank-remainder", PACKAGE, PLATFORM_PACKAGE, PACKAGE + "\n\n" + PLATFORM_PACKAGE, False)]
+        for label, store, platform, all_packages, accepted in cases:
+            with self.subTest(case=label):
+                result = subprocess.run(["/bin/bash", "-c", stub + script],
+                                        env={**os.environ, "PATH": "", "STUB_STORE": store, "STUB_PLATFORM": platform,
+                                             "STUB_ALL": all_packages}, text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ["race:" + package for package in remainder] if accepted else [])
 
 
 if __name__ == "__main__":
