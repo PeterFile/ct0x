@@ -16,11 +16,10 @@ import (
 	"agentworkspace/internal/store"
 )
 
-// Uncompiled test draft: the private fence API and readTurn seam are provisional.
 // One core instance models a future runtime-owned fence; nothing here wires it
 // into MemberToolRuntime, grants tools, calls an adapter, or tests Revoke/drain.
-// The proposed core keeps at most M records/slots and a persistent GC cursor,
-// with at most M GC reads per admission round and no Release, Reset, or TTL.
+// Core records/slots are bounded by M with a persistent GC cursor, at most M GC
+// reads per admission round, and no Release, Reset, or TTL.
 type memberToolRoleFenceFixture struct {
 	localMessageFixture
 	runtime   *MemberToolRuntime
@@ -104,7 +103,7 @@ func (f memberToolRoleFenceFixture) requireTurn(t *testing.T, claim store.TurnCl
 	return turn
 }
 
-// The only proposed read seam is fence.readTurn, with Store.GetTurn's signature.
+// The private read seam is fence.readTurn, with Store.GetTurn's signature.
 // The hook runs inside that read call, after the SAME real Store returned a row.
 // It may delay or reject the read, but cannot manufacture or change a DB row.
 // Install it before concurrent admissions; never replace it while calls run.
@@ -514,6 +513,105 @@ func TestMemberToolRoleFenceRootClaimAndReadFailures(t *testing.T) {
 		if !reflect.DeepEqual(before, after) || len(f.runtime.Tools().capabilities) != 0 {
 			t.Fatal("root/claim checks changed the Store or issued tool authority")
 		}
+	})
+
+	for _, change := range []string{"terminal", "claim-token", "session", "cancel"} {
+		t.Run("stale-fresh-snapshot/"+change, func(t *testing.T) {
+			f := setupMemberToolRoleFence(t, 1)
+			claim := f.claim(t, f.groupID)
+			reads := 0
+			reader := memberToolRoleFenceReader{db: f.db, after: func(ctx context.Context, turn domain.Turn) error {
+				if _, bounded := ctx.Deadline(); !bounded {
+					t.Error("fence identity read has no bounded context")
+				}
+				reads++
+				if reads != 1 {
+					return nil
+				}
+				// The returned snapshot is still genuinely fresh, but the SAME
+				// Store now has newer authoritative facts before reserve resumes.
+				switch change {
+				case "terminal":
+					_, err := f.db.ApplyTurnReceipt(context.Background(), claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted})
+					return err
+				case "claim-token":
+					result, err := f.raw.Exec("UPDATE turns SET claim_token=? WHERE group_id=? AND id=? AND claim_token=?", "changed-"+claim.Token, claim.GroupID, claim.TurnID, claim.Token)
+					if err != nil {
+						return err
+					}
+					if n, err := result.RowsAffected(); err != nil || n != 1 {
+						t.Fatalf("change fixture token: rows=%d, error=%v", n, err)
+					}
+				case "session":
+					return f.db.RecordTurnEvent(context.Background(), claim, provider.Event{Kind: provider.SessionEvent, NativeSessionID: "native"})
+				case "cancel":
+					_, err := f.db.RequestTurnCancel(context.Background(), claim.GroupID, claim.TurnID)
+					return err
+				}
+				return nil
+			}}
+			f.fence.readTurn = reader.getTurn
+			f.deny(t, context.Background(), claim, f.root)
+			if reads < 2 {
+				t.Fatal("stale fresh snapshot was not checked against a new Store read")
+			}
+			f.fence.readTurn = f.db.GetTurn
+			f.deny(t, context.Background(), claim, f.root)
+			if change == "terminal" {
+				f.requireTurn(t, claim, domain.TurnStateNotStarted, 0)
+			} else if err := f.fence.checkCapacity(context.Background()); err == nil {
+				t.Fatal("post-reservation uncertainty discarded occupancy")
+			}
+		})
+	}
+
+	for _, failure := range []string{"read-error", "cancelled-successful-read"} {
+		t.Run("post-reservation/"+failure, func(t *testing.T) {
+			f := setupMemberToolRoleFence(t, 1)
+			claim := f.claim(t, f.groupID)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			reads := 0
+			reader := memberToolRoleFenceReader{db: f.db, after: func(context.Context, domain.Turn) error {
+				reads++
+				if reads == 2 {
+					if failure == "read-error" {
+						return errors.New("injected post-reservation read failure")
+					}
+					cancel()
+				}
+				return nil
+			}}
+			f.fence.readTurn = reader.getTurn
+			f.deny(t, ctx, claim, f.root)
+			if reads != 2 {
+				t.Fatalf("post-reservation failure read count=%d, want two", reads)
+			}
+			f.fence.readTurn = f.db.GetTurn
+			f.deny(t, context.Background(), claim, f.root)
+			if err := f.fence.checkCapacity(context.Background()); err == nil {
+				t.Fatal("post-reservation failure released the still-starting Turn")
+			}
+			if _, err := f.db.ApplyTurnReceipt(context.Background(), claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.fence.checkCapacity(context.Background()); err != nil {
+				t.Fatalf("unexposed owner's completion and committed terminal did not reclaim: %v", err)
+			}
+		})
+	}
+
+	t.Run("closed-store", func(t *testing.T) {
+		f := setupMemberToolRoleFence(t, 1)
+		claim := f.claim(t, f.groupID)
+		f.reserve(t, claim).markLocalDone()
+		if err := f.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.fence.checkCapacity(context.Background()); err == nil {
+			t.Fatal("closed Store discarded occupancy")
+		}
+		f.deny(t, context.Background(), claim, f.root)
 	})
 
 	for _, uncertainty := range []string{"missing-row", "changed-token", "read-error"} {
