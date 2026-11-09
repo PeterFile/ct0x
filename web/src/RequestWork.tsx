@@ -146,7 +146,7 @@ export function RequestWork({ groupId, active, members = [], ref }: {
       if (mounted.current) update({ receipt, operation: null, phase: "confirmed", error: "", notice: "" });
     } catch (error) {
       if (!mounted.current) return;
-      const unknown = !isRequestWorkDefinitiveRejection(error);
+      const unknown = previous.phase === "unknown" || !isRequestWorkDefinitiveRejection(error);
       update({ phase: unknown ? "unknown" : "idle", operation: unknown ? operation : null,
         error: unknown ? `创建结果未确认。${errorText(error)} 请重试同一次创建。` : errorText(error) });
     }
