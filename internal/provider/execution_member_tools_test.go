@@ -233,6 +233,184 @@ func TestPiMemberToolsLiteralArgumentsAndChildOnlyConfig(t *testing.T) {
 	}
 }
 
+func TestPiMemberToolsRoleProfilesValidationWithoutLaunch(t *testing.T) {
+	selected, extension, config := memberToolFiles(t, `: > "$0.invoked"; exit 99`)
+	before := selected
+	before.Evidence = append([]Evidence(nil), selected.Evidence...)
+	// Even role profiles leave config content validation exclusively to the bridge.
+	contents := "not JSON; " + memberToolTestToken
+	if err := os.WriteFile(config, []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	configBefore, err := os.Stat(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name  string
+		names []string
+		valid bool
+	}{
+		{"coordinator", []string{"decide_dispatch", "read_history", "list_members", "search_history", "read_channel"}, true},
+		{"worker", []string{"submit_result", "read_history", "read_channel", "search_history"}, true},
+		{"ordinary-singleton", []string{"send_message"}, true},
+		{"history-singleton", []string{"read_history"}, true},
+		{"ordinary-mixed-subset", []string{"read_history", "send_message", "list_members"}, true},
+		{"ordinary-role-reads-without-write", []string{"read_history", "list_members", "read_channel", "search_history"}, true},
+		{"coordinator-singleton", []string{"decide_dispatch"}, false},
+		{"worker-singleton", []string{"submit_result"}, false},
+		{"coordinator-missing-list", []string{"read_channel", "search_history", "read_history", "decide_dispatch"}, false},
+		{"coordinator-missing-channel", []string{"list_members", "search_history", "read_history", "decide_dispatch"}, false},
+		{"coordinator-missing-search", []string{"list_members", "read_channel", "read_history", "decide_dispatch"}, false},
+		{"coordinator-missing-history", []string{"list_members", "read_channel", "search_history", "decide_dispatch"}, false},
+		{"worker-missing-channel", []string{"search_history", "read_history", "submit_result"}, false},
+		{"worker-missing-search", []string{"read_channel", "read_history", "submit_result"}, false},
+		{"worker-missing-history", []string{"read_channel", "search_history", "submit_result"}, false},
+		{"mixed-role-writes", []string{"read_channel", "search_history", "read_history", "submit_result", "decide_dispatch"}, false},
+		{"coordinator-extra-send", []string{"list_members", "read_channel", "search_history", "read_history", "decide_dispatch", "send_message"}, false},
+		{"worker-extra-create", []string{"read_channel", "search_history", "read_history", "submit_result", "create_member"}, false},
+		{"worker-extra-list", []string{"list_members", "read_channel", "search_history", "read_history", "submit_result"}, false},
+		{"coordinator-replaced-read", []string{"send_message", "read_channel", "search_history", "read_history", "decide_dispatch"}, false},
+		{"worker-replaced-read", []string{"list_members", "search_history", "read_history", "submit_result"}, false},
+		{"duplicate-role-write", []string{"list_members", "read_channel", "search_history", "decide_dispatch", "decide_dispatch"}, false},
+		{"duplicate-role-read", []string{"read_channel", "read_history", "read_history", "submit_result"}, false},
+		{"ordinary-six-plus-role-write", []string{"list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch"}, false},
+		{"all-eight", []string{"list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result"}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor, err := NewPiMemberToolExecutorWithTools(selected, extension, config, test.names, time.Second)
+			if test.valid {
+				if executor == nil || err != nil {
+					t.Fatalf("valid trusted profile rejected: executor=%T, error=%v", executor, err)
+				}
+			} else if executor != nil || err != errPiMemberToolConfiguration {
+				t.Fatalf("invalid trusted profile accepted or leaked: executor=%T, error=%v", executor, err)
+			}
+		})
+	}
+	for _, name := range []string{"unknown", "Decide_dispatch", "SUBMIT_RESULT", " decide_dispatch", "submit_result ", "decide_dispatch\n", "submit_result\x00", "*", "decide_*", "+decide_dispatch", "-submit_result", "decide_dispatch,submit_result"} {
+		t.Run("invalid-selector/"+name, func(t *testing.T) {
+			names := []string{"list_members", "read_channel", "search_history", "read_history", name}
+			executor, err := NewPiMemberToolExecutorWithTools(selected, extension, config, names, 0)
+			if executor != nil || err != errPiMemberToolConfiguration {
+				t.Fatalf("nonliteral tool selector accepted or leaked: executor=%T, error=%v", executor, err)
+			}
+		})
+	}
+	for _, gate := range []string{"provider", "version", "timeout"} {
+		t.Run("provider-gate-precedes-profile-and-files/"+gate, func(t *testing.T) {
+			invalid, timeout := selected, time.Duration(0)
+			switch gate {
+			case "provider":
+				invalid.Name, invalid.Version = Codex, "0.162.1"
+			case "version":
+				invalid.Version = "1.4.1"
+			case "timeout":
+				timeout = -time.Second
+			}
+			executor, err := NewPiMemberToolExecutorWithTools(invalid, "relative", "relative", []string{"decide_dispatch"}, timeout)
+			if executor != nil || err != errExecutorConfiguration {
+				t.Fatalf("provider validation precedence changed: executor=%T, error=%v", executor, err)
+			}
+		})
+	}
+	if !reflect.DeepEqual(selected, before) {
+		t.Fatal("profile construction changed provider metadata")
+	}
+	configAfter, err := os.Stat(config)
+	if err != nil || !os.SameFile(configBefore, configAfter) || configBefore.Mode() != configAfter.Mode() || !configBefore.ModTime().Equal(configAfter.ModTime()) {
+		t.Fatalf("profile construction changed config metadata: %v", err)
+	}
+	if data, err := os.ReadFile(config); err != nil || string(data) != contents {
+		t.Fatalf("profile construction changed config contents: %v", err)
+	}
+	if _, err := os.Stat(selected.Path + ".invoked"); !os.IsNotExist(err) {
+		t.Fatalf("profile constructor launched a CLI: %v", err)
+	}
+}
+
+func TestPiMemberToolsRoleProfilesCanonicalArgvAndFrozenSelection(t *testing.T) {
+	t.Setenv(memberToolConfigEnv, "inherited-untrusted-config")
+	for _, profile := range []struct {
+		name  string
+		input []string
+		want  string
+	}{
+		{"coordinator", []string{"decide_dispatch", "read_history", "list_members", "search_history", "read_channel"}, "list_members,read_channel,search_history,read_history,decide_dispatch"},
+		{"worker", []string{"submit_result", "read_history", "read_channel", "search_history"}, "read_channel,search_history,read_history,submit_result"},
+	} {
+		t.Run(profile.name, func(t *testing.T) {
+			body := ": > \"$0.invoked\"\nset -eu\nprintf '%s\\n' \"$@\" > argv\nprintf '%s' \"$AGENT_WORKSPACE_MEMBER_TOOL_CONFIG\" > config-path\n/bin/cat > stdin\n" + executionHeader + executionEmit(executionStart, executionAssistant("stop"), executionEnd, executionSettled)
+			selected, extension, config := memberToolFiles(t, body)
+			before := append([]string(nil), profile.input...)
+			executor, err := NewPiMemberToolExecutorWithTools(selected, extension, config, profile.input, 10*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(profile.input, before) {
+				t.Fatal("constructor reordered caller-owned selection")
+			}
+			if _, err := os.Stat(selected.Path + ".invoked"); !os.IsNotExist(err) {
+				t.Fatalf("role construction invoked executable: %v", err)
+			}
+			for i := range profile.input {
+				profile.input[i] = "send_message"
+			}
+			request := ExecuteRequest{RunID: "run1", CWD: t.TempDir(), RuntimeDir: t.TempDir(), Prompt: "synthetic role prompt\n$(touch prompt-marker)\n", Model: "synthetic/model;$(touch model-marker)", Thinking: "max"}
+			if err := os.Chmod(request.RuntimeDir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			var events []Event
+			receipt := executor.Execute(context.Background(), request, func(event Event) error { events = append(events, event); return nil })
+			if receipt.Outcome != OutcomeSucceeded || receipt.Terminal != OutcomeSucceeded || !receipt.Started || !receipt.Accepted || !receipt.OutputComplete || !receipt.DirectChildReaped || receipt.ExitCode != 0 || receipt.NativeSessionID != request.RunID {
+				t.Fatalf("synthetic role execution failed: %+v", receipt)
+			}
+			argv, err := os.ReadFile(filepath.Join(request.CWD, "argv"))
+			want := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", "--no-builtin-tools", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--session-dir", filepath.Join(request.RuntimeDir, request.RunID), "--session-id", request.RunID,
+				"--tools", profile.want, "--extension", extension, "--model", request.Model, "--thinking", "max"}
+			if err != nil || !reflect.DeepEqual(strings.Split(strings.TrimSuffix(string(argv), "\n"), "\n"), want) {
+				t.Fatalf("role argv not literal, canonical or frozen: %s, %v", argv, err)
+			}
+			for path, want := range map[string]string{filepath.Join(request.CWD, "config-path"): config, filepath.Join(request.CWD, "stdin"): request.Prompt, config: memberToolTestConfig} {
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != want {
+					t.Fatalf("role config handoff or literal input changed at %s: %v", path, err)
+				}
+			}
+			if _, err := os.Stat(selected.Path + ".invoked"); err != nil {
+				t.Fatalf("synthetic executable did not run: %v", err)
+			}
+			for _, name := range []string{"extension-marker", "config-marker", "prompt-marker", "model-marker"} {
+				if _, err := os.Stat(filepath.Join(request.CWD, name)); !os.IsNotExist(err) {
+					t.Fatal("shell interpreted role path or model input")
+				}
+			}
+			encoded, err := json.Marshal(struct {
+				Receipt ExecutionReceipt
+				Events  []Event
+			}{receipt, events})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{receipt.StdoutPath, receipt.StderrPath, filepath.Join(request.CWD, "argv"), filepath.Join(request.CWD, "stdin")} {
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				encoded = append(encoded, data...)
+			}
+			for _, private := range []string{memberToolTestToken, "http://127.0.0.1:1/api/v1/member-tools", config} {
+				if strings.Contains(string(encoded), private) {
+					t.Fatal("role config path or contents leaked into argv, prompt, logs, events or receipt")
+				}
+			}
+			if os.Getenv(memberToolConfigEnv) != "inherited-untrusted-config" {
+				t.Fatal("role execution changed parent environment")
+			}
+		})
+	}
+}
+
 func TestPiMemberToolsEnvironmentReplacesDuplicatesWithoutMutation(t *testing.T) {
 	inherited := []string{"KEEP=literal=value", memberToolConfigEnv + "=first", "AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_EXTRA=keep", memberToolConfigEnv + "=second"}
 	before := append([]string(nil), inherited...)

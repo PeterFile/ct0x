@@ -168,7 +168,7 @@ for (const [index, name] of history.entries()) {
 for (const profile of [four, six]) {
   test(`real Pi 1.4.0 SDK activates exactly ${profile.length} granted tools and cannot widen them without a prompt`, async t => {
     const extensions = await load(t);
-    assert.deepEqual([...definitions(extensions).keys()], six, "the actual loader must register all six schemas");
+    assert.deepEqual([...definitions(extensions).keys()], [...six, "decide_dispatch", "submit_result"], "the actual loader must register all eight schemas");
     const { createAgentSession, SessionManager, SettingsManager } = await loadSessionSDK();
     const directory = await mkdtemp(join(tmpdir(), "pi-history-session-"));
     t.after(() => rm(directory, { recursive: true, force: true }));
@@ -210,7 +210,7 @@ for (const profile of [four, six]) {
       assert.equal(session.model, model);
       assert.deepEqual(session.getActiveToolNames(), profile);
       assert.deepEqual(session.getCallableToolNames(), profile);
-      const inactive = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls", "codemode", "tool_search", "ungranted", "create_task"];
+      const inactive = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls", "codemode", "tool_search", "ungranted", "create_task", "decide_dispatch", "submit_result"];
       session.setActiveToolsByName([...profile, ...history, ...inactive]);
       assert.deepEqual(session.getActiveToolNames(), profile, "session API must not widen the allowlist");
       assert.deepEqual(session.getCallableToolNames(), profile);

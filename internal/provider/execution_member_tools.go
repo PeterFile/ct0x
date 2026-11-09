@@ -34,7 +34,8 @@ func NewPiMemberToolExecutor(selected Provider, extensionPath, configPath string
 }
 
 // NewPiMemberToolExecutorWithTools freezes a trusted, nonempty subset of the six
-// member tools in canonical order. Names never come from model or HTTP input.
+// ordinary member tools or a complete coordinator/worker profile in canonical
+// order. Names never come from model or HTTP input and do not grant authority.
 // It preserves the legacy constructor's file/version gates and does not launch Pi.
 func NewPiMemberToolExecutorWithTools(selected Provider, extensionPath, configPath string, toolNames []string, timeout time.Duration) (Executor, error) {
 	if selected.Name != Pi {
@@ -45,7 +46,16 @@ func NewPiMemberToolExecutorWithTools(selected Provider, extensionPath, configPa
 		return nil, err
 	}
 	canonical := strings.Split(piMemberToolNames+",search_history,read_history", ",")
-	if len(toolNames) == 0 {
+	requireAll := false
+	switch {
+	case slices.Contains(toolNames, "decide_dispatch"):
+		canonical = []string{"list_members", "read_channel", "search_history", "read_history", "decide_dispatch"}
+		requireAll = true
+	case slices.Contains(toolNames, "submit_result"):
+		canonical = []string{"read_channel", "search_history", "read_history", "submit_result"}
+		requireAll = true
+	}
+	if len(toolNames) == 0 || requireAll && len(toolNames) != len(canonical) {
 		return nil, errPiMemberToolConfiguration
 	}
 	for i, name := range toolNames {
