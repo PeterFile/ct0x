@@ -119,7 +119,7 @@ func (f *roleRuntimeFixture) claim(t *testing.T, delivery string) roleRun {
 	}
 	turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group, DeliveryID: delivery, MaxActive: f.options.RoleMaxActive, ResourceKeys: []string{"role/" + delivery}})
 	roleOK(t, err)
-	return roleRun{binding: platform.MemberToolRunBinding{GroupID: turn.GroupID, MemberID: turn.MemberID, ConversationID: turn.ConversationID, DeliveryID: turn.DeliveryID, ProviderID: state.ProviderID, Model: state.Model}, provenance: state.Provenance, claim: store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}, request: provider.ExecuteRequest{RunID: turn.ID, RuntimeDir: f.root, CWD: f.root, Model: state.Model, Prompt: "trusted packet"}}
+	return roleRun{binding: platform.MemberToolRunBinding{GroupID: turn.GroupID, MemberID: turn.MemberID, ConversationID: turn.ConversationID, DeliveryID: turn.DeliveryID, ProviderID: state.ProviderID, Model: state.Model, ProviderName: provider.Pi}, provenance: state.Provenance, claim: store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}, request: provider.ExecuteRequest{RunID: turn.ID, RuntimeDir: f.root, CWD: f.root, Model: state.Model, Prompt: "trusted packet"}}
 }
 func (f *roleRuntimeFixture) http(t *testing.T, token, operation, body, key string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -215,6 +215,80 @@ func (f *roleRuntimeFixture) decisionSnapshot(t *testing.T) map[string][][]any {
 
 func roleNotStarted() provider.ExecutionReceipt {
 	return provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted, ExitCode: -1, Reason: "PRIVATE-native-before-mkdir"}
+}
+
+func TestRoleRuntimeDiscoveredProviderIdentity(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "inert-pi")
+	roleOK(t, os.WriteFile(path, []byte("#!/bin/sh\nexit 99\n"), 0700))
+	// Discover only inspects supplied paths. The factory below is entirely
+	// synthetic; this private executable is never run, not even for --version.
+	catalog := provider.Discover(provider.Search{Explicit: []provider.Location{{Name: provider.Pi, Path: path}}})
+	if len(catalog) != 1 || catalog[0].ID == "" || catalog[0].ID == provider.Pi || catalog[0].Name != provider.Pi ||
+		catalog[0].Path != path || catalog[0].Installation != provider.Installed || len(catalog[0].Evidence) != 1 || catalog[0].Evidence[0].Type != provider.DiscoveryProbe {
+		t.Fatal("real path-only discovery did not produce an opaque Pi installation ID")
+	}
+	selected := catalog[0]
+	f := newRoleRuntime(t)
+	member, err := f.local.CreateMember(ctx, f.group, platform.MemberInput{Name: "discovered lead", Role: "untrusted", ProviderID: selected.ID, Model: "selected"}, "")
+	roleOK(t, err)
+	previous, err := f.db.GetCoordinator(ctx, f.group)
+	roleOK(t, err)
+	_, err = f.db.SetCoordinator(ctx, f.group, member.ID, previous.Revision, "discovered-binding")
+	roleOK(t, err)
+	run := f.coordinator(t)
+	run.binding.ProviderName = selected.Name
+	scope, err := f.db.BindMemberTool(ctx, run.claim)
+	roleOK(t, err)
+	state, err := f.db.ResolveCoordinationExecution(ctx, scope, run.provenance)
+	roleOK(t, err)
+	if member.ProviderID != selected.ID || run.binding.ProviderID != selected.ID || state.ProviderID != selected.ID || state.Blocked != store.CoordinationReady || state.Provenance != run.provenance {
+		t.Fatal("Store member, claim and authoritative role selection disagree with discovery")
+	}
+	f.claims(t, run, domain.TurnStateStarting, 1)
+	t.Log("real path-only Discover ID persisted and resolved exactly with ready coordinator claim")
+	factories, natives := 0, 0
+	raw := provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, Started: true, ExitCode: 17, Reason: "PRIVATE-discovered-original"}
+	executor := f.wrap(t, run, func(token string) provider.ExecutionReceipt {
+		first := f.http(t, token, "decide_dispatch", `{"kind":"decline","reason":"no eligible work"}`, "discovered-decline")
+		replay := f.http(t, token, "decide_dispatch", `{"kind":"decline","reason":"no eligible work"}`, "discovered-decline")
+		if first.Code != 201 || replay.Code != 201 || first.Body.String() != replay.Body.String() {
+			t.Fatalf("discovered-provider real role HTTP failed: %d/%d", first.Code, replay.Code)
+		}
+		return raw
+	}, &factories, &natives)
+	if factories != 0 || natives != 0 {
+		t.Fatal("Wrap performed execution work")
+	}
+	// Wrapping freezes trusted kind metadata along with the exact selected ID.
+	run.binding.ProviderName = provider.Codex
+	got := executor.Execute(ctx, run.request, nil)
+	if got != raw || factories != 1 || natives != 1 {
+		t.Fatal("discovered Pi did not reach exactly one synthetic native invocation")
+	}
+	diagnostic, err := f.runtime.InspectCoordinationRoleReceipt(ctx, run.claim.GroupID, run.claim.TurnID)
+	roleOK(t, err)
+	if diagnostic.Capture == nil || diagnostic.CaptureStatus != "captured" || diagnostic.Capture.Raw != raw || diagnostic.Capture.Aggregate != got || diagnostic.Capture.Source.ProviderID != selected.ID || !diagnostic.CaptureClaimMatchesCurrent {
+		t.Fatal("diagnostic lost the original receipt or exact opaque discovered ID")
+	}
+	for _, bad := range []struct{ name, id, kind string }{
+		{"wrong trusted kind", selected.ID, provider.Codex},
+		{"prefix without trusted kind", selected.ID, ""},
+		{"forged prefix without trusted kind", "pi_forged", ""},
+		{"empty ID", "", provider.Pi},
+	} {
+		t.Run(bad.name, func(t *testing.T) {
+			binding := run.binding
+			binding.ProviderID, binding.ProviderName = bad.id, bad.kind
+			if _, err := f.runtime.WrapCoordinationRole(binding, run.provenance, func(string, string, []string) (provider.Executor, error) { factories++; return nil, nil }); err == nil {
+				t.Fatal("unsupported or missing trusted provider kind accepted")
+			}
+		})
+	}
+	if factories != 1 || natives != 1 {
+		t.Fatal("rejected kind caused factory/native activity")
+	}
+	f.claims(t, run, domain.TurnStateStarting, 1)
 }
 
 func TestRoleRuntimeHTTPAssignSubmitAndDecline(t *testing.T) {
@@ -391,6 +465,7 @@ func TestRoleRuntimeCancellationAndStartupGuards(t *testing.T) {
 	}
 	bad = next
 	bad.binding.ProviderID = "codex"
+	bad.binding.ProviderName = provider.Codex
 	if _, err = f.runtime.WrapCoordinationRole(bad.binding, bad.provenance, func(string, string, []string) (provider.Executor, error) {
 		t.Fatal("unsupported factory")
 		return nil, nil

@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -40,7 +41,7 @@ func roleReceiptRuntime(t *testing.T) (memberRoleFixture, *MemberToolRuntime, pr
 	}
 	scope := f.coordinatorScope
 	req := provider.ExecuteRequest{RunID: scope.Member.Claim.TurnID, RuntimeDir: root, CWD: root, Model: "selected"}
-	binding := MemberToolRunBinding{GroupID: f.groupID, MemberID: f.coordinator.ID, ConversationID: scope.Member.ConversationID, DeliveryID: scope.Provenance.DeliveryID, ProviderID: "pi", Model: "selected"}
+	binding := MemberToolRunBinding{GroupID: f.groupID, MemberID: f.coordinator.ID, ConversationID: scope.Member.ConversationID, DeliveryID: scope.Provenance.DeliveryID, ProviderID: "pi", Model: "selected", ProviderName: provider.Pi}
 	return f, r, req, binding
 }
 func roleReceiptInvoke(t *testing.T, r *MemberToolRuntime, req provider.ExecuteRequest, binding MemberToolRunBinding, p store.CoordinationRoleProvenance, invoke func() provider.ExecutionReceipt) provider.ExecutionReceipt {
@@ -124,6 +125,140 @@ func TestRoleReceiptCaptureSeparatesRawAggregateAndCurrent(t *testing.T) {
 	}
 }
 
+func TestRoleReceiptRecoveryPreservesHistoricalCapture(t *testing.T) {
+	f, oldRuntime, req, binding := roleReceiptRuntime(t)
+	ctx := context.Background()
+	claim := f.coordinatorScope.Member.Claim
+	raw := provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, Started: true, ExitCode: 23, Reason: "PRIVATE-first-unknown"}
+	natives := 0
+	aggregate := roleReceiptInvoke(t, oldRuntime, req, binding, f.coordinatorScope.Provenance, func() provider.ExecutionReceipt { natives++; return raw })
+	first, err := oldRuntime.InspectCoordinationRoleReceipt(ctx, claim.GroupID, claim.TurnID)
+	if err != nil || natives != 1 || aggregate != raw || first.Capture == nil || first.Capture.Raw != raw || first.Capture.Aggregate != aggregate {
+		t.Fatal("real issuance/native/capture precondition failed")
+	}
+	if _, err := f.db.ApplyTurnReceipt(ctx, claim, aggregate); err != nil {
+		t.Fatal(err)
+	}
+	oldRuntime.roleFence.mu.Lock()
+	owner := oldRuntime.roleFence.records[claim.TurnID]
+	oldRuntime.roleFence.mu.Unlock()
+	if owner == nil {
+		t.Fatal("unknown receipt did not retain its local owner")
+	}
+	if _, err := oldRuntime.InspectCoordinationRoleReceipt(ctx, claim.GroupID, claim.TurnID); err != nil {
+		t.Fatal(err)
+	}
+	oldRuntime.roleFence.mu.Lock()
+	retained := oldRuntime.roleFence.records[claim.TurnID] == owner
+	oldRuntime.roleFence.mu.Unlock()
+	if !retained {
+		t.Fatal("inspection released an unknown owner's fence")
+	}
+	path := filepath.Join(req.RuntimeDir, memberToolRoleReceiptDirectory, memberToolRoleReceiptName(claim.GroupID, claim.TurnID))
+	firstBytes, err := os.ReadFile(path)
+	if err != nil || bytes.Contains(firstBytes, []byte(claim.Token)) {
+		t.Fatal("missing sidecar or raw token in capture")
+	}
+	options := MemberToolRuntimeOptions{ConfigRoot: oldRuntime.configRoot, Endpoint: oldRuntime.endpoint, Operations: []string{"list_members"}, RoleMaxActive: 8, RoleExecutionRoot: req.RuntimeDir}
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	oldRuntime = nil // No in-memory fence survival is assumed across restart.
+	reopened, err := store.Open(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	recovered, err := reopened.RecoverInFlight(ctx)
+	if err != nil || recovered != 1 {
+		t.Fatalf("actual singleton recovery failed: count=%d error=%v", recovered, err)
+	}
+	current, err := reopened.GetTurn(ctx, claim.GroupID, claim.TurnID)
+	if err != nil || current.State != domain.TurnStateUnknown || current.ClaimToken == "" || current.ClaimToken == claim.Token {
+		t.Fatal("recovery did not rotate unknown claim")
+	}
+	reader, err := NewMemberToolRuntime(reopened, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileRecord, status := reader.readRoleReceipt(claim.GroupID, claim.TurnID)
+	if status != "captured" || fileRecord == nil || fileRecord.Source != memberToolRoleReceiptSourceFor(binding, f.coordinatorScope) {
+		t.Fatal("first historical record not intact")
+	}
+	var claims int
+	if err := f.raw.QueryRow("SELECT count(*) FROM resource_claims WHERE turn_id=?", claim.TurnID).Scan(&claims); err != nil || claims != 1 {
+		t.Fatal("real recovery failed to retain unknown resources")
+	}
+	t.Log("one real issuance/native/capture; close/reopen/Recover rotated unknown claim, retained resource and unchanged readable first record")
+	before := memberRoleSnapshot(t, f.localMessageFixture)
+	got, err := reader.InspectCoordinationRoleReceipt(ctx, claim.GroupID, claim.TurnID)
+	if err != nil || got.CaptureStatus != "captured" || got.Capture == nil || got.Capture.Raw != raw || got.Capture.Aggregate != aggregate || got.Capture.Source != fileRecord.Source {
+		t.Fatal("recovery hid intact historical raw/aggregate evidence from trusted inspection")
+	}
+	if !first.CaptureClaimMatchesCurrent || got.CaptureClaimMatchesCurrent || got.Current.Turn.ClaimToken != current.ClaimToken || got.Current.Turn.State != domain.TurnStateUnknown ||
+		got.Current.Receipt == nil || got.Current.Receipt.Outcome != provider.OutcomeUnknown || got.Current.Receipt.Reason == raw.Reason {
+		t.Fatal("historical capture was confused with current claim/normalized evidence")
+	}
+	afterBytes, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(firstBytes, afterBytes) || bytes.Contains(afterBytes, []byte(current.ClaimToken)) || !reflect.DeepEqual(before, memberRoleSnapshot(t, f.localMessageFixture)) {
+		t.Fatal("inspection changed file/source or durable rows")
+	}
+	if err := f.raw.QueryRow("SELECT count(*) FROM resource_claims WHERE turn_id=?", claim.TurnID).Scan(&claims); err != nil || claims != 1 {
+		t.Fatal("recovery inspection released durable unknown resources")
+	}
+	if len(reader.roleFence.records) != 0 {
+		t.Fatal("inspection created a new runtime owner")
+	}
+	// Execution evidence acceptance still requires the original exact claim.
+	e := memberToolRuntimeRun{runtime: reader, binding: binding, role: &f.coordinatorScope.Provenance}
+	if e.roleHistorical(ctx, req, f.coordinatorScope) {
+		t.Fatal("Execute evidence acceptance accepted a recovered claim")
+	}
+	factoriesAfterRecovery := 0
+	executor, err := reader.WrapCoordinationRole(binding, f.coordinatorScope.Provenance, func(string, string, []string) (provider.Executor, error) {
+		factoriesAfterRecovery++
+		return memberToolRuntimeExecutorFunc(func(context.Context, provider.ExecuteRequest, func(provider.Event) error) provider.ExecutionReceipt {
+			natives++
+			return raw
+		}), nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executor.Execute(ctx, req, nil).Outcome != provider.OutcomeUnknown || factoriesAfterRecovery != 0 || natives != 1 || len(reader.roleFence.records) != 0 {
+		t.Fatal("historical inspection enabled recovered execution")
+	}
+	if _, err := reader.InspectCoordinationRoleReceipt(ctx, f.otherID, claim.TurnID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatal("cross-group inspection gained history")
+	}
+	message, err := NewLocalUser(reopened).CreateMessage(ctx, f.groupID, MessageInput{TopicID: "other-topic", Content: "other turn", RecipientIDs: []string{f.worker.ID}}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := reopened.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.groupID, DeliveryID: message.Deliveries[0].ID, MaxActive: 8, ResourceKeys: []string{"other-turn"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongPath := filepath.Join(req.RuntimeDir, memberToolRoleReceiptDirectory, memberToolRoleReceiptName(f.groupID, other.ID))
+	if err := os.WriteFile(wrongPath, firstBytes, 0600); err != nil {
+		t.Fatal(err)
+	} // Explicit test-owned wrong-turn file.
+	wrong, err := reader.InspectCoordinationRoleReceipt(ctx, f.groupID, other.ID)
+	if err != nil || wrong.Capture != nil || wrong.CaptureStatus != "unconfirmed" {
+		t.Fatal("wrong-turn sidecar gained historical authority")
+	}
+	if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	} // Explicit test-owned damage, never product repair.
+	damaged, err := reader.InspectCoordinationRoleReceipt(ctx, claim.GroupID, claim.TurnID)
+	if err != nil || damaged.Capture != nil || damaged.CaptureStatus != "unconfirmed" {
+		t.Fatal("damaged first record was returned as complete")
+	}
+	if err := f.raw.QueryRow("SELECT count(*) FROM resource_claims WHERE turn_id=?", claim.TurnID).Scan(&claims); err != nil || claims != 1 || natives != 1 || len(reader.roleFence.records) != 0 {
+		t.Fatal("negative inspection changed retained execution ownership")
+	}
+}
+
 type roleReceiptReadFailure struct{ data []byte }
 
 func (r roleReceiptReadFailure) Read(p []byte) (int, error) {
@@ -168,6 +303,8 @@ func TestRoleReceiptBoundariesAndDamagedFirstRecord(t *testing.T) {
 		func(x *memberToolRoleReceiptRecord) { x.Raw.Reason += "x" },
 		func(x *memberToolRoleReceiptRecord) { x.Aggregate.Reason = strings.Repeat("x", 1025) },
 		func(x *memberToolRoleReceiptRecord) { x.Source.Model = strings.Repeat("x", 16385) },
+		func(x *memberToolRoleReceiptRecord) { x.Source.ProviderID = "" },
+		func(x *memberToolRoleReceiptRecord) { x.Source.ProviderID = "\xff" },
 		func(x *memberToolRoleReceiptRecord) { x.Raw.Reason = "\xff" },
 	} {
 		bad := record
@@ -205,7 +342,9 @@ func TestRoleReceiptBoundariesAndDamagedFirstRecord(t *testing.T) {
 	}
 	// Mutations below are explicit test-owned corruption, never automatic repair.
 	foreign := record
-	foreign.Source.ClaimFingerprint = strings.Repeat("0", 64)
+	// Fingerprint mismatch can be legitimate recovery history; a foreign
+	// immutable request remains invalid regardless of current claim matching.
+	foreign.Source.RequestID = "foreign-request"
 	foreignBytes, ok := memberToolRoleEncodeReceipt(foreign)
 	if !ok {
 		t.Fatal("foreign source fixture not encodable")

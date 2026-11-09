@@ -33,6 +33,9 @@ type MemberToolRuntimeOptions struct {
 
 type MemberToolRunBinding struct {
 	GroupID, MemberID, ConversationID, DeliveryID, ProviderID, Model string
+	// ProviderName is role-only trusted catalog metadata, never inferred from
+	// the opaque ProviderID or supplied by the model. Ordinary Wrap ignores it.
+	ProviderName string `json:"-"`
 }
 
 // MemberToolExecutorFactory is trusted adapter construction, not execution. It

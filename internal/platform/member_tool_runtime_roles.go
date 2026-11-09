@@ -15,7 +15,7 @@ import (
 // immutable server selections without claiming, issuing, creating files or calling
 // the factory. Role support is opt-in; no failure falls back to ordinary tools.
 func (r *MemberToolRuntime) WrapCoordinationRole(binding MemberToolRunBinding, expected store.CoordinationRoleProvenance, factory MemberToolExecutorFactory) (provider.Executor, error) {
-	if r.roleFence == nil || binding.ProviderID != "pi" || factory == nil || len(binding.Model) > 256 || !memberToolRuntimeText(binding.Model) ||
+	if r.roleFence == nil || binding.ProviderName != provider.Pi || !memberToolRuntimeText(binding.ProviderID) || factory == nil || len(binding.Model) > 256 || !memberToolRuntimeText(binding.Model) ||
 		expected.GroupID != binding.GroupID || expected.MemberID != binding.MemberID || expected.ConversationID != binding.ConversationID || expected.DeliveryID != binding.DeliveryID ||
 		expected.TaskRevision < 1 || (expected.Kind != store.CoordinationRoleCoordinator && expected.Kind != store.CoordinationRoleWorker) ||
 		(expected.Kind == store.CoordinationRoleCoordinator && expected.AssignmentID != "") || (expected.Kind == store.CoordinationRoleWorker && !memberToolRuntimeText(expected.AssignmentID)) {
@@ -168,12 +168,20 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 // Evidence acceptance deliberately does NOT call Bind/Resolve/Blocked or inspect
 // current policy/provider settings. Revoked permission is not execution evidence.
 func (e *memberToolRuntimeRun) roleHistorical(ctx context.Context, request provider.ExecuteRequest, scope store.CoordinationToolScope) bool {
-	r, p := e.runtime, scope.Provenance
+	r := e.runtime
 	if !r.roleFence.rootValid(request.RuntimeDir) {
 		return false
 	}
 	turn, err := r.tools.db.GetTurn(ctx, scope.Member.Claim.GroupID, scope.Member.Claim.TurnID)
-	if err != nil || !memberToolRoleFenceMatches(turn, scope.Member.Claim) || turn.DeliveryID != p.DeliveryID || turn.MemberID != p.MemberID || turn.ConversationID != p.ConversationID {
+	return err == nil && memberToolRoleFenceMatches(turn, scope.Member.Claim) &&
+		r.roleHistoricalProvenance(ctx, turn, scope.Provenance, scope.AttemptID)
+}
+
+// Historical diagnostics validate immutable relations without claiming that a
+// recovered token still matches. Execute separately requires its exact claim.
+func (r *MemberToolRuntime) roleHistoricalProvenance(ctx context.Context, turn domain.Turn, p store.CoordinationRoleProvenance, attemptID string) bool {
+	if (p.Kind != store.CoordinationRoleCoordinator && p.Kind != store.CoordinationRoleWorker) ||
+		turn.GroupID != p.GroupID || turn.DeliveryID != p.DeliveryID || turn.MemberID != p.MemberID || turn.ConversationID != p.ConversationID {
 		return false
 	}
 	view, err := r.tools.db.GetDispatchRequest(ctx, p.GroupID, p.RequestID)
@@ -182,7 +190,7 @@ func (e *memberToolRuntimeRun) roleHistorical(ctx context.Context, request provi
 	}
 	if p.Kind == store.CoordinationRoleCoordinator {
 		d := view.State.Delivery
-		return d != nil && d.DeliveryID == p.DeliveryID && d.MessageID == p.MessageID && d.ConversationID == p.ConversationID && d.CoordinatorMemberID == p.MemberID && view.Request.CoordinatorMemberID == p.MemberID && scope.AttemptID == ""
+		return d != nil && d.DeliveryID == p.DeliveryID && d.MessageID == p.MessageID && d.ConversationID == p.ConversationID && d.CoordinatorMemberID == p.MemberID && view.Request.CoordinatorMemberID == p.MemberID && p.AssignmentID == "" && attemptID == ""
 	}
 	assignment, err := r.tools.db.GetAssignment(ctx, p.GroupID, p.AssignmentID)
 	if err != nil || assignment.Assignment.RequestID != p.RequestID || assignment.Assignment.TaskID != p.TaskID || assignment.Assignment.WorkerMemberID != p.MemberID {
@@ -190,5 +198,5 @@ func (e *memberToolRuntimeRun) roleHistorical(ctx context.Context, request provi
 	}
 	d, b := assignment.Dispatch.Delivery, assignment.Binding
 	return d != nil && b != nil && d.DeliveryID == p.DeliveryID && d.MessageID == p.MessageID && d.ConversationID == p.ConversationID && d.WorkerMemberID == p.MemberID &&
-		b.TurnID == turn.ID && b.AttemptID == scope.AttemptID && b.TaskRevision == p.TaskRevision
+		b.TurnID == turn.ID && b.AttemptID == attemptID && b.TaskRevision == p.TaskRevision
 }

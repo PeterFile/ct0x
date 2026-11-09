@@ -43,6 +43,8 @@ type MemberToolRoleReceiptDiagnostics struct {
 	Capture       *MemberToolRoleReceiptCapture         `json:"-"`
 	CaptureStatus string                                `json:"-"`
 	Current       store.CoordinationRoleReceiptSnapshot `json:"-"`
+	// This compares fingerprints with Current only, never live authorization.
+	CaptureClaimMatchesCurrent bool `json:"-"`
 }
 
 func memberToolRoleReceiptSourceFor(binding MemberToolRunBinding, scope store.CoordinationToolScope) memberToolRoleReceiptSource {
@@ -90,7 +92,7 @@ func memberToolRoleReceiptOutcome(outcome provider.Outcome, terminal bool) bool 
 }
 func memberToolRoleEncodeReceipt(record memberToolRoleReceiptRecord) ([]byte, bool) {
 	s := record.Source
-	if record.Version != 1 || s.TaskRevision < 1 || s.ProviderID != "pi" || s.Model == "" || len(s.ClaimFingerprint) != 64 {
+	if record.Version != 1 || s.TaskRevision < 1 || s.Model == "" || len(s.ClaimFingerprint) != 64 {
 		return nil, false
 	}
 	if _, err := hex.DecodeString(s.ClaimFingerprint); err != nil {
@@ -100,7 +102,7 @@ func memberToolRoleEncodeReceipt(record memberToolRoleReceiptRecord) ([]byte, bo
 		(s.Kind == store.CoordinationRoleCoordinator && (s.AssignmentID != "" || s.AttemptID != "")) || (s.Kind == store.CoordinationRoleWorker && (s.AssignmentID == "" || s.AttemptID == "")) {
 		return nil, false
 	}
-	for _, id := range []string{s.GroupID, s.TurnID, s.DeliveryID, s.MessageID, s.ConversationID, s.MemberID, s.RequestID, s.TaskID} {
+	for _, id := range []string{s.GroupID, s.TurnID, s.DeliveryID, s.MessageID, s.ConversationID, s.MemberID, s.RequestID, s.TaskID, s.ProviderID} {
 		if len(id) > 16384 || !memberToolRuntimeText(id) {
 			return nil, false
 		}
@@ -305,16 +307,15 @@ func (r *MemberToolRuntime) InspectCoordinationRoleReceipt(ctx context.Context, 
 	}
 	source := record.Source
 	p := source.provenance()
-	scope := store.CoordinationToolScope{Member: store.MemberToolScope{Claim: store.TurnClaim{GroupID: group, TurnID: turn, Token: current.Turn.ClaimToken},
-		MemberID: p.MemberID, ConversationID: p.ConversationID, TopicID: p.TopicID}, Provenance: p, AttemptID: source.AttemptID}
-	binding := MemberToolRunBinding{GroupID: p.GroupID, MemberID: p.MemberID, ConversationID: p.ConversationID, DeliveryID: p.DeliveryID, ProviderID: source.ProviderID, Model: source.Model}
-	expected := memberToolRoleReceiptSourceFor(binding, scope)
-	e := memberToolRuntimeRun{runtime: r, binding: binding, role: &p}
-	if source != expected || source.GroupID != group || source.TurnID != turn || r.roleFence == nil ||
-		!e.roleHistorical(ctx, provider.ExecuteRequest{RuntimeDir: r.roleFence.executionRoot}, scope) {
+	if source.GroupID != group || source.TurnID != turn || r.roleFence == nil || !r.roleFence.rootValid(r.roleFence.executionRoot) ||
+		!r.roleHistoricalProvenance(ctx, current.Turn, p, source.AttemptID) {
 		out.CaptureStatus = "unconfirmed"
 		return out, nil
 	}
 	out.Capture = &MemberToolRoleReceiptCapture{Raw: record.Raw, Aggregate: record.Aggregate, Source: source}
+	// Keep the original source/fingerprint, even after recovery. This comparison
+	// describes only Current's snapshot, not readiness, authorization or release.
+	hash := sha256.Sum256([]byte(current.Turn.ClaimToken))
+	out.CaptureClaimMatchesCurrent = source.ClaimFingerprint == hex.EncodeToString(hash[:])
 	return out, nil
 }
