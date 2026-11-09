@@ -78,7 +78,8 @@ func (s *MemberTools) withCoordinationRole(ctx context.Context, token, operation
 	if !found || entry.role.Provenance.Kind != kind || entry.role.Member != entry.scope || !slices.Contains(entry.grants.Operations, operation) {
 		return store.ErrMemberToolDenied
 	}
-	return memberRoleError(ctx, use(entry.role))
+	// Preserve Store-owned causes and transaction outcome evidence.
+	return use(entry.role)
 }
 
 func (s *MemberTools) DecideDispatch(ctx context.Context, token string, input store.CoordinatorDecisionInput, key string) (domain.DecisionReceipt, error) {
