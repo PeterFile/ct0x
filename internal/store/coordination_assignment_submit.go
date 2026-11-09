@@ -20,8 +20,12 @@ func (s *Store) SubmitAssignmentResult(ctx context.Context, scope CoordinationTo
 	phase := "begin"
 	var tx *sql.Tx
 	defer func() { err = coordinationAssignmentFinish(tx, phase, err) }()
-	tx, err = s.beginMemberToolTx(ctx, scope.Member)
+	tx, err = s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return out, err
+	}
+	phase = "scope"
+	if err := memberToolScopeInTx(ctx, tx, scope.Member); err != nil {
 		return out, err
 	}
 	phase = "source"
@@ -38,6 +42,12 @@ func (s *Store) SubmitAssignmentResult(ctx context.Context, scope CoordinationTo
 		GroupID: binding.GroupID, TaskID: binding.TaskID, AttemptID: binding.AttemptID, ExpectedRevision: binding.TaskRevision,
 		ActorID: binding.WorkerMemberID, MemberScope: &scope.Member, Summary: input.Summary,
 		ArtifactVersions: input.ArtifactVersions, IdempotencyKey: key,
+	}
+	receiptScope := mutationScope{operation: "submit_task", actorID: binding.WorkerMemberID, groupID: binding.GroupID, key: key}
+	payload := taskSubmissionPayload(derived)
+	priorID, _, err := lookupMutation(ctx, tx, receiptScope, payload)
+	if err != nil {
+		return out, err
 	}
 	result, err := submitTaskInTx(ctx, tx, derived)
 	if err != nil {
@@ -60,9 +70,21 @@ func (s *Store) SubmitAssignmentResult(ctx context.Context, scope CoordinationTo
 		saved.Summary != result.Summary || saved.CreatedAt != result.CreatedAt || !slices.Equal(saved.ArtifactVersions, result.ArtifactVersions) {
 		return out, ErrConflict
 	}
+	if result.ID != priorID {
+		// Only a new write must still own the current Task pointer. Historical
+		// same-key replay remains independent of later Task/policy changes.
+		task, err := taskInTx(ctx, tx, binding.GroupID, binding.TaskID)
+		if err != nil {
+			return out, err
+		}
+		if task.Status != domain.TaskStatusSubmitted || task.Revision != binding.TaskRevision ||
+			task.ActiveAttemptID != binding.AttemptID || task.CurrentSubmissionID != result.ID {
+			return out, ErrConflict
+		}
+	}
 	if key != "" {
 		// Verify the original helper's receipt, without reserving a second key.
-		id, present, err := lookupMutation(ctx, tx, mutationScope{operation: "submit_task", actorID: binding.WorkerMemberID, groupID: binding.GroupID, key: key}, taskSubmissionPayload(derived))
+		id, present, err := lookupMutation(ctx, tx, receiptScope, payload)
 		if err != nil {
 			return out, err
 		}

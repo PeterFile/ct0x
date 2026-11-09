@@ -24,8 +24,64 @@ func assignmentBoundWorker(t *testing.T) (requestDispatchFixture, domain.Dispatc
 	return f, r, worker
 }
 
+func TestSubmitAssignmentScopeRollbackCertainty(t *testing.T) {
+	assignmentScopeRollback(t, true)
+}
+
+func TestSubmitAssignmentPointerRestoredAfterWrite(t *testing.T) {
+	for _, kind := range []string{"keyed", "unkeyed"} {
+		t.Run(kind, func(t *testing.T) {
+			f, r, worker := assignmentBoundWorker(t)
+			version := mustPublishArtifact(t, f.s, artifactPublishInput(r.GroupID))
+			input := AssignmentResultInput{Summary: "成果证据", ArtifactVersions: []domain.ArtifactVersionRef{{ArtifactID: version.ArtifactID, VersionID: version.ID}}}
+			coordinationDecideExec(t, f.s, fmt.Sprintf(`CREATE TRIGGER submit_pointer_restore AFTER UPDATE OF current_submission_id ON tasks
+ WHEN NEW.id='%s' AND NEW.status='submitted'
+ BEGIN UPDATE tasks SET status='open',current_submission_id=NULL WHERE id=NEW.id; END`, r.TaskID))
+			key := ""
+			if kind == "keyed" {
+				key = "pointer-restore"
+			}
+			before := coordinationDecideSnapshot(t, f.s)
+			got, err := f.s.SubmitAssignmentResult(ctx, worker, input, key)
+			assignmentTransactionEvidence(t, "Submit pointer restore "+kind, err)
+			if err == nil || !reflect.DeepEqual(got, domain.Submission{}) {
+				t.Errorf("Task pointer restoration falsely returned successful Submit: %+v, %v", got, err)
+			}
+			var changed int
+			if err := f.s.db.QueryRow("SELECT changes()").Scan(&changed); err != nil || changed != 1 {
+				t.Errorf("expected the outer write to report one changed row: %d, %v", changed, err)
+			}
+			t.Logf("outer SQLite changes()=%d despite AFTER trigger restoring open/null current submission", changed)
+			assignmentReopenPreserved(t, f.s, f.path, before)
+		})
+	}
+}
+
 func TestSubmitAssignmentResultReplayAndLocalReview(t *testing.T) {
 	f, r, worker := assignmentBoundWorker(t)
+	p := worker.Provenance
+	view, err := f.s.GetAssignment(ctx, r.GroupID, p.AssignmentID)
+	if err != nil || view.Binding == nil || view.Assignment.ID != p.AssignmentID || view.Request.ID != p.RequestID ||
+		view.Assignment.TaskID != p.TaskID || view.Assignment.WorkerMemberID != p.MemberID || view.Dispatch.Delivery == nil {
+		t.Fatalf("real source/binding projection: %+v, %v", view, err)
+	}
+	d := view.Dispatch.Delivery
+	if view.Dispatch.Status != domain.AssignmentDispatchStatusEnqueued || d.DeliveryID != p.DeliveryID || d.MessageID != p.MessageID ||
+		d.ConversationID != p.ConversationID || d.WorkerMemberID != p.MemberID || view.Binding.TurnID != worker.Member.Claim.TurnID ||
+		view.Binding.AttemptID != worker.AttemptID || view.Binding.TaskRevision != p.TaskRevision {
+		t.Fatalf("receipt/delivery/Turn/Attempt identities disagree: %+v", view)
+	}
+	turn, err := f.s.GetTurn(ctx, p.GroupID, worker.Member.Claim.TurnID)
+	if err != nil || turn.DeliveryID != p.DeliveryID || turn.MemberID != p.MemberID || turn.ConversationID != p.ConversationID {
+		t.Fatalf("real claimed worker Turn identity: %+v, %v", turn, err)
+	}
+	var backpointer, sender, topic string
+	if err := f.s.db.QueryRow(`SELECT d.turn_id,m.sender_id,d.topic_id FROM deliveries d JOIN messages m ON m.id=d.message_id
+ WHERE d.id=? AND d.message_id=? AND d.group_id=? AND d.recipient_id=? AND d.conversation_id=?`, p.DeliveryID, p.MessageID, p.GroupID, p.MemberID, p.ConversationID).Scan(&backpointer, &sender, &topic); err != nil ||
+		backpointer != turn.ID || sender != view.Decision.CoordinatorMemberID || topic != p.TopicID {
+		t.Fatalf("actual materialized delivery/message/backpointer: %q/%q/%q, %v", backpointer, sender, topic, err)
+	}
+	t.Log("real SQLite source chain: MaterializeAssignment -> ClaimTurn -> BindMemberTool -> BindAssignmentAttempt; no hand-inserted receipt")
 	input := AssignmentResultInput{Summary: "工作结果"}
 	before := coordinationDecideSnapshot(t, f.s)
 	submission, err := f.s.SubmitAssignmentResult(ctx, worker, input, "result")
@@ -57,6 +113,11 @@ func TestSubmitAssignmentResultReplayAndLocalReview(t *testing.T) {
 	if _, err := f.s.ReviewTask(ctx, review); err != nil {
 		t.Fatal(err)
 	}
+	acceptedTask, err := f.s.GetTask(ctx, r.GroupID, r.TaskID)
+	if err != nil || acceptedTask.Status != domain.TaskStatusAccepted || acceptedTask.ActiveAttemptID != "" || acceptedTask.CurrentSubmissionID != submission.ID {
+		t.Fatalf("local-user Review did not establish acceptance: %+v, %v", acceptedTask, err)
+	}
+	t.Log("same real source chain: bound SubmitAssignmentResult yielded submitted, then local-user Review yielded accepted; fixture, not provider/runtime E2E")
 	accepted := coordinationDecideSnapshot(t, f.s)
 	if !reflect.DeepEqual(after["resource_claims"], accepted["resource_claims"]) {
 		t.Fatal("review released a running Turn's claims")

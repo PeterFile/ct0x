@@ -133,6 +133,15 @@ func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTask
 			return domain.TaskAttempt{}, err
 		}
 	}
+	if input.IdempotencyKey != "" {
+		persisted, present, err := lookupMutation(ctx, tx, scope, payload)
+		if err != nil {
+			return domain.TaskAttempt{}, err
+		}
+		if !present || persisted != attempt.ID {
+			return domain.TaskAttempt{}, ErrConflict
+		}
+	}
 	return attempt, nil
 }
 

@@ -2,8 +2,12 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -11,6 +15,7 @@ import (
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
+	"modernc.org/sqlite"
 )
 
 func TestActivateAssignmentReservationGate(t *testing.T) {
@@ -43,6 +48,267 @@ func TestActivateAssignmentReservationGate(t *testing.T) {
 			got, err := f.s.ActivateTaskAttempt(ctx, ActivateTaskAttemptInput{GroupID: r.GroupID, TaskID: r.TaskID, ExpectedRevision: r.TaskRevision, ActorID: "user", IdempotencyKey: "reserved"})
 			requestDispatchZero(t, got, err, ErrConflict)
 			coordinationDecidePreserved(t, f.s, before)
+		})
+	}
+}
+
+func TestActivateAssignmentKeyedLedgerAtomicity(t *testing.T) {
+	for _, fault := range []string{"ignore", "abort", "receipt-missing", "receipt-payload", "receipt-result"} {
+		t.Run(fault, func(t *testing.T) {
+			s, path := openTestStore(t)
+			task := createTestTask(t, s, group(t, s).ID)
+			input := taskAttemptInput(task)
+			input.IdempotencyKey = "activate-ledger"
+			var owners int
+			if err := s.db.QueryRow(`SELECT (SELECT count(*) FROM coordination_dispatch_state WHERE task_id=?) +
+ (SELECT count(*) FROM coordination_assignments WHERE task_id=?)`, task.ID, task.ID).Scan(&owners); err != nil || owners != 0 {
+				t.Fatalf("ledger fixture is not unreserved: %d, %v", owners, err)
+			}
+			timing, body := "AFTER", "DELETE FROM mutation_idempotency WHERE operation=NEW.operation AND actor_id=NEW.actor_id AND group_id=NEW.group_id AND idempotency_key=NEW.idempotency_key;"
+			switch fault {
+			case "ignore":
+				timing, body = "BEFORE", "SELECT RAISE(IGNORE);"
+			case "abort":
+				timing, body = "BEFORE", "SELECT RAISE(ABORT,'activate ledger abort');"
+			case "receipt-payload":
+				body = "UPDATE mutation_idempotency SET payload='changed-payload' WHERE operation=NEW.operation AND actor_id=NEW.actor_id AND group_id=NEW.group_id AND idempotency_key=NEW.idempotency_key;"
+			case "receipt-result":
+				body = "UPDATE mutation_idempotency SET record_id='changed-result' WHERE operation=NEW.operation AND actor_id=NEW.actor_id AND group_id=NEW.group_id AND idempotency_key=NEW.idempotency_key;"
+			}
+			coordinationDecideExec(t, s, "CREATE TRIGGER activate_ledger_fault "+timing+" INSERT ON mutation_idempotency WHEN NEW.operation='activate_task_attempt' BEGIN "+body+" END")
+			before := coordinationDecideSnapshot(t, s)
+			got, err := s.ActivateTaskAttempt(ctx, input)
+			assignmentTransactionEvidence(t, "generic Activate "+fault, err)
+			if err == nil || got != (domain.TaskAttempt{}) {
+				t.Errorf("keyed Activate falsely succeeded: %+v, %v", got, err)
+			}
+			if fault == "abort" {
+				var cause *sqlite.Error
+				if !errors.As(err, &cause) || cause.Code()&0xff != 19 {
+					t.Errorf("real SQLite ABORT cause lost: %v", err)
+				}
+			}
+			assignmentReopenPreserved(t, s, path, before)
+		})
+	}
+}
+
+func assignmentReopenPreserved(t *testing.T, s *Store, path string, before map[string][][]any) {
+	t.Helper()
+	after := coordinationDecideSnapshot(t, s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := queueHandle(t, path, false)
+	observed := coordinationDecideSnapshot(t, reopened)
+	t.Logf("complete typed snapshots: before_after_equal=%t after_reopen_equal=%t attempts=%d/%d submissions=%d/%d ledger=%d/%d claims=%d/%d",
+		reflect.DeepEqual(before, after), reflect.DeepEqual(after, observed), len(before["task_attempts"]), len(after["task_attempts"]),
+		len(before["task_submissions"]), len(after["task_submissions"]), len(before["mutation_idempotency"]), len(after["mutation_idempotency"]),
+		len(before["resource_claims"]), len(after["resource_claims"]))
+	if !reflect.DeepEqual(after, observed) {
+		t.Error("trusted reopen changed the complete persisted snapshot")
+	}
+	coordinationDecidePreserved(t, reopened, before)
+	dispatchAssertFK(t, reopened)
+}
+
+func assignmentTransactionEvidence(t *testing.T, label string, err error) {
+	t.Helper()
+	if err == nil {
+		t.Logf("%s: success", label)
+		return
+	}
+	var failure *assignmentTransactionError
+	if errors.As(err, &failure) {
+		t.Logf("%s: phase=%s rollback_confirmed=%t commit_outcome_unknown=%t", label, failure.Phase(), failure.RollbackConfirmed(), failure.CommitOutcomeUnknown())
+	} else {
+		t.Logf("%s: Assignment transaction phase/proof unavailable", label)
+	}
+	var cause *sqlite.Error
+	if errors.As(err, &cause) {
+		t.Logf("%s: SQLite code=%d", label, cause.Code())
+	}
+	var walk func(error, int)
+	walk = func(e error, depth int) {
+		t.Logf("%s: chain[%d] %T: %v", label, depth, e, e)
+		if joined, ok := e.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				walk(child, depth+1)
+			}
+		} else if child := errors.Unwrap(e); child != nil {
+			walk(child, depth+1)
+		}
+	}
+	walk(err, 0)
+}
+
+// Observe real SQLite transaction boundaries. The only injected driver fault is
+// loss of the Rollback acknowledgment after SQLite itself returned success.
+// This does not simulate a native SQLite rollback I/O failure.
+type assignmentBoundaryEvent struct {
+	label                           string
+	beginErr, rollbackErr, queryErr error
+	rollbackCalls                   int
+	firstSQL                        string
+}
+type assignmentBoundaryDriver struct {
+	base        driver.Driver
+	rollbackAck error
+	events      []*assignmentBoundaryEvent
+}
+type assignmentBoundaryConn struct {
+	driver.Conn
+	owner *assignmentBoundaryDriver
+	event *assignmentBoundaryEvent
+}
+type assignmentBoundaryTx struct {
+	driver.Tx
+	event *assignmentBoundaryEvent
+	ack   error
+}
+type assignmentBoundaryRows struct {
+	driver.Rows
+	event *assignmentBoundaryEvent
+}
+type assignmentBoundaryLabel struct{}
+
+func (d *assignmentBoundaryDriver) Open(name string) (driver.Conn, error) {
+	conn, err := d.base.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return &assignmentBoundaryConn{Conn: conn, owner: d}, nil
+}
+func (c *assignmentBoundaryConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	label, _ := ctx.Value(assignmentBoundaryLabel{}).(string)
+	event := &assignmentBoundaryEvent{label: label}
+	c.owner.events = append(c.owner.events, event)
+	c.event = event
+	tx, err := c.Conn.(driver.ConnBeginTx).BeginTx(ctx, opts)
+	event.beginErr = err
+	if err != nil {
+		return nil, err
+	}
+	return &assignmentBoundaryTx{Tx: tx, event: event, ack: c.owner.rollbackAck}, nil
+}
+func (c *assignmentBoundaryConn) ExecContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Result, error) {
+	if c.event != nil && c.event.firstSQL == "" {
+		c.event.firstSQL = q
+	}
+	return c.Conn.(driver.ExecerContext).ExecContext(ctx, q, args)
+}
+func (c *assignmentBoundaryConn) QueryContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
+	if c.event != nil && c.event.firstSQL == "" {
+		c.event.firstSQL = q
+	}
+	rows, err := c.Conn.(driver.QueryerContext).QueryContext(ctx, q, args)
+	if err != nil {
+		if c.event != nil {
+			c.event.queryErr = err
+		}
+		return nil, err
+	}
+	return &assignmentBoundaryRows{Rows: rows, event: c.event}, nil
+}
+func (r *assignmentBoundaryRows) Next(values []driver.Value) error {
+	err := r.Rows.Next(values)
+	if err != nil && err != io.EOF && r.event != nil {
+		r.event.queryErr = err
+	}
+	return err
+}
+func (tx *assignmentBoundaryTx) Rollback() error {
+	tx.event.rollbackCalls++
+	tx.event.rollbackErr = tx.Tx.Rollback()
+	if tx.event.rollbackErr != nil {
+		return tx.event.rollbackErr
+	}
+	return tx.ack
+}
+func assignmentBoundaryStore(t *testing.T, path string, ack error) (*Store, *assignmentBoundaryDriver) {
+	t.Helper()
+	d := &assignmentBoundaryDriver{base: &sqlite.Driver{}, rollbackAck: ack}
+	name := fmt.Sprintf("assignment-boundary-%p", d)
+	sql.Register(name, d)
+	dsn := url.URL{Scheme: "file", Path: path, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_txlock=immediate"}
+	db, err := sql.Open(name, dsn.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	s := &Store{db: db}
+	t.Cleanup(func() { s.Close() })
+	return s, d
+}
+
+func TestBindAssignmentScopeRollbackCertainty(t *testing.T) {
+	assignmentScopeRollback(t, false)
+}
+
+func assignmentScopeRollback(t *testing.T, submit bool) {
+	t.Helper()
+	for _, mode := range []string{"invalid-scope", "sql-abort", "rollback-ack-error"} {
+		t.Run(mode, func(t *testing.T) {
+			f, _, worker := assignmentAttemptWorker(t)
+			if submit {
+				binding, err := f.s.BindAssignmentAttempt(ctx, worker)
+				if err != nil {
+					t.Fatal(err)
+				}
+				worker.AttemptID = binding.AttemptID
+			}
+			if mode == "invalid-scope" {
+				worker.Member.Claim.Token = "expired"
+			} else {
+				coordinationDecideExec(t, f.s, fmt.Sprintf(`CREATE TRIGGER scope_abort BEFORE UPDATE OF claim_token ON turns
+ WHEN NEW.id='%s' BEGIN SELECT RAISE(ABORT,'PRIVATE scope failure'); END`, worker.Member.Claim.TurnID))
+			}
+			var ack error
+			if mode == "rollback-ack-error" {
+				ack = errors.New("rollback acknowledgment unavailable")
+			}
+			wrapped, observed := assignmentBoundaryStore(t, f.path, ack)
+			before := coordinationDecideSnapshot(t, f.s)
+			var err error
+			if submit {
+				var result domain.Submission
+				result, err = wrapped.SubmitAssignmentResult(ctx, worker, AssignmentResultInput{Summary: "拒绝前置失效授权"}, "scope")
+				requestDispatchZero(t, result, err, ErrMemberToolDenied)
+			} else {
+				var result domain.AssignmentAttemptBinding
+				result, err = wrapped.BindAssignmentAttempt(ctx, worker)
+				requestDispatchZero(t, result, err, ErrMemberToolDenied)
+			}
+			assignmentTransactionEvidence(t, mode, err)
+			var failure *assignmentTransactionError
+			if !errors.As(err, &failure) || failure.Phase() != "scope" || failure.CommitOutcomeUnknown() || failure.RollbackConfirmed() != (ack == nil) {
+				t.Errorf("early scope failure claimed an unobserved rollback: %v", err)
+			}
+			if ack != nil && !errors.Is(err, ack) {
+				t.Error("rollback acknowledgment error was discarded")
+			}
+			if len(observed.events) != 1 {
+				t.Fatalf("unexpected transaction count: %d", len(observed.events))
+			}
+			event := observed.events[0]
+			if event.rollbackCalls != 1 || event.rollbackErr != nil || !strings.HasPrefix(event.firstSQL, "UPDATE turns SET claim_token=claim_token") {
+				t.Fatalf("real scope/rollback boundary not exercised: %+v", event)
+			}
+			if mode != "invalid-scope" {
+				var raw *sqlite.Error
+				if !errors.As(event.queryErr, &raw) || raw.Code()&0xff != 19 {
+					t.Fatalf("real first-SQL ABORT not observed: %v", event.queryErr)
+				}
+				t.Logf("real first-scope SQLite code=%d remains masked as ErrMemberToolDenied; real Rollback returned nil; injected_ack_error=%t", raw.Code(), ack != nil)
+				if errors.As(err, &raw) {
+					t.Error("scope SQL cause escaped the existing denial mask")
+				}
+			}
+			if err := wrapped.Close(); err != nil {
+				t.Fatal(err)
+			}
+			assignmentReopenPreserved(t, f.s, f.path, before)
 		})
 	}
 }
@@ -227,17 +493,41 @@ func TestBindAssignmentRegistrySnapshotAndWrongTurn(t *testing.T) {
 	requestDispatchZero(t, got, err, ErrMemberToolDenied)
 }
 
-func TestBindAssignmentInitialEligibility(t *testing.T) {
-	assignmentAttemptEligibility(t, false)
+func TestBindAssignmentInitialLiveScopeEligibility(t *testing.T) {
+	assignmentAttemptEligibility(t, false, []string{"old-token", "cancel", "unknown", "terminal", "candidate"})
 }
 
-func TestBindAssignmentReplayEligibility(t *testing.T) {
-	assignmentAttemptEligibility(t, true)
+func TestBindAssignmentReplayLiveScopeEligibility(t *testing.T) {
+	assignmentAttemptEligibility(t, true, []string{"old-token", "cancel", "unknown", "terminal", "candidate"})
 }
 
-func assignmentAttemptEligibility(t *testing.T, replay bool) {
+func TestBindAssignmentInitialAuthorityEligibility(t *testing.T) {
+	assignmentAttemptEligibility(t, false, []string{"authority", "binding", "policy"})
+}
+
+func TestBindAssignmentReplayAuthorityEligibility(t *testing.T) {
+	assignmentAttemptEligibility(t, true, []string{"authority", "binding", "policy"})
+}
+
+func TestBindAssignmentInitialTaskEligibility(t *testing.T) {
+	assignmentAttemptEligibility(t, false, []string{"pointer", "revision", "assignee"})
+}
+
+func TestBindAssignmentReplayTaskEligibility(t *testing.T) {
+	assignmentAttemptEligibility(t, true, []string{"pointer", "revision", "assignee"})
+}
+
+func TestBindAssignmentInitialMembershipEligibility(t *testing.T) {
+	assignmentAttemptEligibility(t, false, []string{"worker-left", "coordinator-left"})
+}
+
+func TestBindAssignmentReplayMembershipEligibility(t *testing.T) {
+	assignmentAttemptEligibility(t, true, []string{"worker-left", "coordinator-left"})
+}
+
+func assignmentAttemptEligibility(t *testing.T, replay bool, changes []string) {
 	t.Helper()
-	for _, change := range []string{"old-token", "cancel", "unknown", "terminal", "candidate", "authority", "binding", "policy", "pointer", "revision", "worker-left", "coordinator-left", "assignee"} {
+	for _, change := range changes {
 		t.Run(change, func(t *testing.T) {
 			f, r, worker := assignmentAttemptWorker(t)
 			if replay {
@@ -371,40 +661,153 @@ func TestBindAssignmentDualRoleAndBrokenBackpointer(t *testing.T) {
 	}
 }
 
+func assignmentDefaultTimeout(t *testing.T, stores ...*Store) {
+	t.Helper()
+	for _, s := range stores {
+		var timeout int
+		if err := s.db.QueryRow("PRAGMA busy_timeout").Scan(&timeout); err != nil || timeout != 5000 {
+			t.Fatalf("expected unchanged default 5s lock wait: %d, %v", timeout, err)
+		}
+	}
+}
+
+func assignmentRequireBeginBusy(t *testing.T, err error) {
+	t.Helper()
+	var cause *sqlite.Error
+	var failure *assignmentTransactionError
+	if !errors.As(err, &cause) || cause.Code()&0xff != 5 || !errors.As(err, &failure) ||
+		failure.Phase() != "begin" || !failure.RollbackConfirmed() || failure.CommitOutcomeUnknown() {
+		t.Fatalf("not a proven BEGIN BUSY/no-transaction outcome: %v", err)
+	}
+}
+
 func TestBindAssignmentTwoHandlesAndPublicActivate(t *testing.T) {
 	f, r, worker := assignmentAttemptWorker(t)
-	second := queueHandle(t, f.path, false)
-	// Race-instrumented SQLite can hold the valid Bind longer than the default
-	// five-second lock wait. Wait for serialization, without retrying operations.
-	coordinationDecideExec(t, f.s, "PRAGMA busy_timeout=60000")
-	coordinationDecideExec(t, second, "PRAGMA busy_timeout=60000")
+	second, observed := assignmentBoundaryStore(t, f.path, nil)
+	assignmentDefaultTimeout(t, f.s, second)
 	before := coordinationDecideSnapshot(t, f.s)
 	type result struct {
+		label   string
 		binding domain.AssignmentAttemptBinding
 		err     error
 	}
 	start, results := make(chan struct{}), make(chan result, 2)
-	for _, s := range []*Store{f.s, second} {
-		go func(s *Store) {
+	for i, s := range []*Store{f.s, second} {
+		label := []string{"bind-primary", "bind-secondary"}[i]
+		go func(label string, s *Store) {
 			<-start
-			binding, err := s.BindAssignmentAttempt(ctx, worker)
-			results <- result{binding, err}
-		}(s)
+			binding, err := s.BindAssignmentAttempt(context.WithValue(ctx, assignmentBoundaryLabel{}, label), worker)
+			results <- result{label, binding, err}
+		}(label, s)
 	}
-	activate := make(chan error, 1)
+	type activation struct {
+		attempt domain.TaskAttempt
+		err     error
+	}
+	activate := make(chan activation, 1)
 	go func() {
 		<-start
-		_, err := second.ActivateTaskAttempt(ctx, ActivateTaskAttemptInput{GroupID: r.GroupID, TaskID: r.TaskID, ExpectedRevision: r.TaskRevision, ActorID: "user"})
-		activate <- err
+		attempt, err := second.ActivateTaskAttempt(context.WithValue(ctx, assignmentBoundaryLabel{}, "public-activate"), ActivateTaskAttemptInput{GroupID: r.GroupID, TaskID: r.TaskID, ExpectedRevision: r.TaskRevision, ActorID: "user"})
+		activate <- activation{attempt, err}
 	}()
 	close(start)
-	x, y, activation := <-results, <-results, <-activate
-	if x.err != nil || y.err != nil || x.binding != y.binding || !errors.Is(activation, ErrConflict) {
-		t.Fatalf("two-handle binding/public Activate: %+v (%v), %+v (%v), %v", x, x.err, y, y.err, activation)
+	x, y, public := <-results, <-results, <-activate
+	var winner domain.AssignmentAttemptBinding
+	for _, got := range []result{x, y} {
+		assignmentTransactionEvidence(t, got.label, got.err)
+		if got.err != nil {
+			requestDispatchZero(t, got.binding, got.err, nil)
+			assignmentRequireBeginBusy(t, got.err)
+		} else {
+			if got.binding.AttemptID == "" || winner.AttemptID != "" && got.binding != winner {
+				t.Fatal("successful concurrent bindings disagree")
+			}
+			winner = got.binding
+		}
+	}
+	if winner.AttemptID == "" {
+		t.Fatal("no actual Bind winner")
+	}
+	var publicEvent *assignmentBoundaryEvent
+	for _, event := range observed.events {
+		t.Logf("observed %s: begin_error=%v first_sql_present=%t rollback_calls=%d rollback_error=%v", event.label, event.beginErr, event.firstSQL != "", event.rollbackCalls, event.rollbackErr)
+		if event.label == "public-activate" {
+			publicEvent = event
+		}
+	}
+	assignmentTransactionEvidence(t, "public-activate", public.err)
+	requestDispatchZero(t, public.attempt, public.err, nil)
+	if publicEvent == nil {
+		t.Fatal("public Activate transaction boundary was not observed")
+	}
+	if errors.Is(public.err, ErrConflict) {
+		if publicEvent.beginErr != nil || publicEvent.rollbackCalls != 1 || publicEvent.rollbackErr != nil {
+			t.Fatal("public ownership rejection lacks its actual successful rollback")
+		}
+	} else {
+		var cause *sqlite.Error
+		if !errors.As(public.err, &cause) || cause.Code()&0xff != 5 || !errors.Is(public.err, publicEvent.beginErr) ||
+			publicEvent.firstSQL != "" || publicEvent.rollbackCalls != 0 {
+			t.Fatal("public Activate failed without observed BEGIN BUSY/no-transaction proof")
+		}
 	}
 	after := coordinationDecideSnapshot(t, f.s)
 	if len(after["coordination_assignment_attempts"]) != 1 || len(after["task_attempts"]) != len(before["task_attempts"])+1 || !reflect.DeepEqual(before["resource_claims"], after["resource_claims"]) {
 		t.Fatal("binding race added duplicate work or released claims")
+	}
+	view, err := second.GetAssignment(ctx, r.GroupID, worker.Provenance.AssignmentID)
+	if err != nil || view.Binding == nil || *view.Binding != winner {
+		t.Fatalf("trusted winner receipt reconciliation failed: %+v, %v", view, err)
+	}
+	// Explicit caller reconciliation after the winner's trusted receipt read;
+	// this is one revalidation call, not an automatic retry or native execution.
+	worker.AttemptID = winner.AttemptID
+	reconciled, err := second.BindAssignmentAttempt(ctx, worker)
+	if err != nil || reconciled != winner {
+		t.Fatalf("same-Turn receipt revalidation changed the winner: %+v, %v", reconciled, err)
+	}
+	coordinationDecidePreserved(t, f.s, after)
+	t.Log("default 5000ms: only success or observed BEGIN BUSY accepted; one binding; explicit same-Turn receipt reconciliation; claims unchanged")
+}
+
+func TestBindAssignmentDefaultBusyReconcilesReceipt(t *testing.T) {
+	f, r, worker := assignmentAttemptWorker(t)
+	second, observed := assignmentBoundaryStore(t, f.path, nil)
+	assignmentDefaultTimeout(t, f.s, second)
+	before := coordinationDecideSnapshot(t, f.s)
+	lock, err := f.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Rollback()
+	got, err := second.BindAssignmentAttempt(ctx, worker)
+	assignmentTransactionEvidence(t, "default-5s-held-real-writer", err)
+	if e := lock.Rollback(); e != nil {
+		t.Fatal(e)
+	}
+	requestDispatchZero(t, got, err, nil)
+	assignmentRequireBeginBusy(t, err)
+	if len(observed.events) != 1 || observed.events[0].beginErr == nil || observed.events[0].firstSQL != "" || observed.events[0].rollbackCalls != 0 {
+		t.Fatal("default-5s contention did not fail before a transaction existed")
+	}
+	coordinationDecidePreserved(t, f.s, before)
+	winner, err := f.s.BindAssignmentAttempt(ctx, worker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := second.GetAssignment(ctx, r.GroupID, worker.Provenance.AssignmentID)
+	if err != nil || view.Binding == nil || *view.Binding != winner {
+		t.Fatalf("trusted winner receipt: %+v, %v", view, err)
+	}
+	after := coordinationDecideSnapshot(t, f.s)
+	worker.AttemptID = winner.AttemptID
+	reconciled, err := second.BindAssignmentAttempt(ctx, worker)
+	if err != nil || reconciled != winner {
+		t.Fatalf("explicit receipt reconciliation after default BUSY: %+v, %v", reconciled, err)
+	}
+	coordinationDecidePreserved(t, f.s, after)
+	if len(after["task_attempts"]) != len(before["task_attempts"])+1 || len(after["coordination_assignment_attempts"]) != 1 || !reflect.DeepEqual(before["resource_claims"], after["resource_claims"]) {
+		t.Fatal("default BUSY/reconciliation duplicated work or released claims")
 	}
 }
 
@@ -520,8 +923,7 @@ func TestBindAssignmentLiveScopeRecheck(t *testing.T) {
 func TestBindAssignmentCompetingRequestDispatch(t *testing.T) {
 	f, r, worker := assignmentAttemptWorker(t)
 	second := queueHandle(t, f.path, false)
-	coordinationDecideExec(t, f.s, "PRAGMA busy_timeout=60000")
-	coordinationDecideExec(t, second, "PRAGMA busy_timeout=60000")
+	assignmentDefaultTimeout(t, f.s, second)
 	start, result := make(chan struct{}), make(chan error, 1)
 	go func() {
 		<-start
@@ -720,6 +1122,43 @@ func TestBindAssignmentHistoricalNonterminalUnbounded(t *testing.T) {
 			t.Logf("Bind history state=%s later_terminal_rows=4096 earlier_revision=1 captured_revision=2 other_worker=true elapsed=%s; not a benchmark or hard work bound", state, time.Since(started))
 			dispatchAssertFK(t, f.s)
 		})
+	}
+}
+
+func TestBindAssignmentOwnershipPredicatePlan(t *testing.T) {
+	f, _, worker := assignmentAttemptWorker(t)
+	recorder := assignmentQueryStore(t, f.path)
+	if _, err := recorder.s.BindAssignmentAttempt(ctx, worker); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, q := range recorder.queries {
+		kind, old, exact := "", "", ""
+		if strings.Contains(q.query, "WHERE task_id=? AND group_id=? AND") && strings.Contains(q.query, "coordination_dispatch_state") {
+			kind = "public-ownership"
+			old, exact = "status IN ('pending','enqueued','held','declined')", "(status IN ('pending','enqueued','held') OR status='declined')"
+		} else if strings.Contains(q.query, "ha.id<>:own") {
+			kind = "assignment-start"
+			old, exact = "other.status IN ('pending','enqueued','held','declined')", "(other.status IN ('pending','enqueued','held') OR other.status='declined')"
+		}
+		if kind == "" || seen[kind] {
+			continue
+		}
+		seen[kind] = true
+		t.Logf("actual production %s SQL=%s args=%v", kind, q.query, q.args)
+		current := resolutionPlan(t, f.s, q.query, q.args...)
+		t.Logf("actual production %s plan:\n%s", kind, current)
+		comparison := resolutionPlan(t, f.s, strings.ReplaceAll(q.query, old, exact), q.args...)
+		t.Logf("exact existing OR comparison %s plan:\n%s", kind, comparison)
+		if !strings.Contains(comparison, "coordination_dispatch_task_unfinished") {
+			t.Errorf("existing OR comparison did not use the partial index: %s", kind)
+		}
+		if !strings.Contains(current, "coordination_dispatch_task_unfinished") {
+			t.Errorf("actual production predicate did not use the existing partial index: %s", kind)
+		}
+	}
+	if len(seen) != 2 {
+		t.Fatalf("did not capture both actual ownership predicates: %v", seen)
 	}
 }
 

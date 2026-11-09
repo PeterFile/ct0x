@@ -60,7 +60,7 @@ func TestTaskArtifactV6UpgradePreservesTextHistoryAndClaims(t *testing.T) {
 	}
 	activate := taskAttemptInput(task)
 	activate.IdempotencyKey = "legacy-attempt"
-	attempt, err := old.ActivateTaskAttempt(ctx, activate)
+	attempt, err := dispatchHistoricalAttempt(t, old, activate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestTaskArtifactV6UpgradePreservesTextHistoryAndClaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	reviewedTask := createTestTask(t, old, g.ID)
-	reviewedAttempt, err := old.ActivateTaskAttempt(ctx, taskAttemptInput(reviewedTask))
+	reviewedAttempt, err := dispatchHistoricalAttempt(t, old, taskAttemptInput(reviewedTask))
 	if err != nil {
 		t.Fatal(err)
 	}

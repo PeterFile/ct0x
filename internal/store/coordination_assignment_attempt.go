@@ -58,7 +58,7 @@ const coordinationAssignmentStart = ` AND t.status='open' AND t.revision=r.task_
  AND b.worker_member_id=a.worker_member_id AND b.task_revision=r.task_revision)))
  AND NOT EXISTS(SELECT 1 FROM coordination_assignments other WHERE other.task_id=a.task_id AND other.id<>a.id)
  AND NOT EXISTS(SELECT 1 FROM coordination_dispatch_state other WHERE other.task_id=a.task_id
- AND other.status IN ('pending','enqueued','held','declined'))
+ AND (other.status IN ('pending','enqueued','held') OR other.status='declined'))
  AND NOT EXISTS(SELECT 1 FROM task_attempts ha JOIN turns ht ON ht.id=ha.turn_id
  WHERE ha.group_id=a.group_id AND ha.task_id=a.task_id AND ha.id<>:own
  AND ht.state IN ('starting','running','cancel_requested','unknown'))
@@ -86,7 +86,7 @@ func coordinationAssignmentStartInTx(ctx context.Context, tx *sql.Tx, v assignme
 func coordinationActivateOwnershipInTx(ctx context.Context, tx *sql.Tx, input ActivateTaskAttemptInput, authority *assignmentActivationAuthority) error {
 	var reserved bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM coordination_dispatch_state
- WHERE task_id=? AND group_id=? AND status IN ('pending','enqueued','held','declined'))
+ WHERE task_id=? AND group_id=? AND (status IN ('pending','enqueued','held') OR status='declined'))
  OR EXISTS(SELECT 1 FROM coordination_assignments WHERE task_id=? AND group_id=?)`, input.TaskID, input.GroupID, input.TaskID, input.GroupID).Scan(&reserved); err != nil {
 		// A missing legacy table or storage failure is not proof of no owner.
 		return err
@@ -120,8 +120,12 @@ func (s *Store) BindAssignmentAttempt(ctx context.Context, scope CoordinationToo
 	phase := "begin"
 	var tx *sql.Tx
 	defer func() { err = coordinationAssignmentFinish(tx, phase, err) }()
-	tx, err = s.beginMemberToolTx(ctx, scope.Member)
+	tx, err = s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return out, err
+	}
+	phase = "scope"
+	if err := memberToolScopeInTx(ctx, tx, scope.Member); err != nil {
 		return out, err
 	}
 	phase = "source"
