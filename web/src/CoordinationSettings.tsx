@@ -10,6 +10,7 @@ const kinds = ["coordinator", "policy"] as const;
 type Kind = typeof kinds[number];
 const labels = { coordinator: "协调员", policy: "分派策略" };
 type Configuration = { revision: number; ids: readonly string[] };
+type Recovery = { kinds: readonly Kind[]; round: number; headReady: boolean };
 type Operation = Readonly<{
   groupId: string;
   key: string;
@@ -55,7 +56,7 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
   const [entries, setEntries] = useState(() => ({ coordinator: empty(), policy: empty() }));
   const state = useRef(entries);
   const readRound = useRef(0);
-  const explicitRecovery = useRef<readonly Kind[]>([]);
+  const explicitRecovery = useRef<Recovery | null>(null);
   const mounted = useRef(false);
   const enabled = active && expanded;
   // Synchronous ownership also closes the double-submit window before React commits.
@@ -63,6 +64,14 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
     const next = change(state.current[kind]);
     state.current = { ...state.current, [kind]: next };
     setEntries(previous => ({ ...previous, [kind]: next }));
+  }
+  function finishRecovery(round: number) {
+    const recovery = explicitRecovery.current;
+    if (!recovery || recovery.round !== round || !recovery.headReady
+      || kinds.some(kind => state.current[kind].currentRead.round !== round
+        || state.current[kind].currentRead.status !== "ready")) return;
+    explicitRecovery.current = null;
+    for (const kind of recovery.kinds) update(kind, previous => ({ ...previous, needsRefresh: false }));
   }
   useEffect(() => {
     mounted.current = true;
@@ -72,7 +81,10 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
     };
   }, []);
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled) {
+      explicitRecovery.current = null;
+      return;
+    }
     let ignore = false;
     const controller = new AbortController();
     const round = ++readRound.current;
@@ -95,6 +107,7 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
         return { ...previous, currentRead: { value: value ?? old, status: value ? "ready" : "unavailable", round, error },
           draft: value && !previous.dirty && !previous.operation ? [...value.ids] : previous.draft };
       });
+      finishRecovery(round);
     }
     const coordinator = getCoordinator(groupId, controller.signal);
     const policy = getDispatchPolicy(groupId, controller.signal);
@@ -106,15 +119,18 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
       receive("coordinator", null, error, allowUnbound);
     });
     policy.then(value => receive("policy", configuration(value)), error => receive("policy", null, error));
-    return () => { ignore = true; controller.abort(); };
+    return () => {
+      ignore = true;
+      controller.abort();
+      if (explicitRecovery.current?.round === round) explicitRecovery.current = null;
+    };
   }, [enabled, groupId, refresh]);
   useEffect(() => {
     if (!enabled) { setBefore(""); return; }
     let ignore = false;
     const controller = new AbortController();
-    // Consume recovery on this explicit head request, never on a later page or reopen.
-    const recovering = before ? [] : explicitRecovery.current;
-    if (!before) explicitRecovery.current = [];
+    // Only this configuration round's head can contribute to explicit recovery.
+    const round = readRound.current;
     setRoster(previous => ({ ...previous, pending: true, error: before ? previous.error : "" }));
     listMembers(groupId, before, controller.signal).then(result => {
       if (ignore) return;
@@ -122,7 +138,11 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
         items: [...new Map([...(before ? previous.items : []), ...result.items].map(member => [member.id, member])).values()],
         pending: false, error: before ? previous.error : "", next: result.next_cursor,
       }));
-      for (const kind of recovering) update(kind, previous => ({ ...previous, needsRefresh: false }));
+      const recovery = explicitRecovery.current;
+      if (!before && recovery?.round === round) {
+        recovery.headReady = true;
+        finishRecovery(round);
+      }
     }, error => {
       if (!ignore) setRoster(previous => ({ ...previous, pending: false, error: errorText(error) }));
     });
@@ -141,7 +161,7 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
     if (!enabled) return "请在当前群组展开协调配置。";
     if (entry.operation) return entry.operation.pending ? "正在等待原操作结果。" : "";
     if (other.operation) return "另一项保存尚未确认，不能开始新的保存。";
-    if (kinds.some(key => state.current[key].needsRefresh)) return "保存被拒绝后，成员首页待刷新；请显式刷新配置并保留草稿，核对群组、成员和版本后再保存。";
+    if (kinds.some(key => state.current[key].needsRefresh)) return "保存被拒绝后，请显式刷新配置并保留草稿；同一轮两项当前配置和成员首页均确认后才能再次保存。";
     if (kinds.some(key => state.current[key].currentRead.status !== "ready")) return "当前配置尚未重新确认，请刷新配置。";
     if (entry.currentRead.value!.revision >= Number.MAX_SAFE_INTEGER) return "版本已达到安全整数上限，不能继续保存。";
     if (kind === "coordinator" && !entry.draft.length) return "请选择协调员；不支持清空绑定。";
@@ -157,7 +177,9 @@ export function CoordinationSettings({ groupId, active }: { groupId: string; act
       ? previous : { ...previous, draft: [...ids], dirty: true, error: "" });
   }
   function refreshExplicitly() {
-    explicitRecovery.current = kinds.filter(kind => state.current[kind].needsRefresh);
+    const recovering = kinds.filter(kind => state.current[kind].needsRefresh);
+    explicitRecovery.current = recovering.length
+      ? { kinds: recovering, round: readRound.current + 1, headReady: false } : null;
     for (const kind of kinds) update(kind, previous => ({ ...previous,
       currentRead: { ...previous.currentRead, status: "pending", error: "" } }));
     setBefore("");
