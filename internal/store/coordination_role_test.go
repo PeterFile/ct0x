@@ -61,16 +61,15 @@ func coordinationDecideAssign(t *testing.T, f requestDispatchFixture, scope Coor
 	return got
 }
 
-// No worker materialization API is introduced: this test performs the legal v14 receipt transition.
+// Current worker business fixtures use real B2 materialization and B3 binding.
 func coordinationDecideWorker(t *testing.T, f requestDispatchFixture, r domain.DispatchRequest, receipt domain.DecisionReceipt, bind bool) CoordinationToolScope {
 	t.Helper()
-	m, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: r.GroupID, TopicID: r.TopicID, ActorID: r.CoordinatorMemberID, Content: "工作分配引用", RecipientIDs: []string{f.worker}}, []string{f.worker})
-	if err != nil {
-		t.Fatal(err)
+	materialized, err := f.s.MaterializeAssignment(ctx, receipt.Assignment.ID, 1, time.Now().UTC())
+	if err != nil || materialized.Delivery == nil {
+		t.Fatalf("worker materialization: %+v, %v", materialized, err)
 	}
-	d, stamp := m.Deliveries[0], time.Now().UTC().Format(timestampLayout)
-	coordinationDecideExec(t, f.s, `UPDATE coordination_assignment_dispatch SET status='enqueued',generation=generation+1,updated_at=?,message_id=?,delivery_id=?,conversation_id=?,delivered_member_id=?,materialized_from_generation=1,materialized_at=? WHERE assignment_id=?`, stamp, m.ID, d.ID, d.ConversationID, f.worker, stamp, receipt.Assignment.ID)
-	turn, err := f.s.ClaimTurn(ctx, ClaimTurnInput{GroupID: r.GroupID, DeliveryID: d.ID, MaxActive: 8, ResourceKeys: []string{"worker-resource"}})
+	d := materialized.Delivery
+	turn, err := f.s.ClaimTurn(ctx, ClaimTurnInput{GroupID: r.GroupID, DeliveryID: d.DeliveryID, MaxActive: 8, ResourceKeys: []string{"worker-resource"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,15 +78,14 @@ func coordinationDecideWorker(t *testing.T, f requestDispatchFixture, r domain.D
 		t.Fatal(err)
 	}
 	scope := CoordinationToolScope{Member: member, Provenance: CoordinationRoleProvenance{Kind: CoordinationRoleWorker, GroupID: r.GroupID,
-		DeliveryID: d.ID, MessageID: m.ID, ConversationID: d.ConversationID, MemberID: f.worker, TopicID: r.TopicID,
+		DeliveryID: d.DeliveryID, MessageID: d.MessageID, ConversationID: d.ConversationID, MemberID: f.worker, TopicID: r.TopicID,
 		RequestID: r.ID, TaskID: r.TaskID, TaskRevision: r.TaskRevision, AssignmentID: receipt.Assignment.ID}}
 	if bind {
-		attempt, err := f.s.ActivateTaskAttempt(ctx, ActivateTaskAttemptInput{GroupID: r.GroupID, TaskID: r.TaskID, ExpectedRevision: r.TaskRevision, ActorID: f.worker, MemberScope: &member, IdempotencyKey: "worker-attempt"})
+		binding, err := f.s.BindAssignmentAttempt(ctx, scope)
 		if err != nil {
 			t.Fatal(err)
 		}
-		coordinationDecideExec(t, f.s, `INSERT INTO coordination_assignment_attempts(assignment_id,group_id,task_id,worker_member_id,turn_id,attempt_id,task_revision,created_at) VALUES(?,?,?,?,?,?,?,?)`, receipt.Assignment.ID, r.GroupID, r.TaskID, f.worker, turn.ID, attempt.ID, r.TaskRevision, stamp)
-		scope.AttemptID = attempt.ID
+		scope.AttemptID = binding.AttemptID
 	}
 	return scope
 }

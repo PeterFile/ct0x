@@ -254,7 +254,7 @@ func assignmentV12Fixture(t *testing.T) (*Store, string, func(*Store)) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attempt, err := s.ActivateTaskAttempt(ctx, taskAttemptInput(task))
+	attempt, err := dispatchHistoricalAttempt(t, s, taskAttemptInput(task))
 	if err != nil {
 		t.Fatal(err)
 	}

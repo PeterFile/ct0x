@@ -131,7 +131,8 @@ func assignmentReceipt(t *testing.T, s *Store, r assignmentSQLRows) []any {
 	return v
 }
 
-// Existing queue/task APIs create the fixture parents; the new schema creates neither.
+// Historical v13 foundation sample: queue APIs and guard-checked historical
+// Attempt insertion create parents, not current N3 business activation.
 func assignmentBinding(t *testing.T, s *Store, r assignmentSQLRows) []any {
 	t.Helper()
 	turn, err := s.ClaimTurn(ctx, ClaimTurnInput{GroupID: r.assignment[4].(string), DeliveryID: r.state[12].(string), MaxActive: 20})
@@ -142,7 +143,7 @@ func assignmentBinding(t *testing.T, s *Store, r assignmentSQLRows) []any {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := s.ActivateTaskAttempt(ctx, ActivateTaskAttemptInput{GroupID: turn.GroupID, TaskID: r.assignment[3].(string), ExpectedRevision: 1, ActorID: turn.MemberID, MemberScope: &scope})
+	a, err := dispatchHistoricalAttempt(t, s, ActivateTaskAttemptInput{GroupID: turn.GroupID, TaskID: r.assignment[3].(string), ExpectedRevision: 1, ActorID: turn.MemberID, MemberScope: &scope})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +309,7 @@ func TestCoordinationAssignmentSchemaCounterfactualExactIdentityAndSnapshots(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	attempt, err := s.ActivateTaskAttempt(ctx, taskAttemptInput(task))
+	attempt, err := dispatchHistoricalAttempt(t, s, taskAttemptInput(task))
 	if err != nil {
 		t.Fatal(err)
 	}

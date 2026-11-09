@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"agentworkspace/internal/domain"
 )
@@ -46,6 +48,53 @@ func TestCoordinationDispatchV12MigrationFrozenHistory(t *testing.T) {
 	}
 }
 
+// dispatchHistoricalAttempt constructs a pre-N3b3 historical sample under the
+// fixture's actual schema/FKs/guards. It is not the current activation API.
+func dispatchHistoricalAttempt(t *testing.T, s *Store, input ActivateTaskAttemptInput) (domain.TaskAttempt, error) {
+	t.Helper()
+	t.Log("historical pre-N3b3 Attempt fixture; all schema FK/identity guards remain enabled")
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.TaskAttempt{}, err
+	}
+	defer tx.Rollback()
+	turn, err := taskActorInTx(ctx, tx, input.GroupID, input.ActorID, input.MemberScope)
+	if err != nil {
+		return domain.TaskAttempt{}, err
+	}
+	id, replay, err := reserveMutation(ctx, tx, mutationScope{operation: "activate_task_attempt", actorID: input.ActorID, groupID: input.GroupID, key: input.IdempotencyKey},
+		mutationPayload(input.GroupID, input.TaskID, strconv.FormatInt(input.ExpectedRevision, 10), input.ExpectedActiveAttemptID))
+	if err != nil {
+		return domain.TaskAttempt{}, err
+	}
+	if replay {
+		return domain.TaskAttempt{}, ErrConflict
+	}
+	task, err := taskInTx(ctx, tx, input.GroupID, input.TaskID)
+	if err != nil {
+		return domain.TaskAttempt{}, err
+	}
+	if task.Revision != input.ExpectedRevision || task.ActiveAttemptID != input.ExpectedActiveAttemptID {
+		return domain.TaskAttempt{}, ErrConflict
+	}
+	next, attempt, err := task.ActivateAttempt(domain.TaskAttempt{ID: id, GroupID: task.GroupID, TaskID: task.ID, TaskRevision: task.Revision, TurnID: turn, CreatedAt: time.Now().UTC()})
+	if err != nil {
+		return domain.TaskAttempt{}, err
+	}
+	if err := coordinationDispatchWrite(ctx, tx, `INSERT INTO task_attempts(id,task_id,group_id,task_revision,turn_id,actor_id,created_at)
+ VALUES(?,?,?,?,nullif(?,''),?,?)`, attempt.ID, task.ID, task.GroupID, task.Revision, turn, input.ActorID, attempt.CreatedAt.Format(timestampLayout)); err != nil {
+		return domain.TaskAttempt{}, err
+	}
+	if err := coordinationDispatchWrite(ctx, tx, "UPDATE tasks SET active_attempt_id=? WHERE id=? AND group_id=? AND revision=? AND active_attempt_id IS nullif(?,'')",
+		next.ActiveAttemptID, task.ID, task.GroupID, task.Revision, task.ActiveAttemptID); err != nil {
+		return domain.TaskAttempt{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.TaskAttempt{}, err
+	}
+	return attempt, nil
+}
+
 func dispatchV11Fixture(t *testing.T) (*Store, string, string, string, func(*Store)) {
 	t.Helper()
 	s, path, groupID, coordinator, worker, check := coordinatorV10Fixture(t)
@@ -64,7 +113,7 @@ func dispatchV11Fixture(t *testing.T) (*Store, string, string, string, func(*Sto
 	if err != nil {
 		t.Fatal(err)
 	}
-	attempt, err := s.ActivateTaskAttempt(ctx, taskAttemptInput(task))
+	attempt, err := dispatchHistoricalAttempt(t, s, taskAttemptInput(task))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -20,7 +20,7 @@ func materializeChangeEligibility(t *testing.T, f requestDispatchFixture, change
 	case "task-revision":
 		query, args, code = "UPDATE tasks SET revision=2 WHERE id=?", []any{f.task.ID}, domain.DispatchHeldTaskStale
 	case "active-attempt", "submitted", "accepted":
-		a, err := f.s.ActivateTaskAttempt(ctx, taskAttemptInput(f.task))
+		a, err := dispatchHistoricalAttempt(t, f.s, taskAttemptInput(f.task))
 		if err != nil {
 			t.Fatal(err)
 		}

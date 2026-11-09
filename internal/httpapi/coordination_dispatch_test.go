@@ -214,10 +214,40 @@ func TestDispatchRequestHTTPImmutableReplayCurrentStateAndReopen(t *testing.T) {
 		coordinationHTTPUnchanged(t, raw, before)
 	}
 	check(f.a, domain.DispatchStatusPending, 1)
-	attempt, err := f.a.db.ActivateTaskAttempt(ctx, store.ActivateTaskAttemptInput{GroupID: f.group.ID, TaskID: f.admission.Task.ID, ActorID: "user", ExpectedRevision: 1})
+	// Historical pre-N3b3 sample, not current activation on a reserved Task.
+	// Use one FK-on connection and preserve all existing identity guards.
+	attempt := domain.TaskAttempt{ID: "legacy-http-dispatch-attempt", GroupID: f.group.ID, TaskID: f.admission.Task.ID, TaskRevision: 1, CreatedAt: time.Now().UTC()}
+	conn, err := raw.Conn(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO task_attempts(id,task_id,group_id,task_revision,actor_id,created_at)
+ VALUES(?,?,?,1,'user',?)`, attempt.ID, attempt.TaskID, attempt.GroupID, attempt.CreatedAt.Format("2006-01-02T15:04:05.000000000Z")); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := tx.ExecContext(ctx, "UPDATE tasks SET active_attempt_id=? WHERE id=? AND group_id=? AND revision=1 AND active_attempt_id IS NULL", attempt.ID, attempt.TaskID, attempt.GroupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := changed.RowsAffected(); err != nil || n != 1 {
+		t.Fatalf("historical Task pointer: %d, %v", n, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("historical pre-N3b3 HTTP replay sample; not a current Activate acceptance")
 	check(f.a, domain.DispatchStatusPending, 1)
 	submission, err := f.a.db.SubmitTask(ctx, store.SubmitTaskInput{GroupID: f.group.ID, TaskID: f.admission.Task.ID, AttemptID: attempt.ID, ActorID: "user", ExpectedRevision: 1, Summary: "result"})
 	if err != nil {

@@ -26,7 +26,7 @@ func (s *Store) ActivateTaskAttempt(ctx context.Context, input ActivateTaskAttem
 		return domain.TaskAttempt{}, taskError("激活任务尝试失败", err)
 	}
 	defer tx.Rollback()
-	attempt, err := activateTaskAttemptInTx(ctx, tx, input)
+	attempt, err := activateTaskAttemptInTx(ctx, tx, input, nil)
 	if err != nil {
 		if errors.Is(err, ErrMemberToolDenied) {
 			return domain.TaskAttempt{}, ErrMemberToolDenied
@@ -61,7 +61,7 @@ func taskActorInTx(ctx context.Context, tx *sql.Tx, groupID, actorID string, sco
 	return bound.Claim.TurnID, nil
 }
 
-func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTaskAttemptInput) (domain.TaskAttempt, error) {
+func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTaskAttemptInput, authority *assignmentActivationAuthority) (domain.TaskAttempt, error) {
 	turnID, err := taskActorInTx(ctx, tx, input.GroupID, input.ActorID, input.MemberScope)
 	if err != nil {
 		return domain.TaskAttempt{}, err
@@ -76,6 +76,9 @@ func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTask
 	if replay {
 		attempt, _, err := taskAttemptInTx(ctx, tx, input.GroupID, input.TaskID, id)
 		return attempt, err
+	}
+	if err := coordinationActivateOwnershipInTx(ctx, tx, input, authority); err != nil {
+		return domain.TaskAttempt{}, err
 	}
 	if input.ExpectedRevision < 1 {
 		return domain.TaskAttempt{}, fmt.Errorf("%w：预期任务版本必须大于零", domain.ErrTaskInvalid)
@@ -124,6 +127,11 @@ func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTask
 	}
 	if changed != 1 {
 		return domain.TaskAttempt{}, fmt.Errorf("%w：任务当前状态已改变", ErrConflict)
+	}
+	if authority == nil {
+		if err := coordinationActivateOwnershipInTx(ctx, tx, input, nil); err != nil {
+			return domain.TaskAttempt{}, err
+		}
 	}
 	return attempt, nil
 }
