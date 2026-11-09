@@ -10,6 +10,14 @@ import (
 
 var errExecutorConfiguration = errors.New("提供方执行配置无效或版本不受支持")
 
+// Preserve the actual stat cause for trusted inspection without rendering paths.
+type executorStatFailure struct{ cause error }
+
+func (e *executorStatFailure) Error() string { return errExecutorConfiguration.Error() }
+func (e *executorStatFailure) Unwrap() []error {
+	return []error{errExecutorConfiguration, e.cause}
+}
+
 // NewExecutor selects the verified fresh-turn baseline without probing the CLI,
 // credentials or account. Pi disables tools; Codex uses a read-only sandbox and
 // may use native read tools. Versions must already be normalized. Account and
@@ -25,7 +33,10 @@ func NewExecutor(selected Provider, timeout time.Duration) (Executor, error) {
 		return nil, errExecutorConfiguration
 	}
 	info, err := os.Stat(selected.Path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+	if err != nil {
+		return nil, &executorStatFailure{cause: err}
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
 		return nil, errExecutorConfiguration
 	}
 	if selected.Name == Pi {

@@ -1,9 +1,12 @@
 package provider
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -62,6 +65,66 @@ func TestNewExecutorBindsExactSupportedProviderWithoutProbing(t *testing.T) {
 	}
 }
 
+// The first real stat and subsequent factory stat are a deterministic sequence,
+// not a claim to reproduce interleaving within a complete Prepare call.
+func TestNewExecutorPreservesCapturedStatFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		errno syscall.Errno
+	}{
+		{"removed", syscall.ENOENT},
+		{"self-symlink", syscall.ELOOP},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "PRIVATE-provider")
+			contents := []byte("#!/bin/sh\nprintf invoked > \"$0.invoked\"\nexit 99\n")
+			if err := os.WriteFile(path, contents, 0700); err != nil {
+				t.Fatal(err)
+			}
+			info, err := os.Stat(path)
+			if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+				t.Fatalf("executable preflight failed: %v", err)
+			}
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if tc.errno == syscall.ELOOP {
+				if err := os.Symlink(path, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			selected := Provider{ID: "opaque-id", Name: Pi, Version: "1.4.0", Path: path, Installation: Installed}
+			executor, captured := NewExecutor(selected, 0)
+			// Restore before inspecting the captured error; later path state must
+			// not be used to infer what the actual factory stat observed.
+			if tc.errno == syscall.ELOOP {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(path, contents, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if executor != nil || !errors.Is(captured, errExecutorConfiguration) || !errors.Is(captured, tc.errno) {
+				t.Fatalf("factory lost captured stat cause or returned an executor: %T, %v", executor, captured)
+			}
+			var stat *os.PathError
+			if !errors.As(captured, &stat) || stat.Op != "stat" || stat.Path != path || !errors.Is(stat.Err, tc.errno) {
+				t.Fatal("factory did not preserve the actual stat PathError")
+			}
+			if tc.errno == syscall.ENOENT && !errors.Is(captured, os.ErrNotExist) {
+				t.Fatal("factory lost os.ErrNotExist classification")
+			}
+			if captured.Error() != "提供方执行配置无效或版本不受支持" || strings.Contains(captured.Error(), "PRIVATE") {
+				t.Fatal("factory changed its exact sanitized error text")
+			}
+			if _, err := os.Stat(path + ".invoked"); !os.IsNotExist(err) {
+				t.Fatalf("factory invoked native executable: %v", err)
+			}
+		})
+	}
+}
+
 func TestNewExecutorRejectsUnverifiedConfiguration(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "fixture")
@@ -104,13 +167,16 @@ func TestNewExecutorRejectsUnverifiedConfiguration(t *testing.T) {
 			selected := Provider{ID: "selected", Name: Pi, Version: "1.4.0", Path: path, Installation: Installed}
 			tc.edit(&selected)
 			e, err := NewExecutor(selected, time.Second)
-			if e != nil || err == nil || err.Error() != "提供方执行配置无效或版本不受支持" {
+			if e != nil || !errors.Is(err, errExecutorConfiguration) || err.Error() != "提供方执行配置无效或版本不受支持" {
 				t.Fatalf("invalid configuration accepted or leaked: %T, %v", e, err)
+			}
+			if tc.name != "missing executable" && err != errExecutorConfiguration {
+				t.Fatal("metadata, version or executable-kind sentinel identity changed")
 			}
 		})
 	}
 	selected := Provider{ID: "selected", Name: Pi, Version: "1.4.0", Path: path, Installation: Installed}
-	if e, err := NewExecutor(selected, -time.Second); e != nil || err == nil {
+	if e, err := NewExecutor(selected, -time.Second); e != nil || err != errExecutorConfiguration {
 		t.Fatalf("negative timeout accepted: %T, %v", e, err)
 	}
 }
