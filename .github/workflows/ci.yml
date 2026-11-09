@@ -17,14 +17,15 @@ defaults:
   run:
     shell: bash
 
-env:
-  STORE_RACE_GROUP: '^Test(Coordination|Coordinator|RequestWork|RequestDispatch|GetDispatch|Dispatch)'
-
 jobs:
-  go-store-a:
-    name: Go Store A
+  go-store:
+    name: Go Store ${{ matrix.slot }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -33,46 +34,38 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - name: Run and verify Store shard A
+      - name: Run and verify Store shard
+        env:
+          STORE_SLOT: ${{ matrix.slot }}
         run: |
           set -euo pipefail
           package=$(go list ./internal/store)
-          go test -race -json -list '^(Test|Example|Fuzz)' ./internal/store | tee "$RUNNER_TEMP/store-list.json"
-          go test -race -json -run "$STORE_RACE_GROUP" ./internal/store | tee "$RUNNER_TEMP/store-run.json"
-          python3 .github/scripts/verify-store-shard.py run "$package" "$RUNNER_TEMP/store-list.json" "$RUNNER_TEMP/store-run.json"
-
-  go-store-b:
-    name: Go Store B
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
+          sha=$(git rev-parse HEAD)
+          tree=$(git rev-parse HEAD^{tree})
+          go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/store | tee "$RUNNER_TEMP/store-list.json"
+          pattern=$(python3 .github/scripts/verify-store-shard.py select "$STORE_SLOT" "$package" "$RUNNER_TEMP/store-list.json")
+          go test -count=1 -race -json -run "$pattern" ./internal/store | tee "$RUNNER_TEMP/store-run.json"
+          python3 .github/scripts/verify-store-shard.py verify "$STORE_SLOT" "$package" "$RUNNER_TEMP/store-list.json" "$RUNNER_TEMP/store-run.json" \
+            --run-id "$GITHUB_RUN_ID" --sha "$sha" --tree "$tree" > "$RUNNER_TEMP/store-summary.json"
+      - uses: actions/upload-artifact@v7
         with:
-          persist-credentials: false
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Run and verify Store shard B
-        run: |
-          set -euo pipefail
-          package=$(go list ./internal/store)
-          go test -race -json -list '^(Test|Example|Fuzz)' ./internal/store | tee "$RUNNER_TEMP/store-list.json"
-          go test -race -json -skip "$STORE_RACE_GROUP" ./internal/store | tee "$RUNNER_TEMP/store-run.json"
-          python3 .github/scripts/verify-store-shard.py skip "$package" "$RUNNER_TEMP/store-list.json" "$RUNNER_TEMP/store-run.json"
+          name: store-shard-v1-${{ matrix.slot }}
+          path: ${{ runner.temp }}/store-summary.json
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
 
   go:
     name: Go
-    needs: [go-store-a, go-store-b]
+    needs: [go-store]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Check Store shards
         env:
-          STORE_A_RESULT: ${{ needs.go-store-a.result }}
-          STORE_B_RESULT: ${{ needs.go-store-b.result }}
-        run: test "$STORE_A_RESULT" = success && test "$STORE_B_RESULT" = success
+          STORE_RESULT: ${{ needs.go-store.result }}
+        run: test "$STORE_RESULT" = success
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -80,6 +73,19 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      - name: Test Store shard gates
+        run: python3 .github/scripts/test-store-shard.py -v
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: store-shard-v1-*
+          path: ${{ runner.temp }}/store-shards
+          merge-multiple: false
+      - name: Verify Store shard coverage
+        run: |
+          set -euo pipefail
+          package=$(go list ./internal/store)
+          python3 .github/scripts/verify-store-shard.py aggregate "$package" "$RUNNER_TEMP/store-shards" \
+            --run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"
       - name: Race test all other packages
         run: |
           set -euo pipefail
