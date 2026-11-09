@@ -87,10 +87,14 @@ func TestCoordinationDispatchV12MigrationPopulatedUpgradeReopenAndAppend(t *test
 	old, path, g, coordinator, check := dispatchV11Fixture(t)
 	before := messageSequenceSnapshot(t, old)
 	objects := messageSequenceRows(t, old.db, "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
+	allMigrations := migrations
+	migrations = migrations[:12]
+	defer func() { migrations = allMigrations }()
 	if err := migrate(old.db); err != nil {
 		t.Fatal(err)
 	}
 	messageSequenceLedger(t, old, len(migrations))
+	migrations = allMigrations
 	messageSequencePreserved(t, old, before)
 	check(old)
 	newObjects := messageSequenceRows(t, old.db, "SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
