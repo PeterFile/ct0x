@@ -17,11 +17,12 @@ const maxMemberToolRegistrations = 1024
 // MemberToolGrants is trusted runtime policy, never model or transport input.
 // Creation uses only this fixed provider/model and the group's member capacity.
 type MemberToolGrants struct {
-	Operations      []string            `json:"-"`
-	Skills          *MemberSkillCatalog `json:"-"`
-	MaxGroupMembers int                 `json:"-"`
-	ProviderID      string              `json:"-"`
-	Model           string              `json:"-"`
+	Operations      []string             `json:"-"`
+	Skills          *MemberSkillCatalog  `json:"-"`
+	Artifacts       *MemberArtifactGrant `json:"-"`
+	MaxGroupMembers int                  `json:"-"`
+	ProviderID      string               `json:"-"`
+	Model           string               `json:"-"`
 }
 
 type memberToolRegistration struct {
@@ -50,6 +51,13 @@ func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants M
 		// Freeze the source even if the caller overwrites its exported wrapper.
 		catalog := *grants.Skills
 		grants.Skills = &catalog
+	}
+	if grants.Artifacts != nil {
+		artifact := *grants.Artifacts
+		if artifact.db == nil || artifact.db != s.db || artifact.open == nil {
+			return "", store.ErrMemberToolDenied
+		}
+		grants.Artifacts = &artifact
 	}
 	if !memberToolGrantsValid(grants) {
 		return "", store.ErrMemberToolDenied
@@ -135,6 +143,10 @@ func memberToolGrantsValid(grants MemberToolGrants) bool {
 		case "list_members", "read_channel", "send_message", "search_history", "read_history":
 		case "search_skills", "load_skill":
 			if grants.Skills == nil || grants.Skills.source == nil {
+				return false
+			}
+		case "read_artifact":
+			if grants.Artifacts == nil || grants.Artifacts.db == nil || grants.Artifacts.open == nil {
 				return false
 			}
 		case "create_member":

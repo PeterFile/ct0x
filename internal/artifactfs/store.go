@@ -79,6 +79,11 @@ func New(privateRoot *os.Root, maxBytes int64) (*Store, error) {
 	return &Store{root: root, dir: dir, maxBytes: maxBytes}, nil
 }
 
+// MaxBytes returns the immutable configured publication and verified-read limit.
+func (s *Store) MaxBytes() int64 {
+	return s.maxBytes
+}
+
 // Publish copies at most maxBytes+1 bytes once, hashing the stream into private staging.
 // Paths must be relative without any '..' component. Contained relative symlinks
 // are allowed. The source root must stay open until Publish returns. Concurrent
