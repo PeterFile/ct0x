@@ -145,7 +145,7 @@ func memberRoleToolError(w http.ResponseWriter, operation string, err error) {
 		switch {
 		case errors.Is(err, store.ErrMemberToolDenied):
 			status, code, message = http.StatusForbidden, "forbidden", "无权访问成员工具"
-		case errors.Is(err, store.ErrInvalid):
+		case errors.Is(err, store.ErrInvalid) || errors.Is(err, domain.ErrTaskInvalid):
 			status, code, message = http.StatusBadRequest, "invalid_input", "请求参数无效"
 		case errors.Is(err, store.ErrNotFound):
 			status, code, message = http.StatusNotFound, "not_found", "记录不存在或不可访问"

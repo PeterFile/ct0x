@@ -330,6 +330,11 @@ func TestMemberRoleToolSyntheticErrorCodecOnly(t *testing.T) {
 		{"submit_result", confirmedConflict, 409, "conflict", false},
 		{"decide_dispatch", fmt.Errorf("PRIVATE canceled: %w", errors.Join(context.Canceled, store.ErrConflict)), 408, "request_canceled", true},
 		{"submit_result", fmt.Errorf("PRIVATE deadline: %w", errors.Join(context.DeadlineExceeded, store.ErrInvalid)), 504, "deadline_exceeded", true},
+		{"submit_result", &memberRoleHTTPSyntheticTxError{cause: domain.ErrTaskInvalid, rolledBack: true}, 400, "invalid_input", false},
+		{"submit_result", &memberRoleHTTPSyntheticTxError{cause: domain.ErrTaskInvalid, unknown: true, rolledBack: true}, 500, "internal_error", true},
+		{"submit_result", &memberRoleHTTPSyntheticTxError{cause: domain.ErrTaskInvalid}, 500, "internal_error", true},
+		{"submit_result", &memberRoleHTTPSyntheticTxError{cause: errors.Join(context.Canceled, domain.ErrTaskInvalid), rolledBack: true}, 408, "request_canceled", true},
+		{"submit_result", &memberRoleHTTPSyntheticTxError{cause: errors.Join(context.DeadlineExceeded, domain.ErrTaskInvalid), rolledBack: true}, 504, "deadline_exceeded", true},
 	} {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			w := httptest.NewRecorder()
