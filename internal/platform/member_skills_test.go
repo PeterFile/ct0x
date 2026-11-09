@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -330,6 +331,112 @@ func TestMemberSkillLoadFrozenIdentityRawBytesAndBinary(t *testing.T) {
 	}
 	if same := f.load(t, MemberSkillLoadInput{Identity: &id}); same != first {
 		t.Fatal("source deletion invalidated cached identity")
+	}
+}
+
+func TestMemberSkillLoadRejectsNonCanonicalHashBeforeCache(t *testing.T) {
+	for _, count := range []int{0, 1, 4} {
+		t.Run(fmt.Sprintf("snapshots-%d", count), func(t *testing.T) {
+			f := setupMemberSkills(t, "alpha", "beta", "delta", "gamma", "omega")
+			page := f.search(t, MemberSkillSearchInput{})
+			gate, _ := memberSkillGate(t, &f, "none")
+			var frozen []MemberSkillLoadResult
+			for _, item := range page.Items[:count] {
+				frozen = append(frozen, f.load(t, MemberSkillLoadInput{Identity: &item.Identity}))
+				memberSkillPut(t, f.root, item.Name+"/SKILL.md", memberSkillRaw(item.Name, "changed after selection"))
+			}
+			state := f.state(t)
+			snapshots, captured := maps.Clone(state.snapshots), state.captured
+			if len(snapshots) != count || gate.selectCalls.Load() != int32(count) {
+				t.Fatal("fixture did not populate the requested snapshot count")
+			}
+			checkRejected := func(t *testing.T, id MemberSkillIdentity, want error) {
+				t.Helper()
+				before := gate.selectCalls.Load()
+				got, err := f.tools.LoadSkill(context.Background(), f.token, MemberSkillLoadInput{Identity: &id})
+				memberSkillZeroError(t, got, err, want)
+				if gate.selectCalls.Load() != before || state.captured != captured || !maps.Equal(state.snapshots, snapshots) {
+					t.Fatal("rejected hash reached Catalog.Select or changed frozen handles, snapshots or captured bytes")
+				}
+			}
+			targets := []MemberSkillIdentity{page.Items[len(page.Items)-1].Identity}
+			if count > 0 {
+				targets = append([]MemberSkillIdentity{frozen[0].Identity}, targets...)
+			}
+			for _, id := range targets {
+				for _, hash := range []struct{ name, value string }{
+					{"uppercase", strings.ToUpper(id.SkillSHA256)},
+					{"nonhex", strings.Repeat("0", 63) + "g"},
+				} {
+					t.Run(id.Name+"/"+hash.name, func(t *testing.T) {
+						if hash.value == id.SkillSHA256 || len(hash.value) != 64 {
+							t.Fatal("fixture must supply a distinct, 64-byte noncanonical hash")
+						}
+						bad := id
+						bad.SkillSHA256 = hash.value
+						checkRejected(t, bad, skills.ErrInvalid)
+					})
+				}
+			}
+			if count > 0 {
+				t.Run("valid-different-hash", func(t *testing.T) {
+					changed := frozen[0].Identity
+					prefix := "0"
+					if changed.SkillSHA256[0] == '0' {
+						prefix = "1"
+					}
+					changed.SkillSHA256 = prefix + changed.SkillSHA256[1:]
+					checkRejected(t, changed, skills.ErrChanged)
+				})
+			}
+			before := gate.selectCalls.Load()
+			for _, old := range frozen {
+				for _, input := range []MemberSkillLoadInput{{Identity: &old.Identity}, {Handle: old.Handle}} {
+					if got := f.load(t, input); got != old {
+						t.Fatal("hash rejection changed a frozen result or handle")
+					}
+				}
+			}
+			if gate.selectCalls.Load() != before || state.captured != captured || !maps.Equal(state.snapshots, snapshots) {
+				t.Fatal("frozen reads selected the source again or changed cached state")
+			}
+		})
+	}
+}
+
+func TestMemberSkillLoadNonCanonicalHashAuthorization(t *testing.T) {
+	for _, change := range []string{"wrong-token", "cancel", "terminal", "old-claim"} {
+		t.Run(change, func(t *testing.T) {
+			f := setupMemberSkills(t, "alpha", "omega")
+			page := f.search(t, MemberSkillSearchInput{})
+			gate, _ := memberSkillGate(t, &f, "none")
+			f.load(t, MemberSkillLoadInput{Identity: &page.Items[0].Identity})
+			state := f.state(t)
+			snapshots, captured := maps.Clone(state.snapshots), state.captured
+			before := gate.selectCalls.Load()
+			token := f.token
+			if change == "wrong-token" {
+				token = "PRIVATE-WRONG-TOKEN"
+			} else {
+				memberSkillChangeScope(t, f, change, nil)
+			}
+			for _, item := range page.Items {
+				for _, hash := range []struct{ name, value string }{
+					{"uppercase", strings.ToUpper(item.Identity.SkillSHA256)},
+					{"nonhex", strings.Repeat("0", 63) + "g"},
+				} {
+					t.Run(item.Name+"/"+hash.name, func(t *testing.T) {
+						bad := item.Identity
+						bad.SkillSHA256 = hash.value
+						got, err := f.tools.LoadSkill(context.Background(), token, MemberSkillLoadInput{Identity: &bad})
+						memberSkillZeroError(t, got, err, store.ErrMemberToolDenied)
+						if gate.selectCalls.Load() != before || state.captured != captured || !maps.Equal(state.snapshots, snapshots) {
+							t.Fatal("denied malformed identity reached Catalog.Select or changed cached state")
+						}
+					})
+				}
+			}
+		})
 	}
 }
 

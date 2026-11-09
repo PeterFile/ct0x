@@ -115,7 +115,7 @@ function MemberScope({ groupId, active, catalogue, onMembers }: { groupId: strin
       setMutation({ pending: false, error: "", uncertain: false });
     } catch (error) {
       if (!mounted.current) return;
-      const uncertain = !isDefinitiveRejection(error);
+      const uncertain = mutation.uncertain || !isDefinitiveRejection(error);
       if (!uncertain) operation.current = null;
       setMutation({ pending: false, uncertain, error: uncertain ? `创建结果未确认。${errorText(error)} 请重试同一次创建。` : errorText(error) });
     } finally { posting.current = null; }
