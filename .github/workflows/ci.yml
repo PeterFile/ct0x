@@ -55,17 +55,55 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  go-platform:
+    name: Go Platform ${{ matrix.slot }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run and verify Platform shard
+        env:
+          PLATFORM_SLOT: ${{ matrix.slot }}
+        run: |
+          set -euo pipefail
+          package=$(go list ./internal/platform)
+          sha=$(git rev-parse HEAD)
+          tree=$(git rev-parse HEAD^{tree})
+          go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/platform | tee "$RUNNER_TEMP/platform-list.json"
+          pattern=$(python3 .github/scripts/verify-store-shard.py select --profile platform "$PLATFORM_SLOT" "$package" "$RUNNER_TEMP/platform-list.json")
+          go test -count=1 -race -json -run "$pattern" ./internal/platform | tee "$RUNNER_TEMP/platform-run.json"
+          python3 .github/scripts/verify-store-shard.py verify --profile platform "$PLATFORM_SLOT" "$package" "$RUNNER_TEMP/platform-list.json" "$RUNNER_TEMP/platform-run.json" \
+            --run-id "$GITHUB_RUN_ID" --sha "$sha" --tree "$tree" > "$RUNNER_TEMP/platform-summary.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: platform-shard-v1-${{ matrix.slot }}
+          path: ${{ runner.temp }}/platform-summary.json
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+
   go:
     name: Go
-    needs: [go-store]
+    needs: [go-store, go-platform]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Check Store shards
+      - name: Check Store and Platform shards
         env:
           STORE_RESULT: ${{ needs.go-store.result }}
-        run: test "$STORE_RESULT" = success
+          PLATFORM_RESULT: ${{ needs.go-platform.result }}
+        run: test "$STORE_RESULT" = success && test "$PLATFORM_RESULT" = success
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -86,21 +124,38 @@ jobs:
           package=$(go list ./internal/store)
           python3 .github/scripts/verify-store-shard.py aggregate "$package" "$RUNNER_TEMP/store-shards" \
             --run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: platform-shard-v1-*
+          path: ${{ runner.temp }}/platform-shards
+          merge-multiple: false
+      - name: Verify Platform shard coverage
+        run: |
+          set -euo pipefail
+          package=$(go list ./internal/platform)
+          python3 .github/scripts/verify-store-shard.py aggregate --profile platform "$package" "$RUNNER_TEMP/platform-shards" \
+            --run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"
       - name: Race test all other packages
         run: |
           set -euo pipefail
           store=$(go list ./internal/store)
+          platform=$(go list ./internal/platform)
+          [[ -n "$store" && "$store" != *$'\n'* && -n "$platform" && "$platform" != *$'\n'* && "$store" != "$platform" ]] || exit 1
           all=$(go list ./...)
           rest=()
           store_count=0
+          platform_count=0
           while IFS= read -r package; do
+            [[ -n "$package" ]] || exit 1
             if [[ "$package" == "$store" ]]; then
               store_count=$((store_count + 1))
+            elif [[ "$package" == "$platform" ]]; then
+              platform_count=$((platform_count + 1))
             else
               rest+=("$package")
             fi
           done <<< "$all"
-          [[ -n "$store" && "$store" != *$'\n'* && "$store_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
+          [[ "$store_count" -eq 1 && "$platform_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
           go test -race "${rest[@]}"
       - run: go vet ./...
       - name: Record benchmark metrics
