@@ -213,9 +213,13 @@ func TestMemberArtifactScopeAndMetadataPrecedeRealOpen(t *testing.T) {
 	if calls != 0 {
 		t.Fatal("unauthorized or unresolved tuple reached blobs")
 	}
-	_, err = f.raw.Exec("UPDATE artifact_versions SET created_at='PRIVATE-BAD-TIME' WHERE id=?", base.ID)
+	// Insert malformed persisted metadata without mutating an immutable version.
+	_, err = f.raw.Exec(`INSERT INTO artifact_versions
+ (id,artifact_id,group_id,author_id,blob_hash,size,expected_version_id,observed_version_id,applied,created_at)
+ SELECT 'version/malformed',artifact_id,group_id,author_id,blob_hash,size,id,id,1,'PRIVATE-BAD-TIME'
+ FROM artifact_versions WHERE id=?`, base.ID)
 	artifactsMust(t, err)
-	got, err := f.tools.ReadArtifact(context.Background(), f.token, MemberArtifactReadInput{ArtifactID: base.ArtifactID, VersionID: base.ID})
+	got, err := f.tools.ReadArtifact(context.Background(), f.token, MemberArtifactReadInput{ArtifactID: base.ArtifactID, VersionID: "version/malformed"})
 	if err == nil || got != (MemberArtifactReadResult{}) || strings.Contains(err.Error(), "PRIVATE") || calls != 0 {
 		t.Fatalf("malformed metadata reached blob or leaked details: %+v, %v", got, err)
 	}
@@ -248,7 +252,12 @@ func TestMemberArtifactRangesUseActualBytesAndEncoding(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			v := f.publish(t, PublishArtifactInput{Name: tc.name}, tc.data, "")
 			for _, recordedSize := range []int64{0, 1 << 40} {
-				_, err := f.raw.Exec("UPDATE artifact_versions SET size=? WHERE id=?", recordedSize, v.ID)
+				// Store metadata is an observation; the real published blob stays unchanged.
+				var err error
+				v, err = f.db.PublishArtifact(context.Background(), store.PublishArtifactInput{
+					GroupID: f.groupID, ArtifactID: v.ArtifactID, ExpectedVersionID: v.ID,
+					BlobHash: v.BlobHash, Size: recordedSize, ActorID: "user",
+				})
 				artifactsMust(t, err)
 				got := f.read(t, v, tc.offset, tc.maxBytes)
 				data := []byte(got.Content)
@@ -316,16 +325,14 @@ func TestMemberArtifactJSONBudgetIncludesEscapesAndNewline(t *testing.T) {
 	encoded, err = json.Marshal(got)
 	artifactsMust(t, err)
 	name := strings.Repeat("n", 1+65536-(len(encoded)+1))
-	_, err = f.raw.Exec("UPDATE artifacts SET name=? WHERE id=?", name, v.ArtifactID)
-	artifactsMust(t, err)
+	v = f.publish(t, PublishArtifactInput{Name: name}, "a", "")
 	got = f.read(t, v, 0, 1)
 	encoded, err = json.Marshal(got)
 	artifactsMust(t, err)
 	if len(encoded)+1 != 65536 {
 		t.Fatalf("boundary fixture encoded %d", len(encoded)+1)
 	}
-	_, err = f.raw.Exec("UPDATE artifacts SET name=? WHERE id=?", name+"n", v.ArtifactID)
-	artifactsMust(t, err)
+	v = f.publish(t, PublishArtifactInput{Name: name + "n"}, "a", "")
 	got, err = f.tools.ReadArtifact(context.Background(), f.token, MemberArtifactReadInput{ArtifactID: v.ArtifactID, VersionID: v.ID, MaxBytes: 1})
 	memberArtifactZeroError(t, got, err, store.ErrInvalid)
 }

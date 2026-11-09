@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -188,6 +189,71 @@ func TestMemberArtifactFinalFenceAfterIOCloseAndBudgetErrors(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestMemberArtifactCancelAndUnknownRetainExecutionClaims(t *testing.T) {
+	for _, state := range []string{"cancel_requested", "unknown"} {
+		t.Run(state, func(t *testing.T) {
+			ctx := context.Background()
+			f := &memberArtifactFixture{artifactsFixture: newArtifactsFixture(t, 64)}
+			var err error
+			f.grant, err = NewMemberArtifactGrant(f.service)
+			artifactsMust(t, err)
+			f.tools = NewMemberTools(f.db)
+			local := memberArtifactLocal(f.artifactsFixture)
+			member := local.member(t, f.groupID)
+			message, err := local.local.CreateMessage(ctx, f.groupID, MessageInput{Content: "input", TopicID: "bound-topic", RecipientIDs: []string{member.ID}}, "")
+			artifactsMust(t, err)
+			turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.groupID, DeliveryID: message.Deliveries[0].ID, ResourceKeys: []string{"artifact-reader"}, MaxActive: 4})
+			artifactsMust(t, err)
+			f.claim = store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+			f.issue(t)
+			v := f.publish(t, PublishArtifactInput{Name: "report"}, "verified", "")
+			gate, release := memberArtifactInstallGate(t, f, "close", "close")
+			var result MemberArtifactReadResult
+			var readErr error
+			done := make(chan struct{})
+			go func() {
+				result, readErr = f.tools.ReadArtifact(ctx, f.token, MemberArtifactReadInput{ArtifactID: v.ArtifactID, VersionID: v.ID})
+				close(done)
+			}()
+			memberArtifactWait(t, gate.entered)
+			if state == "cancel_requested" {
+				_, err = f.db.RequestTurnCancel(ctx, f.groupID, f.claim.TurnID)
+			} else {
+				_, err = f.db.ApplyTurnReceipt(ctx, f.claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown})
+			}
+			artifactsMust(t, err)
+			before, err := f.db.GetTurn(ctx, f.groupID, f.claim.TurnID)
+			artifactsMust(t, err)
+			if string(before.State) != state || before.ClaimToken != f.claim.Token {
+				t.Fatal("fixture did not retain the real execution claim")
+			}
+			release()
+			memberArtifactWait(t, done)
+			memberArtifactZeroError(t, result, readErr, store.ErrMemberToolDenied)
+			if gate.closed.Load() != 1 {
+				t.Fatal("invalidated reader was not closed once")
+			}
+			f.tools.Revoke(f.token)
+			after, err := f.db.GetTurn(ctx, f.groupID, f.claim.TurnID)
+			artifactsMust(t, err)
+			if !reflect.DeepEqual(after, before) {
+				t.Fatal("artifact read or capability revocation changed the execution claim")
+			}
+			other := local.member(t, f.otherID)
+			message, err = local.local.CreateMessage(ctx, f.otherID, MessageInput{Content: "other input", RecipientIDs: []string{other.ID}}, "")
+			artifactsMust(t, err)
+			input := store.ClaimTurnInput{GroupID: f.otherID, DeliveryID: message.Deliveries[0].ID, ResourceKeys: []string{"artifact-reader"}, MaxActive: 4}
+			if got, err := f.db.ClaimTurn(ctx, input); !errors.Is(err, store.ErrTurnBusy) || got.ID != "" {
+				t.Fatalf("unsettled read released the shared execution resource: %+v, %v", got, err)
+			}
+			// The resource conflict, not another group's identity or capacity, blocks it.
+			input.ResourceKeys = []string{"independent"}
+			_, err = f.db.ClaimTurn(ctx, input)
+			artifactsMust(t, err)
+		})
 	}
 }
 
