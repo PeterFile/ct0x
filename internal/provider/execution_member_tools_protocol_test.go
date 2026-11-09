@@ -162,7 +162,9 @@ func TestPiMemberToolsEmptyAssistantSnapshotReplacesPreviousText(t *testing.T) {
 					memberToolJSON(t, map[string]any{"type": "message_end", "message": result}),
 					memberToolJSON(t, map[string]any{"type": "message_end", "message": toolOnly}),
 					memberToolJSON(t, map[string]any{"type": "agent_settled", "aborted": tc.aborted})}
-				body := "set -eu\n" + executionHeader + executionEmit(records...) + ": > drained\n"
+				// Keep clean exit behind observation of the full native terminal protocol.
+				body := "set -eu\n" + executionHeader + executionEmit(records...) +
+					"while [ ! -f terminal-observed ]; do :; done\n: > drained\n"
 				var executor Executor
 				var request ExecuteRequest
 				if tools {
@@ -187,6 +189,7 @@ func TestPiMemberToolsEmptyAssistantSnapshotReplacesPreviousText(t *testing.T) {
 						if event.Terminal != tc.outcome {
 							t.Errorf("unexpected native terminal: %+v", event)
 						}
+						return os.WriteFile(filepath.Join(request.CWD, "terminal-observed"), nil, 0600)
 					}
 					return nil
 				})

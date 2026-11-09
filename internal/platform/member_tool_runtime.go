@@ -63,7 +63,7 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 	}
 	operations := slices.Clone(options.Operations)
 	for i, operation := range operations {
-		if !slices.Contains([]string{"list_members", "read_channel", "send_message", "create_member"}, operation) || slices.Contains(operations[:i], operation) {
+		if !slices.Contains([]string{"list_members", "read_channel", "send_message", "create_member", "search_history", "read_history"}, operation) || slices.Contains(operations[:i], operation) {
 			return nil, errMemberToolRuntimeConfig
 		}
 	}

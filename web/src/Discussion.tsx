@@ -78,7 +78,7 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
       setMutation({ pending: false, uncertain: false, error: "", notice: "消息已持久化；投递状态见记录。" });
     } catch (error) {
       if (!mounted.current) return;
-      const uncertain = !isDefinitiveRejection(error), reason = error instanceof ApiError ? error.message : "请求未完成，请重试。";
+      const uncertain = mutation.uncertain || !isDefinitiveRejection(error), reason = error instanceof ApiError ? error.message : "请求未完成，请重试。";
       if (!uncertain) operation.current = null;
       setMutation({ pending: false, uncertain, notice: "", error: uncertain ? `发送结果未确认，消息可能已保存。${reason} 请重试同一次发送。` : reason });
     } finally { posting.current = null; }

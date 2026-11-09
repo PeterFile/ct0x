@@ -250,8 +250,16 @@ func (s *MemberTools) LoadSkill(ctx context.Context, token string, input MemberS
 		if len(input.Handle) > 128 || len(input.Resource) > 65536 || (input.Identity == nil) == (input.Handle == "") || input.Offset < 0 || input.MaxBytes < 1 || input.MaxBytes > 16384 {
 			return skills.ErrInvalid
 		}
-		if id := input.Identity; id != nil && (len(id.RootID) > 128 || len(id.Name) > 64 || len(id.SkillSHA256) != 2*sha256.Size) {
-			return skills.ErrInvalid
+		if id := input.Identity; id != nil {
+			if len(id.RootID) > 128 || len(id.Name) > 64 || len(id.SkillSHA256) != 2*sha256.Size {
+				return skills.ErrInvalid
+			}
+			for i := 0; i < len(id.SkillSHA256); i++ {
+				c := id.SkillSHA256[i]
+				if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+					return skills.ErrInvalid
+				}
+			}
 		}
 		if !memberSkillPath(input.Resource) {
 			return skills.ErrInvalid

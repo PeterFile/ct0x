@@ -51,7 +51,7 @@ func TestMemberToolRuntimeOptionValidation(t *testing.T) {
 			t.Errorf("unsafe endpoint accepted: %q", endpoint)
 		}
 	}
-	for _, operations := range [][]string{nil, {}, {""}, {"list_members", "list_members"}, {"list_members", "search_history"}, {"read_channel "}} {
+	for _, operations := range [][]string{nil, {}, {""}, {"list_members", "list_members"}, {"list_members", "unknown_history"}, {"read_channel "}} {
 		options := f.options
 		options.Operations = operations
 		if _, err := NewMemberToolRuntime(f.db, options); err == nil {
