@@ -18,7 +18,7 @@ function fill(kind: "group" | "member", value: string) {
   if (kind === "member") fireEvent.change(sidebar(kind).getByRole("textbox", { name: "成员职责" }), { target: { value: member.role } });
 }
 beforeEach(() => {
-  writes.mockReset().mockImplementation(async url => json(String(url).includes("/members") ? member : group, 201));
+  writes.mockReset().mockImplementation(async url => json(String(url).includes("/members") ? member : { ...group, description: "" }, 201));
   vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
     if (init?.method === "POST") return writes(input, init);
     const url = String(input);
