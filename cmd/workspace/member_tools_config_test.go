@@ -114,7 +114,7 @@ func TestMemberToolsDisabledNoRootOrRoutes(t *testing.T) {
 		dir := t.TempDir()
 		url, stop := startRun(t, append([]string{"--listen", "127.0.0.1:0", "--data-dir", dir, "--web-dir", web}, args...)...)
 		client := &http.Client{Timeout: 3 * time.Second}
-		for _, operation := range []string{"list_members", "read_channel", "send_message", "create_member"} {
+		for _, operation := range []string{"list_members", "read_channel", "send_message", "create_member", "search_history", "read_history"} {
 			response, err := client.Post(url+"/api/v1/member-tools/"+operation, "application/json", strings.NewReader("{}"))
 			if err != nil {
 				t.Fatal(err)

@@ -115,9 +115,9 @@ export function ReceptionDefaults() {
         : "已保存默认接待设置；不会修改已有群组成员。");
     } catch (error) {
       if (!mounted.current) return;
-      const uncertain = !isDefinitiveRejection(error);
+      const uncertain = mutation.uncertain || !isDefinitiveRejection(error);
       if (!uncertain) operation.current = null;
-      if (error instanceof ApiError && error.status === 409 && error.code === "reception_revision_conflict") setRevisionConflict(true);
+      if (!uncertain && error instanceof ApiError && error.status === 409 && error.code === "reception_revision_conflict") setRevisionConflict(true);
       setMutation({ pending: false, uncertain, error: uncertain
         ? `保存结果未确认。${errorText(error)} 请重试同一次保存。` : errorText(error) });
     } finally { if (posting.current === controller) posting.current = null; }

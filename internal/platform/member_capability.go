@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"agentworkspace/internal/skills"
 	"agentworkspace/internal/store"
 )
 
@@ -16,15 +17,18 @@ const maxMemberToolRegistrations = 1024
 // MemberToolGrants is trusted runtime policy, never model or transport input.
 // Creation uses only this fixed provider/model and the group's member capacity.
 type MemberToolGrants struct {
-	Operations      []string `json:"-"`
-	MaxGroupMembers int      `json:"-"`
-	ProviderID      string   `json:"-"`
-	Model           string   `json:"-"`
+	Operations      []string             `json:"-"`
+	Skills          *MemberSkillCatalog  `json:"-"`
+	Artifacts       *MemberArtifactGrant `json:"-"`
+	MaxGroupMembers int                  `json:"-"`
+	ProviderID      string               `json:"-"`
+	Model           string               `json:"-"`
 }
 
 type memberToolRegistration struct {
 	scope  store.MemberToolScope
 	grants MemberToolGrants
+	skills *memberSkillState
 }
 
 // MemberTools owns process-local capabilities; durable claims authorize every use.
@@ -43,6 +47,18 @@ func NewMemberTools(db *store.Store) *MemberTools {
 // It refuses duplicate registrations rather than silently rotating a live capability.
 func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants) (string, error) {
 	grants.Operations = slices.Clone(grants.Operations)
+	if grants.Skills != nil {
+		// Freeze the source even if the caller overwrites its exported wrapper.
+		catalog := *grants.Skills
+		grants.Skills = &catalog
+	}
+	if grants.Artifacts != nil {
+		artifact := *grants.Artifacts
+		if artifact.db == nil || artifact.db != s.db || artifact.open == nil {
+			return "", store.ErrMemberToolDenied
+		}
+		grants.Artifacts = &artifact
+	}
 	if !memberToolGrantsValid(grants) {
 		return "", store.ErrMemberToolDenied
 	}
@@ -65,7 +81,11 @@ func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants M
 	if _, exists := s.capabilities[key]; exists || token == claim.Token {
 		return "", store.ErrMemberToolDenied
 	}
-	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants}
+	var skillState *memberSkillState
+	if slices.Contains(grants.Operations, "search_skills") || slices.Contains(grants.Operations, "load_skill") {
+		skillState = &memberSkillState{snapshots: make(map[string]*skills.Snapshot)}
+	}
+	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState}
 	return token, nil
 }
 
@@ -73,7 +93,9 @@ func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants M
 func (s *MemberTools) Revoke(token string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.capabilities, sha256.Sum256([]byte(token)))
+	key := sha256.Sum256([]byte(token))
+	s.capabilities[key].skills.clear()
+	delete(s.capabilities, key)
 }
 
 func (s *MemberTools) RevokeTurn(turnID string) {
@@ -81,6 +103,7 @@ func (s *MemberTools) RevokeTurn(turnID string) {
 	defer s.mu.Unlock()
 	for key, entry := range s.capabilities {
 		if entry.scope.Claim.TurnID == turnID {
+			entry.skills.clear()
 			delete(s.capabilities, key)
 		}
 	}
@@ -118,6 +141,14 @@ func memberToolGrantsValid(grants MemberToolGrants) bool {
 	for _, operation := range grants.Operations {
 		switch operation {
 		case "list_members", "read_channel", "send_message", "search_history", "read_history":
+		case "search_skills", "load_skill":
+			if grants.Skills == nil || grants.Skills.source == nil {
+				return false
+			}
+		case "read_artifact":
+			if grants.Artifacts == nil || grants.Artifacts.db == nil || grants.Artifacts.open == nil {
+				return false
+			}
 		case "create_member":
 			if grants.MaxGroupMembers < 1 {
 				return false
