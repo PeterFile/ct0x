@@ -16,8 +16,8 @@ import (
 	"agentworkspace/internal/store"
 )
 
-// Uncompiled, unexecuted test draft. MemberRoleToolRoutes and the three local
-// writer/error seams are proposed in the lane's interface-notes.md, not defined here.
+// Request boundaries use real ordinary capabilities; receipt projection and
+// synthetic error mapping below are codec evidence, not role command success.
 // Real role success/replay, Commit faults, and revoke/claim lifecycles require
 // N4a3's trusted postclaim runtime fixture. Public Issue must remain ordinary-only.
 var memberRoleHTTPRequests = []struct{ operation, body string }{
