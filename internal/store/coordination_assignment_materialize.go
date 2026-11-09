@@ -126,10 +126,11 @@ const coordinationAssignmentRelations = ` FROM coordination_assignments a
 
 // Used verbatim by both the metadata read and the final conditional UPDATE.
 // History is Task-wide: no worker, revision, timestamp, or recent-N restriction.
+// The binding FK and globally unique Assignment.task_id make key lookup sufficient.
 const coordinationAssignmentEligibility = `CASE
  WHEN t.status<>'open' OR t.revision<>r.task_revision OR t.active_attempt_id IS NOT NULL OR t.current_submission_id IS NOT NULL
  OR (coalesce(t.assignee_id,'')<>'' AND t.assignee_id<>a.worker_member_id)
- OR EXISTS(SELECT 1 FROM coordination_assignment_attempts b WHERE b.assignment_id=a.id OR (b.group_id=a.group_id AND b.task_id=a.task_id))
+ OR EXISTS(SELECT 1 FROM coordination_assignment_attempts b WHERE b.assignment_id=a.id)
  OR EXISTS(SELECT 1 FROM task_attempts ha JOIN turns ht ON ht.id=ha.turn_id
  WHERE ha.group_id=a.group_id AND ha.task_id=a.task_id AND ht.state IN ('starting','running','cancel_requested','unknown')) THEN 'task_stale'
  WHEN NOT EXISTS(SELECT 1 FROM task_coordination tc WHERE tc.task_id=r.task_id AND tc.group_id=r.group_id AND tc.topic_id=r.topic_id

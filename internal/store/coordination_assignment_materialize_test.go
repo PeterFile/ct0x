@@ -880,6 +880,46 @@ func TestMaterializeAssignmentCoordinatorLifecycleAndHistoricalReplay(t *testing
 	}
 }
 
+func TestMaterializeAssignmentBindingEligibilityAndReceiptReplay(t *testing.T) {
+	f, r, d, _ := assignmentPending(t)
+	worker := coordinationDecideWorker(t, f, r, d, false)
+	if _, err := f.s.ApplyTurnReceipt(ctx, worker.Member.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted, ExitCode: -1}); err != nil {
+		t.Fatal(err)
+	}
+	// Guard-checked terminal history leaves only the binding to change eligibility.
+	stamp := materializeAt.Format(timestampLayout)
+	coordinationDecideExec(t, f.s, `INSERT INTO task_attempts(id,task_id,group_id,task_revision,actor_id,turn_id,created_at)
+ VALUES('binding-attempt',?,?,?,?,?,?)`, r.TaskID, r.GroupID, r.TaskRevision, f.worker, worker.Member.Claim.TurnID, stamp)
+	tx, err := f.s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	v, state, err := coordinationAssignmentLoad(ctx, tx, d.Assignment.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, err := coordinationAssignmentEligible(ctx, tx, v); err != nil || code != "" {
+		t.Fatalf("terminal history without binding must remain eligible: %q, %v", code, err)
+	}
+	if _, err := tx.ExecContext(ctx, assignmentBindingInsert, d.Assignment.ID, r.GroupID, r.TaskID, f.worker, worker.Member.Claim.TurnID, "binding-attempt", r.TaskRevision, stamp); err != nil {
+		t.Fatal(err)
+	}
+	if code, err := coordinationAssignmentEligible(ctx, tx, v); err != nil || code != domain.DispatchHeldTaskStale {
+		t.Fatalf("current Assignment binding did not fence eligibility: %q, %v", code, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	before := coordinationDecideSnapshot(t, f.s)
+	got, err := f.s.MaterializeAssignment(ctx, d.Assignment.ID, 1, materializeAt)
+	if err != nil || got.Disposition != "enqueued" || got.Generation != state.Generation || !reflect.DeepEqual(got.Delivery, state.Delivery) {
+		t.Fatalf("binding displaced historical receipt replay: %+v, %v", got, err)
+	}
+	coordinationDecidePreserved(t, f.s, before)
+	dispatchAssertFK(t, f.s)
+}
+
 func TestMaterializeAssignmentDamagedSourceIsNotHeld(t *testing.T) {
 	for _, damage := range []string{"decision-worker", "coordinator-turn", "dual-role", "routing", "binding-history", "missing-table"} {
 		t.Run(damage, func(t *testing.T) {
@@ -1047,6 +1087,11 @@ func TestMaterializeAssignmentHistoricalNonterminalUnbounded(t *testing.T) {
 					plan := resolutionPlan(t, f.s, q.query, q.args...)
 					if !strings.Contains(plan, "task_attempts_group_task_created_id") || strings.Contains(strings.ToUpper(q.query), "LIMIT") {
 						t.Fatal("history fence is truncated or lost Task index")
+					}
+					// Both eligibility and provenance binding checks must search the Assignment key.
+					bindingPlan := strings.ReplaceAll(plan, "USING COVERING INDEX", "USING INDEX")
+					if strings.Count(bindingPlan, "SEARCH b USING INDEX sqlite_autoindex_coordination_assignment_attempts_1 (assignment_id=?)") != 2 || strings.Contains(plan, "SCAN b") {
+						t.Fatal("binding checks must search the assignment_id primary key without scanning b")
 					}
 					found = true
 					break
