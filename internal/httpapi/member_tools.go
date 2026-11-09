@@ -40,6 +40,16 @@ func MemberHistoryToolRoutes(tools *platform.MemberTools) []Route {
 	}
 }
 
+// MemberSkillToolRoutes opts into skill reads under NewServer's loopback Host/deadline guard.
+// Use the same trusted post-claim MemberTools registry as MemberToolRoutes.
+func MemberSkillToolRoutes(tools *platform.MemberTools) []Route {
+	a := memberToolAPI{tools}
+	return []Route{
+		{http.MethodPost, "/api/v1/member-tools/search_skills", memberToolNative(a.searchSkills)},
+		{http.MethodPost, "/api/v1/member-tools/load_skill", memberToolNative(a.loadSkill)},
+	}
+}
+
 func memberToolNative(next func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -91,6 +101,10 @@ func memberToolBearer(header http.Header) (string, bool) {
 
 // Read the complete bounded body, including trailing bytes, before any operation.
 func decodeMemberToolJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	return decodeMemberToolJSONWithContextError(w, r, dst, operationError)
+}
+
+func decodeMemberToolJSONWithContextError(w http.ResponseWriter, r *http.Request, dst any, writeContextError func(http.ResponseWriter, error)) bool {
 	limited := http.MaxBytesReader(w, r.Body, memberToolJSONBytes)
 	defer limited.Close()
 	body, err := io.ReadAll(limited)
@@ -101,7 +115,7 @@ func decodeMemberToolJSON(w http.ResponseWriter, r *http.Request, dst any) bool 
 	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			operationError(w, err)
+			writeContextError(w, err)
 		} else {
 			WriteError(w, http.StatusBadRequest, "invalid_json", "请求体读取失败")
 		}

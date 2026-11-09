@@ -60,9 +60,17 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 	t.CreatedAt = time.Now().UTC()
 	t.UpdatedAt = t.CreatedAt
 	stamp := t.CreatedAt.Format(timestampLayout)
-	if _, err := tx.ExecContext(ctx, `INSERT INTO turns(id,group_id,delivery_id,conversation_id,member_id,claim_token,state,created_at,updated_at)
-	 VALUES(?,?,?,?,?,?,?,?,?)`, t.ID, t.GroupID, t.DeliveryID, t.ConversationID, t.MemberID, t.ClaimToken, t.State, stamp, stamp); err != nil {
+	result, err := tx.ExecContext(ctx, `INSERT INTO turns(id,group_id,delivery_id,conversation_id,member_id,claim_token,state,created_at,updated_at)
+	 VALUES(?,?,?,?,?,?,?,?,?)`, t.ID, t.GroupID, t.DeliveryID, t.ConversationID, t.MemberID, t.ClaimToken, t.State, stamp, stamp)
+	if err != nil {
 		return domain.Turn{}, queueError(action, err)
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return domain.Turn{}, queueError(action, err)
+	}
+	if n != 1 {
+		return domain.Turn{}, queueError(action, ErrConflict)
 	}
 	for _, key := range keys {
 		result, err := tx.ExecContext(ctx, `INSERT INTO resource_claims(resource_key,turn_id) VALUES(?,?) ON CONFLICT(resource_key) DO NOTHING`, key, t.ID)

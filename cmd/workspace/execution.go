@@ -36,7 +36,7 @@ func executionRunner(config config, db *store.Store, catalog *platform.ProviderC
 		}
 		tools, err = platform.NewMemberToolRuntime(db, platform.MemberToolRuntimeOptions{
 			ConfigRoot: root, Endpoint: endpoint, MaxGroupMembers: config.memberToolsMaxMembers,
-			Operations: []string{"list_members", "read_channel", "send_message", "create_member"},
+			Operations: []string{"list_members", "read_channel", "send_message", "create_member", "search_history", "read_history"},
 		})
 		if err != nil {
 			return nil, nil, err
