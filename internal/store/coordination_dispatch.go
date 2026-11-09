@@ -97,13 +97,15 @@ func coordinationDispatchCreateInTx(ctx context.Context, tx *sql.Tx, groupID, ta
 	if !coordinatorActive || !workerEligible {
 		return domain.DispatchRequest{}, fmt.Errorf("%w：协调员不在群内或没有符合授权的执行成员", ErrConflict)
 	}
-	var unfinished bool
+	// Match the partial-index predicate; Assignment owns the task after assignment.
+	var occupied bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM coordination_dispatch_state
-	 WHERE task_id=? AND group_id=? AND status IN ('pending','held','enqueued'))`, taskID, groupID).Scan(&unfinished); err != nil {
+	 WHERE task_id=? AND group_id=? AND (status IN ('pending','enqueued','held') OR status='declined'))
+	 OR EXISTS(SELECT 1 FROM coordination_assignments WHERE task_id=?)`, taskID, groupID, taskID).Scan(&occupied); err != nil {
 		return domain.DispatchRequest{}, err
 	}
-	if unfinished {
-		return domain.DispatchRequest{}, fmt.Errorf("%w：任务已有未结束的分派请求", ErrConflict)
+	if occupied {
+		return domain.DispatchRequest{}, fmt.Errorf("%w：任务已被分派请求或工作分配占用", ErrConflict)
 	}
 	stamp := time.Now().UTC().Format(timestampLayout)
 	createdAt, err := coordinationDispatchTime(stamp)
