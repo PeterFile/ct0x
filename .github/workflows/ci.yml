@@ -17,9 +17,12 @@ defaults:
   run:
     shell: bash
 
+env:
+  STORE_RACE_GROUP: '^Test(Coordination|Coordinator|RequestWork|RequestDispatch|GetDispatch|Dispatch)'
+
 jobs:
-  go:
-    name: Go
+  go-store-a:
+    name: Go Store A
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -30,7 +33,69 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - run: go test -race ./...
+      - name: Run and verify Store shard A
+        run: |
+          set -euo pipefail
+          package=$(go list ./internal/store)
+          go test -race -json -list '^(Test|Example|Fuzz)' ./internal/store | tee "$RUNNER_TEMP/store-list.json"
+          go test -race -json -run "$STORE_RACE_GROUP" ./internal/store | tee "$RUNNER_TEMP/store-run.json"
+          python3 .github/scripts/verify-store-shard.py run "$package" "$RUNNER_TEMP/store-list.json" "$RUNNER_TEMP/store-run.json"
+
+  go-store-b:
+    name: Go Store B
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run and verify Store shard B
+        run: |
+          set -euo pipefail
+          package=$(go list ./internal/store)
+          go test -race -json -list '^(Test|Example|Fuzz)' ./internal/store | tee "$RUNNER_TEMP/store-list.json"
+          go test -race -json -skip "$STORE_RACE_GROUP" ./internal/store | tee "$RUNNER_TEMP/store-run.json"
+          python3 .github/scripts/verify-store-shard.py skip "$package" "$RUNNER_TEMP/store-list.json" "$RUNNER_TEMP/store-run.json"
+
+  go:
+    name: Go
+    needs: [go-store-a, go-store-b]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check Store shards
+        env:
+          STORE_A_RESULT: ${{ needs.go-store-a.result }}
+          STORE_B_RESULT: ${{ needs.go-store-b.result }}
+        run: test "$STORE_A_RESULT" = success && test "$STORE_B_RESULT" = success
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Race test all other packages
+        run: |
+          set -euo pipefail
+          store=$(go list ./internal/store)
+          all=$(go list ./...)
+          rest=()
+          store_count=0
+          while IFS= read -r package; do
+            if [[ "$package" == "$store" ]]; then
+              store_count=$((store_count + 1))
+            else
+              rest+=("$package")
+            fi
+          done <<< "$all"
+          [[ -n "$store" && "$store" != *$'\n'* && "$store_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
+          go test -race "${rest[@]}"
       - run: go vet ./...
       - name: Record benchmark metrics
         run: |
