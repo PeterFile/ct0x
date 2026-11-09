@@ -34,7 +34,15 @@ func dispatchRecursive(t *testing.T, s *Store, recursive int) {
 func TestCoordinationDispatchSchemaEveryUniqueInsertConflict(t *testing.T) {
 	for _, recursive := range []int{0, 1} {
 		t.Run(fmt.Sprint(recursive), func(t *testing.T) {
+			original := migrations
+			defer func() { migrations = original }()
+			if len(original) < 12 {
+				t.Fatal("v12 dispatch migration is missing")
+			}
+			migrations = original[:12]
 			s, _ := openTestStore(t)
+			migrations = original
+			messageSequenceLedger(t, s, 12)
 			g, coordinator, _ := dispatchConfiguredGroup(t, s)
 			a, b := dispatchCandidate(t, s, g, coordinator, "unique"), dispatchCandidate(t, s, g, coordinator, "unique")
 			coordinatorMustCommit(t, s, dispatchPair(a)...)
