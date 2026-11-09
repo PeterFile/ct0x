@@ -1164,37 +1164,60 @@ func assignmentPreparedMutation(t *testing.T, f requestDispatchFixture, change s
 	}
 }
 
-func TestMaterializeAssignmentWritePointEligibilityAndFinalSQL(t *testing.T) {
+func TestMaterializeAssignmentWritePointMessages(t *testing.T) {
+	assignmentWritePointEligibilityAndFinalSQL(t, "messages")
+}
+
+func TestMaterializeAssignmentWritePointMessageLog(t *testing.T) {
+	assignmentWritePointEligibilityAndFinalSQL(t, "message_log")
+}
+
+func TestMaterializeAssignmentWritePointConversations(t *testing.T) {
+	assignmentWritePointEligibilityAndFinalSQL(t, "conversations")
+}
+
+func TestMaterializeAssignmentWritePointDeliveries(t *testing.T) {
+	assignmentWritePointEligibilityAndFinalSQL(t, "deliveries")
+}
+
+func TestMaterializeAssignmentWritePointDispatchReceipt(t *testing.T) {
+	assignmentWritePointEligibilityAndFinalSQL(t, "coordination_assignment_dispatch")
+}
+
+func TestMaterializeAssignmentWritePointFinalSQL(t *testing.T) {
+	assignmentWritePointEligibilityAndFinalSQL(t, "sql-cas")
+}
+
+func assignmentWritePointEligibilityAndFinalSQL(t *testing.T, point string) {
+	t.Helper()
 	changes := []string{"task", "active", "submission", "assignee", "authority", "mandate", "current-mandate", "binding", "policy", "coordinator", "worker", "history"}
-	for _, point := range []string{"messages", "message_log", "conversations", "deliveries", "coordination_assignment_dispatch", "sql-cas"} {
-		for _, change := range changes {
-			t.Run(point+"/"+change, func(t *testing.T) {
-				f, _, d, _ := assignmentPending(t)
-				observer := queueHandle(t, f.path, false)
-				mutation := assignmentPreparedMutation(t, f, change)
-				recorder := assignmentQueryStore(t, f.path)
-				if point == "sql-cas" {
-					recorder.beforeCAS = func(conn driver.Conn) {
-						if _, err := conn.(driver.ExecerContext).ExecContext(ctx, mutation, nil); err != nil {
-							t.Fatal(err)
-						}
+	for _, change := range changes {
+		t.Run(point+"/"+change, func(t *testing.T) {
+			f, _, d, _ := assignmentPending(t)
+			observer := queueHandle(t, f.path, false)
+			mutation := assignmentPreparedMutation(t, f, change)
+			recorder := assignmentQueryStore(t, f.path)
+			if point == "sql-cas" {
+				recorder.beforeCAS = func(conn driver.Conn) {
+					if _, err := conn.(driver.ExecerContext).ExecContext(ctx, mutation, nil); err != nil {
+						t.Fatal(err)
 					}
-				} else {
-					op := "INSERT"
-					if point == "coordination_assignment_dispatch" {
-						op = "UPDATE"
-					}
-					coordinationDecideExec(t, f.s, "CREATE TRIGGER assignment_drift AFTER "+op+" ON "+point+" BEGIN "+mutation+" END")
 				}
-				before := coordinationDecideSnapshot(t, observer)
-				got, err := recorder.s.MaterializeAssignment(ctx, d.Assignment.ID, 1, materializeAt)
-				requestDispatchZero(t, got, err, ErrConflict)
-				coordinationDecidePreserved(t, observer, before)
-				if point == "sql-cas" && !reflect.DeepEqual(recorder.casRows, []int64{0}) {
-					t.Fatalf("final SQL did not independently refuse drift: %v", recorder.casRows)
+			} else {
+				op := "INSERT"
+				if point == "coordination_assignment_dispatch" {
+					op = "UPDATE"
 				}
-			})
-		}
+				coordinationDecideExec(t, f.s, "CREATE TRIGGER assignment_drift AFTER "+op+" ON "+point+" BEGIN "+mutation+" END")
+			}
+			before := coordinationDecideSnapshot(t, observer)
+			got, err := recorder.s.MaterializeAssignment(ctx, d.Assignment.ID, 1, materializeAt)
+			requestDispatchZero(t, got, err, ErrConflict)
+			coordinationDecidePreserved(t, observer, before)
+			if point == "sql-cas" && !reflect.DeepEqual(recorder.casRows, []int64{0}) {
+				t.Fatalf("final SQL did not independently refuse drift: %v", recorder.casRows)
+			}
+		})
 	}
 }
 
