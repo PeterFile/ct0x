@@ -14,7 +14,7 @@ export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel",
 /** @typedef {{ unknown?: { toolName: string, toolCallId: string, fingerprint: string, error: Error } }} WriteState */
 const REJECTION_CODES = new Map([
   [400, ["invalid_input", "invalid_json"]], [403, ["forbidden", "invalid_host", "invalid_origin"]],
-  [404, ["not_found"]], [405, ["method_not_allowed"]], [409, ["conflict"]],
+  [405, ["method_not_allowed"]],
   [413, ["body_too_large"]], [415, ["unsupported_media_type"]],
 ]);
 const CONFIG_ERROR = "成员工具配置无效，未启用任何成员工具。";
@@ -93,6 +93,25 @@ function parseJSON(buffer) {
     return value;
   });
   return { text, json };
+}
+
+/** @param {string} text */
+function validRoleReceiptWire(text) {
+  // JSON syntax and decoded field types are already checked. The fixed receipts
+  // allow only four primitive fields, unique decoded keys and unsigned decimal integers.
+  const wire = text.trim();
+  if (wire[0] !== "{") return false;
+  const field = /\s*("(?:[^"\\]|\\.)*")\s*:\s*("(?:[^"\\]|\\.)*"|true|0|[1-9]\d*)\s*([,}])/y;
+  field.lastIndex = 1;
+  const keys = new Set();
+  for (let index = 0; index < 4; index++) {
+    const match = field.exec(wire);
+    if (!match || match[3] !== (index === 3 ? "}" : ",")) return false;
+    const key = JSON.parse(match[1]);
+    if (keys.has(key)) return false;
+    keys.add(key);
+  }
+  return field.lastIndex === wire.length;
 }
 
 /** @param {unknown} value @param {string} token @param {boolean} roleWrite */
@@ -261,12 +280,18 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
             const error = isRecord(result.json) && isRecord(result.json.error) ? result.json.error : undefined;
             const code = error?.code;
             const rejected = !sensitive && typeof code === "string" && typeof error?.message === "string" &&
-              (REJECTION_CODES.get(status)?.includes(code) || (!roleWrite && status === 409 && code === "member_capacity"));
+              (REJECTION_CODES.get(status)?.includes(code) ||
+                (toolName !== "decide_dispatch" && ((status === 404 && code === "not_found") || (status === 409 && code === "conflict"))) ||
+                (!roleWrite && status === 409 && code === "member_capacity"));
             const suffix = rejected || code === "request_canceled" || code === "deadline_exceeded" ? "" : ` ${unknown}`;
             return fail(message ? message + suffix : invalidResponse, rejected ? "rejected" : "unknown");
           }
           if (sensitive) return fail(`成员工具返回了敏感数据，已拒绝显示；${unknown}`);
           if (!validWriteReceipt(toolName, status, result.json, requestKind)) return fail(invalidResponse);
+          if (roleWrite) {
+            if (!validRoleReceiptWire(result.text)) return fail(invalidResponse);
+            result = { text: JSON.stringify(result.json), json: result.json };
+          }
           settled = true;
           cleanup();
           resolve(result);

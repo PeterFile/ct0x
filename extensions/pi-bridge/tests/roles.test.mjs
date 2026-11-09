@@ -74,7 +74,8 @@ function definitions(result) {
 
 async function toolsFor(t, handler = success) {
   const server = await loopback(t, handler);
-  return { ...server, tools: definitions(await load(t, server.endpoint)) };
+  const tools = definitions(await load(t, server.endpoint));
+  return { ...server, tools, invoke: (name, params, id, signal) => execute(tools, name, params, id, signal) };
 }
 
 function execute(tools, name, params, id = "native-role", signal) {
@@ -120,7 +121,8 @@ async function latched(server, original, name, params = payloads[name], id = "or
   }
   assert.equal(server.requests.length, before, "all four writes must share the same fuse");
   for (const [tool, payload] of Object.entries(readPayloads)) {
-    assert.deepEqual((await server.invoke(tool, payload, `read-${tool}`)).json, page);
+    const result = await server.invoke(tool, payload, `read-${tool}`);
+    assert.deepEqual(result.json ?? JSON.parse(result.content[0].text), page);
     assert.equal(server.requests.at(-1).headers["idempotency-key"], undefined);
   }
   await cached(server, original, name, params, id);
@@ -213,7 +215,7 @@ for (const [role, profile] of Object.entries(profiles)) {
   });
 }
 
-test("schema/profile: role native execute preserves exact HTTP bytes and confirmed same-key fixture replay", async t => {
+test("schema/profile: role native execute preserves exact request bytes and reconstructed same-key fixture replay", async t => {
   // This is protocol-fixture replay, not Store or role-token integration.
   const saved = new Map();
   let effects = 0;
@@ -242,7 +244,7 @@ test("schema/profile: role native execute preserves exact HTTP bytes and confirm
       const headers = request.rawHeaders.filter((_, index) => index % 2 === 0).map(header => header.toLowerCase());
       for (const header of ["idempotency-key", "authorization", "content-type"]) assert.equal(headers.filter(value => value === header).length, 1);
       assert.ok(headers.every(header => header !== "origin" && !header.startsWith("sec-fetch-")));
-      assert.deepEqual(result, { content: [{ type: "text", text: saved.get(key).text }], details: undefined });
+      assert.deepEqual(result, { content: [{ type: "text", text: JSON.stringify(JSON.parse(saved.get(key).text)) }], details: undefined });
     }
   }
   for (const [name, params] of [
@@ -307,6 +309,48 @@ test("receipt: fixed role receipts accept real calendar timestamps and safe boun
   assert.equal(server.requests.length, cases.length);
 });
 
+test("receipt: role wire reconstruction accepts unique escaped keys and punctuation in strings", async t => {
+  for (const [name, key, wireKey, value] of [
+    ["decide_dispatch", "decision_id", "decision_\\u0069d", { ...decision, decision_id: 'decision\\",}:true' }],
+    ["submit_result", "submission_id", "\\u0073ubmission_id", { ...submission, submission_id: 'submission\\",}:false' }],
+  ]) {
+    await t.test(name, async t => {
+      const text = ` \t${JSON.stringify(value).replace(`"${key}"`, `"${wireKey}"`)}\r\n`;
+      const server = await toolsFor(t, (_, response) => {
+        response.writeHead(201, { "Content-Type": "application/json" });
+        response.end(text);
+      });
+      const result = await server.invoke(name, payloads[name], "escaped-receipt");
+      assert.deepEqual(result, { content: [{ type: "text", text: JSON.stringify(value) }], details: undefined });
+      assert.equal(server.requests.length, 1);
+    });
+  }
+});
+
+test("receipt: role raw-wire duplicates and non-integer count tokens are unknown and share the fuse", async t => {
+  const marker = "SYNTHETIC_PRIVATE_ROLE_VALUE";
+  const submitText = JSON.stringify(submission);
+  const cases = [
+    ["submit_result", "overwritten private id and omission flag", `{"submission_id":"${marker}",${submitText.slice(1).replace('"summary_omitted":true', '"summary_omitted":false,"summary_omitted":true')}`],
+    ["submit_result", "escaped duplicate omission flag", submitText.replace('"summary_omitted":true', '"summary_omitted":true,"summary_omit\\u0074ed":true')],
+    ["decide_dispatch", "escaped duplicate decision id", `{"decision_\\u0069d":"${marker}",${JSON.stringify(decision).slice(1)}`],
+    ...["-1e-324", "1e-324", "-0", "1.0000000000000001", "9007199254740991.1", "1.0", "1e0"].map(token =>
+      ["submit_result", `count token ${token}`, submitText.replace('"artifact_version_count":1', `"artifact_version_count":${token}`)]),
+  ];
+  for (const [name, label, text] of cases) {
+    await t.test(label, async t => {
+      const server = await toolsFor(t, (request, response, body) => {
+        if (server.requests.length !== 1) return success(request, response, body);
+        response.writeHead(201, { "Content-Type": "application/json" });
+        response.end(text);
+      });
+      const original = await unknown(server.invoke(name, payloads[name], "original"));
+      safeFailure(original, /结果未知.*对账/, [TOKEN, marker]);
+      await latched(server, original, name);
+    });
+  }
+});
+
 test("receipt: invalid, mismatched, additive or sensitive role success is unknown and cached", async t => {
   const cases = [
     ...roleNames.flatMap(name => [200, 202].map(status => [name, status, name === "decide_dispatch" ? decision : submission])),
@@ -352,6 +396,26 @@ for (const name of writeNames) {
     await latched(server, original, name);
   });
 }
+
+test("uncertainty: Decide Submit-only status/code pairs latch at the native HTTP boundary", async t => {
+  for (const [status, code, message] of [
+    [409, "conflict", "任意文案"],
+    [404, "not_found", "已确认拒绝，可更换幂等键"],
+  ]) {
+    await t.test(`${status}/${code}`, async t => {
+      const server = await toolsFor(t, (request, response, body) => {
+        if (server.requests.length === 1) json(response, { error: { code, message } }, status);
+        else success(request, response, body);
+      });
+      const original = await server.invoke("decide_dispatch", payloads.decide_dispatch, "original").catch(error => error);
+      const next = await server.invoke("send_message", payloads.send_message, "must-not-send").catch(error => error);
+      assert.equal(server.requests.length, 1, "an unguaranteed Decide rejection must block the next HTTP write");
+      safeFailure(original, /结果未知.*对账/);
+      safeFailure(next, /结果未知.*对账/);
+      await latched(server, original, "decide_dispatch");
+    });
+  }
+});
 
 test("uncertainty: frozen role status/code table permits only guaranteed rejections and retains the key", async t => {
   const rejected = [
