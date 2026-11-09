@@ -93,6 +93,98 @@ func TestActivateAssignmentKeyedLedgerAtomicity(t *testing.T) {
 	}
 }
 
+func TestActivateAssignmentPointerRestoredAfterWrite(t *testing.T) {
+	for _, kind := range []string{"keyed", "unkeyed"} {
+		t.Run(kind, func(t *testing.T) {
+			f, _, _ := queueClaimFixture(t)
+			s := f.s
+			task := createTestTask(t, s, f.groupID)
+			input := taskAttemptInput(task)
+			if kind == "keyed" {
+				input.IdempotencyKey = "pointer-restore"
+			}
+			var foreignKeys, guards, owners int
+			if err := s.db.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil || foreignKeys != 1 {
+				t.Fatalf("foreign keys not enabled: %d, %v", foreignKeys, err)
+			}
+			if err := s.db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='trigger'
+ AND name IN ('task_attempts_insert','task_attempts_no_update','task_attempts_no_delete','tasks_accept_update')`).Scan(&guards); err != nil || guards != 4 {
+				t.Fatalf("original Task/Attempt guards missing: %d, %v", guards, err)
+			}
+			if err := s.db.QueryRow(`SELECT (SELECT count(*) FROM coordination_dispatch_state WHERE task_id=?) +
+ (SELECT count(*) FROM coordination_assignments WHERE task_id=?)`, task.ID, task.ID).Scan(&owners); err != nil || owners != 0 {
+				t.Fatalf("pointer fixture is not unreserved: %d, %v", owners, err)
+			}
+			coordinationDecideExec(t, s, fmt.Sprintf(`CREATE TRIGGER activate_pointer_restore AFTER UPDATE OF active_attempt_id ON tasks
+ WHEN NEW.id='%s' AND NEW.active_attempt_id IS NOT NULL
+ BEGIN UPDATE tasks SET active_attempt_id=NULL WHERE id=NEW.id; END`, task.ID))
+			dispatchAssertFK(t, s)
+			before := coordinationDecideSnapshot(t, s)
+			if len(before["resource_claims"]) == 0 {
+				t.Fatal("fixture must include real held claims")
+			}
+
+			// Prove the trigger and outer row count with valid evidence before
+			// relying on the public API's rollback to hide its in-tx state.
+			tx, err := s.db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			probe := domain.TaskAttempt{ID: "activate-pointer-probe", TaskID: task.ID, GroupID: task.GroupID, TaskRevision: task.Revision, CreatedAt: task.CreatedAt}
+			if _, err := tx.Exec(`INSERT INTO task_attempts(id,task_id,group_id,task_revision,actor_id,created_at)
+ VALUES(?,?,?,?,'user',?)`, probe.ID, probe.TaskID, probe.GroupID, probe.TaskRevision, probe.CreatedAt.Format(timestampLayout)); err != nil {
+				t.Fatal(err)
+			}
+			result, err := tx.Exec(`UPDATE tasks SET active_attempt_id=? WHERE id=? AND group_id=?
+ AND status='open' AND revision=? AND active_attempt_id IS NULL AND current_submission_id IS NULL`, probe.ID, task.ID, task.GroupID, task.Revision)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed, err := result.RowsAffected()
+			if err != nil || changed != 1 {
+				t.Fatalf("outer UPDATE row count: %d, %v", changed, err)
+			}
+			var restored bool
+			if err := tx.QueryRow("SELECT active_attempt_id IS NULL FROM tasks WHERE id=?", task.ID).Scan(&restored); err != nil || !restored {
+				t.Fatalf("real AFTER trigger did not restore NULL: %t, %v", restored, err)
+			}
+			current, err := taskInTx(ctx, tx, task.GroupID, task.ID)
+			if err != nil || !reflect.DeepEqual(current, task) {
+				t.Fatalf("probe changed other Task state: %+v, %v", current, err)
+			}
+			saved, actor, err := taskAttemptInTx(ctx, tx, task.GroupID, task.ID, probe.ID)
+			if err != nil || saved != probe || actor != "user" {
+				t.Fatalf("probe Attempt did not survive the trigger: %+v, %q, %v", saved, actor, err)
+			}
+			var violations int
+			if err := tx.QueryRow("SELECT count(*) FROM pragma_foreign_key_check").Scan(&violations); err != nil || violations != 0 {
+				t.Fatalf("probe violated foreign keys: %d, %v", violations, err)
+			}
+			if err := tx.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+			coordinationDecidePreserved(t, s, before)
+			t.Logf("real SQLite probe: outer RowsAffected=%d restored_NULL=%t saved_Attempt_verified=true foreign_key_violations=%d rollback_returned_nil=true complete_snapshot_preserved=true", changed, restored, violations)
+
+			got, err := s.ActivateTaskAttempt(ctx, input)
+			assignmentTransactionEvidence(t, "generic Activate pointer restore "+kind, err)
+			if !errors.Is(err, ErrConflict) || got != (domain.TaskAttempt{}) {
+				t.Errorf("Task pointer restoration must return zero/ErrConflict: %+v, %v", got, err)
+			}
+			if err := s.db.QueryRow("SELECT changes()").Scan(&changed); err != nil || changed != 1 {
+				t.Errorf("public Activate outer UPDATE count: %d, %v", changed, err)
+			}
+			current, err = s.GetTask(ctx, task.GroupID, task.ID)
+			if err != nil || !reflect.DeepEqual(current, task) {
+				t.Errorf("public Activate did not preserve the complete Task: %+v, %v", current, err)
+			}
+			t.Logf("public Activate outer SQLite changes()=%d; original Task preserved=%t", changed, reflect.DeepEqual(current, task))
+			assignmentReopenPreserved(t, s, f.path, before)
+		})
+	}
+}
+
 func assignmentReopenPreserved(t *testing.T, s *Store, path string, before map[string][][]any) {
 	t.Helper()
 	after := coordinationDecideSnapshot(t, s)
@@ -922,20 +1014,104 @@ func TestBindAssignmentLiveScopeRecheck(t *testing.T) {
 
 func TestBindAssignmentCompetingRequestDispatch(t *testing.T) {
 	f, r, worker := assignmentAttemptWorker(t)
-	second := queueHandle(t, f.path, false)
+	second, observed := assignmentBoundaryStore(t, f.path, nil)
 	assignmentDefaultTimeout(t, f.s, second)
-	start, result := make(chan struct{}), make(chan error, 1)
+	before := coordinationDecideSnapshot(t, f.s)
+	if len(before["resource_claims"]) == 0 || len(before["coordination_assignment_attempts"]) != 0 {
+		t.Fatal("competing fixture must hold claims without a binding")
+	}
+	type dispatchResult struct {
+		request domain.DispatchRequest
+		err     error
+	}
+	const reason, key = "不重复分配", "second-request"
+	start, result := make(chan struct{}), make(chan dispatchResult, 1)
 	go func() {
 		<-start
-		_, err := second.RequestDispatch(ctx, r.GroupID, r.TaskID, r.TaskRevision, r.AuthorityGeneration, "不重复分配", "second-request")
-		result <- err
+		request, err := second.RequestDispatch(ctx, r.GroupID, r.TaskID, r.TaskRevision, r.AuthorityGeneration, reason, key)
+		result <- dispatchResult{request, err}
 	}()
 	close(start)
 	binding, err := f.s.BindAssignmentAttempt(ctx, worker)
-	requestErr := <-result
-	if err != nil || binding.AttemptID == "" || !errors.Is(requestErr, ErrConflict) {
-		t.Fatalf("Bind/RequestDispatch lost exclusion: %+v, %v / %v", binding, err, requestErr)
+	request := <-result
+	requestErr := request.err
+	assignmentTransactionEvidence(t, "Bind competing RequestDispatch", err)
+	assignmentTransactionEvidence(t, "competing RequestDispatch", requestErr)
+	if err != nil || binding.AttemptID == "" {
+		t.Errorf("Bind/RequestDispatch lost its binding: %+v, %v", binding, err)
 	}
+	if request.request != (domain.DispatchRequest{}) {
+		t.Errorf("competing RequestDispatch failure returned a nonzero request: %+v, %v", request.request, requestErr)
+	}
+	busy := false
+	if len(observed.events) != 1 {
+		t.Errorf("unexpected RequestDispatch transaction count: %d", len(observed.events))
+	} else {
+		event := observed.events[0]
+		t.Logf("real RequestDispatch boundary: begin_error=%v first_sql_present=%t rollback_calls=%d rollback_error=%v", event.beginErr, event.firstSQL != "", event.rollbackCalls, event.rollbackErr)
+		var cause *sqlite.Error
+		switch {
+		case errors.Is(requestErr, ErrConflict):
+			if event.beginErr != nil || event.firstSQL == "" || event.rollbackCalls != 1 || event.rollbackErr != nil {
+				t.Error("competing request conflict lacks its actual successful rollback")
+			} else {
+				t.Log("concurrent RequestDispatch outcome=ErrConflict; actual transaction rollback succeeded; zero request asserted")
+			}
+		case errors.As(requestErr, &cause) && cause.Code() == 5 && event.beginErr != nil && errors.Is(requestErr, event.beginErr) &&
+			event.firstSQL == "" && event.rollbackCalls == 0 && event.rollbackErr == nil:
+			busy = true
+			t.Log("concurrent RequestDispatch outcome=BEGIN SQLITE_BUSY(5); wrapped error matches observed begin_error; no SQL/transaction/rollback; zero request asserted")
+		default:
+			t.Errorf("competing RequestDispatch was neither a rolled-back conflict nor the observed BEGIN BUSY: %v", requestErr)
+		}
+	}
+	after := coordinationDecideSnapshot(t, f.s)
+	for table, rows := range before {
+		if table != "tasks" && table != "task_attempts" && table != "coordination_assignment_attempts" && !reflect.DeepEqual(rows, after[table]) {
+			t.Errorf("competing request changed source/ledger/claims table %s", table)
+		}
+	}
+	if len(after["task_attempts"]) != len(before["task_attempts"])+1 || len(after["coordination_assignment_attempts"]) != 1 {
+		t.Error("competing request lost or duplicated the single bound Attempt")
+	}
+	view, err := second.GetAssignment(ctx, r.GroupID, worker.Provenance.AssignmentID)
+	if err != nil || view.Binding == nil || *view.Binding != binding || view.Request != r || view.Dispatch.Delivery == nil {
+		t.Errorf("competing request changed the trusted source/binding receipt: %+v, %v", view, err)
+	} else {
+		p, d := worker.Provenance, view.Dispatch.Delivery
+		if view.Assignment.ID != p.AssignmentID || view.Assignment.TaskID != p.TaskID || view.Assignment.WorkerMemberID != p.MemberID ||
+			d.DeliveryID != p.DeliveryID || d.MessageID != p.MessageID || d.ConversationID != p.ConversationID || d.WorkerMemberID != p.MemberID ||
+			binding.TurnID != worker.Member.Claim.TurnID || binding.TaskRevision != p.TaskRevision {
+			t.Error("competing request broke the actual Assignment/delivery/worker/Turn source chain")
+		}
+	}
+	current, err := f.s.GetTask(ctx, r.GroupID, r.TaskID)
+	if err != nil || current.Status != domain.TaskStatusOpen || current.Revision != r.TaskRevision || current.ActiveAttemptID != binding.AttemptID || current.CurrentSubmissionID != "" {
+		t.Errorf("competing request changed the Task binding fence: %+v, %v", current, err)
+	}
+	if busy && !t.Failed() {
+		// Both callers returned and the winner's committed binding was read above.
+		// This single same-key call is controlled by the test, never a production retry.
+		events := len(observed.events)
+		request, err := second.RequestDispatch(ctx, r.GroupID, r.TaskID, r.TaskRevision, r.AuthorityGeneration, reason, key)
+		assignmentTransactionEvidence(t, "explicit test-controlled RequestDispatch after BEGIN BUSY", err)
+		if !errors.Is(err, ErrConflict) || request != (domain.DispatchRequest{}) {
+			t.Errorf("same request/key after BEGIN BUSY must return zero/ErrConflict: %+v, %v", request, err)
+		}
+		if len(observed.events) != events+1 {
+			t.Errorf("explicit subsequent RequestDispatch transaction count: %d; want %d", len(observed.events), events+1)
+		} else {
+			event := observed.events[events]
+			t.Logf("explicit subsequent RequestDispatch boundary: begin_error=%v first_sql_present=%t rollback_calls=%d rollback_error=%v", event.beginErr, event.firstSQL != "", event.rollbackCalls, event.rollbackErr)
+			if event.beginErr != nil || event.firstSQL == "" || event.rollbackCalls != 1 || event.rollbackErr != nil {
+				t.Error("explicit subsequent RequestDispatch lacks its actual successful rollback")
+			}
+		}
+		coordinationDecidePreserved(t, f.s, after)
+		t.Logf("single explicit same-key RequestDispatch after BEGIN BUSY: complete persistence unchanged; assertions_passed=%t", !t.Failed())
+	}
+	dispatchAssertFK(t, f.s)
+	t.Logf("default busy_timeout=5000ms on both handles; source/claim/exclusion assertions_passed=%t; no arbitrary error accepted", !t.Failed())
 }
 
 func TestBindAssignmentAttemptInsertAtomicity(t *testing.T) {
