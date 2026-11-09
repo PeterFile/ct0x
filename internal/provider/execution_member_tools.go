@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -17,6 +18,7 @@ var errPiMemberToolConfiguration = errors.New("成员工具执行配置无效")
 type piMemberToolOptions struct {
 	extensionPath string
 	configPath    string
+	toolNames     []string
 }
 
 // NewPiMemberToolExecutor opts into four native member tools on verified Pi 1.4.0.
@@ -28,12 +30,34 @@ type piMemberToolOptions struct {
 // The trusted extension is not a host filesystem sandbox. Tools can perform only
 // server-authorized platform operations. Default Pi executors remain tool-disabled.
 func NewPiMemberToolExecutor(selected Provider, extensionPath, configPath string, timeout time.Duration) (Executor, error) {
+	return NewPiMemberToolExecutorWithTools(selected, extensionPath, configPath, strings.Split(piMemberToolNames, ","), timeout)
+}
+
+// NewPiMemberToolExecutorWithTools freezes a trusted, nonempty subset of the six
+// member tools in canonical order. Names never come from model or HTTP input.
+// It preserves the legacy constructor's file/version gates and does not launch Pi.
+func NewPiMemberToolExecutorWithTools(selected Provider, extensionPath, configPath string, toolNames []string, timeout time.Duration) (Executor, error) {
 	if selected.Name != Pi {
 		return nil, errExecutorConfiguration
 	}
 	baseline, err := NewExecutor(selected, timeout)
 	if err != nil {
 		return nil, err
+	}
+	canonical := strings.Split(piMemberToolNames+",search_history,read_history", ",")
+	if len(toolNames) == 0 {
+		return nil, errPiMemberToolConfiguration
+	}
+	for i, name := range toolNames {
+		if !slices.Contains(canonical, name) || slices.Contains(toolNames[:i], name) {
+			return nil, errPiMemberToolConfiguration
+		}
+	}
+	names := make([]string, 0, len(toolNames))
+	for _, name := range canonical {
+		if slices.Contains(toolNames, name) {
+			names = append(names, name)
+		}
 	}
 	if !filepath.IsAbs(extensionPath) || strings.ContainsRune(extensionPath, 0) ||
 		!filepath.IsAbs(configPath) || strings.ContainsRune(configPath, 0) {
@@ -56,7 +80,7 @@ func NewPiMemberToolExecutor(selected Provider, extensionPath, configPath string
 		return nil, errPiMemberToolConfiguration
 	}
 	e := baseline.(piExecutor)
-	e.memberTools = &piMemberToolOptions{extensionPath: extensionPath, configPath: configPath}
+	e.memberTools = &piMemberToolOptions{extensionPath: extensionPath, configPath: configPath, toolNames: names}
 	return e, nil
 }
 

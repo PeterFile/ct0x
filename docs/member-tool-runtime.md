@@ -23,7 +23,7 @@ func (*MemberToolRuntime) Wrap(MemberToolRunBinding, MemberToolExecutorFactory) 
 - 构造函数复制策略；`Tools()` 始终返回绑定同一个 Store 的同一个 registry，供后续私有 HTTP 组合复用。不能另建 registry 接收这份 token。
 - `ConfigRoot` 必须已存在、绝对路径、末级非符号链接且权限严格为 `0700`；记录并复查目录身份及解析路径。祖先必须可信、稳定。
 - `Endpoint` 仅允许 `http://127.0.0.1:<port>/api/v1/member-tools` 或 `http://[::1]:<port>/api/v1/member-tools`；端口须为 1..5 位十进制数字，数值 `1..65535`。地址/端口形式与冻结的 [bridge](../extensions/pi-bridge/bridge.mjs) 对齐，不接受其他 loopback、展开/映射 IPv6、六位零填充端口、DNS、userinfo、query、fragment、编码路径、尾斜线或任何 CR/LF；合法输入不做 authority 规范化。
-- `Operations` 为 `list_members/read_channel/send_message/create_member` 的非空、无重复子集。容量默认 `4`，显式范围 `1..200`。
+- `Operations` 为 `list_members/read_channel/send_message/create_member/search_history/read_history` 六个精确名称的非空、无重复子集；拒绝空白/大小写变体和未知项。容量默认 `4`，显式范围 `1..200`。H2 只扩展名称校验，不改 Issue/Revoke/drain、凭证或 unknown/资源语义；Prepare 另限完整四/六 profile，runtime 接受子集不代表 Prepare 会启用。
 - `Wrap` 复制规范化身份，验证 factory；不读 claim、不分配 token、不建文件、不调用 factory。授予 `create_member` 时，ProviderID/Model 必须非空且规范化；创建策略继承这两个可信值及容量，没有外部 cwd。Model 长度沿用原生执行契约的 256 字节上限；不授予创建时可使用空 provider/model。
 - 后续 C 从权威 Prepare 记录建立 binding，并从已验证目录选择可信 adapter factory。模型参数不能选择身份、群组、权限或 adapter。原生 Pi constructor 是独立接入，不是 B 的依赖；factory 是正式组合接口，不是全局测试 hook。
 

@@ -92,6 +92,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	coordinatorConfiguration := platform.NewCoordinatorConfiguration(engine)
 	routes := append(httpapi.LocalUserRoutes(local), httpapi.MessageRoutes(local)...)
 	routes = append(routes, httpapi.TaskRoutes(local)...)
+	routes = append(routes, httpapi.TaskLifecycleRoutes(local)...)
 	routes = append(routes, httpapi.HistoryRoutes(local)...)
 	routes = append(routes, httpapi.CoordinationRoutes(coordinations)...)
 	routes = append(routes, httpapi.CoordinatorConfigurationRoutes(coordinatorConfiguration)...)
