@@ -25,6 +25,10 @@ type MemberToolRuntimeOptions struct {
 	ConfigRoot, Endpoint string
 	Operations           []string
 	MaxGroupMembers      int
+	// Roles are disabled when both fields are zero. Trusted composition must
+	// use the scheduler's same MaxActive and actual private RuntimeDir.
+	RoleMaxActive     int
+	RoleExecutionRoot string
 }
 
 type MemberToolRunBinding struct {
@@ -45,6 +49,7 @@ type MemberToolRuntime struct {
 	endpoint                 string
 	operations               []string
 	maxGroupMembers          int
+	roleFence                *memberToolRoleFence
 }
 
 const memberToolRuntimeVerificationTimeout = 5 * time.Second
@@ -80,8 +85,19 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 	if capacity == 0 {
 		capacity = 4
 	}
+	var roleFence *memberToolRoleFence
+	if options.RoleMaxActive != 0 || options.RoleExecutionRoot != "" {
+		roleFence, err = newMemberToolRoleFence(db, options.RoleMaxActive, options.RoleExecutionRoot)
+		if err != nil {
+			return nil, err
+		}
+		keys, keyErr := scheduler.WorkspaceResourceKeys([]string{root, options.RoleExecutionRoot})
+		if keyErr != nil || keys[0] == keys[1] {
+			return nil, errMemberToolRuntimeConfig
+		}
+	}
 	return &MemberToolRuntime{tools: NewMemberTools(db), configRoot: root, resolvedRoot: resolved,
-		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity}, nil
+		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence}, nil
 }
 
 func memberToolRuntimeEndpoint(endpoint string) bool {
@@ -123,6 +139,7 @@ type memberToolRuntimeRun struct {
 	binding MemberToolRunBinding
 	factory MemberToolExecutorFactory
 	used    atomic.Bool
+	role    *store.CoordinationRoleProvenance
 }
 
 func memberToolRuntimeReceipt(outcome provider.Outcome, reason string) provider.ExecutionReceipt {
@@ -138,6 +155,9 @@ func (e *memberToolRuntimeRun) fresh(turn domain.Turn) bool {
 }
 
 func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.ExecuteRequest, onEvent func(provider.Event) error) provider.ExecutionReceipt {
+	if e.role != nil {
+		return e.executeCoordinationRole(ctx, request, onEvent)
+	}
 	unknown := memberToolRuntimeReceipt(provider.OutcomeUnknown, "成员工具执行归属或历史结果未知，需对账后再处理")
 	if e.used.Swap(true) || !memberToolRuntimeRunID.MatchString(request.RunID) || request.Model != e.binding.Model {
 		return unknown
