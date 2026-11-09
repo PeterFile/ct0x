@@ -72,7 +72,8 @@ func (s *Store) GetCoordinationRoleReceipt(ctx context.Context, groupID, turnID 
 		if decoder.Decode(new(any)) != io.EOF {
 			return out, ErrInvalid
 		}
-		canonical, encodeErr := json.Marshal(receipt)
+		// Require a normalization fixed point, not just canonical JSON; never repair evidence.
+		canonical, encodeErr := json.Marshal(normalizeTurnReceipt(turn, *receipt))
 		if encodeErr != nil || string(canonical) != data {
 			return out, ErrInvalid
 		}
