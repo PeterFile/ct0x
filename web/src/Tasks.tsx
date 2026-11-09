@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection } from "./api";
 import type { Group } from "./api";
+import { CoordinationSettings } from "./CoordinationSettings";
 import { createTask, getTask, getTaskAttempt, getTaskSubmission, listTasks, registerTaskAttempt, reviewTask, submitTask } from "./task-api";
 import type { Task, TaskAttempt, TaskAttemptInput, TaskInput, TaskReview, TaskReviewInput, TaskSubmission, TaskSubmissionInput } from "./task-api";
 import "./tasks.css";
@@ -133,6 +134,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
   return <section className="tasks-scope" aria-label="群组任务">
     <header className="tasks-toolbar"><h2>任务</h2><button type="button" onClick={() => { load(); select(); }}>刷新任务</button></header>
     <p className="tasks-note">“待交付”不代表已开始执行；“已接纳”表示成果被接纳，不等同于 CLI 运行成功。</p>
+    <CoordinationSettings groupId={groupId} active={active} />
     <div className="tasks-layout">
       <div aria-busy={page.pending}>
         {page.pending ? <p role="status">正在载入任务…</p> : null}
