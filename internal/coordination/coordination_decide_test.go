@@ -97,7 +97,9 @@ func TestEngineDecideAlwaysClosed(t *testing.T) {
 }
 
 func TestCoordinationDecideNoProductionCallsites(t *testing.T) {
+	// The session-gated MemberTools role callback is the only exception.
 	root := filepath.Join("..", "..")
+	authorizedCalls := 0
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -112,15 +114,20 @@ func TestCoordinationDecideNoProductionCallsites(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		var authorizedCall *ast.CallExpr
+		if path == filepath.Join(root, "internal", "platform", "member_tool_roles.go") {
+			authorizedCall = sessionGatedMemberDecideCall(file)
+		}
 		ast.Inspect(file, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok {
 				return true
 			}
-			if selector, ok := call.Fun.(*ast.SelectorExpr); ok && selector.Sel.Name == "DecideDispatch" {
-				t.Errorf("forbidden non-test DecideDispatch call: %s", path)
+			if call == authorizedCall {
+				authorizedCalls++
+				return true
 			}
-			if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == "DecideDispatch" {
+			if isDecideDispatchTarget(call.Fun) {
 				t.Errorf("forbidden non-test DecideDispatch call: %s", path)
 			}
 			return true
@@ -130,4 +137,87 @@ func TestCoordinationDecideNoProductionCallsites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if authorizedCalls != 1 {
+		t.Errorf("want exactly one session-gated MemberTools DecideDispatch call, got %d", authorizedCalls)
+	}
+}
+
+func isDecideDispatchTarget(target ast.Expr) bool {
+	for {
+		switch expr := target.(type) {
+		case *ast.ParenExpr:
+			target = expr.X
+		case *ast.IndexExpr:
+			target = expr.X
+		case *ast.IndexListExpr:
+			target = expr.X
+		case *ast.SelectorExpr:
+			return expr.Sel.Name == "DecideDispatch"
+		case *ast.Ident:
+			return expr.Name == "DecideDispatch"
+		default:
+			return false
+		}
+	}
+}
+
+func sessionGatedMemberDecideCall(file *ast.File) *ast.CallExpr {
+	isIdent := func(expr ast.Expr, name string) bool {
+		ident, ok := expr.(*ast.Ident)
+		return ok && ident.Name == name
+	}
+	isSelector := func(expr ast.Expr, receiver, name string) bool {
+		selector, ok := expr.(*ast.SelectorExpr)
+		return ok && isIdent(selector.X, receiver) && selector.Sel.Name == name
+	}
+	for _, decl := range file.Decls {
+		method, ok := decl.(*ast.FuncDecl)
+		if !ok || method.Name.Name != "DecideDispatch" || method.Recv == nil || len(method.Recv.List) != 1 || method.Body == nil {
+			continue
+		}
+		receiver := method.Recv.List[0]
+		pointer, ok := receiver.Type.(*ast.StarExpr)
+		if !ok || !isIdent(pointer.X, "MemberTools") || len(receiver.Names) != 1 || receiver.Names[0].Name != "s" {
+			continue
+		}
+		for _, statement := range method.Body.List {
+			assignment, ok := statement.(*ast.AssignStmt)
+			if !ok || len(assignment.Rhs) != 1 {
+				continue
+			}
+			gate, ok := assignment.Rhs[0].(*ast.CallExpr)
+			if !ok || !isSelector(gate.Fun, "s", "withCoordinationRole") || len(gate.Args) != 5 || gate.Ellipsis.IsValid() {
+				continue
+			}
+			operation, ok := gate.Args[2].(*ast.BasicLit)
+			if !isIdent(gate.Args[0], "ctx") || !isIdent(gate.Args[1], "token") || !ok || operation.Kind != token.STRING || operation.Value != `"decide_dispatch"` ||
+				!isSelector(gate.Args[3], "store", "CoordinationRoleCoordinator") {
+				continue
+			}
+			callback, ok := gate.Args[4].(*ast.FuncLit)
+			if !ok || callback.Type.Params == nil || len(callback.Type.Params.List) != 1 || callback.Body == nil {
+				continue
+			}
+			scope := callback.Type.Params.List[0]
+			if len(scope.Names) != 1 || scope.Names[0].Name != "scope" || !isSelector(scope.Type, "store", "CoordinationToolScope") {
+				continue
+			}
+			for _, statement := range callback.Body.List {
+				assignment, ok := statement.(*ast.AssignStmt)
+				if !ok || len(assignment.Rhs) != 1 {
+					continue
+				}
+				call, ok := assignment.Rhs[0].(*ast.CallExpr)
+				if !ok || len(call.Args) != 4 || call.Ellipsis.IsValid() {
+					continue
+				}
+				target, ok := call.Fun.(*ast.SelectorExpr)
+				if ok && target.Sel.Name == "DecideDispatch" && isSelector(target.X, "s", "db") &&
+					isIdent(call.Args[0], "ctx") && isIdent(call.Args[1], "scope") && isIdent(call.Args[2], "input") && isIdent(call.Args[3], "key") {
+					return call
+				}
+			}
+		}
+	}
+	return nil
 }

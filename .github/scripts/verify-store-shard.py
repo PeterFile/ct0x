@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select, verify and aggregate eighteen Store race shards from Go JSON evidence."""
+"""Select, verify and aggregate fixed Store18/Platform4 race shards from Go JSON evidence."""
 import argparse
 from collections import Counter
 import hashlib
@@ -18,6 +18,10 @@ MAX_NAME_BYTES = 4096
 MAX_PATTERN_BYTES = 60000
 SUMMARY = "store-summary.json"
 ARTIFACT_PREFIX = "store-shard-v1-"
+PROFILES = {
+    "store": (TOTAL, "agentworkspace/internal/store", SUMMARY, ARTIFACT_PREFIX),
+    "platform": (4, "agentworkspace/internal/platform", "platform-summary.json", "platform-shard-v1-"),
+}
 
 
 def check(condition, message):
@@ -119,9 +123,9 @@ def inventory(path, package):
     return compiled
 
 
-def selection(compiled, slot):
+def selection(compiled, slot, total=TOTAL):
     selected = Counter({name: count for name, count in compiled.items()
-                        if int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big") % TOTAL == slot})
+                        if int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big") % total == slot})
     pattern = "^(" + "|".join(re.escape(name) for name in sorted(selected)) + ")$" if selected else "^$"
     check("/" not in pattern and len(pattern.encode("utf-8")) <= MAX_PATTERN_BYTES, "分片表达式过长或包含 slash；拒绝截断")
     return selected, pattern
@@ -183,22 +187,24 @@ def counter(value):
     return Counter(value)
 
 
-def aggregate(directory, expected):
+def aggregate(directory, expected, profile="store"):
+    total, package, summary_name, artifact_prefix = PROFILES[profile]
+    check(expected["package"] == package, "固定配置与预期包身份不符")
     directory = Path(directory)
-    names = {f"{ARTIFACT_PREFIX}{slot}" for slot in range(TOTAL)}
+    names = {f"{artifact_prefix}{slot}" for slot in range(total)}
     check(directory.is_dir() and not directory.is_symlink(), "summary 下载目录不存在或为符号链接")
-    check({path.name for path in directory.iterdir()} == names, "summary 必须恰有槽 0..17 的十八个 artifact 目录")
+    check({path.name for path in directory.iterdir()} == names, f"summary 必须恰有槽 0..{total - 1} 的 {total} 个 artifact 目录")
     common, combined, all_runs, all_passes = None, Counter(), Counter(), Counter()
-    for slot in range(TOTAL):
-        artifact = directory / f"{ARTIFACT_PREFIX}{slot}"
+    for slot in range(total):
+        artifact = directory / f"{artifact_prefix}{slot}"
         check(artifact.is_dir() and not artifact.is_symlink(), "artifact 目录非法")
         files = list(artifact.iterdir())
-        check(len(files) == 1 and files[0].name == SUMMARY and files[0].is_file() and not files[0].is_symlink(),
+        check(len(files) == 1 and files[0].name == summary_name and files[0].is_file() and not files[0].is_symlink(),
               "每槽必须恰有一份 summary，不允许额外文件或符号链接")
         summary = decode(files[0].read_text(encoding="utf-8"))
         fields = {"schema", "slot", "total", *expected, "compiled", "selected", "runs", "passes", "skips"}
         check(isinstance(summary, dict) and set(summary) == fields, "summary 字段不完整或多余")
-        for field, value in (("schema", SCHEMA), ("total", TOTAL), ("slot", slot)):
+        for field, value in (("schema", SCHEMA), ("total", total), ("slot", slot)):
             check(type(summary[field]) is int and summary[field] == value, f"summary {field} 非法或槽重复")
         check(all(summary[field] == value for field, value in expected.items()), "summary 与本次 run/实际 checkout/包身份不符")
         compiled, selected, runs, passes, skips = (counter(summary[field]) for field in ("compiled", "selected", "runs", "passes", "skips"))
@@ -206,14 +212,14 @@ def aggregate(directory, expected):
         if common is None:
             common = compiled
         check(compiled == common, "跨片 compiled 不一致")
-        check(selected == selection(compiled, slot)[0] and runs == selected and passes == selected and not skips,
+        check(selected == selection(compiled, slot, total)[0] and runs == selected and passes == selected and not skips,
               "summary 哈希选片或 run/pass/skip 覆盖不符")
         check(not (combined.keys() & selected.keys()), "分片重复覆盖")
         combined.update(selected)
         all_runs.update(runs)
         all_passes.update(passes)
-    check(combined == all_runs == all_passes == common, "十八片并集与 compiled 多重计数不符")
-    return {"schema": SCHEMA, "total": TOTAL, **expected, "compiled": common, "runs": all_runs, "passes": all_passes, "skips": {}}
+    check(combined == all_runs == all_passes == common, "分片并集与 compiled 多重计数不符")
+    return {"schema": SCHEMA, "total": total, **expected, "compiled": common, "runs": all_runs, "passes": all_passes, "skips": {}}
 
 
 def main():
@@ -221,8 +227,9 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     for command in ("select", "verify", "aggregate"):
         subparser = commands.add_parser(command)
+        subparser.add_argument("--profile", choices=PROFILES, default="store")
         if command != "aggregate":
-            subparser.add_argument("slot", type=int, choices=range(TOTAL))
+            subparser.add_argument("slot", type=int)
         subparser.add_argument("package")
         subparser.add_argument("directory" if command == "aggregate" else "inventory")
         if command == "verify":
@@ -231,18 +238,22 @@ def main():
             for flag in ("run-id", "sha", "tree"):
                 subparser.add_argument("--" + flag, required=True)
     args = parser.parse_args()
+    total, package, _, _ = PROFILES[args.profile]
+    if args.command != "aggregate" and args.slot not in range(total):
+        parser.error(f"argument slot: invalid choice: {args.slot} (choose from {', '.join(map(str, range(total)))})")
+    check(args.package == package, "固定配置与预期包身份不符")
     check(len(args.package) <= 4096 and re.fullmatch(r"[A-Za-z0-9._~+-]+(?:/[A-Za-z0-9._~+-]+)*", args.package)
           and not any(part in (".", "..") for part in args.package.split("/")), "预期包身份非法")
     if args.command == "aggregate":
-        result = aggregate(args.directory, identity(args))
+        result = aggregate(args.directory, identity(args), args.profile)
     else:
         compiled = inventory(args.inventory, args.package)
-        selected, pattern = selection(compiled, args.slot)
+        selected, pattern = selection(compiled, args.slot, total)
         if args.command == "select":
             print(pattern)
             return
         runs, passes = verify(args.events, args.package, selected)
-        result = {"schema": SCHEMA, "slot": args.slot, "total": TOTAL, **identity(args),
+        result = {"schema": SCHEMA, "slot": args.slot, "total": total, **identity(args),
                   "compiled": compiled, "selected": selected, "runs": runs, "passes": passes, "skips": {}}
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
 
