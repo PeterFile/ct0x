@@ -165,18 +165,45 @@ func TestMemberSkillToolHTTPFourSnapshotsRemainReadableAtLimit(t *testing.T) {
 		t.Fatal("fixture needs five real selectable skills")
 	}
 	before := f.state(t)
-	var handles []string
-	for i, item := range page.Items {
+	var snapshots []platform.MemberSkillLoadResult
+	var frozenBodies []string
+	for _, item := range page.Items[:4] {
 		w := f.request(t, "load_skill", memberSkillHTTPJSON(t, map[string]any{"identity": item.Identity}))
-		if i == 4 {
-			assertError(t, w.Code, w.Header(), w.Body.Bytes(), 413, "skill_limit")
-		} else {
-			loaded := decoded[platform.MemberSkillLoadResult](t, w, 200)
-			handles = append(handles, loaded.Handle)
+		snapshots = append(snapshots, decoded[platform.MemberSkillLoadResult](t, w, 200))
+		frozenBodies = append(frozenBodies, w.Body.String())
+	}
+	for _, selection := range []struct {
+		name     string
+		identity platform.MemberSkillIdentity
+	}{{"cached", snapshots[0].Identity}, {"uncached", page.Items[4].Identity}} {
+		for _, hash := range []struct{ name, value string }{
+			{"uppercase", strings.ToUpper(selection.identity.SkillSHA256)},
+			{"nonhex", strings.Repeat("g", 64)},
+		} {
+			t.Run(selection.name+"/"+hash.name, func(t *testing.T) {
+				bad := selection.identity
+				bad.SkillSHA256 = hash.value
+				w := f.request(t, "load_skill", memberSkillHTTPJSON(t, map[string]any{"identity": bad}))
+				assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+				if w.Body.String() != "{\"error\":{\"code\":\"invalid_input\",\"message\":\"请求参数无效\"}}\n" {
+					t.Fatal("full-cache invalid hash leaked a result or raw cause")
+				}
+			})
 		}
 	}
-	for _, handle := range handles {
-		decoded[platform.MemberSkillLoadResult](t, f.request(t, "load_skill", memberSkillHTTPJSON(t, map[string]string{"handle": handle})), 200)
+	w := f.request(t, "load_skill", memberSkillHTTPJSON(t, map[string]any{"identity": page.Items[4].Identity}))
+	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 413, "skill_limit")
+	if w.Body.String() != "{\"error\":{\"code\":\"skill_limit\",\"message\":\"技能读取超过限制\"}}\n" {
+		t.Fatal("fifth snapshot rejection leaked a result or raw cause")
+	}
+	for i, snapshot := range snapshots {
+		for _, selector := range []map[string]any{{"handle": snapshot.Handle}, {"identity": snapshot.Identity}} {
+			w := f.request(t, "load_skill", memberSkillHTTPJSON(t, selector))
+			decoded[platform.MemberSkillLoadResult](t, w, 200)
+			if w.Body.String() != frozenBodies[i] {
+				t.Fatal("full-cache rejection changed a frozen identity, handle or bytes")
+			}
+		}
 	}
 	if f.state(t) != before {
 		t.Fatal("snapshot admission or rejection changed durable state")

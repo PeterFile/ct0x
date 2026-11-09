@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -19,7 +20,8 @@ func TestMemberSkillToolHTTPStrictInputs(t *testing.T) {
 	id := f.identity(t)
 	identity := memberSkillHTTPJSON(t, id)
 	selection := `{"identity":` + identity + `}`
-	loaded := decoded[platform.MemberSkillLoadResult](t, f.request(t, "load_skill", selection), 200)
+	firstResponse := f.request(t, "load_skill", selection)
+	loaded := decoded[platform.MemberSkillLoadResult](t, firstResponse, 200)
 	handle := memberSkillHTTPJSON(t, loaded.Handle)
 	before := f.state(t)
 	selectors := []string{"actor_id", "sender_id", "group_id", "member_id", "conversation_id", "topic_id", "caller", "caller_id", "turn_id", "claim", "capability", "token", "role", "grants", "provider_id", "model", "workspace", "source", "source_path", "root_path", "path", "url", "idempotency_key"}
@@ -125,6 +127,8 @@ func TestMemberSkillToolHTTPStrictInputs(t *testing.T) {
 		func(id *platform.MemberSkillIdentity) { id.Name = "../demo" },
 		func(id *platform.MemberSkillIdentity) { id.Name = strings.Repeat("a", 65) },
 		func(id *platform.MemberSkillIdentity) { id.SkillSHA256 = "not-a-hash" },
+		func(id *platform.MemberSkillIdentity) { id.SkillSHA256 = strings.ToUpper(id.SkillSHA256) },
+		func(id *platform.MemberSkillIdentity) { id.SkillSHA256 = strings.Repeat("g", 64) },
 	} {
 		bad := id
 		mutate(&bad)
@@ -137,12 +141,22 @@ func TestMemberSkillToolHTTPStrictInputs(t *testing.T) {
 		t.Run(fmt.Sprintf("%s/input/%d", input.operation, i), func(t *testing.T) {
 			w := f.request(t, input.operation, input.body)
 			assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+			if w.Body.String() != "{\"error\":{\"code\":\"invalid_input\",\"message\":\"请求参数无效\"}}\n" {
+				t.Fatal("invalid input leaked a result or raw cause")
+			}
 		})
 	}
 	// Retain encoding/json's existing case-insensitive field matching.
 	uppercase := `{"IDENTITY":{"ROOT_ID":` + memberSkillHTTPJSON(t, id.RootID) + `,"NAME":"demo","SKILL_SHA256":` + memberSkillHTTPJSON(t, id.SkillSHA256) + `},"OFFSET":0,"MAX_BYTES":1}`
 	decoded[platform.MemberSkillLoadResult](t, f.request(t, "load_skill", uppercase), 200)
 	decoded[platform.MemberSkillSearchResult](t, f.request(t, "search_skills", `{"QUERY":"","LIMIT":1,"BEFORE":""}`), 200)
+	for _, body := range []string{selection, `{"handle":` + handle + `}`} {
+		w := f.request(t, "load_skill", body)
+		decoded[platform.MemberSkillLoadResult](t, w, 200)
+		if !bytes.Equal(w.Body.Bytes(), firstResponse.Body.Bytes()) {
+			t.Fatal("invalid inputs changed the frozen identity, handle or bytes")
+		}
+	}
 	if f.state(t) != before {
 		t.Fatal("strict input failures or boundary reads changed durable state")
 	}

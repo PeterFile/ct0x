@@ -394,12 +394,22 @@ func TestMemberSkillToolHTTPStaleIdentityBeforeSelection(t *testing.T) {
 	id := f.identity(t)
 	before := f.state(t)
 	// Before any snapshot is cached, the core validates canonical hash spelling.
-	bad := id
-	bad.SkillSHA256 = strings.ToUpper(bad.SkillSHA256)
-	w := f.request(t, "load_skill", memberSkillHTTPJSON(t, map[string]any{"identity": bad}))
-	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+	for _, hash := range []struct{ name, value string }{
+		{"uppercase", strings.ToUpper(id.SkillSHA256)},
+		{"nonhex", strings.Repeat("g", 64)},
+	} {
+		t.Run(hash.name, func(t *testing.T) {
+			bad := id
+			bad.SkillSHA256 = hash.value
+			w := f.request(t, "load_skill", memberSkillHTTPJSON(t, map[string]any{"identity": bad}))
+			assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+			if w.Body.String() != "{\"error\":{\"code\":\"invalid_input\",\"message\":\"请求参数无效\"}}\n" {
+				t.Fatal("invalid hash leaked a result or raw cause")
+			}
+		})
+	}
 	memberSkillHTTPPut(t, f.root, "demo/SKILL.md", memberSkillHTTPRaw("demo", "MIT", "changed before selection"))
-	w = f.request(t, "load_skill", memberSkillHTTPJSON(t, map[string]any{"identity": id}))
+	w := f.request(t, "load_skill", memberSkillHTTPJSON(t, map[string]any{"identity": id}))
 	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 409, "skill_changed")
 	newID := f.identity(t)
 	loaded := decoded[platform.MemberSkillLoadResult](t, f.request(t, "load_skill", memberSkillHTTPJSON(t, map[string]any{"identity": newID})), 200)
