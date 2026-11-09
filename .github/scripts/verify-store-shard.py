@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select, verify and aggregate ten Store race shards from Go JSON evidence."""
+"""Select, verify and aggregate eighteen Store race shards from Go JSON evidence."""
 import argparse
 from collections import Counter
 import hashlib
@@ -11,7 +11,7 @@ import sys
 import unicodedata
 
 
-TOTAL = 10
+TOTAL = 18
 SCHEMA = 1
 MAX_NAME_BYTES = 4096
 # Stay below Linux's per-argument limit, including for multibyte identifiers.
@@ -187,7 +187,7 @@ def aggregate(directory, expected):
     directory = Path(directory)
     names = {f"{ARTIFACT_PREFIX}{slot}" for slot in range(TOTAL)}
     check(directory.is_dir() and not directory.is_symlink(), "summary 下载目录不存在或为符号链接")
-    check({path.name for path in directory.iterdir()} == names, "summary 必须恰有槽 0..9 的十个 artifact 目录")
+    check({path.name for path in directory.iterdir()} == names, "summary 必须恰有槽 0..17 的十八个 artifact 目录")
     common, combined, all_runs, all_passes = None, Counter(), Counter(), Counter()
     for slot in range(TOTAL):
         artifact = directory / f"{ARTIFACT_PREFIX}{slot}"
@@ -212,7 +212,7 @@ def aggregate(directory, expected):
         combined.update(selected)
         all_runs.update(runs)
         all_passes.update(passes)
-    check(combined == all_runs == all_passes == common, "十片并集与 compiled 多重计数不符")
+    check(combined == all_runs == all_passes == common, "十八片并集与 compiled 多重计数不符")
     return {"schema": SCHEMA, "total": TOTAL, **expected, "compiled": common, "runs": all_runs, "passes": all_passes, "skips": {}}
 
 

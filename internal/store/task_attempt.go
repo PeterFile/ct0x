@@ -132,6 +132,28 @@ func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTask
 		if err := coordinationActivateOwnershipInTx(ctx, tx, input, nil); err != nil {
 			return domain.TaskAttempt{}, err
 		}
+		// RowsAffected excludes trigger side effects; read back the actual result.
+		current, err := taskInTx(ctx, tx, input.GroupID, input.TaskID)
+		if err != nil {
+			return domain.TaskAttempt{}, err
+		}
+		saved, actor, err := taskAttemptInTx(ctx, tx, input.GroupID, input.TaskID, attempt.ID)
+		if err != nil {
+			return domain.TaskAttempt{}, err
+		}
+		if current.Status != next.Status || current.Revision != next.Revision || current.ActiveAttemptID != next.ActiveAttemptID ||
+			current.CurrentSubmissionID != next.CurrentSubmissionID || saved != attempt || actor != input.ActorID {
+			return domain.TaskAttempt{}, ErrConflict
+		}
+	}
+	if input.IdempotencyKey != "" {
+		persisted, present, err := lookupMutation(ctx, tx, scope, payload)
+		if err != nil {
+			return domain.TaskAttempt{}, err
+		}
+		if !present || persisted != attempt.ID {
+			return domain.TaskAttempt{}, ErrConflict
+		}
 	}
 	return attempt, nil
 }
