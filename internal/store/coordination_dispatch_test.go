@@ -205,7 +205,7 @@ func TestRequestDispatchOriginalReceiptPrecedesCurrentEligibility(t *testing.T) 
 			}
 			switch change {
 			case "active-attempt", "submitted", "accepted", "rejected":
-				attempt, err := f.s.ActivateTaskAttempt(ctx, taskAttemptInput(f.task))
+				attempt, err := dispatchHistoricalAttempt(t, f.s, taskAttemptInput(f.task))
 				if err != nil {
 					t.Fatal(err)
 				}

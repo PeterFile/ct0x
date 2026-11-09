@@ -56,7 +56,8 @@ func messageSequenceV7Fixture(t *testing.T) (*Store, string, func(*Store)) {
 	task := createTestTask(t, s, g.ID)
 	activate := taskAttemptInput(task)
 	activate.IdempotencyKey = "legacy-attempt"
-	attempt, err := s.ActivateTaskAttempt(ctx, activate)
+	// Historical v7 construction; keep the later public keyed replay unchanged.
+	attempt, err := dispatchHistoricalAttempt(t, s, activate)
 	if err != nil {
 		t.Fatal(err)
 	}

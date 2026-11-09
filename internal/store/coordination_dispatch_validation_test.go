@@ -356,6 +356,10 @@ func TestRequestDispatchBothAssigneesAndUnacceptedDependencies(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			// Prove the legacy dependency gate before any N3 reservation can mask it.
+			if _, err := f.s.ActivateTaskAttempt(ctx, taskAttemptInput(task)); !errors.Is(err, ErrConflict) {
+				t.Fatalf("unreserved task bypassed the existing dependency gate: %v", err)
+			}
 			before := messageSequenceSnapshot(t, f.s)
 			got, err := api.RequestDispatch(ctx, f.groupID, task.ID, 1, 1, "依赖未验收也可先安排", "dependency")
 			if assignee == "coordinator" || assignee == "disallowed" || assignee == "left" || assignee == "task-disagrees" || assignee == "mandate-disallowed" {
@@ -367,7 +371,7 @@ func TestRequestDispatchBothAssigneesAndUnacceptedDependencies(t *testing.T) {
 				}
 				requestDispatchOnlyRows(t, before, messageSequenceSnapshot(t, f.s))
 				if _, err := f.s.ActivateTaskAttempt(ctx, taskAttemptInput(task)); !errors.Is(err, ErrConflict) {
-					t.Fatalf("dispatch bypassed existing dependency execution gate: %v", err)
+					t.Fatalf("reserved task bypassed the shared ownership gate: %v", err)
 				}
 			}
 		})
