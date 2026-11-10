@@ -3,6 +3,7 @@ package platform
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -63,6 +64,12 @@ func (p *Preparer) revalidateWorkspaces() error {
 }
 
 func (p *Preparer) workspace(member domain.Member, conversation domain.Conversation) (string, string, error) {
+	return p.resolvePreparationWorkspace(member, conversation, true)
+}
+
+// Only Prepare may create a private scope. Inspect validates existing targets;
+// absence under a revalidated trusted root is not a future write/claim promise.
+func (p *Preparer) resolvePreparationWorkspace(member domain.Member, conversation domain.Conversation, createPrivate bool) (string, string, error) {
 	if member.Workspace != "" {
 		index, granted := p.grants[preparationRecipient{member.GroupID, member.ID}]
 		if !granted || !filepath.IsAbs(member.Workspace) {
@@ -83,11 +90,24 @@ func (p *Preparer) workspace(member domain.Member, conversation domain.Conversat
 	// never any ID or model-selected path component, enters the private path.
 	identity, _ := json.Marshal([]string{member.GroupID, member.ID, conversation.ID})
 	path := filepath.Join(p.privateRoot, fmt.Sprintf("scope-%x", sha256.Sum256(identity)))
-	if err := os.Mkdir(path, 0700); err != nil && !os.IsExist(err) {
-		return "", "", errPrepareWorkspace
-	}
-	if !privatePreparationDirectory(path) {
-		return "", "", errPrepareWorkspace
+	if createPrivate {
+		if err := os.Mkdir(path, 0700); err != nil && !os.IsExist(err) {
+			return "", "", errPrepareWorkspace
+		}
+		if !privatePreparationDirectory(path) {
+			return "", "", errPrepareWorkspace
+		}
+	} else {
+		info, err := os.Lstat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return "", "", nil
+		}
+		if err != nil {
+			return "", "", &preparationFailure{category: errPrepareWorkspace, cause: err}
+		}
+		if info.Mode() != os.ModeDir|0700 {
+			return "", "", errPrepareWorkspace
+		}
 	}
 	keys, err := scheduler.WorkspaceResourceKeys([]string{path})
 	if err != nil {
