@@ -76,6 +76,13 @@ func roleExecutorPreparationError(ctx context.Context, state store.CoordinationR
 	return preparationFailureWithCause(ctx, errPrepareRead, err)
 }
 
+func roleWorkspacePreparationError(state store.CoordinationRoleState, err error) error {
+	if errors.Is(err, scheduler.ErrNotReady) {
+		return rolePreparationBlocked(state, "workspace_not_ready", nil)
+	}
+	return err
+}
+
 func validatePreparationRole(state store.CoordinationRoleState, group domain.Group, member domain.Member,
 	conversation domain.Conversation, trigger domain.Message, delivery domain.Delivery) error {
 	p := state.Provenance
@@ -145,8 +152,8 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 		len(member.Model) > 256 || !memberToolRuntimeText(member.Model) {
 		return empty, rolePreparationBlocked(state, "unsupported_provider", nil)
 	}
-	// Reject known unsupported paths before construction. If the factory's own
-	// stat later fails, classify that captured error, not a subsequent path state.
+	// Keep the explicit preflight and provider validation stats separate. If
+	// validation's own stat fails, classify its captured error, not a later path.
 	info, err := os.Stat(selected.Path)
 	if errors.Is(err, os.ErrNotExist) || err == nil && (!info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0) {
 		return empty, rolePreparationBlocked(state, "unsupported_provider", nil)
@@ -154,7 +161,7 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 	if err != nil {
 		return empty, preparationFailureWithCause(ctx, errPrepareRead, err)
 	}
-	if _, err := provider.NewExecutor(selected, p.executionTimeout); err != nil {
+	if err := provider.ValidateExecutor(selected, p.executionTimeout); err != nil {
 		return empty, roleExecutorPreparationError(ctx, state, err)
 	}
 	if err := r.CheckCoordinationRoleCapacity(ctx); err != nil {
@@ -205,10 +212,7 @@ func (p *Preparer) prepareCoordinationRole(ctx context.Context, state store.Coor
 	}
 	cwd, key, err := p.workspace(member, conversation)
 	if err != nil {
-		if errors.Is(err, scheduler.ErrNotReady) {
-			return empty, rolePreparationBlocked(state, "workspace_not_ready", nil)
-		}
-		return empty, err
+		return empty, roleWorkspacePreparationError(state, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return empty, preparationReadError(ctx, err)

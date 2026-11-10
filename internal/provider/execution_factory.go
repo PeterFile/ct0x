@@ -24,23 +24,33 @@ func (e *executorStatFailure) Unwrap() []error {
 // discovery capability flags do not authorize or upgrade this baseline.
 // A zero timeout uses the adapter's ten-minute default; negatives are invalid.
 func NewExecutor(selected Provider, timeout time.Duration) (Executor, error) {
-	if strings.TrimSpace(selected.ID) == "" || selected.Installation != Installed || timeout < 0 ||
-		!filepath.IsAbs(selected.Path) || strings.ContainsRune(selected.Path, 0) {
-		return nil, errExecutorConfiguration
-	}
-	if (selected.Name != Pi || selected.Version != "1.4.0") &&
-		(selected.Name != Codex || selected.Version != "0.162.1" && selected.Version != "0.166.0") {
-		return nil, errExecutorConfiguration
-	}
-	info, err := os.Stat(selected.Path)
-	if err != nil {
-		return nil, &executorStatFailure{cause: err}
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
-		return nil, errExecutorConfiguration
+	if err := ValidateExecutor(selected, timeout); err != nil {
+		return nil, err
 	}
 	if selected.Name == Pi {
 		return NewPiExecutor(selected.Path, timeout)
 	}
 	return NewCodexExecutor(selected.Path, timeout)
+}
+
+// ValidateExecutor performs the same metadata and path checks as NewExecutor,
+// without constructing an executor, probing a CLI or changing credentials.
+// It observes the current path only; construction must revalidate later.
+func ValidateExecutor(selected Provider, timeout time.Duration) error {
+	if strings.TrimSpace(selected.ID) == "" || selected.Installation != Installed || timeout < 0 ||
+		!filepath.IsAbs(selected.Path) || strings.ContainsRune(selected.Path, 0) {
+		return errExecutorConfiguration
+	}
+	if (selected.Name != Pi || selected.Version != "1.4.0") &&
+		(selected.Name != Codex || selected.Version != "0.162.1" && selected.Version != "0.166.0") {
+		return errExecutorConfiguration
+	}
+	info, err := os.Stat(selected.Path)
+	if err != nil {
+		return &executorStatFailure{cause: err}
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+		return errExecutorConfiguration
+	}
+	return nil
 }
