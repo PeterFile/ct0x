@@ -228,5 +228,5 @@ func (p *Preparer) prepareCoordinationRole(ctx context.Context, state store.Coor
 		return empty, preparationFailureWithCause(ctx, errPrepareBinding, err)
 	}
 	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{key},
-		Request: provider.ExecuteRequest{CWD: cwd, Prompt: string(packet), Model: member.Model}}, nil
+		Request: provider.ExecuteRequest{CWD: cwd, Prompt: string(packet), Model: member.Model, Thinking: p.roleThinking}}, nil
 }

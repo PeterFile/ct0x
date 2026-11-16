@@ -37,6 +37,7 @@ type PrepareOptions struct {
 	MaxContextBytes        int           // Zero defaults to 16 KiB; maximum is 1 MiB.
 	RoleHistoryLimit       int           // Zero defaults to 50; explicit range is 1..200.
 	RoleMaxContextBytes    int           // Zero defaults to 256 KiB; maximum is 1 MiB.
+	RoleThinking           string        // Trusted role-only Pi thinking level; empty preserves CLI defaults.
 	ExecutionTimeout       time.Duration // Zero uses the provider default.
 }
 
@@ -55,6 +56,7 @@ type Preparer struct {
 	maxContextBytes        int
 	roleHistoryLimit       int
 	roleMaxContextBytes    int
+	roleThinking           string
 	executionTimeout       time.Duration
 	memberTools            *MemberToolRuntime
 	piMemberToolsExtension string
@@ -77,10 +79,16 @@ func NewPreparer(s *store.Store, opts PrepareOptions) (*Preparer, error) {
 		opts.RoleHistoryLimit < 0 || opts.RoleHistoryLimit > 200 || opts.RoleMaxContextBytes < 0 || opts.RoleMaxContextBytes > 1<<20 {
 		return nil, errPrepareConfig
 	}
+	switch opts.RoleThinking {
+	case "", "off", "minimal", "low", "medium", "high", "xhigh", "max":
+	default:
+		return nil, errPrepareConfig
+	}
 	p := &Preparer{store: s, providers: make(map[string]provider.Provider),
 		grants: make(map[preparationRecipient]int), historyLimit: opts.HistoryLimit,
 		maxContextBytes: opts.MaxContextBytes, executionTimeout: opts.ExecutionTimeout,
-		roleHistoryLimit: opts.RoleHistoryLimit, roleMaxContextBytes: opts.RoleMaxContextBytes}
+		roleHistoryLimit: opts.RoleHistoryLimit, roleMaxContextBytes: opts.RoleMaxContextBytes,
+		roleThinking: opts.RoleThinking}
 	if p.historyLimit == 0 {
 		p.historyLimit = 50
 	}
