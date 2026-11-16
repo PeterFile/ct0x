@@ -242,14 +242,16 @@ func TestIntentPassPersistentFailurePrefixDoesNotStarve51(t *testing.T) {
 	 WHEN EXISTS(SELECT 1 FROM intent_bad_prefix WHERE id=NEW.request_id)
 	 BEGIN SELECT RAISE(ABORT,'persistent intent fault'); END`)
 	p := intentCore(t, f.s, at)
-	err = p.run(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err = p.observe(ctx)
 	if err == nil || strings.Count(err.Error(), "persistent intent fault") != 49 {
 		t.Fatalf("first pass must expose exactly 49 real rolled-back failures: %v", err)
 	}
 	if p.dispatchAfter == nil || p.dispatchAfter.RequestID != page.Items[48].RequestID {
 		t.Fatalf("failed prefix did not advance original cursor: %+v", p.dispatchAfter)
 	}
-	err = p.run(context.Background())
+	err = p.observe(ctx)
 	if err == nil || strings.Count(err.Error(), "persistent intent fault") != 1 {
 		t.Fatalf("resuming pass rescanned failed prefix or hid item 50: %v", err)
 	}
