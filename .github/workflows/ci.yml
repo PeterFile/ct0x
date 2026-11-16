@@ -135,27 +135,38 @@ jobs:
           package=$(go list ./internal/platform)
           python3 .github/scripts/verify-store-shard.py aggregate --profile platform "$package" "$RUNNER_TEMP/platform-shards" \
             --run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"
+      - name: Ordinary test coordination package
+        run: go test -count=1 ./internal/coordination
+      - name: Race test coordination package
+        run: go test -count=1 -race ./internal/coordination
       - name: Race test all other packages
         run: |
           set -euo pipefail
           store=$(go list ./internal/store)
           platform=$(go list ./internal/platform)
-          [[ -n "$store" && "$store" != *$'\n'* && -n "$platform" && "$platform" != *$'\n'* && "$store" != "$platform" ]] || exit 1
+          coordination=$(go list ./internal/coordination)
+          [[ -n "$store" && "$store" != *$'\n'* &&
+             -n "$platform" && "$platform" != *$'\n'* &&
+             -n "$coordination" && "$coordination" != *$'\n'* &&
+             "$store" != "$platform" && "$store" != "$coordination" && "$platform" != "$coordination" ]] || exit 1
           all=$(go list ./...)
           rest=()
           store_count=0
           platform_count=0
+          coordination_count=0
           while IFS= read -r package; do
             [[ -n "$package" ]] || exit 1
             if [[ "$package" == "$store" ]]; then
               store_count=$((store_count + 1))
             elif [[ "$package" == "$platform" ]]; then
               platform_count=$((platform_count + 1))
+            elif [[ "$package" == "$coordination" ]]; then
+              coordination_count=$((coordination_count + 1))
             else
               rest+=("$package")
             fi
           done <<< "$all"
-          [[ "$store_count" -eq 1 && "$platform_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
+          [[ "$store_count" -eq 1 && "$platform_count" -eq 1 && "$coordination_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
           go test -race "${rest[@]}"
       - run: go vet ./...
       - name: Record benchmark metrics

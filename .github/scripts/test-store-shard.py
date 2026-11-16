@@ -23,6 +23,7 @@ SLOTS = {"TestCoordination": 11, "TestAlpha": 1, "TestBeta": 17, "TestGamma": 2,
          "TestVector77": 6, "TestVector5": 8, "TestSeven": 9, "TestVector2": 10,
          "TestFifteen": 13, "TestFive": 14}
 PLATFORM_PACKAGE = "agentworkspace/internal/platform"
+COORDINATION_PACKAGE = "agentworkspace/internal/coordination"
 # Fixed SHA-256 first-eight-byte big-endian mod-4 vectors.
 PLATFORM_SLOTS = {"TestCoordination": 3, "TestAlpha": 3, "TestBeta": 3, "TestGamma": 0,
                   "Test新入口": 2, "Example": 1, "FuzzBytes": 0}
@@ -615,8 +616,17 @@ class WorkflowTests(unittest.TestCase):
                     self.assertEqual(result.returncode == 0, store_state == platform_state == "success")
         positions = [job.index(text) for text in ["Check Store and Platform shards", "actions/checkout@v7", "actions/download-artifact@v7",
                                                  "Verify Store shard coverage", "Verify Platform shard coverage",
+                                                 "Ordinary test coordination package", "Race test coordination package",
                                                  "Race test all other packages", "go vet ./...", "Record benchmark metrics"]]
         self.assertEqual(positions, sorted(positions))
+        coordination_steps = [("Ordinary test coordination package", "go test -count=1 ./internal/coordination"),
+                              ("Race test coordination package", "go test -count=1 -race ./internal/coordination")]
+        for name, command in coordination_steps:
+            steps = re.findall(rf"^      - name: {re.escape(name)}\n        run: ([^\n]+)$", job, re.M)
+            self.assertEqual(steps, [command])
+        commands = re.findall(r"^[ \t]+(?:run: )?(go test[^\n]*)$", job, re.M)
+        self.assertEqual([command for command in commands if "./internal/coordination" in command.split()],
+                         [command for _, command in coordination_steps])
         self.assertIn('--run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"', job)
         self.assertIn('package=$(go list ./internal/store)', job)
 
@@ -673,6 +683,7 @@ class WorkflowTests(unittest.TestCase):
             case "$2" in
               ./internal/store) printf '%s\\n' "$STUB_STORE" ;;
               ./internal/platform) printf '%s\\n' "$STUB_PLATFORM" ;;
+              ./internal/coordination) printf '%s\\n' "$STUB_COORDINATION" ;;
               ./...) printf '%s\\n' "$STUB_ALL" ;;
               *) return 90 ;;
             esac
@@ -684,25 +695,40 @@ class WorkflowTests(unittest.TestCase):
         }
         readonly -f go
         '''
-        remainder = ["agentworkspace/other", PACKAGE + "extra", PLATFORM_PACKAGE + "/child"]
-        valid = "\n".join([PACKAGE, *remainder, PLATFORM_PACKAGE])
-        cases = [("valid", PACKAGE, PLATFORM_PACKAGE, valid, True),
-                 ("empty-store", "", PLATFORM_PACKAGE, valid, False),
-                 ("empty-platform", PACKAGE, "", valid, False),
-                 ("multiline-store", PACKAGE + "\nother", PLATFORM_PACKAGE, valid, False),
-                 ("multiline-platform", PACKAGE, PLATFORM_PACKAGE + "\nother", valid, False),
-                 ("equal", PACKAGE, PACKAGE, valid, False),
-                 ("missing-store", PACKAGE, PLATFORM_PACKAGE, PLATFORM_PACKAGE + "\nother", False),
-                 ("missing-platform", PACKAGE, PLATFORM_PACKAGE, PACKAGE + "\nother", False),
-                 ("duplicate-store", PACKAGE, PLATFORM_PACKAGE, valid + "\n" + PACKAGE, False),
-                 ("duplicate-platform", PACKAGE, PLATFORM_PACKAGE, valid + "\n" + PLATFORM_PACKAGE, False),
-                 ("empty-remainder", PACKAGE, PLATFORM_PACKAGE, PACKAGE + "\n" + PLATFORM_PACKAGE, False),
-                 ("blank-remainder", PACKAGE, PLATFORM_PACKAGE, PACKAGE + "\n\n" + PLATFORM_PACKAGE, False)]
-        for label, store, platform, all_packages, accepted in cases:
+        remainder = ["agentworkspace/other", PACKAGE + "extra", PLATFORM_PACKAGE + "/child",
+                     COORDINATION_PACKAGE + "/child", COORDINATION_PACKAGE + "extra"]
+        valid = "\n".join([PACKAGE, *remainder, PLATFORM_PACKAGE, COORDINATION_PACKAGE])
+        cases = [("valid", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE, valid, True),
+                 ("empty-store", "", PLATFORM_PACKAGE, COORDINATION_PACKAGE, valid, False),
+                 ("empty-platform", PACKAGE, "", COORDINATION_PACKAGE, valid, False),
+                 ("multiline-store", PACKAGE + "\nother", PLATFORM_PACKAGE, COORDINATION_PACKAGE, valid, False),
+                 ("multiline-platform", PACKAGE, PLATFORM_PACKAGE + "\nother", COORDINATION_PACKAGE, valid, False),
+                 ("equal", PACKAGE, PACKAGE, COORDINATION_PACKAGE, valid, False),
+                 ("missing-store", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
+                  "\n".join([PLATFORM_PACKAGE, COORDINATION_PACKAGE, "other"]), False),
+                 ("missing-platform", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
+                  "\n".join([PACKAGE, COORDINATION_PACKAGE, "other"]), False),
+                 ("duplicate-store", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE, valid + "\n" + PACKAGE, False),
+                 ("duplicate-platform", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE, valid + "\n" + PLATFORM_PACKAGE, False),
+                 ("empty-remainder", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE, PACKAGE + "\n" + PLATFORM_PACKAGE, False),
+                 ("blank-remainder", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
+                  PACKAGE + "\n\n" + PLATFORM_PACKAGE + "\n" + COORDINATION_PACKAGE, False),
+                 ("empty-coordination", PACKAGE, PLATFORM_PACKAGE, "", valid, False),
+                 ("multiline-coordination", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE + "\nother", valid, False),
+                 ("coordination-equals-store", PACKAGE, PLATFORM_PACKAGE, PACKAGE, valid, False),
+                 ("coordination-equals-platform", PACKAGE, PLATFORM_PACKAGE, PLATFORM_PACKAGE, valid, False),
+                 ("missing-coordination", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
+                  "\n".join([PACKAGE, *remainder, PLATFORM_PACKAGE]), False),
+                 ("duplicate-coordination", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
+                  valid + "\n" + COORDINATION_PACKAGE, False),
+                 ("coordination-empty-remainder", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
+                  "\n".join([PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE]), False)]
+        for label, store, platform, coordination, all_packages, accepted in cases:
             with self.subTest(case=label):
                 result = subprocess.run(["/bin/bash", "-c", stub + script],
                                         env={**os.environ, "PATH": "", "STUB_STORE": store, "STUB_PLATFORM": platform,
-                                             "STUB_ALL": all_packages}, text=True, capture_output=True, timeout=5)
+                                             "STUB_COORDINATION": coordination, "STUB_ALL": all_packages},
+                                        text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), ["race:" + package for package in remainder] if accepted else [])
 

@@ -40,6 +40,16 @@ func (p *intentPass) run(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Share one cancellable SQL budget across the whole pass, not each item.
+	// Driver Commit/Rollback may outlive it; expiry is not transaction evidence.
+	ctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	return p.observe(ctx)
+}
+
+// observe keeps the sweep's quantity/cursor rules independent of its caller's
+// context budget. Production run always supplies the single short-lived child.
+func (p *intentPass) observe(ctx context.Context) error {
 	if p.cutoff.IsZero() || p.dispatchExhausted && p.assignmentExhausted {
 		p.cutoff = p.now()
 		p.dispatchAfter, p.assignmentAfter = nil, nil
@@ -76,7 +86,7 @@ func (p *intentPass) run(ctx context.Context) error {
 		}
 	}
 	// At most one error tree per charged observation, plus cancellation.
-	return errors.Join(failures...)
+	return errors.Join(append(failures, ctx.Err())...)
 }
 
 func (p *intentPass) dispatch(ctx context.Context) (error, bool) {

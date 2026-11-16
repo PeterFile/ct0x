@@ -25,6 +25,8 @@ type Options struct {
 	MaxActive    int
 	PollInterval time.Duration
 	RuntimeDir   string
+	// IntentPass synchronously observes intents once per scheduling cycle using the run context.
+	IntentPass func(context.Context)
 	// Recovered declares singleton ownership and successful explicit startup recovery.
 	Recovered bool
 }
