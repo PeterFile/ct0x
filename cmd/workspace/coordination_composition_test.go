@@ -432,7 +432,7 @@ func TestCoordinationCompositionSchedulerRoleReceipts(t *testing.T) {
 	for _, thinking := range []string{"", "max"} {
 		t.Run("thinking="+thinking, func(t *testing.T) {
 			f := newCoordinationCompositionFixture(t, "normal", thinking)
-			base, stop := startRun(t, f.args(t, thinking)...)
+			base, stop, _, _ := startCoordinationComposition(t, 10*time.Second, f.args(t, thinking)...)
 			// The configured coordinator also receives an ordinary delivery; its
 			// member identity must not turn that capability into a role grant.
 			if _, err := f.db.CreateMessage(context.Background(), store.MessageRequest{GroupID: f.group.ID, ActorID: "user", TopicID: "ordinary", Content: "普通协调成员投递", RecipientIDs: []string{f.lead.ID}}, []string{f.lead.ID}); err != nil {
@@ -573,7 +573,7 @@ func TestCoordinationCompositionUnknownCancelAndShutdownHoldClaims(t *testing.T)
 	for _, mode := range []string{"unknown", "turn-cancel", "shutdown"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newCoordinationCompositionFixture(t, mode, "max")
-			base, stop := startRun(t, f.args(t, "max")...)
+			base, stop, _, _ := startCoordinationComposition(t, 10*time.Second, f.args(t, "max")...)
 			f.dispatchHTTP(t, base)
 			coordinator := f.report(t, "coordinator")
 			assignment := f.workerQueuedAtCapacity(t, base, coordinator)
@@ -653,6 +653,65 @@ func (w *coordinationCompositionOutput) text() string {
 	return w.body.String()
 }
 
+func startCoordinationComposition(t *testing.T, wait time.Duration, args ...string) (string, func() error, *coordinationCompositionOutput, <-chan struct{}) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	output := &coordinationCompositionOutput{lines: make(chan string, 1)}
+	done := make(chan struct{})
+	var result error
+	go func() {
+		result = runWithSearch(ctx, args, output, provider.Search{})
+		close(done)
+	}()
+	stop := func() error {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(wait):
+			t.Errorf("composition failed to drain within %s; complete output so far:\n%s", wait, output.text())
+			// A failed deadline must not release Store owners before the join.
+			<-done
+		}
+		return result
+	}
+	t.Cleanup(func() {
+		defer func() { t.Logf("complete composition output:\n%s", output.text()) }()
+		if err := stop(); err != nil {
+			t.Error(err)
+		}
+	})
+	select {
+	case line := <-output.lines:
+		if !chinese(line) || !strings.Contains(line, "群组与成员") || !strings.Contains(line, "其他功能尚未启用") || !strings.Contains(line, "CLI 目录") || !strings.Contains(line, "仅存内存") {
+			t.Fatalf("startup must describe the group/member boundary: %s", line)
+		}
+		parsed, err := parseConfig(args, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		executionStatus := "执行已禁用，投递仅排队"
+		if parsed.enableExecution {
+			executionStatus = "全新单轮执行已启用，最大并发 1"
+		}
+		for _, want := range []string{"消息持久化", "历史与详情", "排队投递记录", executionStatus, "不支持恢复", "平台工具", "不是主机读取沙箱", "祖先必须可信"} {
+			if !strings.Contains(line, want) {
+				t.Fatalf("startup must state execution boundaries: missing %q: %s", want, line)
+			}
+		}
+		for _, field := range strings.Fields(line) {
+			if strings.HasPrefix(field, "http://") {
+				return field, stop, output, done
+			}
+		}
+		t.Fatalf("startup did not report actual URL: %s", line)
+	case <-done:
+		t.Fatalf("composition exited before startup: %v", result)
+	case <-time.After(wait):
+		t.Fatal("composition did not announce startup")
+	}
+	return "", stop, output, done
+}
+
 func TestCoordinationCompositionReporterAndOrdinaryProgress(t *testing.T) {
 	f := newCoordinationCompositionFixture(t, "normal", "max")
 	requests := []domain.DispatchRequest{f.request(t), f.request(t)}
@@ -665,42 +724,7 @@ func TestCoordinationCompositionReporterAndOrdinaryProgress(t *testing.T) {
 		}
 	}
 	f.ordinary(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	output := &coordinationCompositionOutput{lines: make(chan string, 1)}
-	done := make(chan struct{})
-	var result error
-	args := f.args(t, "max")
-	go func() {
-		result = runWithSearch(ctx, args, output, provider.Search{})
-		close(done)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-done:
-			if result != nil {
-				t.Error(result)
-			}
-		case <-time.After(30 * time.Second):
-			t.Error("reporter composition failed to drain")
-		}
-	})
-	var base string
-	select {
-	case line := <-output.lines:
-		for _, field := range strings.Fields(line) {
-			if strings.HasPrefix(field, "http://") {
-				base = field
-			}
-		}
-	case <-done:
-		t.Fatalf("reporter composition exited before startup: %v", result)
-	case <-time.After(30 * time.Second):
-		t.Fatal("reporter composition did not announce startup")
-	}
-	if base == "" {
-		t.Fatal("reporter output has no actual startup listener")
-	}
+	base, stop, output, done := startCoordinationComposition(t, 30*time.Second, f.args(t, "max")...)
 	// Budget exhaustion may split these causes across callbacks. Require actual
 	// observable causes and eventual work, not a fixed number of cycles/candidates.
 	f.await(t, "observable materialization causes", func() bool {
@@ -717,17 +741,11 @@ func TestCoordinationCompositionReporterAndOrdinaryProgress(t *testing.T) {
 	coordinationCompositionHTTP(t, "GET", base+"/healthz", nil, "", 200, nil)
 	select {
 	case <-done:
-		t.Fatalf("nonfatal intent-pass errors stopped ordinary execution/HTTP: %v", result)
+		t.Fatalf("nonfatal intent-pass errors stopped ordinary execution/HTTP: %v", stop())
 	default:
 	}
-	cancel()
-	select {
-	case <-done:
-		if result != nil {
-			t.Fatal(result)
-		}
-	case <-time.After(30 * time.Second):
-		t.Fatal("reporter composition failed to drain after cancellation")
+	if err := stop(); err != nil {
+		t.Fatal(err)
 	}
 	for _, request := range requests {
 		view, err := f.db.GetDispatchRequest(context.Background(), f.group.ID, request.ID)
