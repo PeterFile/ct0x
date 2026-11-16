@@ -73,6 +73,15 @@ func Run(parent context.Context, s *store.Store, options Options, prepare Prepar
 		if failure = r.pollCancellation(); failure != nil {
 			break
 		}
+		if ctx.Err() != nil {
+			break
+		}
+		if options.IntentPass != nil {
+			options.IntentPass(ctx)
+		}
+		if ctx.Err() != nil {
+			break
+		}
 		if failure = r.schedule(); failure != nil || ctx.Err() != nil {
 			break
 		}
