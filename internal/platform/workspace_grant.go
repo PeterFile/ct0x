@@ -69,30 +69,14 @@ func (p *Preparer) validateDurableWorkspaceRoots(grants []store.WorkspaceGrantRe
 	}
 	keys, err := scheduler.WorkspaceResourceKeys(roots)
 	if err != nil {
-		// A stale receipt must not hide a conflict between still-current roots
-		// and trusted configuration. Recheck the strictly smaller valid subset
-		// before classifying staleness; neither case authorizes an external run.
-		currentGrants := make([]store.WorkspaceGrantReceipt, 0, len(grants))
-		for _, grant := range grants {
-			current, err := scheduler.WorkspaceResourceKeys([]string{grant.Root})
-			if err == nil && current[0] == grant.ResourceKey {
-				currentGrants = append(currentGrants, grant)
-			}
-		}
-		if len(currentGrants) < len(grants) {
-			if _, err := p.validateDurableWorkspaceRoots(currentGrants, ""); err != nil {
-				return nil, err
-			}
-			return nil, scheduler.ErrNotReady
-		}
-		return nil, errPrepareWorkspace
+		return nil, p.staleDurableWorkspaceRootsError(grants)
 	}
 	if !slices.Equal(keys[:len(p.roots)], p.rootKeys) {
 		return nil, errPrepareWorkspace
 	}
 	for i, grant := range grants {
 		if keys[len(p.roots)+i] != grant.ResourceKey {
-			return nil, scheduler.ErrNotReady
+			return nil, p.staleDurableWorkspaceRootsError(grants)
 		}
 	}
 	for _, key := range keys[len(p.roots):] {
@@ -113,6 +97,26 @@ func (p *Preparer) validateDurableWorkspaceRoots(grants []store.WorkspaceGrantRe
 		}
 	}
 	return keys, nil
+}
+
+// A stale receipt must not hide a conflict between still-current roots and
+// trusted configuration. Audit the strictly smaller current subset on collection
+// errors and identity mismatches before classifying staleness.
+func (p *Preparer) staleDurableWorkspaceRootsError(grants []store.WorkspaceGrantReceipt) error {
+	currentGrants := make([]store.WorkspaceGrantReceipt, 0, len(grants))
+	for _, grant := range grants {
+		current, err := scheduler.WorkspaceResourceKeys([]string{grant.Root})
+		if err == nil && current[0] == grant.ResourceKey {
+			currentGrants = append(currentGrants, grant)
+		}
+	}
+	if len(currentGrants) < len(grants) {
+		if _, err := p.validateDurableWorkspaceRoots(currentGrants, ""); err != nil {
+			return err
+		}
+		return scheduler.ErrNotReady
+	}
+	return errPrepareWorkspace
 }
 
 // A stale claimed directory may have moved inside a private scope. Historical

@@ -233,6 +233,59 @@ func TestWorkspaceGrantStaleReceiptMustNotMaskTrustedOverlap(t *testing.T) {
 	}
 }
 
+// Review-only overlay: physical directory fixtures only; no store or DB access.
+func TestDelta2ReplacedReceiptMustNotMaskPrivateRootConflict(t *testing.T) {
+	for _, kind := range []string{"private-root-alias", "private-data-descendant"} {
+		t.Run(kind, func(t *testing.T) {
+			data := t.TempDir()
+			private := filepath.Join(data, "private")
+			if err := os.Mkdir(private, 0700); err != nil {
+				t.Fatal(err)
+			}
+			valid := private
+			opts := PrepareOptions{PrivateWorkspaceRoot: private}
+			if kind == "private-data-descendant" {
+				valid = filepath.Join(data, "runtime")
+				if err := os.Mkdir(valid, 0700); err != nil {
+					t.Fatal(err)
+				}
+				opts.PrivateDataRoot = data
+			}
+			other := filepath.Join(t.TempDir(), "external")
+			if err := os.Mkdir(other, 0700); err != nil {
+				t.Fatal(err)
+			}
+			key := func(path string) string {
+				keys, err := scheduler.WorkspaceResourceKeys([]string{path})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return keys[0]
+			}
+			grant := func(path string) store.WorkspaceGrantReceipt {
+				return store.WorkspaceGrantReceipt{Root: path, ResolvedRoot: path, ResourceKey: key(path), Scope: "read_only", NodeID: "local", AuthorizedBy: "user"}
+			}
+			grants := []store.WorkspaceGrantReceipt{grant(valid), grant(other)}
+			p, err := NewPreparer(&store.Store{}, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := p.validateDurableWorkspaceRoots(grants, ""); !errors.Is(err, errPrepareWorkspace) {
+				t.Fatalf("expected genuine private-root conflict before replacement: %v", err)
+			}
+			if err := os.Rename(other, other+"-old"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(other, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := p.validateDurableWorkspaceRoots(grants, ""); !errors.Is(err, errPrepareWorkspace) {
+				t.Fatalf("unrelated replacement hid unchanged private-root conflict: %v", err)
+			}
+		})
+	}
+}
+
 func TestWorkspaceGrantStaleClaimReadFailureIsNotReadiness(t *testing.T) {
 	ctx := context.Background()
 	f := newPrepareFixture(t)
