@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { ApiError } from "./api";
+import { TaskExecution } from "./TaskExecution";
 import type { Task } from "./task-api";
 import { getDispatchRequest, getDispatchTask, getTaskCoordination, isDispatchRequestDefinitiveRejection, requestDispatch } from "./dispatch-request-api";
 import type { DispatchRequest, DispatchRequestInput, DispatchState, DispatchView, TaskCoordinationView } from "./dispatch-request-api";
@@ -15,7 +16,7 @@ const errorText = (error: unknown) => error instanceof ApiError ? error.message 
 const versions = (revision: number, generation: number) => `任务版本 ${revision} / 授权代次 ${generation}`;
 const statusText: Record<DispatchState["status"], string> = {
   pending: "已登记，等待协调", enqueued: "已进入协调员投递队列", held: "协调请求暂停",
-  assigned: "已记录分配，具体执行尚未由本页核实", declined: "协调员已拒绝本次分派，不能自动重派",
+  assigned: "已记录分配，执行状态请读取下方执行回执", declined: "协调员已拒绝本次分派，不能自动重派",
 };
 const heldText: Readonly<Record<string, string>> = {
   task_stale: "任务已变化", authority_stale: "授权已变化", binding_stale: "协调员绑定已变化", policy_stale: "分派策略已变化",
@@ -234,10 +235,12 @@ export function TaskDispatch({ groupId, taskId, active }: { groupId: string; tas
             {view.state.last_error_code ? <p>协调检查错误：{view.state.last_error_code}</p> : null}
             {view.state.delivery ? <dl><dt>协调员投递回执</dt><dd className="tasks-meta">{view.state.delivery.delivery_id}</dd>
               <dt>协调消息</dt><dd className="tasks-meta">{view.state.delivery.message_id}</dd></dl> : null}
-            <p className="tasks-note">投递回执不表示 CLI 已接收、执行成员已运行或成果已接纳；本页不提供决定或分配详情。</p>
+            <p className="tasks-note">投递或分配不表示 CLI 已接收、执行成员已运行或成果已接纳；执行证据请显式刷新下方执行回执，提交与用户验收仍独立。</p>
           </> : null}
           <button type="button" disabled={!enabled || !lookup.id} onClick={() => setLookup(value => ({ ...value, version: value.version + 1 }))}>刷新请求状态</button>
         </section>
+        {lookup.id ? <TaskExecution groupId={groupId} taskId={taskId} requestId={lookup.id}
+          active={enabled && !reading.pending && !reading.error && view?.request.id === lookup.id} /> : null}
       </div>
     </div>
   </section>;
