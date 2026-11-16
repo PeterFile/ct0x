@@ -3,8 +3,10 @@ package platform
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"agentworkspace/internal/scheduler"
 	"agentworkspace/internal/store"
@@ -56,7 +58,8 @@ func (p *Preparer) validateDurableWorkspaceRoots(grants []store.WorkspaceGrantRe
 	}
 	roots := slices.Clone(p.roots)
 	for _, grant := range grants {
-		if grant.Scope != "read_only" || grant.NodeID != "local" || grant.AuthorizedBy != "user" {
+		if grant.Scope != "read_only" || grant.NodeID != "local" || grant.AuthorizedBy != "user" ||
+			!filepath.IsAbs(grant.Root) || !filepath.IsAbs(grant.ResolvedRoot) || !strings.HasPrefix(grant.ResourceKey, "workspace:") {
 			return nil, errPrepareWorkspace
 		}
 		roots = append(roots, grant.Root)
@@ -65,12 +68,23 @@ func (p *Preparer) validateDurableWorkspaceRoots(grants []store.WorkspaceGrantRe
 		roots = append(roots, candidate)
 	}
 	keys, err := scheduler.WorkspaceResourceKeys(roots)
-	if err != nil || !slices.Equal(keys[:len(p.roots)], p.rootKeys) {
+	if err != nil {
+		// Diagnose external staleness separately from a genuinely overlapping
+		// trusted configuration. Neither case can authorize an external run.
+		for _, grant := range grants {
+			current, err := scheduler.WorkspaceResourceKeys([]string{grant.Root})
+			if err != nil || current[0] != grant.ResourceKey {
+				return nil, scheduler.ErrNotReady
+			}
+		}
+		return nil, errPrepareWorkspace
+	}
+	if !slices.Equal(keys[:len(p.roots)], p.rootKeys) {
 		return nil, errPrepareWorkspace
 	}
 	for i, grant := range grants {
 		if keys[len(p.roots)+i] != grant.ResourceKey {
-			return nil, errPrepareWorkspace
+			return nil, scheduler.ErrNotReady
 		}
 	}
 	for _, key := range keys[len(p.roots):] {
@@ -93,20 +107,89 @@ func (p *Preparer) validateDurableWorkspaceRoots(grants []store.WorkspaceGrantRe
 	return keys, nil
 }
 
-func (p *Preparer) durableWorkspaceKey(ctx context.Context, groupID, memberID string) (string, error) {
-	grant, err := p.store.GetWorkspaceGrant(ctx, groupID, memberID)
-	if errors.Is(err, store.ErrNotFound) {
-		return "", scheduler.ErrNotReady
+// A stale external root must not stop a provably separate private scope. Check
+// both historical and current locations; a missing path is bounded only by its
+// nearest existing ancestor. Broad/shared or unreadable boundaries fail closed.
+func (p *Preparer) validateStalePrivateWorkspaceRoots(grants []store.WorkspaceGrantReceipt) error {
+	roots := slices.Clone(p.roots)
+	for _, grant := range grants {
+		for _, path := range []string{grant.Root, grant.ResolvedRoot} {
+			boundary, err := existingWorkspaceBoundary(path)
+			if err != nil {
+				return err
+			}
+			roots = append(roots, boundary)
+		}
 	}
+	keys, err := scheduler.WorkspaceResourceKeys(roots)
 	if err != nil {
-		return "", preparationReadError(ctx, err)
+		return scheduler.ErrNotReady
 	}
-	grants, err := p.store.WorkspaceGrantSnapshot(ctx)
+	if !slices.Equal(keys[:len(p.roots)], p.rootKeys) {
+		return errPrepareWorkspace
+	}
+	for _, key := range keys[len(p.roots):] {
+		if key == p.rootKeys[0] {
+			return scheduler.ErrNotReady
+		}
+	}
+	if p.privateDataRoot != "" {
+		protected := append([]string{p.privateDataRoot}, roots[len(p.roots):]...)
+		protectedKeys, err := scheduler.WorkspaceResourceKeys(protected)
+		if err != nil {
+			return scheduler.ErrNotReady
+		}
+		if protectedKeys[0] != p.privateDataKey {
+			return errPrepareWorkspace
+		}
+		for _, key := range protectedKeys[1:] {
+			if key == p.privateDataKey {
+				return scheduler.ErrNotReady
+			}
+		}
+	}
+	// Also fence an old durable parent renamed around the configured private
+	// root: its retained identity remains authoritative even at a new path.
+	privatePath, err := filepath.EvalSymlinks(p.privateRoot)
 	if err != nil {
-		return "", preparationReadError(ctx, err)
+		return errPrepareWorkspace
 	}
-	if _, err := p.validateDurableWorkspaceRoots(grants, ""); err != nil {
-		return "", err
+	for path := privatePath; ; path = filepath.Dir(path) {
+		keys, err := scheduler.WorkspaceResourceKeys([]string{path})
+		if err != nil {
+			return errPrepareWorkspace
+		}
+		for _, grant := range grants {
+			if keys[0] == grant.ResourceKey {
+				return scheduler.ErrNotReady
+			}
+		}
+		if filepath.Dir(path) == path {
+			return nil
+		}
 	}
-	return grant.ResourceKey, nil
+}
+
+func existingWorkspaceBoundary(path string) (string, error) {
+	for {
+		if _, err := os.Lstat(path); err == nil {
+			return path, nil // Do not climb past a dangling or retargeted symlink.
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", scheduler.ErrNotReady
+		}
+		parent := filepath.Dir(path)
+		if parent == path {
+			return "", scheduler.ErrNotReady
+		}
+		path = parent
+	}
+}
+
+func durableWorkspaceKey(grants []store.WorkspaceGrantReceipt, groupID, memberID string) (string, error) {
+	for _, grant := range grants {
+		if grant.GroupID == groupID && grant.MemberID == memberID {
+			return grant.ResourceKey, nil
+		}
+	}
+	return "", scheduler.ErrNotReady
 }
