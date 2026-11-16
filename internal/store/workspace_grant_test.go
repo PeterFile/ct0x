@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -140,6 +141,62 @@ func TestWorkspaceGrantTransactionFailuresLeaveNoAuthority(t *testing.T) {
 				t.Fatalf("failed authorization changed member: %+v, %v", after, err)
 			}
 		})
+	}
+}
+
+func TestWorkspaceGrantResourceClaimReadUsesRetainedRows(t *testing.T) {
+	s, _ := openTestStore(t)
+	input := workspaceGrantInput(t, s)
+	key := "workspace:1:2"
+	assertClaim := func(resourceKey string, want bool) {
+		t.Helper()
+		if got, err := s.HasResourceClaim(ctx, resourceKey); err != nil || got != want {
+			t.Fatalf("retained claim %q: got=%v want=%v err=%v", resourceKey, got, want, err)
+		}
+	}
+	assertClaim(key, false)
+	d := queueDelivery(t, s, input.GroupID, input.MemberID, "held")
+	turn, err := s.ClaimTurn(ctx, ClaimTurnInput{GroupID: input.GroupID, DeliveryID: d.ID, ResourceKeys: []string{key}, MaxActive: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := TurnClaim{GroupID: input.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	assertClaim(key, true)
+	if _, err := s.RequestTurnCancel(ctx, input.GroupID, turn.ID); err != nil {
+		t.Fatal(err)
+	}
+	assertClaim(key, true)
+	if _, err := s.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown}); err != nil {
+		t.Fatal(err)
+	}
+	assertClaim(key, true)
+	settled, err := s.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{
+		Started: true, Accepted: true, NativeSessionID: "terminal-fixture", Outcome: provider.OutcomeSucceeded,
+		Terminal: provider.OutcomeSucceeded, OutputComplete: true, DirectChildReaped: true,
+	})
+	if err != nil || settled.State != domain.TurnStateSucceeded {
+		t.Fatalf("terminal evidence did not settle: %+v, %v", settled, err)
+	}
+	assertClaim(key, false)
+	// Fixture-only retained row: even terminal status must not override an
+	// actual resource claim. Only the existing receipt path may release it.
+	if _, err := s.db.Exec("INSERT INTO resource_claims(resource_key,turn_id) VALUES(?,?)", key, turn.ID); err != nil {
+		t.Fatal(err)
+	}
+	before := messageSequenceSnapshot(t, s)
+	assertClaim(key, true)
+	assertClaim("workspace:other", false)
+	messageSequencePreserved(t, s, before)
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if claimed, err := s.HasResourceClaim(cancelled, key); claimed || !errors.Is(err, context.Canceled) {
+		t.Fatalf("claim read hid cancellation: claimed=%v err=%v", claimed, err)
+	}
+	if _, err := s.db.Exec("DROP TABLE resource_claims"); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := s.HasResourceClaim(ctx, key); claimed || err == nil {
+		t.Fatalf("claim read failure became absence: claimed=%v err=%v", claimed, err)
 	}
 }
 

@@ -141,6 +141,15 @@ func (s *Store) GetWorkspaceGrant(ctx context.Context, groupID, memberID string)
 	return receipt, storeError("读取目录授权回执失败", err)
 }
 
+// HasResourceClaim is a trusted preclaim read, not a member tool. The caller
+// selects the key from server authority; every retained row counts, regardless
+// of turn status or receipt. This read neither reserves nor releases a claim.
+func (s *Store) HasResourceClaim(ctx context.Context, resourceKey string) (bool, error) {
+	var claimed bool
+	err := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM resource_claims WHERE resource_key=?)", resourceKey).Scan(&claimed)
+	return claimed, err
+}
+
 // WorkspaceGrantSnapshot is a trusted complete-root read, not a member-visible list.
 func (s *Store) WorkspaceGrantSnapshot(ctx context.Context) ([]WorkspaceGrantReceipt, error) {
 	return workspaceGrantSnapshot(ctx, s.db)

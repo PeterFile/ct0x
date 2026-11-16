@@ -69,13 +69,21 @@ func (p *Preparer) validateDurableWorkspaceRoots(grants []store.WorkspaceGrantRe
 	}
 	keys, err := scheduler.WorkspaceResourceKeys(roots)
 	if err != nil {
-		// Diagnose external staleness separately from a genuinely overlapping
-		// trusted configuration. Neither case can authorize an external run.
+		// A stale receipt must not hide a conflict between still-current roots
+		// and trusted configuration. Recheck the strictly smaller valid subset
+		// before classifying staleness; neither case authorizes an external run.
+		currentGrants := make([]store.WorkspaceGrantReceipt, 0, len(grants))
 		for _, grant := range grants {
 			current, err := scheduler.WorkspaceResourceKeys([]string{grant.Root})
-			if err != nil || current[0] != grant.ResourceKey {
-				return nil, scheduler.ErrNotReady
+			if err == nil && current[0] == grant.ResourceKey {
+				currentGrants = append(currentGrants, grant)
 			}
+		}
+		if len(currentGrants) < len(grants) {
+			if _, err := p.validateDurableWorkspaceRoots(currentGrants, ""); err != nil {
+				return nil, err
+			}
+			return nil, scheduler.ErrNotReady
 		}
 		return nil, errPrepareWorkspace
 	}
@@ -107,12 +115,22 @@ func (p *Preparer) validateDurableWorkspaceRoots(grants []store.WorkspaceGrantRe
 	return keys, nil
 }
 
-// A stale external root must not stop a provably separate private scope. Check
-// both historical and current locations; a missing path is bounded only by its
-// nearest existing ancestor. Broad/shared or unreadable boundaries fail closed.
-func (p *Preparer) validateStalePrivateWorkspaceRoots(grants []store.WorkspaceGrantReceipt) error {
+// A stale claimed directory may have moved inside a private scope. Historical
+// path geometry cannot prove separation from that retained physical identity.
+// Unclaimed stale roots still require conservative, disjoint path boundaries.
+func (p *Preparer) validateStalePrivateWorkspaceRoots(ctx context.Context, grants []store.WorkspaceGrantReceipt) error {
 	roots := slices.Clone(p.roots)
 	for _, grant := range grants {
+		current, err := scheduler.WorkspaceResourceKeys([]string{grant.Root})
+		if err != nil || current[0] != grant.ResourceKey {
+			claimed, err := p.store.HasResourceClaim(ctx, grant.ResourceKey)
+			if err != nil {
+				return preparationReadError(ctx, err)
+			}
+			if claimed {
+				return scheduler.ErrNotReady
+			}
+		}
 		for _, path := range []string{grant.Root, grant.ResolvedRoot} {
 			boundary, err := existingWorkspaceBoundary(path)
 			if err != nil {

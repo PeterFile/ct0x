@@ -93,7 +93,7 @@ func (p *Preparer) resolvePreparationWorkspace(ctx context.Context, member domai
 			if member.Workspace != "" || !errors.Is(err, scheduler.ErrNotReady) {
 				return "", "", err
 			}
-			if err := p.validateStalePrivateWorkspaceRoots(grants); err != nil {
+			if err := p.validateStalePrivateWorkspaceRoots(ctx, grants); err != nil {
 				return "", "", err
 			}
 		}

@@ -405,17 +405,13 @@ func TestWorkspaceGrantMixedRootsRetainClaimsAcrossRestart(t *testing.T) {
 					}
 				}
 				second, err := p.Prepare(ctx, pending)
-				if target == "missing-private" || target == "replaced-private" {
-					if err != nil || second.Executor == nil || len(second.ResourceKeys) != 1 || second.ResourceKeys[0] == receipt.ResourceKey {
-						t.Fatalf("retained external claim blocked a disjoint private scope: %+v, %v", second, err)
-					}
-				} else if target == "trusted-alias" {
+				if target == "trusted-alias" {
 					if err != nil || len(second.ResourceKeys) != 1 || second.ResourceKeys[0] != receipt.ResourceKey {
 						t.Fatalf("mixed aliases changed the lock namespace: %+v, %v", second, err)
 					}
 				} else {
 					want := errPrepareWorkspace
-					if target == "renamed-private-child" {
+					if target == "missing-private" || target == "replaced-private" || target == "renamed-private-child" {
 						want = scheduler.ErrNotReady
 					}
 					if !errors.Is(err, want) || second.Executor != nil || len(second.ResourceKeys) != 0 {
