@@ -501,70 +501,117 @@ func TestIntentPassRealCommitBusyDoesNotDefer(t *testing.T) {
 	}
 }
 
-// Count deadline derivations without replacing any Store operation. The timer is
-// an observation gate after the proposed budget, not a return-latency assertion.
+// Count production deadline derivations without replacing any Store operation.
 type intentBudgetParent struct {
 	context.Context
 	derivations int
-	expired     *time.Timer
 }
 
 func (c *intentBudgetParent) Deadline() (time.Time, bool) {
 	c.derivations++
-	if c.expired == nil {
-		c.expired = time.NewTimer(2 * time.Second)
-	}
 	return c.Context.Deadline()
 }
 
+// The observe-only fixture advances a logical deadline at a candidate boundary.
+// Its real parent deadline still bounds the exercise if that boundary is missed.
+type intentControlledDeadline struct{ context.Context }
+
+func (c intentControlledDeadline) Err() error {
+	if errors.Is(context.Cause(c.Context), context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	return c.Context.Err()
+}
+
 func TestIntentPassSharedRunBudget(t *testing.T) {
-	f := intentConfigured(t)
-	first, second := f.request(t), f.request(t)
-	intentExec(t, f.db, `CREATE TRIGGER intent_budget_fault BEFORE UPDATE ON coordination_dispatch_state
-	 WHEN NEW.request_id='`+first.ID+`'
-	 BEGIN SELECT RAISE(ABORT,'shared budget SQL fault'); END`)
-	before := engineCoordinatorSnapshot(t, f.db)
-	at := time.Now().UTC().Add(time.Second)
-	p := intentCore(t, f.s, at)
-	parent := &intentBudgetParent{Context: context.Background()}
-	defer func() {
-		if parent.expired != nil {
-			parent.expired.Stop()
+	t.Run("controlled-mixed-deadline", func(t *testing.T) {
+		f := intentConfigured(t)
+		first, second := f.request(t), f.request(t)
+		intentExec(t, f.db, `CREATE TRIGGER intent_budget_fault BEFORE UPDATE ON coordination_dispatch_state
+		 WHEN NEW.request_id='`+first.ID+`'
+		 BEGIN SELECT RAISE(ABORT,'shared budget SQL fault'); END`)
+		before := engineCoordinatorSnapshot(t, f.db)
+		at := time.Now().UTC().Add(time.Second)
+		p := intentCore(t, f.s, at)
+		parent, stop := context.WithTimeout(context.Background(), 30*time.Second)
+		defer stop()
+		child, expire := context.WithCancelCause(parent)
+		defer expire(context.Canceled)
+		ctx := intentControlledDeadline{child}
+		calls := 0
+		p.now = func() time.Time {
+			calls++
+			if calls == 3 {
+				// The real SQL failure and rollback precede logical expiry. No
+				// successful transaction is required inside the production 1s.
+				expire(context.DeadlineExceeded)
+			}
+			return at
 		}
-	}()
-	calls := 0
-	p.now = func() time.Time {
-		calls++
-		if parent.derivations != 1 {
-			t.Fatalf("production run must derive one shared deadline before scanning, got %d", parent.derivations)
+		err := p.observe(ctx)
+		var evidence interface {
+			Phase() string
+			RollbackConfirmed() bool
+			CommitOutcomeUnknown() bool
 		}
-		if calls == 3 {
-			// The first candidate has failed and the second due read has completed.
-			// Expire the run budget before starting its Materialize, without a
-			// latency assertion or cancelling the healthy scheduler parent.
-			<-parent.expired.C
+		if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "shared budget SQL fault") ||
+			!errors.As(err, &evidence) || evidence.Phase() != "receipt" || !evidence.RollbackConfirmed() || evidence.CommitOutcomeUnknown() {
+			t.Fatalf("controlled deadline discarded real SQL/rollback evidence: %v", err)
 		}
-		return at
+		if calls != 3 || parent.Err() != nil || p.cutoff != at ||
+			p.dispatchAfter == nil || *p.dispatchAfter != (store.DispatchDueCursor{RequestID: first.ID, NextAttemptAt: first.CreatedAt}) ||
+			!p.assignmentExhausted || p.dispatchExhausted {
+			t.Fatalf("controlled expiry changed parent or original sweep: calls=%d parent=%v state=%+v", calls, parent.Err(), p)
+		}
+		if !reflect.DeepEqual(before, engineCoordinatorSnapshot(t, f.db)) {
+			t.Fatal("expiry started later Materialize/Defer or partially wrote")
+		}
+		t.Logf("controlled deadline after real SQL: first=%s next=%s cursor=%+v cutoff=%s mixed=%v", first.ID, second.ID, p.dispatchAfter, p.cutoff, err)
+	})
+	for _, earlierParent := range []bool{false, true} {
+		name := "production-child"
+		if earlierParent {
+			name = "earlier-parent-deadline"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := intentConfigured(t)
+			f.request(t)
+			before := engineCoordinatorSnapshot(t, f.db)
+			locked, err := f.db.Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer locked.Close()
+			if _, err := locked.ExecContext(context.Background(), "BEGIN EXCLUSIVE"); err != nil {
+				t.Fatal(err)
+			}
+			defer locked.ExecContext(context.Background(), "ROLLBACK")
+			parentCtx := context.Background()
+			if earlierParent {
+				var cancel context.CancelFunc
+				parentCtx, cancel = context.WithDeadline(parentCtx, time.Now().Add(100*time.Millisecond))
+				defer cancel()
+			}
+			parent := &intentBudgetParent{Context: parentCtx}
+			at := time.Now().UTC().Add(time.Second)
+			p := intentCore(t, f.s, at)
+			err = p.run(parent)
+			if !errors.Is(err, context.DeadlineExceeded) || parent.derivations != 1 || p.cutoff != at ||
+				p.dispatchAfter != nil || p.assignmentAfter != nil || p.dispatchExhausted || p.assignmentExhausted || p.next != intentDispatch {
+				t.Fatalf("production run lost its one inherited deadline or advanced a failed query: derivations=%d state=%+v err=%v", parent.derivations, p, err)
+			}
+			if earlierParent && !errors.Is(parent.Err(), context.DeadlineExceeded) || !earlierParent && parent.Err() != nil {
+				t.Fatalf("wrong parent outcome: earlier=%t parent=%v pass=%v", earlierParent, parent.Err(), err)
+			}
+			if _, err := locked.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(before, engineCoordinatorSnapshot(t, f.db)) {
+				t.Fatal("deadline query performed Materialize/Defer or partial writes")
+			}
+			t.Logf("production query deadline: earlier-parent=%t derivations=%d parent=%v cursor=%+v cutoff=%s full-tree=%v", earlierParent, parent.derivations, parent.Err(), p.dispatchAfter, p.cutoff, err)
+		})
 	}
-	err := p.run(parent)
-	var evidence interface {
-		Phase() string
-		RollbackConfirmed() bool
-		CommitOutcomeUnknown() bool
-	}
-	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "shared budget SQL fault") ||
-		!errors.As(err, &evidence) || evidence.Phase() != "receipt" || !evidence.RollbackConfirmed() || evidence.CommitOutcomeUnknown() {
-		t.Fatalf("shared deadline discarded the earlier real SQL/rollback cause: %v", err)
-	}
-	if calls != 3 || parent.derivations != 1 || parent.Err() != nil || p.cutoff != at ||
-		p.dispatchAfter == nil || *p.dispatchAfter != (store.DispatchDueCursor{RequestID: first.ID, NextAttemptAt: first.CreatedAt}) ||
-		!p.assignmentExhausted || p.dispatchExhausted {
-		t.Fatalf("budget refreshed, cancelled parent, or changed original sweep: calls=%d derivations=%d parent=%v state=%+v", calls, parent.derivations, parent.Err(), p)
-	}
-	if !reflect.DeepEqual(before, engineCoordinatorSnapshot(t, f.db)) {
-		t.Fatal("expired budget started another materialization, deferred, or partially wrote")
-	}
-	t.Logf("one production deadline across candidates %s/%s; original cursor=%+v cutoff=%s mixed=%v", first.ID, second.ID, p.dispatchAfter, p.cutoff, err)
 }
 
 func TestIntentPassBudgetCancellationBoundaries(t *testing.T) {

@@ -2,7 +2,9 @@ package coordination
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -10,6 +12,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
@@ -27,9 +30,9 @@ func (f pumpSchedulerExecutor) Execute(ctx context.Context, request provider.Exe
 }
 
 type pumpSchedulerErrors struct {
-	mu       sync.Mutex
-	items    []error
-	overflow int
+	mu    sync.Mutex
+	items []error
+	limit int
 }
 
 func (r *pumpSchedulerErrors) record(err error) {
@@ -39,20 +42,20 @@ func (r *pumpSchedulerErrors) record(err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	// Preserve entire joined trees, including mixed cancellation and SQL errors.
-	if len(r.items) < 8 {
-		r.items = append(r.items, err)
-	} else {
-		r.overflow++
+	limit := r.limit
+	if limit == 0 {
+		limit = 8
 	}
+	if len(r.items) == limit {
+		panic(fmt.Sprintf("bounded intent error recorder overflow: limit=%d next-full-tree=%v", limit, err))
+	}
+	r.items = append(r.items, err)
 }
 
 func (r *pumpSchedulerErrors) checked(t *testing.T) []error {
 	t.Helper()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if r.overflow != 0 {
-		t.Fatalf("bounded error recorder overflowed: %d", r.overflow)
-	}
 	return append([]error(nil), r.items...)
 }
 
@@ -169,6 +172,21 @@ func pumpSchedulerCount(t *testing.T, f intentFixture, query string, args ...any
 	return n
 }
 
+// This test-only seam exposes Stats, never an operable DB or configurable pool.
+// A Store layout/type change must fail rather than inspect any other memory.
+func pumpSchedulerStoreStats(t *testing.T, s *store.Store) func() sql.DBStats {
+	t.Helper()
+	if s == nil {
+		t.Fatal("Store Stats requires a nonnil Store")
+	}
+	field := reflect.ValueOf(s).Elem().FieldByName("db")
+	if !field.IsValid() || field.Type() != reflect.TypeOf((*sql.DB)(nil)) || !field.CanAddr() || field.IsNil() {
+		t.Fatal("Store Stats requires the fixed addressable nonnil db field of exact type *sql.DB")
+	}
+	db := *(**sql.DB)(unsafe.Pointer(field.UnsafeAddr()))
+	return db.Stats
+}
+
 func pumpSchedulerSuccess() provider.ExecutionReceipt {
 	return provider.ExecutionReceipt{Started: true, Accepted: true, Outcome: provider.OutcomeSucceeded,
 		Terminal: provider.OutcomeSucceeded, NativeSessionID: "pump-native", DirectChildReaped: true, OutputComplete: true}
@@ -192,7 +210,7 @@ func pumpSchedulerBeginEvidence(t *testing.T, report pumpSchedulerReport) {
 		t.Fatalf("expected real child-deadline BEGIN/no-transaction evidence, parent=%v elapsed=%s err=%v cause=%v",
 			report.ctx.Err(), report.elapsed, report.err, evidence.Unwrap())
 	}
-	t.Logf("real SQLite contention: phase=%s cause=%v elapsed=%s known-no-transaction=%t commit-unknown=%t parent=%v",
+	t.Logf("materialization BEGIN evidence: phase=%s cause=%v elapsed=%s known-no-transaction=%t commit-unknown=%t parent=%v",
 		evidence.Phase(), evidence.Unwrap(), report.elapsed, evidence.RollbackConfirmed(), evidence.CommitOutcomeUnknown(), report.ctx.Err())
 }
 
@@ -302,19 +320,103 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 	intentExec(t, f.db, `CREATE TRIGGER pump_prefix_fault BEFORE UPDATE ON coordination_dispatch_state
 	 WHEN EXISTS(SELECT 1 FROM pump_bad_prefix WHERE id=NEW.request_id)
 	 BEGIN SELECT RAISE(ABORT,'persistent scheduler intent fault'); END`)
+	items := append(append([]store.DispatchDueCandidate(nil), prefix.Items...), tail.Items...)
+	positions := make(map[string]int, len(items))
+	for i, item := range items {
+		positions[item.RequestID] = i
+	}
+	// Capacity bounds diagnostics, not throughput. A whole-exercise watchdog
+	// also bounds no-progress segments; every allowed tree is retained.
+	maxSegments := 2*len(items) + 8
+	exercise, finish := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer finish()
+	before := engineCoordinatorSnapshot(t, f.db)
 	p := intentCore(t, f.s, at)
-	var recorder pumpSchedulerErrors
-	reports := make(chan pumpSchedulerReport, 8)
-	advance, tailPreparing := make(chan struct{}), make(chan struct{})
+	recorder := pumpSchedulerErrors{limit: maxSegments}
+	type segment struct {
+		pumpSchedulerReport
+		sweep      int
+		before     int
+		boundaries []int
+		empty      int
+		held       *sql.Tx
+		heldIndex  int
+		setupErr   error
+	}
+	reports := make(chan segment, 1)
+	entered := make(chan context.Context, 1)
+	proceed, advance, tailPreparing := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	forced := make(map[int]bool, 7)
 	options := pumpSchedulerOptions(t, f, 1)
+	sweep, segments := 0, 0
 	options.IntentPass = func(ctx context.Context) {
 		select {
 		case <-tailPreparing:
-			<-ctx.Done() // Stop observation only after item 51 can actually launch.
+			<-ctx.Done()
 			return
 		default:
 		}
-		reports <- pumpSchedulerPass(p, &recorder, ctx)
+		entered <- ctx
+		pumpSchedulerWait(ctx, proceed)
+		if ctx.Err() != nil {
+			return
+		}
+		segments++
+		if segments > maxSegments {
+			reports <- segment{setupErr: fmt.Errorf("segment diagnostic bound exceeded: %d", maxSegments)}
+			<-ctx.Done()
+			return
+		}
+		reset := p.cutoff.IsZero() || p.dispatchExhausted && p.assignmentExhausted
+		if reset {
+			sweep++
+		}
+		current := segment{sweep: sweep, before: -1, heldIndex: -1}
+		if !reset && p.dispatchAfter != nil {
+			current.before = positions[p.dispatchAfter.RequestID]
+		}
+		dispatchEmpty, assignmentEmpty := p.dispatchExhausted, p.assignmentExhausted
+		if reset {
+			dispatchEmpty, assignmentEmpty = false, false
+		}
+		cutoff := at.Add(time.Duration(sweep-1) * time.Second)
+		needCutoff := reset
+		p.now = func() time.Time {
+			if needCutoff {
+				needCutoff = false
+				return cutoff
+			}
+			i := 0
+			if p.dispatchAfter != nil {
+				i = positions[p.dispatchAfter.RequestID] + 1
+			}
+			if i >= len(items) {
+				current.setupErr = fmt.Errorf("unexpected candidate boundary after original cursor: %+v", p.dispatchAfter)
+				return cutoff
+			}
+			current.boundaries = append(current.boundaries, i)
+			if sweep == 1 && len(forced) < 7 && !forced[i] && current.held == nil {
+				// The due query is closed. A separate real writer now prevents
+				// this candidate's BEGIN until after the production pass returns.
+				writer, err := f.db.BeginTx(exercise, nil)
+				if err != nil {
+					current.setupErr = err
+					return cutoff
+				}
+				t.Cleanup(func() { writer.Rollback() })
+				current.held, current.heldIndex = writer, i
+				_, current.setupErr = writer.ExecContext(exercise, "UPDATE groups SET name=name WHERE id=?", f.thread.GroupID)
+			}
+			return cutoff
+		}
+		current.pumpSchedulerReport = pumpSchedulerPass(p, &recorder, ctx)
+		if !dispatchEmpty && p.dispatchExhausted {
+			current.empty++
+		}
+		if !assignmentEmpty && p.assignmentExhausted {
+			current.empty++
+		}
+		reports <- current
 		pumpSchedulerWait(ctx, advance)
 	}
 	started := make(chan provider.ExecuteRequest, 2)
@@ -328,85 +430,174 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 		}
 		return pumpSchedulerPrepare(e)(ctx, pending)
 	})
-	var ordinaryCall provider.ExecuteRequest
+	var ordinaryCall, lastCall provider.ExecuteRequest
 	var view domain.DispatchView
 	var expectedErrors []error
-	var perCycle []int
-	seen := make(map[string]int)
-	total := 0
-	for cycle := 0; cycle < 6; cycle++ {
+	lastBySweep := make(map[int]int)
+	cutoffBySweep := make(map[int]time.Time)
+	seenBySweep := make(map[int]map[int]bool)
+	firstSweepSegments, sqlFaults, materializeDeadlines, noAdvanceDeadlines := 0, 0, 0, 0
+	for lastCall.RunID == "" {
+		select {
+		case call := <-started:
+			if ordinaryCall.RunID == "" {
+				ordinaryCall = call
+			} else {
+				lastCall = call
+			}
+			continue
+		case <-entered:
+			if len(expectedErrors) > 0 && ordinaryCall.RunID == "" {
+				ordinaryCall = pumpSchedulerReceive(t, started)
+			}
+			if ordinaryCall.RunID != "" {
+				// Finish ordinary receipt persistence before injecting another
+				// external writer. The scheduler is gated before this pass.
+				poll := time.NewTicker(time.Millisecond)
+				for {
+					turn, err := f.s.GetTurn(exercise, f.thread.GroupID, ordinaryCall.RunID)
+					if err != nil {
+						poll.Stop()
+						t.Fatal(err)
+					}
+					if turn.State == domain.TurnStateSucceeded {
+						break
+					}
+					select {
+					case <-poll.C:
+					case <-exercise.Done():
+						poll.Stop()
+						t.Fatalf("ordinary receipt did not settle: turn=%+v errors=%v", turn, expectedErrors)
+					}
+				}
+				poll.Stop()
+			}
+		case <-exercise.Done():
+			t.Fatalf("prefix exercise watchdog: cursors=%v forced=%v errors=%v", lastBySweep, forced, expectedErrors)
+		case <-r.done:
+			t.Fatalf("scheduler stopped before item51: run=%v cursors=%v errors=%v", r.err, lastBySweep, expectedErrors)
+		}
+		pumpSchedulerAdvance(t, r, proceed)
 		report := pumpSchedulerReceive(t, reports)
-		text := ""
+		if report.setupErr != nil {
+			t.Fatalf("controlled prefix setup failed: %v report=%+v", report.setupErr, report)
+		}
 		if report.err != nil {
 			expectedErrors = append(expectedErrors, report.err)
-			text = report.err.Error()
 		}
-		count := strings.Count(text, "persistent scheduler intent fault")
-		perCycle = append(perCycle, count)
-		total += count
-		if count > 50 || cycle == 0 && count > 49 || total > 50 || report.cutoff != at || report.ctx.Err() != nil ||
-			report.err != nil && count == 0 && !errors.Is(report.err, context.DeadlineExceeded) {
-			t.Fatalf("lost observation cap, cutoff, or error tree: counts=%v report=%+v", perCycle, report)
+		if report.ctx.Err() != nil {
+			t.Fatalf("budget cancelled the parent: %v", report.err)
 		}
-		for _, item := range prefix.Items {
-			seen[item.RequestID] += strings.Count(text, item.RequestID)
-			if seen[item.RequestID] > 1 {
-				t.Fatalf("rescanned failed prefix %s: counts=%v", item.RequestID, perCycle)
+		if _, exists := lastBySweep[report.sweep]; !exists {
+			lastBySweep[report.sweep] = -1
+			cutoffBySweep[report.sweep] = report.cutoff
+			seenBySweep[report.sweep] = make(map[int]bool, len(items))
+		}
+		if report.before != lastBySweep[report.sweep] || report.cutoff != cutoffBySweep[report.sweep] {
+			t.Fatalf("sweep rewound or widened cutoff: last=%v report=%+v", lastBySweep, report)
+		}
+		after := -1
+		if report.after != nil {
+			var exists bool
+			after, exists = positions[report.after.RequestID]
+			if !exists || *report.after != (store.DispatchDueCursor{RequestID: items[after].RequestID, NextAttemptAt: items[after].NextAttemptAt}) {
+				t.Fatalf("not an exact original candidate key: %+v", report.after)
 			}
 		}
-		view, err = f.s.GetDispatchRequest(context.Background(), f.thread.GroupID, tail.Items[0].RequestID)
+		byCandidate := make(map[int]error)
+		queryFailures := 0
+		var observations []error
+		if joined, ok := report.err.(interface{ Unwrap() []error }); ok {
+			observations = joined.Unwrap()
+		} else if report.err != nil {
+			observations = []error{report.err}
+		}
+		for _, observed := range observations {
+			candidate := -1
+			for i, item := range items {
+				if strings.HasPrefix(observed.Error(), fmt.Sprintf("物化分派请求 %s（世代 1）失败：", item.RequestID)) {
+					candidate = i
+					break
+				}
+			}
+			if candidate < 0 {
+				if !errors.Is(observed, context.DeadlineExceeded) {
+					t.Fatalf("unexpected non-candidate error tree: %v", observed)
+				}
+				if strings.HasPrefix(observed.Error(), "扫描到期") {
+					queryFailures++
+				}
+				continue // The full joined tree remains in recorder and stdout.
+			}
+			if byCandidate[candidate] != nil || candidate <= report.before || candidate > after {
+				t.Fatalf("error identity does not match original cursor progression: candidate=%s report=%+v tree=%v", items[candidate].RequestID, report, observed)
+			}
+			byCandidate[candidate] = observed
+			var evidence interface {
+				Phase() string
+				RollbackConfirmed() bool
+				CommitOutcomeUnknown() bool
+				Unwrap() error
+			}
+			if !errors.As(observed, &evidence) {
+				t.Fatalf("candidate error lost transaction evidence: %v", observed)
+			}
+			if strings.Contains(evidence.Unwrap().Error(), "persistent scheduler intent fault") {
+				if evidence.Phase() != "receipt" || evidence.CommitOutcomeUnknown() {
+					t.Fatalf("trigger error has wrong transaction phase: %v", observed)
+				}
+				sqlFaults++
+			} else if errors.Is(observed, context.DeadlineExceeded) {
+				materializeDeadlines++
+			} else {
+				t.Fatalf("unexpected candidate SQL/transaction tree: %v", observed)
+			}
+		}
+		charged := len(report.boundaries) + report.empty + queryFailures
+		if charged > 50 || queryFailures > 1 || after < report.before || after-report.before > len(report.boundaries) || len(report.boundaries)-(after-report.before) > 1 {
+			t.Fatalf("invalid <=50 observation accounting: charged=%d after=%d report=%+v", charged, after, report)
+		}
+		for n, candidate := range report.boundaries {
+			if candidate != report.before+1+n {
+				t.Fatalf("due boundary rescanned or skipped an original key: %+v", report)
+			}
+		}
+		for i := report.before + 1; i <= after; i++ {
+			if seenBySweep[report.sweep][i] || i < len(prefix.Items) && byCandidate[i] == nil {
+				t.Fatalf("advanced prefix key was rescanned or lost its error identity: item=%s report=%+v", items[i].RequestID, report)
+			}
+			seenBySweep[report.sweep][i] = true
+		}
+		if after == report.before && errors.Is(report.err, context.DeadlineExceeded) {
+			noAdvanceDeadlines++
+		}
+		if report.sweep == 1 {
+			firstSweepSegments++
+		}
+		if report.held != nil {
+			// Validate the no-trigger Materialize deadline before releasing the
+			// actual external writer; expiry alone proves no resource release.
+			pumpSchedulerBeginEvidence(t, report.pumpSchedulerReport)
+			if after != report.heldIndex || after != report.before+1 || byCandidate[after] == nil ||
+				strings.Contains(byCandidate[after].Error(), "persistent scheduler intent fault") {
+				t.Fatalf("held BEGIN did not advance exactly its original identity without trigger: %+v", report)
+			}
+			forced[after] = true
+			if err := report.held.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		lastBySweep[report.sweep] = after
+		t.Logf("real segment=%d sweep=%d cutoff=%s before=%d cursor=%+v charged=%d boundaries=%v empty=%d full-tree=%v", segments, report.sweep, report.cutoff, report.before, report.after, charged, report.boundaries, report.empty, report.err)
+		view, err = f.s.GetDispatchRequest(exercise, f.thread.GroupID, tail.Items[0].RequestID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if view.State.Delivery != nil {
-			if report.after == nil || *report.after != (store.DispatchDueCursor{RequestID: tail.Items[0].RequestID, NextAttemptAt: tail.Items[0].NextAttemptAt}) {
-				t.Fatalf("item51 lost original cursor: %+v", report)
-			}
-			break
-		}
-		if total > 0 && (report.after == nil || *report.after != (store.DispatchDueCursor{RequestID: prefix.Items[total-1].RequestID, NextAttemptAt: prefix.Items[total-1].NextAttemptAt})) {
-			t.Fatalf("failed prefix did not advance its exact original key: counts=%v report=%+v", perCycle, report)
-		}
 		pumpSchedulerAdvance(t, r, advance)
-		if cycle == 0 {
-			ordinaryCall = pumpSchedulerReceive(t, started)
-		}
 	}
-	if total != 50 || view.State.Delivery == nil || view.State.Delivery.MaterializedFromGeneration != 1 || view.State.AttemptCount != 0 {
-		t.Fatalf("real scheduler cycles did not persist item51 after exactly 50 failures: counts=%v view=%+v", perCycle, view)
-	}
-	for _, item := range prefix.Items {
-		if seen[item.RequestID] != 1 {
-			t.Fatalf("failed prefix identity missing: %s count=%d", item.RequestID, seen[item.RequestID])
-		}
-	}
-	var lastCall provider.ExecuteRequest
-	for cycle := 0; cycle < 4 && lastCall.RunID == ""; cycle++ {
-		pumpSchedulerAdvance(t, r, advance)
-		select {
-		case lastCall = <-started:
-		case report := <-reports:
-			// A ticker may precede consuming the ordinary completion. Preserve
-			// genuine later-sweep errors separately from the measured first 50.
-			if report.err != nil {
-				expectedErrors = append(expectedErrors, report.err)
-				count := strings.Count(report.err.Error(), "persistent scheduler intent fault")
-				if count > 50 || count == 0 && !errors.Is(report.err, context.DeadlineExceeded) {
-					t.Fatalf("unexpected post-materialization tree: %v", report.err)
-				}
-				t.Logf("post-materialization real cycle: failures=%d cursor=%+v cutoff=%s err=%v", count, report.after, report.cutoff, report.err)
-			}
-			if report.ctx.Err() != nil || report.cutoff != at {
-				t.Fatalf("later real cycle lost the parent/cutoff: %+v", report)
-			}
-		case <-r.done:
-			t.Fatalf("scheduler stopped before tail launch: %v", r.err)
-		case <-time.After(pumpSchedulerWatchdog):
-			t.Fatal("real scheduler did not launch item51 after materializing it")
-		}
-	}
-	if lastCall.RunID == "" {
-		t.Fatal("bounded real scheduler cycles did not launch item51")
+	if firstSweepSegments <= 6 || len(forced) != 7 || materializeDeadlines < 7 || len(seenBySweep[1]) < len(prefix.Items) ||
+		view.State.Status != domain.DispatchStatusEnqueued || view.State.Delivery == nil || view.State.Delivery.MaterializedFromGeneration != 1 || view.State.Generation != 2 || view.State.AttemptCount != 0 {
+		t.Fatalf("missing >6 real segments, distinct no-trigger deadlines, or original-generation item51 receipt: segments=%d forced=%v seen=%v view=%+v", firstSweepSegments, forced, seenBySweep[1], view)
 	}
 	rows := engineLocalRows(t, f.db, `SELECT generation,status,attempt_count,last_error_code FROM coordination_dispatch_state
 	 WHERE request_id IN (SELECT id FROM pump_bad_prefix)`)
@@ -428,7 +619,13 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 		!reflect.DeepEqual(recorded, expectedErrors) || r.err == nil || r.err.Error() != context.Canceled.Error() {
 		t.Fatalf("core errors blocked ordinary/tail scheduling or lost bounded trees: ordinary=%+v last=%+v errors=%v/%v recorded=%v run=%v", ordinaryTurn, lastTurn, err, turnErr, recorded, r.err)
 	}
-	t.Logf("real scheduler cycles: failures=%v total=%d cutoff=%s item51=%s receipt=%s turn=%s", perCycle, total, at, tail.Items[0].RequestID, view.State.Delivery.DeliveryID, lastTurn.ID)
+	after := engineCoordinatorSnapshot(t, f.db)
+	for _, table := range []string{"messages", "message_log", "deliveries"} {
+		if len(after[table]) != len(before[table])+1 {
+			t.Fatalf("prefix failure partially persisted %s: before=%d after=%d", table, len(before[table]), len(after[table]))
+		}
+	}
+	t.Logf("real scheduler progression: first-sweep-segments=%d forced-original-identities=%v SQL-faults=%d materialize-deadlines=%d no-advance-deadlines=%d item51=%s receipt=%s ordinary-turn=%s tail-turn=%s", firstSweepSegments, forced, sqlFaults, materializeDeadlines, noAdvanceDeadlines, tail.Items[0].RequestID, view.State.Delivery.DeliveryID, ordinaryTurn.ID, lastTurn.ID)
 }
 
 func TestIntentPumpSchedulerCancellationPreservesMixedErrorsAndDrain(t *testing.T) {
@@ -599,155 +796,238 @@ func TestIntentPumpSchedulerBeginBusyRecovery(t *testing.T) {
 }
 
 func TestIntentPumpSchedulerBeginBusyActiveReceiptDrain(t *testing.T) {
-	f := intentConfigured(t)
-	ordinary := pumpSchedulerQueue(t, f, f.worker)
-	p, err := newIntentPass(New(f.s))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var recorder pumpSchedulerErrors
-	reports := make(chan pumpSchedulerReport, 8)
-	secondEntered, ready, beginning, advance := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
-	options := pumpSchedulerOptions(t, f, 1)
-	cycle := 0
-	options.IntentPass = func(ctx context.Context) {
-		cycle++
-		if cycle == 2 {
-			close(secondEntered)
-			pumpSchedulerWait(ctx, ready)
+	for _, callbackFirst := range []bool{false, true} {
+		name := "pass-first"
+		if callbackFirst {
+			name = "callback-first-rejected"
 		}
-		reports <- pumpSchedulerPass(p, &recorder, ctx)
-		if cycle >= 2 {
-			pumpSchedulerWait(ctx, advance)
-		}
-	}
-	type callbackObservation struct {
-		err     error
-		started time.Time
-		elapsed time.Duration
-	}
-	started := make(chan provider.ExecuteRequest, 1)
-	executionContexts := make(chan context.Context, 1)
-	emit, receiptGate := make(chan struct{}), make(chan struct{})
-	var emitOnce, receiptOnce sync.Once
-	releaseExecutor := func() { emitOnce.Do(func() { close(emit) }) }
-	releaseReceipt := func() { receiptOnce.Do(func() { close(receiptGate) }) }
-	callbackEntered := make(chan struct{})
-	callbacks := make(chan callbackObservation, 1)
-	e := pumpSchedulerExecutor(func(ctx context.Context, request provider.ExecuteRequest, callback func(provider.Event) error) provider.ExecutionReceipt {
-		executionContexts <- ctx
-		started <- request
-		pumpSchedulerWait(ctx, emit)
-		at := time.Now()
-		close(callbackEntered)
-		err := callback(provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: "pump-native"})
-		callbacks <- callbackObservation{err: err, started: at, elapsed: time.Since(at)}
-		<-receiptGate // Acceptance must be inspected before receipt can backfill it.
-		return provider.ExecutionReceipt{Started: true, Accepted: true, NativeSessionID: "pump-native", Outcome: provider.OutcomeUnknown, DeliveryFailed: err != nil}
-	})
-	r := pumpSchedulerStart(t, f, options, pumpSchedulerPrepare(e))
-	t.Cleanup(releaseExecutor)
-	t.Cleanup(releaseReceipt)
-	initial := pumpSchedulerReceive(t, reports)
-	if initial.err != nil {
-		t.Fatal(initial.err)
-	}
-	call := pumpSchedulerReceive(t, started)
-	executionCtx := pumpSchedulerReceive(t, executionContexts)
-	pumpSchedulerReceive(t, secondEntered)
-	originalTurn, err := f.s.GetTurn(context.Background(), f.thread.GroupID, call.RunID)
-	if err != nil || originalTurn.DeliveryID != ordinary.Deliveries[0].ID || originalTurn.ClaimToken == "" {
-		t.Fatalf("ordinary active claim missing: %+v %v", originalTurn, err)
-	}
-	request := f.request(t) // One due candidate beside the already active executor.
-	before := engineCoordinatorSnapshot(t, f.db)
-	at := time.Now().Add(time.Second)
-	clockCalls := 0
-	p.now = func() time.Time {
-		clockCalls++
-		if clockCalls == 2 {
-			close(beginning)
-		}
-		return at
-	}
-	writer, err := f.db.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer writer.Rollback()
-	if _, err := writer.Exec("UPDATE groups SET name=name WHERE id=?", f.thread.GroupID); err != nil {
-		t.Fatal(err)
-	}
-	close(ready)
-	pumpSchedulerReceive(t, beginning)
-	// Observe a real OS wait, then enter the callback while BEGIN is contended.
-	// This is not a cancellation-latency or hard SQL wall-time assertion.
-	time.Sleep(100 * time.Millisecond)
-	releaseExecutor()
-	pumpSchedulerReceive(t, callbackEntered)
-	blocked := pumpSchedulerReceive(t, reports)
-	pumpSchedulerBeginEvidence(t, blocked)
-	if blocked.ctx != initial.ctx || executionCtx.Err() != nil || blocked.after == nil ||
-		*blocked.after != (store.DispatchDueCursor{RequestID: request.ID, NextAttemptAt: request.CreatedAt}) ||
-		!reflect.DeepEqual(before, engineCoordinatorSnapshot(t, f.db)) {
-		t.Fatalf("contended pass changed run/executor context, original key, or persistent state: %+v executor=%v", blocked, executionCtx.Err())
-	}
-	// Release only after the pass has returned while the writer was still held.
-	if err := writer.Rollback(); err != nil {
-		t.Fatal(err)
-	}
-	observation := pumpSchedulerReceive(t, callbacks)
-	turn, err := f.s.GetTurn(context.Background(), f.thread.GroupID, call.RunID)
-	if observation.err != nil || !observation.started.Before(blocked.returned) || err != nil || turn.State != domain.TurnStateRunning || turn.AcceptedAt == nil ||
-		turn.NativeSessionID != "pump-native" || turn.ClaimToken != originalTurn.ClaimToken ||
-		pumpSchedulerCount(t, f, "SELECT count(*) FROM turns WHERE receipt_json<>''") != 0 ||
-		pumpSchedulerCount(t, f, "SELECT count(*) FROM resource_claims") != 1 || blocked.ctx.Err() != nil || executionCtx.Err() != nil {
-		t.Fatalf("event failed or acceptance was not independently persisted before receipt: callback=%v turn=%+v read=%v parent=%v executor=%v", observation.err, turn, err, blocked.ctx.Err(), executionCtx.Err())
-	}
-	acceptedAt := *turn.AcceptedAt
-	t.Logf("event-before-receipt: turn=%s acceptedAt=%s same-token=true receipt-rows=0 claims=1 parent=%v executor=%v", turn.ID, acceptedAt, blocked.ctx.Err(), executionCtx.Err())
-	view, err := f.s.GetDispatchRequest(context.Background(), request.GroupID, request.ID)
-	if err != nil || view.State.Generation != 1 || view.State.AttemptCount != 0 || view.State.Delivery != nil || view.State.Status != domain.DispatchStatusPending {
-		t.Fatalf("contended BEGIN invented defer or partial materialization: %+v %v", view, err)
-	}
-	releaseReceipt()
-	for recoveryCycle := 0; recoveryCycle < 6; recoveryCycle++ {
-		pumpSchedulerAdvance(t, r, advance)
-		recovered := pumpSchedulerReceive(t, reports)
-		if recovered.err != nil || recovered.ctx != blocked.ctx || recovered.ctx.Err() != nil {
-			t.Fatalf("later real scheduler cycle failed: %+v", recovered)
-		}
-		view, err = f.s.GetDispatchRequest(context.Background(), request.GroupID, request.ID)
-		turn, turnErr := f.s.GetTurn(context.Background(), f.thread.GroupID, call.RunID)
-		if err != nil || turnErr != nil {
-			t.Fatalf("recovery evidence read failed: %v / %v", err, turnErr)
-		}
-		if view.State.Delivery != nil && turn.State == domain.TurnStateUnknown && pumpSchedulerCount(t, f, "SELECT count(*) FROM turns WHERE receipt_json<>''") == 1 {
-			break
-		}
-	}
-	if view.State.Delivery == nil || view.State.Delivery.MaterializedFromGeneration != 1 || view.State.Generation != 2 || view.State.AttemptCount != 0 {
-		t.Fatalf("bounded genuine scheduler cycles did not materialize original generation: %+v", view)
-	}
-	turn, err = f.s.GetTurn(context.Background(), f.thread.GroupID, call.RunID)
-	if blocked.ctx.Err() != nil || err != nil || turn.State != domain.TurnStateUnknown ||
-		pumpSchedulerCount(t, f, "SELECT count(*) FROM turns WHERE receipt_json<>''") != 1 ||
-		pumpSchedulerCount(t, f, "SELECT count(*) FROM resource_claims") != 1 {
-		t.Fatalf("unknown receipt/occupancy did not settle under the healthy parent: parent=%v turn=%+v read=%v", blocked.ctx.Err(), turn, err)
-	}
-	r.cancel()
-	pumpSchedulerReceive(t, r.done)
-	turn, err = f.s.GetTurn(context.Background(), f.thread.GroupID, call.RunID)
-	receipts := pumpSchedulerCount(t, f, "SELECT count(*) FROM turns WHERE receipt_json<>''")
-	claims := pumpSchedulerCount(t, f, "SELECT count(*) FROM resource_claims")
-	recorded := recorder.checked(t)
-	t.Logf("same-Store contention: pass=%s callback-start=%s callback=%s callback-error=%v run=%v turn=%s read=%v receipt-rows=%d resource-claims=%d core-errors=%v original-generation-receipt=%s",
-		blocked.elapsed, observation.started.Format(time.RFC3339Nano), observation.elapsed, observation.err,
-		r.err, turn.ID, err, receipts, claims, recorded, view.State.Delivery.DeliveryID)
-	if observation.err != nil || r.err == nil || r.err.Error() != context.Canceled.Error() || len(recorded) != 1 || recorded[0] != blocked.err {
-		t.Fatalf("event/receipt failure or lost hook error: callback=%v run=%v recorded=%v receipts=%d claims=%d", observation.err, r.err, recorded, receipts, claims)
-	}
-	if err != nil || turn.State != domain.TurnStateUnknown || turn.ClaimToken != originalTurn.ClaimToken || turn.AcceptedAt == nil || !turn.AcceptedAt.Equal(acceptedAt) || receipts != 1 || claims != 1 {
-		t.Fatalf("contention drain erased unknown execution evidence: %+v read=%v receipts=%d claims=%d", turn, err, receipts, claims)
+		t.Run(name, func(t *testing.T) {
+			f := intentConfigured(t)
+			stats := pumpSchedulerStoreStats(t, f.s)
+			ordinary := pumpSchedulerQueue(t, f, f.worker)
+			p, err := newIntentPass(New(f.s))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var recorder pumpSchedulerErrors
+			reports := make(chan pumpSchedulerReport, 8)
+			secondEntered, ready, materialize, advance := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+			beforeMaterialize := make(chan sql.DBStats, 1)
+			passReturned := make(chan struct{})
+			options := pumpSchedulerOptions(t, f, 1)
+			cycle := 0
+			options.IntentPass = func(ctx context.Context) {
+				cycle++
+				if cycle == 2 {
+					close(secondEntered)
+					pumpSchedulerWait(ctx, ready)
+				}
+				report := pumpSchedulerPass(p, &recorder, ctx)
+				if cycle == 2 {
+					close(passReturned)
+				}
+				reports <- report
+				if cycle >= 2 {
+					pumpSchedulerWait(ctx, advance)
+				}
+			}
+			type callbackObservation struct {
+				err     error
+				started time.Time
+				elapsed time.Duration
+			}
+			started := make(chan provider.ExecuteRequest, 1)
+			executionContexts := make(chan context.Context, 1)
+			emit, receiptGate := make(chan struct{}), make(chan struct{})
+			var emitOnce, receiptOnce sync.Once
+			releaseExecutor := func() { emitOnce.Do(func() { close(emit) }) }
+			releaseReceipt := func() { receiptOnce.Do(func() { close(receiptGate) }) }
+			callbacks := make(chan callbackObservation, 1)
+			e := pumpSchedulerExecutor(func(ctx context.Context, request provider.ExecuteRequest, callback func(provider.Event) error) provider.ExecutionReceipt {
+				executionContexts <- ctx
+				started <- request
+				pumpSchedulerWait(ctx, emit)
+				at := time.Now()
+				err := callback(provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: "pump-native"})
+				callbacks <- callbackObservation{err: err, started: at, elapsed: time.Since(at)}
+				<-receiptGate // Acceptance must be inspected before receipt can backfill it.
+				return provider.ExecutionReceipt{Started: true, Accepted: true, NativeSessionID: "pump-native", Outcome: provider.OutcomeUnknown, DeliveryFailed: err != nil}
+			})
+			r := pumpSchedulerStart(t, f, options, pumpSchedulerPrepare(e))
+			t.Cleanup(releaseExecutor)
+			t.Cleanup(releaseReceipt)
+			initial := pumpSchedulerReceive(t, reports)
+			if initial.err != nil {
+				t.Fatal(initial.err)
+			}
+			call := pumpSchedulerReceive(t, started)
+			executionCtx := pumpSchedulerReceive(t, executionContexts)
+			pumpSchedulerReceive(t, secondEntered)
+			originalTurn, err := f.s.GetTurn(context.Background(), f.thread.GroupID, call.RunID)
+			if err != nil || originalTurn.DeliveryID != ordinary.Deliveries[0].ID || originalTurn.ClaimToken == "" {
+				t.Fatalf("ordinary active claim missing: %+v %v", originalTurn, err)
+			}
+			request := f.request(t) // One due candidate beside the already active executor.
+			before := engineCoordinatorSnapshot(t, f.db)
+			at := time.Now().Add(time.Second)
+			clockCalls := 0
+			p.now = func() time.Time {
+				clockCalls++
+				if clockCalls == 2 {
+					// ListDue has returned and closed its rows. No same-Store user
+					// can run here except the deliberately gated executor and pass.
+					beforeMaterialize <- stats()
+					pumpSchedulerWait(initial.ctx, materialize)
+				}
+				return at
+			}
+			writer, err := f.db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer writer.Rollback()
+			if _, err := writer.Exec("UPDATE groups SET name=name WHERE id=?", f.thread.GroupID); err != nil {
+				t.Fatal(err)
+			}
+			close(ready)
+			idle := pumpSchedulerReceive(t, beforeMaterialize)
+			if idle.MaxOpenConnections != 1 || idle.OpenConnections != 1 || idle.InUse != 0 || idle.Idle != 1 {
+				t.Fatalf("due query did not return the single connection before Materialize: %+v", idle)
+			}
+			awaitStats := func(label string, accept func(sql.DBStats) bool) sql.DBStats {
+				t.Helper()
+				poll := time.NewTicker(time.Millisecond)
+				defer poll.Stop()
+				guard := time.NewTimer(pumpSchedulerWatchdog)
+				defer guard.Stop()
+				for {
+					select {
+					case <-passReturned:
+						t.Fatalf("pass returned before physical %s: stats=%+v", label, stats())
+					default:
+					}
+					current := stats()
+					if accept(current) {
+						select {
+						case <-passReturned:
+							t.Fatalf("pass returned during physical %s: stats=%+v", label, current)
+						default:
+							return current
+						}
+					}
+					select {
+					case <-poll.C:
+					case <-guard.C:
+						t.Fatalf("physical %s was not observed: stats=%+v", label, current)
+					case <-r.done:
+						t.Fatalf("scheduler stopped before physical %s: %v", label, r.err)
+					}
+				}
+			}
+			passOwns := func(snapshot sql.DBStats) bool {
+				select {
+				case <-materialize:
+				default:
+					return false
+				}
+				select {
+				case <-emit:
+					return false // Callback was enabled before attribution could be established.
+				case <-passReturned:
+					return false
+				default:
+				}
+				return snapshot.MaxOpenConnections == 1 && snapshot.InUse == 1
+			}
+			if callbackFirst {
+				// The pass is still physically gated before Materialize. An InUse=1
+				// transition can only be the callback, not a pre-call timestamp.
+				releaseExecutor()
+				owner := awaitStats("callback-first ownership", func(s sql.DBStats) bool { return s.InUse == 1 })
+				if passOwns(owner) || owner.WaitCount != idle.WaitCount {
+					t.Fatalf("callback-owned connection was falsely attributed to the gated pass: idle=%+v owner=%+v", idle, owner)
+				}
+				close(materialize)
+				waiting := awaitStats("pass pool wait behind callback", func(s sql.DBStats) bool { return s.InUse == 1 && s.WaitCount > owner.WaitCount })
+				if passOwns(waiting) {
+					t.Fatal("callback-first ordering was accepted by the positive handshake")
+				}
+				t.Logf("negative ordering rejected: candidate=%s idle=%+v callback-owner=%+v pass-wait=%+v", request.ID, idle, owner, waiting)
+			} else {
+				close(materialize)
+				owner := awaitStats("pass-only ownership", func(s sql.DBStats) bool { return s.InUse == 1 })
+				if !passOwns(owner) {
+					t.Fatalf("pass ownership was not attributable before enabling callback: %+v", owner)
+				}
+				releaseExecutor()
+				waiting := awaitStats("callback pool wait behind pass", func(s sql.DBStats) bool { return s.InUse == 1 && s.WaitCount > owner.WaitCount })
+				t.Logf("positive physical handshake: candidate=%s idle=%+v pass-owner=%+v callback-wait=%+v", request.ID, idle, owner, waiting)
+			}
+			blocked := pumpSchedulerReceive(t, reports)
+			pumpSchedulerBeginEvidence(t, blocked)
+			if blocked.ctx != initial.ctx || executionCtx.Err() != nil || blocked.after == nil ||
+				*blocked.after != (store.DispatchDueCursor{RequestID: request.ID, NextAttemptAt: request.CreatedAt}) ||
+				!reflect.DeepEqual(before, engineCoordinatorSnapshot(t, f.db)) {
+				t.Fatalf("contended pass changed run/executor context, original key, or persistent state: %+v executor=%v", blocked, executionCtx.Err())
+			}
+			// Release only after the pass has returned while the writer was still held.
+			if err := writer.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+			observation := pumpSchedulerReceive(t, callbacks)
+			turn, err := f.s.GetTurn(context.Background(), f.thread.GroupID, call.RunID)
+			if observation.err != nil || err != nil || turn.State != domain.TurnStateRunning || turn.AcceptedAt == nil ||
+				turn.NativeSessionID != "pump-native" || turn.ClaimToken != originalTurn.ClaimToken ||
+				pumpSchedulerCount(t, f, "SELECT count(*) FROM turns WHERE receipt_json<>''") != 0 ||
+				pumpSchedulerCount(t, f, "SELECT count(*) FROM resource_claims") != 1 || blocked.ctx.Err() != nil || executionCtx.Err() != nil {
+				t.Fatalf("event failed or acceptance was not independently persisted before receipt: callback=%v turn=%+v read=%v parent=%v executor=%v", observation.err, turn, err, blocked.ctx.Err(), executionCtx.Err())
+			}
+			acceptedAt := *turn.AcceptedAt
+			t.Logf("event-before-receipt: turn=%s acceptedAt=%s same-token=true receipt-rows=0 claims=1 parent=%v executor=%v", turn.ID, acceptedAt, blocked.ctx.Err(), executionCtx.Err())
+			view, err := f.s.GetDispatchRequest(context.Background(), request.GroupID, request.ID)
+			if err != nil || view.State.Generation != 1 || view.State.AttemptCount != 0 || view.State.Delivery != nil || view.State.Status != domain.DispatchStatusPending {
+				t.Fatalf("contended BEGIN invented defer or partial materialization: %+v %v", view, err)
+			}
+			releaseReceipt()
+			for recoveryCycle := 0; recoveryCycle < 6; recoveryCycle++ {
+				pumpSchedulerAdvance(t, r, advance)
+				recovered := pumpSchedulerReceive(t, reports)
+				if recovered.err != nil || recovered.ctx != blocked.ctx || recovered.ctx.Err() != nil {
+					t.Fatalf("later real scheduler cycle failed: %+v", recovered)
+				}
+				view, err = f.s.GetDispatchRequest(context.Background(), request.GroupID, request.ID)
+				turn, turnErr := f.s.GetTurn(context.Background(), f.thread.GroupID, call.RunID)
+				if err != nil || turnErr != nil {
+					t.Fatalf("recovery evidence read failed: %v / %v", err, turnErr)
+				}
+				if view.State.Delivery != nil && turn.State == domain.TurnStateUnknown && pumpSchedulerCount(t, f, "SELECT count(*) FROM turns WHERE receipt_json<>''") == 1 {
+					break
+				}
+			}
+			if view.State.Delivery == nil || view.State.Delivery.MaterializedFromGeneration != 1 || view.State.Generation != 2 || view.State.AttemptCount != 0 {
+				t.Fatalf("bounded genuine scheduler cycles did not materialize original generation: %+v", view)
+			}
+			turn, err = f.s.GetTurn(context.Background(), f.thread.GroupID, call.RunID)
+			if blocked.ctx.Err() != nil || err != nil || turn.State != domain.TurnStateUnknown ||
+				pumpSchedulerCount(t, f, "SELECT count(*) FROM turns WHERE receipt_json<>''") != 1 ||
+				pumpSchedulerCount(t, f, "SELECT count(*) FROM resource_claims") != 1 {
+				t.Fatalf("unknown receipt/occupancy did not settle under the healthy parent: parent=%v turn=%+v read=%v", blocked.ctx.Err(), turn, err)
+			}
+			r.cancel()
+			pumpSchedulerReceive(t, r.done)
+			turn, err = f.s.GetTurn(context.Background(), f.thread.GroupID, call.RunID)
+			receipts := pumpSchedulerCount(t, f, "SELECT count(*) FROM turns WHERE receipt_json<>''")
+			claims := pumpSchedulerCount(t, f, "SELECT count(*) FROM resource_claims")
+			recorded := recorder.checked(t)
+			t.Logf("same-Store contention: pass=%s callback-start=%s callback=%s callback-error=%v run=%v turn=%s read=%v receipt-rows=%d resource-claims=%d core-errors=%v original-generation-receipt=%s",
+				blocked.elapsed, observation.started.Format(time.RFC3339Nano), observation.elapsed, observation.err,
+				r.err, turn.ID, err, receipts, claims, recorded, view.State.Delivery.DeliveryID)
+			if observation.err != nil || r.err == nil || r.err.Error() != context.Canceled.Error() || len(recorded) != 1 || recorded[0] != blocked.err {
+				t.Fatalf("event/receipt failure or lost hook error: callback=%v run=%v recorded=%v receipts=%d claims=%d", observation.err, r.err, recorded, receipts, claims)
+			}
+			if err != nil || turn.State != domain.TurnStateUnknown || turn.ClaimToken != originalTurn.ClaimToken || turn.AcceptedAt == nil || !turn.AcceptedAt.Equal(acceptedAt) || receipts != 1 || claims != 1 {
+				t.Fatalf("contention drain erased unknown execution evidence: %+v read=%v receipts=%d claims=%d", turn, err, receipts, claims)
+			}
+		})
 	}
 }
