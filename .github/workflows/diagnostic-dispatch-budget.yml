@@ -1,0 +1,163 @@
+name: Dispatch budget diagnostic
+
+on:
+  push:
+    branches:
+      - codex/diagnostic-dispatch-budget-ci
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  diagnostic:
+    name: Dispatch budget observations
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Initialize evidence before checkout and setup
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+          import platform
+
+          directory = pathlib.Path(os.environ["RUNNER_TEMP"]) / "dispatch-budget-diagnostic"
+          directory.mkdir(parents=True, exist_ok=True)
+          metadata = {
+              "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              "expected_base_commit": "edf3ae8490d250a2429f4e8e1570f839ab4ccefc",
+              "frozen_test": {
+                  "path": "internal/coordination/dispatch_budget_diagnostic_test.go",
+                  "expected_sha256": "93f2a9bb1b30d41361e491e7008e59dcee284555c93fc68e7e191564de4feafe",
+                  "verification": "not_started",
+              },
+              "scope": (
+                  "Observation/invariant run only. A passing test, including observed deadlines, "
+                  "is not automatic liveness or release acceptance. Each case uses a fresh fixture "
+                  "and a dedicated group on this runner, NOT the original full-package concurrent "
+                  "load, and does not reproduce the complete original environment. OS/toolchain "
+                  "can match recorded descriptors only; ubuntu-latest is moving."
+              ),
+              "cases": ["direct1s", "direct10s", "passAfterOneFault", "passAfterTwoFaults"],
+              "runner": {
+                  "label": "ubuntu-latest",
+                  "os": platform.system(),
+                  "kernel": platform.release(),
+                  "arch": platform.machine(),
+              },
+              "ci": {key: os.environ.get(key) for key in (
+                  "GITHUB_REPOSITORY", "GITHUB_EVENT_NAME", "GITHUB_REF", "GITHUB_SHA",
+                  "GITHUB_WORKFLOW", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT",
+                  "RUNNER_OS", "RUNNER_ARCH", "ImageOS", "ImageVersion",
+              )},
+              "source": {"status": "not_observed"},
+              "toolchain": {key: {"status": "not_started"} for key in ("go-version", "go-env")},
+              "runs": {key: {"status": "not_started"} for key in ("ordinary", "race")},
+              "returncode_semantics": "Direct child returncode; negative values mean signal termination.",
+          }
+          (directory / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+          PY
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Record source and verify frozen diagnostic
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import subprocess
+
+          path = pathlib.Path(os.environ["RUNNER_TEMP"]) / "dispatch-budget-diagnostic" / "metadata.json"
+          metadata = json.loads(path.read_text(encoding="utf-8"))
+          metadata["source"] = {
+              key: subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
+              for key, ref in (("commit", "HEAD"), ("tree", "HEAD^{tree}"))
+          }
+          frozen = metadata["frozen_test"]
+          frozen["verification"] = "started"
+          path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+          frozen["actual_sha256"] = hashlib.sha256(pathlib.Path(frozen["path"]).read_bytes()).hexdigest()
+          frozen["verification"] = "matched" if frozen["actual_sha256"] == frozen["expected_sha256"] else "mismatch"
+          path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+          if frozen["verification"] != "matched":
+              raise SystemExit("Frozen diagnostic hash mismatch; no tests attempted.")
+          if metadata["source"]["commit"] != metadata["ci"]["GITHUB_SHA"]:
+              raise SystemExit("Checked-out commit differs from push SHA; no tests attempted.")
+          PY
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Capture toolchain and run ordinary then race once
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          import pathlib
+          import shlex
+          import subprocess
+
+          directory = pathlib.Path(os.environ["RUNNER_TEMP"]) / "dispatch-budget-diagnostic"
+          path = directory / "metadata.json"
+          metadata = json.loads(path.read_text(encoding="utf-8"))
+
+          def now():
+              return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+          def save():
+              temporary = path.with_suffix(".tmp")
+              temporary.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+              temporary.replace(path)
+
+          def capture(name, record, command, stdout_name):
+              record.update(
+                  command=command, command_text=shlex.join(command),
+                  stdout=stdout_name, stderr=name + ".stderr.txt",
+                  started_at=now(), ended_at=None, returncode=None, status="running",
+              )
+              save()
+              try:
+                  with (directory / stdout_name).open("wb") as out, (directory / record["stderr"]).open("wb") as err:
+                      # No pipes: retain complete raw streams and the direct Go returncode.
+                      result = subprocess.run(command, stdout=out, stderr=err, check=False)
+                  record.update(status="exited", returncode=result.returncode)
+              except OSError as error:
+                  record.update(status="launch_or_capture_error", error=str(error))
+              record["ended_at"] = now()
+              save()
+              print(f"{name}: status={record['status']} returncode={record['returncode']}; output saved to artifact")
+              return record["returncode"]
+
+          for name, command, stdout_name in (
+              ("go-version", ["go", "version"], "go-version.stdout.txt"),
+              ("go-env", ["go", "env", "-json", "GOVERSION", "GOOS", "GOARCH", "GOTOOLCHAIN"], "go-env.stdout.json"),
+          ):
+              if capture(name, metadata["toolchain"][name], command, stdout_name) != 0:
+                  raise SystemExit("Toolchain capture failed; no diagnostic tests attempted.")
+
+          arguments = [
+              "-p", "1", "-count=1", "-vet=off", "-timeout=240s", "-json",
+              "-run", "^TestDispatchBudgetDiagnostic$", "./internal/coordination",
+          ]
+          # An ordinary nonzero returncode must not skip the single race run.
+          ordinary_rc = capture("ordinary", metadata["runs"]["ordinary"], ["go", "test", *arguments], "ordinary.stdout.jsonl")
+          race_rc = capture("race", metadata["runs"]["race"], ["go", "test", "-race", *arguments], "race.stdout.jsonl")
+          raise SystemExit(0 if ordinary_rc == 0 and race_rc == 0 else 1)
+          PY
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dispatch-budget-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: ${{ runner.temp }}/dispatch-budget-diagnostic
+          if-no-files-found: error
+          retention-days: 7
