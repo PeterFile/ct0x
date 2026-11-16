@@ -298,13 +298,14 @@ func TestIntentPumpSchedulerMaterializesEmptyQueueAtCapacity(t *testing.T) {
 	}
 }
 
-// Only raw deadline leaves and nonempty recursive join nodes are approved.
+// This pre-Materialize oracle accepts only the local ctx.Err -> errors.Join
+// shape, not deadline wrappers in general.
 func pumpSchedulerOnlyDeadline(err error) bool {
 	if err == context.DeadlineExceeded {
 		return true
 	}
 	joined, ok := err.(interface{ Unwrap() []error })
-	if !ok {
+	if !ok || reflect.TypeOf(err) != reflect.TypeOf(errors.Join(context.DeadlineExceeded)) {
 		return false
 	}
 	children := joined.Unwrap()
@@ -317,6 +318,17 @@ func pumpSchedulerOnlyDeadline(err error) bool {
 		}
 	}
 	return true
+}
+
+// This unapproved node is only a fixture for the pre-Materialize oracle.
+type pumpSchedulerOracleMulti []error
+
+func (e pumpSchedulerOracleMulti) Error() string {
+	return "unapproved oracle multi-error"
+}
+
+func (e pumpSchedulerOracleMulti) Unwrap() []error {
+	return e
 }
 
 func TestIntentPumpSchedulerPredeadlineOracle(t *testing.T) {
@@ -343,6 +355,10 @@ func TestIntentPumpSchedulerPredeadlineOracle(t *testing.T) {
 		{"transaction-error", intentTestEvidence{cause: deadline, phase: "begin", rollback: true}, false},
 		{"candidate-error", fmt.Errorf("物化分派请求 original（世代 1）失败：%w", deadline), false},
 		{"query-error", fmt.Errorf("扫描到期分派请求失败：%w", deadline), false},
+		{"reviewer-nested-multi-query", errors.Join(errors.Join(deadline, fmt.Errorf("扫描到期分派请求失败：%w / %w", deadline, deadline)), deadline), false},
+		{"nested-multi-wrapper", errors.Join(deadline, fmt.Errorf("unapproved multi wrapper: %w / %w", errors.Join(deadline, deadline), fmt.Errorf("nested multi wrapper: %w / %w", deadline, deadline))), false},
+		{"fake-multi-nil-child", pumpSchedulerOracleMulti{deadline, nil}, false},
+		{"fake-multi-all-deadline", pumpSchedulerOracleMulti{deadline, deadline}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := pumpSchedulerOnlyDeadline(tc.err); got != tc.want {
