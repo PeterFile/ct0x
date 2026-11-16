@@ -86,8 +86,8 @@ func TestWorkspaceGrantAuthorizationReopenPreparation(t *testing.T) {
 		t.Fatal(err)
 	}
 	p = f.preparer(t)
-	if got, err := p.Prepare(ctx, f.pending); !errors.Is(err, errPrepareWorkspace) || got.Executor != nil {
-		t.Fatalf("restart silently trusted a replacement inode: %+v, %v", got, err)
+	if got, err := p.Prepare(ctx, f.pending); !errors.Is(err, scheduler.ErrNotReady) || got.Executor != nil {
+		t.Fatalf("replacement must remain queued without stopping scheduling: %+v, %v", got, err)
 	}
 	replay := authorizeWorkspace(t, p, f.group.ID, f.member.ID, root)
 	if replay != first {
@@ -310,6 +310,237 @@ func TestWorkspaceGrantAliasesKeepUnknownAndCancelFences(t *testing.T) {
 	}
 	defer reopened.Close()
 	claimOther(reopened)
+}
+
+func TestWorkspaceGrantMixedRootsRetainClaimsAcrossRestart(t *testing.T) {
+	for _, outcome := range []string{"unknown", "cancelling"} {
+		for _, target := range []string{"trusted-child", "private-child", "trusted-alias", "missing-private", "replaced-private", "renamed-private-child"} {
+			t.Run(outcome+"/"+target, func(t *testing.T) {
+				ctx := context.Background()
+				f := newPrepareFixture(t)
+				root := filepath.Join(t.TempDir(), "external")
+				if err := os.Mkdir(root, 0700); err != nil {
+					t.Fatal(err)
+				}
+				child := filepath.Join(root, "child")
+				if err := os.Mkdir(child, 0700); err != nil {
+					t.Fatal(err)
+				}
+				p := f.preparer(t)
+				receipt := authorizeWorkspace(t, p, f.group.ID, f.member.ID, root)
+				first, err := p.Prepare(ctx, f.pending)
+				if err != nil {
+					t.Fatal(err)
+				}
+				turn, err := f.s.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group.ID, DeliveryID: f.pending.Delivery.ID, ResourceKeys: first.ResourceKeys, MaxActive: 3})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if outcome == "cancelling" {
+					if _, err := f.s.RequestTurnCancel(ctx, f.group.ID, turn.ID); err != nil {
+						t.Fatal(err)
+					}
+				} else if _, err := f.s.ApplyTurnReceipt(ctx, store.TurnClaim{GroupID: f.group.ID, TurnID: turn.ID, Token: turn.ClaimToken}, provider.ExecutionReceipt{Started: true, Outcome: provider.OutcomeUnknown}); err != nil {
+					t.Fatal(err)
+				}
+				group, err := f.s.CreateGroup(ctx, store.CreateGroupInput{Name: "independent recipient"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				workspace := child
+				if target == "trusted-alias" {
+					workspace = filepath.Join(t.TempDir(), "alias")
+					if err := os.Symlink(root, workspace); err != nil {
+						t.Fatal(err)
+					}
+				} else if target == "private-child" {
+					workspace = ""
+					f.opts.PrivateWorkspaceRoot = child // Legacy options intentionally omit PrivateDataRoot.
+				} else if target == "missing-private" || target == "replaced-private" || target == "renamed-private-child" {
+					workspace = ""
+					moved := filepath.Join(t.TempDir(), "moved")
+					if err := os.Rename(root, moved); err != nil {
+						t.Fatal(err)
+					}
+					if target == "replaced-private" {
+						if err := os.Mkdir(root, 0700); err != nil {
+							t.Fatal(err)
+						}
+					} else if target == "renamed-private-child" {
+						alias := filepath.Join(t.TempDir(), "ancestor-alias")
+						if err := os.Symlink(filepath.Join(moved, "child"), alias); err != nil {
+							t.Fatal(err)
+						}
+						f.opts.PrivateWorkspaceRoot = filepath.Join(alias, "private")
+						if err := os.Mkdir(f.opts.PrivateWorkspaceRoot, 0700); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				member, err := f.s.CreateMember(ctx, store.CreateMemberInput{GroupID: group.ID, Name: "other", Role: "reader", ProviderID: f.member.ProviderID, Model: f.member.Model, Workspace: workspace})
+				if err != nil {
+					t.Fatal(err)
+				}
+				message := f.message(t, group.ID, "", "user", "queued", member.ID)
+				pending := store.PendingDelivery{GroupID: group.ID, Delivery: message.Deliveries[0]}
+				if workspace != "" {
+					f.opts.WorkspaceGrants = []WorkspaceGrant{{GroupID: group.ID, MemberID: member.ID, Root: workspace}}
+				}
+				path := filepath.Join(filepath.Dir(p.privateRoot), "fixture.sqlite")
+				if err := f.s.Close(); err != nil {
+					t.Fatal(err)
+				}
+				f.s, err = store.Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n, err := f.s.RecoverInFlight(ctx); err != nil || n != 1 {
+					t.Fatalf("recovery lost the retained execution: %d, %v", n, err)
+				}
+				p = f.preparer(t)
+				if target == "missing-private" || target == "replaced-private" || target == "renamed-private-child" {
+					waiting := f.message(t, f.group.ID, "next", "user", "stale external remains queued", f.member.ID)
+					if got, err := p.Prepare(ctx, store.PendingDelivery{GroupID: f.group.ID, Delivery: waiting.Deliveries[0]}); !errors.Is(err, scheduler.ErrNotReady) || got.Executor != nil {
+						t.Fatalf("stale claimed root did not remain not-ready: %+v, %v", got, err)
+					}
+				}
+				second, err := p.Prepare(ctx, pending)
+				if target == "missing-private" || target == "replaced-private" {
+					if err != nil || second.Executor == nil || len(second.ResourceKeys) != 1 || second.ResourceKeys[0] == receipt.ResourceKey {
+						t.Fatalf("retained external claim blocked a disjoint private scope: %+v, %v", second, err)
+					}
+				} else if target == "trusted-alias" {
+					if err != nil || len(second.ResourceKeys) != 1 || second.ResourceKeys[0] != receipt.ResourceKey {
+						t.Fatalf("mixed aliases changed the lock namespace: %+v, %v", second, err)
+					}
+				} else {
+					want := errPrepareWorkspace
+					if target == "renamed-private-child" {
+						want = scheduler.ErrNotReady
+					}
+					if !errors.Is(err, want) || second.Executor != nil || len(second.ResourceKeys) != 0 {
+						// Exercise the actual claim path on the vulnerable implementation.
+						_, claimErr := f.s.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: group.ID, DeliveryID: pending.Delivery.ID, ResourceKeys: second.ResourceKeys, MaxActive: 3})
+						t.Fatalf("overlapping mixed authority prepared after restart: prepare=%v claim=%v", err, claimErr)
+					}
+				}
+				if _, err := f.s.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: group.ID, DeliveryID: pending.Delivery.ID, ResourceKeys: []string{receipt.ResourceKey}, MaxActive: 3}); !errors.Is(err, store.ErrTurnBusy) {
+					t.Fatalf("retained resource claim was released: %v", err)
+				}
+				held, err := f.s.GetTurn(ctx, f.group.ID, turn.ID)
+				if err != nil || held.State != domain.TurnStateUnknown || held.ClaimToken == turn.ClaimToken || (held.CancelRequestedAt != nil) != (outcome == "cancelling") {
+					t.Fatalf("restart changed unknown/cancel evidence: %+v, %v", held, err)
+				}
+				stored, err := f.s.GetMessage(ctx, group.ID, message.ID)
+				if err != nil || stored.Deliveries[0].State != domain.DeliveryStateQueued || stored.Deliveries[0].TurnID != "" {
+					t.Fatalf("overlap acquired a second admission: %+v, %v", stored, err)
+				}
+				var turns, claims int
+				if err := f.db.QueryRow("SELECT count(*) FROM turns").Scan(&turns); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.db.QueryRow("SELECT count(*) FROM resource_claims WHERE resource_key=? AND turn_id=?", receipt.ResourceKey, turn.ID).Scan(&claims); err != nil || turns != 1 || claims != 1 {
+					t.Fatalf("overlap changed durable claims: turns=%d claims=%d err=%v", turns, claims, err)
+				}
+			})
+		}
+	}
+}
+
+func TestWorkspaceGrantStaleSnapshotStillFencesEveryExternalRoot(t *testing.T) {
+	for _, mutation := range []string{"missing", "replaced", "private-alias", "dangling-alias", "missing-shared-boundary"} {
+		t.Run(mutation, func(t *testing.T) {
+			ctx := context.Background()
+			f := newPrepareFixture(t)
+			root := filepath.Join(t.TempDir(), "external")
+			if mutation == "missing-shared-boundary" {
+				root = filepath.Join(filepath.Dir(f.opts.PrivateWorkspaceRoot), "external")
+			}
+			if err := os.Mkdir(root, 0700); err != nil {
+				t.Fatal(err)
+			}
+			p := f.preparer(t)
+			authorizeWorkspace(t, p, f.group.ID, f.member.ID, root)
+			other, err := f.s.CreateMember(ctx, store.CreateMemberInput{GroupID: f.group.ID, Name: "healthy external", Role: "reader", ProviderID: f.member.ProviderID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			healthy := t.TempDir()
+			if _, err := p.AuthorizeWorkspaceGrant(ctx, f.group.ID, other.ID, WorkspaceGrantInput{Root: healthy, Scope: "read_only"}, "healthy"); err != nil {
+				t.Fatal(err)
+			}
+			message := f.message(t, f.group.ID, "", "user", "still subject to complete validation", other.ID)
+			pending := store.PendingDelivery{GroupID: f.group.ID, Delivery: message.Deliveries[0]}
+			if err := os.Rename(root, root+"-old"); err != nil {
+				t.Fatal(err)
+			}
+			switch mutation {
+			case "replaced":
+				if err := os.Mkdir(root, 0700); err != nil {
+					t.Fatal(err)
+				}
+			case "private-alias", "dangling-alias":
+				target := f.opts.PrivateWorkspaceRoot
+				if mutation == "dangling-alias" {
+					target = filepath.Join(target, "missing")
+				}
+				if err := os.Symlink(target, root); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Both durable and legacy external preparation must inspect unused receipts.
+			for _, trusted := range []bool{false, true} {
+				if trusted {
+					f.opts.WorkspaceGrants = []WorkspaceGrant{{GroupID: f.group.ID, MemberID: other.ID, Root: healthy}}
+				}
+				if got, err := f.preparer(t).Prepare(ctx, pending); !errors.Is(err, scheduler.ErrNotReady) || got.Executor != nil {
+					t.Fatalf("unused stale receipt was ignored or fatal: trusted=%v prepared=%+v err=%v", trusted, got, err)
+				}
+			}
+			private, err := f.s.CreateMember(ctx, store.CreateMemberInput{GroupID: f.group.ID, Name: "private", Role: "reader", ProviderID: f.member.ProviderID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			message = f.message(t, f.group.ID, "", "user", "private isolation", private.ID)
+			pending = store.PendingDelivery{GroupID: f.group.ID, Delivery: message.Deliveries[0]}
+			got, err := f.preparer(t).Prepare(ctx, pending)
+			if mutation == "private-alias" || mutation == "dangling-alias" || mutation == "missing-shared-boundary" {
+				if !errors.Is(err, scheduler.ErrNotReady) || got.Executor != nil {
+					t.Fatalf("unproven private isolation was admitted: %+v, %v", got, err)
+				}
+			} else if err != nil || got.Executor == nil || filepath.Dir(got.Request.CWD) != f.opts.PrivateWorkspaceRoot {
+				t.Fatalf("disjoint private workspace could not progress: %+v, %v", got, err)
+			}
+			f.assertQueued(t)
+		})
+	}
+}
+
+func TestWorkspaceGrantStalenessDoesNotHideTrustedOrStoreFailures(t *testing.T) {
+	for _, failure := range []string{"trusted-root", "snapshot-read"} {
+		t.Run(failure, func(t *testing.T) {
+			f := newPrepareFixture(t)
+			root := t.TempDir()
+			p := f.preparer(t)
+			authorizeWorkspace(t, p, f.group.ID, f.member.ID, root)
+			f.exec(t, "UPDATE members SET workspace='' WHERE id=?", f.member.ID)
+			if err := os.Remove(root); err != nil {
+				t.Fatal(err)
+			}
+			want := errPrepareRead
+			if failure == "trusted-root" {
+				want = errPrepareWorkspace
+				if err := os.Chmod(f.opts.PrivateWorkspaceRoot, 0750); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				f.exec(t, "DROP TABLE workspace_grants")
+			}
+			if got, err := p.Prepare(context.Background(), f.pending); !errors.Is(err, want) || errors.Is(err, scheduler.ErrNotReady) || got.Executor != nil {
+				t.Fatalf("real failure was masked as staleness: %+v, %v", got, err)
+			}
+		})
+	}
 }
 
 func TestWorkspaceGrantRoleReadinessUsesSameAuthorization(t *testing.T) {

@@ -84,6 +84,20 @@ func (p *Preparer) workspace(ctx context.Context, member domain.Member, conversa
 // Only Prepare may create a private scope. Inspect validates existing targets;
 // absence under a revalidated trusted root is not a future write/claim promise.
 func (p *Preparer) resolvePreparationWorkspace(ctx context.Context, member domain.Member, conversation domain.Conversation, createPrivate bool) (string, string, error) {
+	grants, err := p.store.WorkspaceGrantSnapshot(ctx)
+	if err != nil {
+		return "", "", preparationReadError(ctx, err)
+	}
+	if len(grants) != 0 {
+		if _, err := p.validateDurableWorkspaceRoots(grants, ""); err != nil {
+			if member.Workspace != "" || !errors.Is(err, scheduler.ErrNotReady) {
+				return "", "", err
+			}
+			if err := p.validateStalePrivateWorkspaceRoots(grants); err != nil {
+				return "", "", err
+			}
+		}
+	}
 	if member.Workspace != "" {
 		if !filepath.IsAbs(member.Workspace) {
 			return "", "", scheduler.ErrNotReady
@@ -93,7 +107,7 @@ func (p *Preparer) resolvePreparationWorkspace(ctx context.Context, member domai
 			key = p.rootKeys[index]
 		} else {
 			var err error
-			key, err = p.durableWorkspaceKey(ctx, member.GroupID, member.ID)
+			key, err = durableWorkspaceKey(grants, member.GroupID, member.ID)
 			if err != nil {
 				return "", "", err
 			}
