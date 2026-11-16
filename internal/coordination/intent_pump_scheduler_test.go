@@ -339,6 +339,7 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 		before     int
 		boundaries []int
 		empty      int
+		induced    bool
 		held       *sql.Tx
 		heldIndex  int
 		setupErr   error
@@ -349,6 +350,7 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 	forced := make(map[int]bool, 7)
 	options := pumpSchedulerOptions(t, f, 1)
 	sweep, segments := 0, 0
+	preexpiryGateUsed := false
 	options.IntentPass = func(ctx context.Context) {
 		select {
 		case <-tailPreparing:
@@ -406,6 +408,20 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 				t.Cleanup(func() { writer.Rollback() })
 				current.held, current.heldIndex = writer, i
 				_, current.setupErr = writer.ExecContext(exercise, "UPDATE groups SET name=name WHERE id=?", f.thread.GroupID)
+				if current.setupErr == nil && !preexpiryGateUsed {
+					preexpiryGateUsed, current.induced = true, true
+					// Deliberately park with the writer beyond run's fixed 1s
+					// child. This is test scheduling, not an SQL latency bound.
+					hold := 2 * time.Second
+					t.Logf("intentional pre-Materialize gate: candidate=%s original-key=%+v sweep=%d cutoff=%s hold=%s", items[i].RequestID, items[i], sweep, cutoff, hold)
+					gate := time.NewTimer(hold)
+					select {
+					case <-gate.C:
+					case <-exercise.Done():
+						current.setupErr = fmt.Errorf("pre-Materialize gate watchdog: %w", exercise.Err())
+					}
+					gate.Stop()
+				}
 			}
 			return cutoff
 		}
@@ -437,6 +453,11 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 	cutoffBySweep := make(map[int]time.Time)
 	seenBySweep := make(map[int]map[int]bool)
 	firstSweepSegments, sqlFaults, materializeDeadlines, noAdvanceDeadlines := 0, 0, 0, 0
+	preexpiry := struct {
+		count, index, sweep int
+		cutoff              time.Time
+		uncounted, retried  bool
+	}{index: -1}
 	for lastCall.RunID == "" {
 		select {
 		case call := <-started:
@@ -575,14 +596,48 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 			firstSweepSegments++
 		}
 		if report.held != nil {
-			// Validate the no-trigger Materialize deadline before releasing the
-			// actual external writer; expiry alone proves no resource release.
-			pumpSchedulerBeginEvidence(t, report.pumpSchedulerReport)
-			if after != report.heldIndex || after != report.before+1 || byCandidate[after] == nil ||
-				strings.Contains(byCandidate[after].Error(), "persistent scheduler intent fault") {
-				t.Fatalf("held BEGIN did not advance exactly its original identity without trigger: %+v", report)
+			forcedBefore := len(forced)
+			if after == report.before {
+				// The writer uses the independent exercise context. Holding it
+				// does not prove the child crossed the Materialize ctx fence.
+				var transaction interface{ Phase() string }
+				if !errors.Is(report.err, context.DeadlineExceeded) || len(byCandidate) != 0 || errors.As(report.err, &transaction) ||
+					queryFailures != 0 || len(report.boundaries) != 1 || report.boundaries[0] != report.heldIndex || report.heldIndex != report.before+1 {
+					t.Fatalf("held pre-Materialize expiry lost its unchanged cursor or no-candidate tree: %+v", report)
+				}
+				if forced[report.heldIndex] {
+					t.Fatalf("unadvanced pre-Materialize expiry counted as a forced BEGIN: %+v forced=%v", report, forced)
+				}
+				if report.induced {
+					preexpiry.count++
+					if preexpiry.count != 1 {
+						t.Fatal("pre-Materialize gate was induced more than once")
+					}
+					preexpiry.index, preexpiry.sweep, preexpiry.cutoff = report.heldIndex, report.sweep, report.cutoff
+					preexpiry.uncounted = !forced[report.heldIndex]
+				}
+				t.Logf("held pre-Materialize deadline: induced=%t original-key=%+v unchanged-cursor=%+v sweep=%d cutoff=%s forced=%d/%d parent=%v full-tree=%v", report.induced, items[report.heldIndex], report.after, report.sweep, report.cutoff, forcedBefore, len(forced), report.ctx.Err(), report.err)
+			} else {
+				if report.induced {
+					t.Fatalf("intentional pre-Materialize gate unexpectedly entered Materialize: %+v", report)
+				}
+				// Only real typed BEGIN evidence and exact key advancement may
+				// count; expiry alone proves no transaction/resource release.
+				pumpSchedulerBeginEvidence(t, report.pumpSchedulerReport)
+				if after != report.heldIndex || after != report.before+1 || byCandidate[after] == nil ||
+					strings.Contains(byCandidate[after].Error(), "persistent scheduler intent fault") {
+					t.Fatalf("held BEGIN did not advance exactly its original identity without trigger: %+v", report)
+				}
+				forced[after] = true
+				if after == preexpiry.index {
+					if preexpiry.count != 1 || !preexpiry.uncounted || preexpiry.retried || report.sweep != preexpiry.sweep || report.cutoff != preexpiry.cutoff {
+						t.Fatalf("induced pre-Materialize key was not retried in the same sweep/cutoff: proof=%+v report=%+v", preexpiry, report)
+					}
+					preexpiry.retried = true
+					t.Logf("induced pre-Materialize same-key BEGIN retry: original-key=%+v cursor=%+v sweep=%d cutoff=%s forced=%d full-tree=%v", items[after], report.after, report.sweep, report.cutoff, len(forced), report.err)
+				}
 			}
-			forced[after] = true
+			// Both dispositions retain the real writer until the pass returns.
 			if err := report.held.Rollback(); err != nil {
 				t.Fatal(err)
 			}
@@ -594,6 +649,9 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 			t.Fatal(err)
 		}
 		pumpSchedulerAdvance(t, r, advance)
+	}
+	if preexpiry.count != 1 || !preexpiry.uncounted || !preexpiry.retried || !forced[preexpiry.index] {
+		t.Fatalf("missing induced uncounted pre-Materialize expiry and same-original-key BEGIN retry: proof=%+v forced=%v", preexpiry, forced)
 	}
 	if firstSweepSegments <= 6 || len(forced) != 7 || materializeDeadlines < 7 || len(seenBySweep[1]) < len(prefix.Items) ||
 		view.State.Status != domain.DispatchStatusEnqueued || view.State.Delivery == nil || view.State.Delivery.MaterializedFromGeneration != 1 || view.State.Generation != 2 || view.State.AttemptCount != 0 {
@@ -625,7 +683,7 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 			t.Fatalf("prefix failure partially persisted %s: before=%d after=%d", table, len(before[table]), len(after[table]))
 		}
 	}
-	t.Logf("real scheduler progression: first-sweep-segments=%d forced-original-identities=%v SQL-faults=%d materialize-deadlines=%d no-advance-deadlines=%d item51=%s receipt=%s ordinary-turn=%s tail-turn=%s", firstSweepSegments, forced, sqlFaults, materializeDeadlines, noAdvanceDeadlines, tail.Items[0].RequestID, view.State.Delivery.DeliveryID, ordinaryTurn.ID, lastTurn.ID)
+	t.Logf("real scheduler progression: first-sweep-segments=%d forced-original-identities=%v SQL-faults=%d materialize-deadlines=%d no-advance-deadlines=%d item51=%s receipt=%s ordinary-turn=%s tail-turn=%s induced-predeadline=%+v", firstSweepSegments, forced, sqlFaults, materializeDeadlines, noAdvanceDeadlines, tail.Items[0].RequestID, view.State.Delivery.DeliveryID, ordinaryTurn.ID, lastTurn.ID, preexpiry)
 }
 
 func TestIntentPumpSchedulerCancellationPreservesMixedErrorsAndDrain(t *testing.T) {
