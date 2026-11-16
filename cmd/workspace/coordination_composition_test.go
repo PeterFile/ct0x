@@ -177,7 +177,11 @@ func TestCoordinationCompositionRoutesOptIn(t *testing.T) {
 				if mode == "roles" {
 					code = "forbidden"
 				}
-				memberToolsHTTP(t, base+"/api/v1/member-tools", "not-a-capability", operation, map[string]any{}, "", roleStatus, code)
+				input := map[string]any{"summary": "角色权限检查"}
+				if operation == "decide_dispatch" {
+					input = map[string]any{"kind": "decline", "reason": "角色权限检查"}
+				}
+				memberToolsHTTP(t, base+"/api/v1/member-tools", "not-a-capability", operation, input, "route-"+operation, roleStatus, code)
 			}
 			d := message.Deliveries[0]
 			var inspection platform.RoleReadinessInspection
