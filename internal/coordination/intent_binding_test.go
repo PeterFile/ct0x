@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -151,30 +152,137 @@ func trustedIntentLogError(t *testing.T, err error) {
 	})
 }
 
-func trustedIntentRequireLeaves(t *testing.T, err error, allow func(error) bool) {
-	t.Helper()
+func trustedIntentCheckLeaves(err error, allow func(error) bool) error {
+	cancelled := false
 	trustedIntentWalkError(err, func(node error, _ int) {
-		if len(trustedIntentErrorChildren(node)) == 0 && !allow(node) {
-			t.Fatalf("unexpected error leaf %T: %v; complete callback tree=%v", node, node, err)
+		if len(trustedIntentErrorChildren(node)) == 0 && (node == context.Canceled || node == context.DeadlineExceeded) {
+			cancelled = true
 		}
 	})
+	var check func(error, trustedIntentTransactionEvidence) error
+	check = func(node error, transaction trustedIntentTransactionEvidence) error {
+		if node == nil {
+			return nil
+		}
+		if evidence, ok := node.(trustedIntentTransactionEvidence); ok {
+			valid := false
+			switch evidence.Phase() {
+			case "input", "begin":
+				valid = evidence.RollbackConfirmed() && !evidence.CommitOutcomeUnknown()
+			case "source", "eligibility", "payload", "held", "message", "receipt", "readback":
+				valid = !evidence.CommitOutcomeUnknown()
+			case "commit":
+				valid = evidence.CommitOutcomeUnknown() && !evidence.RollbackConfirmed()
+			}
+			if !valid {
+				return fmt.Errorf("invalid transaction evidence: phase=%s rollback=%t unknown=%t", evidence.Phase(), evidence.RollbackConfirmed(), evidence.CommitOutcomeUnknown())
+			}
+			transaction = evidence // Only this branch's nearest typed ancestor owns its leaves.
+		}
+		children := trustedIntentErrorChildren(node)
+		if len(children) == 0 {
+			if node == sql.ErrTxDone {
+				// Automatic rollback can win before a statement grabs the Tx.
+				// Neither ErrTxDone nor a pending readback proves successful Rollback.
+				if transaction == nil || transaction.RollbackConfirmed() || transaction.Phase() == "input" || transaction.Phase() == "begin" ||
+					!cancelled && !transaction.CommitOutcomeUnknown() {
+					return fmt.Errorf("ErrTxDone lacks compatible transaction ancestry: %w", node)
+				}
+			}
+			if !allow(node) {
+				return fmt.Errorf("unexpected error leaf %T: %w", node, node)
+			}
+		}
+		for _, cause := range children {
+			if invalid := check(cause, transaction); invalid != nil {
+				return invalid
+			}
+		}
+		return nil
+	}
+	return check(err, nil)
 }
 
-func trustedIntentRequireCancellationTree(t *testing.T, err error, allowTxDone bool) {
+func trustedIntentRequireLeaves(t *testing.T, err error, allow func(error) bool) {
 	t.Helper()
+	if invalid := trustedIntentCheckLeaves(err, allow); invalid != nil {
+		t.Fatalf("invalid error tree: %v; complete callback tree=%v", invalid, err)
+	}
+}
+
+func trustedIntentCancellationTree(err error) error {
 	seen := false
-	trustedIntentRequireLeaves(t, err, func(leaf error) bool {
-		switch leaf {
-		case context.DeadlineExceeded, context.Canceled:
+	invalid := trustedIntentCheckLeaves(err, func(leaf error) bool {
+		if leaf == context.DeadlineExceeded || leaf == context.Canceled {
 			seen = true
 			return true
-		case sql.ErrTxDone:
-			return allowTxDone
 		}
-		return false
+		return leaf == sql.ErrTxDone
 	})
+	if invalid != nil {
+		return invalid
+	}
 	if !seen {
-		t.Fatalf("missing actual cancellation/deadline leaf: %v", err)
+		return errors.New("missing actual cancellation/deadline leaf")
+	}
+	return nil
+}
+
+func trustedIntentRequireCancellationTree(t *testing.T, err error) {
+	t.Helper()
+	if invalid := trustedIntentCancellationTree(err); invalid != nil {
+		t.Fatalf("invalid cancellation tree: %v; complete callback tree=%v", invalid, err)
+	}
+}
+
+func TestTrustedIntentPassCancellationTree(t *testing.T) {
+	_, db, _ := engineLocalFixture(t)
+	_, sqlFault := db.Exec("SELECT * FROM trusted_intent_oracle_missing")
+	if sqlFault == nil {
+		t.Fatal("missing real SQLite error leaf for the classification oracle")
+	}
+	// Hand-built trees test classification only, not a driver cancellation race.
+	transaction := func(phase string, rollback, unknown bool, cause error) error {
+		return intentTestEvidence{cause: cause, phase: phase, rollback: rollback, unknown: unknown}
+	}
+	source := transaction("source", false, false, sql.ErrTxDone)
+	commit := transaction("commit", false, true, sql.ErrTxDone)
+	for _, tc := range []struct {
+		name string
+		tree error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"deadline-only", context.DeadlineExceeded, true},
+		{"cancel-only", context.Canceled, true},
+		{"begin-context-no-transaction", transaction("begin", true, false, context.Canceled), true},
+		{"source-context", transaction("source", false, false, context.DeadlineExceeded), true},
+		{"source-auto-rollback", errors.Join(fmt.Errorf("candidate: %w", source), context.DeadlineExceeded), true},
+		{"source-parent-cancel", errors.Join(source, context.Canceled), true},
+		{"source-rollback-claimed", errors.Join(transaction("source", true, false, sql.ErrTxDone), context.DeadlineExceeded), false},
+		{"source-unknown-claimed", errors.Join(transaction("source", false, true, sql.ErrTxDone), context.DeadlineExceeded), false},
+		{"begin-errtxdone", errors.Join(transaction("begin", true, false, sql.ErrTxDone), context.DeadlineExceeded), false},
+		{"input-errtxdone", errors.Join(transaction("input", true, false, sql.ErrTxDone), context.DeadlineExceeded), false},
+		{"unknown-phase", transaction("unreviewed", false, false, context.DeadlineExceeded), false},
+		{"bare-errtxdone-with-context", errors.Join(sql.ErrTxDone, context.DeadlineExceeded), false},
+		{"source-without-context", source, false},
+		{"unrelated-commit-ancestor", errors.Join(transaction("commit", false, true, context.DeadlineExceeded), sql.ErrTxDone), false},
+		{"sibling-errtxdone", errors.Join(source, sql.ErrTxDone, context.DeadlineExceeded), false},
+		{"nearest-begin-ancestor", errors.Join(transaction("commit", false, true, transaction("begin", true, false, sql.ErrTxDone)), context.DeadlineExceeded), false},
+		{"commit-unknown", errors.Join(commit, context.DeadlineExceeded), true},
+		{"commit-without-context", commit, false},
+		{"commit-known-claimed", transaction("commit", false, false, context.DeadlineExceeded), false},
+		{"commit-rollback-claimed", errors.Join(transaction("commit", true, true, sql.ErrTxDone), context.DeadlineExceeded), false},
+		{"mixed-sql", errors.Join(source, context.DeadlineExceeded, sqlFault), false},
+		{"mixed-business", errors.Join(source, context.DeadlineExceeded, store.ErrInvalid), false},
+		{"mixed-rollback", errors.Join(transaction("source", false, false, errors.Join(sql.ErrTxDone, errors.New("oracle rollback failure"))), context.DeadlineExceeded), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			invalid := trustedIntentCancellationTree(tc.tree)
+			if (invalid == nil) != tc.want {
+				t.Errorf("classification accepted=%t want=%t error=%v", invalid == nil, tc.want, invalid)
+			}
+		})
 	}
 }
 
@@ -347,7 +455,7 @@ func TestTrustedIntentPassAssignmentBudgetSafety(t *testing.T) {
 			if reported != nil {
 				// Every leaf is checked. A joined SQL/business/rollback failure is
 				// not made harmless merely by also containing a deadline.
-				trustedIntentRequireCancellationTree(t, reported, commitUnknown)
+				trustedIntentRequireCancellationTree(t, reported)
 			}
 			if transactions == 0 && v.Dispatch.Delivery == nil {
 				t.Log("no typed assignment transaction error: candidate/transaction start is unproven; only cancellation and unchanged durable state were observed")
@@ -500,7 +608,7 @@ func TestTrustedIntentPassReportsCompleteErrors(t *testing.T) {
 			})
 			var evidence trustedIntentTransactionEvidence
 			if !errors.As(reported, &evidence) || evidence.Phase() != "commit" {
-				trustedIntentRequireCancellationTree(t, reported, true)
+				trustedIntentRequireCancellationTree(t, reported)
 				continue
 			}
 			var aggregate interface{ Unwrap() []error }
@@ -520,22 +628,35 @@ func TestTrustedIntentPassReportsCompleteErrors(t *testing.T) {
 }
 
 func TestTrustedIntentPassRetainsSweepAcrossCallbacks(t *testing.T) {
-	f := intentConfigured(t)
-	f.request(t)
-	f.request(t)
-	page, err := f.s.ListDueDispatchRequests(context.Background(), time.Now().UTC(), store.DispatchDueOptions{})
-	if err != nil || len(page.Items) != 2 {
-		t.Fatalf("candidate setup: %+v, %v", page, err)
-	}
-	first, tail := page.Items[0], page.Items[1]
-	intentExec(t, f.db, `CREATE TRIGGER trusted_intent_prefix_fault BEFORE UPDATE ON coordination_dispatch_state
-	 WHEN NEW.request_id='`+first.RequestID+`' BEGIN SELECT RAISE(ABORT,'persistent trusted intent fault'); END`)
-	// A real next-kind query failure pauses the sweep without a timing gate or 51-item fixture.
-	intentExec(t, f.db, `ALTER TABLE coordination_assignment_dispatch RENAME TO trusted_intent_hidden_assignments`)
-	callback := trustedIntentCallback(t, New(f.s))
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	seen, calls := 0, 0
+	var f intentFixture
+	var first, tail store.DispatchDueCandidate
+	var callback func(context.Context) error
+	seen, calls, setups := 0, 0, 0
+	interrupted := false
+	prepare := func() {
+		if seen != 0 || ctx.Err() != nil {
+			t.Fatalf("cannot rebuild a proven prefix or expired setup: seen=%d context=%v", seen, ctx.Err())
+		}
+		f = intentConfigured(t)
+		f.request(t)
+		f.request(t)
+		page, err := f.s.ListDueDispatchRequests(context.Background(), time.Now().UTC(), store.DispatchDueOptions{})
+		if err != nil || len(page.Items) != 2 {
+			t.Fatalf("candidate setup: %+v, %v", page, err)
+		}
+		first, tail = page.Items[0], page.Items[1]
+		intentExec(t, f.db, `CREATE TRIGGER trusted_intent_prefix_fault BEFORE UPDATE ON coordination_dispatch_state
+	 WHEN NEW.request_id='`+first.RequestID+`' BEGIN SELECT RAISE(ABORT,'persistent trusted intent fault'); END`)
+		// A real next-kind query failure pauses the sweep without a production seam.
+		intentExec(t, f.db, `ALTER TABLE coordination_assignment_dispatch RENAME TO trusted_intent_hidden_assignments`)
+		callback = trustedIntentCallback(t, New(f.s))
+		setups++
+		interrupted = false
+		t.Logf("cursor setup=%d prefix=%s generation=%d tail=%s; prefix fault not yet proven", setups, first.RequestID, first.Generation, tail.RequestID)
+	}
+	prepare()
 	for {
 		if ctx.Err() != nil {
 			t.Fatalf("candidate/query progress watchdog: calls=%d seen=%d", calls, seen)
@@ -556,15 +677,49 @@ func TestTrustedIntentPassRetainsSweepAcrossCallbacks(t *testing.T) {
 			return ok && (code.Code()&255 == 19 && strings.Contains(leaf.Error(), "persistent trusted intent fault") ||
 				code.Code()&255 == 1 && strings.Contains(leaf.Error(), "no such table: coordination_assignment_dispatch"))
 		})
-		seen += strings.Count(reported.Error(), first.RequestID)
+		trustedIntentWalkError(reported, func(node error, _ int) {
+			if len(trustedIntentErrorChildren(node)) == 0 && (node == context.Canceled || node == context.DeadlineExceeded) {
+				interrupted = true
+			}
+		})
+		var aggregate interface{ Unwrap() []error }
+		if errors.As(reported, &aggregate) {
+			for _, cause := range aggregate.Unwrap() {
+				if cause == nil || !strings.Contains(cause.Error(), fmt.Sprintf("物化分派请求 %s（世代 %d）", first.RequestID, first.Generation)) {
+					continue
+				}
+				fault := false
+				trustedIntentWalkError(cause, func(node error, _ int) {
+					code, ok := node.(interface{ Code() int })
+					if ok && code.Code() == 1811 && strings.Contains(node.Error(), "persistent trusted intent fault") {
+						fault = true
+					}
+				})
+				if !fault {
+					continue // An ID on a timeout is not proof that the trigger ran.
+				}
+				var evidence trustedIntentTransactionEvidence
+				if !errors.As(cause, &evidence) || evidence.Phase() != "receipt" || evidence.CommitOutcomeUnknown() {
+					t.Fatalf("prefix trigger lost its actual transaction provenance: %v", cause)
+				}
+				seen++
+				t.Logf("proven prefix fault setup=%d request=%s phase=%s rollback=%t unknown=%t", setups, first.RequestID,
+					evidence.Phase(), evidence.RollbackConfirmed(), evidence.CommitOutcomeUnknown())
+			}
+		}
 		if seen > 1 {
-			t.Fatal("callback reconstructed its pass and rescanned the failed original candidate")
+			t.Fatal("callback reconstructed its pass and rescanned the proven failed original candidate")
 		}
 		if strings.Contains(reported.Error(), "no such table: coordination_assignment_dispatch") {
-			if seen != 1 {
-				t.Fatalf("query pause did not retain an observed original candidate: %v", reported)
+			if seen == 0 {
+				if !interrupted {
+					t.Fatalf("query pause without a prefix fault or real cancellation evidence: %v", reported)
+				}
+				t.Logf("setup=%d calls=%d prefix=%s unproven after cancellation; no cursor-retention claim; rebuilding only this unproven setup", setups, calls, first.RequestID)
+				prepare()
+				continue
 			}
-			t.Logf("query pause after original candidate %s: %v", first.RequestID, reported)
+			t.Logf("query pause after proven original candidate %s on the same callback: %v", first.RequestID, reported)
 			break
 		}
 	}
