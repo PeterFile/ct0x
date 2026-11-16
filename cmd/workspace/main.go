@@ -72,12 +72,14 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		return fmt.Errorf("监听本地地址失败：%w", err)
 	}
 	defer listener.Close()
+	engine := coordination.New(db)
 	var schedule func(context.Context) error
 	var memberTools *platform.MemberToolRuntime
+	var preparer *platform.Preparer
 	executionStatus := "执行已禁用，投递仅排队"
 	toolStatus := "平台工具已禁用；Pi 禁用工具，Codex 仅原生只读工具且无平台令牌"
 	if config.enableExecution {
-		schedule, memberTools, err = executionRunner(config, db, catalog, "http://"+listener.Addr().String()+"/api/v1/member-tools")
+		schedule, memberTools, preparer, err = executionRunner(config, db, engine, catalog, "http://"+listener.Addr().String()+"/api/v1/member-tools", output)
 		if err != nil {
 			return err
 		}
@@ -85,9 +87,11 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	}
 	if memberTools != nil {
 		toolStatus = "平台工具已配置：仅已验证 Pi 1.4.0 且显式指定模型时可用六项成员工具（含只读历史搜索与分段读取）；Codex 仅原生只读工具且无平台令牌；不授予 Coordinator、Assignment 或 RequestWork 权限"
+		if config.enableCoordinationRoles {
+			toolStatus = "平台工具与显式协调角色已配置：普通投递仍仅六项基础成员工具且不授予角色；受信协调员与工作成员按服务端执行身份分别绑定专用工具；仅已验证 Pi 1.4.0 且显式指定模型时可执行，Codex 仅原生只读工具且无平台令牌；分派登记不直接执行，成果提交不等于接纳；角色就绪查询仅为采样诊断，不保证后续认领或执行"
+		}
 	}
 	local := platform.NewLocalUser(db)
-	engine := coordination.New(db)
 	coordinations := platform.NewCoordinations(engine)
 	coordinatorConfiguration := platform.NewCoordinatorConfiguration(engine)
 	routes := append(httpapi.LocalUserRoutes(local), httpapi.MessageRoutes(local)...)
@@ -106,6 +110,11 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if memberTools != nil {
 		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)
 		routes = append(routes, httpapi.MemberHistoryToolRoutes(memberTools.Tools())...)
+	}
+	if config.enableCoordinationRoles {
+		routes = append(routes, httpapi.DispatchRequestRoutes(platform.NewDispatchRequests(engine))...)
+		routes = append(routes, httpapi.MemberRoleToolRoutes(memberTools.Tools())...)
+		routes = append(routes, httpapi.CoordinationReadinessRoutes(db, preparer)...)
 	}
 	if config.webDir != "" {
 		web, openErr := webassets.Open(config.webDir)
