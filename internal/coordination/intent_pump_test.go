@@ -139,7 +139,8 @@ func TestIntentPassBindingBudgetAndRotation(t *testing.T) {
 	if p.store != f.s {
 		t.Fatal("pass did not borrow the exact Engine Store")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Bound real two-kind quantity work, not production throughput.
+	ctx, cancel := context.WithTimeout(context.Background(), 360*time.Second)
 	defer cancel()
 	if err := p.observe(ctx); err != nil {
 		t.Fatal(err)
@@ -278,8 +279,10 @@ func TestIntentPassHeldAndGenerationConflict(t *testing.T) {
 		r := f.request(t)
 		intentExec(t, f.db, "UPDATE members SET status='left' WHERE id=?", f.worker)
 		before := engineCoordinatorSnapshot(t, f.db)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
 		p := intentCore(t, f.s, time.Now().Add(time.Second))
-		if err := p.run(context.Background()); err != nil {
+		if err := p.observe(ctx); err != nil {
 			t.Fatalf("held is a persisted disposition, not a pass error: %v", err)
 		}
 		d, err := f.s.GetDispatchRequest(context.Background(), r.GroupID, r.ID)
@@ -300,6 +303,8 @@ func TestIntentPassHeldAndGenerationConflict(t *testing.T) {
 	t.Run("real-generation-race-keeps-original-key", func(t *testing.T) {
 		f := intentConfigured(t)
 		r := f.request(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer cancel()
 		base := time.Now().UTC().Add(time.Second)
 		p := intentCore(t, f.s, base)
 		calls := 0
@@ -307,13 +312,13 @@ func TestIntentPassHeldAndGenerationConflict(t *testing.T) {
 			calls++
 			if calls == 2 {
 				// A real competing transaction after the due read, before materialization.
-				if err := f.s.DeferDispatchRequest(context.Background(), r.ID, 1, base, store.DispatchTransientSQLiteBusy); err != nil {
+				if err := f.s.DeferDispatchRequest(ctx, r.ID, 1, base, store.DispatchTransientSQLiteBusy); err != nil {
 					t.Fatal(err)
 				}
 			}
 			return base
 		}
-		err := p.run(context.Background())
+		err := p.observe(ctx)
 		if !errors.Is(err, store.ErrConflict) || !strings.Contains(err.Error(), r.ID) || !strings.Contains(err.Error(), "世代 1") {
 			t.Fatalf("original identity/conflict lost: %v", err)
 		}
@@ -325,7 +330,7 @@ func TestIntentPassHeldAndGenerationConflict(t *testing.T) {
 			t.Fatalf("conflict caused another defer: %+v, %v", v, err)
 		}
 		p.now = func() time.Time { return base.Add(3 * time.Second) }
-		if err := p.run(context.Background()); err != nil {
+		if err := p.observe(ctx); err != nil {
 			t.Fatal(err)
 		}
 		v, err = f.s.GetDispatchRequest(context.Background(), r.GroupID, r.ID)
@@ -414,16 +419,42 @@ func TestIntentPassCommitUnknownAndOriginalGenerationReplay(t *testing.T) {
 	 CREATE TRIGGER intent_assignment_commit AFTER UPDATE ON coordination_assignment_dispatch
 	 WHEN NEW.status='enqueued' BEGIN INSERT INTO intent_commit_guard VALUES('missing'); END`)
 	before := engineCoordinatorSnapshot(t, f.db)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
 	p := intentCore(t, f.s, time.Now().Add(time.Second))
-	err := p.run(context.Background())
-	var evidence interface {
-		Phase() string
-		RollbackConfirmed() bool
-		CommitOutcomeUnknown() bool
-	}
-	if err == nil || !strings.Contains(err.Error(), r.ID) || !strings.Contains(err.Error(), a.ID) || !strings.Contains(err.Error(), "世代 1") ||
-		!errors.As(err, &evidence) || evidence.Phase() != "commit" || !evidence.CommitOutcomeUnknown() || evidence.RollbackConfirmed() {
+	err := p.observe(ctx)
+	if err == nil || !strings.Contains(err.Error(), r.ID) || !strings.Contains(err.Error(), a.ID) || !strings.Contains(err.Error(), "世代 1") {
 		t.Fatalf("unknown commit/original identities not preserved: %v", err)
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok || len(joined.Unwrap()) != 2 {
+		t.Fatalf("expected both original candidate error trees, got: %v", err)
+	}
+	for _, want := range []struct{ kind, id, prefix string }{
+		{"dispatch", r.ID, fmt.Sprintf("物化分派请求 %s（世代 1）失败：", r.ID)},
+		{"assignment", a.ID, fmt.Sprintf("物化工作分配 %s（世代 1）失败：", a.ID)},
+	} {
+		var observed error
+		for _, failure := range joined.Unwrap() {
+			if strings.HasPrefix(failure.Error(), want.prefix) {
+				if observed != nil {
+					t.Fatalf("duplicate %s original candidate error: %v", want.kind, err)
+				}
+				observed = failure
+			}
+		}
+		var evidence interface {
+			Phase() string
+			RollbackConfirmed() bool
+			CommitOutcomeUnknown() bool
+			Unwrap() error
+		}
+		if observed == nil || !errors.As(observed, &evidence) || evidence.Phase() != "commit" ||
+			!evidence.CommitOutcomeUnknown() || evidence.RollbackConfirmed() || evidence.Unwrap() == nil {
+			t.Fatalf("%s original-generation commit evidence missing: candidate=%v full-tree=%v", want.kind, observed, err)
+		}
+		t.Logf("actual commit unknown: kind=%s original-id=%s generation=1 phase=%s unknown=%t rollback-confirmed=%t raw-cause=%v full-tree=%v", want.kind, want.id,
+			evidence.Phase(), evidence.CommitOutcomeUnknown(), evidence.RollbackConfirmed(), evidence.Unwrap(), observed)
 	}
 	if p.dispatchAfter == nil || p.dispatchAfter.RequestID != r.ID || p.assignmentAfter == nil || p.assignmentAfter.AssignmentID != a.ID || !p.dispatchExhausted || !p.assignmentExhausted {
 		t.Fatalf("unknown commit stopped cursor progress: %+v", p)
@@ -432,7 +463,7 @@ func TestIntentPassCommitUnknownAndOriginalGenerationReplay(t *testing.T) {
 		t.Fatal("unknown commit was deferred, treated as success, or partially persisted")
 	}
 	intentExec(t, f.db, "DROP TRIGGER intent_request_commit; DROP TRIGGER intent_assignment_commit")
-	if err := p.run(context.Background()); err != nil {
+	if err := p.observe(ctx); err != nil {
 		t.Fatalf("pending original generations did not reconcile on a later sweep: %v", err)
 	}
 	d, err := f.s.GetDispatchRequest(context.Background(), r.GroupID, r.ID)
@@ -444,11 +475,11 @@ func TestIntentPassCommitUnknownAndOriginalGenerationReplay(t *testing.T) {
 		t.Fatalf("assignment reconciliation: %+v, %v", v, err)
 	}
 	after := engineCoordinatorSnapshot(t, f.db)
-	dReplay, err := f.s.MaterializeDispatchRequest(context.Background(), r.ID, 1, time.Now().Add(time.Hour))
+	dReplay, err := f.s.MaterializeDispatchRequest(ctx, r.ID, 1, time.Now().Add(time.Hour))
 	if err != nil || !reflect.DeepEqual(dReplay.Delivery, d.State.Delivery) {
 		t.Fatalf("request original-generation replay: %+v, %v", dReplay, err)
 	}
-	aReplay, err := f.s.MaterializeAssignment(context.Background(), a.ID, 1, time.Now().Add(time.Hour))
+	aReplay, err := f.s.MaterializeAssignment(ctx, a.ID, 1, time.Now().Add(time.Hour))
 	if err != nil || !reflect.DeepEqual(aReplay.Delivery, v.Dispatch.Delivery) {
 		t.Fatalf("assignment original-generation replay: %+v, %v", aReplay, err)
 	}
@@ -803,8 +834,10 @@ func TestIntentPassPreservesUnknownAndCancelResources(t *testing.T) {
 			if err != nil || turn.State != state || len(before["resource_claims"]) != 1 {
 				t.Fatalf("uncertain execution fixture: %+v, %v", turn, err)
 			}
+			ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
+			defer cancel()
 			p := intentCore(t, s, time.Now().Add(time.Second))
-			if err := p.run(ctx); err != nil {
+			if err := p.observe(ctx); err != nil {
 				t.Fatal(err)
 			}
 			v, err := s.GetAssignment(ctx, r.GroupID, decision.Assignment.ID)

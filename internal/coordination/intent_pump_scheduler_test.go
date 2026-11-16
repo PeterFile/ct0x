@@ -298,6 +298,60 @@ func TestIntentPumpSchedulerMaterializesEmptyQueueAtCapacity(t *testing.T) {
 	}
 }
 
+// Only raw deadline leaves and nonempty recursive join nodes are approved.
+func pumpSchedulerOnlyDeadline(err error) bool {
+	if err == context.DeadlineExceeded {
+		return true
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		return false
+	}
+	children := joined.Unwrap()
+	if len(children) == 0 {
+		return false
+	}
+	for _, child := range children {
+		if !pumpSchedulerOnlyDeadline(child) {
+			return false
+		}
+	}
+	return true
+}
+
+func TestIntentPumpSchedulerPredeadlineOracle(t *testing.T) {
+	deadline := context.DeadlineExceeded
+	diskIO := errors.New("disk I/O error")
+	for _, tc := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"raw", deadline, true},
+		{"joined", errors.Join(deadline, deadline), true},
+		{"nested", errors.Join(errors.Join(deadline, errors.Join(deadline)), deadline), true},
+		{"nil", nil, false},
+		{"empty-join", errors.Join(nil, nil), false},
+		{"disk-io", diskIO, false},
+		{"canceled", context.Canceled, false},
+		{"deadline-text-not-sentinel", errors.New(deadline.Error()), false},
+		{"mixed-disk-io", errors.Join(deadline, diskIO), false},
+		{"reviewer-nested-mixed", errors.Join(errors.Join(deadline, diskIO), deadline), false},
+		{"wrapped-deadline", fmt.Errorf("wrapped: %w", deadline), false},
+		{"joined-wrapped-deadline", errors.Join(deadline, fmt.Errorf("wrapped: %w", errors.Join(deadline, deadline))), false},
+		{"mixed-canceled", errors.Join(deadline, context.Canceled), false},
+		{"transaction-error", intentTestEvidence{cause: deadline, phase: "begin", rollback: true}, false},
+		{"candidate-error", fmt.Errorf("物化分派请求 original（世代 1）失败：%w", deadline), false},
+		{"query-error", fmt.Errorf("扫描到期分派请求失败：%w", deadline), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pumpSchedulerOnlyDeadline(tc.err); got != tc.want {
+				t.Fatalf("predeadline leaf oracle=%t, want %t: %v", got, tc.want, tc.err)
+			}
+		})
+	}
+}
+
 func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 	f := intentConfigured(t)
 	for range 51 {
@@ -601,7 +655,7 @@ func TestIntentPumpSchedulerPersistentFailurePrefixReaches51(t *testing.T) {
 				// The writer uses the independent exercise context. Holding it
 				// does not prove the child crossed the Materialize ctx fence.
 				var transaction interface{ Phase() string }
-				if !errors.Is(report.err, context.DeadlineExceeded) || len(byCandidate) != 0 || errors.As(report.err, &transaction) ||
+				if !pumpSchedulerOnlyDeadline(report.err) || len(byCandidate) != 0 || errors.As(report.err, &transaction) ||
 					queryFailures != 0 || len(report.boundaries) != 1 || report.boundaries[0] != report.heldIndex || report.heldIndex != report.before+1 {
 					t.Fatalf("held pre-Materialize expiry lost its unchanged cursor or no-candidate tree: %+v", report)
 				}

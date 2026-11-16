@@ -135,6 +135,8 @@ jobs:
           package=$(go list ./internal/platform)
           python3 .github/scripts/verify-store-shard.py aggregate --profile platform "$package" "$RUNNER_TEMP/platform-shards" \
             --run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"
+      - name: Ordinary test coordination package
+        run: go test -count=1 ./internal/coordination
       - name: Race test all other packages
         run: |
           set -euo pipefail
