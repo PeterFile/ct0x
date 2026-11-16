@@ -29,8 +29,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		return nil, nil, nil, err
 	}
 	schedulerOptions := scheduler.Options{MaxActive: 1, Recovered: true, RuntimeDir: runtime}
-	// No external workspace grants: member preferences cannot authorize access.
-	options := platform.PrepareOptions{Providers: providers, PrivateWorkspaceRoot: workspaces}
+	// Only explicit local-user receipts authorize external directories. Protect
+	// the entire private data root, not just per-conversation workspaces.
+	options := platform.PrepareOptions{Providers: providers, PrivateWorkspaceRoot: workspaces, PrivateDataRoot: config.dataDir}
 	var tools *platform.MemberToolRuntime
 	if config.enableMemberTools {
 		root, err := privateExecutionRoot(config.dataDir, "member-tools")

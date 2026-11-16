@@ -210,7 +210,7 @@ func (p *Preparer) prepareCoordinationRole(ctx context.Context, state store.Coor
 	if err != nil {
 		return empty, err
 	}
-	cwd, key, err := p.workspace(member, conversation)
+	cwd, key, err := p.workspace(ctx, member, conversation)
 	if err != nil {
 		return empty, roleWorkspacePreparationError(state, err)
 	}

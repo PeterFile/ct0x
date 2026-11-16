@@ -83,7 +83,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		if err != nil {
 			return err
 		}
-		executionStatus = "全新单轮执行已启用，最大并发 1"
+		executionStatus = "全新单轮执行已启用，最大并发 1；可由本机用户明确登记单成员只读目录授权，不新增文件工具"
 	}
 	if memberTools != nil {
 		toolStatus = "平台工具已配置：仅已验证 Pi 1.4.0 且显式指定模型时可用六项成员工具（含只读历史搜索与分段读取）；Codex 仅原生只读工具且无平台令牌；不授予 Coordinator、Assignment 或 RequestWork 权限"
@@ -98,6 +98,9 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	routes = append(routes, httpapi.TaskRoutes(local)...)
 	routes = append(routes, httpapi.TaskLifecycleRoutes(local)...)
 	routes = append(routes, httpapi.HistoryRoutes(local)...)
+	if preparer != nil {
+		routes = append(routes, httpapi.WorkspaceGrantRoutes(preparer)...)
+	}
 	routes = append(routes, httpapi.CoordinationRoutes(coordinations)...)
 	routes = append(routes, httpapi.CoordinatorConfigurationRoutes(coordinatorConfiguration)...)
 	routes = append(routes, httpapi.ProviderRoute(catalog))

@@ -53,7 +53,7 @@ func (p *Preparer) InspectRoleReadiness(ctx context.Context, pending store.Pendi
 	if err != nil || ctx.Err() != nil {
 		return roleInspectionResult(ctx, result, err)
 	}
-	_, _, err = p.resolvePreparationWorkspace(input.member, input.conversation, false)
+	_, _, err = p.resolvePreparationWorkspace(ctx, input.member, input.conversation, false)
 	return roleInspectionResult(ctx, result, roleWorkspacePreparationError(input.state, err))
 }
 
