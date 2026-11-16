@@ -123,8 +123,8 @@ func TestTrustedIntentPassCallbackUsesEngineStore(t *testing.T) {
 		}
 		trustedIntentRequireEffects(t, before, engineCoordinatorSnapshot(t, f.db), outputs)
 		if reported != nil {
-			// Inspect every leaf; a deadline must not hide any mixed failure.
-			trustedIntentRequireCancellationTree(t, reported, false)
+			// Inspect every leaf and each ErrTxDone's own transaction ancestry.
+			trustedIntentRequireCancellationTree(t, reported)
 		}
 		if hadReceipts && reported == nil {
 			break // Durable completion was already observed; this callback preserved it.
