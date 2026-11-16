@@ -32,7 +32,7 @@ type resolvedDispatchFixture struct {
 
 func resolvedDispatchSchema(t *testing.T, s *Store) [][]any {
 	t.Helper()
-	messageSequenceLedger(t, s, 14)
+	messageSequenceLedger(t, s, len(migrations))
 	var enabled int
 	if err := s.db.QueryRow("PRAGMA foreign_keys").Scan(&enabled); err != nil || enabled != 1 {
 		t.Fatalf("production foreign keys must remain enabled: %d, %v", enabled, err)

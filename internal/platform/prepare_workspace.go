@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -49,6 +50,13 @@ func (p *Preparer) configureWorkspaces(opts PrepareOptions) error {
 		}
 	}
 	p.rootKeys = keys
+	if opts.PrivateDataRoot != "" {
+		dataKeys, err := scheduler.WorkspaceResourceKeys([]string{opts.PrivateDataRoot})
+		if err != nil {
+			return errPrepareWorkspace
+		}
+		p.privateDataRoot, p.privateDataKey = opts.PrivateDataRoot, dataKeys[0]
+	}
 	return nil
 }
 
@@ -60,31 +68,60 @@ func (p *Preparer) revalidateWorkspaces() error {
 	if err != nil || !slices.Equal(keys, p.rootKeys) {
 		return errPrepareWorkspace
 	}
+	if p.privateDataRoot != "" {
+		keys, err := scheduler.WorkspaceResourceKeys([]string{p.privateDataRoot})
+		if err != nil || keys[0] != p.privateDataKey {
+			return errPrepareWorkspace
+		}
+	}
 	return nil
 }
 
-func (p *Preparer) workspace(member domain.Member, conversation domain.Conversation) (string, string, error) {
-	return p.resolvePreparationWorkspace(member, conversation, true)
+func (p *Preparer) workspace(ctx context.Context, member domain.Member, conversation domain.Conversation) (string, string, error) {
+	return p.resolvePreparationWorkspace(ctx, member, conversation, true)
 }
 
 // Only Prepare may create a private scope. Inspect validates existing targets;
 // absence under a revalidated trusted root is not a future write/claim promise.
-func (p *Preparer) resolvePreparationWorkspace(member domain.Member, conversation domain.Conversation, createPrivate bool) (string, string, error) {
+func (p *Preparer) resolvePreparationWorkspace(ctx context.Context, member domain.Member, conversation domain.Conversation, createPrivate bool) (string, string, error) {
+	grants, err := p.store.WorkspaceGrantSnapshot(ctx)
+	if err != nil {
+		return "", "", preparationReadError(ctx, err)
+	}
+	if len(grants) != 0 {
+		if _, err := p.validateDurableWorkspaceRoots(grants, ""); err != nil {
+			if member.Workspace != "" || !errors.Is(err, scheduler.ErrNotReady) {
+				return "", "", err
+			}
+			if err := p.validateStalePrivateWorkspaceRoots(ctx, grants); err != nil {
+				return "", "", err
+			}
+		}
+	}
 	if member.Workspace != "" {
-		index, granted := p.grants[preparationRecipient{member.GroupID, member.ID}]
-		if !granted || !filepath.IsAbs(member.Workspace) {
+		if !filepath.IsAbs(member.Workspace) {
 			return "", "", scheduler.ErrNotReady
+		}
+		var key string
+		if index, granted := p.grants[preparationRecipient{member.GroupID, member.ID}]; granted {
+			key = p.rootKeys[index]
+		} else {
+			var err error
+			key, err = durableWorkspaceKey(grants, member.GroupID, member.ID)
+			if err != nil {
+				return "", "", err
+			}
 		}
 		resolved, err := filepath.EvalSymlinks(member.Workspace)
 		if err != nil {
 			return "", "", scheduler.ErrNotReady
 		}
 		keys, err := scheduler.WorkspaceResourceKeys([]string{resolved})
-		if err != nil || keys[0] != p.rootKeys[index] {
+		if err != nil || keys[0] != key {
 			return "", "", scheduler.ErrNotReady
 		}
 		// Use the authorized root's key, not a key for an arbitrary selected child.
-		return resolved, p.rootKeys[index], nil
+		return resolved, key, nil
 	}
 	// JSON makes the three opaque authoritative IDs unambiguous. Only the hash,
 	// never any ID or model-selected path component, enters the private path.

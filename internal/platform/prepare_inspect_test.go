@@ -271,7 +271,7 @@ func TestInspectRoleReadinessWorkspace(t *testing.T) {
 		}
 		input, err := p.loadPreparationInput(context.Background(), f.pending)
 		prepareRoleOK(t, err)
-		cwd, key, err := p.resolvePreparationWorkspace(input.member, input.conversation, false)
+		cwd, key, err := p.resolvePreparationWorkspace(context.Background(), input.member, input.conversation, false)
 		prepareRoleOK(t, err)
 		if cwd != "" || key != "" {
 			t.Fatal("read-only resolution fabricated a missing target identity")

@@ -19,7 +19,8 @@ import (
 )
 
 // WorkspaceGrant is trusted, read-only authorization for one exact directory
-// identity and recipient. It is not a persisted or model-selected permission.
+// identity and recipient supplied by trusted configuration, never by a model.
+// Durable local-user receipts use the same physical-directory resource keys.
 type WorkspaceGrant struct {
 	GroupID, MemberID, Root string
 }
@@ -28,6 +29,9 @@ type PrepareOptions struct {
 	Providers            []provider.Provider
 	PrivateWorkspaceRoot string
 	WorkspaceGrants      []WorkspaceGrant
+	// PrivateDataRoot optionally excludes the entire trusted application data
+	// directory from durable grants; empty preserves legacy configuration.
+	PrivateDataRoot string
 	// MemberTools and PiMemberToolsExtension are a trusted, Pi-only opt-in pair.
 	// The runtime must borrow the same Store; the extension and its ancestors
 	// must remain trusted and stable for the preparer's lifetime.
@@ -43,7 +47,8 @@ type PrepareOptions struct {
 
 type preparationRecipient struct{ group, member string }
 
-// Preparer holds an immutable trusted configuration snapshot. Callers must keep
+// Preparer holds an immutable trusted configuration snapshot; durable directory
+// receipts are read on demand, never inferred from preferences. Callers must keep
 // root ancestors trusted and directory identities stable while runs are claimed.
 // This is local coordination, not protection against hostile host filesystem edits.
 type Preparer struct {
@@ -51,6 +56,8 @@ type Preparer struct {
 	providers              map[string]provider.Provider
 	grants                 map[preparationRecipient]int
 	privateRoot            string
+	privateDataRoot        string
+	privateDataKey         string
 	roots, rootKeys        []string
 	historyLimit           int
 	maxContextBytes        int
@@ -71,7 +78,7 @@ var (
 
 // NewPreparer copies the catalog and grants without probing CLIs or accounts.
 // PrivateWorkspaceRoot must already exist as a non-symlink 0700 directory, with
-// trusted ancestors. Every grant root participates in overlap/identity checks,
+// trusted ancestors. Every configured grant root participates in overlap/identity checks,
 // even if no current member uses it. Provider readiness is checked by Prepare.
 func NewPreparer(s *store.Store, opts PrepareOptions) (*Preparer, error) {
 	if s == nil || opts.HistoryLimit < 0 || opts.HistoryLimit > 200 ||
@@ -201,7 +208,7 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	if err := ctx.Err(); err != nil {
 		return empty, preparationReadError(ctx, err)
 	}
-	cwd, key, err := p.workspace(member, conversation)
+	cwd, key, err := p.workspace(ctx, member, conversation)
 	if err != nil {
 		return empty, err
 	}
