@@ -97,7 +97,7 @@ jobs:
     needs: [go-store, go-platform]
     if: ${{ always() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - name: Check Store and Platform shards
         env:
