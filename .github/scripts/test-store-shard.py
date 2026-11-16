@@ -617,7 +617,7 @@ class WorkflowTests(unittest.TestCase):
         positions = [job.index(text) for text in ["Check Store and Platform shards", "actions/checkout@v7", "actions/download-artifact@v7",
                                                  "Verify Store shard coverage", "Verify Platform shard coverage",
                                                  "Ordinary test coordination package", "Race test coordination package",
-                                                 "Race test all other packages", "go vet ./...", "Record benchmark metrics"]]
+                                                 "Ordinary test cmd package", "Race test all other packages", "go vet ./...", "Record benchmark metrics"]]
         self.assertEqual(positions, sorted(positions))
         coordination_steps = [("Ordinary test coordination package", "go test -count=1 ./internal/coordination"),
                               ("Race test coordination package", "go test -count=1 -race ./internal/coordination")]
@@ -627,6 +627,10 @@ class WorkflowTests(unittest.TestCase):
         commands = re.findall(r"^[ \t]+(?:run: )?(go test[^\n]*)$", job, re.M)
         self.assertEqual([command for command in commands if "./internal/coordination" in command.split()],
                          [command for _, command in coordination_steps])
+        cmd_command = "go test -count=1 ./cmd/workspace"
+        cmd_steps = re.findall(r"^      - name: Ordinary test cmd package\n        run: ([^\n]+)$", job, re.M)
+        self.assertEqual(cmd_steps, [cmd_command])
+        self.assertEqual([command for command in commands if "./cmd/workspace" in command.split()], [cmd_command])
         self.assertIn('--run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"', job)
         self.assertIn('package=$(go list ./internal/store)', job)
 

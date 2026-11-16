@@ -14,10 +14,10 @@ import (
 )
 
 type config struct {
-	listen, dataDir, webDir, devOrigin, piPath, codexPath string
-	enableExecution, enableMemberTools                    bool
-	piMemberToolsExtension                                string
-	memberToolsMaxMembers                                 int
+	listen, dataDir, webDir, devOrigin, piPath, codexPath       string
+	enableExecution, enableMemberTools, enableCoordinationRoles bool
+	piMemberToolsExtension, roleThinking                        string
+	memberToolsMaxMembers                                       int
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -25,7 +25,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags := flag.NewFlagSet("workspace", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.Usage = func() {
-		fmt.Fprintf(output, "用法：workspace [选项]\n  --listen 地址    回环 IP 与端口（默认 %s，显式指定时可用端口 0）\n  --data-dir 路径  数据目录（默认用户配置目录下的 agent-workspace）\n  --web-dir 路径   网页构建目录（默认禁用，仅提供 API）\n  --enable-execution  启用全新单轮执行（默认禁用，最大并发 1；不支持恢复）\n  --enable-member-tools  启用 Pi 六项基础平台工具（含只读历史搜索与分段读取；默认禁用，须启用执行）\n  --pi-member-tools-extension 路径  显式可信扩展的绝对可读文件路径（须保留相邻依赖）\n  --member-tools-max-members 数量  工具增员容量（默认 4，1..200；仅工具启用时可指定）\n  --dev-origin 来源  单个 HTTP 回环开发来源，必须有端口（默认禁用）\n  --pi-path 路径   Pi 绝对可执行文件路径（可选，以发现结果为准）\n  --codex-path 路径  Codex 绝对可执行文件路径（可选，以发现结果为准）\nCLI 目录仅启动时只读探测，证据仅存内存，不验证执行能力。\n执行要求数据目录及祖先可信且目录身份稳定；工作目录不是主机文件读取沙箱。Pi 默认禁用工具，显式开启平台工具须选已验证 Pi 1.4.0 与显式模型；Codex 仅原生只读工具，无平台令牌。基础工具不授予协调或工作准入权限；不支持运行中追加输入。\n", httpapi.DefaultAddress)
+		fmt.Fprintf(output, "用法：workspace [选项]\n  --listen 地址    回环 IP 与端口（默认 %s，显式指定时可用端口 0）\n  --data-dir 路径  数据目录（默认用户配置目录下的 agent-workspace）\n  --web-dir 路径   网页构建目录（默认禁用，仅提供 API）\n  --enable-execution  启用全新单轮执行（默认禁用，最大并发 1；不支持恢复）\n  --enable-member-tools  启用 Pi 六项基础平台工具（含只读历史搜索与分段读取；默认禁用，须启用执行）\n  --pi-member-tools-extension 路径  显式可信扩展的绝对可读文件路径（须保留相邻依赖）\n  --member-tools-max-members 数量  工具增员容量（默认 4，1..200；仅工具启用时可指定）\n  --enable-coordination-roles  显式启用受信协调角色（默认禁用，须启用执行、成员工具与可信 Pi 扩展）\n  --role-thinking 级别  仅协调角色使用：off、minimal、low、medium、high、xhigh、max（默认空，沿用 CLI 默认；须启用协调角色）\n  --dev-origin 来源  单个 HTTP 回环开发来源，必须有端口（默认禁用）\n  --pi-path 路径   Pi 绝对可执行文件路径（可选，以发现结果为准）\n  --codex-path 路径  Codex 绝对可执行文件路径（可选，以发现结果为准）\nCLI 目录仅启动时只读探测，证据仅存内存，不验证执行能力。\n执行要求数据目录及祖先可信且目录身份稳定；工作目录不是主机文件读取沙箱。Pi 默认禁用工具，显式开启平台工具须选已验证 Pi 1.4.0 与显式模型；Codex 仅原生只读工具，无平台令牌。普通投递的基础工具不授予协调或工作准入权限；显式协调角色按服务端执行身份绑定专用工具。角色就绪查询仅为采样诊断，不保证后续认领或执行；不支持运行中追加输入。\n", httpapi.DefaultAddress)
 	}
 	flags.StringVar(&config.listen, "listen", httpapi.DefaultAddress, "监听地址")
 	flags.StringVar(&config.dataDir, "data-dir", "", "数据目录")
@@ -34,6 +34,8 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags.BoolVar(&config.enableMemberTools, "enable-member-tools", false, "启用 Pi 基础成员工具（默认禁用）")
 	flags.StringVar(&config.piMemberToolsExtension, "pi-member-tools-extension", "", "可信 Pi 扩展的绝对文件路径")
 	flags.IntVar(&config.memberToolsMaxMembers, "member-tools-max-members", 4, "成员工具增员容量（1..200）")
+	flags.BoolVar(&config.enableCoordinationRoles, "enable-coordination-roles", false, "显式启用受信协调角色（默认禁用）")
+	flags.StringVar(&config.roleThinking, "role-thinking", "", "协调角色的 Pi thinking 级别（默认空）")
 	for name, destination := range map[string]*string{"pi-path": &config.piPath, "codex-path": &config.codexPath} {
 		flags.Func(name, "CLI 绝对路径", func(value string) error {
 			if *destination != "" || !filepath.IsAbs(value) {
@@ -68,6 +70,17 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		return config, errors.New("监听地址必须是带端口的回环 IP 地址")
 	}
 	config.listen = address.String()
+	if config.enableCoordinationRoles && (!config.enableExecution || !config.enableMemberTools) {
+		return config, errors.New("启用协调角色必须同时启用执行、成员工具并显式指定可信 Pi 扩展")
+	}
+	if !config.enableCoordinationRoles && set["role-thinking"] {
+		return config, errors.New("协调角色禁用时不能指定角色 thinking 级别，包括空值")
+	}
+	switch config.roleThinking {
+	case "", "off", "minimal", "low", "medium", "high", "xhigh", "max":
+	default:
+		return config, errors.New("角色 thinking 级别无效，请使用 --help 查看允许的精确值")
+	}
 	if !config.enableMemberTools && (set["pi-member-tools-extension"] || set["member-tools-max-members"]) {
 		return config, errors.New("成员工具禁用时不能指定扩展或增员容量")
 	}
