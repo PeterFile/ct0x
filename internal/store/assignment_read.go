@@ -106,7 +106,11 @@ func coordinationDecideReceiptInTx(ctx context.Context, tx *sql.Tx, groupID, req
 	return out, nil
 }
 
-func coordinationDecideAssignmentInTx(ctx context.Context, tx *sql.Tx, groupID, id string) (out domain.AssignmentView, err error) {
+func coordinationDecideAssignmentInTx(ctx context.Context, tx *sql.Tx, groupID, id string) (domain.AssignmentView, error) {
+	return coordinationDecideAssignmentProjectionInTx(ctx, tx, groupID, id, true)
+}
+
+func coordinationDecideAssignmentProjectionInTx(ctx context.Context, tx *sql.Tx, groupID, id string, includeTask bool) (out domain.AssignmentView, err error) {
 	var requestID string
 	if err := tx.QueryRowContext(ctx, "SELECT request_id FROM coordination_assignments WHERE group_id=? AND id=?", groupID, id).Scan(&requestID); err != nil {
 		return out, err
@@ -184,6 +188,9 @@ func coordinationDecideAssignmentInTx(ctx context.Context, tx *sql.Tx, groupID, 
 			return out, err
 		}
 		out.Binding = b
+	}
+	if !includeTask {
+		return out, nil
 	}
 	out.Task, err = taskInTx(ctx, tx, groupID, out.Assignment.TaskID)
 	if err == nil {

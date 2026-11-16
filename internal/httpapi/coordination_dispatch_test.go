@@ -394,11 +394,12 @@ func TestDispatchRequestHTTPUnregisteredRoutesRemainOptIn(t *testing.T) {
 	}
 	routes := DispatchRequestRoutes(platform.NewDispatchRequests(coordination.New(a.db)))
 	want := map[string]bool{
-		"POST /api/v1/groups/{group}/tasks/{task}/dispatch-requests":          true,
-		"GET /api/v1/groups/{group}/coordination/dispatch-requests/{request}": true,
+		"POST /api/v1/groups/{group}/tasks/{task}/dispatch-requests":                    true,
+		"GET /api/v1/groups/{group}/coordination/dispatch-requests/{request}":           true,
+		"GET /api/v1/groups/{group}/tasks/{task}/dispatch-requests/{request}/execution": true,
 	}
 	if len(routes) != len(want) {
-		t.Fatalf("expected exactly two opt-in routes, got %d", len(routes))
+		t.Fatalf("expected exactly three opt-in routes, got %d", len(routes))
 	}
 	for _, route := range routes {
 		key := route.Method + " " + route.Pattern

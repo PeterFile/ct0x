@@ -40,7 +40,7 @@ function viewFor(receipt = receiptFor(), status: DispatchState["status"] = "pend
         materialized_from_generation: generation - (decision ? 2 : 1), created_at: receipt.created_at } : null } };
 }
 const tasks = new Map<string, Task>(), authorities = new Map<string, TaskCoordinationView>(), views = new Map<string, DispatchView>();
-const details = vi.fn<typeof fetch>(), authorityReads = vi.fn<typeof fetch>(), stateReads = vi.fn<typeof fetch>();
+const details = vi.fn<typeof fetch>(), authorityReads = vi.fn<typeof fetch>(), stateReads = vi.fn<typeof fetch>(), executionReads = vi.fn<typeof fetch>();
 const dispatchWrites = vi.fn<typeof fetch>(), taskWrites = vi.fn<typeof fetch>(), configWrites = vi.fn<typeof fetch>();
 const requests = vi.fn<typeof fetch>();
 let unexpected: string[];
@@ -86,6 +86,11 @@ beforeEach(() => {
   details.mockReset().mockImplementation(async input => { const ids = idsOf(input); return json(tasks.get(scopeKey(ids[4], ids[6]))); });
   authorityReads.mockReset().mockImplementation(async input => { const ids = idsOf(input); return json(authorities.get(scopeKey(ids[4], ids[6]))); });
   stateReads.mockReset().mockImplementation(async input => json(views.get(idsOf(input)[7])));
+  executionReads.mockReset().mockImplementation(async input => {
+    const ids = idsOf(input);
+    return json({ group_id: ids[4], task_id: ids[6], request_id: ids[8], dispatch_status: "pending", coordinator_turn: null,
+      decision: null, assignment: null, assignment_dispatch_status: null, binding: null, worker_turn: null });
+  });
   dispatchWrites.mockReset().mockResolvedValue(json(receiptFor(), 201));
   taskWrites.mockReset().mockRejectedValue(new TypeError("Lost lifecycle receipt"));
   configWrites.mockReset().mockRejectedValue(new TypeError("Lost settings receipt"));
@@ -98,6 +103,7 @@ beforeEach(() => {
       if (url.pathname.endsWith("/tasks")) return Promise.resolve(page([...tasks.values()].filter(value => value.group_id === groupId)));
       if (/\/tasks\/[^/]+\/coordination$/.test(url.pathname)) return authorityReads(input, init);
       if (/\/coordination\/dispatch-requests\/[^/]+$/.test(url.pathname)) return stateReads(input, init);
+      if (/\/tasks\/[^/]+\/dispatch-requests\/[^/]+\/execution$/.test(url.pathname)) return executionReads(input, init);
       if (/\/tasks\/[^/]+$/.test(url.pathname)) return details(input, init);
       if (/\/tasks\/[^/]+\/attempts\/[^/]+$/.test(url.pathname)) return Promise.resolve(json({ id: "attempt-1", group_id: groupId, task_id: ids[6],
         task_revision: 7, turn_id: "", created_at: task.created_at }));
@@ -118,6 +124,18 @@ async function lookupKnown(id = receiptFor().id) {
   change(dispatch().getByRole("textbox", { name: "已知分派请求标识" }), id);
   fireEvent.submit(dispatch().getByRole("form", { name: "读取已知请求" })); await flush();
 }
+it("mounts an explicit execution read for a known request without changing dispatch or user Review", async () => {
+  await open(); await lookupKnown();
+  const execution = within(dispatch().getByRole("region", { name: "执行回执" }));
+  expect(execution.getByText(/执行不等于任务提交或用户验收/)).toBeVisible();
+  expect(execution.getByRole("button", { name: "刷新执行回执" })).toBeEnabled();
+  expect(executionReads).not.toHaveBeenCalled();
+  fireEvent.click(execution.getByRole("button", { name: "刷新执行回执" })); await flush();
+  expect(executionReads).toHaveBeenCalledTimes(1);
+  expect(executionReads.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/tasks/${currentTask.id}/dispatch-requests/${receiptFor().id}/execution`);
+  expect(execution.getAllByText(/尚未观测到轮次/)).toHaveLength(2);
+  expect(dispatchWrites).not.toHaveBeenCalled(); expect(taskWrites).not.toHaveBeenCalled();
+});
 it.each(["7.0000000000000001", "9007199254740991.4"])("[repair 1] rejects the raw Task revision %s before any POST", async token => {
   const value = { ...currentTask, revision: Number(token) }; storeTask(value);
   const raw = JSON.stringify(value).replace(`"revision":${value.revision}`, `"revision":${token}`);
@@ -149,7 +167,7 @@ it.each([7, Number.MAX_SAFE_INTEGER])("[repair 1] permits an exact safe Task rev
 });
 it.each([
   ["pending", 1, "已登记，等待协调"], ["held", 2, "协调请求暂停"], ["enqueued", 2, "已进入协调员投递队列"],
-  ["assigned", 3, "已记录分配，具体执行尚未由本页核实"], ["declined", 3, "协调员已拒绝本次分派，不能自动重派"],
+  ["assigned", 3, "已记录分配，执行状态请读取下方执行回执"], ["declined", 3, "协调员已拒绝本次分派，不能自动重派"],
 ] as const)("[initial time] rejects zero-retry %s before observations and recovers at the same generation", async (status, generation, label) => {
   const valid = viewFor(receiptFor(), status, generation);
   stateReads.mockResolvedValueOnce(json({ ...valid, state: { ...valid.state, next_attempt_at: "2026-10-31T12:00:00Z" } }));
@@ -177,7 +195,7 @@ it("[initial time] permits retry wall-clock reversal before creation and preserv
     { view: viewFor(receiptFor(), "pending", 2), next: "2026-10-31T12:00:00Z", label: "已登记，等待协调" },
     { view: viewFor(receiptFor(), "pending", 3), next: "2026-10-29T12:00:00Z", label: "已登记，等待协调" },
     { view: viewFor(receiptFor(), "enqueued", 4), next: "2026-10-29T12:00:00Z", label: "已进入协调员投递队列" },
-    { view: viewFor(receiptFor(), "assigned", 5), next: "2026-10-29T12:00:00Z", label: "已记录分配，具体执行尚未由本页核实" },
+    { view: viewFor(receiptFor(), "assigned", 5), next: "2026-10-29T12:00:00Z", label: "已记录分配，执行状态请读取下方执行回执" },
   ];
   for (const { view, next, label } of timeline) {
     views.set(view.request.id, { ...view, state: { ...view.state, next_attempt_at: next } }); refreshState(); await flush();
@@ -201,7 +219,7 @@ it("[repair 3] rejects malformed pending before it can poison the generation hig
 it.each([
   ["enqueued", 2, "pending", 3, "已进入协调员投递队列"],
   ["held", 2, "pending", 3, "协调请求暂停"],
-  ["assigned", 3, "declined", 4, "已记录分配，具体执行尚未由本页核实"],
+  ["assigned", 3, "declined", 4, "已记录分配，执行状态请读取下方执行回执"],
   ["declined", 3, "enqueued", 4, "协调员已拒绝本次分派，不能自动重派"],
 ] as const)("[repair 3] rejects an impossible observed transition %s gen%s -> %s gen%s", async (before, generation, after, nextGeneration, label) => {
   const original = viewFor(receiptFor(), before, generation); views.set(receiptFor().id, original);
@@ -215,7 +233,7 @@ it.each([
 });
 it.each([
   ["held", 5, "协调请求暂停"], ["enqueued", 5, "已进入协调员投递队列"],
-  ["assigned", 6, "已记录分配，具体执行尚未由本页核实"], ["declined", 6, "协调员已拒绝本次分派，不能自动重派"],
+  ["assigned", 6, "已记录分配，执行状态请读取下方执行回执"], ["declined", 6, "协调员已拒绝本次分派，不能自动重派"],
 ] as const)("[repair 3] allows skipped retry generations followed by %s", async (status, generation, label) => {
   await open(); editReason(); submit(); await flush();
   views.set(receiptFor().id, viewFor(receiptFor(), "pending", 4)); refreshState(); await flush();
@@ -229,7 +247,7 @@ it.each(["assigned", "declined"] as const)("[repair 3] accepts the actual enqueu
   await open(); editReason(); submit(); await flush();
   views.set(receiptFor().id, viewFor(receiptFor(), status, 3)); refreshState(); await flush();
   expect(state().queryByRole("alert")).not.toBeInTheDocument();
-  expect(state().getByText(status === "assigned" ? "已记录分配，具体执行尚未由本页核实" : "协调员已拒绝本次分派，不能自动重派")).toBeVisible();
+  expect(state().getByText(status === "assigned" ? "已记录分配，执行状态请读取下方执行回执" : "协调员已拒绝本次分派，不能自动重派")).toBeVisible();
 });
 it("[repair 4] keeps the original unknown operation when its 201 contradicts observed immutable history for that ID", async () => {
   dispatchWrites.mockRejectedValueOnce(new TypeError("Lost receipt"));
@@ -254,7 +272,7 @@ it("[repair 4] confirms a matching historical 201 without clearing the newer tru
   expect(history().getByText("任务版本 7 / 授权代次 3")).toBeVisible();
   expect(dispatch().getByText("任务版本 8 / 授权代次 5")).toBeVisible();
   expect.soft(stateReads).toHaveBeenCalledTimes(1);
-  expect(state().getByText("已记录分配，具体执行尚未由本页核实")).toBeVisible();
+  expect(state().getByText("已记录分配，执行状态请读取下方执行回执")).toBeVisible();
   expect(dispatch().queryByRole("button", { name: "重试原分派登记" })).not.toBeInTheDocument();
   expect(captured(1)).toEqual(original);
 });
@@ -286,7 +304,7 @@ it("reads lazily and requires an explicit reason and confirmation, freezing real
 });
 it.each([
   ["pending", "已登记，等待协调"], ["enqueued", "已进入协调员投递队列"], ["held", "协调请求暂停"],
-  ["assigned", "已记录分配，具体执行尚未由本页核实"], ["declined", "协调员已拒绝本次分派，不能自动重派"],
+  ["assigned", "已记录分配，执行状态请读取下方执行回执"], ["declined", "协调员已拒绝本次分派，不能自动重派"],
 ] as const)("separates immutable registration from %s without inventing lifecycle progress", async (status, label) => {
   views.set(receiptFor().id, viewFor(receiptFor(), status));
   await open(); editReason(); submit();
@@ -405,9 +423,9 @@ it("rejects generation downgrades and same-generation contradictions while retai
   }
   const late = deferred<Response>(); stateReads.mockReturnValueOnce(late.promise); refreshState();
   stateReads.mockResolvedValueOnce(json(viewFor(receiptFor(), "assigned", 5))); refreshState(); await flush();
-  expect(state().getByText("已记录分配，具体执行尚未由本页核实")).toBeVisible();
+  expect(state().getByText("已记录分配，执行状态请读取下方执行回执")).toBeVisible();
   await act(async () => late.resolve(json(viewFor(receiptFor(), "enqueued", 4))));
-  expect(state().getByText("已记录分配，具体执行尚未由本页核实")).toBeVisible();
+  expect(state().getByText("已记录分配，执行状态请读取下方执行回执")).toBeVisible();
   expect(dispatchWrites).toHaveBeenCalledTimes(1);
 });
 it("keeps TaskLifecycle unknown, creation drafts and C2 settings independent from dispatch", async () => {

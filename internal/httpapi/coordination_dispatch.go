@@ -22,6 +22,7 @@ func DispatchRequestRoutes(service *platform.DispatchRequests) []Route {
 	return []Route{
 		{http.MethodPost, "/api/v1/groups/{group}/tasks/{task}/dispatch-requests", noQuery(a.requestDispatch)},
 		{http.MethodGet, "/api/v1/groups/{group}/coordination/dispatch-requests/{request}", noQuery(a.getDispatchRequest)},
+		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/dispatch-requests/{request}/execution", noQuery(a.getDispatchExecution)},
 	}
 }
 
