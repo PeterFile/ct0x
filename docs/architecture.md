@@ -1,6 +1,8 @@
 # Local group collaboration
 
-The product is a local, single-user collaboration workspace. An empty group can begin a discussion without a profile, task, Git repository, or external working directory. The backend is one Go process with SQLite. The web client is React with TypeScript and Vite, served locally by the backend in the packaged build.
+The product is a local, single-user collaboration workspace. [PRD.md](../PRD.md) is the product authority. The accepted target is `Workspace → Project → Channel`; current runtime and persistence remain `Group/Conversation`.
+
+An empty group can begin a discussion without a profile, task, Git repository, or external working directory. The backend is one Go process with SQLite. The web client is React with TypeScript and Vite, served locally by the backend in the packaged build.
 
 The architecture direction selected on 2026-11-01 follows the pinned dsh-superagent-prototype's coordination model and uses an IM interface. [Conversation-led orchestration](orchestration.md) defines the mapping, role-scoped Engine, migration sequence, and compatibility rules. It distinguishes target design from implemented behavior. Existing storage and execution invariants below remain in force.
 
@@ -10,7 +12,7 @@ The architecture direction selected on 2026-11-01 follows the pinned dsh-superag
 - `internal/store`: SQLite transactions, migrations, indexed bounded reads, identity and resource constraints.
 - `internal/provider`: CLI discovery, capability contracts, native/one-shot transport, execution receipts. No group-specific routing.
 - `internal/platform`: shared operations, actor binding, discussion routing, task lifecycle, artifacts, skills, and context.
-- Coordination Engine (planned): source intake, versioned admission, Mandates, Assignment bindings, follow-up ownership, and structured attention through one transactional module. It reuses the existing scheduler and Store rather than introducing a parallel execution system.
+- `internal/coordination`: Engine for source intake, versioned admission, Mandates, Assignment bindings, follow-up ownership, and structured attention through one transactional module. Coordination storage and role-scoped primitives exist; production role composition remains gated. It reuses the existing Store, queue, and scheduler, not a parallel execution system.
 - `internal/scheduler`: durable claims, fair inbox/work scheduling, cancellation, and recovery.
 - `internal/httpapi`, `cmd/workspace`: loopback HTTP, SSE, process lifecycle, and platform CLI entry.
 - `web`: design tokens, accessible interaction, and server-backed views.
@@ -26,6 +28,20 @@ Only one active turn holds a conversation. Shared write resources are exclusive.
 Local user operations and member tools call the same platform methods. A member's actor is bound to the runtime session, never read from arbitrary request payloads. Cross-group history, artifacts, skills, and resources require explicit authorization.
 
 The UI does not interpret `installed` as `authenticated`, configuration presence as account proof, or process exit success as accepted deliverable. Capability flags default to unsupported. Every probe records timestamp, type, and sanitized evidence. Discovery has timeouts and never invokes a paid model request.
+
+## Project compatibility migration
+
+These are accepted requirements, not enabled Project behavior. [Migration sequencing and rollback](orchestration.md#project-migration-and-rollback) retain the existing execution authority.
+
+A Project owns Channels and Tasks and may have no directory. A Thread is shared discussion within a Channel; Thread and Task are many-to-many. An Agent Session is a member's working context, distinct from both Task and provider-native session.
+
+The first slice creates one persistent local default Workspace and a distinct Project plus one Channel for each legacy Group. Project and Channel have independent stable IDs and an explicit Group-to-Channel-to-Project mapping. This is an import policy, not `Group = Project`; names, paths, providers, or owners must not merge old groups.
+
+These initial Group-to-Channel and Channel-to-Project bindings are immutable. The first slice does not move groups or enable cross-Channel AgentInstance reuse. Workspace or Project membership never grants cross-group history, artifact, tool, or filesystem access; original group authorization and resource grants remain authoritative.
+
+Append ownership and compatibility records; do not rename or rebuild legacy tables or replace the execution system. Preserve Group IDs, member identities, messages/topics, deliveries, Task versions, artifacts, idempotency records, grants, claims, provenance, and terminal/unknown evidence.
+
+Legacy API paths and DTOs, idempotency scope/key/payload, and same-Turn, claim-token, and generation fences remain in force until their respective migration is verified. Never reinterpret a legacy Group ID as a Project or Channel ID.
 
 ## HTTP contract, version 1
 
@@ -59,7 +75,7 @@ Version and account probes cannot promote resume, append, tools, or compaction c
 
 ## Visual language
 
-Current shell direction: [reuse the pinned Openbot source](openbot-shell.md), superseding the early claude.dev direction below. Applicable color and central-token constraints, keyboard navigation, visible focus, reduced motion, and narrow-screen usability remain in force.
+The default UI is the [pinned OpenBot-derived shell](openbot-shell.md), superseding the early claude.dev direction below. That document records actual source reuse, attribution, NOTICE, and PolyForm Noncommercial 1.0.0 licensing. Applicable color and central-token constraints, keyboard navigation, visible focus, reduced motion, and narrow-screen usability remain in force.
 
 Reference inspected on 2026-10-30: [claude.dev](https://claude.dev/). Borrow its restrained charcoal canvas, warm off-white text, vermilion highlights, monospaced navigation, thin rules, and generous editorial spacing. Create original product identity; do not copy logos or illustrations.
 
