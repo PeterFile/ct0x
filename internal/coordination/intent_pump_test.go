@@ -139,7 +139,9 @@ func TestIntentPassBindingBudgetAndRotation(t *testing.T) {
 	if p.store != f.s {
 		t.Fatal("pass did not borrow the exact Engine Store")
 	}
-	if err := p.run(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := p.observe(ctx); err != nil {
 		t.Fatal(err)
 	}
 	rows := engineLocalRows(t, f.db, "SELECT kind,item FROM intent_audit ORDER BY rowid")
@@ -159,7 +161,7 @@ func TestIntentPassBindingBudgetAndRotation(t *testing.T) {
 		t.Fatalf("full pages invented exhaustion or lost next kind: %+v", p)
 	}
 	cutoff := p.cutoff
-	if err := p.run(context.Background()); err != nil {
+	if err := p.observe(ctx); err != nil {
 		t.Fatal(err)
 	}
 	rows = engineLocalRows(t, f.db, "SELECT kind,item FROM intent_audit ORDER BY rowid")
@@ -184,7 +186,9 @@ func TestIntentPassCutoffFullPageAndEmptyBudget(t *testing.T) {
 	}
 	intentAudit(t, f.db)
 	p := intentCore(t, f.s, base)
-	if err := p.run(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := p.observe(ctx); err != nil {
 		t.Fatal(err)
 	}
 	rows := engineLocalRows(t, f.db, "SELECT item FROM intent_audit ORDER BY rowid")
@@ -196,7 +200,7 @@ func TestIntentPassCutoffFullPageAndEmptyBudget(t *testing.T) {
 		t.Fatalf("budget boundary lost original key: %+v", p.dispatchAfter)
 	}
 	p.now = func() time.Time { return base.Add(time.Hour) }
-	if err := p.run(context.Background()); err != nil {
+	if err := p.observe(ctx); err != nil {
 		t.Fatal(err)
 	}
 	rows = engineLocalRows(t, f.db, "SELECT item FROM intent_audit ORDER BY rowid")
@@ -207,7 +211,7 @@ func TestIntentPassCutoffFullPageAndEmptyBudget(t *testing.T) {
 	if err != nil || view.State.Status != domain.DispatchStatusPending || view.State.Generation != 2 {
 		t.Fatalf("future candidate crossed the sweep cutoff: %+v, %v", view, err)
 	}
-	if err := p.run(context.Background()); err != nil {
+	if err := p.observe(ctx); err != nil {
 		t.Fatal(err)
 	}
 	view, err = f.s.GetDispatchRequest(context.Background(), later.GroupID, later.ID)
@@ -369,6 +373,8 @@ func TestIntentPassTransientEvidenceGate(t *testing.T) {
 	if code, ok := store.ClassifyDispatchTransient(locked); !ok || code != store.DispatchTransientSQLiteLocked {
 		t.Fatalf("not a real SQLite LOCKED cause: %v", locked)
 	}
+	expired, cancel := context.WithDeadline(context.Background(), time.Now())
+	defer cancel()
 	for _, tc := range []struct {
 		name string
 		err  error
@@ -383,6 +389,7 @@ func TestIntentPassTransientEvidenceGate(t *testing.T) {
 		{"cause-only", locked, false},
 		{"message-only", errors.New("SQLITE_BUSY: database is locked"), false},
 		{"cancelled", intentTestEvidence{cause: errors.Join(locked, context.Canceled), phase: "message", rollback: true}, false},
+		{"deadline-before-defer", intentTestEvidence{cause: errors.Join(locked, expired.Err()), phase: "message", rollback: true}, false},
 		{"conflict", intentTestEvidence{cause: errors.Join(locked, store.ErrConflict), phase: "receipt", rollback: true}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -474,16 +481,193 @@ func TestIntentPassRealCommitBusyDoesNotDefer(t *testing.T) {
 		Phase() string
 		RollbackConfirmed() bool
 		CommitOutcomeUnknown() bool
+		Unwrap() error
 	}
-	code, transient := store.ClassifyDispatchTransient(callErr)
-	if !transient || code != store.DispatchTransientSQLiteBusy || !errors.As(callErr, &evidence) ||
+	if !errors.As(callErr, &evidence) {
+		t.Fatalf("missing COMMIT transaction evidence: %v", callErr)
+	}
+	code, transient := store.ClassifyDispatchTransient(evidence.Unwrap())
+	_, aggregateTransient := store.ClassifyDispatchTransient(callErr)
+	if !transient || code != store.DispatchTransientSQLiteBusy || aggregateTransient || !errors.Is(callErr, context.DeadlineExceeded) ||
 		evidence.Phase() != "commit" || !evidence.CommitOutcomeUnknown() || evidence.RollbackConfirmed() {
-		t.Fatalf("not an actual unknown SQLite COMMIT BUSY: %v", callErr)
+		t.Fatalf("lost actual unknown COMMIT BUSY or mixed deadline tree: %v cause=%v", callErr, evidence.Unwrap())
 	}
+	t.Logf("phase=%s original-cause=%v unknown=%t rollback=%t aggregate-transient=%t mixed=%v", evidence.Phase(), evidence.Unwrap(), evidence.CommitOutcomeUnknown(), evidence.RollbackConfirmed(), aggregateTransient, callErr)
 	v, err := f.s.GetDispatchRequest(context.Background(), r.GroupID, r.ID)
 	if err != nil || v.State.Generation != 1 || v.State.AttemptCount != 0 || v.State.Delivery != nil || p.dispatchAfter == nil || p.dispatchAfter.RequestID != r.ID {
 		t.Fatalf("COMMIT BUSY was deferred or lost its cursor: %+v, %v state=%+v", v, err, p)
 	}
+}
+
+// Count deadline derivations without replacing any Store operation. The timer is
+// an observation gate after the proposed budget, not a return-latency assertion.
+type intentBudgetParent struct {
+	context.Context
+	derivations int
+	expired     *time.Timer
+}
+
+func (c *intentBudgetParent) Deadline() (time.Time, bool) {
+	c.derivations++
+	if c.expired == nil {
+		c.expired = time.NewTimer(2 * time.Second)
+	}
+	return c.Context.Deadline()
+}
+
+func TestIntentPassSharedRunBudget(t *testing.T) {
+	f := intentConfigured(t)
+	first, second := f.request(t), f.request(t)
+	intentExec(t, f.db, `CREATE TRIGGER intent_budget_fault BEFORE UPDATE ON coordination_dispatch_state
+	 WHEN NEW.request_id='`+first.ID+`'
+	 BEGIN SELECT RAISE(ABORT,'shared budget SQL fault'); END`)
+	before := engineCoordinatorSnapshot(t, f.db)
+	at := time.Now().UTC().Add(time.Second)
+	p := intentCore(t, f.s, at)
+	parent := &intentBudgetParent{Context: context.Background()}
+	defer func() {
+		if parent.expired != nil {
+			parent.expired.Stop()
+		}
+	}()
+	calls := 0
+	p.now = func() time.Time {
+		calls++
+		if parent.derivations != 1 {
+			t.Fatalf("production run must derive one shared deadline before scanning, got %d", parent.derivations)
+		}
+		if calls == 3 {
+			// The first candidate has failed and the second due read has completed.
+			// Expire the run budget before starting its Materialize, without a
+			// latency assertion or cancelling the healthy scheduler parent.
+			<-parent.expired.C
+		}
+		return at
+	}
+	err := p.run(parent)
+	var evidence interface {
+		Phase() string
+		RollbackConfirmed() bool
+		CommitOutcomeUnknown() bool
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "shared budget SQL fault") ||
+		!errors.As(err, &evidence) || evidence.Phase() != "receipt" || !evidence.RollbackConfirmed() || evidence.CommitOutcomeUnknown() {
+		t.Fatalf("shared deadline discarded the earlier real SQL/rollback cause: %v", err)
+	}
+	if calls != 3 || parent.derivations != 1 || parent.Err() != nil || p.cutoff != at ||
+		p.dispatchAfter == nil || *p.dispatchAfter != (store.DispatchDueCursor{RequestID: first.ID, NextAttemptAt: first.CreatedAt}) ||
+		!p.assignmentExhausted || p.dispatchExhausted {
+		t.Fatalf("budget refreshed, cancelled parent, or changed original sweep: calls=%d derivations=%d parent=%v state=%+v", calls, parent.derivations, parent.Err(), p)
+	}
+	if !reflect.DeepEqual(before, engineCoordinatorSnapshot(t, f.db)) {
+		t.Fatal("expired budget started another materialization, deferred, or partially wrote")
+	}
+	t.Logf("one production deadline across candidates %s/%s; original cursor=%+v cutoff=%s mixed=%v", first.ID, second.ID, p.dispatchAfter, p.cutoff, err)
+}
+
+func TestIntentPassBudgetCancellationBoundaries(t *testing.T) {
+	for _, kind := range []intentKind{intentDispatch, intentAssignment} {
+		for _, boundary := range []string{"query-child-deadline", "query-parent-deadline", "before-materialize-parent-cancel"} {
+			t.Run(fmt.Sprintf("%d/%s", kind, boundary), func(t *testing.T) {
+				f := intentConfigured(t)
+				if kind == intentDispatch {
+					f.request(t)
+				} else {
+					f.assignment(t)
+				}
+				before := engineCoordinatorSnapshot(t, f.db)
+				at := time.Now().UTC().Add(time.Second)
+				p := intentCore(t, f.s, at)
+				p.next = kind
+				ctx, cancel := context.WithCancel(context.Background())
+				var locked *sql.Conn
+				if strings.HasPrefix(boundary, "query-") {
+					var err error
+					locked, err = f.db.Conn(context.Background())
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer locked.Close()
+					if _, err := locked.ExecContext(context.Background(), "BEGIN EXCLUSIVE"); err != nil {
+						t.Fatal(err)
+					}
+					defer locked.ExecContext(context.Background(), "ROLLBACK")
+				} else {
+					calls := 0
+					p.now = func() time.Time {
+						calls++
+						if calls == 2 {
+							cancel() // Due read completed, Materialize has not begun.
+						}
+						return at
+					}
+				}
+				if boundary == "query-parent-deadline" {
+					cancel()
+					ctx, cancel = context.WithDeadline(context.Background(), time.Now().Add(100*time.Millisecond))
+				}
+				defer cancel()
+				err := p.run(ctx)
+				want := context.DeadlineExceeded
+				if boundary == "before-materialize-parent-cancel" {
+					want = context.Canceled
+				}
+				if !errors.Is(err, want) || p.cutoff != at || p.dispatchAfter != nil || p.assignmentAfter != nil ||
+					p.dispatchExhausted || p.assignmentExhausted {
+					t.Fatalf("cancellation invented cursor, exhaustion, or a widened cutoff: err=%v state=%+v", err, p)
+				}
+				if boundary == "query-child-deadline" && ctx.Err() != nil || boundary != "query-child-deadline" && !errors.Is(ctx.Err(), want) {
+					t.Fatalf("wrong parent cancellation/deadline: parent=%v pass=%v", ctx.Err(), err)
+				}
+				if locked != nil {
+					if p.next != kind {
+						t.Fatal("failed query rotated without an observation")
+					}
+					if _, err := locked.ExecContext(context.Background(), "ROLLBACK"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if !reflect.DeepEqual(before, engineCoordinatorSnapshot(t, f.db)) {
+					t.Fatal("cancelled query/Materialize boundary started writes or Defer")
+				}
+				t.Logf("kind=%d boundary=%s parent=%v cutoff=%s cause=%v", kind, boundary, ctx.Err(), p.cutoff, err)
+			})
+		}
+	}
+}
+
+func TestIntentPassStoreDefaultBeginBusy(t *testing.T) {
+	f := intentConfigured(t)
+	r := f.request(t)
+	before := engineCoordinatorSnapshot(t, f.db)
+	writer, err := f.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Rollback()
+	if _, err := writer.Exec("UPDATE groups SET name=name WHERE id=?", f.thread.GroupID); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	_, callErr := f.s.MaterializeDispatchRequest(context.Background(), r.ID, 1, time.Now())
+	var evidence interface {
+		Phase() string
+		RollbackConfirmed() bool
+		CommitOutcomeUnknown() bool
+		Unwrap() error
+	}
+	if !errors.As(callErr, &evidence) {
+		t.Fatalf("missing direct Store BEGIN evidence: %v", callErr)
+	}
+	code, transient := store.ClassifyDispatchTransient(evidence.Unwrap())
+	if evidence.Phase() != "begin" || !evidence.RollbackConfirmed() || evidence.CommitOutcomeUnknown() ||
+		!transient || code != store.DispatchTransientSQLiteBusy || errors.Is(callErr, context.DeadlineExceeded) || errors.Is(callErr, context.Canceled) {
+		t.Fatalf("not a default5000 no-transaction SQLITE_BUSY cause: %v", callErr)
+	}
+	if !reflect.DeepEqual(before, engineCoordinatorSnapshot(t, f.db)) {
+		t.Fatal("direct BEGIN BUSY partially wrote or deferred")
+	}
+	t.Logf("unmodified Store.Open default5000: phase=%s cause=%v no-transaction=%t unknown=%t elapsed=%s", evidence.Phase(), evidence.Unwrap(), evidence.RollbackConfirmed(), evidence.CommitOutcomeUnknown(), time.Since(started))
 }
 
 func TestIntentPassCancellationAndQueryFailure(t *testing.T) {
