@@ -11,14 +11,19 @@ import (
 	"agentworkspace/internal/store"
 )
 
-func TestDispatchRequestPlatformBorrowedEngineAndTwoLocalUserMethods(t *testing.T) {
+func TestDispatchRequestPlatformBorrowedEngineAndThreeLocalUserMethods(t *testing.T) {
 	f := setupLocalMessages(t)
 	ctx := context.Background()
 	lead, worker := f.member(t, f.groupID), f.member(t, f.groupID)
 	engine := coordination.New(f.db)
 	service := NewDispatchRequests(engine)
-	if service.engine != engine || reflect.TypeOf(service).NumMethod() != 2 {
-		t.Fatal("dispatch service must borrow the supplied Engine and expose only two operations without lifecycle")
+	serviceType := reflect.TypeOf(service)
+	methods := make([]string, serviceType.NumMethod())
+	for i := range methods {
+		methods[i] = serviceType.Method(i).Name
+	}
+	if service.engine != engine || !reflect.DeepEqual(methods, []string{"GetDispatchExecution", "GetDispatchRequest", "RequestDispatch"}) {
+		t.Fatal("dispatch service must borrow the supplied Engine and expose only RequestDispatch, GetDispatchRequest, and GetDispatchExecution without lifecycle methods")
 	}
 	if _, err := engine.SetCoordinator(ctx, f.groupID, lead.ID, 0, "shared"); err != nil {
 		t.Fatal(err)
