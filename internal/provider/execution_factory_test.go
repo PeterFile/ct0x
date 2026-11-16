@@ -32,6 +32,9 @@ func TestNewExecutorBindsExactSupportedProviderWithoutProbing(t *testing.T) {
 				Capabilities: Capabilities{Resume: true, Tools: true}, Evidence: []Evidence{{Reason: "unchanged"}}}
 			before := selected
 			before.Evidence = append([]Evidence(nil), selected.Evidence...)
+			if err := ValidateExecutor(selected, tc.timeout); err != nil || !reflect.DeepEqual(selected, before) {
+				t.Fatalf("validation rejected verified metadata or mutated it: %v", err)
+			}
 			e, err := NewExecutor(selected, tc.timeout)
 			if err != nil || e == nil {
 				t.Fatalf("supported unknown-account provider rejected: %v", err)
@@ -95,6 +98,7 @@ func TestNewExecutorPreservesCapturedStatFailure(t *testing.T) {
 			}
 			selected := Provider{ID: "opaque-id", Name: Pi, Version: "1.4.0", Path: path, Installation: Installed}
 			executor, captured := NewExecutor(selected, 0)
+			validated := ValidateExecutor(selected, 0)
 			// Restore before inspecting the captured error; later path state must
 			// not be used to infer what the actual factory stat observed.
 			if tc.errno == syscall.ELOOP {
@@ -108,15 +112,17 @@ func TestNewExecutorPreservesCapturedStatFailure(t *testing.T) {
 			if executor != nil || !errors.Is(captured, errExecutorConfiguration) || !errors.Is(captured, tc.errno) {
 				t.Fatalf("factory lost captured stat cause or returned an executor: %T, %v", executor, captured)
 			}
-			var stat *os.PathError
-			if !errors.As(captured, &stat) || stat.Op != "stat" || stat.Path != path || !errors.Is(stat.Err, tc.errno) {
-				t.Fatal("factory did not preserve the actual stat PathError")
-			}
-			if tc.errno == syscall.ENOENT && !errors.Is(captured, os.ErrNotExist) {
-				t.Fatal("factory lost os.ErrNotExist classification")
-			}
-			if captured.Error() != "提供方执行配置无效或版本不受支持" || strings.Contains(captured.Error(), "PRIVATE") {
-				t.Fatal("factory changed its exact sanitized error text")
+			for _, observed := range []error{captured, validated} {
+				var stat *os.PathError
+				if !errors.Is(observed, errExecutorConfiguration) || !errors.As(observed, &stat) || stat.Op != "stat" || stat.Path != path || !errors.Is(stat.Err, tc.errno) {
+					t.Fatal("factory/validator did not preserve the actual stat PathError")
+				}
+				if tc.errno == syscall.ENOENT && !errors.Is(observed, os.ErrNotExist) {
+					t.Fatal("factory/validator lost os.ErrNotExist classification")
+				}
+				if observed.Error() != "提供方执行配置无效或版本不受支持" || strings.Contains(observed.Error(), "PRIVATE") {
+					t.Fatal("factory/validator changed its exact sanitized error text")
+				}
 			}
 			if _, err := os.Stat(path + ".invoked"); !os.IsNotExist(err) {
 				t.Fatalf("factory invoked native executable: %v", err)
@@ -167,6 +173,11 @@ func TestNewExecutorRejectsUnverifiedConfiguration(t *testing.T) {
 			selected := Provider{ID: "selected", Name: Pi, Version: "1.4.0", Path: path, Installation: Installed}
 			tc.edit(&selected)
 			e, err := NewExecutor(selected, time.Second)
+			validationErr := ValidateExecutor(selected, time.Second)
+			if !errors.Is(validationErr, errExecutorConfiguration) || validationErr.Error() != "提供方执行配置无效或版本不受支持" ||
+				(tc.name != "missing executable" && validationErr != errExecutorConfiguration) {
+				t.Fatalf("validator configuration ordering or classification changed: %v", validationErr)
+			}
 			if e != nil || !errors.Is(err, errExecutorConfiguration) || err.Error() != "提供方执行配置无效或版本不受支持" {
 				t.Fatalf("invalid configuration accepted or leaked: %T, %v", e, err)
 			}
@@ -176,6 +187,9 @@ func TestNewExecutorRejectsUnverifiedConfiguration(t *testing.T) {
 		})
 	}
 	selected := Provider{ID: "selected", Name: Pi, Version: "1.4.0", Path: path, Installation: Installed}
+	if err := ValidateExecutor(selected, -time.Second); err != errExecutorConfiguration {
+		t.Fatalf("validator timeout sentinel changed: %v", err)
+	}
 	if e, err := NewExecutor(selected, -time.Second); e != nil || err != errExecutorConfiguration {
 		t.Fatalf("negative timeout accepted: %T, %v", e, err)
 	}

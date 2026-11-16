@@ -158,6 +158,74 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 // summary coverage frontier. Summary is always nil.
 func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (scheduler.PreparedExecution, error) {
 	var empty scheduler.PreparedExecution
+	input, err := p.loadPreparationInput(ctx, pending)
+	if err != nil {
+		return empty, err
+	}
+	group, member, conversation, trigger, state := input.group, input.member, input.conversation, input.trigger, input.state
+	d := pending.Delivery
+	if state.Provenance.Kind != store.CoordinationRoleOrdinary {
+		return p.prepareCoordinationRole(ctx, state, group, member, conversation, trigger)
+	}
+	if state.Blocked != store.CoordinationReady || member.Status != domain.MemberStatusActive || len(member.Model) > 256 || strings.ContainsAny(member.Model, "\x00\r\n") {
+		return empty, scheduler.ErrNotReady
+	}
+	selected, ok := p.providers[member.ProviderID]
+	if !ok {
+		return empty, scheduler.ErrNotReady
+	}
+	executor, err := provider.NewExecutor(selected, p.executionTimeout)
+	if err != nil {
+		return empty, scheduler.ErrNotReady
+	}
+	useMemberTools := p.memberTools != nil && selected.Name == provider.Pi
+	if useMemberTools && !memberToolRuntimeText(member.Model) {
+		return empty, scheduler.ErrNotReady
+	}
+	history, err := p.store.ListPreparationHistory(ctx, group.ID, trigger.ID, p.historyLimit)
+	if err != nil {
+		return empty, preparationReadError(ctx, err)
+	}
+	prompt, err := p.buildContext(group, member, conversation, trigger, history, useMemberTools)
+	if err != nil {
+		return empty, err
+	}
+	if err := ctx.Err(); err != nil {
+		return empty, preparationReadError(ctx, err)
+	}
+	cwd, key, err := p.workspace(member, conversation)
+	if err != nil {
+		return empty, err
+	}
+	if err := ctx.Err(); err != nil {
+		return empty, preparationReadError(ctx, err)
+	}
+	if useMemberTools {
+		executor, err = p.memberTools.Wrap(MemberToolRunBinding{GroupID: group.ID, MemberID: member.ID,
+			ConversationID: conversation.ID, DeliveryID: d.ID, ProviderID: selected.ID, Model: member.Model},
+			func(configPath, _ string, toolNames []string) (provider.Executor, error) {
+				return provider.NewPiMemberToolExecutorWithTools(selected, p.piMemberToolsExtension, configPath, toolNames, p.executionTimeout)
+			})
+		if err != nil {
+			return empty, scheduler.ErrNotReady
+		}
+	}
+	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{key},
+		Request: provider.ExecuteRequest{CWD: cwd, Prompt: string(prompt), Model: member.Model}}, nil
+}
+
+type preparationInput struct {
+	group        domain.Group
+	member       domain.Member
+	conversation domain.Conversation
+	trigger      domain.Message
+	state        store.CoordinationRoleState
+}
+
+// Keep the authority read order and checks shared by both trusted entry points.
+// These separate reads are not an atomic snapshot or execution authorization.
+func (p *Preparer) loadPreparationInput(ctx context.Context, pending store.PendingDelivery) (preparationInput, error) {
+	var empty preparationInput
 	if err := ctx.Err(); err != nil {
 		return empty, preparationReadError(ctx, err)
 	}
@@ -211,54 +279,7 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	if err := validatePreparationRole(state, group, member, conversation, trigger, d); err != nil {
 		return empty, err
 	}
-	if state.Provenance.Kind != store.CoordinationRoleOrdinary {
-		return p.prepareCoordinationRole(ctx, state, group, member, conversation, trigger)
-	}
-	if state.Blocked != store.CoordinationReady || member.Status != domain.MemberStatusActive || len(member.Model) > 256 || strings.ContainsAny(member.Model, "\x00\r\n") {
-		return empty, scheduler.ErrNotReady
-	}
-	selected, ok := p.providers[member.ProviderID]
-	if !ok {
-		return empty, scheduler.ErrNotReady
-	}
-	executor, err := provider.NewExecutor(selected, p.executionTimeout)
-	if err != nil {
-		return empty, scheduler.ErrNotReady
-	}
-	useMemberTools := p.memberTools != nil && selected.Name == provider.Pi
-	if useMemberTools && !memberToolRuntimeText(member.Model) {
-		return empty, scheduler.ErrNotReady
-	}
-	history, err := p.store.ListPreparationHistory(ctx, group.ID, trigger.ID, p.historyLimit)
-	if err != nil {
-		return empty, preparationReadError(ctx, err)
-	}
-	prompt, err := p.buildContext(group, member, conversation, trigger, history, useMemberTools)
-	if err != nil {
-		return empty, err
-	}
-	if err := ctx.Err(); err != nil {
-		return empty, preparationReadError(ctx, err)
-	}
-	cwd, key, err := p.workspace(member, conversation)
-	if err != nil {
-		return empty, err
-	}
-	if err := ctx.Err(); err != nil {
-		return empty, preparationReadError(ctx, err)
-	}
-	if useMemberTools {
-		executor, err = p.memberTools.Wrap(MemberToolRunBinding{GroupID: group.ID, MemberID: member.ID,
-			ConversationID: conversation.ID, DeliveryID: d.ID, ProviderID: selected.ID, Model: member.Model},
-			func(configPath, _ string, toolNames []string) (provider.Executor, error) {
-				return provider.NewPiMemberToolExecutorWithTools(selected, p.piMemberToolsExtension, configPath, toolNames, p.executionTimeout)
-			})
-		if err != nil {
-			return empty, scheduler.ErrNotReady
-		}
-	}
-	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{key},
-		Request: provider.ExecuteRequest{CWD: cwd, Prompt: string(prompt), Model: member.Model}}, nil
+	return preparationInput{group: group, member: member, conversation: conversation, trigger: trigger, state: state}, nil
 }
 
 func preparationReadError(ctx context.Context, err error) error {
