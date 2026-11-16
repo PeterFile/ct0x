@@ -139,6 +139,8 @@ jobs:
         run: go test -count=1 ./internal/coordination
       - name: Race test coordination package
         run: go test -count=1 -race ./internal/coordination
+      - name: Ordinary test cmd package
+        run: go test -count=1 ./cmd/workspace
       - name: Race test all other packages
         run: |
           set -euo pipefail
