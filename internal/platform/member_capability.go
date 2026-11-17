@@ -42,6 +42,7 @@ type MemberTools struct {
 	db           *store.Store
 	mu           sync.RWMutex
 	capabilities map[[sha256.Size]byte]memberToolRegistration
+	mcpRequests  map[[sha256.Size]byte]map[[sha256.Size]byte][sha256.Size]byte
 	chatEngine   *coordination.Engine
 }
 
@@ -130,6 +131,7 @@ func (s *MemberTools) Revoke(token string) {
 	key := sha256.Sum256([]byte(token))
 	s.capabilities[key].skills.clear()
 	delete(s.capabilities, key)
+	delete(s.mcpRequests, key)
 }
 
 func (s *MemberTools) RevokeTurn(turnID string) {
@@ -139,6 +141,7 @@ func (s *MemberTools) RevokeTurn(turnID string) {
 		if entry.scope.Claim.TurnID == turnID {
 			entry.skills.clear()
 			delete(s.capabilities, key)
+			delete(s.mcpRequests, key)
 		}
 	}
 }

@@ -99,11 +99,11 @@ func TestMemberMCPRealRoleHandlersReplayAndUnknown(t *testing.T) {
 			t.Fatal("MCP decision did not reuse the native handler/key namespace")
 		}
 		conflict := memberMCPRoleHTTP(t, f, token, `"decision"`, "tools/call", strings.Replace(params, "eligible", "changed", 1))
-		unknown := memberMCPRoleText(t, conflict, true)
-		// Decide's public native handler deliberately preserves an opaque conflict
-		// as unconfirmed; MCP must not turn it into a known rollback or retry.
-		if !strings.Contains(unknown, `"code":"internal_error"`) || !strings.Contains(unknown, "未确认") || !strings.Contains(unknown, "相同 JSON-RPC id") || !strings.Contains(unknown, "原幂等键") || !strings.Contains(unknown, "不要自动重试") || !reflect.DeepEqual(before, f.decisionSnapshot(t)) {
-			t.Fatal("MCP changed the native role unknown boundary")
+		rejected := memberMCPRoleText(t, conflict, true)
+		// Changed request identity is a protocol rejection, not an outcome for
+		// the original command. Native unknown faults below must stay unknown.
+		if !strings.Contains(rejected, `"code":"conflict"`) || !strings.Contains(rejected, "相同 JSON-RPC id") || !strings.Contains(rejected, "原幂等键") || !strings.Contains(rejected, "不要自动重试") || !reflect.DeepEqual(before, f.decisionSnapshot(t)) {
+			t.Fatal("changed role request bypassed its binding or lost reconciliation guidance")
 		}
 		denied := memberMCPRoleHTTP(t, f, token, "10", "tools/call", `{"name":"submit_result","arguments":{"summary":"wrong role"}}`)
 		if !strings.Contains(memberMCPRoleText(t, denied, true), `"code":"forbidden"`) {
@@ -200,6 +200,20 @@ func TestMemberMCPRealCommitRejectionPreservesNativeCode(t *testing.T) {
 		text := memberMCPRoleText(t, w, true)
 		if !strings.Contains(text, `"code":"internal_error"`) || !strings.Contains(text, "未确认") || strings.Contains(text, "PRIVATE") || !strings.Contains(text, "不要自动重试") || !reflect.DeepEqual(before, f.decisionSnapshot(t)) {
 			t.Fatal("real deferred-FK Commit failure lost native uncertainty or leaked SQL")
+		}
+		changed := memberMCPRoleHTTP(t, f, token, "1", "tools/call", `{"name":"decide_dispatch","arguments":{"kind":"decline","reason":"changed after rollback"}}`)
+		if !strings.Contains(memberMCPRoleText(t, changed, true), `"code":"conflict"`) || !reflect.DeepEqual(before, f.decisionSnapshot(t)) {
+			t.Fatal("a rollback or unknown response discarded the live request binding")
+		}
+		// Remove this known fixture fault, then explicitly replay the original
+		// request. No cached error or inferred result may replace the handler.
+		_, err := f.raw.Exec("DROP TRIGGER member_mcp_commit_fault")
+		roleOK(t, err)
+		original := `{"name":"decide_dispatch","arguments":{"kind":"decline","reason":"legal"}}`
+		succeeded := memberMCPRoleHTTP(t, f, token, "1", "tools/call", original)
+		memberMCPRoleText(t, succeeded, false)
+		if replay := memberMCPRoleHTTP(t, f, token, "1", "tools/call", original); replay.Body.String() != succeeded.Body.String() {
+			t.Fatal("original request did not reach the native success receipt after rollback")
 		}
 		f.claims(t, run, domain.TurnStateStarting, 1)
 		return roleNotStarted()

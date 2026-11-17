@@ -110,9 +110,19 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			if tool.Name != name {
 				continue
 			}
+			key := memberMCPKey(token, id)
+			fingerprint, bindErr := memberMCPFingerprint(name, arguments)
+			if bindErr != nil {
+				memberMCPError(w, 400, id, -32602, "工具 arguments 无效")
+				return
+			}
+			if bindErr = a.tools.BindMCPRequest(token, sha256.Sum256([]byte(key)), fingerprint); bindErr != nil {
+				memberMCPBindingError(w, id, bindErr)
+				return
+			}
 			// Discovery preflight is not command outcome evidence: its generic
 			// validator sanitizes SQL errors that role writes must keep unknown.
-			// Always use the fixed native handler's own token/claim/purpose and
+			// Unchanged bindings use the native handler's own token/claim/purpose and
 			// same-tx fences, even after a preflight error. No URL dispatch or
 			// model headers/metadata can bypass those checks.
 			native := r.Clone(r.Context())
@@ -120,7 +130,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			native.Body = io.NopCloser(bytes.NewReader(arguments))
 			native.ContentLength = int64(len(arguments))
 			if tool.write {
-				native.Header.Set("Idempotency-Key", memberMCPKey(token, id))
+				native.Header.Set("Idempotency-Key", key)
 			}
 			buffer = newMemberMCPBuffer()
 			tool.invoke(a, buffer, native, token)
