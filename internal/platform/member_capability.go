@@ -34,6 +34,8 @@ type memberToolRegistration struct {
 	role      store.CoordinationToolScope
 	candidate *domain.ChatCandidate
 	purpose   string
+	// Frozen server capability facts are not grants or model-controlled input.
+	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
 
 // MemberTools owns process-local capabilities; durable claims authorize every use.

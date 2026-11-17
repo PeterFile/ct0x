@@ -431,6 +431,9 @@ func TestInspectRoleReadinessCallBoundary(t *testing.T) {
 		{"prepare_inspect.go", "roleInspectionResult"},
 		{"prepare.go", "loadPreparationInput"},
 		{"prepare_roles.go", "planCoordinationRole"},
+		{"prepare_adapters.go", "sampleMemberToolAdapter"},
+		{"prepare_adapters.go", "sampleMemberToolMember"},
+		{"prepare_adapters.go", "sampleDispatchCandidates"},
 		{"prepare_roles.go", "format"},
 		{"../provider/execution_factory.go", "ValidateExecutor"},
 	} {
@@ -470,7 +473,7 @@ func TestInspectRoleReadinessCallBoundary(t *testing.T) {
 						t.Error("Inspect workspace mode is not the private literal false")
 					}
 				}
-				if slices.Contains([]string{"Prepare", "workspace", "NewExecutor", "NewPiExecutor", "NewCodexExecutor", "NewPiMemberToolExecutorWithTools", "Wrap", "WrapCoordinationRole", "ClaimTurn", "BindMemberTool", "Issue", "Mkdir", "MkdirAll", "OpenFile"}, name) {
+				if slices.Contains([]string{"Prepare", "workspace", "NewExecutor", "NewPiExecutor", "NewCodexExecutor", "NewPiMemberToolExecutorWithTools", "Wrap", "WrapCoordinationRole", "WrapCoordinationRoleWithCapabilities", "ClaimTurn", "BindMemberTool", "Issue", "Mkdir", "MkdirAll", "OpenFile"}, name) {
 					t.Errorf("%s still calls forbidden Inspect operation %s", target.name, name)
 				}
 				return true
@@ -481,7 +484,7 @@ func TestInspectRoleReadinessCallBoundary(t *testing.T) {
 			if target.name == "loadPreparationInput" && !slices.Equal(authorityReads, []string{"GetGroup", "GetMember", "GetConversation", "GetMessage", "ResolveCoordinationDelivery"}) {
 				t.Error("shared authority load changed the original read order/count")
 			}
-			if (target.name == "planCoordinationRole" || target.name == "ValidateExecutor") && stats != 1 {
+			if (target.name == "sampleMemberToolAdapter" || target.name == "ValidateExecutor") && stats != 1 {
 				t.Error("role preflight/provider validation no longer has one original stat each")
 			}
 		}

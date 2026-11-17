@@ -83,12 +83,20 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		if err != nil {
 			return err
 		}
+		catalog, err = catalog.WithAdapterReports(preparer.AdapterReports())
+		if err != nil {
+			return err
+		}
 		executionStatus = "全新单轮执行已启用，最大并发 1；可由本机用户明确登记单成员只读目录授权，不新增文件工具"
 	}
 	if memberTools != nil {
-		toolStatus = "平台工具已配置：仅已验证 Pi 1.4.0 且显式指定模型时可用六项成员工具（含只读历史搜索与分段读取）；Codex 仅原生只读工具且无平台令牌；不授予 Coordinator、Assignment 或 RequestWork 权限"
+		adapterStatus := "仅已验证 Pi 1.4.0 且显式指定模型时可用六项成员工具（含只读历史搜索与分段读取）；Codex 仅原生只读工具且无平台令牌"
+		if config.enableCodexAppServer {
+			adapterStatus = "Pi 仍须受支持版本、可信扩展与显式模型；Codex 已显式选择实验性 AppServer 与同一成员工具的会话级 MCP，须版本能力受支持且指定模型；仅受限只读原生文本配置（无可写目录、审批 never），不保证禁用所有原生工具或隔离文件读取，不启用文件任务或 Artifact；能力报告不是账号或网络实测，也不授予工作许可"
+		}
+		toolStatus = "平台工具已配置：" + adapterStatus + "；不授予 Coordinator、Assignment 或 RequestWork 权限"
 		if config.enableCoordinationRoles {
-			toolStatus = "平台工具与协调角色已配置：普通投递仍仅六项基础成员工具且不授予角色；启用话题聊天策略后可通过绑定来源的结构化语义评估自动准入与登记文本分派，不开放成员冒充本机用户的 RequestWork/RequestDispatch；受信协调员与工作成员按服务端执行身份分别绑定专用工具；仅已验证 Pi 1.4.0 且显式指定模型时可执行，Codex 仅原生只读工具且无平台令牌；分派登记不直接执行，具体成果提交不等于接纳；角色就绪查询仅为采样诊断，不保证后续认领或执行"
+			toolStatus = "平台工具与协调角色已配置：普通投递仍仅六项基础成员工具且不授予角色；启用话题聊天策略后可通过绑定来源的结构化语义评估自动准入与登记文本分派，不开放成员冒充本机用户的 RequestWork/RequestDispatch；受信协调员与工作成员按服务端执行身份分别绑定专用工具；" + adapterStatus + "；分派登记不直接执行，具体成果提交不等于接纳；角色就绪查询仅为采样诊断，不保证后续认领或执行"
 		}
 	}
 	local := platform.NewLocalUser(db)
@@ -113,6 +121,9 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if memberTools != nil {
 		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)
 		routes = append(routes, httpapi.MemberHistoryToolRoutes(memberTools.Tools())...)
+		if config.enableCodexAppServer {
+			routes = append(routes, httpapi.MemberMCPRoutes(memberTools.Tools())...)
+		}
 	}
 	if config.enableCoordinationRoles {
 		routes = append(routes, httpapi.DispatchRequestRoutes(platform.NewDispatchRequests(engine))...)

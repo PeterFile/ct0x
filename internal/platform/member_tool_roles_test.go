@@ -140,9 +140,24 @@ func (f memberRoleFixture) claimWorker(t *testing.T, decision domain.DecisionRec
 	return scope
 }
 
+// These fixtures stand in for trusted, successful adapter sampling. Production
+// preparation must additionally check the selected adapter and executable.
+func memberRoleCapabilityFacts(t *testing.T, tools *MemberTools, groupID string) []store.DispatchWorkerCapabilityFact {
+	t.Helper()
+	members, err := tools.db.ListMembers(context.Background(), groupID, store.ListOptions{Limit: 200})
+	if err != nil || members.NextCursor != nil {
+		t.Fatalf("fixture capability facts: %+v, %v", members, err)
+	}
+	var facts []store.DispatchWorkerCapabilityFact
+	for _, member := range members.Items {
+		facts = append(facts, store.DispatchWorkerCapabilityFact{GroupID: groupID, MemberID: member.ID, ProviderID: member.ProviderID, Model: member.Model})
+	}
+	return facts
+}
+
 func memberRoleIssue(t *testing.T, tools *MemberTools, scope store.CoordinationToolScope) string {
 	t.Helper()
-	token, err := tools.issueCoordinationRole(context.Background(), scope)
+	token, err := tools.issueCoordinationRoleWithCapabilities(context.Background(), scope, memberRoleCapabilityFacts(t, tools, scope.Provenance.GroupID))
 	if err != nil || token == "" || token == scope.Member.Claim.Token {
 		t.Fatalf("private role issuance did not return a distinct capability: %v", err)
 	}
