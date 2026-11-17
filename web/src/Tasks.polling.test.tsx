@@ -1,13 +1,15 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Tasks } from "./Tasks";
-import type { Task, TaskSubmission } from "./task-api";
+import type { Task, TaskAttempt, TaskSubmission } from "./task-api";
 import { deferred, group, json, page } from "./test/groups";
 import { acceptedTask, secondTask, submittedTask, task } from "./test/tasks";
 
 const transport = vi.fn<typeof fetch>();
 let current: Task, items: Task[];
 let evidenceResponse: Promise<Response> | undefined;
+const humanAttempt: TaskAttempt = { id: "attempt-1", task_id: task.id, group_id: group.id, task_revision: 1,
+  turn_id: "", created_at: task.created_at };
 const submission: TaskSubmission = { id: "submission-1", task_id: task.id, group_id: group.id, task_revision: 1,
   attempt_id: "attempt-1", summary: "服务端真实文本交付", submitted_by: "member-1", artifact_versions: [], created_at: task.created_at };
 const flush = () => act(async () => {});
@@ -16,12 +18,13 @@ const panel = () => within(screen.getByRole("region", { name: "群组任务" }))
 beforeEach(() => {
   vi.useFakeTimers(); current = task; items = []; evidenceResponse = undefined;
   transport.mockReset().mockImplementation(async url => String(url).includes("/submissions/") ? evidenceResponse ?? json(submission)
-    : String(url).includes("/tasks?") ? page(String(url).includes("before=") ? [secondTask] : items, "older") : json(current));
+    : String(url).includes("/attempts/") ? evidenceResponse ?? json(humanAttempt)
+      : String(url).includes("/tasks?") ? page(String(url).includes("before=") ? [secondTask] : items, "older") : json(current));
   vi.stubGlobal("fetch", transport);
 });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-it("automatically reads new Tasks and authoritative Submissions while leaving final Review to the user", async () => {
+it("UI-3: continues independent list reads during slow Submission evidence without replacing its detail epoch", async () => {
   render(<Tasks group={group} />); await flush();
   expect(panel().getByText("尚无任务，可创建任务并约定验收条件。")).toBeVisible();
   items = [task]; await tick();
@@ -35,14 +38,38 @@ it("automatically reads new Tasks and authoritative Submissions while leaving fi
   expect(panel().getByRole("textbox", { name: "验收说明（可选）" })).toBe(reason);
   expect(reason).toBeEnabled(); expect(reason).toHaveFocus(); expect(reason).toHaveValue("保留人工验收草稿");
   expect(panel().getByRole("button", { name: "接纳交付" })).toBeDisabled();
-  const count = transport.mock.calls.length; await tick(20000);
-  expect(transport).toHaveBeenCalledTimes(count);
+  const count = transport.mock.calls.length;
+  const nonListReads = () => transport.mock.calls.filter(([url]) => !String(url).includes("/tasks?"));
+  const originalReads = nonListReads(), signal = originalReads.at(-1)?.[1]?.signal;
+  items = [current, secondTask];
+  for (let cycle = 0; cycle < 4; ++cycle) await tick();
+  expect(panel().getByRole("button", { name: `${secondTask.title}，待交付` })).toBeVisible();
+  expect(transport).toHaveBeenCalledTimes(count + 4);
+  expect(nonListReads()).toEqual(originalReads); expect(signal?.aborted).toBe(false);
   await act(async () => evidence.resolve(json(submission))); evidenceResponse = undefined;
   expect(panel().getByRole("button", { name: "接纳交付" })).toBeEnabled();
   current = acceptedTask; items = [current]; await tick();
   expect(panel().getByRole("button", { name: `${task.title}，已接纳` })).toBeVisible();
   expect(panel().queryByRole("button", { name: "接纳交付" })).not.toBeInTheDocument();
   expect(transport.mock.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+});
+it("UI-2: keeps the human summary DOM and editing focus during background Attempt reads, but fences submission", async () => {
+  current = { ...task, active_attempt_id: humanAttempt.id }; items = [current];
+  render(<Tasks group={group} />); await flush();
+  fireEvent.click(panel().getByRole("button", { name: `${task.title}，待交付` })); await flush();
+  const summary = panel().getByRole("textbox", { name: "交付摘要" });
+  fireEvent.change(summary, { target: { value: "人工交付草稿" } }); summary.focus(); fireEvent.compositionStart(summary);
+  const evidence = deferred<Response>(); evidenceResponse = evidence.promise; await tick();
+  expect(summary).toBeInTheDocument(); expect(panel().getByRole("textbox", { name: "交付摘要" })).toBe(summary);
+  expect(summary).toBeEnabled(); expect(summary).toHaveFocus();
+  fireEvent.change(summary, { target: { value: "后台期间继续编辑" } });
+  expect(panel().getByRole("button", { name: "提交交付" })).toBeDisabled();
+  fireEvent.submit(panel().getByRole("form", { name: "提交交付" })); await flush();
+  expect(transport.mock.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+  await act(async () => evidence.resolve(json(humanAttempt)));
+  fireEvent.compositionEnd(summary);
+  expect(panel().getByRole("textbox", { name: "交付摘要" })).toBe(summary); expect(summary).toHaveFocus();
+  expect(summary).toHaveValue("后台期间继续编辑"); expect(panel().getByRole("button", { name: "提交交付" })).toBeEnabled();
 });
 it("keeps loaded older rows and creation drafts during latest-page polling, and stops while the panel is inactive", async () => {
   items = [task]; const view = render(<Tasks group={group} />); await flush();

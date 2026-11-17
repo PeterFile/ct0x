@@ -64,7 +64,7 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
   const memberNames = new Map(members.filter(member => member.group_id === groupId).map(member => [member.id, member.name]));
   const authorName = (id: string) => id === "user" ? "我" : memberNames.get(id) ?? "未载入成员";
   const blocked = mutation.pending || mutation.uncertain;
-  const suggestions = mention && active && !blocked ? eligible.filter(member => !recipients.includes(member.id)
+  const suggestions = mention && active && !blocked ? eligible.filter(member => (route !== "selected" || !recipients.includes(member.id))
     && `${member.name} ${member.role} ${member.id}`.toLocaleLowerCase().includes(mention.query.toLocaleLowerCase())) : [];
   const highlighted = Math.min(highlight, suggestions.length - 1);
   useLayoutEffect(() => {
@@ -78,9 +78,10 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
       setMutation(previous => ({ ...previous, notice: "原发送尚未确认，不能替换接收者。" })); return;
     }
     if (!eligible.some(member => member.id === recipientSelection.memberId)) return;
-    setRecipients(previous => previous.includes(recipientSelection.memberId) ? previous : [...previous, recipientSelection.memberId]);
+    setRecipients(previous => route !== "selected" ? [recipientSelection.memberId]
+      : previous.includes(recipientSelection.memberId) ? previous : [...previous, recipientSelection.memberId]);
     setRoute("selected"); setMention(null); textarea.current?.focus();
-  }, [recipientSelection, groupId, members]);
+  }, [recipientSelection, groupId, members, route]);
   function updateMention(input: HTMLTextAreaElement) {
     const end = input.selectionStart, match = /@([^\s@]*)$/u.exec(input.value.slice(0, end));
     setMention(!composing.current && input.selectionStart === input.selectionEnd && match
@@ -90,7 +91,7 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
   function selectMention(id: string) {
     const member = eligible.find(member => member.id === id);
     if (blocked || posting.current || operation.current || !member || !mention) return;
-    setRecipients(previous => previous.includes(id) ? previous : [...previous, id]); setRoute("selected");
+    setRecipients(previous => route !== "selected" ? [id] : previous.includes(id) ? previous : [...previous, id]); setRoute("selected");
     const insertion = `@${member.name} `;
     caret.current = mention.start + insertion.length;
     setContent(previous => previous.slice(0, mention.start) + insertion + previous.slice(mention.end)); setMention(null);

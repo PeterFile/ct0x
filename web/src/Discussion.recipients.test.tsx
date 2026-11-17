@@ -55,6 +55,26 @@ it("binds the clicked same-name suggestion to its ID, not a subsequent matching 
   await screen.findByText(/消息已持久化/);
   expect(JSON.parse(String(attempt().body))).toEqual({ content: `${member.name} 和 @${member.name} 都只是正文`, recipient_ids: [twin.id] });
 });
+it.each([
+  { mode: "public", entry: "mention" },
+  { mode: "default", entry: "avatar" },
+])("UI-1: selects only the new $entry recipient after switching to $mode", async ({ mode, entry }) => {
+  const view = render(scope()); await screen.findByText("尚无消息，可发送第一条讨论。");
+  change("@"); fireEvent.click(choice(member.id));
+  fireEvent.click(screen.getByText("发送选项", { selector: "summary" }));
+  fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: mode } });
+  expect(screen.queryByRole("list", { name: "已选接收者" })).not.toBeInTheDocument();
+  if (entry === "mention") {
+    change("@"); expect.soft(choices().queryByRole("option", { name: new RegExp(member.id) })).toBeVisible();
+    fireEvent.click(choice(twin.id));
+  } else {
+    view.rerender(<Discussion groupId={group.id} members={{ [group.id]: roster }}
+      recipientSelection={{ groupId: group.id, memberId: twin.id, version: 1 }} />);
+  }
+  expect.soft(chosen().getAllByRole("listitem")).toHaveLength(1);
+  change("本次只发给 B"); submit(); await screen.findByText(/消息已持久化/);
+  expect(JSON.parse(String(attempt().body))).toEqual({ content: "本次只发给 B", recipient_ids: [twin.id] });
+});
 it("supports keyboard selection, IME-safe Enter and explicit recipient removal", async () => {
   render(scope()); await screen.findByText("尚无消息，可发送第一条讨论。");
   change("@");

@@ -57,8 +57,9 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
   const mounted = useRef(false);
   const load = (before = "", background = false) => setRequest(previous => ({ before, version: previous.version + 1, background }));
   const select = (id: string | null = selection.id, background = false) => setSelection(previous => ({ id, version: previous.version + 1, background }));
-  useActiveRefresh(active, page.pending || detail.pending || Boolean(selection.id && evidencePending[selection.id]),
-    () => { load("", true); select(selection.id, true); });
+  useActiveRefresh(active, page.pending, () => load("", true));
+  useActiveRefresh(active && Boolean(selection.id), detail.pending || Boolean(selection.id && evidencePending[selection.id]),
+    () => select(selection.id, true));
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; posting.current?.abort(); };
@@ -210,6 +211,7 @@ function TaskLifecycle({ groupId, taskId, task, onReceipt, onReading }: {
   const formId = useId();
   const [summary, setSummary] = useState("");
   const [reason, setReason] = useState("");
+  const [manualDraftAttempt, setManualDraftAttempt] = useState<TaskAttempt | null>(null);
   const [content, setContent] = useState<{
     task: Task | null; attempt: TaskAttempt | null; submission: TaskSubmission | null; pending: boolean; error: string;
   }>({ task: null, attempt: null, submission: null, pending: false, error: "" });
@@ -233,6 +235,7 @@ function TaskLifecycle({ groupId, taskId, task, onReceipt, onReading }: {
         const attempt = await getTaskAttempt(groupId, taskId, task.active_attempt_id, controller.signal);
         if (ignore) return;
         if (attempt.task_revision !== task.revision) throw new ApiError("当前尝试与任务详情不匹配，请刷新详情。");
+        setManualDraftAttempt(attempt.turn_id === "" ? attempt : null);
         setContent({ ...empty, attempt });
       } else if (task.current_submission_id) {
         const submission = await getTaskSubmission(groupId, taskId, task.current_submission_id, controller.signal);
@@ -251,6 +254,9 @@ function TaskLifecycle({ groupId, taskId, task, onReceipt, onReading }: {
   // Each authoritative Task object is a read epoch, also fencing the render before effects run.
   const loaded = content.task === task ? content : null;
   const attempt = loaded?.attempt, submission = loaded?.submission;
+  // Prior manual evidence preserves only the draft UI; mutations still require the current loaded epoch.
+  const manualDraft = manualDraftAttempt !== null && manualDraftAttempt.id === task?.active_attempt_id
+    && manualDraftAttempt.task_revision === task?.revision;
   const reading = Boolean(task && (!loaded || loaded.pending));
   useEffect(() => {
     // Do not replace a Task read epoch while its authoritative evidence is still loading.
@@ -318,17 +324,20 @@ function TaskLifecycle({ groupId, taskId, task, onReceipt, onReading }: {
       {!task.active_attempt_id ? <>
         <button type="button" disabled={blocked} onClick={() => void mutate("attempt")}>登记人工尝试</button>
         <p className="tasks-note">登记只记录人工尝试，不会启动成员执行。</p>
-      </> : !loaded || loaded.pending ? <p role="status">正在载入当前尝试…</p>
-        : attempt?.turn_id ? <>
+      </> : <>
+        {reading ? <p role="status">正在载入当前尝试…</p> : null}
+        {attempt?.turn_id ? <>
           <p className="tasks-note">该尝试属于成员，不能人工替换或提交交付。</p><p className="tasks-meta">{attempt.turn_id}</p>
-        </> : attempt ? <form aria-label="提交交付" onSubmit={event => { event.preventDefault(); void mutate("submission"); }}>
+        </> : null}
+        {manualDraft ? <form aria-label="提交交付" onSubmit={event => { event.preventDefault(); void mutate("submission"); }}>
           <fieldset disabled={blocked}>
             <legend>提交交付</legend><p className="tasks-note">仅文本成果，不附加文件或成果版本</p>
             <label htmlFor={`${formId}-summary`}>交付摘要</label>
             <textarea id={`${formId}-summary`} required value={summary} onChange={event => setSummary(event.target.value)} />
-            <button type="submit">提交交付</button>
+            <button type="submit" disabled={attempt?.turn_id !== ""}>提交交付</button>
           </fieldset>
         </form> : null}
+      </>}
     </> : null}
     {task && task.status !== "open" ? <>
       <section className="tasks-delivery" aria-label="当前交付" aria-busy={!loaded || loaded.pending}>
