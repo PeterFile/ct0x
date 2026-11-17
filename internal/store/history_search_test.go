@@ -27,7 +27,7 @@ func TestHistorySearchScopedPagination(t *testing.T) {
 	for i := range 210 {
 		n := (i * 73) % 210
 		m := domain.Message{ID: fmt.Sprintf("match-%03d", n), GroupID: f.groupID, TopicID: topic,
-			SenderID: "user", Content: "a needle in history", CreatedAt: base.Add(time.Duration(n%5) * time.Nanosecond), Deliveries: []domain.Delivery{}}
+			SenderID: "user", SourceKind: "unknown", Content: "a needle in history", CreatedAt: base.Add(time.Duration(n%5) * time.Nanosecond), Deliveries: []domain.Delivery{}}
 		if err := insertMessageRow(ctx, tx, m); err != nil {
 			t.Fatal(err)
 		}
