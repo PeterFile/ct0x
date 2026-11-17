@@ -49,8 +49,20 @@ func chatRepairAdmissionInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandi
 		if c.RepairSource == nil || c.SourceKind != "platform" || c.SourceID != "review:"+source.ParentReviewID {
 			return nil, chatDeny("repair_source_mismatch", "此轮没有绑定真实用户评审的受信来源。", "是否由本机用户说明当前希望处理的原版本？")
 		}
-		if proposal.Authorization == domain.ChatRepairOriginalAgreement && source.OriginalAuthorization.ScopeKind != "" {
-			return nil, chatDeny("repair_agreement_unavailable", "原规范预授权仅允许话题摘要准备，不能升级为拒收后的继续执行许可。", "是否需要在原任务范围继续处理此拒收？")
+		if proposal.Authorization == domain.ChatRepairOriginalAgreement {
+			if source.OriginalAuthorization.ScopeKind != "" {
+				return nil, chatDeny("repair_agreement_unavailable", "原规范预授权仅允许话题摘要准备，不能升级为拒收后的继续执行许可。", "是否需要在原任务范围继续处理此拒收？")
+			}
+			current, err := chatRepairOriginalAgreementCurrentInTx(ctx, tx, c, source.OriginalAuthorization)
+			if errors.Is(err, sql.ErrNoRows) || errors.Is(err, ErrConflict) {
+				return nil, chatDeny("repair_agreement_unavailable", "原许可缺少可核验的不可变来源位置。", "是否由本机用户说明当前是否继续修复？")
+			}
+			if err != nil {
+				return nil, err
+			}
+			if !current {
+				return nil, chatDeny("repair_agreement_superseded", "原许可之后已有更新的真实用户聊天命令，不能沿用旧约定开工。", "是否按当前用户要求重新确认本次修复？")
+			}
 		}
 	}
 	return &source, nil

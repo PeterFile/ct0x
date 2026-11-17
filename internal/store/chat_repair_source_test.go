@@ -61,7 +61,7 @@ func TestChatRepairSourceBindsOfficialReviewWithoutAuthorizingWork(t *testing.T)
 		ThreadRef: f.candidate.ThreadRef, ParentTaskID: submission.TaskID, ParentSubmissionID: submission.ID,
 		ParentReviewID: review.ID, ReviewedTaskRevision: review.TaskRevision,
 		ParentMandate: coordination.Admission.Mandate, ParentAdmission: originalAdmission,
-		ReviewReason: review.Reason, ArtifactVersions: review.ArtifactVersions,
+		ParentSubmissionSummary: submission.Summary, ReviewReason: review.Reason, ArtifactVersions: review.ArtifactVersions,
 		OriginalAuthorization: domain.ChatRepairAuthorization{SourceKind: "local_user_chat", SourceID: originalMessage.SourceID, MessageID: originalMessage.ID, PolicyRevision: f.policy.Revision, Content: originalMessage.Content},
 	}
 	for _, reader := range []chatRepairSourceAPI{api, chatRepairReader(t, queueHandle(t, f.path, false))} {

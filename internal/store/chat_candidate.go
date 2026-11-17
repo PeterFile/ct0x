@@ -61,6 +61,9 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 		}
 	}
 	if err != nil {
+		if errors.Is(err, ErrChatRepairSourceEncoding) {
+			return domain.ChatCandidate{}, err
+		}
 		return domain.ChatCandidate{}, memberToolOperationError("保存聊天候选失败", err)
 	}
 	candidate, err := chatCandidateInTx(ctx, tx, scope, id)

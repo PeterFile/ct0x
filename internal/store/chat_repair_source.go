@@ -118,8 +118,43 @@ func chatRepairSourceEvidenceInTx(ctx context.Context, tx *sql.Tx, thread domain
 	return domain.ChatRepairSource{
 		ThreadRef: thread, ParentTaskID: taskID, ParentSubmissionID: submission.ID, ParentReviewID: review.ID,
 		ReviewedTaskRevision: review.TaskRevision, ParentMandate: admission.Mandate, ParentAdmission: parent,
-		ReviewReason: review.Reason, ArtifactVersions: submission.ArtifactVersions, OriginalAuthorization: proof,
+		ParentSubmissionSummary: submission.Summary, ReviewReason: review.Reason,
+		ArtifactVersions: submission.ArtifactVersions, OriginalAuthorization: proof,
 	}, nil
+}
+
+// The original command, not the later Review notice, anchors inherited consent.
+// Any newer real user chat requires a fresh semantic request; member discussion
+// cannot withdraw or renew user authority.
+func chatRepairOriginalAgreementCurrentInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, proof domain.ChatRepairAuthorization) (bool, error) {
+	var generation int64
+	var err error
+	switch proof.SourceKind {
+	case "local_user_chat", "local_user_policy":
+		err = tx.QueryRowContext(ctx, `SELECT l.sequence FROM message_log l
+		 JOIN message_command_sources s ON s.message_id=l.message_id
+		 WHERE l.group_id=? AND l.topic_id=? AND l.message_id=? AND s.kind=? AND s.id=?`,
+			c.GroupID, c.TopicID, proof.MessageID, proof.SourceKind, proof.SourceID).Scan(&generation)
+	case "local_user_review":
+		err = tx.QueryRowContext(ctx, `SELECT l.sequence FROM message_log l
+		 JOIN chat_review_notices rn ON rn.message_id=l.message_id
+		 JOIN task_review_decisions r ON r.id=rn.review_id AND r.group_id=l.group_id
+		 WHERE l.group_id=? AND l.topic_id=? AND r.id=? AND r.reviewed_by='user' AND r.outcome='rejected'`,
+			c.GroupID, c.TopicID, proof.SourceID).Scan(&generation)
+	default:
+		return false, ErrConflict
+	}
+	if err != nil {
+		return false, err
+	}
+	var superseded bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+	 SELECT 1 FROM message_log l JOIN message_command_sources s ON s.message_id=l.message_id AND s.kind='local_user_chat'
+	 WHERE l.group_id=? AND l.topic_id=? AND l.sequence>?)`,
+		c.GroupID, c.TopicID, generation).Scan(&superseded); err != nil {
+		return false, err
+	}
+	return generation > 0 && generation <= c.Generation && !superseded, nil
 }
 
 func chatRepairOriginalAuthorizationInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, parent domain.ChatAssessmentReceipt, policy domain.ChatPolicy) (domain.ChatRepairAuthorization, error) {

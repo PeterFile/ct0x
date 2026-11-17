@@ -45,15 +45,16 @@ type ChatRepairLink struct {
 // admission must separately check intent, current Policy, grants and execution.
 type ChatRepairSource struct {
 	ThreadRef
-	ParentTaskID          string                  `json:"parent_task_id"`
-	ParentSubmissionID    string                  `json:"parent_submission_id"`
-	ParentReviewID        string                  `json:"parent_review_id"`
-	ReviewedTaskRevision  int64                   `json:"reviewed_task_revision"`
-	ParentMandate         Mandate                 `json:"parent_mandate"`
-	ParentAdmission       ChatAssessmentReceipt   `json:"parent_admission"`
-	ReviewReason          string                  `json:"review_reason"`
-	ArtifactVersions      []ArtifactVersionRef    `json:"artifact_versions"`
-	OriginalAuthorization ChatRepairAuthorization `json:"original_authorization"`
+	ParentTaskID            string                  `json:"parent_task_id"`
+	ParentSubmissionID      string                  `json:"parent_submission_id"`
+	ParentSubmissionSummary string                  `json:"parent_submission_summary"`
+	ParentReviewID          string                  `json:"parent_review_id"`
+	ReviewedTaskRevision    int64                   `json:"reviewed_task_revision"`
+	ParentMandate           Mandate                 `json:"parent_mandate"`
+	ParentAdmission         ChatAssessmentReceipt   `json:"parent_admission"`
+	ReviewReason            string                  `json:"review_reason"`
+	ArtifactVersions        []ArtifactVersionRef    `json:"artifact_versions"`
+	OriginalAuthorization   ChatRepairAuthorization `json:"original_authorization"`
 }
 
 // ChatRepairAuthorization carries complete actual user evidence, not a model's

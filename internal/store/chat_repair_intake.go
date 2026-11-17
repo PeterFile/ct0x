@@ -6,10 +6,17 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
 )
+
+// ErrChatRepairSourceEncoding blocks assessment without rewriting source bytes.
+var ErrChatRepairSourceEncoding = errors.New("完整修复来源含非法 UTF-8，无法无损评估")
 
 func chatRepairSupportedInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	var supported bool
@@ -80,11 +87,50 @@ func captureChatRepairCandidateInTx(ctx context.Context, tx *sql.Tx, scope Membe
 	if err != nil {
 		return err
 	}
+	if err := validateChatRepairSourceUTF8(reflect.ValueOf(source), "repair_source"); err != nil {
+		return err
+	}
 	data, err := json.Marshal(source)
 	if err != nil {
 		return err
 	}
 	return coordinationDispatchWrite(ctx, tx, "INSERT INTO chat_repair_candidates(candidate_id,review_id,source_json) VALUES(?,?,?)", candidateID, reviewID, string(data))
+}
+
+// Check every exported string in the acyclic source DTO before encoding/json
+// can silently replace invalid bytes, including nested historical evidence.
+func validateChatRepairSourceUTF8(value reflect.Value, path string) error {
+	switch value.Kind() {
+	case reflect.String:
+		if !utf8.ValidString(value.String()) {
+			return fmt.Errorf("%w：%w：%s", ErrInvalid, ErrChatRepairSourceEncoding, path)
+		}
+	case reflect.Struct:
+		for i := 0; i < value.NumField(); i++ {
+			field := value.Type().Field(i)
+			name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+			if field.PkgPath != "" || name == "-" {
+				continue
+			}
+			if name == "" {
+				name = field.Name
+			}
+			if err := validateChatRepairSourceUTF8(value.Field(i), path+"."+name); err != nil {
+				return err
+			}
+		}
+	case reflect.Pointer, reflect.Interface:
+		if !value.IsNil() {
+			return validateChatRepairSourceUTF8(value.Elem(), path)
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < value.Len(); i++ {
+			if err := validateChatRepairSourceUTF8(value.Index(i), fmt.Sprintf("%s[%d]", path, i)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func chatRepairCandidateInTx(ctx context.Context, tx *sql.Tx, candidateID string) (*domain.ChatRepairSource, error) {
