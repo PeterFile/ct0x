@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/store"
 )
@@ -197,7 +198,12 @@ func (a memberToolAPI) readChannel(w http.ResponseWriter, r *http.Request, token
 		memberToolError(w, err)
 		return
 	}
-	writeMemberToolPage(w, page, scope)
+	candidate, err := a.tools.ChatCandidate(r.Context(), token)
+	if err != nil {
+		memberToolError(w, err)
+		return
+	}
+	writeMemberToolPage(w, page, scope, candidate)
 }
 
 func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token string) {
@@ -212,8 +218,34 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 	var input struct {
 		Content      memberToolField[string]                    `json:"content"`
 		RecipientIDs memberToolField[[]memberToolField[string]] `json:"recipient_ids"`
+		Assessment   memberToolField[json.RawMessage]           `json:"intent_assessment"`
 	}
 	if !decodeMemberToolJSON(w, r, &input) {
+		return
+	}
+	if input.Assessment.present {
+		var assessment domain.ChatAssessment
+		decoder := json.NewDecoder(bytes.NewReader(input.Assessment.value))
+		decoder.DisallowUnknownFields()
+		if input.RecipientIDs.present || decoder.Decode(&assessment) != nil {
+			memberToolError(w, store.ErrInvalid)
+			return
+		}
+		receipt, err := a.tools.AssessChatIntent(r.Context(), token, assessment, input.Content.value, key)
+		if err != nil {
+			memberToolError(w, err)
+			return
+		}
+		assessmentReceipt := chatIntentToolReceipt{ID: receipt.ID, Disposition: receipt.Disposition,
+			PolicyRevision: receipt.PolicyRevision, CandidateGeneration: receipt.CandidateGeneration, Authority: receipt.Authority,
+			TaskID: receipt.TaskID, MandateID: receipt.MandateID, DispatchRequestID: receipt.DispatchRequestID, NoticeMessageID: receipt.NoticeMessageID}
+		WriteJSON(w, http.StatusCreated, struct {
+			MessageID      string                `json:"message_id"`
+			CreatedAt      time.Time             `json:"created_at"`
+			DeliveryCount  int                   `json:"delivery_count"`
+			ContentOmitted bool                  `json:"content_omitted"`
+			Assessment     chatIntentToolReceipt `json:"intent_assessment"`
+		}{receipt.NoticeMessageID, receipt.CreatedAt, 0, true, assessmentReceipt})
 		return
 	}
 	var recipients []string
@@ -283,9 +315,23 @@ type memberToolPageBuffer struct {
 func (b *memberToolPageBuffer) Header() http.Header    { return b.header }
 func (b *memberToolPageBuffer) WriteHeader(status int) { b.status = status }
 
-func writeMemberToolPage[T any](w http.ResponseWriter, page store.Page[T], scope string) {
+func writeMemberToolPage[T any](w http.ResponseWriter, page store.Page[T], scope string, candidates ...*domain.ChatCandidate) {
 	buffer := memberToolPageBuffer{header: make(http.Header)}
 	writePage(&buffer, page, scope, "", nil)
+	if len(candidates) == 1 && candidates[0] != nil && buffer.Len() <= memberToolJSONBytes {
+		var result struct {
+			Items         []T                   `json:"items"`
+			NextCursor    string                `json:"next_cursor"`
+			ChatCandidate *domain.ChatCandidate `json:"chat_candidate"`
+		}
+		if err := json.Unmarshal(buffer.Bytes(), &result); err != nil {
+			operationError(w, err)
+			return
+		}
+		result.ChatCandidate = candidates[0]
+		buffer.Reset()
+		WriteJSON(&buffer, http.StatusOK, result)
+	}
 	if buffer.Len() > memberToolJSONBytes {
 		WriteError(w, http.StatusRequestEntityTooLarge, "tool_result_too_large", "工具结果过大，请减小 limit 后重试")
 		return

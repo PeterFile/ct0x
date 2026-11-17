@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/scheduler"
@@ -29,6 +30,8 @@ type MemberToolRuntimeOptions struct {
 	// use the scheduler's same MaxActive and actual private RuntimeDir.
 	RoleMaxActive     int
 	RoleExecutionRoot string
+	// ChatIntake reuses the same Engine and requires the role execution path.
+	ChatIntake *coordination.Engine
 }
 
 type MemberToolRunBinding struct {
@@ -99,7 +102,16 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 			return nil, errMemberToolRuntimeConfig
 		}
 	}
-	return &MemberToolRuntime{tools: NewMemberTools(db), configRoot: root, resolvedRoot: resolved,
+	tools := NewMemberTools(db)
+	if options.ChatIntake != nil {
+		if roleFence == nil {
+			return nil, errMemberToolRuntimeConfig
+		}
+		if err := tools.EnableChatIntake(options.ChatIntake); err != nil {
+			return nil, errMemberToolRuntimeConfig
+		}
+	}
+	return &MemberToolRuntime{tools: tools, configRoot: root, resolvedRoot: resolved,
 		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence}, nil
 }
 

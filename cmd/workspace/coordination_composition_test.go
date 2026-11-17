@@ -801,11 +801,17 @@ func TestCoordinationCompositionNativeHelper(t *testing.T) {
 		case 404:
 			code = "not_found"
 		}
+		if expected.Mode == "chat-intake" {
+			return memberToolsHTTP(t, config.Endpoint, config.Token, operation, input, key, status, code, coordinationCompositionToolBudget())
+		}
 		return memberToolsHTTP(t, config.Endpoint, config.Token, operation, input, key, status, code)
 	}
 	// An issued role capability must work on the ordinary read route's registry.
 	channel := call("read_channel", map[string]any{}, "", 200)
-	var page struct{ Items []domain.Message }
+	var page struct {
+		Items         []domain.Message
+		ChatCandidate *domain.ChatCandidate `json:"chat_candidate"`
+	}
 	if json.Unmarshal(channel, &page) != nil || len(page.Items) == 0 {
 		t.Fatal("native capability read a different/empty composition Store")
 	}
@@ -828,6 +834,26 @@ func TestCoordinationCompositionNativeHelper(t *testing.T) {
 		}
 		call("decide_dispatch", map[string]any{"kind": "assign", "worker_member_id": expected.WorkerID, "reason": "forged role"}, "ordinary-decide", status)
 		call("submit_result", map[string]any{"summary": "forged role"}, "ordinary-submit", status)
+		if expected.Mode == "chat-intake" {
+			if page.ChatCandidate == nil || page.ChatCandidate.SourceSenderID != "user" || page.ChatCandidate.Policy.Revision != 1 || !bytes.Contains(prompt, []byte("intent_assessment")) {
+				t.Fatal("ordinary semantic assessment lacks a captured source/policy and prompt contract")
+			}
+			var sourceContent string
+			for _, message := range page.Items {
+				if message.ID == page.ChatCandidate.MessageID {
+					sourceContent = message.Content
+					break
+				}
+			}
+			if sourceContent == "" {
+				t.Fatal("captured source missing from the bound channel snapshot")
+			}
+			assessment := domain.ChatAssessment{Disposition: "request_work", Action: domain.ChatActionTextSubmission, Title: "三条讨论摘要", Description: "仅生成群聊文本", Acceptance: "包含三条可核对结论", Reason: "模拟语义评估：用户要求落实前文约定"}
+			if sourceContent == "先讨论摘要应当包含哪三条结论。" {
+				assessment = domain.ChatAssessment{Disposition: "discuss", Reason: "模拟语义评估：仅讨论，没有工作请求"}
+			}
+			operation, input = "send_message", map[string]any{"content": "三条结论与边界已说明。", "intent_assessment": assessment}
+		}
 	case "coordinator":
 		call("send_message", map[string]any{"content": "not granted"}, "role-send", 403)
 		call("submit_result", map[string]any{"summary": "wrong role"}, "role-submit", 403)

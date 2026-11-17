@@ -10,6 +10,10 @@ import (
 	"agentworkspace/internal/domain"
 )
 
+// Only the new instrumented chat fixture needs extra client time for SQLite;
+// ordinary tests and every production HTTP/intent budget remain unchanged.
+func coordinationCompositionToolBudget() time.Duration { return 20 * time.Second }
+
 // This is a race safety prerequisite, not evidence of one-second pump throughput.
 // The production scheduler and its real intent callback continue running normally.
 func coordinationCompositionAssignmentPrerequisite(t *testing.T, f *coordinationCompositionFixture, report coordinationCompositionReport) {

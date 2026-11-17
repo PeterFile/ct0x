@@ -23,6 +23,9 @@ func CoordinationRoutes(service *platform.Coordinations) []Route {
 		{http.MethodGet, "/api/v1/groups/{group}/coordination/triggers", a.listTriggers},
 		{http.MethodGet, "/api/v1/groups/{group}/coordination/decisions/{decision}", a.getAdmissionReceipt},
 		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/coordination", noQuery(a.getTaskCoordination)},
+		{http.MethodGet, "/api/v1/groups/{group}/coordination/chat-policy", a.getChatPolicy},
+		{http.MethodPut, "/api/v1/groups/{group}/coordination/chat-policy", a.setChatPolicy},
+		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/chat-admission", noQuery(a.getChatAdmission)},
 	}
 }
 

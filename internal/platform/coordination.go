@@ -18,6 +18,18 @@ func (s *Coordinations) RequestWork(ctx context.Context, groupID string, request
 	return s.engine.RequestWork(ctx, groupID, request, key)
 }
 
+func (s *Coordinations) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, input domain.ChatPolicyRequest, expected int64, key string) (domain.ChatPolicy, error) {
+	return s.engine.SetChatPolicy(ctx, thread, input, expected, key)
+}
+
+func (s *Coordinations) GetChatPolicy(ctx context.Context, thread domain.ThreadRef) (domain.ChatPolicy, error) {
+	return s.engine.GetChatPolicy(ctx, thread)
+}
+
+func (s *Coordinations) GetChatAdmission(ctx context.Context, groupID, taskID string) (domain.ChatAssessmentReceipt, error) {
+	return s.engine.GetChatAdmission(ctx, groupID, taskID)
+}
+
 func (s *Coordinations) GetTrigger(ctx context.Context, thread domain.ThreadRef, triggerID string) (domain.Trigger, error) {
 	return s.engine.GetTrigger(ctx, thread, triggerID)
 }

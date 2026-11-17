@@ -8,6 +8,16 @@ const pagination = Type.Object({
   before: Type.Optional(Type.String({ description: "上一页返回的不透明游标。" })),
 }, { additionalProperties: false });
 
+const chatAssessment = Type.Object({
+  disposition: Type.Union([Type.Literal("discuss"), Type.Literal("clarify"), Type.Literal("request_work"), Type.Literal("prepare_work")], { description: "仅讨论、一个具体问题、当前用户明确工作请求、书面预授权准备；服务端决定准入。" }),
+  action: Type.Optional(Type.Literal("text_submission", { description: "本片只允许文本 Submission，不授文件或外部动作。" })),
+  title: Type.Optional(Type.String({ maxLength: 256, description: "从当前来源和上下文形成的目标。" })),
+  description: Type.Optional(Type.String({ maxLength: 8192, description: "任务边界与约束。" })),
+  acceptance: Type.Optional(Type.String({ maxLength: 4096, description: "可核对的文本交付验收条件。" })),
+  reason: Type.String({ minLength: 1, maxLength: 4096, description: "结合可信来源、上下文与已启用 Policy 的语义评估依据；不能把 Agent 共识当授权。" }),
+  question: Type.Optional(Type.String({ maxLength: 2048, description: "clarify 时一个具体的范围或授权问题。" })),
+}, { additionalProperties: false });
+
 const tools = [
   {
     name: "list_members",
@@ -28,6 +38,7 @@ const tools = [
     parameters: Type.Object({
       content: Type.String({ description: "消息正文。" }),
       recipient_ids: Type.Optional(Type.Array(Type.String(), { description: "接收成员标识；省略或空数组表示公开消息，不创建投递、不唤醒成员；仅显式列出的成员会进入投递队列。" })),
+      intent_assessment: Type.Optional(chatAssessment),
     }, { additionalProperties: false }),
   },
   {
@@ -100,6 +111,10 @@ export default function piBridge(pi: ExtensionAPI) {
             });
             payload = JSON.parse(encoded);
             valid = Value.Check(tool.parameters, payload);
+            if (valid && tool.name === "send_message") {
+              const message = payload as { recipient_ids?: string[]; intent_assessment?: unknown };
+              if (Object.hasOwn(message, "intent_assessment")) valid = !Object.hasOwn(message, "recipient_ids");
+            }
             if (valid && tool.name === "decide_dispatch") {
               // Keep an object schema for Pi; check the conditional field on the safe snapshot.
               const decision = payload as { kind: string; worker_member_id?: string };

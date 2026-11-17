@@ -271,12 +271,12 @@ func TestCoordinationHTTPRoutesOptInAndRequestURLUnchanged(t *testing.T) {
 	a := openGroupAPI(t, "")
 	g := newGroup(t, a, "group")
 	base := coordinationHTTPBase(g.ID)
-	for _, path := range []string{base + "/requests", base + "/triggers", base + "/triggers/x", base + "/decisions/x", "/api/v1/groups/" + g.ID + "/tasks/x/coordination"} {
+	for _, path := range []string{base + "/requests", base + "/triggers", base + "/triggers/x", base + "/decisions/x", base + "/chat-policy", "/api/v1/groups/" + g.ID + "/tasks/x/coordination", "/api/v1/groups/" + g.ID + "/tasks/x/chat-admission"} {
 		w := a.request("GET", path, "")
 		assertError(t, w.Code, w.Header(), w.Body.Bytes(), 404, "not_found")
 	}
 	routes := CoordinationRoutes(platform.NewCoordinations(coordination.New(a.db)))
-	if len(routes) != 5 {
+	if len(routes) != 8 {
 		t.Fatalf("unexpected route count: %d", len(routes))
 	}
 	a.handler = mustServer(t, DefaultAddress, routes...).Handler

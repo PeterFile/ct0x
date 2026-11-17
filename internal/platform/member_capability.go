@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 
+	"agentworkspace/internal/coordination"
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/skills"
 	"agentworkspace/internal/store"
 )
@@ -26,10 +28,11 @@ type MemberToolGrants struct {
 }
 
 type memberToolRegistration struct {
-	scope  store.MemberToolScope
-	grants MemberToolGrants
-	skills *memberSkillState
-	role   store.CoordinationToolScope
+	scope     store.MemberToolScope
+	grants    MemberToolGrants
+	skills    *memberSkillState
+	role      store.CoordinationToolScope
+	candidate *domain.ChatCandidate
 }
 
 // MemberTools owns process-local capabilities; durable claims authorize every use.
@@ -38,6 +41,7 @@ type MemberTools struct {
 	db           *store.Store
 	mu           sync.RWMutex
 	capabilities map[[sha256.Size]byte]memberToolRegistration
+	chatEngine   *coordination.Engine
 }
 
 func NewMemberTools(db *store.Store) *MemberTools {
@@ -86,7 +90,15 @@ func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants M
 	if slices.Contains(grants.Operations, "search_skills") || slices.Contains(grants.Operations, "load_skill") {
 		skillState = &memberSkillState{snapshots: make(map[string]*skills.Snapshot)}
 	}
-	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState}
+	var candidate *domain.ChatCandidate
+	if s.chatEngine != nil && slices.Contains(grants.Operations, "send_message") {
+		captured, err := s.chatEngine.CaptureChatCandidate(ctx, scope)
+		if err != nil {
+			return "", err
+		}
+		candidate = &captured
+	}
+	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate}
 	return token, nil
 }
 
