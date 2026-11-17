@@ -283,7 +283,7 @@ func TestHistoryHelpersUseCallerTransaction(t *testing.T) {
 	if _, err := tx.ExecContext(bounded, "INSERT INTO groups(id,name,created_at) VALUES('uncommitted','fixture',?)", stamp.Format(timestampLayout)); err != nil {
 		t.Fatal(err)
 	}
-	m := domain.Message{ID: "uncommitted-message", GroupID: "uncommitted", TopicID: "bound", SenderID: "historical-member",
+	m := domain.Message{ID: "uncommitted-message", GroupID: "uncommitted", TopicID: "bound", SenderID: "historical-member", SourceKind: "unknown",
 		Content: "transaction needle", CreatedAt: stamp, Deliveries: []domain.Delivery{}}
 	if err := insertMessageRow(bounded, tx, m); err != nil {
 		t.Fatal(err)

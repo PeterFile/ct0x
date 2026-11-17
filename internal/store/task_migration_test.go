@@ -67,13 +67,15 @@ func TestTaskV4UpgradePreservesOriginalReads(t *testing.T) {
 	if got, err := s.GetTurn(ctx, g.ID, turn.ID); err != nil || !reflect.DeepEqual(got, beforeTurn) {
 		t.Fatalf("v5 changed unknown turn: %+v, %v", got, err)
 	}
-	if got, err := s.GetMessage(ctx, g.ID, message.ID); err != nil || !reflect.DeepEqual(got, beforeMessage) {
+	expectedMessage := beforeMessage
+	expectedMessage.SourceKind = "unknown"
+	if got, err := s.GetMessage(ctx, g.ID, message.ID); err != nil || !reflect.DeepEqual(got, expectedMessage) {
 		t.Fatalf("v5 changed original message read: %+v, %v", got, err)
 	}
-	if got, found, err := s.LookupMessageReceipt(ctx, r); err != nil || !found || !reflect.DeepEqual(got, beforeMessage) {
+	if got, found, err := s.LookupMessageReceipt(ctx, r); err != nil || !found || !reflect.DeepEqual(got, expectedMessage) {
 		t.Fatalf("v5 changed original message receipt: %+v, %v, %v", got, found, err)
 	}
-	if got, err := s.CreateMessage(ctx, r, nil); err != nil || !reflect.DeepEqual(got, beforeMessage) {
+	if got, err := s.CreateMessage(ctx, r, nil); err != nil || !reflect.DeepEqual(got, expectedMessage) {
 		t.Fatalf("v5 changed message replay: %+v, %v", got, err)
 	}
 	if got, err := s.CreateGroup(ctx, keyedGroup()); err != nil || !reflect.DeepEqual(got, g) {

@@ -64,6 +64,8 @@ func TestArtifactV5UpgradePreservesExistingReads(t *testing.T) {
 	if err := old.Close(); err != nil {
 		t.Fatal(err)
 	}
+	expectedMessage := beforeMessage
+	expectedMessage.SourceKind = "unknown"
 	for range 2 {
 		s, err := Open(path)
 		if err != nil {
@@ -81,18 +83,18 @@ func TestArtifactV5UpgradePreservesExistingReads(t *testing.T) {
 		}{
 			{"group", g, func() (any, error) { return s.GetGroup(ctx, g.ID) }},
 			{"member", m, func() (any, error) { return s.GetMember(ctx, g.ID, m.ID) }},
-			{"message", beforeMessage, func() (any, error) { return s.GetMessage(ctx, g.ID, message.ID) }},
+			{"message", expectedMessage, func() (any, error) { return s.GetMessage(ctx, g.ID, message.ID) }},
 			{"unknown turn", beforeTurn, func() (any, error) { return s.GetTurn(ctx, g.ID, turn.ID) }},
 			{"task/dependencies", task, func() (any, error) { return s.GetTask(ctx, g.ID, task.ID) }},
 			{"group receipt", g, func() (any, error) { return s.CreateGroup(ctx, keyedGroup()) }},
-			{"message receipt", beforeMessage, func() (any, error) { return s.CreateMessage(ctx, r, nil) }},
+			{"message receipt", expectedMessage, func() (any, error) { return s.CreateMessage(ctx, r, nil) }},
 			{"task receipt", task, func() (any, error) { return s.CreateTask(ctx, input) }},
 		} {
 			if got, err := check.read(); err != nil || !reflect.DeepEqual(got, check.want) {
 				t.Fatalf("v6 changed %s: %+v, %v", check.name, got, err)
 			}
 		}
-		if got, found, err := s.LookupMessageReceipt(ctx, r); err != nil || !found || !reflect.DeepEqual(got, beforeMessage) {
+		if got, found, err := s.LookupMessageReceipt(ctx, r); err != nil || !found || !reflect.DeepEqual(got, expectedMessage) {
 			t.Fatalf("v6 changed receipt lookup: %+v, %t, %v", got, found, err)
 		}
 		var resourceTurn, receipt string

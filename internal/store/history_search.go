@@ -134,6 +134,9 @@ func searchHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, q H
 			return HistoryPage{}, err
 		}
 	}
+	if err := messageSourcesInTx(ctx, tx, page.Items); err != nil {
+		return HistoryPage{}, err
+	}
 	return page, nil
 }
 
@@ -172,6 +175,11 @@ func readHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, topic
 		"SELECT "+messageColumns+" FROM messages WHERE group_id=? AND topic_id=? AND id=?", groupID, *topicID, messageID))
 	if err == nil {
 		err = messageDeliveries(ctx, tx, &m)
+	}
+	if err == nil {
+		messages := []domain.Message{m}
+		err = messageSourcesInTx(ctx, tx, messages)
+		m = messages[0]
 	}
 	return m, err
 }
