@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"agentworkspace/internal/contextpack"
+	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/scheduler"
@@ -268,6 +270,139 @@ func TestChatRepairPreparationWaitsUnclaimedAndSchedulerContinues(t *testing.T) 
 	}
 }
 
+func TestChatRepairPreparationDefaultIntakeProfile(t *testing.T) {
+	f := newPrepareFixture(t)
+	selectPrepareMemberToolsPi(f)
+	options := configurePrepareMemberTools(t, f)
+	options.Operations = slices.Clone(historyProfileNames)
+	options.RoleMaxActive, options.RoleExecutionRoot = 1, t.TempDir()
+	options.ChatIntake = coordination.New(f.s)
+	var err error
+	f.opts.MemberTools, err = NewMemberToolRuntime(f.s, options)
+	prepareRoleOK(t, err)
+	t.Cleanup(func() { f.opts.MemberTools.Close() })
+	ctx := context.Background()
+	conversation, err := f.s.GetConversation(ctx, f.group.ID, f.pending.Delivery.ConversationID)
+	prepareRoleOK(t, err)
+	// Packet data only: no admission, Assignment, file publication or claim.
+	// No actual user text, host configuration or runtime database is required.
+	id := func(letter string) string { return strings.Repeat(letter, 26) }
+	thread := domain.ThreadRef{GroupID: f.group.ID, TopicID: f.trigger.TopicID}
+	source := domain.ChatRepairSource{ThreadRef: thread,
+		ParentTaskID: id("t"), ParentSubmissionID: id("s"), ParentReviewID: id("r"), ReviewedTaskRevision: 1,
+		ParentMandate: domain.Mandate{ID: id("m"), DecisionID: id("d"), OriginTriggerID: id("o"),
+			GroupID: f.group.ID, TopicID: thread.TopicID, TaskID: id("t"), TaskRevisionAtAdmission: 1,
+			AuthorityKind: domain.MandateAuthorityLocalUserExplicit, AuthorizedBy: "user", Strength: domain.MandateStrengthExplicit,
+			PolicyRevision: domain.LocalUserExplicitPolicyRevision, CreatedAt: f.trigger.CreatedAt,
+			Scope: domain.TaskScope{Objective: "在原授权范围修订文档，提供精确冻结版本供本机用户评审", DependencyIDs: []string{}}},
+		ParentAdmission: domain.ChatAssessmentReceipt{ID: id("a"), CandidateID: id("c"), ThreadRef: thread,
+			MessageID: id("u"), SourceSenderID: "user", AssessedBy: f.member.ID, TurnID: id("i"),
+			PolicyRevision: 1, CandidateGeneration: 8, Disposition: "request_work", Authority: "explicit_request",
+			AuthorizationMessageID: id("u"), Action: domain.ChatActionWorkspaceChange, TaskID: id("t"), MandateID: id("m"),
+			DispatchRequestID: id("q"), NoticeMessageID: id("n"), CreatedAt: f.trigger.CreatedAt,
+			Purpose: domain.ChatIntakePurpose, SourceID: id("z"), SourceKind: "local_user_chat", Outcome: "admitted", AuthorityEvidenceVerified: true,
+			WorkspaceScope: &domain.TaskWorkspaceScope{ThreadRef: thread, TaskID: id("t"), TaskRevision: 1, MandateID: id("m"),
+				CandidateID: id("c"), AssessmentID: id("a"), DispatchRequestID: id("q"), PolicyRevision: 1,
+				ResourceKey: "workspace:fixture", NodeID: "local", Grants: []domain.TaskWorkspaceGrant{{GrantID: id("g"), MemberID: id("w"),
+					Root: f.opts.PrivateWorkspaceRoot, ResolvedRoot: f.opts.PrivateWorkspaceRoot, GrantSchemaVersion: 19}}}},
+		ArtifactVersions:      []domain.ArtifactVersionRef{{ArtifactID: id("b"), VersionID: id("v")}},
+		OriginalAuthorization: domain.ChatRepairAuthorization{SourceKind: "local_user_chat", SourceID: id("z"), MessageID: id("u"), PolicyRevision: 1}}
+	source.OriginalAuthorization.Content = strings.Repeat("请仅修订原授权文件并提交冻结版本，由我评审。", 10)
+	source.ParentMandate.Scope.Description = strings.Repeat("原授权目录内修改文档，保留既有内容，不执行外部动作。", 12)
+	source.ParentMandate.Scope.Acceptance = strings.Repeat("提供真实文件、精确版本和校验依据；提交不代表接纳。", 8)
+	source.ParentSubmissionSummary = strings.Repeat("已读取旧文件并在原范围修改，发布实际冻结版本，仍待本机用户评审。\n", 21) + "完整正文尾部<&>。"
+	source.ReviewReason = strings.Repeat("请按原约定继续修订同一文件，保留原版本并发布新版本供我评审。", 8)
+	trigger := f.trigger
+	trigger.SourceKind, trigger.SourceID = "platform", "review:"+source.ParentReviewID
+	trigger.Content = "平台记录：本机用户拒收原版本。\n任务：" + source.ParentTaskID + "\nSubmission：" + source.ParentSubmissionID +
+		"\nReview：" + source.ParentReviewID + "\n" + strings.Repeat("拒收不自动授予修复权限，保留原始版本和原评审记录。", 6) + "\n" + source.ReviewReason
+	history := make([]domain.Message, 17)
+	for i := range history {
+		history[i] = domain.Message{ID: strings.Repeat("h", 25) + string(rune('a'+i)), GroupID: f.group.ID,
+			TopicID: trigger.TopicID, SenderID: f.member.ID, Content: "可省略正文，但来源引用不可丢弃。", CreatedAt: trigger.CreatedAt}
+	}
+	build := func(p *Preparer, history []domain.Message) ([]byte, error) {
+		return p.buildContext(f.group, f.member, conversation, trigger, history, true, &source)
+	}
+	minimum := func(wire []byte) int {
+		t.Helper()
+		packet := decodePreparation(t, string(wire))
+		_, err := contextpack.Build(contextpack.Input{Scope: packet.Scope, Responsibility: packet.Responsibility,
+			Permissions: packet.Permissions, Pending: packet.Pending, History: packet.History, MaxBytes: 0})
+		var budget *contextpack.BudgetError
+		if !errors.As(err, &budget) {
+			t.Fatalf("minimum packet measurement failed: %v", err)
+		}
+		return budget.Required
+	}
+	f.opts.MaxContextBytes = 1 << 20
+	large := f.preparer(t)
+	withoutRefs, err := build(large, nil)
+	prepareRoleOK(t, err)
+	full, err := build(large, history)
+	prepareRoleOK(t, err)
+	required := minimum(full)
+	if minimum(withoutRefs) > 16<<10 || required <= 16<<10 {
+		t.Fatalf("fixture lost actual failure shape: without_refs=%d with_17_refs=%d", minimum(withoutRefs), required)
+	}
+	t.Logf("portable_full_source: without_refs=%d with_17_refs=%d generic_default=%d", minimum(withoutRefs), required, 16<<10)
+	f.opts.MaxContextBytes = 0
+	wire, err := build(f.preparer(t), history)
+	if err != nil {
+		t.Fatalf("trusted intake default stranded complete repair source and mandatory refs: %v", err)
+	}
+	assertComplete := func(t *testing.T, wire []byte) {
+		t.Helper()
+		packet := decodePreparation(t, string(wire))
+		var metadata struct {
+			Source domain.ChatRepairSource `json:"repair_source"`
+		}
+		prepareRoleOK(t, json.Unmarshal([]byte(packet.Responsibility), &metadata))
+		if !reflect.DeepEqual(metadata.Source, source) || len(packet.History)+len(packet.Overflow) != len(history) {
+			t.Fatal("intake profile dropped full authority, Review, Summary, exact versions or history refs")
+		}
+	}
+	assertComplete(t, wire)
+	for _, tc := range []struct {
+		name      string
+		max, role int
+		blocked   bool
+	}{
+		{"explicit ordinary limit", 16 << 10, 0, true},
+		{"explicit exact limit overrides role limit", required, 1, false},
+		{"configured intake fallback limit", 0, required - 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f.opts.MaxContextBytes, f.opts.RoleMaxContextBytes = tc.max, tc.role
+			wire, err := build(f.preparer(t), history)
+			if tc.blocked {
+				if err != scheduler.ErrNotReady || len(wire) != 0 {
+					t.Fatalf("explicit context budget was bypassed: %v", err)
+				}
+				return
+			}
+			prepareRoleOK(t, err)
+			if len(wire) != tc.max {
+				t.Fatal("exact encoded byte limit changed")
+			}
+			assertComplete(t, wire)
+		})
+	}
+	t.Run("generic ordinary remains 16 KiB", func(t *testing.T) {
+		ordinary := newPrepareFixture(t)
+		ordinary.opts.RoleMaxContextBytes = 1 << 20
+		p := ordinary.preparer(t)
+		conversation, err := ordinary.s.GetConversation(ctx, ordinary.group.ID, ordinary.pending.Delivery.ConversationID)
+		prepareRoleOK(t, err)
+		trigger := ordinary.trigger
+		trigger.Content = strings.Repeat("ordinary", 2048)
+		wire, err := p.buildContext(ordinary.group, ordinary.member, conversation, trigger, nil, false)
+		if err != scheduler.ErrNotReady || len(wire) != 0 || p.maxContextBytes != 16<<10 {
+			t.Fatalf("trusted intake profile changed generic ordinary budget: %v", err)
+		}
+	})
+}
+
 func TestChatRepairPreparationFullSourceCannotBeBudgetTruncated(t *testing.T) {
 	f := newRepairPreparation(t)
 	f.settleParent(t)
@@ -288,7 +423,8 @@ func TestChatRepairPreparationFullSourceCannotBeBudgetTruncated(t *testing.T) {
 	prepareRoleOK(t, err)
 	baseline, err := p.buildContext(f.group, member, conversation, f.notice, nil, true)
 	prepareRoleOK(t, err)
-	p.maxContextBytes = len(baseline)
+	f.opts.MaxContextBytes = len(baseline)
+	p = f.preparer(t)
 	before := f.snapshot(t)
 	blocked, err := p.Prepare(ctx, f.pendingReview)
 	if !errors.Is(err, scheduler.ErrNotReady) || blocked.Executor != nil || blocked.Request.Prompt != "" {
