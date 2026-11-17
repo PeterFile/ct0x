@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 )
 
 // The caller owns the existing submission transaction and its first SQL scope
@@ -22,7 +23,7 @@ func workerArtifactPublicationsInTx(ctx context.Context, tx *sql.Tx, input Submi
 		err := tx.QueryRowContext(ctx, `SELECT operation_id,blob_hash,size FROM worker_artifact_publications
  WHERE version_id=? AND group_id=? AND member_id=?`, ref.VersionID, input.GroupID, input.ActorID).Scan(&operationID, &blob.Hash, &blob.Size)
 		if errors.Is(err, sql.ErrNoRows) {
-			return ErrMemberToolDenied
+			return fmt.Errorf("%w：目录成果版本缺少执行绑定的可信发布回执", ErrMemberToolDenied)
 		}
 		if err != nil {
 			return err
