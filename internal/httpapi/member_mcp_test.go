@@ -231,7 +231,7 @@ func TestMemberMCPAuthAndFramingFailClosed(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"content":"a","Content":"b"}}}`,
 		memberMCPCall("1", "send_message", `[]`),
 		memberMCPCall("1", "send_message", `null`),
-		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"content":"forged"},"_meta":{"purpose":"chat_intake/v1"}}}`,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"content":"forged"},"purpose":"chat_intake/v1"}}`,
 		`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"send_message","arguments":{"content":"notification write"}}}`,
 		`{"jsonrpc":"2.0","id":1,"method":"notifications/initialized"}`,
 		memberMCPInitialize + `{}`,

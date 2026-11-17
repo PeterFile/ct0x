@@ -209,8 +209,22 @@ func (m *codexAppServerMemberSession) configure(inherited []string, config map[s
 		return err
 	}
 	m.server = name
+	// In 0.166 model-selected code mode can override false feature flags. Keep
+	// only this server's issued tools direct, outside search and the disabled
+	// code-mode host. Clear inherited global namespace overrides rather than
+	// giving unrelated native/MCP namespaces direct-only exposure.
+	features := config["features"].(map[string]any)
+	features["code_mode"] = map[string]any{"enabled": false, "direct_only_tool_namespaces": []string{}}
+	features["code_mode_only_strict_3p_tools"] = false
+	// Native Approve removes the redundant prompt only for issued tools. The
+	// platform still checks the original token, claim, purpose and grants per call.
+	toolApprovals := make(map[string]map[string]string, len(m.names))
+	for _, tool := range m.names {
+		toolApprovals[tool] = map[string]string{"approval_mode": "approve"}
+	}
 	config["mcp_servers"].(map[string]any)[name] = map[string]any{
 		"url": m.endpoint, "bearer_token_env_var": m.tokenEnv, "enabled": true, "enabled_tools": m.names,
+		"omit_tools_from": []string{"code_mode", "deferred"}, "tools": toolApprovals,
 	}
 	return nil
 }
@@ -222,13 +236,25 @@ func (p *codexAppServerProtocol) memberStatus(raw json.RawMessage) {
 		p.fail()
 		return
 	}
-	status, err := codexRPCObject(data[0], "name", "runtimeStatus", "httpOrigin", "authStatus", "toolsError", "pluginId")
+	status, err := codexRPCObject(data[0], "name", "runtimeStatus", "httpOrigin", "authStatus", "toolsError", "pluginId", "tools")
 	name, _ := codexAppServerString(status, "name")
 	origin, _ := codexAppServerString(status, "httpOrigin")
-	if err != nil || name != p.member.server || string(status["runtimeStatus"]) != `"connected"` || string(status["authStatus"]) != `"bearerToken"` ||
+	tools, toolsErr := codexAppServerMap(status["tools"])
+	if err != nil || toolsErr != nil || name != p.member.server || string(status["runtimeStatus"]) != `"connected"` || string(status["authStatus"]) != `"bearerToken"` ||
 		origin != p.member.origin || !codexAppServerNoError(status["toolsError"]) || !codexAppServerNoError(status["pluginId"]) {
 		p.fail()
 		return
+	}
+	// Status returns raw Tool definitions, not model-visible ToolInfo namespaces.
+	// A catalog can include unissued tools; enabled_tools and memberItem retain
+	// the exact allowlist. Every issued tool must exist with its raw name bound.
+	for _, name := range p.member.names {
+		tool, err := codexRPCObject(tools[name], "name")
+		observed, valid := codexAppServerString(tool, "name")
+		if err != nil || !valid || observed != name {
+			p.fail()
+			return
+		}
 	}
 	p.member.ready = true
 	p.startTurn()

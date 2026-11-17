@@ -16,6 +16,7 @@ import (
 type config struct {
 	listen, dataDir, webDir, devOrigin, piPath, codexPath       string
 	enableExecution, enableMemberTools, enableCoordinationRoles bool
+	enableCodexAppServer                                        bool
 	piMemberToolsExtension, roleThinking                        string
 	memberToolsMaxMembers                                       int
 }
@@ -25,7 +26,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags := flag.NewFlagSet("workspace", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	flags.Usage = func() {
-		fmt.Fprintf(output, "用法：workspace [选项]\n  --listen 地址    回环 IP 与端口（默认 %s，显式指定时可用端口 0）\n  --data-dir 路径  数据目录（默认用户配置目录下的 agent-workspace）\n  --web-dir 路径   网页构建目录（默认禁用，仅提供 API）\n  --enable-execution  启用全新单轮执行（默认禁用，最大并发 1；不支持恢复）\n  --enable-member-tools  启用 Pi 六项基础平台工具（含只读历史搜索与分段读取；默认禁用，须启用执行）\n  --pi-member-tools-extension 路径  显式可信扩展的绝对可读文件路径（须保留相邻依赖）\n  --member-tools-max-members 数量  工具增员容量（默认 4，1..200；仅工具启用时可指定）\n  --enable-coordination-roles  显式启用受信协调角色（默认禁用，须启用执行、成员工具与可信 Pi 扩展）\n  --role-thinking 级别  仅协调角色使用：off、minimal、low、medium、high、xhigh、max（默认空，沿用 CLI 默认；须启用协调角色）\n  --dev-origin 来源  单个 HTTP 回环开发来源，必须有端口（默认禁用）\n  --pi-path 路径   Pi 绝对可执行文件路径（可选，以发现结果为准）\n  --codex-path 路径  Codex 绝对可执行文件路径（可选，以发现结果为准）\nCLI 目录仅启动时只读探测，证据仅存内存，不验证执行能力。\n执行要求数据目录及祖先可信且目录身份稳定；工作目录不是主机文件读取沙箱。Pi 默认禁用工具，显式开启平台工具须选已验证 Pi 1.4.0 与显式模型；Codex 仅原生只读工具，无平台令牌。普通投递的基础工具不授予协调或工作准入权限；显式协调角色按服务端执行身份绑定专用工具。角色就绪查询仅为采样诊断，不保证后续认领或执行；不支持运行中追加输入。\n", httpapi.DefaultAddress)
+		fmt.Fprintf(output, "用法：workspace [选项]\n  --listen 地址    回环 IP 与端口（默认 %s，显式指定时可用端口 0）\n  --data-dir 路径  数据目录（默认用户配置目录下的 agent-workspace）\n  --web-dir 路径   网页构建目录（默认禁用，仅提供 API）\n  --enable-execution  启用全新单轮执行（默认禁用，最大并发 1；不支持恢复）\n  --enable-member-tools  启用 Pi 六项基础平台工具（含只读历史搜索与分段读取；默认禁用，须启用执行）\n  --pi-member-tools-extension 路径  显式可信扩展的绝对可读文件路径（须保留相邻依赖）\n  --member-tools-max-members 数量  工具增员容量（默认 4，1..200；仅工具启用时可指定）\n  --enable-coordination-roles  显式启用受信协调角色（默认禁用，须启用执行、成员工具及所选原生工具适配器；Pi 仍须可信扩展）\n  --enable-codex-app-server  显式选择实验性 Codex AppServer 与会话级平台 MCP（默认禁用；须启用执行、成员工具和协调角色；可不配置 Pi 扩展）\n  --role-thinking 级别  仅 Pi 协调角色使用：off、minimal、low、medium、high、xhigh、max（默认空，沿用 Pi CLI 默认；Codex 不传此参数；须启用协调角色）\n  --dev-origin 来源  单个 HTTP 回环开发来源，必须有端口（默认禁用）\n  --pi-path 路径   Pi 绝对可执行文件路径（可选，以发现结果为准）\n  --codex-path 路径  Codex 绝对可执行文件路径（可选，以发现结果为准）\nCLI 目录仅启动时只读探测，证据仅存内存，不验证执行能力。适配器能力仅描述固定实现版本支持，不代表账号、网络实测或工作许可；未知能力不能自动分派。\n执行要求数据目录及祖先可信且目录身份稳定；工作目录不是主机文件读取沙箱。Pi 默认禁用工具，显式开启平台工具须选已验证 Pi 1.4.0 与显式模型；Codex 默认仅原生只读工具，无平台令牌。显式开启 AppServer 时，所选受支持版本可复用同一成员工具与 claim/角色围栏；仅受限只读原生文本配置（无可写目录、approval never），不保证禁用全部原生工具；原生 apply_patch 可能仍注册但写入须被原生安全边界拒绝，view_image 关闭，不承诺文件读取隔离；继承 MCP 禁用，唯一平台 MCP 不提供 resources，不启用文件任务或 Artifact。普通投递的基础工具不授予协调或工作准入权限；显式协调角色按服务端执行身份绑定专用工具。角色就绪查询仅为采样诊断，不保证后续认领或执行；不支持运行中追加输入。\n", httpapi.DefaultAddress)
 	}
 	flags.StringVar(&config.listen, "listen", httpapi.DefaultAddress, "监听地址")
 	flags.StringVar(&config.dataDir, "data-dir", "", "数据目录")
@@ -35,6 +36,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags.StringVar(&config.piMemberToolsExtension, "pi-member-tools-extension", "", "可信 Pi 扩展的绝对文件路径")
 	flags.IntVar(&config.memberToolsMaxMembers, "member-tools-max-members", 4, "成员工具增员容量（1..200）")
 	flags.BoolVar(&config.enableCoordinationRoles, "enable-coordination-roles", false, "显式启用受信协调角色（默认禁用）")
+	flags.BoolVar(&config.enableCodexAppServer, "enable-codex-app-server", false, "显式选择实验性 Codex AppServer 与会话级平台 MCP（默认禁用）")
 	flags.StringVar(&config.roleThinking, "role-thinking", "", "协调角色的 Pi thinking 级别（默认空）")
 	for name, destination := range map[string]*string{"pi-path": &config.piPath, "codex-path": &config.codexPath} {
 		flags.Func(name, "CLI 绝对路径", func(value string) error {
@@ -70,6 +72,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		return config, errors.New("监听地址必须是带端口的回环 IP 地址")
 	}
 	config.listen = address.String()
+	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
+		return config, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
+	}
 	if config.enableCoordinationRoles && (!config.enableExecution || !config.enableMemberTools) {
 		return config, errors.New("启用协调角色必须同时启用执行、成员工具并显式指定可信 Pi 扩展")
 	}
@@ -85,7 +90,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		return config, errors.New("成员工具禁用时不能指定扩展或增员容量")
 	}
 	if config.enableMemberTools {
-		if !config.enableExecution || !set["pi-member-tools-extension"] {
+		if !config.enableExecution || !set["pi-member-tools-extension"] && !config.enableCodexAppServer {
 			return config, errors.New("启用成员工具必须同时启用执行并显式指定可信 Pi 扩展")
 		}
 		if address.Addr() != netip.MustParseAddr("127.0.0.1") && address.Addr() != netip.IPv6Loopback() {
@@ -94,6 +99,8 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		if config.memberToolsMaxMembers < 1 || config.memberToolsMaxMembers > 200 {
 			return config, errors.New("成员工具增员容量必须在 1..200 之间")
 		}
+	}
+	if config.enableMemberTools && set["pi-member-tools-extension"] {
 		path := config.piMemberToolsExtension
 		if !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
 			return config, errors.New("Pi 成员工具扩展必须是绝对可读普通文件路径")

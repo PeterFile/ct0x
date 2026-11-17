@@ -14,6 +14,11 @@ import (
 // issueCoordinationRole is a trusted process-local entry, never a grant option
 // on public Issue. Registration is not a startup-readiness or native-execution gate.
 func (s *MemberTools) issueCoordinationRole(ctx context.Context, scope store.CoordinationToolScope) (string, error) {
+	return s.issueCoordinationRoleWithCapabilities(ctx, scope, nil)
+}
+
+func (s *MemberTools) issueCoordinationRoleWithCapabilities(ctx context.Context, scope store.CoordinationToolScope, facts []store.DispatchWorkerCapabilityFact) (string, error) {
+	facts = slices.Clone(facts)
 	var operations []string
 	switch scope.Provenance.Kind {
 	case store.CoordinationRoleCoordinator:
@@ -52,7 +57,7 @@ func (s *MemberTools) issueCoordinationRole(ctx context.Context, scope store.Coo
 		return "", store.ErrMemberToolDenied
 	}
 	s.capabilities[key] = memberToolRegistration{scope: scope.Member, role: scope,
-		grants: MemberToolGrants{Operations: operations}}
+		grants: MemberToolGrants{Operations: operations}, dispatchCapabilities: facts}
 	return token, nil
 }
 
@@ -72,6 +77,12 @@ func memberRoleError(ctx context.Context, err error) error {
 // Store owns the same-tx live/provenance fence and replay-before-new-eligibility
 // order; neither Bind nor a separate startup-readiness preflight belongs here.
 func (s *MemberTools) withCoordinationRole(ctx context.Context, token, operation string, kind store.CoordinationRoleKind, use func(store.CoordinationToolScope) error) error {
+	return s.withCoordinationRoleRegistration(token, operation, kind, func(entry memberToolRegistration) error {
+		return use(entry.role)
+	})
+}
+
+func (s *MemberTools) withCoordinationRoleRegistration(token, operation string, kind store.CoordinationRoleKind, use func(memberToolRegistration) error) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry, found := s.capabilities[sha256.Sum256([]byte(token))]
@@ -79,14 +90,14 @@ func (s *MemberTools) withCoordinationRole(ctx context.Context, token, operation
 		return store.ErrMemberToolDenied
 	}
 	// Preserve Store-owned causes and transaction outcome evidence.
-	return use(entry.role)
+	return use(entry)
 }
 
 func (s *MemberTools) DecideDispatch(ctx context.Context, token string, input store.CoordinatorDecisionInput, key string) (domain.DecisionReceipt, error) {
 	var result domain.DecisionReceipt
-	err := s.withCoordinationRole(ctx, token, "decide_dispatch", store.CoordinationRoleCoordinator, func(scope store.CoordinationToolScope) error {
+	err := s.withCoordinationRoleRegistration(token, "decide_dispatch", store.CoordinationRoleCoordinator, func(entry memberToolRegistration) error {
 		var err error
-		result, err = s.db.DecideDispatch(ctx, scope, input, key)
+		result, err = s.db.DecideDispatchWithCapabilities(ctx, entry.role, input, key, entry.dispatchCapabilities)
 		return err
 	})
 	if err != nil {
