@@ -30,10 +30,19 @@ func chatReviewV17(t *testing.T, outcome domain.ReviewOutcome) (chatFixture, dom
 	return f, submission, input, decision
 }
 
-func TestChatReviewNoticeV17UpgradePreservesHistoricalReceipts(t *testing.T) {
-	if len(migrations) != 18 {
+// Pin historical notice contracts to v18; later migrations have their own tests.
+func chatReviewNoticeV18Migrations(t *testing.T) {
+	t.Helper()
+	if len(migrations) < 18 {
 		t.Fatalf("Review notice requires appended v18 migration; got %d", len(migrations))
 	}
+	original := migrations
+	migrations = original[:18]
+	t.Cleanup(func() { migrations = original })
+}
+
+func TestChatReviewNoticeV17UpgradePreservesHistoricalReceipts(t *testing.T) {
+	chatReviewNoticeV18Migrations(t)
 	for _, outcome := range []domain.ReviewOutcome{domain.ReviewOutcomeAccepted, domain.ReviewOutcomeRejected} {
 		t.Run(string(outcome), func(t *testing.T) {
 			f, submission, input, decision := chatReviewV17(t, outcome)
@@ -69,9 +78,7 @@ func TestChatReviewNoticeV17UpgradePreservesHistoricalReceipts(t *testing.T) {
 }
 
 func TestChatReviewNoticeV18MigrationRollbackAndRetry(t *testing.T) {
-	if len(migrations) != 18 {
-		t.Fatalf("Review notice requires appended v18 migration; got %d", len(migrations))
-	}
+	chatReviewNoticeV18Migrations(t)
 	f, _, input, decision := chatReviewV17(t, domain.ReviewOutcomeRejected)
 	original := migrations
 	defer func() { migrations = original }()
@@ -129,9 +136,7 @@ func TestChatReviewNoticeLegacyNonChatTaskUnaffected(t *testing.T) {
 }
 
 func TestChatReviewNoticeSchemaGuardsAndIndexedSourceJoin(t *testing.T) {
-	if len(migrations) != 18 {
-		t.Fatalf("Review notice requires appended v18 migration; got %d", len(migrations))
-	}
+	chatReviewNoticeV18Migrations(t)
 	f, _, _, decision := chatReviewV17(t, domain.ReviewOutcomeAccepted)
 	if err := migrate(f.s.db); err != nil {
 		t.Fatal(err)
