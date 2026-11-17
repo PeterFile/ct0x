@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"path/filepath"
@@ -240,6 +241,7 @@ type codexAppServerProtocol struct {
 	reply                 func(codexRPCMessage, any) bool
 	summary               func(codexAppServerConfigSnapshot)
 	member                *codexAppServerMemberSession
+	session               *codexAppServerSession
 	awaiting              int
 	threadID              string
 	turnID                string
@@ -308,7 +310,7 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 		p.interruptAcknowledged = true
 		return
 	}
-	if p.awaiting == 0 || !bytes.Equal(bytes.TrimSpace(message.ID), []byte(strconv.Itoa(p.awaiting))) || message.Error != nil {
+	if p.awaiting == 0 || !bytes.Equal(bytes.TrimSpace(message.ID), []byte(strconv.Itoa(p.awaiting))) || message.Error != nil && (p.session == nil || p.awaiting != 9) {
 		p.fail()
 		return
 	}
@@ -325,6 +327,13 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			p.fail()
 			return
 		}
+		if p.session != nil {
+			if !nativeSessionPath(home) || p.session.resume != nil && p.session.resume.NativeHome != home {
+				p.fail()
+				return
+			}
+			p.session.home = home
+		}
 		if !p.send(0, "initialized", nil) {
 			p.fail()
 			return
@@ -333,6 +342,10 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 	case 2, 4:
 		config, err := readCodexAppServerConfig(message.Result)
 		if err != nil {
+			p.fail()
+			return
+		}
+		if p.session != nil && !p.session.currentConfig(message.Result, id == 2) {
 			p.fail()
 			return
 		}
@@ -348,7 +361,22 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			if p.request.Model != "" {
 				params["model"] = p.request.Model
 			}
-			p.next(3, "thread/start", params)
+			method := "thread/start"
+			if p.session != nil {
+				params["modelProvider"] = p.session.provider
+				params["approvalsReviewer"] = "user"
+				threadConfig["approvals_reviewer"] = "user"
+				if p.session.effort != "" {
+					threadConfig["model_reasoning_effort"] = p.session.effort
+				}
+				threadConfig["mcp_servers"].(map[string]any)[p.member.server].(map[string]any)["required"] = true
+				if p.session.resume != nil {
+					method = "thread/resume"
+					delete(params, "ephemeral")
+					params["threadId"], params["excludeTurns"] = p.session.resume.NativeThreadID, true
+				}
+			}
+			p.next(3, method, params)
 		} else {
 			if config.origins != p.before.origins || config.layers != p.before.layers || !slices.Equal(config.names, p.before.names) {
 				p.fail()
@@ -391,6 +419,10 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 				return
 			}
 		}
+		if p.session != nil && !p.session.threadResponse(message.Result, p.request, threadID) {
+			p.fail()
+			return
+		}
 		p.threadID, p.receipt.NativeSessionID = threadID, threadID
 		p.emit(Event{Kind: SessionEvent})
 		p.replayBuffer()
@@ -403,6 +435,10 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			p.fail()
 			return
 		}
+		if p.session != nil && p.session.priorTurnIDs[turnID] {
+			p.fail()
+			return
+		}
 		p.turnID = turnID
 		p.replayBuffer()
 	case 7:
@@ -411,13 +447,33 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			return
 		}
 		p.memberStatus(message.Result)
+	case 8:
+		if p.session == nil || p.session.resume == nil || !p.verifySessionHistory(message.Result, false) {
+			p.fail()
+			return
+		}
+		p.startTurn()
+	case 9:
+		// Capture is optional. A well-formed read error or unavailable anchor
+		// drops only the reference, never invents or erases native evidence.
+		if message.Error == nil {
+			p.verifySessionHistory(message.Result, true)
+		}
 	default:
 		p.fail()
 	}
 }
 
 func (p *codexAppServerProtocol) startTurn() {
-	p.next(5, "turn/start", map[string]any{"threadId": p.threadID, "input": []any{map[string]string{"type": "text", "text": p.request.Prompt}}})
+	params := map[string]any{"threadId": p.threadID, "input": []any{map[string]string{"type": "text", "text": p.request.Prompt}}}
+	if p.session != nil {
+		params["cwd"], params["model"], params["approvalPolicy"] = p.request.CWD, p.request.Model, "never"
+		params["sandboxPolicy"] = map[string]any{"type": "readOnly", "networkAccess": false}
+		if p.session.effort != "" {
+			params["effort"] = p.session.effort
+		}
+	}
+	p.next(5, "turn/start", params)
 }
 
 func (p *codexAppServerProtocol) replayBuffer() {
@@ -561,6 +617,9 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 			p.fail()
 		}
 		if id := fields["turnId"]; id != nil && (p.turnID == "" || string(id) != string(mustCodexAppServerJSON(p.turnID))) {
+			p.fail()
+		}
+		if p.session != nil && p.turnID == "" && (method == "thread/closed" || method == "thread/status/changed" && !codexSessionIdle(message.Params, "status")) {
 			p.fail()
 		}
 		if method == "serverRequest/resolved" {
@@ -709,6 +768,9 @@ func (p *codexAppServerProtocol) turnNotification(method string, raw json.RawMes
 	}
 	p.receipt.Terminal = terminal
 	p.emit(Event{Kind: TerminalEvent, Terminal: terminal})
+	if p.session != nil && terminal == OutcomeSucceeded && p.settled() {
+		p.next(9, "thread/read", map[string]any{"threadId": p.threadID, "includeTurns": true})
+	}
 }
 
 func (p *codexAppServerProtocol) item(raw json.RawMessage, completed bool) {
@@ -784,4 +846,315 @@ func (p *codexAppServerProtocol) interrupt() {
 func mustCodexAppServerJSON(value any) json.RawMessage {
 	raw, _ := json.Marshal(value)
 	return raw
+}
+
+// Per-invocation state only: never retain a native process, token or transcript.
+// The original native writer is acquired by cold thread/resume and retained
+// through the final history read and ordinary stdin shutdown.
+type codexAppServerSession struct {
+	cliPath      string
+	home         string
+	toolsProfile string
+	provider     string
+	effort       string
+	binding      json.RawMessage
+	resume       *CodexNativeSessionReference
+	pending      *NativeSessionReference
+	priorTurnIDs map[string]bool
+}
+
+func codexSessionToolsProfile(names []string) string {
+	// Match Store.NativeToolsProfileSHA256 without changing issuance order.
+	// The adapter/protocol versions separately bind the fixed native policy.
+	canonical := slices.Clone(names)
+	slices.Sort(canonical)
+	canonical = slices.Compact(canonical)
+	digest := sha256.Sum256(mustCodexAppServerJSON(canonical))
+	return hex.EncodeToString(digest[:])
+}
+
+func (s *codexAppServerSession) currentConfig(raw json.RawMessage, first bool) bool {
+	fields, err := codexRPCObject(raw, "config")
+	config, configErr := codexRPCObject(fields["config"], "model_provider", "model_reasoning_effort")
+	provider, valid := codexAppServerString(config, "model_provider")
+	effort := ""
+	if !codexAppServerNoError(config["model_reasoning_effort"]) {
+		var effortOK bool
+		effort, effortOK = codexAppServerString(config, "model_reasoning_effort")
+		valid = valid && effortOK
+	}
+	if err != nil || configErr != nil || !valid || !first && (provider != s.provider || effort != s.effort) ||
+		s.resume != nil && (provider != s.resume.Provider || effort != s.resume.ReasoningEffort) {
+		return false
+	}
+	s.provider, s.effort = provider, effort
+	return true
+}
+
+func codexSessionIdle(raw json.RawMessage, key string) bool {
+	fields, err := codexRPCObject(raw, key)
+	status, statusErr := codexAppServerMap(fields[key])
+	return err == nil && statusErr == nil && len(status) == 1 && string(status["type"]) == `"idle"`
+}
+
+func (s *codexAppServerSession) threadResponse(raw json.RawMessage, request ExecuteRequest, threadID string) bool {
+	fields, err := codexRPCObject(raw, "modelProvider", "reasoningEffort", "approvalsReviewer", "thread")
+	provider, valid := codexAppServerString(fields, "modelProvider")
+	effort := ""
+	if !codexAppServerNoError(fields["reasoningEffort"]) {
+		var effortOK bool
+		effort, effortOK = codexAppServerString(fields, "reasoningEffort")
+		valid = valid && effortOK
+	}
+	thread, threadErr := codexRPCObject(fields["thread"], "cliVersion", "source", "cwd", "modelProvider")
+	var cwd string
+	return err == nil && threadErr == nil && valid && provider == s.provider && effort == s.effort &&
+		string(fields["approvalsReviewer"]) == `"user"` && codexSessionIdle(fields["thread"], "status") &&
+		string(thread["cliVersion"]) == `"0.166.0"` && string(thread["source"]) == `"appServer"` &&
+		json.Unmarshal(thread["cwd"], &cwd) == nil && cwd == request.CWD &&
+		string(thread["modelProvider"]) == string(mustCodexAppServerJSON(s.provider)) &&
+		(s.resume == nil || threadID == s.resume.NativeThreadID)
+}
+
+// This is a public-history anchor, not a CAS over hidden native settings or
+// arbitrary file bytes. It excludes runtime timing/status metadata at thread
+// level, but hashes actual stable turn/item contents, including MCP arguments and
+// results. Full content is held only in this bounded stack-local snapshot.
+type codexSessionPublicHistory struct {
+	turns []any
+	items int
+}
+
+func (h codexSessionPublicHistory) digest() string {
+	digest := sha256.Sum256(mustCodexAppServerJSON(h.turns))
+	return hex.EncodeToString(digest[:])
+}
+
+func (h codexSessionPublicHistory) matches(ref *CodexNativeSessionReference) bool {
+	if len(h.turns) != ref.HistoryTurns || h.items != ref.HistoryItems || h.digest() != ref.HistorySHA256 {
+		return false
+	}
+	last := h.turns[len(h.turns)-1].(map[string]any)
+	return last["id"] == ref.NativeTurnID && last["status"] == "completed"
+}
+
+func (p *codexAppServerProtocol) sessionHistory(raw json.RawMessage) (codexSessionPublicHistory, bool) {
+	var history codexSessionPublicHistory
+	if len(raw) > codexRPCFrameLimit {
+		return history, false
+	}
+	decoded, err := nativeSessionJSON(raw, 64, false)
+	response, ok := decoded.(map[string]any)
+	if err != nil || !ok {
+		return history, false
+	}
+	thread, ok := response["thread"].(map[string]any)
+	if !ok || thread["id"] != p.threadID || thread["ephemeral"] != false || thread["parentThreadId"] != nil || thread["forkedFromId"] != nil ||
+		thread["cliVersion"] != "0.166.0" || thread["source"] != "appServer" || thread["cwd"] != p.request.CWD || thread["modelProvider"] != p.session.provider {
+		return history, false
+	}
+	status, ok := thread["status"].(map[string]any)
+	if !ok || len(status) != 1 || status["type"] != "idle" {
+		return history, false
+	}
+	turns, ok := thread["turns"].([]any)
+	if !ok || len(turns) == 0 || len(turns) > codexSessionHistoryTurnLimit {
+		return history, false
+	}
+	turnIDs, itemIDs := map[string]bool{}, map[string]bool{}
+	history.turns = make([]any, 0, len(turns))
+	for _, value := range turns {
+		turn, ok := value.(map[string]any)
+		id, idOK := turn["id"].(string)
+		items, itemsOK := turn["items"].([]any)
+		if !ok || !idOK || !codexAppServerIdentity(id) || turnIDs[id] || turn["status"] != "completed" || turn["error"] != nil || !itemsOK ||
+			turn["itemsView"] != nil && turn["itemsView"] != "full" || len(items) > codexSessionHistoryItemLimit-history.items {
+			return codexSessionPublicHistory{}, false
+		}
+		if root := turn["rootTurnId"]; root != nil {
+			rootID, ok := root.(string)
+			if !ok || !codexAppServerIdentity(rootID) {
+				return codexSessionPublicHistory{}, false
+			}
+		}
+		turnIDs[id] = true
+		projectedItems := make([]any, 0, len(items))
+		for _, value := range items {
+			item, ok := value.(map[string]any)
+			if !ok {
+				return codexSessionPublicHistory{}, false
+			}
+			projected, valid := codexSessionPublicItem(item, p.member.names)
+			id, _ := projected["id"].(string)
+			if !valid || itemIDs[id] {
+				return codexSessionPublicHistory{}, false
+			}
+			itemIDs[id] = true
+			projectedItems = append(projectedItems, projected)
+		}
+		history.items += len(projectedItems)
+		history.turns = append(history.turns, map[string]any{"id": id, "rootTurnId": turn["rootTurnId"], "status": "completed", "items": projectedItems, "error": nil})
+	}
+	return history, true
+}
+
+func codexSessionPublicItem(item map[string]any, tools []string) (map[string]any, bool) {
+	id, idOK := item["id"].(string)
+	kind, kindOK := item["type"].(string)
+	if !idOK || !kindOK || !codexAppServerIdentity(id) {
+		return nil, false
+	}
+	projected := map[string]any{"id": id, "type": kind}
+	switch kind {
+	case "userMessage":
+		content, ok := item["content"].([]any)
+		if !ok || len(content) == 0 {
+			return nil, false
+		}
+		for _, value := range content {
+			part, ok := value.(map[string]any)
+			if !ok || part["type"] != "text" {
+				return nil, false
+			}
+			if _, ok := part["text"].(string); !ok {
+				return nil, false
+			}
+		}
+		projected["content"], projected["clientId"] = content, item["clientId"]
+	case "agentMessage":
+		text, ok := item["text"].(string)
+		if !ok || item["delivery"] != nil || item["questions"] != nil {
+			return nil, false
+		}
+		projected["text"], projected["phase"], projected["memoryCitation"] = text, item["phase"], item["memoryCitation"]
+	case "reasoning":
+		for _, key := range []string{"summary", "content"} {
+			parts := []any{}
+			if value, exists := item[key]; exists {
+				var ok bool
+				parts, ok = value.([]any)
+				if !ok {
+					return nil, false
+				}
+			}
+			for _, part := range parts {
+				if _, ok := part.(string); !ok {
+					return nil, false
+				}
+			}
+			projected[key] = parts
+		}
+	case "mcpToolCall":
+		server, serverOK := item["server"].(string)
+		tool, toolOK := item["tool"].(string)
+		_, argsOK := item["arguments"].(map[string]any)
+		result, resultOK := item["result"].(map[string]any)
+		content, contentOK := result["content"].([]any)
+		if !serverOK || !codexAppServerIdentity(server) || !toolOK || !slices.Contains(tools, tool) || !argsOK || !resultOK || !contentOK || item["status"] != "completed" || item["error"] != nil {
+			return nil, false
+		}
+		for _, key := range []string{"appContext", "mcpAppUi", "pluginId", "mcpAppResourceUri"} {
+			if item[key] != nil {
+				return nil, false
+			}
+		}
+		for _, value := range content {
+			part, ok := value.(map[string]any)
+			if !ok || part["type"] != "text" {
+				return nil, false
+			}
+			if _, ok := part["text"].(string); !ok {
+				return nil, false
+			}
+		}
+		if hint := item["readOnlyHint"]; hint != nil {
+			if _, ok := hint.(bool); !ok {
+				return nil, false
+			}
+		}
+		for _, key := range []string{"server", "tool", "arguments", "result", "readOnlyHint"} {
+			projected[key] = item[key]
+		}
+		projected["status"], projected["error"] = "completed", nil
+	default:
+		// No file/resource/dynamic/compaction/experimental plan adoption.
+		return nil, false
+	}
+	return projected, true
+}
+
+func (p *codexAppServerProtocol) verifySessionHistory(raw json.RawMessage, capture bool) bool {
+	history, valid := p.sessionHistory(raw)
+	if !valid {
+		return false
+	}
+	s := p.session
+	if !capture {
+		if s.resume == nil || !history.matches(s.resume) {
+			return false
+		}
+		s.priorTurnIDs = make(map[string]bool, len(history.turns))
+		for _, value := range history.turns {
+			s.priorTurnIDs[value.(map[string]any)["id"].(string)] = true
+		}
+		return true
+	}
+	expectedTurns := 1
+	if s.resume != nil {
+		expectedTurns += s.resume.HistoryTurns
+	}
+	if len(history.turns) != expectedTurns {
+		return false
+	}
+	last := history.turns[len(history.turns)-1].(map[string]any)
+	items := last["items"].([]any)
+	if last["id"] != p.turnID || last["status"] != "completed" {
+		return false
+	}
+	if s.resume != nil {
+		prefix := codexSessionPublicHistory{turns: history.turns[:len(history.turns)-1], items: history.items - len(items)}
+		if !prefix.matches(s.resume) {
+			return false
+		}
+	}
+	seen, users := map[string]bool{}, 0
+	for _, value := range items {
+		item := value.(map[string]any)
+		id, kind := item["id"].(string), item["type"].(string)
+		seen[id] = true
+		known, exists := p.items[id]
+		switch kind {
+		case "userMessage":
+			users++
+			content := item["content"].([]any)
+			if len(content) != 1 || content[0].(map[string]any)["text"] != p.request.Prompt {
+				return false
+			}
+		case "mcpToolCall":
+			if _, ok := p.memberItem(mustCodexAppServerJSON(item), true); !ok {
+				return false
+			}
+		case "agentMessage":
+			if !exists || !known.completed || known.kind != kind || known.textHash != sha256.Sum256([]byte(item["text"].(string))) {
+				return false
+			}
+		case "reasoning":
+			if !exists || !known.completed || known.kind != kind {
+				return false
+			}
+		}
+	}
+	if users != 1 {
+		return false
+	}
+	for id := range p.items {
+		if !seen[id] {
+			return false
+		}
+	}
+	s.pending = &NativeSessionReference{Version: NativeSessionReferenceVersion, Binding: bytes.Clone(s.binding),
+		Codex: &CodexNativeSessionReference{Adapter: codexSessionAdapter, Protocol: codexSessionProtocol, CLIPath: s.cliPath, CLIVersion: "0.166.0",
+			Provider: s.provider, Model: p.request.Model, ReasoningEffort: s.effort, CWD: p.request.CWD, ToolsProfileSHA256: s.toolsProfile,
+			NativeHome: s.home, NativeThreadID: p.threadID, NativeTurnID: p.turnID, HistorySHA256: history.digest(), HistoryTurns: len(history.turns), HistoryItems: history.items}}
+	return true
 }
