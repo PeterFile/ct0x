@@ -13,7 +13,7 @@ import (
 )
 
 var codexAppServerDisabledFeatures = []string{
-	"plugins", "apps", "hooks", "shell_tool", "unified_exec", "multi_agent", "multi_agent_v2",
+	"plugins", "apps", "hooks", "shell_tool", "view_image", "unified_exec", "multi_agent", "multi_agent_v2",
 	"code_mode", "code_mode_only", "code_mode_host", "tool_suggest",
 }
 
@@ -223,6 +223,8 @@ type codexAppServerItem struct {
 	status    string
 	completed bool
 	textHash  [32]byte
+	server    string
+	tool      string
 }
 
 // One owner handles a single connection, thread and turn. Provisional frames are
@@ -237,6 +239,7 @@ type codexAppServerProtocol struct {
 	send                  func(int, string, any) bool
 	reply                 func(codexRPCMessage, any) bool
 	summary               func(codexAppServerConfigSnapshot)
+	member                *codexAppServerMemberSession
 	awaiting              int
 	threadID              string
 	turnID                string
@@ -281,7 +284,7 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 	}
 	if message.Method != nil {
 		method := *message.Method
-		provisional := p.awaiting == 3 && slices.Contains([]string{"thread/status/changed", "thread/name/updated", "thread/project/updated"}, method) || p.awaiting == 5 &&
+		provisional := p.awaiting == 3 && slices.Contains([]string{"thread/status/changed", "thread/name/updated", "thread/project/updated", "mcpServer/startupStatus/updated"}, method) || p.awaiting == 5 &&
 			(strings.HasPrefix(method, "turn/") || strings.HasPrefix(method, "item/") || strings.HasPrefix(method, "hook/") || strings.HasPrefix(method, "model/") || method == "thread/tokenUsage/updated" || method == "error")
 		if provisional {
 			size := len(method) + len(message.Params) + len(message.ID)
@@ -336,7 +339,12 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 		p.summary(config)
 		if id == 2 {
 			p.before = config
-			params := map[string]any{"cwd": p.request.CWD, "sandbox": "read-only", "approvalPolicy": "never", "config": codexAppServerConfig(config.names), "ephemeral": false}
+			threadConfig := codexAppServerConfig(config.names)
+			if p.member != nil && p.member.configure(config.names, threadConfig) != nil {
+				p.fail()
+				return
+			}
+			params := map[string]any{"cwd": p.request.CWD, "sandbox": "read-only", "approvalPolicy": "never", "config": threadConfig, "ephemeral": false}
 			if p.request.Model != "" {
 				params["model"] = p.request.Model
 			}
@@ -346,17 +354,27 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 				p.fail()
 				return
 			}
-			p.next(5, "turn/start", map[string]any{"threadId": p.threadID, "input": []any{map[string]string{"type": "text", "text": p.request.Prompt}}})
+			if p.member != nil {
+				// Both selectors are mandatory: omitting serverName discovers all
+				// inherited servers using freshly loaded config in Codex 0.166.
+				p.next(7, "mcpServerStatus/list", map[string]any{"threadId": p.threadID, "serverName": p.member.server, "detail": "toolsAndAuthOnly", "limit": 1})
+			} else {
+				p.startTurn()
+			}
 		}
 	case 3:
-		fields, err := codexRPCObject(message.Result, "thread", "approvalPolicy", "sandbox", "cwd")
+		// In verified 0.166, the actual snapshot projects writable, external or
+		// unrepresentable permissions away from readOnly. Profile identity and
+		// runtime workspace roots alone do not grant writes.
+		fields, err := codexRPCObject(message.Result, "thread", "approvalPolicy", "sandbox", "cwd", "model")
 		thread, threadErr := codexRPCObject(fields["thread"], "id", "turns", "ephemeral", "parentThreadId", "forkedFromId")
 		sandbox, sandboxErr := codexRPCObject(fields["sandbox"], "type", "networkAccess")
 		threadID, valid := codexAppServerString(thread, "id")
-		var cwd, approval, policy string
+		var cwd, approval, policy, model string
 		if err != nil || threadErr != nil || sandboxErr != nil || !valid ||
 			json.Unmarshal(fields["cwd"], &cwd) != nil || filepath.Clean(cwd) != filepath.Clean(p.request.CWD) ||
 			json.Unmarshal(fields["approvalPolicy"], &approval) != nil || approval != "never" ||
+			p.request.Model != "" && (json.Unmarshal(fields["model"], &model) != nil || model != p.request.Model) ||
 			json.Unmarshal(sandbox["type"], &policy) != nil || policy != "readOnly" ||
 			!bytes.Equal(bytes.TrimSpace(thread["turns"]), []byte("[]")) || string(thread["ephemeral"]) != "false" ||
 			(p.threadSeen != "" && threadID != p.threadSeen) {
@@ -387,9 +405,19 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 		}
 		p.turnID = turnID
 		p.replayBuffer()
+	case 7:
+		if p.member == nil {
+			p.fail()
+			return
+		}
+		p.memberStatus(message.Result)
 	default:
 		p.fail()
 	}
+}
+
+func (p *codexAppServerProtocol) startTurn() {
+	p.next(5, "turn/start", map[string]any{"threadId": p.threadID, "input": []any{map[string]string{"type": "text", "text": p.request.Prompt}}})
 }
 
 func (p *codexAppServerProtocol) replayBuffer() {
@@ -413,6 +441,9 @@ func codexAppServerNoError(raw json.RawMessage) bool {
 }
 
 func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
+	if p.member != nil && p.memberNotification(message) {
+		return
+	}
 	method := *message.Method
 	if method == "remoteControl/status/changed" {
 		// Installed 0.166 emits this connection-level notification during
@@ -591,7 +622,17 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 		if !valid || !exists || item.completed || item.kind != kind {
 			p.fail()
 		}
-	case "turn/plan/updated", "model/rerouted", "model/verification", "model/safetyBuffering/updated":
+	case "item/mcpToolCall/progress":
+		id, valid := codexAppServerString(fields, "itemId")
+		item, exists := p.items[id]
+		if p.member == nil || !valid || !exists || item.kind != "mcpToolCall" || item.completed || item.server != p.member.server || !slices.Contains(p.member.names, item.tool) {
+			p.fail()
+		}
+	case "model/rerouted":
+		if p.request.Model != "" {
+			p.fail() // A selected model is not permission for a silent fallback.
+		}
+	case "turn/plan/updated", "model/verification", "model/safetyBuffering/updated":
 	case "error":
 		// A diagnostic (including a retry) is not a terminal receipt.
 	default:
@@ -656,6 +697,12 @@ func (p *codexAppServerProtocol) turnNotification(method string, raw json.RawMes
 				p.fail()
 				return
 			}
+		} else if kind == "mcpToolCall" && p.member != nil {
+			item, valid := p.memberItem(raw, true)
+			if !valid || !exists || !known.completed || known.server != item.server || known.tool != item.tool {
+				p.fail()
+				return
+			}
 		} else if kind != "userMessage" && kind != "reasoning" && kind != "plan" && kind != "contextCompaction" {
 			p.external = true
 		}
@@ -690,8 +737,20 @@ func (p *codexAppServerProtocol) item(raw json.RawMessage, completed bool) {
 			p.emit(Event{Kind: ResponseEvent, Text: *text})
 		}
 	case "userMessage", "reasoning", "plan", "contextCompaction":
+	case "mcpToolCall":
+		if p.member == nil {
+			p.external = true
+			p.cancel()
+			break
+		}
+		var valid bool
+		item, valid = p.memberItem(raw, completed)
+		if !valid {
+			p.fail()
+			return
+		}
 	default:
-		// No external tools are permitted in this text-only slice. Even a tool's
+		// Only explicitly bound platform MCP calls can be controlled. Even a tool's
 		// completed item does not prove its background work or agents stopped.
 		p.external = true
 		p.cancel()

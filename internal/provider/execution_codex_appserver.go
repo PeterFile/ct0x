@@ -20,7 +20,9 @@ type codexAppServerExecutor struct{ executionCommand }
 // adapter for Codex 0.166. It preserves the original CLI HOME and authentication.
 // It requires trusted, stable local configuration: double config/read and named
 // MCP disabling do not provide atomic config isolation, ABA protection or a
-// directory-read sandbox. No tools, resume or dynamic tool registration are offered.
+// directory-read sandbox. This is a native read-only text profile, with no
+// platform tools, resume or dynamic registration. Native file/resource helpers
+// may remain registered; any external item stays unknown.
 // A nonpositive timeout defaults to ten minutes; caller deadlines also apply.
 func NewCodexAppServerExecutor(path string, timeout time.Duration) (Executor, error) {
 	command, err := newExecutionCommand(path, timeout)
@@ -69,6 +71,10 @@ func codexAppServerArguments() []string {
 }
 
 func (e codexAppServerExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error) ExecutionReceipt {
+	return e.execute(ctx, request, onEvent, nil, nil)
+}
+
+func (e codexAppServerExecutor) execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error, member *codexAppServerMemberSession, env []string) ExecutionReceipt {
 	r := ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "执行参数无效"}
 	if request.Thinking != "" {
 		r.Reason = "Codex 暂不支持 thinking 参数"
@@ -138,6 +144,7 @@ func (e codexAppServerExecutor) Execute(ctx context.Context, request ExecuteRequ
 	}
 	cmd := exec.Command(e.path, codexAppServerArguments()...)
 	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = request.CWD, stdinR, stdoutW, stderrW
+	cmd.Env = env
 	if cmd.Start() != nil {
 		r.Reason = "无法启动模型进程，提示词未被接收"
 		return r
@@ -156,7 +163,17 @@ func (e codexAppServerExecutor) Execute(ctx context.Context, request ExecuteRequ
 	stderrDone := make(chan bool, 1)
 	go func() {
 		defer close(stderrJoined)
-		_, err := io.Copy(errLog, stderrR)
+		var destination io.Writer = errLog
+		if member != nil {
+			// Native diagnostics may contain bearer tokens split over any writes.
+			// Persist only a static byte count, never raw stderr in this profile.
+			destination = io.Discard
+		}
+		n, err := io.Copy(destination, stderrR)
+		if member != nil {
+			raw := mustCodexAppServerJSON(map[string]any{"type": "stderr_summary", "bytes": n})
+			_, _ = errLog.Write(append(raw, '\n'))
+		}
 		stderrDone <- err == nil
 	}()
 	waitDone := make(chan error, 1)
@@ -204,7 +221,7 @@ func (e codexAppServerExecutor) Execute(ctx context.Context, request ExecuteRequ
 		}
 	}
 	protocol := codexAppServerProtocol{
-		ctx: ctx, cancel: cancel, request: request, receipt: &r, delivery: delivery,
+		ctx: ctx, cancel: cancel, request: request, receipt: &r, delivery: delivery, member: member,
 		items: make(map[string]codexAppServerItem), requests: make(map[string]bool),
 		send: func(id int, method string, params any) bool {
 			message := codexRPCMessage{Method: &method}

@@ -175,7 +175,15 @@ func TestCodexAppServerProcessHelper(t *testing.T) {
 	if mode == "early-thread-status" {
 		notify("thread/status/changed", map[string]any{"threadId": appServerFixtureThread, "status": map[string]string{"type": "idle"}})
 	}
-	respond(thread, map[string]any{"thread": threadValue, "approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly", "networkAccess": false}, "cwd": cwd, "model": "synthetic/model", "modelProvider": "synthetic", "approvalsReviewer": "user"})
+	var threadParams struct{ Model string }
+	_ = json.Unmarshal(thread.Params, &threadParams)
+	actualModel := threadParams.Model
+	if mode == "model-fallback" {
+		actualModel = "synthetic/fallback"
+	} else if mode == "missing-model" {
+		actualModel = ""
+	}
+	respond(thread, map[string]any{"thread": threadValue, "approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly", "networkAccess": false}, "cwd": cwd, "model": actualModel, "modelProvider": "synthetic", "approvalsReviewer": "user"})
 	after := read("config/read")
 	respond(after, config(mode == "config-change" || mode == "config-names"))
 	if mode == "config-change" || mode == "config-names" {
@@ -448,7 +456,7 @@ func TestCodexAppServerLiteralHandshakeAndConfiguration(t *testing.T) {
 			if json.Unmarshal(params["config"], &config) != nil || config.Agents.Enabled == nil || *config.Agents.Enabled || config.WebSearch != "disabled" || config.Notify == nil {
 				t.Error("missing restrictions")
 			}
-			for _, feature := range []string{"plugins", "apps", "hooks", "shell_tool", "multi_agent", "multi_agent_v2", "code_mode", "code_mode_only", "code_mode_host", "tool_suggest"} {
+			for _, feature := range []string{"plugins", "apps", "hooks", "shell_tool", "view_image", "multi_agent", "multi_agent_v2", "code_mode", "code_mode_only", "code_mode_host", "tool_suggest"} {
 				if enabled, ok := config.Features[feature]; !ok || enabled {
 					t.Errorf("feature %s was not explicitly disabled", feature)
 				}
