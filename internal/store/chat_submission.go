@@ -36,13 +36,44 @@ func chatTextSubmissionInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInp
 	if err != nil {
 		return err
 	}
+	if action == domain.ChatActionWorkspaceChange {
+		return chatWorkspaceSubmissionInTx(ctx, tx, input)
+	}
 	if action != domain.ChatActionTextSubmission || len(input.ArtifactVersions) != 0 || !utf8.ValidString(input.Summary) {
 		return fmt.Errorf("%w：聊天文本交付不允许Artifact版本或非文本结果", ErrInvalid)
 	}
-	if authority == "written_preauthorization" && scope == domain.ChatPreparationTopicSummary && len(input.Summary) > 8192 {
-		return fmt.Errorf("%w：本话题预授权摘要最多8192字节", ErrInvalid)
+	if len(input.Summary) > 8192 {
+		if authority == "written_preauthorization" && scope == domain.ChatPreparationTopicSummary {
+			return fmt.Errorf("%w：本话题预授权摘要最多8192字节", ErrInvalid)
+		}
+		return fmt.Errorf("%w：聊天文本交付最多8192字节", ErrInvalid)
 	}
 	return nil
+}
+
+func chatWorkspaceSubmissionInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) error {
+	if _, err := taskWorkspaceGrantInTx(ctx, tx, input.GroupID, input.TaskID, input.ActorID); err != nil {
+		return err
+	}
+	if len(input.ArtifactVersions) == 0 || !utf8.ValidString(input.Summary) {
+		return fmt.Errorf("%w：目录工作必须提交真实冻结的成果版本和有效文本说明", ErrInvalid)
+	}
+	for _, ref := range input.ArtifactVersions {
+		version, err := artifactVersionInTx(ctx, tx, input.GroupID, ref.ArtifactID, ref.VersionID)
+		if err != nil {
+			return err
+		}
+		if version.SourceTaskID != input.TaskID {
+			return fmt.Errorf("%w：目录成果版本必须来自同群同任务", ErrInvalid)
+		}
+		if version.AuthorID != input.ActorID {
+			return ErrMemberToolDenied
+		}
+	}
+	// F4/F5 seam: replace this denial with same-tx validation of immutable,
+	// execution-bound publication receipts. Legacy trusted metadata alone does
+	// not prove bytes, resource locks, or the publishing worker's bound role.
+	return fmt.Errorf("%w：目录成果缺少执行绑定的可信发布回执", ErrMemberToolDenied)
 }
 
 // A durable Submission is returned to its chat origin in the same transaction.

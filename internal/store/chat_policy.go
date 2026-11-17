@@ -55,7 +55,19 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 		if current.Revision != expected {
 			return domain.ChatPolicy{}, ErrConflict
 		}
+		if input.AllowWorkspaceChanges {
+			supported, err := chatWorkspaceSupportedInTx(ctx, tx)
+			if err != nil {
+				return domain.ChatPolicy{}, admissionError("读取目录工作策略版本失败", err)
+			}
+			if !supported {
+				return domain.ChatPolicy{}, fmt.Errorf("%w：当前数据库版本不支持目录工作准入", ErrInvalid)
+			}
+		}
 		rule := fmt.Sprintf("本机用户已配置本群、本话题聊天准入策略：启用=%t；仅允许纯文本交付；本版总准入额度=%d。", input.Enabled, input.MaxAdmissions)
+		if input.AllowWorkspaceChanges {
+			rule = fmt.Sprintf("本机用户已配置本群、本话题聊天准入策略：启用=%t；允许纯文本交付，以及真实用户明确请求且已有读写目录授权的目录工作；本版总准入额度=%d。", input.Enabled, input.MaxAdmissions)
+		}
 		if input.AllowPreparation {
 			rule += "\n预授权范围 topic_summary：仅依据本群本话题已有消息准备纯文本摘要；目标与验收由服务端固定。不得改为其他目标、引用Artifact版本、读写文件或执行外部动作。"
 		}
@@ -78,6 +90,11 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 		}
 		if err := coordinatorWrite(ctx, tx, `INSERT INTO chat_policy_scopes(group_id,topic_id,revision,scope_kind,command_source_id) VALUES(?,?,?,?,?)`, thread.GroupID, thread.TopicID, revision, input.PreparationScopeKind, sourceID); err != nil {
 			return domain.ChatPolicy{}, admissionError("保存策略可执行范围失败", err)
+		}
+		if input.AllowWorkspaceChanges {
+			if err := coordinatorWrite(ctx, tx, `INSERT INTO chat_workspace_policy_revisions(group_id,topic_id,revision,allow_workspace_changes) VALUES(?,?,?,1)`, thread.GroupID, thread.TopicID, revision); err != nil {
+				return domain.ChatPolicy{}, admissionError("保存目录工作策略失败", err)
+			}
 		}
 		if expected == 0 {
 			err = coordinatorWrite(ctx, tx, "INSERT INTO chat_policies(group_id,topic_id,revision) VALUES(?,?,?)", thread.GroupID, thread.TopicID, revision)
@@ -122,7 +139,11 @@ func (s *Store) GetChatPolicy(ctx context.Context, thread domain.ThreadRef) (dom
 
 // revision=0 selects current; absence is explicitly disabled, not inferred authorization.
 func chatPolicyInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, revision int64) (domain.ChatPolicy, error) {
-	policy := domain.ChatPolicy{ThreadRef: thread}
+	supported, err := chatWorkspaceSupportedInTx(ctx, tx)
+	if err != nil {
+		return domain.ChatPolicy{}, err
+	}
+	policy := domain.ChatPolicy{ThreadRef: thread, WorkspaceChangesSupported: supported}
 	query := `SELECT r.revision,r.enabled,r.allow_preparation,coalesce(r.preauthorization_message_id,''),r.action,r.max_admissions,r.authorized_by,coalesce(m.content,'')
 	 FROM chat_policy_revisions r LEFT JOIN messages m ON m.id=r.preauthorization_message_id
 	 WHERE r.group_id=? AND r.topic_id=? AND r.revision=?`
@@ -135,17 +156,28 @@ func chatPolicyInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, re
 	if revision != 0 {
 		args = append(args, revision)
 	}
-	err := tx.QueryRowContext(ctx, query, args...).Scan(&policy.Revision, &policy.Enabled, &policy.AllowPreparation,
+	err = tx.QueryRowContext(ctx, query, args...).Scan(&policy.Revision, &policy.Enabled, &policy.AllowPreparation,
 		&policy.PreauthorizationMessageID, &policy.Action, &policy.MaxAdmissions, &policy.AuthorizedBy, &policy.PreauthorizationText)
 	if revision == 0 && errors.Is(err, sql.ErrNoRows) {
 		return policy, nil
 	}
 	if err == nil {
-		scopeErr := tx.QueryRowContext(ctx, `SELECT scope_kind,command_source_id FROM chat_policy_scopes WHERE group_id=? AND topic_id=? AND revision=?`, thread.GroupID, thread.TopicID, policy.Revision).Scan(&policy.PreparationScopeKind, &policy.ConfigurationSourceID)
-		if scopeErr != nil && !errors.Is(scopeErr, sql.ErrNoRows) {
-			return domain.ChatPolicy{}, scopeErr
+		var hasPreparationScopes bool
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=17)").Scan(&hasPreparationScopes); err != nil {
+			return domain.ChatPolicy{}, err
+		}
+		if hasPreparationScopes {
+			scopeErr := tx.QueryRowContext(ctx, `SELECT scope_kind,command_source_id FROM chat_policy_scopes WHERE group_id=? AND topic_id=? AND revision=?`, thread.GroupID, thread.TopicID, policy.Revision).Scan(&policy.PreparationScopeKind, &policy.ConfigurationSourceID)
+			if scopeErr != nil && !errors.Is(scopeErr, sql.ErrNoRows) {
+				return domain.ChatPolicy{}, scopeErr
+			}
 		}
 		policy.PreparationSupported = policy.AllowPreparation && policy.PreparationScopeKind == domain.ChatPreparationTopicSummary && policy.ConfigurationSourceID != ""
+		if supported {
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM chat_workspace_policy_revisions WHERE group_id=? AND topic_id=? AND revision=? AND allow_workspace_changes=1)`, thread.GroupID, thread.TopicID, policy.Revision).Scan(&policy.AllowWorkspaceChanges); err != nil {
+				return domain.ChatPolicy{}, err
+			}
+		}
 	}
 	return policy, err
 }

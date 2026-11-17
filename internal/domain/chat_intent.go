@@ -4,13 +4,14 @@ import "time"
 
 const (
 	ChatActionTextSubmission    = "text_submission"
+	ChatActionWorkspaceChange   = "workspace_change"
 	ChatPreparationTopicSummary = "topic_summary"
 	ChatIntakePurpose           = "chat_intake/v1"
 )
 
 // ChatPolicyRequest is local-user configuration, not a member tool grant.
-// Scope is exactly one group/topic and one text-only action. The budget applies
-// to the entire policy revision, not to each model invocation.
+// Scope is exactly one group/topic. Workspace changes require a separate opt-in
+// and server-bound grants. The budget covers the entire policy revision.
 type ChatPolicyRequest struct {
 	Enabled                   bool   `json:"enabled"`
 	AllowPreparation          bool   `json:"allow_preparation"`
@@ -18,6 +19,7 @@ type ChatPolicyRequest struct {
 	Action                    string `json:"action"`
 	MaxAdmissions             int    `json:"max_admissions"`
 	PreparationScopeKind      string `json:"preparation_scope_kind,omitempty"`
+	AllowWorkspaceChanges     bool   `json:"allow_workspace_changes,omitempty"`
 }
 
 type ChatPolicy struct {
@@ -28,6 +30,10 @@ type ChatPolicy struct {
 	PreauthorizationText  string `json:"preauthorization_text,omitempty"`
 	PreparationSupported  bool   `json:"preparation_supported"`
 	ConfigurationSourceID string `json:"configuration_source_id"`
+
+	// WorkspaceChangesSupported describes Store admission support, not user
+	// permission, provider file capabilities, or connected execution tools.
+	WorkspaceChangesSupported bool `json:"workspace_changes_supported"`
 }
 
 // ChatCandidate is captured by the runtime before semantic assessment. Its
@@ -46,6 +52,33 @@ type ChatCandidate struct {
 	Purpose                string     `json:"purpose"`
 	SourceID               string     `json:"source_id"`
 	SourceKind             string     `json:"source_kind"`
+}
+
+// TaskWorkspaceScope records admission facts, not execution permission or a
+// sandbox. Physical identity, role, capability and resource locks are rechecked
+// by trusted execution wrappers. All same-resource eligible workers are kept.
+type TaskWorkspaceScope struct {
+	ThreadRef
+	TaskID            string               `json:"task_id"`
+	TaskRevision      int64                `json:"task_revision"`
+	MandateID         string               `json:"mandate_id"`
+	CandidateID       string               `json:"candidate_id"`
+	AssessmentID      string               `json:"assessment_id"`
+	DispatchRequestID string               `json:"dispatch_request_id"`
+	PolicyRevision    int64                `json:"policy_revision"`
+	ResourceKey       string               `json:"resource_key"`
+	NodeID            string               `json:"node_id"`
+	Grants            []TaskWorkspaceGrant `json:"grants"`
+}
+
+// TaskWorkspaceGrant preserves the original immutable grant and its owner.
+// GrantSchemaVersion identifies the grant contract, not a mutable grant revision.
+type TaskWorkspaceGrant struct {
+	GrantID            string `json:"grant_id"`
+	MemberID           string `json:"member_id"`
+	Root               string `json:"root"`
+	ResolvedRoot       string `json:"resolved_root"`
+	GrantSchemaVersion int64  `json:"grant_schema_version"`
 }
 
 // ChatAssessment is a semantic proposal, never an authorization decision.
@@ -89,4 +122,6 @@ type ChatAssessmentReceipt struct {
 	ReasonCode                string    `json:"reason_code,omitempty"`
 	Question                  string    `json:"question,omitempty"`
 	AuthorityEvidenceVerified bool      `json:"authority_evidence_verified"`
+
+	WorkspaceScope *TaskWorkspaceScope `json:"workspace_scope,omitempty"`
 }

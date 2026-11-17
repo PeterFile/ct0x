@@ -67,9 +67,14 @@ func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		PolicyRevision: candidate.Policy.Revision, CandidateGeneration: candidate.Generation, Disposition: input.Disposition,
 		Action: input.Action, CreatedAt: time.Now().UTC(), Purpose: candidate.Purpose, SourceID: candidate.SourceID, SourceKind: candidate.SourceKind, Outcome: input.Disposition}
 	decisionID := ""
+	var workspace *domain.TaskWorkspaceScope
 	wantsWork := input.Disposition == "request_work" || input.Disposition == "prepare_work"
 	if wantsWork {
-		if err := chatAdmissionGateInTx(ctx, tx, candidate, input); err != nil {
+		err := chatAdmissionGateInTx(ctx, tx, candidate, input)
+		if err == nil && input.Action == domain.ChatActionWorkspaceChange {
+			workspace, err = chatWorkspaceForCandidateInTx(ctx, tx, candidate)
+		}
+		if err != nil {
 			var denial *chatNonAdmission
 			if !errors.As(err, &denial) {
 				return domain.ChatAssessmentReceipt{}, admissionError("聊天工作准入结果未确认", err)
@@ -112,7 +117,16 @@ func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		}
 		receipt.TaskID, receipt.MandateID, receipt.DispatchRequestID = admission.Task.ID, admission.Mandate.ID, dispatch.ID
 		receipt.AuthorityEvidenceVerified = true
-		content = fmt.Sprintf("已准入文本任务「%s」，分派已登记，尚未执行完成或接纳。\n依据：%s；聊天策略版本 %d；授权来源 %s。\n任务：%s\n分派：%s\n%s", input.Title, input.Reason,
+		kind := "文本任务"
+		if workspace != nil {
+			workspace.TaskID, workspace.TaskRevision, workspace.MandateID = admission.Task.ID, admission.Task.RevisionAtAdmission, admission.Mandate.ID
+			workspace.AssessmentID, workspace.DispatchRequestID = receipt.ID, dispatch.ID
+			if err := insertChatWorkspaceScopeInTx(ctx, tx, *workspace); err != nil {
+				return domain.ChatAssessmentReceipt{}, admissionError("绑定目录工作范围失败", err)
+			}
+			receipt.WorkspaceScope, kind = workspace, "目录任务"
+		}
+		content = fmt.Sprintf("已准入%s「%s」，分派已登记，尚未执行完成或接纳。\n依据：%s；聊天策略版本 %d；授权来源 %s。\n任务：%s\n分派：%s\n%s", kind, input.Title, input.Reason,
 			receipt.PolicyRevision, receipt.AuthorizationMessageID, receipt.TaskID, receipt.DispatchRequestID, content)
 	} else if input.Disposition == "clarify" {
 		receipt.Question, content = input.Question, input.Question
@@ -173,13 +187,20 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 		return err
 	}
 	if !current.Enabled {
-		return chatDeny("policy_disabled", "本话题聊天准入策略未启用。", "是否先在话题策略中启用纯文本准入？")
+		question := "是否先在话题策略中启用纯文本准入？"
+		if input.Action == domain.ChatActionWorkspaceChange {
+			question = "是否先在本话题策略中启用目录工作准入？"
+		}
+		return chatDeny("policy_disabled", "本话题聊天准入策略未启用。", question)
 	}
 	if current.Revision != c.Policy.Revision || current.Revision < 1 {
 		return chatDeny("stale_policy", "评估绑定的策略版本已经变化。", "是否以当前策略重新评估最新请求？")
 	}
-	if current.Action != input.Action || input.Action != domain.ChatActionTextSubmission {
-		return chatDeny("unsupported_action", "本版策略仅允许纯文本交付，不授予文件、Artifact或外部动作。", "是否只需要在群聊交付纯文本？")
+	if current.Action != domain.ChatActionTextSubmission || (input.Action != domain.ChatActionTextSubmission && input.Action != domain.ChatActionWorkspaceChange) {
+		return chatDeny("unsupported_action", "本版策略不支持所提动作。", "是否只需要在群聊交付纯文本？")
+	}
+	if input.Action == domain.ChatActionWorkspaceChange && !current.AllowWorkspaceChanges {
+		return chatDeny("workspace_changes_disabled", "本话题未显式允许目录工作。", "是否在本话题策略中允许已有授权目录的工作？")
 	}
 	// Generation is the actual source's committed position, not the chat head.
 	// Later user messages supersede it even before capture; member replies do not
@@ -216,16 +237,24 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 		return chatDeny("routing_unavailable", "协调员不可用或没有符合当前策略的执行成员，本次没有产生新工作。", "是否先调整协调员及允许执行的成员？")
 	}
 	if c.SourceID == "" || (c.SourceKind != "local_user_chat" && c.SourceKind != "member") {
-		return chatDeny("untrusted_source", "来源没有可核验的聊天命令证明，sender或正文不能构成用户授权。", "请由本机用户说明当前需要落实的文本目标，可以吗？")
+		question := "请由本机用户说明当前需要落实的文本目标，可以吗？"
+		if input.Action == domain.ChatActionWorkspaceChange {
+			question = "请由本机用户说明当前需要落实的目录工作目标，可以吗？"
+		}
+		return chatDeny("untrusted_source", "来源没有可核验的聊天命令证明，sender或正文不能构成用户授权。", question)
 	}
 	if input.Disposition == "request_work" && c.SourceKind != "local_user_chat" {
-		return chatDeny("user_request_required", "成员建议或共识不能替代用户的工作请求。", "你希望将哪项文本目标交付？")
+		question := "你希望将哪项文本目标交付？"
+		if input.Action == domain.ChatActionWorkspaceChange {
+			question = "你希望在已授权目录落实哪项工作？"
+		}
+		return chatDeny("user_request_required", "成员建议或共识不能替代用户的工作请求。", question)
 	}
 	if input.Disposition == "prepare_work" {
 		if !current.PreparationSupported || current.PreauthorizationMessageID == "" || current.AuthorizedBy != "user" {
 			return chatDeny("preparation_not_authorized", "未启用受支持的结构化准备范围；旧自由文本规则不被升级为权限。", "是否显式启用本话题纯文本摘要准备范围？")
 		}
-		if input.Title != "" || input.Description != "" || input.Acceptance != "" {
+		if input.Action != domain.ChatActionTextSubmission || input.Title != "" || input.Description != "" || input.Acceptance != "" {
 			return chatDeny("preparation_scope_mismatch", "topic_summary只允许服务端固定的本话题摘要目标和验收，不能改为其他目标。", "是否仅按本话题摘要范围准备？")
 		}
 	}

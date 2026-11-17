@@ -88,6 +88,9 @@ func chatCandidateInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, i
 	c.Policy = domain.ChatPolicy{ThreadRef: c.ThreadRef}
 	if revision != 0 {
 		c.Policy, err = chatPolicyInTx(ctx, tx, c.ThreadRef, revision)
+	} else {
+		// Revision zero stays a disabled snapshot, never the current policy.
+		c.Policy.WorkspaceChangesSupported, err = chatWorkspaceSupportedInTx(ctx, tx)
 	}
 	return c, err
 }
