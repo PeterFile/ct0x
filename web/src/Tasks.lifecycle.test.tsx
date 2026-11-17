@@ -18,7 +18,7 @@ const decision: TaskReview = { id: "review-1", group_id: group.id, task_id: task
 const nativeFetch = globalThis.fetch;
 const frozenRefs = [{ artifact_id: "report/一", version_id: "opaque-v2" },
   { artifact_id: "report/一", version_id: "opaque-v1" }, { artifact_id: "source", version_id: "snapshot" }];
-const reads = vi.fn<typeof fetch>(), details = vi.fn<typeof fetch>(), evidence = vi.fn<typeof fetch>(), writes = vi.fn<typeof fetch>();
+const reads = vi.fn<typeof fetch>(), details = vi.fn<typeof fetch>(), evidence = vi.fn<typeof fetch>(), admissions = vi.fn<typeof fetch>(), writes = vi.fn<typeof fetch>();
 let current: Task;
 const panel = () => within(screen.getByRole("region", { name: "群组任务" }));
 const detail = () => within(panel().getByRole("region", { name: "任务详情" }));
@@ -59,10 +59,12 @@ beforeEach(() => {
   reads.mockReset().mockImplementation(async () => page([current]));
   details.mockReset().mockImplementation(async () => json(current));
   evidence.mockReset().mockImplementation(async url => json(String(url).includes("/attempts/") ? humanAttempt : delivery));
+  admissions.mockReset().mockImplementation(async () => json({ error: { code: "not_found", message: "记录不存在或不可访问" } }, 404));
   writes.mockReset().mockResolvedValue(json({}, 503));
   vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) =>
-    (init?.method === "POST" ? writes : /\/(attempts|submissions)\//.test(String(input)) ? evidence
-      : String(input).includes("/tasks?") ? reads : details)(input, init));
+    ((init?.method ?? "GET") === "GET" && /^\/api\/v1\/groups\/[^/]+\/tasks\/[^/]+\/chat-admission$/.test(String(input)) ? admissions
+      : init?.method === "POST" ? writes : /\/(attempts|submissions)\//.test(String(input)) ? evidence
+        : String(input).includes("/tasks?") ? reads : details)(input, init));
 });
 afterEach(() => vi.unstubAllGlobals());
 
@@ -174,6 +176,7 @@ it.each(["accepted", "rejected"] as const)("registers a human attempt, submits r
     expect(detail().queryByRole("button", { name: /登记人工尝试|提交交付|接纳交付|退回修改/ })).not.toBeInTheDocument();
   } else expect(detail().getByRole("button", { name: "登记人工尝试" })).toBeEnabled();
   expect(reads).toHaveBeenCalledTimes(4); expect(details).toHaveBeenCalledTimes(4);
+  expect(admissions.mock.calls.map(([url]) => url)).toEqual([`/api/v1/groups/${group.id}/tasks/${task.id}/chat-admission`]);
   expect(new Set(writes.mock.calls.map((_, index) => captured(index).key)).size).toBe(3);
   expect(writes.mock.calls.every(([, init]) => init?.redirect === "error")).toBe(true);
 });
@@ -279,7 +282,7 @@ it("renders actual member Submission pairs read-only, without inventing filename
   fireEvent.click(detail().getByRole("button", { name: "接纳交付" }));
   await detail().findByRole("region", { name: "审查回执" });
   expect(JSON.parse(String(captured(0).body))).toEqual({ expected_revision: 1, submission_id: delivery.id, outcome: "accepted", reason: "" });
-  expect([...reads.mock.calls, ...details.mock.calls, ...evidence.mock.calls, ...writes.mock.calls]
+  expect([...reads.mock.calls, ...details.mock.calls, ...evidence.mock.calls, ...admissions.mock.calls, ...writes.mock.calls]
     .some(([url]) => String(url).includes("/artifacts"))).toBe(false);
 });
 
@@ -324,10 +327,10 @@ it.each(kinds)("retains pending and unknown %s across tasks, groups and null-hid
   expect(detail().getByRole("button", { name: "登记人工尝试" })).toBeEnabled();
   view.rerender(ui(null));
   expect(screen.queryByRole("region", { name: "群组任务" })).not.toBeInTheDocument();
-  const readCount = reads.mock.calls.length + details.mock.calls.length + evidence.mock.calls.length;
+  const readCount = reads.mock.calls.length + details.mock.calls.length + evidence.mock.calls.length + admissions.mock.calls.length;
   expect(writes.mock.calls[0][1]?.signal?.aborted).not.toBe(true);
   await act(async () => pending.resolve(json({}, 503)));
-  expect(reads.mock.calls.length + details.mock.calls.length + evidence.mock.calls.length).toBe(readCount);
+  expect(reads.mock.calls.length + details.mock.calls.length + evidence.mock.calls.length + admissions.mock.calls.length).toBe(readCount);
   expect(writes).toHaveBeenCalledTimes(1);
   current = { ...task, revision: 7 };
   view.rerender(ui(group)); await detail().findByRole("heading", { name: secondTask.title });
@@ -471,7 +474,7 @@ it.each(kinds.flatMap(kind => ["task", "group", "null"].map(boundary => ({ kind,
     }
     const focused = boundary === "null" ? screen.getByRole("button", { name: "聊天输入" }) : row(b.title);
     focused.focus();
-    const readCount = reads.mock.calls.length + details.mock.calls.length + evidence.mock.calls.length;
+    const readCount = reads.mock.calls.length + details.mock.calls.length + evidence.mock.calls.length + admissions.mock.calls.length;
     expect(writes.mock.calls[0][1]?.signal?.aborted).not.toBe(true);
     await act(async () => pending.resolve(json(receiptFor(kind), 201)));
     const hiddenReceipt = within(aDetail).getByText(`已确认操作回执：${receiptFor(kind).id}。`);
@@ -482,7 +485,7 @@ it.each(kinds.flatMap(kind => ["task", "group", "null"].map(boundary => ({ kind,
       expect(detail().getByRole("heading", { name: b.title })).toBeVisible();
       expect(row(b.title)).toHaveAttribute("aria-pressed", "true");
     }
-    expect(reads.mock.calls.length + details.mock.calls.length + evidence.mock.calls.length).toBe(readCount);
+    expect(reads.mock.calls.length + details.mock.calls.length + evidence.mock.calls.length + admissions.mock.calls.length).toBe(readCount);
     if (boundary !== "task") view.rerender(ui(group));
     fireEvent.click(row(a.title)); await detail().findByRole("heading", { name: a.title });
     expect(detail().getByText(`已确认操作回执：${receiptFor(kind).id}。`)).toBeVisible();
@@ -580,7 +583,8 @@ it("keeps a real native-Fetch 307 Review unknown without forwarding, and freezes
         const post = nativeFetch(new URL(String(input), `http://127.0.0.1:${address.port}`), init);
         posts.push(post); return post;
       }
-      return (/\/(attempts|submissions)\//.test(String(input)) ? evidence : String(input).includes("/tasks?") ? reads : details)(input, init);
+      return ((init?.method ?? "GET") === "GET" && /^\/api\/v1\/groups\/[^/]+\/tasks\/[^/]+\/chat-admission$/.test(String(input)) ? admissions
+        : /\/(attempts|submissions)\//.test(String(input)) ? evidence : String(input).includes("/tasks?") ? reads : details)(input, init);
     });
     await open(submittedTask); await perform("review");
     // Event dispatch does not await the native transport or its React state updates.

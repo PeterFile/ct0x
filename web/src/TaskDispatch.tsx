@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { ApiError } from "./api";
 import { TaskExecution } from "./TaskExecution";
 import { useActiveRefresh } from "./useActiveRefresh";
+import { followsDispatchState as followsState, sameDispatchRequest as sameRequest } from "./dispatch-state";
 import type { Task } from "./task-api";
 import { getDispatchRequest, getDispatchTask, getTaskCoordination, isDispatchRequestDefinitiveRejection, requestDispatch } from "./dispatch-request-api";
 import type { DispatchRequest, DispatchRequestInput, DispatchState, DispatchView, TaskCoordinationView } from "./dispatch-request-api";
@@ -24,24 +25,6 @@ const heldText: Readonly<Record<string, string>> = {
   coordinator_inactive: "协调员已不在群内", no_eligible_worker: "没有符合授权的执行成员",
   payload_too_large: "协调输入过大", payload_not_encodable: "协调输入无法编码",
 };
-const sameRequest = (left: DispatchRequest, right: DispatchRequest) =>
-  (Object.keys(left) as (keyof DispatchRequest)[]).every(field => left[field] === right[field]);
-function stateSignature(state: DispatchState) {
-  const d = state.delivery;
-  return JSON.stringify([state.request_id, state.generation, state.status, state.attempt_count, state.next_attempt_at, state.last_error_code,
-    state.held_reason, d && [d.message_id, d.delivery_id, d.conversation_id, d.coordinator_member_id, d.materialized_from_generation, d.created_at]]);
-}
-function followsState(old: DispatchState, incoming: DispatchState) {
-  if (incoming.generation < old.generation) return false;
-  if (incoming.generation === old.generation) return stateSignature(old) === stateSignature(incoming);
-  // Reads may skip retries, materialization and a decision; held/decided states cannot reopen.
-  if (old.status === "pending") return incoming.attempt_count >= old.attempt_count
-    && (incoming.attempt_count > old.attempt_count || incoming.next_attempt_at === old.next_attempt_at);
-  // The only update after enqueued is one decision, preserving every receipt/retry field.
-  return old.status === "enqueued" && (incoming.status === "assigned" || incoming.status === "declined")
-    && incoming.generation - old.generation === 1
-    && stateSignature(old) === stateSignature({ ...incoming, generation: old.generation, status: old.status });
-}
 function eligible(current: Current) {
   const t = current.task, m = current.authority?.admission.mandate;
   if (current.status !== "ready" || !t || !m) return false;
@@ -179,7 +162,7 @@ export function TaskDispatch({ groupId, taskId, active }: { groupId: string; tas
     <div id={`${formId}-body`} hidden={!expanded}>
       <div className="tasks-lifecycle">
         <p className="tasks-note">仅登记分派意图，不表示成员已开始执行，也不改变任务交付或验收状态。</p>
-        <p className="tasks-note">刷新浏览器或完全离开本页会丢失本页幂等键和已知请求标识，不等于未提交或已取消。本页不能按任务发现旧请求；未知结果不要换键试探。</p>
+        <p className="tasks-note">刷新浏览器或完全离开本页会丢失本页幂等键和已知请求标识，不等于未提交或已取消。手动登记的旧请求仍需精确标识；未知结果不要换键试探。</p>
         <section className="tasks-delivery" aria-label="当前任务与授权" aria-busy={current.status === "pending"}>
           <h3>当前任务与授权</h3>
           {current.status === "pending" ? <p role="status">正在读取当前任务与授权…</p> : null}

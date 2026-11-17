@@ -6,6 +6,7 @@ import { acceptedTask, secondTask, submittedTask, task, taskInput } from "./test
 
 const reads = vi.fn<typeof fetch>();
 const details = vi.fn<typeof fetch>();
+const admissions = vi.fn<typeof fetch>();
 const writes = vi.fn<typeof fetch>();
 const panel = () => within(screen.getByRole("region", { name: "群组任务" }));
 const detail = () => within(panel().getByRole("region", { name: "任务详情" }));
@@ -25,9 +26,11 @@ const attempt = (index: number) => {
 beforeEach(() => {
   reads.mockReset().mockImplementation(async () => page());
   details.mockReset().mockImplementation(async () => json(task));
+  admissions.mockReset().mockImplementation(async () => json({ error: { code: "not_found", message: "记录不存在或不可访问" } }, 404));
   writes.mockReset().mockImplementation(async () => json(task, 201));
   vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) =>
-    (init?.method === "POST" ? writes : String(input).includes("/tasks?") ? reads : details)(input, init));
+    ((init?.method ?? "GET") === "GET" && /^\/api\/v1\/groups\/[^/]+\/tasks\/[^/]+\/chat-admission$/.test(String(input)) ? admissions
+      : init?.method === "POST" ? writes : String(input).includes("/tasks?") ? reads : details)(input, init));
 });
 afterEach(() => vi.unstubAllGlobals());
 
@@ -79,6 +82,8 @@ it("reads full authoritative detail separately from the list and explains unset 
   expect(detail().getByText("未指定负责人")).toBeVisible(); expect(detail().getByText("无依赖任务")).toBeVisible();
   expect(detail().getByText("2")).toBeVisible(); expect(detail().getByText("待交付")).toBeVisible();
   expect(details.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/tasks/${task.id}`);
+  expect(admissions.mock.calls.map(([url]) => url)).toEqual([`/api/v1/groups/${group.id}/tasks/${task.id}/chat-admission`]);
+  expect(detail().queryByRole("alert")).not.toBeInTheDocument();
   expect(panel().queryByRole("button", { name: /提交成果|接纳成果|开始执行/ })).not.toBeInTheDocument();
 });
 it.each([["待交付", task], ["待验收", submittedTask], ["已接纳", acceptedTask]] as const)("uses real %s task language, not execution language", async (label, state) => {

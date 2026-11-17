@@ -93,19 +93,22 @@ it("starts without a source, form or reads and ignores a foreign-group source", 
   expect(fetch).not.toHaveBeenCalled();
 });
 it.each([
-  { sender: "user", roster: [{ ...member, id: "user", name: "伪造本地名称" }], author: "我" },
-  { sender: member.id, roster: [member], author: member.name },
+  { sender: "user", roster: [{ ...member, id: "user", name: "伪造本地名称" }], author: "我",
+    source: { source_kind: "local_user_chat" as const, source_id: "actual-local-chat-command" } },
+  { sender: "user", roster: [{ ...member, id: "user", name: "伪造本地名称" }], author: "用户（来源未核验）" },
+  { sender: member.id, roster: [{ ...member, id: "same-name-other-member" }, member], author: member.name },
   { sender: "unloaded", roster: [], author: "未载入成员" },
   { sender: member.id, roster: [{ ...member, group_id: other.id, name: "外群同名" }], author: "未载入成员" },
   { sender: member.id, roster: [{ ...member, status: "left", name: "历史成员" }], author: "历史成员" },
-])("uses real scoped author identity for $author / $sender", ({ sender, roster, author }) => {
-  render(<Harness items={[{ ...message, sender_id: sender }]} members={roster} />); select();
+])("uses real scoped author identity for $author / $sender", ({ sender, roster, author, source }) => {
+  render(<Harness items={[{ ...message, sender_id: sender, ...source }]} members={roster} />); select();
   expect(panel().getByText(author, { exact: true })).toBeVisible();
   expect(panel().queryByText(/伪造本地名称|外群同名/)).not.toBeInTheDocument();
   expect(panel().getByRole("textbox", { name: "验收条件" })).toHaveValue("");
   expect(panel().getByRole("textbox", { name: "授权理由" })).toHaveValue("");
   const details = expand("完整来源与标识");
-  expect(within(details).getByText(sender, { exact: true })).toBeVisible();
+  expect(within(details).getByText(sender, { exact: true })).toBeVisible(); expect(details).not.toHaveTextContent("same-name-other-member");
+  if (!source && sender === "user") expect(panel().queryByText("我", { exact: true })).not.toBeInTheDocument();
   expect(details.querySelector("time")).toHaveAttribute("datetime", message.created_at);
   expect(fetch).not.toHaveBeenCalled();
 });

@@ -1,5 +1,6 @@
 import { ApiError } from "./api";
 import type { Message } from "./api";
+import { hasValidMessageSource } from "./message-source";
 
 export type HistoryQuery = Readonly<{ q: string; topic_id?: string; before?: string }>;
 export type HistoryPage = { items: Message[]; next_cursor: string };
@@ -7,7 +8,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> => typeof va
 const messageIn = (groupId: string, topicId?: string) => (value: unknown): value is Message => isRecord(value)
   && ["id", "group_id", "topic_id", "sender_id", "content", "created_at"].every(key => typeof value[key] === "string")
   && value.id !== "" && value.group_id === groupId && (topicId === undefined || value.topic_id === topicId)
-  && Array.isArray(value.deliveries) && value.deliveries.every(delivery => isRecord(delivery)
+  && hasValidMessageSource(value) && Array.isArray(value.deliveries) && value.deliveries.every(delivery => isRecord(delivery)
     && ["id", "message_id", "conversation_id", "recipient_id", "state", "turn_id", "error", "created_at"]
       .every(key => typeof delivery[key] === "string") && delivery.id !== "" && delivery.message_id === value.id);
 

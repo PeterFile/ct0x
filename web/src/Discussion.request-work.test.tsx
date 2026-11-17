@@ -165,7 +165,8 @@ it.each([local, agent])("opens the exact persisted source $id in one stable hist
   const originalRegion = region(), originalTitle = field(), { details, source: sourceRegion } = evidence();
   expect(originalTitle).toHaveFocus();
   expect(field("验收条件")).toHaveValue(""); expect(field("授权理由")).toHaveValue("");
-  expect(sourceRegion).toHaveTextContent(source.sender_id === "user" ? "我" : member.name);
+  expect(sourceRegion).toHaveTextContent(source.sender_id === "user" ? "用户（来源未核验）" : member.name);
+  expect(sourceRegion).toHaveTextContent("来源未核验");
   expect(details.querySelector("p")?.textContent).toBe(raw);
   expect(within(details).getByText(source.id, { exact: true })).toBeVisible();
   expect(within(details).getByText(source.group_id, { exact: true })).toBeVisible();

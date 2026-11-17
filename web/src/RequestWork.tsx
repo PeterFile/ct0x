@@ -2,13 +2,14 @@ import { useEffect, useId, useImperativeHandle, useLayoutEffect, useRef, useStat
 import type { FormEvent, Ref } from "react";
 import { ApiError } from "./api";
 import type { Member, Message } from "./api";
+import { messageAuthor, messageSourceLabel } from "./message-source";
 import { isRequestWorkDefinitiveRejection, requestWork } from "./coordination-api";
 import type { AdmissionReceipt, RequestWorkInput } from "./coordination-api";
 import { getTask } from "./task-api";
 import type { Task } from "./task-api";
 
 export type RequestWorkHandle = { open(source: Message, returnFocus?: HTMLElement): void };
-type Source = Readonly<Pick<Message, "id" | "group_id" | "topic_id" | "sender_id" | "created_at" | "content">>;
+type Source = Readonly<Pick<Message, "id" | "group_id" | "topic_id" | "sender_id" | "created_at" | "content" | "source_kind" | "source_id">>;
 type Draft = { title: string; description: string; acceptance: string; reason: string };
 type Operation = Readonly<{ groupId: string; key: string; input: RequestWorkInput }>;
 type State = {
@@ -79,7 +80,9 @@ export function RequestWork({ groupId, active, members = [], ref }: {
       update({ notice: "已有未提交草稿；请先明确放弃草稿，再选择另一条消息。" });
     } else if (!previous.source || different) {
       const snapshot = Object.freeze({ id: source.id, group_id: source.group_id, topic_id: source.topic_id,
-        sender_id: source.sender_id, created_at: source.created_at, content: source.content });
+        sender_id: source.sender_id, created_at: source.created_at, content: source.content,
+        ...(source.source_kind === undefined ? {} : { source_kind: source.source_kind }),
+        ...(source.source_id === undefined ? {} : { source_id: source.source_id }) });
       update({ ...initialState(), source: snapshot });
     }
     reveal();
@@ -205,10 +208,10 @@ export function RequestWork({ groupId, active, members = [], ref }: {
 }
 
 function SourceEvidence({ source, members }: { source: Source; members: readonly Member[] }) {
-  const author = source.sender_id === "user" ? "我"
-    : members.find(member => member.group_id === source.group_id && member.id === source.sender_id)?.name ?? "未载入成员";
+  const author = messageAuthor(source, members.find(member => member.group_id === source.group_id && member.id === source.sender_id)?.name);
   return <section aria-label="来源证据">
     <p className="feed-note">来源作者：<strong>{author}</strong> · <time dateTime={source.created_at}>{shortTime(source.created_at)}</time></p>
+    <p className="feed-note">{messageSourceLabel(source.source_kind)}</p>
     <p className="feed-note">{source.topic_id === "" ? "主话题" : <>话题：<span className="message-content">{source.topic_id}</span></>}</p>
     <p className="feed-note">来源预览</p><p className="message-content">{preview(source.content)}</p>
     <details className="message-details"><summary>完整来源与标识</summary>
@@ -217,6 +220,7 @@ function SourceEvidence({ source, members }: { source: Source; members: readonly
         <div><dt>来源群组 ID</dt><dd>{source.group_id}</dd></div>
         <div><dt>来源话题 ID</dt><dd className="message-content">{source.topic_id === "" ? "空串（主话题）" : source.topic_id}</dd></div>
         <div><dt>发送者 ID</dt><dd>{source.sender_id}</dd></div>
+        {source.source_id ? <div><dt>来源命令 / 回执 ID</dt><dd>{source.source_id}</dd></div> : null}
         <div><dt>完整时间</dt><dd><time dateTime={source.created_at}>{source.created_at}</time></dd></div></dl>
     </details>
   </section>;

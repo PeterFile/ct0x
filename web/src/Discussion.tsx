@@ -2,6 +2,7 @@ import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection, sendMessage } from "./api";
 import type { Delivery, Member, MessageInput } from "./api";
+import { messageAuthor, messageSourceLabel } from "./message-source";
 import { RequestWork } from "./RequestWork";
 import type { RequestWorkHandle } from "./RequestWork";
 import { useMessageFeed } from "./useMessageFeed";
@@ -154,8 +155,9 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
     {feed.page.next ? <button type="button" disabled={feed.page.pending} onClick={() => { scroll.beforeOlder(); void feed.loadPage(feed.page.next, false); }}>加载更早消息</button> : null}
     <RequestWork groupId={groupId} active={active} members={members} ref={requestWork} />
     <ol className="message-list" aria-label="群组消息" ref={scroll.listRef}>{feed.items.map(message => <li key={message.id} data-message-id={message.id}>
-      <article className={message.sender_id === "user" ? "message-local" : undefined} aria-label={`消息 ${message.id}`}>
-        <header className="message-meta"><strong>{authorName(message.sender_id)}</strong><time dateTime={message.created_at}>{shortTime(message.created_at)}</time></header>
+      <article className={message.source_kind === "local_user_chat" || message.source_kind === "local_user_policy" ? "message-local" : undefined} aria-label={`消息 ${message.id}`}>
+        <header className="message-meta"><strong>{messageAuthor(message, memberNames.get(message.sender_id))}</strong><time dateTime={message.created_at}>{shortTime(message.created_at)}</time>
+          <span className="feed-note">{messageSourceLabel(message.source_kind)}</span></header>
         {message.topic_id ? <p className="eyebrow accent">话题消息</p> : null}
         <p className="message-content">{message.content}</p>
         <div className="message-actions">
@@ -168,6 +170,8 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
           <dl className="message-technical">
             <div><dt>消息 ID</dt><dd>{message.id}</dd></div>
             <div><dt>发送者 ID</dt><dd>{message.sender_id}</dd></div>
+            <div><dt>来源类型</dt><dd>{message.source_kind ?? "未提供（历史未核验）"}</dd></div>
+            {message.source_id ? <div><dt>来源命令 / 回执 ID</dt><dd>{message.source_id}</dd></div> : null}
             {message.topic_id ? <div><dt>话题 ID</dt><dd>{message.topic_id}</dd></div> : null}
             <div><dt>完整时间</dt><dd><time dateTime={message.created_at}>{message.created_at}</time></dd></div>
           </dl>

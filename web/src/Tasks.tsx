@@ -3,6 +3,8 @@ import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection } from "./api";
 import type { Group } from "./api";
 import { CoordinationSettings } from "./CoordinationSettings";
+import { ChatPolicySettings } from "./ChatPolicySettings";
+import { ChatAdmissionDetails } from "./ChatAdmissionDetails";
 import { TaskDispatch } from "./TaskDispatch";
 import { useActiveRefresh } from "./useActiveRefresh";
 import { createTask, getTask, getTaskAttempt, getTaskSubmission, listTasks, registerTaskAttempt, reviewTask, submitTask } from "./task-api";
@@ -145,6 +147,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
     <p className="tasks-note">当前面板自动读取任务与所选任务详情。</p>
     <p className="tasks-note">“待交付”不代表已开始执行；“已接纳”表示成果被接纳，不等同于 CLI 运行成功。</p>
     <CoordinationSettings groupId={groupId} active={active} />
+    <ChatPolicySettings groupId={groupId} active={active} />
     <div className="tasks-layout">
       <div aria-busy={page.pending}>
         {page.pending ? <p role="status">正在载入任务…</p> : null}
@@ -178,6 +181,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
         {openedTasks.map(id => <div key={id} hidden={id !== selection.id}>
           <TaskLifecycle groupId={groupId} taskId={id} task={active && selected?.id === id ? selected : null}
             onReceipt={refreshAfterReceipt} onReading={reportEvidencePending} />
+          <ChatAdmissionDetails groupId={groupId} taskId={id} active={active && selection.id === id} />
           <TaskDispatch groupId={groupId} taskId={id} active={active && selection.id === id} />
         </div>)}
       </section> : <p className="tasks-note">选择任务以读取最新详情。</p>}

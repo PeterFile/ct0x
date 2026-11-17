@@ -223,6 +223,7 @@ describe("workspace groups", () => {
 
 describe("IM shell", () => {
   const taskReads = vi.fn<typeof fetch>(), taskDetails = vi.fn<typeof fetch>(), taskWrites = vi.fn<typeof fetch>();
+  const chatAdmissionReads = vi.fn<typeof fetch>();
   const messageReads = vi.fn<typeof fetch>(), messageWrites = vi.fn<typeof fetch>();
   const historyReads = vi.fn<typeof fetch>(), historyDetails = vi.fn<typeof fetch>();
   const memberReads = vi.fn<typeof fetch>(), memberWrites = vi.fn<typeof fetch>(), catalogue = vi.fn<typeof fetch>();
@@ -269,6 +270,7 @@ describe("IM shell", () => {
     transport.mockImplementation(async (_url, init) => init?.method === "POST" ? json(group, 201) : page([group, other]));
     taskReads.mockReset().mockImplementation(async () => page());
     taskDetails.mockReset().mockImplementation(async () => json(task));
+    chatAdmissionReads.mockReset().mockImplementation(async () => json({ error: { code: "not_found", message: "旧任务无聊天准入" } }, 404));
     taskWrites.mockReset().mockImplementation(async () => json(task, 201));
     messageReads.mockReset().mockImplementation(async () => page());
     messageWrites.mockReset().mockImplementation(async (_url, init) =>
@@ -284,6 +286,7 @@ describe("IM shell", () => {
         if ((init?.method ?? "GET") !== "GET") throw new Error("Unexpected history mutation");
         return (/\/history\//.test(url) ? historyDetails : historyReads)(input, init);
       }
+      if ((init?.method ?? "GET") === "GET" && /^\/api\/v1\/groups\/[^/]+\/tasks\/[^/]+\/chat-admission$/.test(url)) return chatAdmissionReads(input, init);
       if (url.includes("/tasks")) return (init?.method === "POST" ? taskWrites : /\/tasks\//.test(url) ? taskDetails : taskReads)(input, init);
       if (url.includes("/messages")) return (init?.method === "POST" ? messageWrites : messageReads)(input, init);
       if (url.includes("/members")) return (init?.method === "POST" ? memberWrites : memberReads)(input, init);
@@ -454,6 +457,9 @@ describe("IM shell", () => {
     render(<App />); selectGroup((await screen.findByRole("button", { name: group.name })).textContent!); showContext("任务");
     fireEvent.click(await tasks().findByRole("button", { name: `${task.title}，待交付` }));
     await detail().findByRole("heading", { name: task.title });
+    expect(taskDetails.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/tasks/${task.id}`);
+    expect(chatAdmissionReads.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/tasks/${task.id}/chat-admission`);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     const form = tasks().getByRole("form", { name: "创建任务" });
     const oldList = deferred<Response>(), oldDetail = deferred<Response>();
     taskReads.mockReturnValueOnce(oldList.promise); taskDetails.mockReturnValueOnce(oldDetail.promise);
@@ -463,13 +469,16 @@ describe("IM shell", () => {
     expect(form).toBeInTheDocument(); expect(form).not.toBeVisible(); expect(form.closest("[hidden]")).not.toBeNull();
     expect(screen.queryByRole("region", { name: "群组任务" })).not.toBeInTheDocument();
     showContext("成员"); closeContext();
-    expect(taskReads).toHaveBeenCalledTimes(2); expect(taskDetails).toHaveBeenCalledTimes(2);
+    expect(taskReads).toHaveBeenCalledTimes(2); expect(taskDetails).toHaveBeenCalledTimes(2); expect(chatAdmissionReads).toHaveBeenCalledTimes(1);
     taskReads.mockResolvedValueOnce(page([acceptedTask]));
     taskDetails.mockResolvedValueOnce(json({ ...acceptedTask, acceptance: "返回后重新读取的详情", revision: 2 }));
     showContext("任务");
     expect(await tasks().findByRole("button", { name: `${task.title}，已接纳` })).toBeVisible();
     expect(await detail().findByText("返回后重新读取的详情")).toBeVisible();
     expect(tasks().getByRole("form", { name: "创建任务" })).toBe(form);
+    expect(chatAdmissionReads).toHaveBeenCalledTimes(2);
+    expect(chatAdmissionReads.mock.calls.every(([url, init]) => String(url) === `/api/v1/groups/${group.id}/tasks/${task.id}/chat-admission`
+      && (init?.method ?? "GET") === "GET")).toBe(true);
     await act(async () => { oldList.resolve(page([{ ...task, title: "废弃的列表快照" }])); oldDetail.resolve(json(task)); });
     expect(detail().getByText("返回后重新读取的详情")).toBeVisible();
     expect(tasks().queryByRole("button", { name: "废弃的列表快照，待交付" })).not.toBeInTheDocument();

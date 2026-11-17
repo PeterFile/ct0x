@@ -1,3 +1,6 @@
+import { hasMessageSourceIdentityConflict, hasValidMessageSource } from "./message-source";
+import type { MessageSource } from "./message-source";
+
 export type Group = { id: string; name: string; description: string; created_at: string };
 export type GroupInput = Readonly<{ name: string; description?: string }>;
 export type Member = {
@@ -14,7 +17,7 @@ export type Delivery = {
   id: string; message_id: string; conversation_id: string; recipient_id: string;
   state: string; turn_id: string; error: string; created_at: string;
 };
-export type Message = {
+export type Message = MessageSource & {
   id: string; group_id: string; topic_id: string; sender_id: string; content: string; created_at: string; deliveries: Delivery[];
 };
 export type MessageInput = Readonly<{ content: string; recipient_ids?: readonly string[]; topic_id?: string }>;
@@ -22,6 +25,9 @@ type Page<T> = { items: T[]; next_cursor: string };
 export class ApiError extends Error {
   constructor(message: string, readonly status = 0, readonly code = "disconnected") { super(message); }
 }
+// Only the exact Message read's client-side identity check can create this signal.
+class MessageSourceIdentityConflict extends ApiError {}
+export const isMessageSourceIdentityConflict = (error: unknown) => error instanceof MessageSourceIdentityConflict;
 export const isDefinitiveRejection = (error: unknown) => error instanceof ApiError
   && [400, 404, 409, 413, 415].includes(error.status);
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
@@ -35,7 +41,8 @@ const memberIn = (groupId: string) => (value: unknown): value is Member => isRec
     .every(key => typeof value[key] === "string") && value.id !== "" && value.group_id === groupId;
 const messageIn = (groupId: string, topicId?: string) => (value: unknown): value is Message => isRecord(value)
   && ["id", "group_id", "topic_id", "sender_id", "content", "created_at"].every(key => typeof value[key] === "string")
-  && value.id !== "" && value.group_id === groupId && (topicId === undefined || value.topic_id === topicId) && Array.isArray(value.deliveries)
+  && value.id !== "" && value.group_id === groupId && (topicId === undefined || value.topic_id === topicId)
+  && hasValidMessageSource(value) && Array.isArray(value.deliveries)
   && value.deliveries.every(delivery => isRecord(delivery)
     && ["id", "message_id", "conversation_id", "recipient_id", "state", "turn_id", "error", "created_at"]
       .every(key => typeof delivery[key] === "string") && delivery.id !== "" && delivery.message_id === value.id);
@@ -114,7 +121,12 @@ export function listMessages(groupId: string, before = "", signal?: AbortSignal)
 }
 export function getMessage(groupId: string, id: string, signal?: AbortSignal) {
   return request(`${messagesPath(groupId)}/${encodeURIComponent(id)}`, { signal },
-    (value): value is Message => messageIn(groupId)(value) && value.id === id);
+    (value): value is Message => {
+      if (isRecord(value) && value.group_id === groupId && value.id === id && hasMessageSourceIdentityConflict(value)) {
+        throw new MessageSourceIdentityConflict("来源消息的来源类型与发送者身份矛盾，读取未确认。", 200, "invalid_response");
+      }
+      return messageIn(groupId)(value) && value.id === id;
+    });
 }
 export function listProviders(before = "", signal?: AbortSignal) {
   return request(`/api/v1/providers${pageQuery(before)}`, { signal }, pageOf(isProvider));
