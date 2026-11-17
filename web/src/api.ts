@@ -1,4 +1,4 @@
-import { hasValidMessageSource } from "./message-source";
+import { hasMessageSourceIdentityConflict, hasValidMessageSource } from "./message-source";
 import type { MessageSource } from "./message-source";
 
 export type Group = { id: string; name: string; description: string; created_at: string };
@@ -25,6 +25,9 @@ type Page<T> = { items: T[]; next_cursor: string };
 export class ApiError extends Error {
   constructor(message: string, readonly status = 0, readonly code = "disconnected") { super(message); }
 }
+// Only the exact Message read's client-side identity check can create this signal.
+class MessageSourceIdentityConflict extends ApiError {}
+export const isMessageSourceIdentityConflict = (error: unknown) => error instanceof MessageSourceIdentityConflict;
 export const isDefinitiveRejection = (error: unknown) => error instanceof ApiError
   && [400, 404, 409, 413, 415].includes(error.status);
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
@@ -118,7 +121,12 @@ export function listMessages(groupId: string, before = "", signal?: AbortSignal)
 }
 export function getMessage(groupId: string, id: string, signal?: AbortSignal) {
   return request(`${messagesPath(groupId)}/${encodeURIComponent(id)}`, { signal },
-    (value): value is Message => messageIn(groupId)(value) && value.id === id);
+    (value): value is Message => {
+      if (isRecord(value) && value.group_id === groupId && value.id === id && hasMessageSourceIdentityConflict(value)) {
+        throw new MessageSourceIdentityConflict("来源消息的来源类型与发送者身份矛盾，读取未确认。", 200, "invalid_response");
+      }
+      return messageIn(groupId)(value) && value.id === id;
+    });
 }
 export function listProviders(before = "", signal?: AbortSignal) {
   return request(`/api/v1/providers${pageQuery(before)}`, { signal }, pageOf(isProvider));

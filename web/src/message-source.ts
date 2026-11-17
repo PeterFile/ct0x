@@ -7,6 +7,9 @@ const sourceId = (value: unknown): value is string => typeof value === "string" 
 // Missing/unknown provenance does not infer an identity from the sender.
 export const sourceMatchesSender = (kind: MessageSourceKind | undefined, sender: unknown) =>
   kind === "local_user_chat" || kind === "local_user_policy" ? sender === "user" : kind !== "member" || sender !== "user";
+export const hasMessageSourceIdentityConflict = (value: Record<string, unknown>) =>
+  sourceId(value.source_id) && sourceId(value.sender_id) && isMessageSourceKind(value.source_kind)
+    && !sourceMatchesSender(value.source_kind, value.sender_id);
 export function hasValidMessageSource(value: Record<string, unknown>): boolean {
   if (value.source_kind === undefined) return value.source_id === undefined || value.source_id === "";
   if (!isMessageSourceKind(value.source_kind)) return false;

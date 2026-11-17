@@ -107,7 +107,15 @@ function decode(buffer: ArrayBuffer): unknown {
   return JSON.parse(source);
 }
 class ChatRejection extends ApiError {}
+class CanonicalNotFound extends ChatRejection {}
 class LegacyPlainNotFound extends ApiError {}
+function isCanonicalNotFound(body: ArrayBuffer | null, message: string): boolean {
+  if (body === null) return false;
+  // Match WriteJSON's raw shape, not a parsed envelope that may have lost duplicate keys.
+  const canonical = JSON.stringify({ error: { code: "not_found", message } })
+    .replace(/[<>&\u2028\u2029]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  return new TextDecoder("utf-8", { fatal: true }).decode(body).trim() === canonical;
+}
 function isLegacyPlainNotFound(response: Response, body: ArrayBuffer | null): boolean {
   const mediaType = response.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
   if (response.status !== 404 || body === null || (mediaType && mediaType !== "text/plain")) return false;
@@ -135,7 +143,8 @@ async function request<T>(path: string, init: RequestInit, valid: (value: unknow
   if (!response.ok && record(value) && Object.keys(value).length === 1 && record(value.error) && Object.keys(value.error).length === 2
     && nonblank(value.error.code) && nonblank(value.error.message)) {
     const definitive = refusals[response.status]?.includes(value.error.code) ?? false;
-    const ErrorType = definitive ? ChatRejection : ApiError;
+    const quietNotFound = response.status === 404 && value.error.code === "not_found" && isCanonicalNotFound(body, value.error.message);
+    const ErrorType = quietNotFound ? CanonicalNotFound : definitive ? ChatRejection : ApiError;
     const reason = definitive ? rejectionText[response.status] : "聊天请求未完成，配置或保存结果未确认";
     throw new ErrorType(`${reason}（HTTP ${response.status}）。`, response.status, value.error.code);
   }
@@ -179,7 +188,7 @@ export async function getChatAdmission(groupId: string, taskId: string, signal?:
       (value): value is ChatAdmission => isAdmission(value, groupId, taskId));
   } catch (error) {
     // Only a recognized absence is quiet; malformed or unexpected 404s remain unreadable.
-    if (error instanceof LegacyPlainNotFound || (error instanceof ChatRejection && error.status === 404 && error.code === "not_found")) return null;
+    if (error instanceof LegacyPlainNotFound || error instanceof CanonicalNotFound) return null;
     throw error;
   }
 }

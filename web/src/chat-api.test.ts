@@ -81,3 +81,20 @@ it("PUI-4 still silences a protocol not_found and the identifiable Go plain 404"
   vi.stubGlobal("fetch", transport);
   await expect(getChatAdmission(group.id, task.id)).resolves.toBeNull(); await expect(getChatAdmission(group.id, task.id)).resolves.toBeNull();
 });
+it.each([
+  '{"error":{"code":"unexpected_code","code":"not_found","message":"ambiguous"}}',
+  '{"error":{"code":"unexpected_code","message":"first"},"error":{"code":"not_found","message":"last"}}',
+  String.raw`{"error":{"co\u0064e":"unexpected_code","code":"not_found","message":"ambiguous"}}`,
+  String.raw`{"erro\u0072":{"code":"unexpected_code","message":"first"},"error":{"code":"not_found","message":"last"}}`,
+  '{"error":{"code":"not_found","code":"not_found","message":"duplicate"}}',
+  '{"error":{"code":"not_found","message":"first","message":"last"}}',
+  String.raw`{"error":{"code":"not_found","message":"first","mess\u0061ge":"last"}}`,
+])("delta-4 never silences duplicate or escaped-equivalent 404 fields %s", async raw => {
+  vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(raw, { status: 404, headers: { "Content-Type": "application/json" } })));
+  await expect(getChatAdmission(group.id, task.id)).rejects.toMatchObject({ status: 404 });
+});
+it("delta-4 accepts canonical WriteJSON escaping and key-like text inside an error message", async () => {
+  const raw = String.raw`{"error":{"code":"not_found","message":"\u003c缺失\u003e \u0026 \u2028\u2029 \"code\":\"not_found\""}}` + "\n";
+  vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(raw, { status: 404, headers: { "Content-Type": "application/json" } })));
+  await expect(getChatAdmission(group.id, task.id)).resolves.toBeNull();
+});

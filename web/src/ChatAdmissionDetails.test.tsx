@@ -237,3 +237,54 @@ it("PUI-4 exposes an unrecognized 404 as unreadable while preserving an existing
   fireEvent.click(screen.getByRole("button", { name: "重试读取聊天准入依据" })); await flush();
   expect(screen.getByRole("region", { name: "聊天自动准入依据" })).toBeVisible(); expect(requests).toHaveBeenCalledTimes(1);
 });
+it("delta-2 propagates an exact source codec identity conflict without blocking existing human Review", async () => {
+  vi.useFakeTimers(); selected = submittedTask;
+  admissions.mockImplementation(async () => json({ ...verifiedAdmission, disposition: "prepare_work", authority: "written_preauthorization",
+    authorization_message_id: "policy-rule", source_kind: "member", source_sender_id: "member-A", source_id: "member-command" }));
+  await open();
+  const lateRequest = deferred<Response>(), lateExecution = deferred<Response>();
+  requests.mockReturnValueOnce(lateRequest.promise); executions.mockReturnValueOnce(lateExecution.promise);
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  const requestSignal = requests.mock.calls.at(-1)![1]?.signal, executionSignal = executions.mock.calls.at(-1)![1]?.signal;
+  sources.mockResolvedValueOnce(json({ ...message, source_kind: "member", source_id: "member-command", sender_id: "user" }));
+  fireEvent.click(screen.getByRole("button", { name: "检查来源消息" })); await flush();
+  expect(screen.getByRole("alert")).toHaveTextContent(/来源.*未确认/);
+  expect(screen.queryByText("来源与评估职责已核验")).not.toBeInTheDocument(); expect(screen.queryByText("已登记，等待协调")).not.toBeInTheDocument();
+  expect(screen.queryByRole("region", { name: "执行回执" })).not.toBeInTheDocument();
+  expect(requestSignal?.aborted).toBe(true); expect(executionSignal?.aborted).toBe(true);
+  expect(screen.getByText("已有真实交付")).toBeVisible(); expect(screen.getByRole("button", { name: "退回修改" })).toBeEnabled();
+  const counts = [requests.mock.calls.length, executions.mock.calls.length];
+  await act(async () => { lateRequest.resolve(json(autoDispatch)); lateExecution.resolve(json(autoExecution)); await vi.advanceTimersByTimeAsync(10000); });
+  expect([requests.mock.calls.length, executions.mock.calls.length]).toEqual(counts); expect(screen.getByRole("alert")).toHaveTextContent(/来源.*未确认/);
+});
+it.each([
+  { label: "a different message", body: { ...message, id: "other-message", source_kind: "member", source_id: "source-command" }, status: 200 },
+  { label: "a different group", body: { ...message, group_id: other.id, source_kind: "member", source_id: "source-command" }, status: 200 },
+  { label: "missing source evidence", body: { ...message, source_kind: "member", source_id: "" }, status: 200 },
+  { label: "a server error code", body: { error: { code: "invalid_response", message: "not a client identity proof" } }, status: 500 },
+])("delta-2 does not invent a bound identity conflict from $label", async ({ body, status }) => {
+  await open(); sources.mockResolvedValueOnce(json(body, status));
+  fireEvent.click(screen.getByRole("button", { name: "检查来源消息" })); await flush();
+  expect(screen.getByRole("region", { name: "来源消息原文" })).toHaveTextContent("未确认"); expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByText("已登记，等待协调")).toBeVisible(); expect(screen.getByRole("region", { name: "执行回执" })).toBeVisible();
+});
+it("delta-3 revokes a same-batch read before cleanup and cannot poison the trusted high-water mark", async () => {
+  render(<ChatAdmissionDetails groupId={group.id} taskId={task.id} active />); await flush();
+  const lateRequest = deferred<Response>(), pendingSource = deferred<Response>();
+  requests.mockReturnValueOnce(lateRequest.promise); sources.mockReturnValueOnce(pendingSource.promise);
+  fireEvent.click(screen.getByRole("button", { name: "读取自动分派当前状态" }));
+  fireEvent.click(screen.getByRole("button", { name: "检查来源消息" })); await flush();
+  const signal = requests.mock.calls.at(-1)![1]?.signal; let abortedBeforeCleanup = false;
+  await act(async () => {
+    pendingSource.resolve(json({ ...message, source_kind: "platform", source_id: verifiedAdmission.source_id }));
+    // Keep the outer React batch open after the source conflict is registered.
+    for (let i = 0; i < 32; i++) await Promise.resolve();
+    abortedBeforeCleanup = signal?.aborted === true;
+    lateRequest.resolve(json({ ...autoDispatch, state: { ...autoDispatch.state, generation: 2, status: "held", held_reason: "no_eligible_worker" } }));
+    for (let i = 0; i < 32; i++) await Promise.resolve();
+  });
+  expect(screen.getByRole("alert")).toHaveTextContent(/来源.*未确认/); expect(signal?.aborted).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "重新读取来源消息" })); await flush();
+  expect(screen.getByText("已登记，等待协调")).toBeVisible(); expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(abortedBeforeCleanup).toBe(true); expect(requests).toHaveBeenCalledTimes(3);
+});

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, getMessage } from "./api";
+import { ApiError, getMessage, isMessageSourceIdentityConflict } from "./api";
 import type { Message } from "./api";
 import { messageSourceLabel } from "./message-source";
 import { getChatAdmission } from "./chat-api";
@@ -14,7 +14,7 @@ const errorText = (error: unknown) => error instanceof ApiError ? error.message 
 const statusText = { pending: "已登记，等待协调", enqueued: "已进入协调员投递队列", held: "协调请求暂停",
   assigned: "已记录分配，执行情况见回执", declined: "协调员已拒绝本次分派" };
 
-type Observation = { view: DispatchView | null; sourceConflict: boolean };
+type Observation = { view: DispatchView | null; sourceConflict: boolean; readEpoch: number; cancelRead?: () => void };
 type Observations = Map<string, Observation>;
 
 // The visited-task owner survives hiding; its cache is local to this mounted scope, never global.
@@ -28,7 +28,13 @@ function AdmissionSample({ groupId, taskId, observations }: { groupId: string; t
   const [read, setRead] = useState<{ pending: boolean; receipt: ChatAdmission | null; observation: Observation | null; error: string }>(
     { pending: true, receipt: null, observation: null, error: "" });
   const onSourceCheck = useCallback((conflict: boolean) => {
-    if (read.observation) read.observation.sourceConflict = conflict;
+    if (read.observation) {
+      read.observation.sourceConflict = conflict;
+      if (conflict) {
+        read.observation.readEpoch++;
+        read.observation.cancelRead?.();
+      }
+    }
     setSourceConflict(conflict);
   }, [read.observation]);
   useEffect(() => {
@@ -40,7 +46,7 @@ function AdmissionSample({ groupId, taskId, observations }: { groupId: string; t
       let observation: Observation | null = null;
       if (receipt) {
         const key = JSON.stringify([groupId, taskId, receipt.dispatch_request_id]);
-        observation = observations.get(key) ?? { view: null, sourceConflict: false };
+        observation = observations.get(key) ?? { view: null, sourceConflict: false, readEpoch: 0 };
         observations.set(key, observation);
       }
       setSourceConflict(observation?.sourceConflict ?? false);
@@ -105,7 +111,11 @@ function SourceMessage({ receipt, onCheck }: { receipt: ChatAdmission; onCheck: 
       // Missing legacy metadata is not a contradiction, nor can it clear a previously known conflict.
       if (!expectedSource || knownSource) onCheck(false);
       setRead({ pending: false, value: message, error: "" });
-    }, error => { if (!ignore) setRead({ pending: false, value: null, error: `来源原文查阅未确认。${errorText(error)}` }); });
+    }, error => {
+      if (ignore) return;
+      if (isMessageSourceIdentityConflict(error)) onCheck(true);
+      setRead({ pending: false, value: null, error: `来源原文查阅未确认。${errorText(error)}` });
+    });
     return () => { ignore = true; controller.abort(); };
   }, [expanded, receipt, version, onCheck]);
   return <div>
@@ -124,19 +134,30 @@ function AutomaticDispatch({ receipt, observation }: { receipt: ChatAdmission; o
   useActiveRefresh(true, read.pending, () => setVersion(value => value + 1));
   useEffect(() => {
     let ignore = false;
-    const controller = new AbortController();
+    const controller = new AbortController(), epoch = ++observation.readEpoch;
+    const cancelRead = () => {
+      ignore = true;
+      if (observation.readEpoch === epoch) observation.readEpoch++;
+      controller.abort();
+    };
+    observation.cancelRead = cancelRead;
+    const canCommit = () => !ignore && !observation.sourceConflict && observation.readEpoch === epoch;
     setRead(previous => ({ ...previous, pending: true, error: "" }));
     void getDispatchRequest(receipt.group_id, receipt.task_id, receipt.dispatch_request_id, controller.signal).then(view => {
-      if (ignore) return;
+      if (!canCommit()) return;
       const old = observation.view;
       if (view.request.topic_id !== receipt.topic_id || view.request.mandate_id !== receipt.mandate_id
         || (old && (!sameDispatchRequest(old.request, view.request) || !followsDispatchState(old.state, view.state)))) {
         setRead({ pending: false, view: null, error: "自动分派读取与原聊天准入依据不匹配或已过期，当前事实未确认。" }); return;
       }
+      if (!canCommit()) return;
       observation.view = view;
       setRead({ pending: false, view, error: "" });
-    }, error => { if (!ignore) setRead({ pending: false, view: null, error: `自动分派当前状态未确认。${errorText(error)}` }); });
-    return () => { ignore = true; controller.abort(); };
+    }, error => { if (canCommit()) setRead({ pending: false, view: null, error: `自动分派当前状态未确认。${errorText(error)}` }); });
+    return () => {
+      cancelRead();
+      if (observation.cancelRead === cancelRead) delete observation.cancelRead;
+    };
   }, [receipt, version, observation]);
   const view = read.view;
   return <div className="tasks-lifecycle" aria-busy={read.pending}>
