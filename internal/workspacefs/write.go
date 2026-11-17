@@ -141,6 +141,51 @@ func verifyStaging(parent, root *os.Root) error {
 	return nil
 }
 
+// verifyStage reads the actual inode through the pre-held readable descriptor.
+// Final permission bits may forbid a new path open; they do not revoke this fd.
+// Path and metadata checks remain observations, not protection from excluded writers.
+func verifyStage(ctx context.Context, root *os.Root, name string, file *os.File, owned os.FileInfo, hash string, mode os.FileMode) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	before, err := root.Lstat(name)
+	if err != nil {
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !before.Mode().IsRegular() || !info.Mode().IsRegular() {
+		return ErrNotRegular
+	}
+	if !os.SameFile(owned, info) || !sameFileState(before, info) || info.Mode().Perm() != mode {
+		return ErrStage
+	}
+	if info.Size() > MaxTextBytes {
+		return ErrTooLarge
+	}
+	data, err := io.ReadAll(io.NewSectionReader(file, 0, MaxTextBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > MaxTextBytes {
+		return ErrTooLarge
+	}
+	if !utf8.Valid(data) {
+		return ErrUTF8
+	}
+	after, statErr := file.Stat()
+	named, nameErr := root.Lstat(name)
+	if statErr != nil || nameErr != nil {
+		return errors.Join(ErrStage, statErr, nameErr)
+	}
+	if !sameFileState(info, after) || !sameFileState(info, named) || int64(len(data)) != info.Size() || textHash(string(data)) != hash {
+		return ErrStage
+	}
+	return ctx.Err()
+}
+
 // Replace checks the actual preimage against expectedSHA256, then publishes a
 // synced replacement inode, preserving its ordinary permission bits (0777).
 // It rechecks bytes, inode and metadata immediately before publication. The
@@ -232,7 +277,7 @@ func (r *Root) write(ctx context.Context, name, expected, text string, create bo
 	}
 	defer privateDir.Close()
 	stage := rand.Text()
-	out, err := private.OpenFile(stage, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	out, err := private.OpenFile(stage, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return receipt, err
 	}
@@ -262,11 +307,6 @@ func (r *Root) write(ctx context.Context, name, expected, text string, create bo
 	if err := r.io.sync(out); err != nil {
 		return receipt, err
 	}
-	err = out.Close()
-	out = nil
-	if err != nil {
-		return receipt, err
-	}
 	if err := r.verifyDir(dirName, parent); err != nil {
 		return receipt, err
 	}
@@ -287,9 +327,13 @@ func (r *Root) write(ctx context.Context, name, expected, text string, create bo
 			return receipt, ErrConflict
 		}
 	}
-	staged, info, err := readText(ctx, private, stage)
-	if err != nil || !os.SameFile(owned, info) || staged.SHA256 != receipt.AfterSHA256 || staged.Mode != mode {
+	if err := verifyStage(ctx, private, stage, out, owned, receipt.AfterSHA256, mode); err != nil {
 		return receipt, errors.Join(ErrStage, err)
+	}
+	err = out.Close()
+	out = nil
+	if err != nil {
+		return receipt, err
 	}
 	if err := verifyStaging(parent, private); err != nil {
 		return receipt, err
