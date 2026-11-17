@@ -181,7 +181,7 @@ func TestMessageHTTPBoundedAllTopicBeforePagination(t *testing.T) {
 		n := (i * 73) % 204
 		message := domain.Message{
 			ID: fmt.Sprintf("m-%03d", n), GroupID: g.ID, TopicID: []string{"", "topic-a", "topic-b"}[n%3],
-			SenderID: "user", Content: "fixture", CreatedAt: base.Add(time.Duration(n%5) * time.Nanosecond), Deliveries: []domain.Delivery{},
+			SenderID: "user", SourceKind: "unknown", Content: "fixture", CreatedAt: base.Add(time.Duration(n%5) * time.Nanosecond), Deliveries: []domain.Delivery{},
 		}
 		if _, err := tx.Exec(`INSERT INTO messages(id,group_id,topic_id,sender_id,content,created_at) VALUES(?,?,?,?,?,?)`, message.ID, message.GroupID, message.TopicID, message.SenderID, message.Content, message.CreatedAt.Format("2006-01-02T15:04:05.000000000Z")); err != nil {
 			t.Fatal(err)
