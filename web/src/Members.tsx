@@ -5,6 +5,7 @@ import type { Member, MemberInput, Provider } from "./api";
 import { CreationDisclosure } from "./CreationDisclosure";
 import { MemberAvatar } from "./MemberAvatar";
 import { MemberAdapterDetails } from "./MemberAdapterDetails";
+import { WorkspaceGrantSettings } from "./WorkspaceGrantSettings";
 
 function unique<T extends { id: string }>(items: T[]) {
   const seen = new Set<string>();
@@ -55,13 +56,14 @@ export function Members({ groupId, onMembers, onRecipient, catalogueActive = tru
     {!groupId ? <p className="empty-panel">请先选择群组，再查看成员。</p> : null}
     {/* Keep per-group operations alive across switches; hidden scopes cannot leak into the active UI. */}
     {visited.map(id => <div key={id} hidden={id !== groupId}>
-      <MemberScope groupId={id} active={id === groupId} catalogue={catalogue} onMembers={onMembers} onRecipient={onRecipient} />
+      <MemberScope groupId={id} active={id === groupId} grantActive={catalogueActive && id === groupId}
+        catalogue={catalogue} onMembers={onMembers} onRecipient={onRecipient} />
     </div>)}
   </>;
 }
 
-function MemberScope({ groupId, active, catalogue, onMembers, onRecipient }: {
-  groupId: string; active: boolean; catalogue: ReturnType<typeof useCatalogue>; onMembers?: MemberListener; onRecipient?: RecipientListener;
+function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRecipient }: {
+  groupId: string; active: boolean; grantActive: boolean; catalogue: ReturnType<typeof useCatalogue>; onMembers?: MemberListener; onRecipient?: RecipientListener;
 }) {
   const formId = useId();
   const [items, setItems] = useState<Member[]>([]);
@@ -156,6 +158,7 @@ function MemberScope({ groupId, active, catalogue, onMembers, onRecipient }: {
         <dt>模型配置</dt><dd>{selected.model || "未指定"}</dd><dt>工作目录配置</dt><dd>{selected.workspace || "未配置"}</dd></dl>
       <MemberAdapterDetails provider={selectedProvider} />
     </section> : null}
+    <WorkspaceGrantSettings groupId={groupId} memberId={selected?.id} active={grantActive} />
     <CreationDisclosure label="创建成员" pending={mutation.pending} error={mutation.error} onSubmit={submit}>
       <fieldset disabled={mutation.pending || mutation.uncertain}>
         <legend>创建成员</legend>

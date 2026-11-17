@@ -8,21 +8,40 @@ export type ChatPolicy = Readonly<{
   preauthorization_message_id: string; action: "" | "text_submission"; max_admissions: number;
   revision: number; authorized_by: "" | "user"; preauthorization_text?: string;
   preparation_scope_kind?: string; preparation_supported?: boolean; configuration_source_id?: string;
+  allow_workspace_changes?: boolean; workspace_changes_supported?: boolean;
 }>;
 export type ChatPolicyInput = Readonly<{
-  enabled: boolean; allow_preparation: boolean; preparation_scope_kind?: "topic_summary";
+  enabled: boolean; allow_preparation: boolean; preparation_scope_kind?: "topic_summary"; allow_workspace_changes?: boolean;
   // Retained only for an already-submitted v16 operation; new UI commands never populate this field.
   preauthorization_message_id?: string;
   action: "text_submission"; max_admissions: number; expected_revision: number;
+}>;
+export type TaskWorkspaceGrant = Readonly<{
+  grant_id: string; member_id: string; root: string; resolved_root: string; grant_schema_version: 19;
+}>;
+export type TaskWorkspaceScope = Readonly<{
+  group_id: string; topic_id: string; task_id: string; task_revision: number; mandate_id: string;
+  candidate_id: string; assessment_id: string; dispatch_request_id: string; policy_revision: number;
+  resource_key: string; node_id: "local"; grants: readonly TaskWorkspaceGrant[];
+}>;
+export type ChatRepairLink = Readonly<{
+  id: string; group_id: string; topic_id: string; repair_task_id: string; parent_task_id: string;
+  parent_submission_id: string; parent_review_id: string; reviewed_task_revision: number; parent_mandate_id: string;
+  candidate_id: string; assessment_id: string; mandate_id: string; dispatch_request_id: string; policy_revision: number;
+  authorization: "review_request" | "original_agreement" | "chat_request";
+  // This evidence label does not extend the global message source kinds.
+  authorization_source_kind: "local_user_review" | "local_user_chat" | "local_user_policy";
+  authorization_source_id: string; authorization_message_id?: string; authorization_policy_revision: number;
+  artifact_versions: readonly Readonly<{ artifact_id: string; version_id: string }>[]; created_at: string;
 }>;
 export type ChatAdmission = Readonly<{
   id: string; candidate_id: string; group_id: string; topic_id: string; message_id: string;
   source_sender_id: string; assessed_by: string; turn_id: string; policy_revision: number; candidate_generation: number;
   disposition: "request_work" | "prepare_work"; authority: "explicit_request" | "written_preauthorization";
-  authorization_message_id: string; action: "text_submission"; task_id: string; mandate_id: string;
+  authorization_message_id: string; action: "text_submission" | "workspace_change"; task_id: string; mandate_id: string;
   dispatch_request_id: string; notice_message_id: string; created_at: string;
   source_id?: string; source_kind?: MessageSourceKind; purpose?: string; authority_evidence_verified?: boolean;
-  outcome?: "" | "admitted"; reason_code?: string; question?: string;
+  outcome?: "" | "admitted"; reason_code?: string; question?: string; workspace_scope?: TaskWorkspaceScope; repair_link?: ChatRepairLink;
 }>;
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === "string" && !/[\ud800-\udfff]/u.test(value);
@@ -37,19 +56,23 @@ const keyValid = (value: string) => value.length > 0 && value.length <= 128 && !
 const policyFields = ["group_id", "topic_id", "enabled", "allow_preparation", "preauthorization_message_id", "action", "max_admissions", "revision", "authorized_by"];
 export const hasChatPolicyMetadata = (policy: ChatPolicy) => typeof policy.preparation_supported === "boolean"
   && typeof policy.configuration_source_id === "string";
-const policyMetadata = ["preauthorization_text", "preparation_scope_kind", "preparation_supported", "configuration_source_id"];
+const policyMetadata = ["preauthorization_text", "preparation_scope_kind", "preparation_supported", "configuration_source_id",
+  "allow_workspace_changes", "workspace_changes_supported"];
 function isPolicy(value: unknown, groupId: string, topicId: string): value is ChatPolicy {
   if (!record(value) || !policyFields.every(field => Object.hasOwn(value, field))
     || Object.keys(value).some(field => !policyFields.includes(field) && !policyMetadata.includes(field))
     || value.group_id !== groupId || value.topic_id !== topicId || !integer(value.revision)
     || typeof value.enabled !== "boolean" || typeof value.allow_preparation !== "boolean"
-    || !text(value.preauthorization_message_id) || (value.preauthorization_text !== undefined && !text(value.preauthorization_text))) return false;
+    || !text(value.preauthorization_message_id) || (value.preauthorization_text !== undefined && !text(value.preauthorization_text))
+    || (value.allow_workspace_changes !== undefined && typeof value.allow_workspace_changes !== "boolean")
+    || (value.workspace_changes_supported !== undefined && typeof value.workspace_changes_supported !== "boolean")
+    || (value.allow_workspace_changes === true && value.workspace_changes_supported === false)) return false;
   const metadata = ["preparation_scope_kind", "preparation_supported", "configuration_source_id"].some(field => Object.hasOwn(value, field));
   if (metadata && (typeof value.preparation_supported !== "boolean" || !text(value.configuration_source_id)
     || (value.preparation_scope_kind !== undefined && !text(value.preparation_scope_kind)))) return false;
   const scope = value.preparation_scope_kind ?? "";
   if (value.revision === 0) return !value.enabled && !value.allow_preparation && value.preauthorization_message_id === ""
-    && value.action === "" && value.max_admissions === 0 && value.authorized_by === "" && !value.preauthorization_text
+    && value.action === "" && value.max_admissions === 0 && value.authorized_by === "" && !value.preauthorization_text && !value.allow_workspace_changes
     && (!metadata || (!value.preparation_supported && value.configuration_source_id === "" && scope === ""));
   if (value.action !== "text_submission" || value.authorized_by !== "user" || !budget(value.max_admissions)
     || (value.allow_preparation && !identifier(value.preauthorization_message_id))
@@ -65,16 +88,73 @@ function isPolicy(value: unknown, groupId: string, topicId: string): value is Ch
 const admissionFields = ["id", "candidate_id", "group_id", "topic_id", "message_id", "source_sender_id", "assessed_by", "turn_id",
   "policy_revision", "candidate_generation", "disposition", "authority", "authorization_message_id", "action", "task_id", "mandate_id",
   "dispatch_request_id", "notice_message_id", "created_at"];
+const absoluteRoot = (value: unknown): value is string => text(value) && value.startsWith("/") && !value.includes("\0");
+function isWorkspaceScope(value: unknown, admission: Record<string, unknown>): value is TaskWorkspaceScope {
+  const fields = ["group_id", "topic_id", "task_id", "task_revision", "mandate_id", "candidate_id", "assessment_id",
+    "dispatch_request_id", "policy_revision", "resource_key", "node_id", "grants"];
+  if (!record(value) || Object.keys(value).length !== fields.length || !fields.every(field => Object.hasOwn(value, field))
+    || !["group_id", "topic_id", "task_id", "mandate_id", "candidate_id", "dispatch_request_id", "policy_revision"].every(field => value[field] === admission[field])
+    || value.assessment_id !== admission.id || !positive(value.task_revision) || value.node_id !== "local"
+    || !identifier(value.resource_key) || !value.resource_key.startsWith("workspace:") || value.resource_key === "workspace:"
+    || !Array.isArray(value.grants) || !value.grants.length) return false;
+  const members = new Set<string>(), grants = new Set<string>();
+  return value.grants.every(grant => {
+    if (!record(grant) || Object.keys(grant).length !== 5 || !pathId(grant.grant_id) || !pathId(grant.member_id)
+      || !absoluteRoot(grant.root) || !absoluteRoot(grant.resolved_root) || grant.grant_schema_version !== 19
+      || members.has(grant.member_id) || grants.has(grant.grant_id)) return false;
+    members.add(grant.member_id); grants.add(grant.grant_id); return true;
+  });
+}
+function isRepairLink(value: unknown, admission: Record<string, unknown>): value is ChatRepairLink {
+  const fields = ["id", "group_id", "topic_id", "repair_task_id", "parent_task_id", "parent_submission_id", "parent_review_id",
+    "reviewed_task_revision", "parent_mandate_id", "candidate_id", "assessment_id", "mandate_id", "dispatch_request_id", "policy_revision",
+    "authorization", "authorization_source_kind", "authorization_source_id", "authorization_policy_revision", "artifact_versions", "created_at"];
+  if (!record(value) || !fields.every(field => Object.hasOwn(value, field))
+    || Object.keys(value).some(field => !fields.includes(field) && field !== "authorization_message_id")
+    || !["group_id", "topic_id", "candidate_id", "mandate_id", "dispatch_request_id", "policy_revision"].every(field => value[field] === admission[field])
+    || value.repair_task_id !== admission.task_id || value.assessment_id !== admission.id || value.parent_task_id === value.repair_task_id
+    || !["id", "parent_task_id", "parent_submission_id", "parent_review_id", "parent_mandate_id", "authorization_source_id"].every(field => identifier(value[field]))
+    || !positive(value.reviewed_task_revision) || !positive(value.authorization_policy_revision)
+    || admission.disposition !== "request_work" || admission.outcome !== "admitted" || admission.purpose !== "chat_intake/v1"
+    || admission.authority_evidence_verified !== true || !text(value.created_at)
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value.created_at)
+    || !Number.isFinite(Date.parse(value.created_at))
+    // Reject normalized invalid dates without tightening legacy timestamp parsing.
+    || new Date(value.created_at).toISOString().slice(0, 19) !== value.created_at.slice(0, 19)
+    || !Array.isArray(value.artifact_versions) || (!value.artifact_versions.length && admission.action !== "text_submission")) return false;
+  const versions = new Set<string>();
+  if (!value.artifact_versions.every(ref => {
+    if (!record(ref) || Object.keys(ref).length !== 2 || !pathId(ref.artifact_id) || !pathId(ref.version_id)) return false;
+    const key = JSON.stringify([ref.artifact_id, ref.version_id]);
+    if (versions.has(key)) return false;
+    versions.add(key); return true;
+  })) return false;
+  if (value.authorization_source_kind === "local_user_review") {
+    if (Object.hasOwn(value, "authorization_message_id") || admission.authorization_message_id !== "") return false;
+  } else if ((value.authorization_source_kind !== "local_user_chat" && value.authorization_source_kind !== "local_user_policy")
+    || !identifier(value.authorization_message_id) || admission.authorization_message_id !== value.authorization_message_id) return false;
+  if (admission.authority !== (value.authorization_source_kind === "local_user_policy" ? "written_preauthorization" : "explicit_request")) return false;
+  if (value.authorization === "chat_request") return admission.source_kind === "local_user_chat"
+    && value.authorization_source_kind === "local_user_chat" && value.authorization_source_id === admission.source_id
+    && value.authorization_message_id === admission.message_id && value.authorization_policy_revision === admission.policy_revision;
+  if (admission.source_kind !== "platform" || admission.source_id !== `review:${value.parent_review_id}`) return false;
+  return value.authorization === "review_request" ? value.authorization_source_kind === "local_user_review"
+    && value.authorization_source_id === value.parent_review_id && value.authorization_policy_revision === admission.policy_revision
+    : value.authorization === "original_agreement" && positive(admission.policy_revision) && value.authorization_policy_revision <= admission.policy_revision;
+}
 function isAdmission(value: unknown, groupId: string, taskId: string): value is ChatAdmission {
-  const metadata = ["source_id", "source_kind", "purpose", "authority_evidence_verified", "outcome", "reason_code", "question"];
+  const metadata = ["source_id", "source_kind", "purpose", "authority_evidence_verified", "outcome", "reason_code", "question", "workspace_scope", "repair_link"];
   if (!record(value) || Object.keys(value).some(field => !admissionFields.includes(field) && !metadata.includes(field))
     || !admissionFields.every(field => Object.hasOwn(value, field))
-    || value.group_id !== groupId || value.task_id !== taskId || !text(value.topic_id) || value.action !== "text_submission"
+    || value.group_id !== groupId || value.task_id !== taskId || !text(value.topic_id)
+    || (value.action !== "text_submission" && value.action !== "workspace_change")
     || !positive(value.policy_revision) || !positive(value.candidate_generation)
-    || !["id", "candidate_id", "message_id", "source_sender_id", "assessed_by", "turn_id", "authorization_message_id", "mandate_id", "notice_message_id"].every(field => identifier(value[field]))
-    || !pathId(value.dispatch_request_id) || !text(value.created_at)
+    || !["id", "candidate_id", "message_id", "source_sender_id", "assessed_by", "turn_id", "mandate_id", "notice_message_id"].every(field => identifier(value[field]))
+    || !text(value.authorization_message_id) || !pathId(value.dispatch_request_id) || !text(value.created_at)
     || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value.created_at)
     || !Number.isFinite(Date.parse(value.created_at))) return false;
+  if (value.action === "workspace_change" ? value.disposition !== "request_work" || !isWorkspaceScope(value.workspace_scope, value)
+    : Object.hasOwn(value, "workspace_scope")) return false;
   if ((value.source_kind !== undefined && !isMessageSourceKind(value.source_kind))
     || (value.source_id !== undefined && value.source_id !== "" && !identifier(value.source_id))
     || (value.purpose !== undefined && value.purpose !== "" && value.purpose !== "chat_intake/v1")
@@ -84,6 +164,8 @@ function isAdmission(value: unknown, groupId: string, taskId: string): value is 
   const knownSource = value.source_kind !== undefined && value.source_kind !== "unknown";
   if (knownSource ? !identifier(value.source_id) : value.source_id !== undefined && value.source_id !== "") return false;
   if (!sourceMatchesSender(value.source_kind, value.source_sender_id)) return false;
+  if (Object.hasOwn(value, "repair_link")) return isRepairLink(value.repair_link, value);
+  if (!identifier(value.authorization_message_id)) return false;
   if (value.authority_evidence_verified === true && (value.purpose !== "chat_intake/v1"
     || (value.source_kind !== "local_user_chat" && value.source_kind !== "member")
     || (value.disposition === "request_work" && value.source_kind !== "local_user_chat"))) return false;
@@ -95,13 +177,26 @@ function decode(buffer: ArrayBuffer): unknown {
   const source = new TextDecoder("utf-8", { fatal: true }).decode(buffer), maximum = String(Number.MAX_SAFE_INTEGER);
   // Every numeric wire field in these contracts is a nonnegative integer. Reject rounding before parse.
   const tokens = /"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/uy;
+  const stack: { keys: Set<string> | null; expectingKey: boolean }[] = [];
   for (let index = 0; index < source.length; index++) {
-    if (!/["\d-]/u.test(source[index])) continue;
+    const part = source[index], top = stack.at(-1);
+    if (part === "{" || part === "[") stack.push({ keys: part === "{" ? new Set() : null, expectingKey: part === "{" });
+    else if (part === "}" || part === "]") stack.pop();
+    else if (part === "," && top?.keys) top.expectingKey = true;
+    else if (part === ":" && top) top.expectingKey = false;
+    if (!/["\d-]/u.test(part)) continue;
     tokens.lastIndex = index;
     const token = tokens.exec(source)?.[0];
     if (token === undefined) return null;
     index = tokens.lastIndex - 1;
-    if (token.startsWith('"')) continue;
+    if (token.startsWith('"')) {
+      if (top?.keys && top.expectingKey) {
+        const key: string = JSON.parse(token);
+        if (top.keys.has(key)) return null;
+        top.keys.add(key); top.expectingKey = false;
+      }
+      continue;
+    }
     if (!/^(?:0|[1-9]\d*)$/.test(token) || token.length > maximum.length || (token.length === maximum.length && token > maximum)) return null;
   }
   return JSON.parse(source);
@@ -166,9 +261,11 @@ export async function setChatPolicy(groupId: string, input: ChatPolicyInput, key
   const sent: ChatPolicyInput = Object.freeze({ enabled: input.enabled, allow_preparation: input.allow_preparation,
     ...(legacy ? { preauthorization_message_id: input.preauthorization_message_id }
       : input.preparation_scope_kind === undefined ? {} : { preparation_scope_kind: input.preparation_scope_kind }),
-    action: input.action, max_admissions: input.max_admissions, expected_revision: input.expected_revision });
+    action: input.action, max_admissions: input.max_admissions, expected_revision: input.expected_revision,
+    ...(input.allow_workspace_changes === true ? { allow_workspace_changes: true } : {}) });
   if (typeof sent.enabled !== "boolean" || typeof sent.allow_preparation !== "boolean" || sent.action !== "text_submission"
-    || !budget(sent.max_admissions) || !integer(sent.expected_revision) || sent.expected_revision >= Number.MAX_SAFE_INTEGER) throw invalid();
+    || !budget(sent.max_admissions) || !integer(sent.expected_revision) || sent.expected_revision >= Number.MAX_SAFE_INTEGER
+    || (input.allow_workspace_changes !== undefined && typeof input.allow_workspace_changes !== "boolean")) throw invalid();
   if (legacy ? !text(sent.preauthorization_message_id) || (sent.preauthorization_message_id !== "" && !identifier(sent.preauthorization_message_id))
       || (sent.allow_preparation && !sent.preauthorization_message_id)
     : Boolean(input.preauthorization_message_id) || (sent.allow_preparation ? sent.preparation_scope_kind !== "topic_summary"
@@ -177,6 +274,8 @@ export async function setChatPolicy(groupId: string, input: ChatPolicyInput, key
     body: JSON.stringify(sent) }, (value): value is ChatPolicy => isPolicy(value, groupId, topicId)
       && value.revision === sent.expected_revision + 1 && value.enabled === sent.enabled && value.allow_preparation === sent.allow_preparation
       && value.action === sent.action && value.max_admissions === sent.max_admissions
+      && (value.allow_workspace_changes ?? false) === (sent.allow_workspace_changes ?? false)
+      && (!sent.allow_workspace_changes || value.workspace_changes_supported === true)
       && (legacy ? value.preauthorization_message_id === sent.preauthorization_message_id && !value.preparation_scope_kind && !value.preparation_supported
         : hasChatPolicyMetadata(value) && identifier(value.configuration_source_id)
           && (value.preparation_scope_kind ?? "") === (sent.preparation_scope_kind ?? "") && value.preparation_supported === sent.allow_preparation));

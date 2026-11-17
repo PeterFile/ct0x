@@ -1,0 +1,5 @@
+.workspace-grant-settings { min-width: 0; overflow-wrap: anywhere; }
+.workspace-grant-settings > div:not([hidden]), .workspace-grant-settings dl { display: grid; gap: var(--space-3); }
+.workspace-grant-settings dl, .workspace-grant-settings dd { margin: 0; }
+.workspace-grant-settings dt { color: var(--color-muted); font-size: var(--text-small); }
+.workspace-grant-settings dd, .workspace-grant-settings pre { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }

@@ -15,6 +15,12 @@ const statusText = { open: "待交付", submitted: "待验收", accepted: "已�
 const emptyDraft = { title: "", description: "", acceptance: "" };
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请重试。";
 const mergeTasks = (items: Task[]) => [...new Map(items.map(task => [task.id, task])).values()];
+function artifactContentPath(groupId: string, ref: { artifact_id: string; version_id: string }): string | null {
+  const ids = [groupId, ref.artifact_id, ref.version_id];
+  if (ids.some(id => !id || id === "." || id === ".." || /[\ud800-\udfff]/u.test(id))) return null;
+  const [group, artifact, version] = ids.map(id => encodeURIComponent(id));
+  return `/api/v1/groups/${group}/artifacts/${artifact}/versions/${version}/content`;
+}
 
 export function Tasks({ group }: { group: Group | null }) {
   const groupId = group?.id;
@@ -350,7 +356,12 @@ function TaskLifecycle({ groupId, taskId, task, onReceipt, onReading }: {
         {submission ? <>
           <p className="tasks-copy">{submission.summary}</p><p className="tasks-meta">提交者：{submission.submitted_by}</p>
           {submission.artifact_versions.length ? <ul className="tasks-artifact-refs" aria-label="冻结成果版本">
-            {submission.artifact_versions.map(ref => <li key={JSON.stringify([ref.artifact_id, ref.version_id])} className="tasks-meta">{ref.artifact_id} / {ref.version_id}</li>)}
+            {submission.artifact_versions.map(ref => {
+              const href = artifactContentPath(groupId, ref);
+              return <li key={JSON.stringify([ref.artifact_id, ref.version_id])} className="tasks-meta">
+                <span>{ref.artifact_id} / {ref.version_id}</span>{href ? <> · <a href={href} download>下载固定成果文件</a></> : null}
+              </li>;
+            })}
           </ul> : <p className="tasks-note">无冻结成果版本，仅文本交付。</p>}
         </> : null}
       </section>
