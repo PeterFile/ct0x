@@ -275,7 +275,8 @@ func TestChatRepairPreparationDefaultIntakeProfile(t *testing.T) {
 	selectPrepareMemberToolsPi(f)
 	options := configurePrepareMemberTools(t, f)
 	options.Operations = slices.Clone(historyProfileNames)
-	options.RoleMaxActive, options.RoleExecutionRoot = 1, t.TempDir()
+	options.RoleMaxActive, options.RoleExecutionRoot = 1, filepath.Join(filepath.Dir(f.opts.PrivateWorkspaceRoot), "runs")
+	prepareRoleOK(t, os.Mkdir(options.RoleExecutionRoot, 0700))
 	options.ChatIntake = coordination.New(f.s)
 	var err error
 	f.opts.MemberTools, err = NewMemberToolRuntime(f.s, options)
