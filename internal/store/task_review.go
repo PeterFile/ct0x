@@ -99,6 +99,9 @@ func reviewTaskInTx(ctx context.Context, tx *sql.Tx, input ReviewTaskInput) (dom
 	if changed != 1 {
 		return domain.ReviewDecision{}, fmt.Errorf("%w：任务当前状态已改变", ErrConflict)
 	}
+	if err := chatReviewNoticeInTx(ctx, tx, decision); err != nil {
+		return domain.ReviewDecision{}, err
+	}
 	return decision, nil
 }
 
