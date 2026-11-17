@@ -100,7 +100,11 @@ func memberMCPMetadataRole(t *testing.T, role *readinessHTTPFixture, use func(*m
 	binding := platform.MemberToolRunBinding{GroupID: turn.GroupID, MemberID: turn.MemberID, ConversationID: turn.ConversationID, DeliveryID: turn.DeliveryID, ProviderID: state.ProviderID, ProviderName: provider.Pi, Model: state.Model}
 	raw := provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, Started: true, ExitCode: 0, Reason: "synthetic executor, not native completion evidence"}
 	calls := 0
-	executor, err := role.runtime.WrapCoordinationRole(binding, state.Provenance, func(path, id string, names []string) (provider.Executor, error) {
+	// The synthetic adapter supports this worker; freeze its current server values.
+	worker, err := role.a.db.GetMember(ctx, turn.GroupID, role.worker.ID)
+	readinessHTTPOK(t, err)
+	facts := []store.DispatchWorkerCapabilityFact{{GroupID: worker.GroupID, MemberID: worker.ID, ProviderID: worker.ProviderID, Model: worker.Model}}
+	executor, err := role.runtime.WrapCoordinationRoleWithCapabilities(binding, state.Provenance, facts, func(path, id string, names []string) (provider.Executor, error) {
 		// This is the private config created for this fixture, not a native credential.
 		data, err := os.ReadFile(path)
 		readinessHTTPOK(t, err)
