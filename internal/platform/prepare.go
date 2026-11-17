@@ -32,11 +32,12 @@ type PrepareOptions struct {
 	// PrivateDataRoot optionally excludes the entire trusted application data
 	// directory from durable grants; empty preserves legacy configuration.
 	PrivateDataRoot string
-	// MemberTools and PiMemberToolsExtension are a trusted, Pi-only opt-in pair.
+	// MemberTools pairs with a trusted Pi extension and/or explicit Codex opt-in.
 	// The runtime must borrow the same Store; the extension and its ancestors
 	// must remain trusted and stable for the preparer's lifetime.
 	MemberTools            *MemberToolRuntime
 	PiMemberToolsExtension string
+	EnableCodexAppServer   bool          // Default false; requires the role-enabled runtime.
 	HistoryLimit           int           // Zero defaults to 50; explicit range is 1..200.
 	MaxContextBytes        int           // Zero defaults to 16 KiB; maximum is 1 MiB.
 	RoleHistoryLimit       int           // Zero defaults to 50; explicit range is 1..200.
@@ -67,6 +68,7 @@ type Preparer struct {
 	executionTimeout       time.Duration
 	memberTools            *MemberToolRuntime
 	piMemberToolsExtension string
+	enableCodexAppServer   bool
 }
 
 var (
@@ -126,10 +128,11 @@ func NewPreparer(s *store.Store, opts PrepareOptions) (*Preparer, error) {
 
 func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 	r, path := opts.MemberTools, opts.PiMemberToolsExtension
-	if r == nil && path == "" {
+	if r == nil && path == "" && !opts.EnableCodexAppServer {
 		return nil
 	}
-	if r == nil || path == "" || r.tools == nil || r.tools.db != p.store || r.tools.capabilities == nil ||
+	if r == nil || path == "" && !opts.EnableCodexAppServer || r.tools == nil || r.tools.db != p.store || r.tools.capabilities == nil ||
+		opts.EnableCodexAppServer && r.roleFence == nil ||
 		r.rootInfo == nil || !filepath.IsAbs(r.configRoot) || !filepath.IsAbs(r.resolvedRoot) ||
 		!memberToolRuntimeEndpoint(r.endpoint) || r.maxGroupMembers < 1 || r.maxGroupMembers > 200 || !r.rootValid() {
 		return errPrepareConfig
@@ -147,21 +150,23 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 			return errPrepareConfig
 		}
 	}
-	if !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
-		return errPrepareConfig
+	if path != "" {
+		if !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
+			return errPrepareConfig
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0444 == 0 {
+			return errPrepareConfig
+		}
+		extension, err := os.Open(path)
+		if err != nil {
+			return errPrepareConfig
+		}
+		if extension.Close() != nil {
+			return errPrepareConfig
+		}
 	}
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0444 == 0 {
-		return errPrepareConfig
-	}
-	extension, err := os.Open(path)
-	if err != nil {
-		return errPrepareConfig
-	}
-	if extension.Close() != nil {
-		return errPrepareConfig
-	}
-	p.memberTools, p.piMemberToolsExtension = r, path
+	p.memberTools, p.piMemberToolsExtension, p.enableCodexAppServer = r, path, opts.EnableCodexAppServer
 	return nil
 }
 
@@ -189,13 +194,17 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	if !ok {
 		return empty, scheduler.ErrNotReady
 	}
-	executor, err := provider.NewExecutor(selected, p.executionTimeout)
-	if err != nil {
-		return empty, scheduler.ErrNotReady
-	}
-	useMemberTools := p.memberTools != nil && selected.Name == provider.Pi
-	if useMemberTools && !memberToolRuntimeText(member.Model) {
-		return empty, scheduler.ErrNotReady
+	selection, useMemberTools := p.memberToolAdapter(selected)
+	var executor provider.Executor
+	if useMemberTools {
+		if _, _, err := p.sampleMemberToolMember(member, p.memberTools.operations); err != nil {
+			return empty, scheduler.ErrNotReady
+		}
+	} else {
+		executor, err = provider.NewExecutor(selected, p.executionTimeout)
+		if err != nil {
+			return empty, scheduler.ErrNotReady
+		}
 	}
 	history, err := p.store.ListPreparationHistory(ctx, group.ID, trigger.ID, p.historyLimit)
 	if err != nil {
@@ -222,9 +231,7 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 		}
 		executor, err = wrap(MemberToolRunBinding{GroupID: group.ID, MemberID: member.ID,
 			ConversationID: conversation.ID, DeliveryID: d.ID, ProviderID: selected.ID, Model: member.Model},
-			func(configPath, _ string, toolNames []string) (provider.Executor, error) {
-				return provider.NewPiMemberToolExecutorWithTools(selected, p.piMemberToolsExtension, configPath, toolNames, p.executionTimeout)
-			})
+			p.memberToolExecutorFactory(selected, selection))
 		if err != nil {
 			return empty, scheduler.ErrNotReady
 		}
@@ -371,6 +378,14 @@ func (p *Preparer) buildContext(group domain.Group, member domain.Member, conver
 				"评估持久化后仍可公开讨论/提案。仅真实用户聊天触发的discuss轮可按list_members返回的实际同群成员ID邀请一个同伴一次；随后成员轮只公开回应，不能递归邀请。每轮额外公开消息最多一条，邀请最多一条；不按姓名猜ID。该讨论路径不授用户权限。",
 				"根据工具outcome区分admitted、not_admitted、discuss、clarify；not_admitted的reason_code/question和原话题说明是持久事实，不能自动加额度、换key重复准入或用模型最终文字改称成功。真正HTTP结果未知时保留原key对账，不自动重试业务操作。",
 				"没有文件、Artifact或外部动作授权；CWD不是主机读取沙箱。Task/分派持久化不等于执行成功，具体Submission不等于用户接纳或Review；最终文字必须有效UTF-8且最多65536字节。",
+			}
+		}
+		if selected, ok := p.providers[member.ProviderID]; ok {
+			if selection, enabled := p.memberToolAdapter(selected); enabled && selection.Protocol == provider.CodexAppServerProtocol {
+				if p.memberTools.tools.chatEngine == nil {
+					in.Permissions[0] = "仅支持所选 Codex AppServer 版本的全新单轮执行；不支持恢复或运行中追加输入。"
+				}
+				in.Permissions = append(in.Permissions, codexNativeTextPermission)
 			}
 		}
 	}

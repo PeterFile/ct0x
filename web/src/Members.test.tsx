@@ -7,6 +7,10 @@ import { member, provider } from "./test/members";
 const reads = vi.fn<typeof fetch>();
 const writes = vi.fn<typeof fetch>();
 const catalogue = vi.fn<typeof fetch>();
+const grantReads = vi.fn<typeof fetch>(), grantWrites = vi.fn<typeof fetch>();
+const grantReceipt = { id: "workspace-grant-1", group_id: group.id, member_id: member.id, root: "/chosen/project ",
+  resolved_root: "/physical/project", resource_key: "workspace:device:inode", scope: "read_write", node_id: "local",
+  authorized_by: "user", created_at: member.created_at };
 const panel = () => {
   const landmark = screen.getByRole("complementary", { name: "成员" });
   const form = within(landmark).queryByRole("form", { name: "创建成员" });
@@ -32,7 +36,11 @@ beforeEach(() => {
   reads.mockReset().mockImplementation(async () => page());
   writes.mockReset().mockImplementation(async () => json(member, 201));
   catalogue.mockReset().mockImplementation(async () => page([provider]));
-  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => String(input).includes("/members")
+  grantReads.mockReset().mockImplementation(async () => json({ error: { code: "not_found", message: "记录不存在或不可访问" } }, 404));
+  grantWrites.mockReset().mockImplementation(async () => json({}, 503));
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => String(input).endsWith("/workspace-grant")
+    ? (init?.method === "POST" ? grantWrites : grantReads)(input, init)
+    : String(input).includes("/members")
     ? (init?.method === "POST" ? writes : reads)(input, init)
     : String(input).startsWith("/api/v1/providers") ? catalogue(input, init)
     : Promise.resolve(String(input).includes("/messages") ? page() : page([group, other])));
@@ -243,7 +251,7 @@ it("shows version-bound contract support, disabled process and unsupported permi
   expect(detailValue("终态证据")).toHaveTextContent(/^支持（实现合同）$/);
   expect(detailValue("运行中追加")).toHaveTextContent(/^不支持$/);
   expect(panel().getByText(/实现合同只证明此版本的接入实现/)).toHaveTextContent("并非握手或实际运行证明");
-  expect(panel().queryByRole("button", { name: /批准|授权|启用接入/ })).not.toBeInTheDocument();
+  expect(within(panel().getByRole("region", { name: "成员详情" })).queryByRole("button", { name: /批准|授权|启用接入/ })).not.toBeInTheDocument();
 });
 it("labels refreshed CLI/model selection as current configuration, not historical Turn or actual model evidence", async () => {
   const hostilePath = '<img src=x onerror="alert(1)">';
@@ -386,6 +394,73 @@ it("fences late previous-generation pages and retries failed pagination from pag
   await panel().findByText("未启用");
   expect(catalogue.mock.calls[4][0]).toBe("/api/v1/providers?limit=50");
 });
+it("mounts directory grants from the existing paged stable-ID selection without treating workspace preference as permission", async () => {
+  const selected = { ...member, workspace: "/configured/preference" }, second = { ...member, id: "member /2+?" };
+  reads.mockResolvedValueOnce(page([selected], "member-cursor")); await open();
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  expect(panel().getByText(selected.workspace)).toBeVisible(); expect(grantReads).not.toHaveBeenCalled();
+  fireEvent.click(panel().getByRole("button", { name: "展开目录授权" }));
+  await panel().findByText("该成员尚无已确认目录授权。");
+  const grantForm = within(panel().getByRole("form", { name: "保存目录授权" }));
+  expect(grantForm.getByRole("textbox", { name: "已有目录的绝对路径" })).toHaveValue("");
+  expect(grantForm.getByRole("combobox", { name: "目录授权范围" })).toHaveValue("");
+  expect(grantReads.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/members/${member.id}/workspace-grant`);
+  reads.mockResolvedValueOnce(page([second])); fireEvent.click(panel().getByRole("button", { name: "加载更多成员" })); await act(async () => {});
+  const duplicates = panel().getAllByRole("button", { name: member.name }); expect(duplicates).toHaveLength(2); fireEvent.click(duplicates[1]);
+  grantReads.mockResolvedValueOnce(json({ ...grantReceipt, member_id: second.id, scope: "read_only" }));
+  fireEvent.click(panel().getByRole("button", { name: "展开目录授权" }));
+  expect(await panel().findByRole("region", { name: "已确认目录授权回执" })).toHaveTextContent("只读范围");
+  expect(grantReads.mock.calls[1][0]).toBe(`/api/v1/groups/${group.id}/members/${encodeURIComponent(second.id)}/workspace-grant`);
+  expect(panel().queryByRole("form", { name: "保存目录授权" })).not.toBeInTheDocument();
+  expect(reads).toHaveBeenCalledTimes(2); expect(catalogue).toHaveBeenCalledTimes(1);
+  expect(writes).not.toHaveBeenCalled(); expect(grantWrites).not.toHaveBeenCalled();
+});
+it("retains the original grant POST across member/group switches, hidden panel and temporarily missing selected record", async () => {
+  const second = { ...member, id: "member-2", name: "另一工作成员" }, foreign = { ...member, group_id: other.id, name: "另一群成员" };
+  let items = [member, second]; reads.mockImplementation(async url => page(String(url).includes(other.id) ? [foreign] : items));
+  await open(); fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  fireEvent.click(panel().getByRole("button", { name: "展开目录授权" })); await panel().findByText("该成员尚无已确认目录授权。");
+  let form = within(panel().getByRole("form", { name: "保存目录授权" }));
+  fireEvent.change(form.getByRole("textbox"), { target: { value: grantReceipt.root } });
+  fireEvent.change(form.getByRole("combobox"), { target: { value: "read_write" } });
+  const pending = deferred<Response>(); grantWrites.mockReturnValueOnce(pending.promise);
+  fireEvent.submit(panel().getByRole("form", { name: "保存目录授权" }));
+  const attempt = (index: number) => { const [url, init] = grantWrites.mock.calls[index]; return { url, body: init?.body, key: new Headers(init?.headers).get("Idempotency-Key") }; };
+  const original = attempt(0); expect(JSON.parse(String(original.body))).toEqual({ root: grantReceipt.root, scope: "read_write" });
+  fireEvent.click(panel().getByRole("button", { name: second.name }));
+  fireEvent.click(panel().getByRole("button", { name: "展开目录授权" })); await panel().findByText("该成员尚无已确认目录授权。");
+  fireEvent.change(within(panel().getByRole("form", { name: "保存目录授权" })).getByRole("textbox"), { target: { value: "/second/draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "关闭详情" }));
+  expect(grantWrites.mock.calls[0][1]?.signal?.aborted ?? false).toBe(false);
+  await act(async () => pending.resolve(json({}, 503)));
+  fireEvent.click(screen.getByRole("button", { name: "成员" })); await act(async () => {});
+  expect(within(panel().getByRole("form", { name: "保存目录授权" })).getByRole("textbox")).toHaveValue("/second/draft");
+  selectGroup(other.name); fireEvent.click(await panel().findByRole("button", { name: foreign.name }));
+  selectGroup(group.name); fireEvent.click(await panel().findByRole("button", { name: member.name })); await act(async () => {});
+  items = []; fireEvent.click(panel().getByRole("button", { name: "刷新成员" })); await panel().findByText("尚无成员，可创建群内成员。");
+  expect(panel().queryByRole("region", { name: "成员目录授权" })).not.toBeInTheDocument();
+  items = [member, second]; fireEvent.click(panel().getByRole("button", { name: "刷新成员" })); await panel().findByRole("button", { name: member.name });
+  form = within(panel().getByRole("form", { name: "保存目录授权" }));
+  expect(form.getByRole("textbox")).toHaveValue(grantReceipt.root); expect(form.getByRole("textbox")).toBeDisabled();
+  grantReads.mockImplementation(async () => json(grantReceipt));
+  fireEvent.click(panel().getByRole("button", { name: "读取目录授权并保留原操作" }));
+  await panel().findByRole("region", { name: "已确认目录授权回执" });
+  expect(form.getByRole("button", { name: "重试同一次目录授权" })).toBeEnabled();
+  grantWrites.mockResolvedValueOnce(json(grantReceipt, 201)); fireEvent.submit(panel().getByRole("form", { name: "保存目录授权" }));
+  await act(async () => {}); expect(attempt(1)).toEqual(original); expect(grantWrites).toHaveBeenCalledTimes(2); expect(writes).not.toHaveBeenCalled();
+  expect(panel().queryByRole("form", { name: "保存目录授权" })).not.toBeInTheDocument();
+});
+it("suspends a selected grant GET when the actual Members panel closes without unmounting its owner", async () => {
+  reads.mockResolvedValueOnce(page([member])); const pending = deferred<Response>(); grantReads.mockReturnValueOnce(pending.promise);
+  await open(); fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  fireEvent.click(panel().getByRole("button", { name: "展开目录授权" })); const signal = grantReads.mock.calls[0][1]?.signal;
+  fireEvent.click(screen.getByRole("button", { name: "关闭详情" })); expect(signal?.aborted).toBe(true);
+  await act(async () => pending.resolve(json(grantReceipt)));
+  fireEvent.click(screen.getByRole("button", { name: "成员" })); await panel().findByText("该成员尚无已确认目录授权。");
+  expect(panel().queryByRole("region", { name: "已确认目录授权回执" })).not.toBeInTheDocument();
+  expect(grantReads).toHaveBeenCalledTimes(2); expect(reads).toHaveBeenCalledTimes(1); expect(grantWrites).not.toHaveBeenCalled();
+});
+
 it("shows a real empty catalogue, retries a network failure, and aborts on full unmount", async () => {
   catalogue.mockRejectedValueOnce(new TypeError("offline")); await open();
   await panel().findByText(/运行器目录暂不可用/); catalogue.mockResolvedValueOnce(page());

@@ -273,7 +273,10 @@ it("renders actual member Submission pairs read-only, without inventing filename
   const refs = within(detail().getByRole("list", { name: "冻结成果版本" }));
   expect(refs.getAllByRole("listitem")).toHaveLength(3);
   for (const ref of frozenRefs) expect(refs.getByText(`${ref.artifact_id} / ${ref.version_id}`)).toBeVisible();
-  expect(detail().queryByRole("link")).not.toBeInTheDocument();
+  const links = refs.getAllByRole("link", { name: "下载固定成果文件" });
+  expect(links.map(link => link.getAttribute("href"))).toEqual(frozenRefs.map(ref =>
+    `/api/v1/groups/${encodeURIComponent(group.id)}/artifacts/${encodeURIComponent(ref.artifact_id)}/versions/${encodeURIComponent(ref.version_id)}/content`));
+  expect(links.every(link => link.hasAttribute("download"))).toBe(true);
   expect(detail().queryByRole("combobox")).not.toBeInTheDocument();
   expect(detail().queryByRole("textbox", { name: /文件|成果版本|JSON/ })).not.toBeInTheDocument();
   expect(writes).not.toHaveBeenCalled();
@@ -284,6 +287,22 @@ it("renders actual member Submission pairs read-only, without inventing filename
   expect(JSON.parse(String(captured(0).body))).toEqual({ expected_revision: 1, submission_id: delivery.id, outcome: "accepted", reason: "" });
   expect([...reads.mock.calls, ...details.mock.calls, ...evidence.mock.calls, ...admissions.mock.calls, ...writes.mock.calls]
     .some(([url]) => String(url).includes("/artifacts"))).toBe(false);
+});
+
+it("binds downloads to the current group and exact opaque version without fetching or checking bytes in the browser", async () => {
+  const selectedGroup = { ...other, id: "group /+?" }, ref = { artifact_id: "artifact /+?", version_id: "version /+?#" };
+  current = { ...submittedTask, group_id: selectedGroup.id };
+  evidence.mockResolvedValueOnce(json({ ...delivery, group_id: selectedGroup.id, artifact_versions: [ref] }));
+  render(ui(selectedGroup)); fireEvent.click(await panel().findByRole("button", { name: new RegExp(`^${task.title}，`) }));
+  const link = await detail().findByRole("link", { name: "下载固定成果文件" });
+  expect(link).toHaveAttribute("href", `/api/v1/groups/${encodeURIComponent(selectedGroup.id)}/artifacts/${encodeURIComponent(ref.artifact_id)}/versions/${encodeURIComponent(ref.version_id)}/content`);
+  expect(detail().getByText(`${ref.artifact_id} / ${ref.version_id}`)).toBeVisible(); expect(writes).not.toHaveBeenCalled();
+  expect([...reads.mock.calls, ...details.mock.calls, ...evidence.mock.calls].some(([url]) => String(url).includes("/artifacts/"))).toBe(false);
+});
+it.each([".", "..", "bad\ud800"])("does not create a misbound download for invalid path-segment version %j", async versionId => {
+  evidence.mockResolvedValueOnce(json({ ...delivery, artifact_versions: [{ artifact_id: "report", version_id: versionId }] }));
+  await open(submittedTask); await detail().findByText(summary, { normalizer: text => text });
+  expect(detail().queryByRole("link", { name: "下载固定成果文件" })).not.toBeInTheDocument();
 });
 
 it("loads accepted Task and Submission read-only without fabricating a historical Review", async () => {

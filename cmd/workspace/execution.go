@@ -16,6 +16,9 @@ import (
 )
 
 func executionRunner(config config, db *store.Store, engine *coordination.Engine, catalog *platform.ProviderCatalog, endpoint string, output io.Writer) (func(context.Context) error, *platform.MemberToolRuntime, *platform.Preparer, error) {
+	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
+		return nil, nil, nil, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
+	}
 	runtime, err := privateExecutionRoot(config.dataDir, "runtime")
 	if err != nil {
 		return nil, nil, nil, err
@@ -52,6 +55,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			return nil, nil, nil, err
 		}
 		options.MemberTools, options.PiMemberToolsExtension = tools, config.piMemberToolsExtension
+		options.EnableCodexAppServer = config.enableCodexAppServer
 	}
 	preparer, err := platform.NewPreparer(db, options)
 	if err != nil {

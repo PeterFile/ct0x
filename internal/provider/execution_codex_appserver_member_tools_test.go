@@ -51,10 +51,17 @@ func TestCodexAppServerMemberProcessHelper(t *testing.T) {
 	respond := func(request codexRPCMessage, value any) { send(map[string]any{"id": request.ID, "result": value}) }
 	notify := func(method string, params any) { send(map[string]any{"method": method, "params": params}) }
 	config := func() any {
-		return map[string]any{"config": map[string]any{"mcp_servers": map[string]any{
+		inherited := map[string]any{"mcp_servers": map[string]any{
 			"workspace":       map[string]any{"command": "must-not-execute", "env": map[string]string{"TOKEN": memberToolTestToken}},
 			"aw_member_tools": map[string]any{"url": "https://synthetic.invalid", "bearer_token": memberToolTestToken},
-		}}, "origins": map[string]any{"mcp_servers": map[string]any{"name": map[string]string{"type": "sessionFlags"}, "version": "flags-v1"}},
+		}}
+		if mode == "direct-routing-polluted" {
+			inherited["features"] = map[string]any{
+				"code_mode":                      map[string]any{"enabled": true, "direct_only_tool_namespaces": []string{"functions", "mcp__workspace", "*"}},
+				"code_mode_only_strict_3p_tools": true, "non_prefixed_mcp_tool_names": true,
+			}
+		}
+		return map[string]any{"config": inherited, "origins": map[string]any{"mcp_servers": map[string]any{"name": map[string]string{"type": "sessionFlags"}, "version": "flags-v1"}},
 			"layers": []any{map[string]any{"name": map[string]string{"type": "sessionFlags"}, "version": "flags-v1", "config": map[string]any{}}}}
 	}
 	respond(read("initialize"), map[string]string{"userAgent": "synthetic", "platformFamily": "unix", "platformOs": "synthetic", "codexHome": "/synthetic/original-home"})
@@ -64,12 +71,19 @@ func TestCodexAppServerMemberProcessHelper(t *testing.T) {
 	respond(read("config/read"), config())
 	threadRequest := read("thread/start")
 	var params struct {
-		Config struct {
-			Servers map[string]struct {
-				Enabled  bool     `json:"enabled"`
-				URL      string   `json:"url"`
-				TokenEnv string   `json:"bearer_token_env_var"`
-				Tools    []string `json:"enabled_tools"`
+		ApprovalPolicy string `json:"approvalPolicy"`
+		Sandbox        string `json:"sandbox"`
+		Config         struct {
+			Features map[string]json.RawMessage `json:"features"`
+			Servers  map[string]struct {
+				Enabled   bool     `json:"enabled"`
+				URL       string   `json:"url"`
+				TokenEnv  string   `json:"bearer_token_env_var"`
+				Tools     []string `json:"enabled_tools"`
+				Omit      []string `json:"omit_tools_from"`
+				Approvals map[string]struct {
+					Mode string `json:"approval_mode"`
+				} `json:"tools"`
 			} `json:"mcp_servers"`
 		} `json:"config"`
 	}
@@ -126,8 +140,12 @@ func TestCodexAppServerMemberProcessHelper(t *testing.T) {
 		_, _ = io.Copy(io.Discard, input)
 		return
 	}
+	tools := make(map[string]any)
+	for _, name := range params.Config.Servers[server].Tools {
+		tools[name] = map[string]any{"name": name, "inputSchema": map[string]any{"type": "object"}}
+	}
 	status := map[string]any{"name": server, "runtimeStatus": "connected", "httpOrigin": "http://127.0.0.1:1", "authStatus": "bearerToken", "toolsError": nil,
-		"tools": map[string]any{"read_channel": map[string]any{"name": "read_channel", "inputSchema": map[string]any{"type": "object"}}}, "resources": []any{}, "resourceTemplates": []any{}}
+		"tools": tools, "resources": []any{}, "resourceTemplates": []any{}}
 	switch mode {
 	case "status-origin":
 		status["httpOrigin"] = "http://127.0.0.1:2"
@@ -137,6 +155,12 @@ func TestCodexAppServerMemberProcessHelper(t *testing.T) {
 		status["runtimeStatus"] = "failed"
 	case "status-tools-error":
 		status["toolsError"] = memberToolTestToken
+	case "status-tools-missing":
+		delete(tools, "read_channel")
+	case "status-tools-name":
+		tools["read_channel"] = map[string]string{"name": "send_message"}
+	case "status-tools-null":
+		status["tools"] = nil
 	}
 	if mode == "startup-failed" || mode == "startup-foreign" {
 		name, state := server, "failed"
@@ -154,6 +178,73 @@ func TestCodexAppServerMemberProcessHelper(t *testing.T) {
 	}
 	respond(read("turn/start"), map[string]any{"turn": turn("inProgress", []any{})})
 	notify("turn/started", map[string]any{"threadId": appServerFixtureThread, "turn": turn("inProgress", []any{})})
+	if strings.HasPrefix(mode, "direct-routing") {
+		// Replay a model-selected code-mode/search surface with the host disabled.
+		// A native text terminal can succeed without any actual MCP invocation.
+		direct := string(params.Config.Features["code_mode_only_strict_3p_tools"]) == "false" &&
+			reflect.DeepEqual(params.Config.Servers[server].Omit, []string{"code_mode", "deferred"})
+		if !direct {
+			answer := map[string]string{"id": "answer", "type": "agentMessage", "text": "code-mode host is disabled"}
+			notify("item/completed", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "item": answer})
+			notify("turn/completed", map[string]any{"threadId": appServerFixtureThread, "turn": turn("completed", []any{answer})})
+			_, _ = io.Copy(io.Discard, input)
+			_ = os.WriteFile("stdin-eof", nil, 0600)
+			return
+		}
+		_ = os.WriteFile("direct-mcp-invoked", nil, 0600)
+	}
+	if strings.HasPrefix(mode, "native-approval") {
+		if params.ApprovalPolicy != "never" || params.Sandbox != "read-only" {
+			os.Exit(8)
+		}
+		selected := params.Config.Servers[server]
+		names := selected.Tools
+		if mode == "native-approval-unknown-tool" {
+			names = []string{"future_member_tool"}
+		}
+		approved := []string{}
+		items := []any{}
+		failed := false
+		for _, name := range names {
+			// Replay 0.166's per-tool Approve branch with Never/ManagedReadOnly.
+			// Missing approval stops before the synthetic platform invocation.
+			failure := ""
+			if selected.Approvals[name].Mode != "approve" {
+				failure = "MCP tool call requires approval, but approval policy is never"
+				_ = os.WriteFile("native-approval-denied", nil, 0600)
+			} else {
+				approved = append(approved, name)
+				_ = os.WriteFile("native-approved-tools.json", mustAppServerFixtureJSON(approved), 0600)
+				if mode == "native-approval-platform-rejected" {
+					failure = "synthetic platform token/claim rejected"
+					_ = os.WriteFile("platform-rejected", nil, 0600)
+				}
+			}
+			item := map[string]any{"id": "approval-call-" + name, "type": "mcpToolCall", "server": server, "tool": name,
+				"status": "inProgress", "arguments": map[string]any{}, "result": nil, "error": nil}
+			notify("item/started", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "item": item})
+			if failure != "" {
+				item["status"], item["error"] = "failed", map[string]string{"message": failure}
+			} else {
+				item["status"], item["result"] = "completed", map[string]any{"content": []any{map[string]string{"type": "text", "text": "synthetic approved member result"}}}
+			}
+			notify("item/completed", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "item": item})
+			items = append(items, item)
+			if failure != "" {
+				failed = true
+				break
+			}
+		}
+		if !failed {
+			answer := map[string]string{"id": "answer", "type": "agentMessage", "text": "synthetic approved member answer"}
+			notify("item/completed", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "item": answer})
+			items = append(items, answer)
+		}
+		notify("turn/completed", map[string]any{"threadId": appServerFixtureThread, "turn": turn("completed", items)})
+		_, _ = io.Copy(io.Discard, input)
+		_ = os.WriteFile("stdin-eof", nil, 0600)
+		return
+	}
 	item := map[string]any{"id": "member-call", "type": "mcpToolCall", "server": server, "tool": "read_channel", "status": "inProgress", "arguments": map[string]int{"limit": 1}, "result": nil, "error": nil}
 	itemEvent := func(method string) {
 		thread, turn := appServerFixtureThread, appServerFixtureTurn

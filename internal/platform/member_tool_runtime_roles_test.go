@@ -134,7 +134,9 @@ func (f *roleRuntimeFixture) http(t *testing.T, token, operation, body, key stri
 }
 func (f *roleRuntimeFixture) wrap(t *testing.T, run roleRun, use func(string) provider.ExecutionReceipt, factoryCalls, nativeCalls *int) provider.Executor {
 	t.Helper()
-	executor, err := f.runtime.WrapCoordinationRole(run.binding, run.provenance, func(path, id string, tools []string) (provider.Executor, error) {
+	// This synthetic adapter fixture explicitly supplies its frozen worker fact.
+	facts := []store.DispatchWorkerCapabilityFact{{GroupID: f.group, MemberID: f.worker.ID, ProviderID: f.worker.ProviderID, Model: f.worker.Model}}
+	executor, err := f.runtime.WrapCoordinationRoleWithCapabilities(run.binding, run.provenance, facts, func(path, id string, tools []string) (provider.Executor, error) {
 		*factoryCalls++
 		want := []string{"list_members", "read_channel", "search_history", "read_history", "decide_dispatch"}
 		if run.provenance.Kind == store.CoordinationRoleWorker {

@@ -23,8 +23,14 @@ type roleContextProvenance struct {
 	AssignmentID string                     `json:"assignment_id,omitempty"`
 }
 
+type roleContextDispatchCandidate struct {
+	MemberID   string `json:"member_id"`
+	ProviderID string `json:"provider_id"`
+	Model      string `json:"model"`
+}
+
 func rolePreparationContext(p store.CoordinationRoleProvenance, group domain.Group, member domain.Member,
-	conversation domain.Conversation, trigger domain.Message, history []domain.Message, maxBytes int) (contextpack.Input, error) {
+	conversation domain.Conversation, trigger domain.Message, history []domain.Message, maxBytes int, snapshots ...[]store.DispatchWorkerCapabilityFact) (contextpack.Input, error) {
 	var empty contextpack.Input
 	if p.Kind != store.CoordinationRoleCoordinator && p.Kind != store.CoordinationRoleWorker {
 		return empty, errPrepareBinding
@@ -47,14 +53,27 @@ func rolePreparationContext(p store.CoordinationRoleProvenance, group domain.Gro
 			Role       string `json:"role"`
 			ProviderID string `json:"provider_id"`
 		} `json:"member"`
-		SequenceSemantics string                `json:"sequence_semantics"`
-		Coordination      roleContextProvenance `json:"coordination"`
+		SequenceSemantics           string                          `json:"sequence_semantics"`
+		Coordination                roleContextProvenance           `json:"coordination"`
+		DispatchCandidates          *[]roleContextDispatchCandidate `json:"dispatch_candidates,omitempty"`
+		DispatchCandidatesSemantics string                          `json:"dispatch_candidates_semantics,omitempty"`
 	}{Group: group, Conversation: conversation,
 		SequenceSemantics: "Source.Sequence 仅为本次快照内位置：选中历史从旧到新为 1..N，触发消息为 N+1；不是数据库提交序号、高水位（HWM）或摘要覆盖范围。未提供摘要，也不将消息意见升级为已确认决定。",
 		Coordination: roleContextProvenance{Role: p.Kind, DeliveryID: p.DeliveryID, RequestID: p.RequestID,
 			TaskID: p.TaskID, TaskRevision: p.TaskRevision, AssignmentID: p.AssignmentID}}
 	metadata.Member.ID, metadata.Member.Name = member.ID, member.Name
 	metadata.Member.Role, metadata.Member.ProviderID = member.Role, member.ProviderID
+	if p.Kind == store.CoordinationRoleCoordinator && len(snapshots) > 0 {
+		candidates := []roleContextDispatchCandidate{}
+		for _, fact := range snapshots[0] {
+			if fact.GroupID != group.ID || !memberToolRuntimeText(fact.MemberID) || !memberToolRuntimeText(fact.ProviderID) || !memberToolRuntimeText(fact.Model) {
+				return empty, errPrepareBinding
+			}
+			candidates = append(candidates, roleContextDispatchCandidate{MemberID: fact.MemberID, ProviderID: fact.ProviderID, Model: fact.Model})
+		}
+		metadata.DispatchCandidates = &candidates
+		metadata.DispatchCandidatesSemantics = "dispatch_candidates 仅为本轮服务端选定适配器支持平台工具与原生终态证据的准入能力采样，不是账号或网络实测，不授予工作、文件或 Artifact 许可，也不保证已认领或能够执行。只能从此列表选择工作成员；服务端落库前还须在同一事务核对成员、提供方、模型及现有 Policy、Mandate、claim 与代次。list_members 仍显示普通可见成员，不能据其可见性绕过此能力门禁。"
+	}
 	responsibility, err := json.Marshal(metadata)
 	if err != nil {
 		return empty, &preparationFailure{category: errPrepareRead, cause: err}
