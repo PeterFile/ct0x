@@ -36,9 +36,10 @@ SLOTS = {"TestCoordination": 23, "TestAlpha": 27, "TestBeta": 51, "TestGamma": 1
 PLATFORM_PACKAGE = "agentworkspace/internal/platform"
 HTTPAPI_PACKAGE = "agentworkspace/internal/httpapi"
 COORDINATION_PACKAGE = "agentworkspace/internal/coordination"
-# Fixed SHA-256 first-eight-byte big-endian mod-4 vectors.
-PLATFORM_SLOTS = {"TestCoordination": 3, "TestAlpha": 3, "TestBeta": 3, "TestGamma": 0,
-                  "Test新入口": 2, "Example": 1, "FuzzBytes": 0}
+# Fixed SHA-256 first-eight-byte big-endian mod-8 vectors.
+PLATFORM_SLOTS = {"TestCoordination": 7, "TestAlpha": 3, "TestBeta": 3, "TestGamma": 4,
+                  "Test新入口": 2, "Example": 5, "FuzzBytes": 4,
+                  "TestVector6": 0, "TestVector0": 1, "TestIota": 6}
 # Fixed SHA-256 first-eight-byte big-endian mod-8 vectors.
 HTTPAPI_SLOTS = {"TestVector6": 0, "TestVector0": 1, "Test新入口": 2, "TestAlpha": 3,
                  "FuzzBytes": 4, "Example": 5, "TestIota": 6, "TestCoordination": 7,
@@ -95,7 +96,7 @@ class VerifierTests(unittest.TestCase):
     def artifacts(self, names=tuple(SLOTS), profile=None):
         directory = self.directory / "summaries"
         suite = profile or "store"
-        slots, total = (HTTPAPI_SLOTS, 8) if profile == "httpapi" else ((PLATFORM_SLOTS, 4) if profile == "platform" else (SLOTS, 64))
+        slots, total = (HTTPAPI_SLOTS, 8) if profile == "httpapi" else ((PLATFORM_SLOTS, 8) if profile == "platform" else (SLOTS, 64))
         make_event = httpapi_event if profile == "httpapi" else (platform_event if profile == "platform" else event)
         for slot in range(total):
             selected = [name for name in names if slots[name] == slot]
@@ -495,7 +496,7 @@ class VerifierTests(unittest.TestCase):
 
     def test_platform_fixed_vectors_full_coverage_and_empty_slots(self):
         listed = self.inventory(PLATFORM_SLOTS, PLATFORM_PACKAGE)
-        for slot in range(4):
+        for slot in range(8):
             result = self.invoke("select", slot, PLATFORM_PACKAGE, listed, "--profile", "platform")
             self.assertEqual(result.returncode, 0, result.stderr)
             expected = sorted(name for name, assigned in PLATFORM_SLOTS.items() if assigned == slot)
@@ -503,7 +504,7 @@ class VerifierTests(unittest.TestCase):
             self.assertIsNone(re.fullmatch(result.stdout.strip(), expected[0] + "Extra"))
         directory = self.artifacts(PLATFORM_SLOTS, "platform")
         summary = self.success(self.aggregate(directory, profile="platform"))
-        self.assertEqual((summary["schema"], summary["total"], summary["package"]), (1, 4, PLATFORM_PACKAGE))
+        self.assertEqual((summary["schema"], summary["total"], summary["package"]), (1, 8, PLATFORM_PACKAGE))
         for field in ["compiled", "runs", "passes"]:
             self.assertEqual(summary[field], {name: 1 for name in PLATFORM_SLOTS})
         self.assertEqual(summary["skips"], {})
@@ -522,7 +523,7 @@ class VerifierTests(unittest.TestCase):
         run = self.json_lines("run.json", [platform_event("start"), platform_event("run", ROOT),
                                             platform_event("pass", ROOT), platform_event("pass")])
         for command, args in [("select", [listed]), ("verify", [listed, run, *IDENTITY])]:
-            for slot in [-1, 4, 18]:
+            for slot in [-1, 8, 18]:
                 with self.subTest(command=command, slot=slot):
                     result = self.invoke(command, slot, PLATFORM_PACKAGE, *args, "--profile", "platform")
                     self.assertEqual(result.returncode, 2, result.stderr)
@@ -547,7 +548,7 @@ class VerifierTests(unittest.TestCase):
         child = ROOT + "/child"
         rows = [platform_event("run", ROOT), platform_event("run", child), platform_event("pause", child),
                 platform_event("cont", child), platform_event("pass", child), platform_event("pass", ROOT)]
-        summary = self.success(self.verify(rows, slot=3, profile="platform"))
+        summary = self.success(self.verify(rows, slot=7, profile="platform"))
         self.assertEqual(summary["selected"], {ROOT: 1})
         good = [platform_event("run", ROOT), platform_event("pass", ROOT)]
         cases = [[], good * 2, [platform_event("run", ROOT)], [platform_event("pass", ROOT)]]
@@ -557,17 +558,17 @@ class VerifierTests(unittest.TestCase):
                            platform_event("pass", ROOT)]])
         for rows in cases:
             with self.subTest(rows=rows):
-                self.reject(self.verify(rows, slot=3, profile="platform"))
+                self.reject(self.verify(rows, slot=7, profile="platform"))
         listed = self.inventory([ROOT], PLATFORM_PACKAGE)
         for rows in [[platform_event("start"), *good], [platform_event("start"), platform_event("skip")],
                      [platform_event("start"), platform_event("fail")]]:
             run = self.json_lines("run.json", rows)
-            self.reject(self.invoke("verify", 3, PLATFORM_PACKAGE, listed, run, *IDENTITY, "--profile", "platform"))
+            self.reject(self.invoke("verify", 7, PLATFORM_PACKAGE, listed, run, *IDENTITY, "--profile", "platform"))
         run = self.json_lines("run.json", [platform_event("start"), *good, platform_event("pass")])
         run.write_bytes(run.read_bytes()[:-1])
-        self.reject(self.invoke("verify", 3, PLATFORM_PACKAGE, listed, run, *IDENTITY, "--profile", "platform"))
+        self.reject(self.invoke("verify", 7, PLATFORM_PACKAGE, listed, run, *IDENTITY, "--profile", "platform"))
         listed.write_bytes(listed.read_bytes()[:-1])
-        self.reject(self.invoke("select", 3, PLATFORM_PACKAGE, listed, "--profile", "platform"))
+        self.reject(self.invoke("select", 7, PLATFORM_PACKAGE, listed, "--profile", "platform"))
         self.reject(self.invoke("select", 0, PLATFORM_PACKAGE, self.inventory([], PLATFORM_PACKAGE), "--profile", "platform"))
 
     def test_platform_aggregate_identity_profile_and_prefix_binding(self):
@@ -578,19 +579,19 @@ class VerifierTests(unittest.TestCase):
             self.reject(self.aggregate(directory, identity=identity, profile="platform"))
         for field, value, original in [("run_id", "42566516009", IDENTITY[1]), ("checkout_sha", "c" * 40, IDENTITY[3]),
                                        ("checkout_tree", "d" * 40, IDENTITY[5]), ("package", PACKAGE, PLATFORM_PACKAGE)]:
-            for slot in range(4):
+            for slot in range(8):
                 self.mutate(directory, slot, lambda summary: summary.update({field: value}), "platform")
             self.reject(self.aggregate(directory, profile="platform"))
             if field == "package":
                 self.reject(self.aggregate(directory, package=PACKAGE, profile="platform"))
-            for slot in range(4):
+            for slot in range(8):
                 self.mutate(directory, slot, lambda summary: summary.update({field: original}), "platform")
         self.reject(self.aggregate(directory))
         path = directory / "platform-shard-v1-0/platform-summary.json"
         path.rename(path.with_name("store-summary.json"))
         self.reject(self.aggregate(directory, profile="platform"))
         path.with_name("store-summary.json").rename(path)
-        for slot in range(4):
+        for slot in range(8):
             (directory / f"platform-shard-v1-{slot}").rename(directory / f"store-shard-v1-{slot}")
         self.reject(self.aggregate(directory, profile="platform"))
 
@@ -603,13 +604,13 @@ class VerifierTests(unittest.TestCase):
         self.mutate(directory, 1, lambda summary: summary.update(slot=0), "platform")
         self.reject(self.aggregate(directory, profile="platform"))
         self.mutate(directory, 1, lambda summary: summary.update(slot=1), "platform")
-        extra = directory / "platform-shard-v1-4"
+        extra = directory / "platform-shard-v1-8"
         extra.mkdir()
         self.reject(self.aggregate(directory, profile="platform"))
         extra.rmdir()
         self.mutate(directory, 0, lambda summary: summary["compiled"].pop(ROOT), "platform")
         self.reject(self.aggregate(directory, profile="platform"))
-        for slot in range(4):
+        for slot in range(8):
             self.mutate(directory, slot, lambda summary: summary.update(compiled={}, selected={}, runs={}, passes={}), "platform")
         self.reject(self.aggregate(directory, profile="platform"))
 
@@ -617,10 +618,11 @@ class VerifierTests(unittest.TestCase):
         directory = self.artifacts(PLATFORM_SLOTS, "platform")
         # Both wrong assignments still partition the complete inventory exactly once.
         assignments = [{"TestCoordination": 3, "TestAlpha": 1, "TestBeta": 1, "TestGamma": 2,
-                        "Test新入口": 0, "Example": 1, "FuzzBytes": 0},  # Legacy Store18 mod 4, not Platform4.
-                       {name: (slot + 1) % 4 for name, slot in PLATFORM_SLOTS.items()}]
+                        "Test新入口": 0, "Example": 1, "FuzzBytes": 0,
+                        "TestVector6": 0, "TestVector0": 1, "TestIota": 0},  # Legacy Store18 mod 4, not Platform8.
+                       {name: (slot + 1) % 8 for name, slot in PLATFORM_SLOTS.items()}]
         for assigned in assignments:
-            for slot in range(4):
+            for slot in range(8):
                 selected = {name: 1 for name in assigned if assigned[name] == slot}
                 self.mutate(directory, slot, lambda summary: summary.update(selected=selected, runs=selected, passes=selected), "platform")
             self.reject(self.aggregate(directory, profile="platform"))
@@ -900,7 +902,7 @@ class WorkflowTests(unittest.TestCase):
     def test_platform_matrix_and_independent_aggregate(self):
         platform = re.search(r"\n  go-platform:\n(.*?)(?=\n  go-httpapi:)", self.workflow, re.S)
         self.assertIsNotNone(platform)
-        for text in ["fail-fast: false", "slot: [0, 1, 2, 3]", "timeout-minutes: 15",
+        for text in ["fail-fast: false", "slot: [0, 1, 2, 3, 4, 5, 6, 7]", "timeout-minutes: 15",
                      "go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/platform",
                      'go test -count=1 -race -json -run "$pattern" ./internal/platform',
                      'package=$(go list ./internal/platform)', 'git rev-parse HEAD', 'git rev-parse HEAD^{tree}',
