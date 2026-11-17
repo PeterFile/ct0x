@@ -31,7 +31,7 @@ func TestChatReviewNoticeReturnsDecisionToOrigin(t *testing.T) {
 				t.Fatal(err)
 			}
 			unchanged := messageSequenceSnapshot(t, f.s)
-			for _, table := range []string{"tasks", "task_review_decisions", "mutation_idempotency", "messages", "message_log", "chat_review_notices"} {
+			for _, table := range []string{"tasks", "task_review_decisions", "mutation_idempotency", "messages", "message_log", "chat_review_notices", "deliveries", "chat_repair_review_intakes"} {
 				delete(unchanged, table)
 			}
 			before, err := f.s.ListMessages(ctx, f.groupID, MessageListOptions{})
@@ -52,8 +52,12 @@ func TestChatReviewNoticeReturnsDecisionToOrigin(t *testing.T) {
 				t.Fatalf("%s Review persisted (%s) but original group/topic has %d messages; want %d including exactly one new Review notice", outcome, decision.ID, len(after.Items), len(before.Items)+1)
 			}
 			notice := after.Items[0]
-			if notice.TopicID != f.candidate.TopicID || notice.SourceKind != "platform" || notice.SourceID != "review:"+decision.ID || len(notice.Deliveries) != 0 {
-				t.Fatalf("notice has wrong origin/provenance or wakes a model: %+v", notice)
+			wantDeliveries := 0
+			if outcome == domain.ReviewOutcomeRejected {
+				wantDeliveries = 1
+			}
+			if notice.TopicID != f.candidate.TopicID || notice.SourceKind != "platform" || notice.SourceID != "review:"+decision.ID || len(notice.Deliveries) != wantDeliveries {
+				t.Fatalf("notice has wrong origin/provenance or intake delivery: %+v", notice)
 			}
 			for _, text := range []string{submission.TaskID, submission.ID, decision.ID, fmt.Sprintf("审查任务版本：%d", submission.TaskRevision), string(outcome), input.Reason, "平台记录", "本机用户", "不是 Agent 共识", "不代表原生执行成功"} {
 				if !strings.Contains(notice.Content, text) {

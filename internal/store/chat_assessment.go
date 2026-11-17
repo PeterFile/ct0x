@@ -68,11 +68,19 @@ func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		Action: input.Action, CreatedAt: time.Now().UTC(), Purpose: candidate.Purpose, SourceID: candidate.SourceID, SourceKind: candidate.SourceKind, Outcome: input.Disposition}
 	decisionID := ""
 	var workspace *domain.TaskWorkspaceScope
+	var repair *domain.ChatRepairSource
 	wantsWork := input.Disposition == "request_work" || input.Disposition == "prepare_work"
 	if wantsWork {
 		err := chatAdmissionGateInTx(ctx, tx, candidate, input)
+		if err == nil && input.Repair != nil {
+			repair, err = chatRepairAdmissionInTx(ctx, tx, candidate, input)
+		}
 		if err == nil && input.Action == domain.ChatActionWorkspaceChange {
-			workspace, err = chatWorkspaceForCandidateInTx(ctx, tx, candidate)
+			if repair != nil {
+				workspace, err = chatRepairWorkspaceInTx(ctx, tx, candidate, *repair)
+			} else {
+				workspace, err = chatWorkspaceForCandidateInTx(ctx, tx, candidate)
+			}
 		}
 		if err != nil {
 			var denial *chatNonAdmission
@@ -93,6 +101,13 @@ func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		if input.Disposition == "prepare_work" {
 			receipt.Authority, receipt.AuthorizationMessageID = "written_preauthorization", candidate.Policy.PreauthorizationMessageID
 		}
+		if repair != nil {
+			input.Title, input.Description, input.Acceptance = repair.ParentMandate.Scope.Objective, repair.ParentMandate.Scope.Description, repair.ParentMandate.Scope.Acceptance
+			receipt.Authority, receipt.AuthorizationMessageID = "explicit_request", ""
+			if input.Repair.Authorization == domain.ChatRepairOriginalAgreement && repair.OriginalAuthorization.SourceKind == "local_user_policy" {
+				receipt.Authority = "written_preauthorization"
+			}
+		}
 		trigger, err := recordLocalMessageTriggerInTx(ctx, tx, candidate.ThreadRef, candidate.MessageID)
 		if err != nil {
 			return domain.ChatAssessmentReceipt{}, admissionError("捕获聊天工作来源失败", err)
@@ -101,6 +116,10 @@ func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		request := domain.RequestWorkRequest{TopicID: candidate.TopicID, MessageID: candidate.MessageID,
 			Mode: domain.RoutingDecisionCreateNew, Reason: input.Reason,
 			NewTask: &domain.NewTaskRequest{Title: input.Title, Description: input.Description, Acceptance: input.Acceptance}}
+		if repair != nil {
+			request.NewTask.AssigneeID = repair.ParentMandate.Scope.AssigneeID
+			request.NewTask.DependencyIDs = repair.ParentMandate.Scope.DependencyIDs
+		}
 		// The fixed legacy gate records explicit local-user authority: either the
 		// actual request or their explicitly enabled written policy. The precise
 		// distinction and assessor remain in this immutable chat receipt.
@@ -117,6 +136,13 @@ func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		}
 		receipt.TaskID, receipt.MandateID, receipt.DispatchRequestID = admission.Task.ID, admission.Mandate.ID, dispatch.ID
 		receipt.AuthorityEvidenceVerified = true
+		if repair != nil {
+			link, err := insertChatRepairLinkInTx(ctx, tx, candidate, receipt, *repair, *input.Repair)
+			if err != nil {
+				return domain.ChatAssessmentReceipt{}, admissionError("保存正式修复关联失败", err)
+			}
+			receipt.RepairLink, receipt.AuthorizationMessageID = link, link.AuthorizationMessageID
+		}
 		kind := "文本任务"
 		if workspace != nil {
 			workspace.TaskID, workspace.TaskRevision, workspace.MandateID = admission.Task.ID, admission.Task.RevisionAtAdmission, admission.Mandate.ID
@@ -157,6 +183,16 @@ func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, 
 func validateChatAssessment(input domain.ChatAssessment, content string) error {
 	if !memberToolTextValid(input.Reason, 4096) || !memberToolTextValid(content, 16384) {
 		return ErrInvalid
+	}
+	if input.Repair != nil {
+		if input.Disposition != "request_work" || !validTriggerID(input.Repair.ReviewID) {
+			return ErrInvalid
+		}
+		switch input.Repair.Authorization {
+		case domain.ChatRepairReviewRequest, domain.ChatRepairOriginalAgreement, domain.ChatRepairChatRequest:
+		default:
+			return ErrInvalid
+		}
 	}
 	switch input.Disposition {
 	case "request_work":
@@ -236,14 +272,14 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 	if !coordinatorActive || !workerEligible {
 		return chatDeny("routing_unavailable", "协调员不可用或没有符合当前策略的执行成员，本次没有产生新工作。", "是否先调整协调员及允许执行的成员？")
 	}
-	if c.SourceID == "" || (c.SourceKind != "local_user_chat" && c.SourceKind != "member") {
+	if input.Repair == nil && (c.SourceID == "" || (c.SourceKind != "local_user_chat" && c.SourceKind != "member")) {
 		question := "请由本机用户说明当前需要落实的文本目标，可以吗？"
 		if input.Action == domain.ChatActionWorkspaceChange {
 			question = "请由本机用户说明当前需要落实的目录工作目标，可以吗？"
 		}
 		return chatDeny("untrusted_source", "来源没有可核验的聊天命令证明，sender或正文不能构成用户授权。", question)
 	}
-	if input.Disposition == "request_work" && c.SourceKind != "local_user_chat" {
+	if input.Repair == nil && input.Disposition == "request_work" && c.SourceKind != "local_user_chat" {
 		question := "你希望将哪项文本目标交付？"
 		if input.Action == domain.ChatActionWorkspaceChange {
 			question = "你希望在已授权目录落实哪项工作？"
