@@ -153,15 +153,21 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 	if !current.Enabled || current.Revision != c.Policy.Revision || current.Revision < 1 || current.Action != input.Action {
 		return ErrConflict
 	}
-	var generation int64
-	if err := tx.QueryRowContext(ctx, `SELECT sequence FROM message_log WHERE group_id=? AND topic_id=? ORDER BY sequence DESC LIMIT 1`, c.GroupID, c.TopicID).Scan(&generation); err != nil {
+	// Generation is the actual source's committed position, not the chat head.
+	// Later user messages supersede it even before capture; member replies do not
+	// change user authority. Keep the range anchored to the immutable source.
+	var superseded bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+	 SELECT 1 FROM message_log l JOIN messages m ON m.id=l.message_id
+	 WHERE l.group_id=? AND l.topic_id=? AND l.sequence>? AND m.sender_id='user')`,
+		c.GroupID, c.TopicID, c.Generation).Scan(&superseded); err != nil {
 		return err
 	}
 	binding, policy, err := chatDispatchRevisionsInTx(ctx, tx, c.GroupID)
 	if err != nil {
 		return err
 	}
-	if generation != c.Generation || binding != c.BindingRevision || policy != c.DispatchPolicyRevision {
+	if superseded || binding != c.BindingRevision || policy != c.DispatchPolicyRevision {
 		return ErrConflict
 	}
 	if input.Disposition == "request_work" && c.SourceSenderID != "user" {

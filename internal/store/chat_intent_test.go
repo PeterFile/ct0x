@@ -39,6 +39,11 @@ type chatFixture struct {
 
 func chatSetup(t *testing.T, sender string, preparation bool) chatFixture {
 	t.Helper()
+	return chatSetupSource(t, sender, preparation, "就依照刚才商定的边界把那份摘要落实吧，交付三条可核对的结论。")
+}
+
+func chatSetupSource(t *testing.T, sender string, preparation bool, content string) chatFixture {
+	t.Helper()
 	f := setupMessages(t)
 	api := chatIntake(t, f.s)
 	thread := domain.ThreadRef{GroupID: f.groupID, TopicID: "chat-topic"}
@@ -64,7 +69,7 @@ func chatSetup(t *testing.T, sender string, preparation bool) chatFixture {
 		sender = f.b
 	}
 	message, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: thread.TopicID, ActorID: sender,
-		Content: "就依照刚才商定的边界把那份摘要落实吧，交付三条可核对的结论。", RecipientIDs: []string{f.a}}, []string{f.a})
+		Content: content, RecipientIDs: []string{f.a}}, []string{f.a})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,14 +138,156 @@ func TestChatIntentExplicitAdmissionAtomicReplayAndReopen(t *testing.T) {
 	dispatchAssertFK(t, f.s)
 }
 
+func TestChatIntentQueuedRequestSurvivesEarlierDiscussionReply(t *testing.T) {
+	for _, change := range []string{"none", "before-capture", "after-capture", "other-group", "other-topic"} {
+		t.Run(change, func(t *testing.T) {
+			f := chatSetupSource(t, "user", false, "先讨论摘要可能的结构，暂时不要形成任务。")
+			queueEvent(t, f.s, f.scope.Claim, provider.AcceptedEvent, "", "")
+			request, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID, ActorID: "user",
+				Content: "现在按刚才的边界形成摘要，交付三条可核对的结论。", RecipientIDs: []string{f.a}}, []string{f.a})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claimInput := ClaimTurnInput{GroupID: f.groupID, DeliveryID: request.Deliveries[0].ID, MaxActive: 1, ResourceKeys: []string{"chat-resource"}}
+			if _, err := f.s.ClaimTurn(ctx, claimInput); !errors.Is(err, ErrTurnBusy) {
+				t.Fatalf("queued request bypassed the earlier active turn: %v", err)
+			}
+			queued, err := f.s.GetMessage(ctx, f.groupID, request.ID)
+			if err != nil || queued.Deliveries[0].State != domain.DeliveryStateQueued || queued.Deliveries[0].TurnID != "" {
+				t.Fatalf("request did not remain queued: %+v err=%v", queued, err)
+			}
+			queueEvent(t, f.s, f.scope.Claim, provider.ResponseEvent, "讨论可以归纳为背景、结论和待核对项。", "")
+			queueEvent(t, f.s, f.scope.Claim, provider.TerminalEvent, "", provider.OutcomeSucceeded)
+			earlier, err := f.s.ApplyTurnReceipt(ctx, f.scope.Claim, queueReceipt(provider.OutcomeSucceeded))
+			if err != nil || earlier.State != domain.TurnStateSucceeded || earlier.ReplyMessageID == "" {
+				t.Fatalf("earlier discussion did not publish its reply: state=%s err=%v", earlier.State, err)
+			}
+			var sourceSequence, replySequence int64
+			if err := f.s.db.QueryRow("SELECT sequence FROM message_log WHERE message_id=?", request.ID).Scan(&sourceSequence); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.s.db.QueryRow("SELECT sequence FROM message_log WHERE message_id=?", earlier.ReplyMessageID).Scan(&replySequence); err != nil || replySequence <= sourceSequence {
+				t.Fatalf("reply did not commit after queued request: source=%d reply=%d err=%v", sourceSequence, replySequence, err)
+			}
+			newUser := func(groupID, topicID string) {
+				t.Helper()
+				if _, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: groupID, TopicID: topicID, ActorID: "user", Content: "先不要落实，约束变了。"}, nil); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if change == "before-capture" {
+				newUser(f.groupID, f.scope.TopicID)
+			}
+			turn, err := f.s.ClaimTurn(ctx, claimInput)
+			if err != nil {
+				t.Fatal(err)
+			}
+			scope, err := f.s.BindMemberTool(ctx, TurnClaim{GroupID: f.groupID, TurnID: turn.ID, Token: turn.ClaimToken})
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate, err := f.api.CaptureChatCandidate(ctx, scope)
+			if err != nil || candidate.MessageID != request.ID || candidate.SourceSenderID != "user" || candidate.Generation != sourceSequence {
+				t.Fatalf("queued request lost its actual source: %+v err=%v", candidate, err)
+			}
+			history, err := f.s.ReadChannelForTool(ctx, scope, ListOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, id := range []string{f.candidate.MessageID, request.ID, earlier.ReplyMessageID} {
+				if !slices.ContainsFunc(history.Items, func(m domain.Message) bool { return m.ID == id }) {
+					t.Fatal("bound channel history omitted the request or earlier discussion")
+				}
+			}
+			switch change {
+			case "after-capture":
+				newUser(f.groupID, f.scope.TopicID)
+			case "other-group":
+				newUser(f.otherID, f.scope.TopicID)
+			case "other-topic":
+				newUser(f.groupID, "other-topic")
+			}
+			t.Logf("source sequence=%d, earlier reply sequence=%d, candidate generation=%d, new user=%s", sourceSequence, replySequence, candidate.Generation, change)
+			before := messageSequenceSnapshot(t, f.s)
+			got, err := f.api.ApplyChatAssessment(ctx, scope, candidate.ID, f.input, "我会据此形成文本交付。", "queued-request")
+			if change == "before-capture" || change == "after-capture" {
+				if !errors.Is(err, ErrConflict) || !reflect.ValueOf(got).IsZero() {
+					t.Fatalf("new user requirement did not fence queued assessment: %+v err=%v", got, err)
+				}
+				messageSequencePreserved(t, f.s, before)
+				return
+			}
+			if err != nil {
+				t.Fatalf("latest user request rejected after earlier agent reply: %v", err)
+			}
+			if got.TaskID == "" || got.DispatchRequestID == "" || got.MessageID != request.ID || got.AuthorizationMessageID != request.ID ||
+				got.SourceSenderID != "user" || got.AssessedBy != f.a || got.TurnID != turn.ID || got.Authority != "explicit_request" ||
+				got.CandidateGeneration != sourceSequence || got.PolicyRevision != f.policy.Revision {
+				t.Fatalf("queued admission lost trusted evidence: %+v", got)
+			}
+			dispatchAssertFK(t, f.s)
+		})
+	}
+}
+
+func TestChatIntentMemberDiscussionPreservesUserAuthority(t *testing.T) {
+	for _, sender := range []string{"user", "agent"} {
+		t.Run(sender, func(t *testing.T) {
+			f := chatSetup(t, sender, sender == "agent")
+			if sender == "agent" {
+				f.input.Disposition = "prepare_work"
+			}
+			public, err := f.s.SendMessageForTool(ctx, f.scope, MemberToolMessageInput{Content: "补充讨论，不代替用户更改要求。"}, "public-reply")
+			if err != nil || public.SenderID != f.a || len(public.Deliveries) != 0 {
+				t.Fatalf("bound public reply failed: %+v err=%v", public, err)
+			}
+			invitation, err := f.s.SendMessageForTool(ctx, f.scope, MemberToolMessageInput{Content: "请补充文本结构建议。", RecipientIDs: []string{f.b}}, "peer-invitation")
+			if err != nil {
+				t.Fatal(err)
+			}
+			peer, err := f.s.ClaimTurn(ctx, ClaimTurnInput{GroupID: f.groupID, DeliveryID: invitation.Deliveries[0].ID, MaxActive: 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			peerScope, err := f.s.BindMemberTool(ctx, TurnClaim{GroupID: f.groupID, TurnID: peer.ID, Token: peer.ClaimToken})
+			if err != nil {
+				t.Fatal(err)
+			}
+			discussion, err := f.s.SendMessageForTool(ctx, peerScope, MemberToolMessageInput{Content: "我的建议是将结论分成三点，这不是用户批准。"}, "peer-discussion")
+			if err != nil || discussion.SenderID != f.b || len(discussion.Deliveries) != 0 {
+				t.Fatalf("bound peer discussion failed: %+v err=%v", discussion, err)
+			}
+			captured, err := f.api.CaptureChatCandidate(ctx, f.scope)
+			if err != nil || !reflect.DeepEqual(captured, f.candidate) {
+				t.Fatalf("member discussion changed immutable candidate: %+v err=%v", captured, err)
+			}
+			got, err := f.api.ApplyChatAssessment(ctx, f.scope, f.candidate.ID, f.input, "仍按实际用户来源或书面预授权准备文本。", "after-discussion")
+			if err != nil {
+				t.Fatalf("member discussion incorrectly superseded user authority: %v", err)
+			}
+			wantAuthority, wantSource, wantAuthorization := "explicit_request", "user", f.candidate.MessageID
+			if sender == "agent" {
+				wantAuthority, wantSource, wantAuthorization = "written_preauthorization", f.b, f.policy.PreauthorizationMessageID
+			}
+			if got.TaskID == "" || got.SourceSenderID != wantSource || got.AssessedBy != f.a || got.Authority != wantAuthority ||
+				got.AuthorizationMessageID != wantAuthorization || got.CandidateGeneration != f.candidate.Generation || got.PolicyRevision != f.policy.Revision {
+				t.Fatalf("discussion replaced trusted authority: %+v", got)
+			}
+		})
+	}
+}
+
 func TestChatIntentDeterministicAuthorityAndStaleFences(t *testing.T) {
-	for _, scenario := range []string{"agent-consensus", "disabled", "policy-revision", "generation", "dispatch-policy", "coordinator-binding", "wrong-group", "wrong-topic", "wrong-member", "wrong-claim", "cancelled", "unknown", "file-action"} {
+	for _, scenario := range []string{"agent-consensus", "disabled", "policy-revision", "generation", "preparation-generation", "dispatch-policy", "coordinator-binding", "wrong-group", "wrong-topic", "wrong-member", "wrong-claim", "cancelled", "unknown", "file-action"} {
 		t.Run(scenario, func(t *testing.T) {
 			sender := "user"
-			if scenario == "agent-consensus" {
+			if scenario == "agent-consensus" || scenario == "preparation-generation" {
 				sender = "agent"
 			}
-			f := chatSetup(t, sender, false)
+			f := chatSetup(t, sender, scenario == "preparation-generation")
+			if scenario == "preparation-generation" {
+				f.input.Disposition = "prepare_work"
+			}
 			want := ErrConflict
 			switch scenario {
 			case "disabled", "policy-revision":
@@ -149,7 +296,7 @@ func TestChatIntentDeterministicAuthorityAndStaleFences(t *testing.T) {
 				if _, err := f.api.SetChatPolicy(ctx, f.candidate.ThreadRef, input, 1, "new-policy"); err != nil {
 					t.Fatal(err)
 				}
-			case "generation":
+			case "generation", "preparation-generation":
 				if _, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID, ActorID: "user", Content: "先不要落实，约束变了。"}, nil); err != nil {
 					t.Fatal(err)
 				}
