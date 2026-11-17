@@ -19,6 +19,20 @@ import (
 
 const artifactReadLimit = 64 << 20
 
+// The execution registry borrows the exact read API blob owner. Main drains
+// HTTP/scheduler and closes the registry before closing this immutable store.
+func workspaceRuntimeOptions(dataDir string, closer io.Closer) (platform.MemberWorkspaceOptions, error) {
+	blobs, ok := closer.(*artifactfs.Store)
+	if !ok {
+		return platform.MemberWorkspaceOptions{}, errors.New("成果文件库所有者无效")
+	}
+	scratch, err := privateExecutionRoot(dataDir, "workspace-snapshots")
+	if err != nil {
+		return platform.MemberWorkspaceOptions{}, err
+	}
+	return platform.MemberWorkspaceOptions{Blobs: blobs, ScratchRoot: scratch, ProtectedRoots: []string{dataDir}}, nil
+}
+
 func artifactReadRoutes(dataDir string, db *store.Store) ([]httpapi.Route, io.Closer, error) {
 	return artifactReadRoutesWithSync(dataDir, db, (*os.File).Sync)
 }

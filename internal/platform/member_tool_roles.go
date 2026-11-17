@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"agentworkspace/internal/domain"
+	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
 )
 
@@ -55,6 +56,23 @@ func (s *MemberTools) issueCoordinationRoleWithCapabilities(ctx context.Context,
 	key := sha256.Sum256([]byte(token))
 	if _, exists := s.capabilities[key]; exists || token == scope.Member.Claim.Token {
 		return "", store.ErrMemberToolDenied
+	}
+	if scope.Provenance.Kind == store.CoordinationRoleWorker {
+		_, err := s.db.GetTaskWorkspaceScope(ctx, scope.Provenance.GroupID, scope.Provenance.TaskID)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return "", err
+		}
+		if err == nil {
+			if s.workspace == nil {
+				return "", store.ErrMemberToolDenied
+			}
+			grant, err := s.workspace.openGrantLocked(ctx, scope)
+			if err != nil {
+				return "", err
+			}
+			s.workspace.grants[key] = grant
+			operations = provider.WorkspaceWorkerToolNames()
+		}
 	}
 	s.capabilities[key] = memberToolRegistration{scope: scope.Member, role: scope,
 		grants: MemberToolGrants{Operations: operations}, dispatchCapabilities: facts}

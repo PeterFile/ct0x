@@ -73,21 +73,37 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	}
 	defer listener.Close()
 	engine := coordination.New(db)
+	artifactRoutes, artifactCloser, err := artifactReadRoutes(config.dataDir, db)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, artifactCloser.Close()) }()
+	var workspaceOptions []platform.MemberWorkspaceOptions
+	if config.enableExecution && config.enableMemberTools && config.enableCoordinationRoles {
+		options, err := workspaceRuntimeOptions(config.dataDir, artifactCloser)
+		if err != nil {
+			return err
+		}
+		workspaceOptions = append(workspaceOptions, options)
+	}
 	var schedule func(context.Context) error
 	var memberTools *platform.MemberToolRuntime
 	var preparer *platform.Preparer
 	executionStatus := "执行已禁用，投递仅排队"
 	toolStatus := "平台工具已禁用；Pi 禁用工具，Codex 仅原生只读工具且无平台令牌"
 	if config.enableExecution {
-		schedule, memberTools, preparer, err = executionRunner(config, db, engine, catalog, "http://"+listener.Addr().String()+"/api/v1/member-tools", output)
+		schedule, memberTools, preparer, err = executionRunner(config, db, engine, catalog, "http://"+listener.Addr().String()+"/api/v1/member-tools", output, workspaceOptions...)
 		if err != nil {
 			return err
+		}
+		if memberTools != nil {
+			defer func() { err = errors.Join(err, memberTools.Close()) }()
 		}
 		catalog, err = catalog.WithAdapterReports(preparer.AdapterReports())
 		if err != nil {
 			return err
 		}
-		executionStatus = "全新单轮执行已启用，最大并发 1；可由本机用户明确登记单成员只读目录授权，不新增文件工具"
+		executionStatus = "全新单轮执行已启用，最大并发 1；目录授权与Task执行权限分开，只有获准目录Task及实际验证的完整文件工具适配器可读写和发布版本"
 	}
 	if memberTools != nil {
 		adapterStatus := "仅已验证 Pi 1.4.0 且显式指定模型时可用六项成员工具（含只读历史搜索与分段读取）；Codex 仅原生只读工具且无平台令牌"
@@ -112,11 +128,6 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	routes = append(routes, httpapi.CoordinationRoutes(coordinations)...)
 	routes = append(routes, httpapi.CoordinatorConfigurationRoutes(coordinatorConfiguration)...)
 	routes = append(routes, httpapi.ProviderRoute(catalog))
-	artifactRoutes, artifactCloser, err := artifactReadRoutes(config.dataDir, db)
-	if err != nil {
-		return err
-	}
-	defer func() { err = errors.Join(err, artifactCloser.Close()) }()
 	routes = append(routes, artifactRoutes...)
 	if memberTools != nil {
 		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)

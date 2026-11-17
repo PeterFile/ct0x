@@ -13,10 +13,12 @@ import { BASE, BUDGET, TOKEN, json, loopback, privateConfig, safeFailure } from 
 const entry = fileURLToPath(new URL("../index.ts", import.meta.url));
 const ordinary = ["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history"];
 const roleNames = ["decide_dispatch", "submit_result"];
-const catalog = [...ordinary, ...roleNames];
+const workspaceNames = ["workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact"];
+const catalog = [...ordinary, ...roleNames, ...workspaceNames];
 const profiles = {
   coordinator: ["list_members", "read_channel", "search_history", "read_history", "decide_dispatch"],
   worker: ["read_channel", "search_history", "read_history", "submit_result"],
+  workspace_worker: ["read_channel", "search_history", "read_history", "submit_result", ...workspaceNames],
 };
 const payloads = {
   send_message: { content: "fixture message", recipient_ids: [] },

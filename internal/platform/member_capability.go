@@ -46,6 +46,7 @@ type MemberTools struct {
 	capabilities map[[sha256.Size]byte]memberToolRegistration
 	mcpRequests  map[[sha256.Size]byte]map[[sha256.Size]byte][sha256.Size]byte
 	chatEngine   *coordination.Engine
+	workspace    *memberWorkspaceRegistry
 }
 
 func NewMemberTools(db *store.Store) *MemberTools {
@@ -132,6 +133,9 @@ func (s *MemberTools) Revoke(token string) {
 	defer s.mu.Unlock()
 	key := sha256.Sum256([]byte(token))
 	s.capabilities[key].skills.clear()
+	if s.workspace != nil {
+		_ = s.workspace.revokeLocked(key)
+	}
 	delete(s.capabilities, key)
 	delete(s.mcpRequests, key)
 }
@@ -142,6 +146,9 @@ func (s *MemberTools) RevokeTurn(turnID string) {
 	for key, entry := range s.capabilities {
 		if entry.scope.Claim.TurnID == turnID {
 			entry.skills.clear()
+			if s.workspace != nil {
+				_ = s.workspace.revokeLocked(key)
+			}
 			delete(s.capabilities, key)
 			delete(s.mcpRequests, key)
 		}

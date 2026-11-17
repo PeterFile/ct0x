@@ -10,12 +10,16 @@ const pagination = Type.Object({
 
 const chatAssessment = Type.Object({
   disposition: Type.Union([Type.Literal("discuss"), Type.Literal("clarify"), Type.Literal("request_work"), Type.Literal("prepare_work")], { description: "仅受信chat_intake/v1解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。prepare_work仅限受支持的topic_summary。" }),
-  action: Type.Optional(Type.Literal("text_submission", { description: "本片只允许文本 Submission，不授文件或外部动作。" })),
+  action: Type.Optional(Type.Union([Type.Literal("text_submission"), Type.Literal("workspace_change")], { description: "结合可信来源和上下文提出文本交付或目录文件修改；只是一项语义建议，当前 Policy、目录授权和 Task 范围由服务器核定，模型不能授予 IO 权限。" })),
   title: Type.Optional(Type.String({ maxLength: 256, description: "仅request_work填写目标；prepare_work须省略。" })),
   description: Type.Optional(Type.String({ maxLength: 8192, description: "仅request_work填写边界；prepare_work须省略。" })),
-  acceptance: Type.Optional(Type.String({ maxLength: 4096, description: "仅request_work填写文本验收；prepare_work须省略，服务器固定目标和验收。" })),
+  acceptance: Type.Optional(Type.String({ maxLength: 4096, description: "仅request_work填写交付验收；prepare_work须省略，服务器固定目标和验收。" })),
   reason: Type.String({ minLength: 1, maxLength: 4096, description: "结合可信来源、上下文与已启用 Policy 的语义评估依据；不能把 Agent 共识当授权。" }),
   question: Type.Optional(Type.String({ maxLength: 2048, description: "clarify 时一个具体的范围或授权问题。" })),
+  repair: Type.Optional(Type.Object({
+    review_id: Type.String({ minLength: 1, maxLength: 256, description: "仅引用服务器 repair_source 中的真实本机用户评审；不能选择调用者、目录或授权。" }),
+    authorization: Type.Union([Type.Literal("review_request"), Type.Literal("original_agreement"), Type.Literal("chat_request")], { description: "解释实际评审修复请求、原冻结同范围约定或当前真人聊天修复请求；chat_request还须服务器核对当前真实聊天命令和正式Review引用。拒收本身、Agent共识、平台消息标签均不自动授权。服务器重验许可和版本范围。" }),
+  }, { additionalProperties: false })),
 }, { additionalProperties: false });
 
 const tools = [
@@ -84,7 +88,7 @@ const tools = [
   {
     name: "submit_result",
     label: "提交任务结果",
-    description: "为绑定尝试提交成果；聊天text_submission禁止产物版本引用，topic_summary摘要须非空有效UTF-8且最多8192字节，其他任务按原约定。提交不代表审查通过；结果未知时先对账，不要自动重试或换幂等键。",
+    description: "为绑定尝试提交成果；text_submission禁止产物版本引用，workspace_change必须引用本任务真实发布的精确Artifact版本，不能用完成文字替代文件或版本回执。topic_summary摘要最多8192字节。提交不代表审查通过；结果未知先对账，不自动重试或换幂等键。",
     parameters: Type.Object({
       summary: Type.String({ description: "任务结果摘要。" }),
       artifact_versions: Type.Optional(Type.Array(Type.Object({
@@ -93,7 +97,50 @@ const tools = [
       }, { additionalProperties: false }), { description: "可选的产物版本引用列表。" })),
     }, { additionalProperties: false }),
   },
+  {
+    name: "workspace_list",
+    label: "查看任务目录",
+    description: "列出绑定文件任务的获准目录，非递归且不跟随符号链接；根目录使用相对路径 .。目录和身份由服务器绑定，CWD 不授予权限；结果超限整体拒绝，不截断。",
+    parameters: Type.Object({ path: Type.String({ minLength: 1, maxLength: 4096, description: "规范 slash 相对目录路径；根目录为 .，不得包含 ..、反斜杠或控制字符。" }) }, { additionalProperties: false }),
+  },
+  {
+    name: "workspace_read",
+    label: "读取任务文件",
+    description: "从绑定任务的获准目录读取普通UTF-8文本及实际SHA256，不跟随符号链接。最大64 KiB原文仍须满足完整JSON结果64 KiB预算；超限拒绝，不截断。",
+    parameters: Type.Object({ path: Type.String({ minLength: 1, maxLength: 4096, description: "规范 slash 相对文件路径；不能选择根目录或授权目录以外的路径。" }) }, { additionalProperties: false }),
+  },
+  {
+    name: "workspace_write",
+    label: "写入任务文件",
+    description: "仅在绑定worker文件任务内创建或完整替换UTF-8文本。替换须提供读取到的实际expected_sha256；先保存实际旧字节与持久intent，再写盘并实际读回核验。text最多8192 UTF-8字节，不截断。返回服务器operation_id；未知先对账，不重试、不回滚、不换调用标识。",
+    parameters: Type.Object({
+      path: Type.String({ minLength: 1, maxLength: 4096, description: "规范 slash 相对文件路径，不自动创建父目录。" }),
+      create: Type.Boolean({ description: "true仅新建且禁止expected_sha256；false仅替换且必须提供expected_sha256。" }),
+      text: Type.String({ maxLength: 8192, description: "完整新文本，最多8192 UTF-8字节；空文本合法。" }),
+      expected_sha256: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$", description: "仅替换时提供实际preimage的小写SHA256。" })),
+    }, { additionalProperties: false }),
+  },
+  {
+    name: "publish_workspace_artifact",
+    label: "发布任务文件版本",
+    description: "发布本轮本任务已done的operation文件实际字节，保存不可变Artifact精确版本；旧版本永留。新建提供name，更新提供artifact_id与expected_version_id且禁止name。结果中的精确version_id用于submit_result，发布不代表提交或接纳。",
+    parameters: Type.Object({
+      operation_id: Type.String({ minLength: 1, maxLength: 256, description: "workspace_write返回的服务器operation_id，不是模型自定幂等键。" }),
+      artifact_id: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "仅更新现有Artifact时提供。" })),
+      name: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "仅新建Artifact时提供名称。" })),
+      expected_version_id: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "更新时必须提供实际基于的精确版本。" })),
+    }, { additionalProperties: false }),
+  },
 ] as const;
+
+function workspacePath(value: string, directory: boolean): boolean {
+  return Buffer.byteLength(value, "utf8") <= 4096 && !/[\\\\\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(value) &&
+    (directory && value === "." || value.split("/").every(part => part !== "" && part !== "." && part !== ".."));
+}
+
+function workspaceText(value: string, limit: number): boolean {
+  return !/[\ud800-\udfff]/u.test(value) && Buffer.byteLength(value, "utf8") <= limit;
+}
 
 export default function piBridge(pi: ExtensionAPI) {
   const invoke = createClient(process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG);
@@ -112,13 +159,32 @@ export default function piBridge(pi: ExtensionAPI) {
             payload = JSON.parse(encoded);
             valid = Value.Check(tool.parameters, payload);
             if (valid && tool.name === "send_message") {
-              const message = payload as { recipient_ids?: string[]; intent_assessment?: unknown };
-              if (Object.hasOwn(message, "intent_assessment")) valid = !Object.hasOwn(message, "recipient_ids");
+              const message = payload as { recipient_ids?: string[]; intent_assessment?: { disposition: string; repair?: { review_id: string } } };
+              if (Object.hasOwn(message, "intent_assessment")) {
+                valid = !Object.hasOwn(message, "recipient_ids");
+                const assessment = message.intent_assessment!;
+                if (Object.hasOwn(assessment, "repair")) {
+                  const id = assessment.repair!.review_id;
+                  valid = valid && assessment.disposition === "request_work" && workspaceText(id, 256) && id.trim() === id && id !== "" && !/[\u0000-\u001f\u007f-\u009f]/u.test(id);
+                }
+              }
             }
             if (valid && tool.name === "decide_dispatch") {
               // Keep an object schema for Pi; check the conditional field on the safe snapshot.
               const decision = payload as { kind: string; worker_member_id?: string };
               valid = Object.hasOwn(decision, "worker_member_id") === (decision.kind === "assign");
+            }
+            if (valid && (tool.name === "workspace_list" || tool.name === "workspace_read" || tool.name === "workspace_write")) {
+              const file = payload as { path: string; create?: boolean; text?: string; expected_sha256?: string };
+              valid = workspacePath(file.path, tool.name === "workspace_list");
+              if (tool.name === "workspace_write") valid = valid &&
+                Object.hasOwn(file, "expected_sha256") === !file.create && workspaceText(file.text!, 8192);
+            }
+            if (valid && tool.name === "publish_workspace_artifact") {
+              const artifact = payload as { operation_id: string; artifact_id?: string; name?: string; expected_version_id?: string };
+              const update = Object.hasOwn(artifact, "artifact_id");
+              valid = Object.hasOwn(artifact, "expected_version_id") === update && Object.hasOwn(artifact, "name") === !update &&
+                Object.values(artifact).every(value => workspaceText(value, 256) && value.trim() !== "" && !/[\u0000-\u001f\u007f-\u009f]/u.test(value));
             }
           }
         } catch { /* Reject unsafe runtime values without exposing their errors. */ }
