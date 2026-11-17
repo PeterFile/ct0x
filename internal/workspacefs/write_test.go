@@ -18,6 +18,18 @@ func assertNoStage(t testing.TB, path string) {
 	entries, err := os.ReadDir(path)
 	must(t, err)
 	for _, entry := range entries {
+		if entry.Name() == stagingDirName {
+			private := filepath.Join(path, stagingDirName)
+			if !privateStageDir(trustedInfo(t, private)) {
+				t.Fatal("staging namespace is not private")
+			}
+			staged, err := os.ReadDir(private)
+			must(t, err)
+			if len(staged) != 0 {
+				t.Fatalf("private staging payloads leaked: %v", staged)
+			}
+			continue
+		}
 		if strings.HasPrefix(entry.Name(), ".workspacefs-") {
 			t.Fatalf("private staging file leaked: %s", entry.Name())
 		}
@@ -208,7 +220,7 @@ func TestWriteCreateRaceNoOverwrite(t *testing.T) {
 		return publish(parent, staged, name, create)
 	}
 	receipt, err := r.Create(context.Background(), "new", "ours")
-	if !errors.Is(err, os.ErrExist) || receipt.Effect != EffectUnchanged || receipt.Stage != StagePublish {
+	if !errors.Is(err, os.ErrExist) || receipt.Effect != EffectUnknown || receipt.Stage != StagePublish {
 		t.Fatalf("create race = %+v, %v", receipt, err)
 	}
 	assertDisk(t, filepath.Join(path, "new"), "competitor", 0600)

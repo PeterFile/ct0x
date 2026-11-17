@@ -32,12 +32,19 @@ type Root struct {
 
 // Open verifies expected against both the current absolute path and a new handle.
 // expected must be obtained by the trusted caller from the actual directory.
-// The caller must keep the directory's ancestors trusted and stable.
+// The caller must keep the directory's ancestors trusted and stable, and reserve
+// .workspacefs-staging below writable directories exclusively for this protocol.
+// Public operations cannot address or list that namespace. Nonprotocol writers
+// must be excluded from it for the whole write, using OS-level exclusivity if
+// needed; this package does not isolate arbitrary same-UID processes.
 func Open(path string, expected os.FileInfo) (*Root, error) {
 	if !filepath.IsAbs(path) || expected == nil || !expected.IsDir() {
 		return nil, ErrRootChanged
 	}
 	path = filepath.Clean(path)
+	if reservedPath(filepath.ToSlash(path)) {
+		return nil, ErrPath
+	}
 	info, err := os.Lstat(path)
 	if err != nil || !info.IsDir() || !os.SameFile(expected, info) {
 		return nil, errors.Join(ErrRootChanged, err)

@@ -11,10 +11,16 @@ import (
 	"io"
 	"os"
 	"path"
+	"syscall"
 	"unicode/utf8"
 )
 
-var ErrHash = errors.New("预期 SHA256 必须是小写十六进制")
+const stagingDirName = ".workspacefs-staging"
+
+var (
+	ErrHash  = errors.New("预期 SHA256 必须是小写十六进制")
+	ErrStage = errors.New("私有暂存目录或文件身份无效或已改变")
+)
 
 type WriteStage string
 type WriteEffect string
@@ -85,24 +91,68 @@ func absent(parent *os.Root, name string) error {
 	return err
 }
 
-func removeStage(parent *os.Root, name string) error {
-	err := parent.Remove(name)
+func privateStageDir(info os.FileInfo) bool {
+	if info == nil || !info.IsDir() || info.Mode().Perm() != 0700 {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && stat.Uid == uint32(os.Geteuid())
+}
+
+func openStaging(parent *os.Root) (*os.Root, error) {
+	if err := parent.Mkdir(stagingDirName, 0700); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, err
+	}
+	info, err := parent.Lstat(stagingDirName)
+	if err != nil || !privateStageDir(info) {
+		return nil, errors.Join(ErrStage, err)
+	}
+	root, err := parent.OpenRoot(stagingDirName)
+	if err != nil {
+		return nil, errors.Join(ErrStage, err)
+	}
+	held, err := root.Stat(".")
+	if err != nil || !privateStageDir(held) || !os.SameFile(info, held) {
+		return nil, errors.Join(ErrStage, err, root.Close())
+	}
+	return root, nil
+}
+
+// Cleanup is relative to the pinned private directory, never the public name
+// of that directory. Leave the namespace itself in place. The identity check is
+// defense in depth, not unlink CAS; nonprotocol namespace writers are excluded.
+func removeStage(root *os.Root, name string, owned os.FileInfo) error {
+	current, err := root.Lstat(name)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
-	return err
+	if err != nil || owned == nil || !os.SameFile(owned, current) {
+		return errors.Join(ErrStage, err)
+	}
+	return root.Remove(name)
+}
+
+func verifyStaging(parent, root *os.Root) error {
+	current, err := parent.Lstat(stagingDirName)
+	held, heldErr := root.Stat(".")
+	if err != nil || heldErr != nil || !privateStageDir(current) || !privateStageDir(held) || !os.SameFile(current, held) {
+		return errors.Join(ErrStage, err, heldErr)
+	}
+	return nil
 }
 
 // Replace checks the actual preimage against expectedSHA256, then publishes a
 // synced replacement inode, preserving its ordinary permission bits (0777).
-// It rechecks bytes, inode and metadata immediately before publication. Rename
-// has no expected-inode/hash CAS: external writes in the final gap are excluded
-// by the caller's trust/locking contract, not by these observations.
+// It rechecks bytes, inode and metadata immediately before publication. The
+// private staging namespace must remain exclusive to this protocol (see Open).
+// Neither staging checks nor target Rename provide inode/hash CAS; external
+// writers in the final gap are excluded by that contract, not by observations.
 func (r *Root) Replace(ctx context.Context, name, expectedSHA256, text string) (WriteReceipt, error) {
 	return r.write(ctx, name, expectedSHA256, text, false)
 }
 
 // Create atomically publishes complete text with mode 0600 only if name is absent.
+// Every error after a publication attempt, including EEXIST, remains unknown.
 // Neither method creates parents. Once publication is attempted, cancellation is
 // not used to interrupt finishing sync or to replace the actual operation result.
 func (r *Root) Create(ctx context.Context, name, text string) (WriteReceipt, error) {
@@ -168,20 +218,34 @@ func (r *Root) write(ctx context.Context, name, expected, text string, create bo
 	defer dir.Close()
 
 	receipt.Stage = StagePrepare
-	stage := ".workspacefs-" + rand.Text()
-	out, err := parent.OpenFile(stage, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	private, err := openStaging(parent)
 	if err != nil {
 		return receipt, err
 	}
+	defer private.Close()
+	privateDir, err := private.Open(".")
+	if err != nil {
+		return receipt, err
+	}
+	defer privateDir.Close()
+	stage := rand.Text()
+	out, err := private.OpenFile(stage, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return receipt, err
+	}
+	owned, statErr := out.Stat()
 	stageLive := true
 	defer func() {
 		if out != nil {
 			err = errors.Join(err, out.Close())
 		}
 		if stageLive {
-			err = errors.Join(err, removeStage(parent, stage))
+			err = errors.Join(err, removeStage(private, stage, owned))
 		}
 	}()
+	if statErr != nil {
+		return receipt, statErr
+	}
 	n, err := io.WriteString(out, text)
 	if err != nil {
 		return receipt, err
@@ -216,27 +280,30 @@ func (r *Root) write(ctx context.Context, name, expected, text string, create bo
 			return receipt, ErrConflict
 		}
 	}
+	staged, info, err := readText(ctx, private, stage)
+	if err != nil || !os.SameFile(owned, info) || staged.SHA256 != receipt.AfterSHA256 || staged.Mode != mode {
+		return receipt, errors.Join(ErrStage, err)
+	}
+	if err := verifyStaging(parent, private); err != nil {
+		return receipt, err
+	}
 	if err := ctx.Err(); err != nil {
 		return receipt, err
 	}
 
 	receipt.Stage, receipt.Effect = StagePublish, EffectUnknown
-	if err := r.io.publish(parent, stage, leaf, create); err != nil {
-		// EEXIST from link is a definitive no-overwrite result. Other publication
-		// failures are conservatively unknown, including remote filesystem errors.
-		if create && errors.Is(err, os.ErrExist) {
-			receipt.Effect = EffectUnchanged
-		}
+	if err := r.io.publish(parent, path.Join(stagingDirName, stage), leaf, create); err != nil {
 		return receipt, err
 	}
 	receipt.Stage, receipt.Effect = StageSync, EffectApplied
 	stageLive = false
 	var cleanupErr error
 	if create {
-		cleanupErr = removeStage(parent, stage)
+		cleanupErr = removeStage(private, stage, owned)
 	}
-	// Even a canceled caller must receive the real post-publication outcome.
-	if err := errors.Join(cleanupErr, r.io.sync(dir), r.verifyDir(dirName, parent)); err != nil {
+	// Cross-directory publication needs both directories synced. Even a canceled
+	// caller receives the real post-publication outcome, never a rollback claim.
+	if err := errors.Join(cleanupErr, privateDir.Sync(), r.io.sync(dir), r.verifyDir(dirName, parent), verifyStaging(parent, private)); err != nil {
 		return receipt, err
 	}
 	receipt.Stage = StageDone

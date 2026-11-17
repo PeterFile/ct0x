@@ -47,8 +47,17 @@ type Entry struct {
 	Size int64
 }
 
+func reservedPath(name string) bool {
+	for _, part := range strings.Split(name, "/") {
+		if part == stagingDirName {
+			return true
+		}
+	}
+	return false
+}
+
 func validPath(name string, directory bool) bool {
-	return fs.ValidPath(name) && !strings.ContainsAny(name, "\\\x00") && (directory || name != ".")
+	return fs.ValidPath(name) && !strings.ContainsAny(name, "\\\x00") && (directory || name != ".") && !reservedPath(name)
 }
 
 // openDir rejects symlinks in every path component, then pins the final directory.
@@ -196,7 +205,8 @@ func (r *Root) Read(ctx context.Context, name string) (snapshot Snapshot, err er
 }
 
 // List returns at most MaxEntries sorted entries, or ErrTooManyEntries and no
-// partial list. It is nonrecursive, accepts ".", and is not a point-in-time view.
+// partial list. The reserved staging directory is hidden and does not count.
+// It is nonrecursive, accepts ".", and is not a point-in-time view.
 func (r *Root) List(ctx context.Context, name string) (entries []Entry, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -224,17 +234,21 @@ func (r *Root) List(ctx context.Context, name string) (entries []Entry, err erro
 		return nil, err
 	}
 	defer file.Close()
-	items, err := file.ReadDir(MaxEntries + 1)
+	// At most one entry can have the reserved name; scanning remains bounded.
+	items, err := file.ReadDir(MaxEntries + 2)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
-	}
-	if len(items) > MaxEntries {
-		return nil, ErrTooManyEntries
 	}
 	result := make([]Entry, 0, len(items))
 	for _, item := range items {
 		if err := ctx.Err(); err != nil {
 			return nil, err
+		}
+		if item.Name() == stagingDirName {
+			continue
+		}
+		if len(result) == MaxEntries {
+			return nil, ErrTooManyEntries
 		}
 		if !validPath(item.Name(), false) {
 			return nil, ErrPath
