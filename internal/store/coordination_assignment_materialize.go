@@ -58,32 +58,32 @@ type assignmentSnapshot struct {
 // These relations describe immutable provenance, not a live coordinator scope.
 // Receipt candidates are excluded by their raw keys before any identity join can
 // hide a damaged second role. Runtime delivery/Turn states are deliberately absent.
+// Keep required key-bound provenance in separate EXISTS blocks to limit planning.
+// Their guards stay conjunctive; optional receipt and corruption checks retain scope.
 const coordinationAssignmentRelations = ` FROM coordination_assignments a
- JOIN coordination_decisions c ON c.id=a.decision_id
  JOIN coordination_dispatch_requests r ON r.id=a.request_id
- JOIN coordination_dispatch_state ds ON ds.request_id=r.id
- JOIN coordination_assignment_dispatch s ON s.assignment_id=a.id
  JOIN tasks t ON t.id=a.task_id AND t.group_id=a.group_id
- JOIN mandates m ON m.id=r.mandate_id
- JOIN routing_decisions rd ON rd.id=m.decision_id
- JOIN group_coordinator_binding_revisions h ON h.group_id=r.group_id AND h.revision=r.binding_revision
- JOIN group_dispatch_policy_revisions p ON p.group_id=r.group_id AND p.revision=r.policy_revision
- JOIN turns ct ON ct.id=c.coordinator_turn_id
- JOIN deliveries cd ON cd.id=ds.delivery_id
- JOIN messages cm ON cm.id=cd.message_id
- JOIN conversations cc ON cc.id=cd.conversation_id
  WHERE a.id=:assignment AND a.request_id=:request AND a.decision_id=:decision AND a.task_id=:task
  AND a.group_id=:grp AND a.worker_member_id=:worker AND a.created_at=:assigned
  AND r.id=a.request_id AND r.task_id=a.task_id AND r.group_id=a.group_id
  AND r.topic_id=:topic AND r.task_revision=:revision AND r.authority_generation=:authority
  AND r.mandate_id=:mandate AND r.coordinator_member_id=:coordinator
  AND r.binding_revision=:binding AND r.policy_revision=:policy AND r.requested_by='user'
+ AND a.worker_member_id<>r.coordinator_member_id
+ AND EXISTS(SELECT 1 FROM coordination_decisions c
+ JOIN coordination_assignment_dispatch s ON s.assignment_id=a.id
+ WHERE c.id=a.decision_id
  AND c.request_id=r.id AND c.task_id=r.task_id AND c.group_id=r.group_id
  AND c.kind='assign' AND c.assignment_id=a.id AND c.worker_member_id=a.worker_member_id
  AND c.coordinator_member_id=r.coordinator_member_id AND c.coordinator_turn_id=:coordinator_turn
- AND a.worker_member_id<>r.coordinator_member_id
- AND ds.task_id=r.task_id AND ds.group_id=r.group_id AND ds.status='assigned' AND ds.decision_id=c.id
  AND s.task_id=a.task_id AND s.group_id=a.group_id AND s.worker_member_id=a.worker_member_id
+ AND EXISTS(SELECT 1 FROM coordination_dispatch_state ds
+ JOIN turns ct ON ct.id=c.coordinator_turn_id
+ JOIN deliveries cd ON cd.id=ds.delivery_id
+ JOIN messages cm ON cm.id=cd.message_id
+ JOIN conversations cc ON cc.id=cd.conversation_id
+ WHERE ds.request_id=r.id
+ AND ds.task_id=r.task_id AND ds.group_id=r.group_id AND ds.status='assigned' AND ds.decision_id=c.id
  AND ct.delivery_id=cd.id AND cd.turn_id=ct.id AND ct.group_id=r.group_id
  AND ct.member_id=r.coordinator_member_id AND ct.conversation_id=cd.conversation_id
  AND cd.group_id=r.group_id AND cd.topic_id=r.topic_id AND cd.message_id=ds.message_id
@@ -91,17 +91,9 @@ const coordinationAssignmentRelations = ` FROM coordination_assignments a
  AND cm.group_id=r.group_id AND cm.topic_id=r.topic_id AND cm.sender_id='user'
  AND cc.group_id=r.group_id AND cc.topic_id=r.topic_id AND cc.member_id=r.coordinator_member_id
  AND NOT EXISTS(SELECT 1 FROM turns other WHERE other.delivery_id=cd.id AND other.id<>ct.id)
- AND NOT EXISTS(SELECT 1 FROM coordination_assignment_dispatch other WHERE other.delivery_id=cd.id OR other.message_id=cd.message_id)
- AND m.task_id=r.task_id AND m.group_id=r.group_id AND m.topic_id=r.topic_id AND m.task_revision_at_admission=r.task_revision
- AND rd.mandate_id=m.id AND rd.trigger_id=m.origin_trigger_id AND rd.task_id=m.task_id
- AND rd.group_id=m.group_id AND rd.topic_id=m.topic_id AND rd.task_revision_at_admission=m.task_revision_at_admission
- AND m.authority_kind='local_user_explicit' AND m.authorized_by='user' AND m.strength='explicit'
- AND m.policy_revision='local-user-explicit/v1' AND rd.actor_id='user' AND rd.policy_revision=m.policy_revision
- AND h.member_id=r.coordinator_member_id
+ AND NOT EXISTS(SELECT 1 FROM coordination_assignment_dispatch other WHERE other.delivery_id=cd.id OR other.message_id=cd.message_id))
  AND EXISTS(SELECT 1 FROM members WHERE id=r.coordinator_member_id)
  AND EXISTS(SELECT 1 FROM members WHERE id=a.worker_member_id)
- AND EXISTS(SELECT 1 FROM json_each(p.allowed_worker_ids) WHERE type='text' AND value=a.worker_member_id)
- AND (m.assignee_id='' OR m.assignee_id=a.worker_member_id)
  AND (s.delivery_id IS NULL OR EXISTS(SELECT 1 FROM deliveries wd JOIN messages wm ON wm.id=wd.message_id
  JOIN conversations wc ON wc.id=wd.conversation_id
  WHERE wd.id=s.delivery_id AND wd.group_id=a.group_id AND wd.topic_id=r.topic_id AND wd.message_id=s.message_id
@@ -119,7 +111,20 @@ const coordinationAssignmentRelations = ` FROM coordination_assignments a
  JOIN deliveries bd ON bd.id=s.delivery_id WHERE ba.id=b.attempt_id AND ba.turn_id=bt.id AND ba.task_id=a.task_id
  AND ba.group_id=a.group_id AND ba.actor_id=a.worker_member_id AND ba.task_revision=b.task_revision
  AND bt.delivery_id=bd.id AND bd.turn_id=bt.id AND bt.group_id=a.group_id AND bt.member_id=a.worker_member_id
- AND bt.conversation_id=s.conversation_id)))
+ AND bt.conversation_id=s.conversation_id))))
+ AND EXISTS(SELECT 1 FROM mandates m
+ JOIN routing_decisions rd ON rd.id=m.decision_id
+ JOIN group_coordinator_binding_revisions h ON h.group_id=r.group_id AND h.revision=r.binding_revision
+ JOIN group_dispatch_policy_revisions p ON p.group_id=r.group_id AND p.revision=r.policy_revision
+ WHERE m.id=r.mandate_id
+ AND m.task_id=r.task_id AND m.group_id=r.group_id AND m.topic_id=r.topic_id AND m.task_revision_at_admission=r.task_revision
+ AND rd.mandate_id=m.id AND rd.trigger_id=m.origin_trigger_id AND rd.task_id=m.task_id
+ AND rd.group_id=m.group_id AND rd.topic_id=m.topic_id AND rd.task_revision_at_admission=m.task_revision_at_admission
+ AND m.authority_kind='local_user_explicit' AND m.authorized_by='user' AND m.strength='explicit'
+ AND m.policy_revision='local-user-explicit/v1' AND rd.actor_id='user' AND rd.policy_revision=m.policy_revision
+ AND h.member_id=r.coordinator_member_id
+ AND EXISTS(SELECT 1 FROM json_each(p.allowed_worker_ids) WHERE type='text' AND value=a.worker_member_id)
+ AND (m.assignee_id='' OR m.assignee_id=a.worker_member_id))
  AND NOT EXISTS(SELECT 1 FROM task_attempts ha LEFT JOIN turns ht ON ht.id=ha.turn_id
  WHERE ha.group_id=a.group_id AND ha.task_id=a.task_id AND ha.turn_id IS NOT NULL
  AND (ht.id IS NULL OR ht.group_id<>ha.group_id OR (ha.actor_id<>'user' AND ht.member_id<>ha.actor_id)))`
