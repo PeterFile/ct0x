@@ -274,6 +274,38 @@ it("labels refreshed CLI/model selection as current configuration, not historica
 function catalogueScope(active: boolean) {
   return <aside aria-label="成员" hidden={!active}><Members groupId={group.id} catalogueActive={active} /></aside>;
 }
+it.each([["failed", false], ["first-page", false], ["failed", true]] as const)(
+  "keeps provider draft selection aligned with its DTO after %s reload (clear=%s)", async (reload, clear) => {
+    const firstPage = { ...provider, id: "first-page-provider", name: "codex", path: "/fixture/codex" };
+    catalogue.mockResolvedValueOnce(page([firstPage], "provider-page"));
+    const mounted = render(catalogueScope(true));
+    fireEvent.click(await panel().findByRole("button", { name: "展开创建成员" }));
+    await draft(); await panel().findByRole("option", { name: /\/fixture\/codex/ });
+    catalogue.mockResolvedValueOnce(page([provider]));
+    fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+    await panel().findByRole("option", { name: /\/opt\/bin\/pi/ });
+    const select = panel().getByRole("combobox", { name: "运行器（可选）" }) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: provider.id } });
+    catalogue.mockResolvedValueOnce(reload === "failed" ? json({}, 503) : page([firstPage], "new-provider-page"));
+    mounted.rerender(catalogueScope(false)); mounted.rerender(catalogueScope(true));
+    if (reload === "failed") expect(await panel().findByText(/运行器目录暂不可用/)).toBeVisible();
+    else await panel().findByRole("option", { name: /\/fixture\/codex/ });
+    expect(select).toHaveValue(provider.id);
+    expect(select.selectedOptions[0].textContent).toBe(`原选择，目录未确认（${provider.id}）`);
+    if (clear) {
+      fireEvent.change(select, { target: { value: "" } });
+      expect(select).toHaveValue("");
+      expect(select.selectedOptions[0]).toHaveTextContent("暂不绑定运行器");
+    }
+    const shown = select.value;
+    writes.mockResolvedValueOnce(json({ ...member, provider_id: clear ? "" : provider.id }, 201));
+    submit();
+    const sent = JSON.parse(String(writes.mock.calls[0][1]?.body));
+    expect(sent.provider_id ?? "").toBe(shown);
+    expect(sent).toEqual({ name: member.name, role: member.role, ...(clear ? {} : { provider_id: provider.id }) });
+    await panel().findByRole("button", { name: member.name });
+  },
+);
 it("downgrades unconfirmed catalogue reactivation and exposes failure outside collapsed creation while preserving selection and draft", async () => {
   const current = { ...provider, version: "1.4.0", adapter: { ...memberAdapter(), enabled: true } };
   reads.mockResolvedValueOnce(page([{ ...member, provider_id: provider.id, model: "configured-model" }]));

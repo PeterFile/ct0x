@@ -166,6 +166,8 @@ function MemberScope({ groupId, active, catalogue, onMembers, onRecipient }: {
         <select id={`${formId}-provider`} value={draft.provider_id} aria-describedby={`${formId}-runtime-help`}
           onChange={event => setDraft(previous => ({ ...previous, provider_id: event.target.value }))}>
           <option value="">暂不绑定运行器</option>
+          {draft.provider_id && !catalogue.items.some(provider => provider.id === draft.provider_id)
+            ? <option value={draft.provider_id}>原选择，目录未确认（{draft.provider_id}）</option> : null}
           {catalogue.items.map(provider => <option key={provider.id} value={provider.id}>{providerLabel(provider)}</option>)}
         </select>
         {catalogue.next ? <button type="button" disabled={catalogue.pending} onClick={() => catalogue.load(catalogue.next)}>加载更多运行器</button> : null}
