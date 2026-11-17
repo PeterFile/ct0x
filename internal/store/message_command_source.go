@@ -75,8 +75,9 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 	if len(messages) == 0 {
 		return nil
 	}
-	var available bool
-	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='message_command_sources' AND type='table')").Scan(&available); err != nil {
+	var available, hasReviewNotices bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='message_command_sources' AND type='table'),
+	 EXISTS(SELECT 1 FROM sqlite_schema WHERE name='chat_review_notices' AND type='table')`).Scan(&available, &hasReviewNotices); err != nil {
 		return err
 	}
 	if !available {
@@ -88,14 +89,20 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 		args[i] = m.ID
 		positions[m.ID] = i
 	}
+	reviewKind, reviewSource, reviewJoin := "", "", ""
+	if hasReviewNotices {
+		reviewKind = "CASE WHEN rn.review_id IS NOT NULL THEN 'platform' END,"
+		reviewSource = "CASE WHEN rn.review_id IS NOT NULL THEN 'review:'||rn.review_id END,"
+		reviewJoin = " LEFT JOIN chat_review_notices rn ON rn.message_id=m.id"
+	}
 	query := `SELECT m.id,
-	 coalesce(s.kind,CASE WHEN d.request_id IS NOT NULL OR a.assignment_id IS NOT NULL OR n.id IS NOT NULL OR sn.submission_id IS NOT NULL THEN 'platform' WHEN t.id IS NOT NULL THEN 'member' ELSE 'unknown' END),
-	 coalesce(s.id,CASE WHEN d.request_id IS NOT NULL THEN 'dispatch:'||d.request_id WHEN a.assignment_id IS NOT NULL THEN 'assignment:'||a.assignment_id WHEN n.id IS NOT NULL THEN 'assessment:'||n.id WHEN sn.submission_id IS NOT NULL THEN 'submission:'||sn.submission_id WHEN t.id IS NOT NULL THEN 'turn:'||t.id ELSE '' END)
+	 coalesce(` + reviewKind + `s.kind,CASE WHEN d.request_id IS NOT NULL OR a.assignment_id IS NOT NULL OR n.id IS NOT NULL OR sn.submission_id IS NOT NULL THEN 'platform' WHEN t.id IS NOT NULL THEN 'member' ELSE 'unknown' END),
+	 coalesce(` + reviewSource + `s.id,CASE WHEN d.request_id IS NOT NULL THEN 'dispatch:'||d.request_id WHEN a.assignment_id IS NOT NULL THEN 'assignment:'||a.assignment_id WHEN n.id IS NOT NULL THEN 'assessment:'||n.id WHEN sn.submission_id IS NOT NULL THEN 'submission:'||sn.submission_id WHEN t.id IS NOT NULL THEN 'turn:'||t.id ELSE '' END)
 	 FROM messages m LEFT JOIN message_command_sources s ON s.message_id=m.id
 	 LEFT JOIN coordination_dispatch_state d ON d.message_id=m.id
 	 LEFT JOIN coordination_assignment_dispatch a ON a.message_id=m.id
 	 LEFT JOIN chat_assessments n ON n.notice_message_id=m.id
-	 LEFT JOIN chat_submission_notices sn ON sn.message_id=m.id
+	 LEFT JOIN chat_submission_notices sn ON sn.message_id=m.id` + reviewJoin + `
 	 LEFT JOIN turns t ON t.reply_message_id=m.id AND t.reply_message_id<>''
 	 WHERE m.id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(messages)), ",") + ")"
 	rows, err := tx.QueryContext(ctx, query, args...)
