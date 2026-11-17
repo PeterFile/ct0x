@@ -9,7 +9,9 @@ import (
 // These limits include the frame currently being parsed and any ordered damage
 // markers. Raw bytes include CR but exclude LF. The producer separately owns one
 // fixed 1 MiB framing buffer; this is not the callback/event delivery budget.
-const executionFramesCountLimit = 64
+// One 32 KiB copier read can contain 131 observed 249-byte delta frames.
+// Round up with room for the in-flight frame; the byte budget stays independent.
+const executionFramesCountLimit = 256
 const executionFramesByteLimit = 8 << 20
 
 type executionFrame struct {

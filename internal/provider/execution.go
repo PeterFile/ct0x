@@ -239,6 +239,9 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		r.Outcome = r.Terminal
 		r.Reason = map[Outcome]string{OutcomeSucceeded: "执行完成", OutcomeFailed: "模型执行失败", OutcomeAborted: "模型执行已中止", OutcomeTruncated: "模型输出被截断"}[r.Outcome]
 	}
+	if frames != nil && frames.overflowed {
+		r.Reason = "输出帧队列超限，执行结果未知，需对账"
+	}
 	if r.DeliveryFailed {
 		r.Reason = "执行事件保存失败，交付与执行结果未知"
 	}

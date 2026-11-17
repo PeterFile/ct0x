@@ -225,7 +225,7 @@ func TestExecutionFramesLimitsIncludeInFlight(t *testing.T) {
 			})
 			finish := sync.OnceFunc(frames.finish)
 			defer func() { release(); finish() }()
-			limit := 64
+			limit := executionFramesCountLimit
 			data := []byte(`{"type":"turn_start","index":0}`)
 			if budget == "bytes" {
 				limit = 8
@@ -312,7 +312,7 @@ func TestExecutionFramesLimitsIncludeInFlight(t *testing.T) {
 func TestExecutionFramesOverflowDrainsAndReapsChild(t *testing.T) {
 	root := t.TempDir()
 	body := "set -eu\n" + executionHeader + executionEmit(executionStart) + "while [ ! -f emit-tail ]; do :; done\n" +
-		strings.Repeat(executionEmit(`{"type":"turn_start"}`), 80) + executionEmit(executionAssistant("stop"), executionSettled) + "printf '%s\\n' 'AFTER-OVERFLOW-STDERR-DRAIN' >&2\n: > tail-emitted\n"
+		strings.Repeat(executionEmit(`{"type":"turn_start"}`), executionFramesCountLimit+16) + executionEmit(executionAssistant("stop"), executionSettled) + "printf '%s\\n' 'AFTER-OVERFLOW-STDERR-DRAIN' >&2\n: > tail-emitted\n"
 	path := executable(t, filepath.Join(root, "fake-pi"), body)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
