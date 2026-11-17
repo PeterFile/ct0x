@@ -705,25 +705,14 @@ func TestRoleRuntimeRevokeDrainKeepsFenceUntilCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	go func() { returned <- executor.Execute(context.Background(), req, nil) }()
-	<-entered
-	// Only a complete, valid sidecar proves the wrapper has actually returned
-	// from native.Execute; owner.invoked is set BEFORE native entry.
-	captureDeadline := time.After(3 * time.Second)
-	for {
-		record, status := r.readRoleReceipt(claim.GroupID, claim.TurnID)
-		if status == "captured" && record.Raw == raw && record.Aggregate == raw && record.Source == memberToolRoleReceiptSourceFor(binding, f.coordinatorScope) {
-			break
-		}
-		select {
-		case <-captureDeadline:
-			t.Fatal("no complete post-native capture while callback was blocked")
-		default:
-			runtime.Gosched()
-		}
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("real registry callback did not enter")
 	}
-	t.Log("complete post-native sidecar observed before releasing the real registry callback")
 	// The callback holds RLock. TryRLock only fails once the sole writer,
-	// wrapper Revoke, is actually waiting. No elapsed-time guess is evidence.
+	// wrapper Revoke, is actually waiting AFTER native.Execute returned.
+	// Capture follows callback drain, so it cannot be the pre-drain barrier.
 	deadline := time.After(3 * time.Second)
 	for r.tools.mu.TryRLock() {
 		r.tools.mu.RUnlock()
@@ -733,6 +722,10 @@ func TestRoleRuntimeRevokeDrainKeepsFenceUntilCleanup(t *testing.T) {
 		default:
 			runtime.Gosched()
 		}
+	}
+	t.Log("post-native Revoke observed waiting for the real registry callback")
+	if record, status := r.readRoleReceipt(claim.GroupID, claim.TurnID); record != nil || status != "missing" {
+		t.Fatalf("receipt captured before callback drain: %s", status)
 	}
 	terminal, err := f.db.ApplyTurnReceipt(context.Background(), claim, raw)
 	if err != nil || terminal.State != domain.TurnStateNotStarted {
@@ -764,10 +757,18 @@ func TestRoleRuntimeRevokeDrainKeepsFenceUntilCleanup(t *testing.T) {
 	}
 	close(release)
 	select {
-	case <-returned:
+	case got := <-returned:
+		if got != raw {
+			t.Fatalf("callback drain changed native evidence: %+v", got)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Revoke did not finish")
 	}
+	record, status := r.readRoleReceipt(claim.GroupID, claim.TurnID)
+	if status != "captured" || record.Raw != raw || record.Aggregate != raw || record.Source != memberToolRoleReceiptSourceFor(binding, f.coordinatorScope) {
+		t.Fatalf("no complete post-native capture after callback drain: %s", status)
+	}
+	t.Log("complete raw/aggregate/source sidecar observed after callback drain and Execute return")
 	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
 		t.Fatal("config cleanup incomplete")
 	}
