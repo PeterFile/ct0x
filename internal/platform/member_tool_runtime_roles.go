@@ -55,6 +55,13 @@ func memberToolRoleOperations(kind store.CoordinationRoleKind) []string {
 	return []string{"read_channel", "search_history", "read_history", "submit_result"}
 }
 
+func (e *memberToolRuntimeRun) roleOperations() []string {
+	if e.workspace {
+		return provider.WorkspaceWorkerToolNames()
+	}
+	return memberToolRoleOperations(e.role.Kind)
+}
+
 func (e *memberToolRuntimeRun) roleStartup(ctx context.Context, claim store.TurnClaim) (store.CoordinationToolScope, error) {
 	db := e.runtime.tools.db
 	turn, err := db.GetTurn(ctx, claim.GroupID, claim.TurnID)
@@ -98,7 +105,7 @@ func (e *memberToolRuntimeRun) rolePreflight(ctx context.Context, request provid
 	// successful Issue. Lock order stays registry -> Store, never fence -> registry.
 	r.tools.mu.RLock()
 	entry, found := r.tools.capabilities[sha256.Sum256([]byte(token))]
-	valid := found && entry.scope == scope.Member && entry.role == scope && slices.Equal(entry.grants.Operations, memberToolRoleOperations(e.role.Kind)) &&
+	valid := found && entry.scope == scope.Member && entry.role == scope && slices.Equal(entry.grants.Operations, e.roleOperations()) &&
 		entry.grants.Skills == nil && entry.grants.Artifacts == nil && slices.Equal(entry.dispatchCapabilities, e.dispatchCapabilities)
 	r.tools.mu.RUnlock()
 	return valid && r.roleFence.rootValid(request.RuntimeDir) && r.rootValid() && config.valid() && checkCtx.Err() == nil && ctx.Err() == nil
@@ -146,17 +153,27 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 	if err != nil {
 		return unknown
 	}
+	r.tools.mu.RLock()
+	entry := r.tools.capabilities[sha256.Sum256([]byte(token))]
+	e.workspace = slices.Equal(entry.grants.Operations, provider.WorkspaceWorkerToolNames())
+	r.tools.mu.RUnlock()
+	if e.workspace && e.binding.ProviderName == provider.Codex {
+		return unknown
+	}
 	config, err = r.createConfig(token)
 	if err != nil || !e.rolePreflight(ctx, request, scope, token, config) {
 		return unknown
 	}
-	native, err := e.factory(filepath.Join(r.configRoot, config.name), claim.TurnID, memberToolRoleOperations(e.role.Kind))
+	native, err := e.factory(filepath.Join(r.configRoot, config.name), claim.TurnID, e.roleOperations())
 	if err != nil || native == nil || !e.rolePreflight(ctx, request, scope, token, config) || !owner.beginInvoke() {
 		return unknown
 	}
 	// ExecutionReceipt currently contains only values/strings: this assignment
 	// copies ALL native evidence before constructing any wrapper aggregate.
 	raw := native.Execute(ctx, request, onEvent)
+	// Drain every authorized callback before auditing unresolved filesystem IO.
+	// Native success/cancellation is not evidence that file operations settled.
+	r.tools.Revoke(token)
 	aggregate := raw
 	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), memberToolRuntimeVerificationTimeout)
 	defer cancel()
@@ -169,6 +186,13 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 			current.AcceptedAt != nil || current.NativeSessionID != "" || current.CandidateText != "" || current.CandidateTerminal != "" {
 			aggregate.Outcome = provider.OutcomeUnknown
 			aggregate.Reason = "本次调用未启动，但整轮未执行证据不足，需对账后再处理"
+		}
+	}
+	if e.workspace {
+		unresolved, err := r.tools.db.HasUnresolvedWorkspaceOperations(checkCtx, claim.GroupID, claim.TurnID)
+		if err != nil || unresolved {
+			aggregate.Outcome = provider.OutcomeUnknown
+			aggregate.Reason = "本轮文件操作结果未确认或无法核验，须保留资源并先对账；原生回执不代表目录操作已完成"
 		}
 	}
 	r.captureRoleReceipt(e.binding, scope, token, raw, aggregate)

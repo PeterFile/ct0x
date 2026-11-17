@@ -127,6 +127,7 @@ type rolePreparationPlan struct {
 	selected             provider.Provider
 	selection            provider.AdapterSelection
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
+	workspace            *domain.TaskWorkspaceScope
 	input                contextpack.Input
 }
 
@@ -146,7 +147,21 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 	if r.tools == nil || r.tools.db != p.store || !r.rootValid() {
 		return empty, preparationFailureWithCause(ctx, errPrepareConfig, errMemberToolRuntimeConfig)
 	}
-	selected, selection, err := p.sampleMemberToolMember(member, memberToolRoleOperations(state.Provenance.Kind))
+	workspace, err := p.taskWorkspaceForPreparation(ctx, state.Provenance)
+	if err != nil {
+		return empty, err
+	}
+	names := memberToolRoleOperations(state.Provenance.Kind)
+	if workspace != nil && state.Provenance.Kind == store.CoordinationRoleWorker {
+		if !r.workspaceConfigured() {
+			return empty, rolePreparationBlocked(state, "workspace_not_ready", nil)
+		}
+		if _, _, _, err := p.workspacePreparationGrant(ctx, *workspace, member.ID); err != nil {
+			return empty, roleWorkspacePreparationError(state, err)
+		}
+		names = provider.WorkspaceWorkerToolNames()
+	}
+	selected, selection, err := p.sampleMemberToolMember(member, names)
 	if errors.Is(err, errMemberToolAdapterUnsupported) {
 		return empty, rolePreparationBlocked(state, "unsupported_provider", nil)
 	}
@@ -165,7 +180,7 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 	}
 	var facts []store.DispatchWorkerCapabilityFact
 	if state.Provenance.Kind == store.CoordinationRoleCoordinator {
-		facts, err = p.sampleDispatchCandidates(ctx, group.ID, member.ID)
+		facts, err = p.sampleDispatchCandidates(ctx, group.ID, member.ID, workspace)
 		if err != nil {
 			return empty, err
 		}
@@ -174,12 +189,20 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 	if err != nil {
 		return empty, err
 	}
+	if workspace != nil {
+		if err := addWorkspacePreparationContext(&in, *workspace, state.Provenance.Kind == store.CoordinationRoleWorker); err != nil {
+			return empty, err
+		}
+	}
+	if err := p.addRepairRolePreparationContext(ctx, state, &in); err != nil {
+		return empty, err
+	}
 	if selection.Protocol == provider.CodexAppServerProtocol {
 		in.Permissions[0] = "仅支持所选 Codex AppServer 版本的全新单轮角色执行；不支持恢复或运行中追加输入。"
 		in.Permissions[1] = "本轮角色平台工具仅有 " + strings.Join(memberToolRoleOperations(state.Provenance.Kind), "、") + "；调用者、群组、会话、话题和任务关系由服务端绑定，模型不能改选身份或授权。"
 		in.Permissions = append(in.Permissions, codexNativeTextPermission)
 	}
-	return rolePreparationPlan{state: state, selected: selected, selection: selection, dispatchCapabilities: facts, input: in}, nil
+	return rolePreparationPlan{state: state, selected: selected, selection: selection, dispatchCapabilities: facts, workspace: workspace, input: in}, nil
 }
 
 func (plan rolePreparationPlan) format() ([]byte, error) {
@@ -211,7 +234,13 @@ func (p *Preparer) prepareCoordinationRole(ctx context.Context, state store.Coor
 	if err != nil {
 		return empty, err
 	}
-	cwd, key, err := p.workspace(ctx, member, conversation)
+	var cwd, key string
+	if plan.workspace != nil && state.Provenance.Kind == store.CoordinationRoleWorker {
+		_, cwd, _, err = p.workspacePreparationGrant(ctx, *plan.workspace, member.ID)
+		key = plan.workspace.ResourceKey
+	} else {
+		cwd, key, err = p.workspace(ctx, member, conversation)
+	}
 	if err != nil {
 		return empty, roleWorkspacePreparationError(state, err)
 	}

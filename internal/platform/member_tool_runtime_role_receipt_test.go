@@ -681,49 +681,90 @@ func TestRoleRuntimeRevokeDrainKeepsFenceUntilCleanup(t *testing.T) {
 		fenceFixture.reserve(t, fenceFixture.claim(t, f.groupID))
 	}
 	raw := provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted, ExitCode: -1}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	entered, release, returned := make(chan struct{}), make(chan struct{}), make(chan provider.ExecutionReceipt, 1)
-	defer func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	}()
+	authorized, authorizationDone := make(chan error, 1), make(chan struct{})
+	executeDone := make(chan struct{})
+	var callbackStarted bool
 	var configPath string
 	executor, err := r.WrapCoordinationRole(binding, f.coordinatorScope.Provenance, func(path, _ string, _ []string) (provider.Executor, error) {
 		configPath = path
-		_, token := memberToolRuntimeConfig(t, path)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		var config map[string]string
+		if err := json.Unmarshal(data, &config); err != nil {
+			return nil, err
+		}
+		token := config["token"]
 		return memberToolRuntimeExecutorFunc(func(context.Context, provider.ExecuteRequest, func(provider.Event) error) provider.ExecutionReceipt {
+			callbackStarted = true
 			go func() {
-				_ = r.tools.withAuthorized(context.Background(), token, "read_channel", func(store.MemberToolScope, MemberToolGrants) error { close(entered); <-release; return nil })
+				authorized <- r.tools.withAuthorized(ctx, token, "read_channel", func(store.MemberToolScope, MemberToolGrants) error {
+					close(entered)
+					<-release
+					return nil
+				})
+				close(authorizationDone)
 			}()
-			<-entered
-			return raw
+			select {
+			case <-entered:
+				return raw
+			case <-authorizationDone:
+			case <-ctx.Done():
+			}
+			// Failure to enter the callback is not native terminal evidence.
+			return provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, ExitCode: -1}
 		}), nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	go func() { returned <- executor.Execute(context.Background(), req, nil) }()
-	<-entered
-	// Only a complete, valid sidecar proves the wrapper has actually returned
-	// from native.Execute; owner.invoked is set BEFORE native entry.
-	captureDeadline := time.After(3 * time.Second)
-	for {
-		record, status := r.readRoleReceipt(claim.GroupID, claim.TurnID)
-		if status == "captured" && record.Raw == raw && record.Aggregate == raw && record.Source == memberToolRoleReceiptSourceFor(binding, f.coordinatorScope) {
-			break
-		}
+	defer func() {
+		cancel()
 		select {
-		case <-captureDeadline:
-			t.Fatal("no complete post-native capture while callback was blocked")
+		case <-release:
 		default:
-			runtime.Gosched()
+			close(release)
 		}
+		cleanupDeadline := time.After(3 * time.Second)
+		select {
+		case <-executeDone:
+		case <-cleanupDeadline:
+			t.Error("Execute did not finish after callback cancellation/release")
+			return
+		}
+		// executeDone also synchronizes callbackStarted, including pre-native errors.
+		if callbackStarted {
+			select {
+			case <-authorizationDone:
+				if err := <-authorized; err != nil {
+					t.Errorf("real registry authorization failed: %v", err)
+				}
+			case <-cleanupDeadline:
+				t.Error("registry authorization did not finish after callback cancellation/release")
+			}
+		}
+	}()
+	go func() {
+		returned <- executor.Execute(ctx, req, nil)
+		close(executeDone)
+	}()
+	select {
+	case <-entered:
+	case <-authorizationDone:
+		t.Fatal("real registry authorization ended before callback entry")
+	case got := <-returned:
+		t.Fatalf("Execute returned before callback entry: %+v", got)
+	case <-time.After(3 * time.Second):
+		t.Fatal("real registry callback did not enter")
 	}
-	t.Log("complete post-native sidecar observed before releasing the real registry callback")
+	memberToolRuntimeConfig(t, configPath)
 	// The callback holds RLock. TryRLock only fails once the sole writer,
-	// wrapper Revoke, is actually waiting. No elapsed-time guess is evidence.
+	// wrapper Revoke, is actually waiting AFTER native.Execute returned.
+	// Capture follows callback drain, so it cannot be the pre-drain barrier.
 	deadline := time.After(3 * time.Second)
 	for r.tools.mu.TryRLock() {
 		r.tools.mu.RUnlock()
@@ -733,6 +774,10 @@ func TestRoleRuntimeRevokeDrainKeepsFenceUntilCleanup(t *testing.T) {
 		default:
 			runtime.Gosched()
 		}
+	}
+	t.Log("post-native Revoke observed waiting for the real registry callback")
+	if record, status := r.readRoleReceipt(claim.GroupID, claim.TurnID); record != nil || status != "missing" {
+		t.Fatalf("receipt captured before callback drain: %s", status)
 	}
 	terminal, err := f.db.ApplyTurnReceipt(context.Background(), claim, raw)
 	if err != nil || terminal.State != domain.TurnStateNotStarted {
@@ -764,10 +809,18 @@ func TestRoleRuntimeRevokeDrainKeepsFenceUntilCleanup(t *testing.T) {
 	}
 	close(release)
 	select {
-	case <-returned:
+	case got := <-returned:
+		if got != raw {
+			t.Fatalf("callback drain changed native evidence: %+v", got)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Revoke did not finish")
 	}
+	record, status := r.readRoleReceipt(claim.GroupID, claim.TurnID)
+	if status != "captured" || record.Raw != raw || record.Aggregate != raw || record.Source != memberToolRoleReceiptSourceFor(binding, f.coordinatorScope) {
+		t.Fatalf("no complete post-native capture after callback drain: %s", status)
+	}
+	t.Log("complete raw/aggregate/source sidecar observed after callback drain and Execute return")
 	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
 		t.Fatal("config cleanup incomplete")
 	}

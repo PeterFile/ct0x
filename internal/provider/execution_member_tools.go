@@ -12,6 +12,13 @@ import (
 const piMemberToolFrameLimit = 1 << 20
 const piMemberToolConfigEnv = "AGENT_WORKSPACE_MEMBER_TOOL_CONFIG"
 const piMemberToolNames = "list_members,read_channel,send_message,create_member"
+const workspaceWorkerToolNames = "read_channel,search_history,read_history,submit_result,workspace_list,workspace_read,workspace_write,publish_workspace_artifact"
+
+// WorkspaceWorkerToolNames is the complete server-selected file-worker profile.
+// Names describe implementation support, never filesystem or task authority.
+func WorkspaceWorkerToolNames() []string {
+	return strings.Split(workspaceWorkerToolNames, ",")
+}
 
 var errPiMemberToolConfiguration = errors.New("成员工具执行配置无效")
 
@@ -34,7 +41,7 @@ func NewPiMemberToolExecutor(selected Provider, extensionPath, configPath string
 }
 
 // NewPiMemberToolExecutorWithTools freezes a trusted, nonempty subset of the six
-// ordinary member tools or a complete coordinator/worker profile in canonical
+// ordinary member tools or a complete coordinator/text-worker/file-worker profile in canonical
 // order. Names never come from model or HTTP input and do not grant authority.
 // It preserves the legacy constructor's file/version gates and does not launch Pi.
 func NewPiMemberToolExecutorWithTools(selected Provider, extensionPath, configPath string, toolNames []string, timeout time.Duration) (Executor, error) {
@@ -48,6 +55,9 @@ func NewPiMemberToolExecutorWithTools(selected Provider, extensionPath, configPa
 	canonical := strings.Split(piMemberToolNames+",search_history,read_history", ",")
 	requireAll := false
 	switch {
+	case slices.Contains(toolNames, "workspace_write"):
+		canonical = WorkspaceWorkerToolNames()
+		requireAll = true
 	case slices.Contains(toolNames, "decide_dispatch"):
 		canonical = []string{"list_members", "read_channel", "search_history", "read_history", "decide_dispatch"}
 		requireAll = true
@@ -92,6 +102,36 @@ func NewPiMemberToolExecutorWithTools(selected Provider, extensionPath, configPa
 	e := baseline.(piExecutor)
 	e.memberTools = &piMemberToolOptions{extensionPath: extensionPath, configPath: configPath, toolNames: names}
 	return e, nil
+}
+
+type piWorkspaceMemberToolAdapter struct {
+	extensionPath, configPath string
+}
+
+// NewPiWorkspaceMemberToolAdapter is a separate verified file profile, not an
+// upgrade of text-only SupportSupported evidence. A blank config samples only.
+// Codex's experimental text/readOnly selector and allowlist stay unchanged.
+func NewPiWorkspaceMemberToolAdapter(extensionPath, configPath string) Adapter {
+	return piWorkspaceMemberToolAdapter{extensionPath: extensionPath, configPath: configPath}
+}
+
+func (a piWorkspaceMemberToolAdapter) Capabilities(selected Provider) (AdapterCapabilities, error) {
+	// Reuse the exact executable/version/extension gates, not a model probe.
+	return (memberToolAdapter{name: Pi, extensionPath: a.extensionPath,
+		toolNames: []string{"read_channel", "search_history", "read_history", "submit_result"}}).Capabilities(selected)
+}
+
+func (a piWorkspaceMemberToolAdapter) NewExecutor(selected Provider, timeout time.Duration) (Executor, error) {
+	if timeout < 0 {
+		return nil, errExecutorConfiguration
+	}
+	if _, err := a.Capabilities(selected); err != nil {
+		return nil, err
+	}
+	if _, err := readMemberToolConfig(a.configPath); err != nil {
+		return nil, err
+	}
+	return NewPiMemberToolExecutorWithTools(selected, a.extensionPath, filepath.Clean(a.configPath), WorkspaceWorkerToolNames(), timeout)
 }
 
 func piMemberToolEnvironment(inherited []string, configPath string) []string {

@@ -20,6 +20,10 @@ func MemberRoleToolRoutes(tools *platform.MemberTools) []Route {
 	return []Route{
 		{http.MethodPost, "/api/v1/member-tools/decide_dispatch", memberToolNative(a.decideDispatch)},
 		{http.MethodPost, "/api/v1/member-tools/submit_result", memberToolNative(a.submitResult)},
+		{http.MethodPost, "/api/v1/member-tools/workspace_list", memberToolNative(a.workspaceList)},
+		{http.MethodPost, "/api/v1/member-tools/workspace_read", memberToolNative(a.workspaceRead)},
+		{http.MethodPost, "/api/v1/member-tools/workspace_write", memberToolNative(a.workspaceWrite)},
+		{http.MethodPost, "/api/v1/member-tools/publish_workspace_artifact", memberToolNative(a.publishWorkspaceArtifact)},
 	}
 }
 
@@ -141,7 +145,7 @@ func memberRoleToolError(w http.ResponseWriter, operation string, err error) {
 		// Negative outcome evidence dominates every business cause in the chain.
 	case err == store.ErrMemberToolDenied:
 		status, code, message = http.StatusForbidden, "forbidden", "无权访问成员工具"
-	case operation == "submit_result" && confirmed:
+	case confirmed && (operation == "submit_result" || operation == "workspace_write" || operation == "publish_workspace_artifact"):
 		switch {
 		case errors.Is(err, store.ErrMemberToolDenied):
 			status, code, message = http.StatusForbidden, "forbidden", "无权访问成员工具"

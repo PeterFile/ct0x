@@ -127,8 +127,28 @@ func TestMemberMCPProtocolOptInLifecycleAndProfile(t *testing.T) {
 				AdditionalProperties bool                       `json:"additionalProperties"`
 				Required             []string                   `json:"required"`
 			}
-			if err := json.Unmarshal(tool.InputSchema.Properties["intent_assessment"], &assessment); err != nil || len(assessment.Properties) != 7 || assessment.AdditionalProperties || !slices.Equal(assessment.Required, []string{"disposition", "reason"}) {
+			if err := json.Unmarshal(tool.InputSchema.Properties["intent_assessment"], &assessment); err != nil || len(assessment.Properties) != 8 || assessment.AdditionalProperties || !slices.Equal(assessment.Required, []string{"disposition", "reason"}) {
 				t.Fatal("source-chat schema lost the complete bridge contract")
+			}
+			var action struct {
+				Enum []string `json:"enum"`
+			}
+			if json.Unmarshal(assessment.Properties["action"], &action) != nil || !slices.Equal(action.Enum, []string{"text_submission", "workspace_change"}) {
+				t.Fatal("intake action schema lost text/file compatibility")
+			}
+			var repair struct {
+				Properties           map[string]json.RawMessage `json:"properties"`
+				Required             []string                   `json:"required"`
+				AdditionalProperties bool                       `json:"additionalProperties"`
+			}
+			if json.Unmarshal(assessment.Properties["repair"], &repair) != nil || len(repair.Properties) != 2 || repair.AdditionalProperties || !slices.Equal(repair.Required, []string{"review_id", "authorization"}) {
+				t.Fatal("repair schema must not expose authority selectors")
+			}
+			var authorization struct {
+				Enum []string `json:"enum"`
+			}
+			if json.Unmarshal(repair.Properties["authorization"], &authorization) != nil || !slices.Equal(authorization.Enum, []string{"review_request", "original_agreement", "chat_request"}) {
+				t.Fatal("repair authorization labels changed")
 			}
 		}
 	}

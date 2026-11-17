@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"math"
 	"strings"
 	"time"
@@ -24,7 +25,16 @@ type DispatchWorkerCapabilityFact struct {
 	MemberID   string `json:"-"`
 	ProviderID string `json:"-"`
 	Model      string `json:"-"`
+	// File facts bind an exact verified profile to this immutable Task scope.
+	RequiredProfile string `json:"-"`
+	TaskID          string `json:"-"`
+	TaskRevision    int64  `json:"-"`
+	ResourceKey     string `json:"-"`
+	NodeID          string `json:"-"`
+	GrantID         string `json:"-"`
 }
+
+const DispatchWorkspaceWorkerProfile = "workspace_worker/v1"
 
 // DecideDispatchWithCapabilities additionally binds a new assignment to frozen
 // server capability facts. Historical receipts retain the original replay order.
@@ -83,8 +93,8 @@ func (s *Store) decideDispatch(ctx context.Context, scope CoordinationToolScope,
 		if err := coordinationDecideEligibleInTx(ctx, tx, r, input.WorkerMemberID, ""); err != nil {
 			return out, err
 		}
-		if requireCapabilities && input.Kind == "assign" {
-			if err := coordinationDecideCapabilityInTx(ctx, tx, r.GroupID, input.WorkerMemberID, facts); err != nil {
+		if input.Kind == "assign" {
+			if err := coordinationDecideCapabilityInTx(ctx, tx, r, input.WorkerMemberID, facts, requireCapabilities); err != nil {
 				return out, err
 			}
 		}
@@ -177,8 +187,8 @@ func (s *Store) decideDispatch(ctx context.Context, scope CoordinationToolScope,
 		if err := coordinationDecideEligibleInTx(ctx, tx, r, input.WorkerMemberID, want.Decision.AssignmentID); err != nil {
 			return out, err
 		}
-		if requireCapabilities && input.Kind == "assign" {
-			if err := coordinationDecideCapabilityInTx(ctx, tx, r.GroupID, input.WorkerMemberID, facts); err != nil {
+		if input.Kind == "assign" {
+			if err := coordinationDecideCapabilityInTx(ctx, tx, r, input.WorkerMemberID, facts, requireCapabilities); err != nil {
 				return out, err
 			}
 		}
@@ -200,15 +210,35 @@ func (s *Store) decideDispatch(ctx context.Context, scope CoordinationToolScope,
 
 // Only compare immutable server facts with current rows here. Capability
 // sampling, filesystem validation and adapter code must stay outside SQL txs.
-func coordinationDecideCapabilityInTx(ctx context.Context, tx *sql.Tx, groupID, workerID string, facts []DispatchWorkerCapabilityFact) error {
+func coordinationDecideCapabilityInTx(ctx context.Context, tx *sql.Tx, r domain.DispatchRequest, workerID string, facts []DispatchWorkerCapabilityFact, required bool) error {
+	scope, err := taskWorkspaceScopeInTx(ctx, tx, r.GroupID, r.TaskID)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return err
+	}
+	fileTask := err == nil
+	var grant domain.TaskWorkspaceGrant
+	if fileTask {
+		grant, err = taskWorkspaceGrantInTx(ctx, tx, r.GroupID, r.TaskID, workerID)
+		if err != nil {
+			return err
+		}
+		if scope.TaskRevision != r.TaskRevision || scope.DispatchRequestID != r.ID || scope.MandateID != r.MandateID {
+			return ErrConflict
+		}
+	} else if !required {
+		return nil
+	}
 	for _, fact := range facts {
-		if fact.GroupID != groupID || fact.MemberID != workerID || fact.ProviderID == "" || fact.Model == "" {
+		if fact.GroupID != r.GroupID || fact.MemberID != workerID || fact.ProviderID == "" || fact.Model == "" {
+			continue
+		}
+		if fileTask && (fact.RequiredProfile != DispatchWorkspaceWorkerProfile || fact.TaskID != scope.TaskID || fact.TaskRevision != scope.TaskRevision || fact.ResourceKey != scope.ResourceKey || fact.NodeID != scope.NodeID || fact.GrantID != grant.GrantID) {
 			continue
 		}
 		var matches bool
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM members
 		 WHERE group_id=? AND id=? AND provider_id=? AND model=? AND status='active')`,
-			groupID, workerID, fact.ProviderID, fact.Model).Scan(&matches); err != nil {
+			r.GroupID, workerID, fact.ProviderID, fact.Model).Scan(&matches); err != nil {
 			return err
 		}
 		if matches {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"agentworkspace/internal/domain"
@@ -32,7 +33,14 @@ func (p *Preparer) memberToolAdapterRegistry(selection provider.AdapterSelection
 	var adapter provider.Adapter
 	switch selection.ID {
 	case provider.PiMemberToolAdapterID:
-		adapter = provider.NewPiMemberToolAdapter(p.piMemberToolsExtension, configPath, names)
+		if slices.Contains(names, "workspace_write") {
+			if !slices.Equal(names, provider.WorkspaceWorkerToolNames()) {
+				return nil, errMemberToolAdapterUnsupported
+			}
+			adapter = provider.NewPiWorkspaceMemberToolAdapter(p.piMemberToolsExtension, configPath)
+		} else {
+			adapter = provider.NewPiMemberToolAdapter(p.piMemberToolsExtension, configPath, names)
+		}
 	case provider.CodexAppServerAdapterID:
 		adapter = provider.NewCodexAppServerMemberToolAdapter(configPath, names)
 	default:
@@ -100,8 +108,15 @@ func (p *Preparer) memberToolExecutorFactory(selected provider.Provider, selecti
 	}
 }
 
-func (p *Preparer) sampleDispatchCandidates(ctx context.Context, groupID, coordinatorID string) ([]store.DispatchWorkerCapabilityFact, error) {
+func (p *Preparer) sampleDispatchCandidates(ctx context.Context, groupID, coordinatorID string, workspace ...*domain.TaskWorkspaceScope) ([]store.DispatchWorkerCapabilityFact, error) {
 	facts := []store.DispatchWorkerCapabilityFact{}
+	var scope *domain.TaskWorkspaceScope
+	if len(workspace) > 0 {
+		scope = workspace[0]
+	}
+	if scope != nil && (p.memberTools == nil || !p.memberTools.workspaceConfigured()) {
+		return facts, nil
+	}
 	options := store.ListOptions{Limit: 200}
 	for {
 		members, err := p.store.ListMembers(ctx, groupID, options)
@@ -112,14 +127,31 @@ func (p *Preparer) sampleDispatchCandidates(ctx context.Context, groupID, coordi
 			if member.GroupID != groupID || member.ID == coordinatorID {
 				continue
 			}
-			_, _, err := p.sampleMemberToolMember(member, memberToolRoleOperations(store.CoordinationRoleWorker))
+			names := memberToolRoleOperations(store.CoordinationRoleWorker)
+			var grant store.WorkspaceGrantReceipt
+			if scope != nil {
+				var err error
+				grant, _, _, err = p.workspacePreparationGrant(ctx, *scope, member.ID)
+				if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrMemberToolDenied) {
+					continue
+				}
+				if err != nil {
+					return nil, preparationResolutionError(ctx, err)
+				}
+				names = provider.WorkspaceWorkerToolNames()
+			}
+			_, _, err := p.sampleMemberToolMember(member, names)
 			if errors.Is(err, errMemberToolAdapterUnsupported) {
 				continue
 			}
 			if err != nil {
 				return nil, preparationFailureWithCause(ctx, errPrepareRead, err)
 			}
-			facts = append(facts, store.DispatchWorkerCapabilityFact{GroupID: groupID, MemberID: member.ID, ProviderID: member.ProviderID, Model: member.Model})
+			fact := store.DispatchWorkerCapabilityFact{GroupID: groupID, MemberID: member.ID, ProviderID: member.ProviderID, Model: member.Model}
+			if scope != nil {
+				fact = workspaceDispatchFact(member, *scope, grant)
+			}
+			facts = append(facts, fact)
 		}
 		if members.NextCursor == nil {
 			return facts, nil

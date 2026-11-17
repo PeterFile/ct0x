@@ -101,6 +101,14 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		if len(arguments) == 0 {
 			arguments = json.RawMessage(`{}`)
 		}
+		switch name {
+		case "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact":
+			// Reject before fingerprint decoding or binding; metadata stays opaque.
+			if !validMemberWorkspaceJSONStrings(arguments) {
+				memberMCPError(w, 400, id, -32602, "文件工具参数包含无效的 Unicode 字符串转义")
+				return
+			}
+		}
 		var object map[string]json.RawMessage
 		if !paramsOK || name == "" || len(name) > 64 || json.Unmarshal(arguments, &object) != nil || object == nil {
 			memberMCPError(w, 400, id, -32602, "工具名称和 arguments 对象无效")

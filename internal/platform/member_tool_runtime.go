@@ -163,12 +163,13 @@ func memberToolRuntimeText(value string) bool {
 }
 
 type memberToolRuntimeRun struct {
-	runtime *MemberToolRuntime
-	binding MemberToolRunBinding
-	factory MemberToolExecutorFactory
-	used    atomic.Bool
-	role    *store.CoordinationRoleProvenance
-	intake  bool
+	runtime   *MemberToolRuntime
+	binding   MemberToolRunBinding
+	factory   MemberToolExecutorFactory
+	used      atomic.Bool
+	role      *store.CoordinationRoleProvenance
+	intake    bool
+	workspace bool
 	// Cloned at trusted wrapping and again when the claimed token is registered.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }

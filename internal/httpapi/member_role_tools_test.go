@@ -58,11 +58,15 @@ func TestMemberRoleToolHTTPOptInRoutes(t *testing.T) {
 	}
 	roles := MemberRoleToolRoutes(f.tools)
 	want := map[string]bool{
-		"/api/v1/member-tools/decide_dispatch": true,
-		"/api/v1/member-tools/submit_result":   true,
+		"/api/v1/member-tools/decide_dispatch":            true,
+		"/api/v1/member-tools/submit_result":              true,
+		"/api/v1/member-tools/workspace_list":             true,
+		"/api/v1/member-tools/workspace_read":             true,
+		"/api/v1/member-tools/workspace_write":            true,
+		"/api/v1/member-tools/publish_workspace_artifact": true,
 	}
-	if len(roles) != 2 {
-		t.Fatalf("role opt-in returned %d routes, want two", len(roles))
+	if len(roles) != len(want) {
+		t.Fatalf("role opt-in returned %d routes, want %d", len(roles), len(want))
 	}
 	for _, route := range roles {
 		if route.Method != http.MethodPost || route.Handler == nil || !want[route.Pattern] {
@@ -218,6 +222,15 @@ func TestMemberRoleToolHTTPOrdinaryCapabilitiesCannotWrite(t *testing.T) {
 			w := f.request(t, request.operation, request.body, key)
 			assertError(t, w.Code, w.Header(), w.Body.Bytes(), 403, "forbidden")
 		}
+		for operation, body := range map[string]string{
+			"workspace_list":             `{"path":"."}`,
+			"workspace_read":             `{"path":"outside.txt"}`,
+			"workspace_write":            `{"path":"outside.txt","create":true,"text":"denied"}`,
+			"publish_workspace_artifact": `{"operation_id":"foreign-operation","name":"denied"}`,
+		} {
+			w := f.request(t, operation, body, "denied-"+operation)
+			assertError(t, w.Code, w.Header(), w.Body.Bytes(), 403, "forbidden")
+		}
 		for _, token := range []string{"unknown-capability", f.claim.Token} {
 			r := f.newRequest("submit_result", memberRoleHTTPRequests[1].body, "denied")
 			r.Header.Set("Authorization", "Bearer "+token)
@@ -328,6 +341,10 @@ func TestMemberRoleToolSyntheticErrorCodecOnly(t *testing.T) {
 		{"submit_result", &memberRoleHTTPSyntheticTxError{cause: store.ErrInvalid}, 500, "internal_error", true},
 		{"submit_result", errors.Join(confirmedConflict, fmt.Errorf("wrapped: %w", unknown)), 500, "internal_error", true},
 		{"submit_result", confirmedConflict, 409, "conflict", false},
+		{"workspace_write", &memberRoleHTTPSyntheticTxError{cause: store.ErrInvalid, rolledBack: true}, 400, "invalid_input", false},
+		{"workspace_write", errors.Join(confirmedConflict, unknown), 500, "internal_error", true},
+		{"publish_workspace_artifact", confirmedConflict, 409, "conflict", false},
+		{"publish_workspace_artifact", &memberRoleHTTPSyntheticTxError{cause: store.ErrInvalid}, 500, "internal_error", true},
 		{"decide_dispatch", fmt.Errorf("PRIVATE canceled: %w", errors.Join(context.Canceled, store.ErrConflict)), 408, "request_canceled", true},
 		{"submit_result", fmt.Errorf("PRIVATE deadline: %w", errors.Join(context.DeadlineExceeded, store.ErrInvalid)), 504, "deadline_exceeded", true},
 		{"submit_result", &memberRoleHTTPSyntheticTxError{cause: domain.ErrTaskInvalid, rolledBack: true}, 400, "invalid_input", false},

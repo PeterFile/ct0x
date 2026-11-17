@@ -15,7 +15,7 @@ import (
 	"agentworkspace/internal/store"
 )
 
-func executionRunner(config config, db *store.Store, engine *coordination.Engine, catalog *platform.ProviderCatalog, endpoint string, output io.Writer) (func(context.Context) error, *platform.MemberToolRuntime, *platform.Preparer, error) {
+func executionRunner(config config, db *store.Store, engine *coordination.Engine, catalog *platform.ProviderCatalog, endpoint string, output io.Writer, workspace ...platform.MemberWorkspaceOptions) (func(context.Context) error, *platform.MemberToolRuntime, *platform.Preparer, error) {
 	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
 		return nil, nil, nil, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
 	}
@@ -54,11 +54,19 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		if err != nil {
 			return nil, nil, nil, err
 		}
+		if config.enableCoordinationRoles && len(workspace) > 0 {
+			if err := tools.EnableWorkspace(workspace[0]); err != nil {
+				return nil, nil, nil, err
+			}
+		}
 		options.MemberTools, options.PiMemberToolsExtension = tools, config.piMemberToolsExtension
 		options.EnableCodexAppServer = config.enableCodexAppServer
 	}
 	preparer, err := platform.NewPreparer(db, options)
 	if err != nil {
+		if tools != nil {
+			err = errors.Join(err, tools.Close())
+		}
 		return nil, nil, nil, err
 	}
 	if config.enableCoordinationRoles {
@@ -67,6 +75,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			fmt.Fprintf(output, "协调意图扫描失败：%v\n", err)
 		})
 		if err != nil {
+			if tools != nil {
+				err = errors.Join(err, tools.Close())
+			}
 			return nil, nil, nil, err
 		}
 	}

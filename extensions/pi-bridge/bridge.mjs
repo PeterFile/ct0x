@@ -6,7 +6,7 @@ import { request } from "node:http";
 const CONFIG_LIMIT = 4096;
 const BYTE_LIMIT = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 25_000;
-export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result"]);
+export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact"]);
 
 /** @typedef {{ text: string, json: unknown }} Reply */
 /** @typedef {(toolName: string, params: unknown, toolCallId: string, signal?: AbortSignal) => Promise<Reply>} Client */
@@ -95,18 +95,18 @@ function parseJSON(buffer) {
   return { text, json };
 }
 
-/** @param {string} text */
-function validRoleReceiptWire(text) {
+/** @param {string} text @param {number} [count] */
+function validRoleReceiptWire(text, count = 4) {
   // JSON syntax and decoded field types are already checked. The fixed receipts
-  // allow only four primitive fields, unique decoded keys and unsigned decimal integers.
+  // allow only primitive fields, unique decoded keys and unsigned decimal integers.
   const wire = text.trim();
   if (wire[0] !== "{") return false;
-  const field = /\s*("(?:[^"\\]|\\.)*")\s*:\s*("(?:[^"\\]|\\.)*"|true|0|[1-9]\d*)\s*([,}])/y;
+  const field = /\s*("(?:[^"\\]|\\.)*")\s*:\s*("(?:[^"\\]|\\.)*"|true|false|0|[1-9]\d*)\s*([,}])/y;
   field.lastIndex = 1;
   const keys = new Set();
-  for (let index = 0; index < 4; index++) {
+  for (let index = 0; index < count; index++) {
     const match = field.exec(wire);
-    if (!match || match[3] !== (index === 3 ? "}" : ",")) return false;
+    if (!match || match[3] !== (index === count - 1 ? "}" : ",")) return false;
     const key = JSON.parse(match[1]);
     if (keys.has(key)) return false;
     keys.add(key);
@@ -151,6 +151,20 @@ function validWriteReceipt(toolName, status, value, requestKind) {
       typeof value.submission_id === "string" && value.submission_id.length > 0 &&
       typeof value.artifact_version_count === "number" && Number.isSafeInteger(value.artifact_version_count) &&
       value.artifact_version_count >= 0 && value.summary_omitted === true;
+  }
+  if (toolName === "workspace_write" || toolName === "publish_workspace_artifact") {
+    if (status !== 201 || !isRecord(value)) return false;
+    const hash = (/** @type {unknown} */ digest) => typeof digest === "string" && /^[a-f0-9]{64}$/.test(digest);
+    const id = (/** @type {unknown} */ identity) => typeof identity === "string" && identity.length > 0 && Buffer.byteLength(identity) <= 256;
+    if (toolName === "workspace_write") {
+      return Object.keys(value).sort().join(",") === "after_sha256,before_sha256,operation_id,outcome,text_omitted" &&
+        id(value.operation_id) && (value.outcome === "done" || value.outcome === "unchanged") &&
+        (value.before_sha256 === "" || hash(value.before_sha256)) && hash(value.after_sha256) && value.text_omitted === true;
+    }
+    return Object.keys(value).sort().join(",") === "applied,artifact_id,sha256,size,version_id" &&
+      id(value.artifact_id) && id(value.version_id) && hash(value.sha256) &&
+      Number.isSafeInteger(value.size) && typeof value.size === "number" && value.size >= 0 && value.size <= 65536 &&
+      typeof value.applied === "boolean";
   }
   if (toolName !== "send_message" && toolName !== "create_member") return true;
   if (!isRecord(value)) return false;
@@ -198,7 +212,8 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
   }
   if (body.length > BYTE_LIMIT) throw safeError("工具请求超过 64 KiB 限制，未发送请求。");
   const roleWrite = toolName === "decide_dispatch" || toolName === "submit_result";
-  const write = roleWrite || toolName === "send_message" || toolName === "create_member";
+  const workspaceWrite = toolName === "workspace_write" || toolName === "publish_workspace_artifact";
+  const write = roleWrite || workspaceWrite || toolName === "send_message" || toolName === "create_member";
   const fingerprint = write ? createHash("sha256").update(body).digest("hex") : "";
   if (write && writes.unknown) {
     const previous = writes.unknown;
@@ -272,7 +287,7 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
           if (settled) return;
           let result;
           try { result = parseJSON(Buffer.concat(chunks, size)); } catch { return fail(invalidResponse); }
-          const success = roleWrite || toolName === "send_message" ? status === 201 :
+          const success = roleWrite || workspaceWrite || toolName === "send_message" ? status === 201 :
             toolName === "create_member" ? status === 200 || status === 201 : status === 200;
           const sensitive = result.text.includes(token) || JSON.stringify(result.json)?.includes(token);
           if (!success) {
@@ -288,8 +303,8 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
           }
           if (sensitive) return fail(`成员工具返回了敏感数据，已拒绝显示；${unknown}`);
           if (!validWriteReceipt(toolName, status, result.json, requestKind)) return fail(invalidResponse);
-          if (roleWrite) {
-            if (!validRoleReceiptWire(result.text)) return fail(invalidResponse);
+          if (roleWrite || workspaceWrite) {
+            if (!validRoleReceiptWire(result.text, workspaceWrite ? 5 : 4)) return fail(invalidResponse);
             result = { text: JSON.stringify(result.json), json: result.json };
           }
           settled = true;
