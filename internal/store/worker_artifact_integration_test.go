@@ -93,47 +93,77 @@ func TestWorkerArtifactPublicationProvenanceReplayAndCAS(t *testing.T) {
 	dispatchAssertFK(t, f.s)
 }
 
-func TestWorkerArtifactRequiresOwnKnownSyncedOperationAndActualBlob(t *testing.T) {
-	for _, outcome := range []string{"pending", "unknown", "applied_sync_error", "unchanged", "wrong-hash", "wrong-size", "bare-hash", "foreign-operation"} {
-		t.Run(outcome, func(t *testing.T) {
-			f, _, role := workspaceOperationFixture(t)
-			o := workspaceOperationBegin(t, f.s, role, "op")
-			result := WorkspaceOperationResult{Outcome: "done", ObservedHash: o.Input.AfterHash, ObservedSize: o.Input.AfterSize}
-			switch outcome {
-			case "unknown":
-				result = WorkspaceOperationResult{Outcome: "unknown", ErrorCode: "io_unknown"}
-			case "applied_sync_error":
-				result.Outcome = outcome
-				result.ErrorCode = "sync_failed"
-			case "unchanged":
-				result = WorkspaceOperationResult{Outcome: "unchanged", ObservedHash: o.Preimage.Hash, ObservedSize: o.Preimage.Size}
-			}
-			if outcome != "pending" {
-				if _, err := f.s.FinishWorkspaceOperation(ctx, role, o.ID, result); err != nil {
-					t.Fatal(err)
-				}
-			}
-			input := WorkerArtifactInput{OperationID: o.ID, Name: "伪造候选"}
-			blob := WorkerArtifactBlob{Hash: o.Input.AfterHash, Size: o.Input.AfterSize}
-			switch outcome {
-			case "wrong-hash":
-				blob.Hash = strings.Repeat("c", 64)
-			case "wrong-size":
-				blob.Size++
-			case "bare-hash":
-				input.OperationID = blob.Hash
-			case "foreign-operation":
-				other, _, otherRole := workspaceOperationFixture(t)
-				foreign := workspaceOperationDone(t, other.s, otherRole, "foreign")
-				input.OperationID = foreign.ID
-			}
-			before := coordinationDecideSnapshot(t, f.s)
-			if got, err := f.s.PublishWorkerArtifact(ctx, role, input, blob, "pub"); err == nil || got != (domain.ArtifactVersion{}) {
-				t.Fatalf("unproven operation/blob published: %+v,%v", got, err)
-			}
-			coordinationDecidePreserved(t, f.s, before)
-		})
+// Keep each fresh-Store case independently selectable by the Store64 shard hash.
+func TestWorkerArtifactRequiresOwnKnownSyncedOperationAndActualBlob_Pending(t *testing.T) {
+	workerArtifactRequiresOwnKnownSyncedOperationAndActualBlob(t, "pending")
+}
+
+func TestWorkerArtifactRequiresOwnKnownSyncedOperationAndActualBlob_Unknown(t *testing.T) {
+	workerArtifactRequiresOwnKnownSyncedOperationAndActualBlob(t, "unknown")
+}
+
+func TestWorkerArtifactRequiresOwnKnownSyncedOperationAndActualBlob_AppliedSyncError(t *testing.T) {
+	workerArtifactRequiresOwnKnownSyncedOperationAndActualBlob(t, "applied_sync_error")
+}
+
+func TestWorkerArtifactRequiresOwnKnownSyncedOperationAndActualBlob_Unchanged(t *testing.T) {
+	workerArtifactRequiresOwnKnownSyncedOperationAndActualBlob(t, "unchanged")
+}
+
+func TestWorkerArtifactRequiresOwnKnownSyncedOperationAndActualBlob_WrongHash(t *testing.T) {
+	workerArtifactRequiresOwnKnownSyncedOperationAndActualBlob(t, "wrong-hash")
+}
+
+func TestWorkerArtifactRequiresOwnKnownSyncedOperationAndActualBlob_WrongSize(t *testing.T) {
+	workerArtifactRequiresOwnKnownSyncedOperationAndActualBlob(t, "wrong-size")
+}
+
+func TestWorkerArtifactRequiresOwnKnownSyncedOperationAndActualBlob_BareHash(t *testing.T) {
+	workerArtifactRequiresOwnKnownSyncedOperationAndActualBlob(t, "bare-hash")
+}
+
+func TestWorkerArtifactRequiresOwnKnownSyncedOperationAndActualBlob_ForeignOperation(t *testing.T) {
+	workerArtifactRequiresOwnKnownSyncedOperationAndActualBlob(t, "foreign-operation")
+}
+
+func workerArtifactRequiresOwnKnownSyncedOperationAndActualBlob(t *testing.T, outcome string) {
+	t.Helper()
+	f, _, role := workspaceOperationFixture(t)
+	o := workspaceOperationBegin(t, f.s, role, "op")
+	result := WorkspaceOperationResult{Outcome: "done", ObservedHash: o.Input.AfterHash, ObservedSize: o.Input.AfterSize}
+	switch outcome {
+	case "unknown":
+		result = WorkspaceOperationResult{Outcome: "unknown", ErrorCode: "io_unknown"}
+	case "applied_sync_error":
+		result.Outcome = outcome
+		result.ErrorCode = "sync_failed"
+	case "unchanged":
+		result = WorkspaceOperationResult{Outcome: "unchanged", ObservedHash: o.Preimage.Hash, ObservedSize: o.Preimage.Size}
 	}
+	if outcome != "pending" {
+		if _, err := f.s.FinishWorkspaceOperation(ctx, role, o.ID, result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	input := WorkerArtifactInput{OperationID: o.ID, Name: "伪造候选"}
+	blob := WorkerArtifactBlob{Hash: o.Input.AfterHash, Size: o.Input.AfterSize}
+	switch outcome {
+	case "wrong-hash":
+		blob.Hash = strings.Repeat("c", 64)
+	case "wrong-size":
+		blob.Size++
+	case "bare-hash":
+		input.OperationID = blob.Hash
+	case "foreign-operation":
+		other, _, otherRole := workspaceOperationFixture(t)
+		foreign := workspaceOperationDone(t, other.s, otherRole, "foreign")
+		input.OperationID = foreign.ID
+	}
+	before := coordinationDecideSnapshot(t, f.s)
+	if got, err := f.s.PublishWorkerArtifact(ctx, role, input, blob, "pub"); err == nil || got != (domain.ArtifactVersion{}) {
+		t.Fatalf("unproven operation/blob published: %+v,%v", got, err)
+	}
+	coordinationDecidePreserved(t, f.s, before)
 }
 
 func TestWorkerArtifactPathDoesNotSkipLatestPendingIntent(t *testing.T) {
