@@ -28,6 +28,7 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	defer os.Exit(0)
 	mode := os.Getenv("AW_SESSION_MODE")
 	pid := strconv.Itoa(os.Getpid())
+	_ = os.WriteFile("argv-"+pid+".json", mustCodexAppServerJSON(os.Args[1:]), 0600)
 	input := bufio.NewReader(os.Stdin)
 	read := func() codexRPCMessage {
 		line, err := input.ReadBytes('\n')
@@ -103,8 +104,15 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 			TokenEnv string   `json:"bearer_token_env_var"`
 			Names    []string `json:"enabled_tools"`
 		} `json:"mcp_servers"`
+		Features map[string]json.RawMessage `json:"features"`
 	}
 	_ = json.Unmarshal(params["config"], &configParams)
+	if os.Getenv("AW_SESSION_ENFORCE_GOALS_DISABLED") != "" {
+		if enabled, present := configParams.Features["goals"]; !present || string(enabled) != "false" {
+			fail(threadRequest)
+			return
+		}
+	}
 	server := ""
 	names := []string{}
 	for name, entry := range configParams.Servers {
@@ -137,8 +145,59 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	if mode == "wrong-thread" {
 		responseThread["id"] = "other-thread"
 	}
+	// Inject resume-only metadata at deterministic wire boundaries, including
+	// before identity binding and on both sides of the new turn response.
+	replay := func(phase string) {
+		if *threadRequest.Method != "thread/resume" || os.Getenv("AW_SESSION_REPLAY_PHASE") != phase {
+			return
+		}
+		kind, replayThread := os.Getenv("AW_SESSION_REPLAY_KIND"), threadID
+		if os.Getenv("AW_SESSION_REPLAY_FOREIGN") != "" {
+			replayThread = "foreign-thread"
+		}
+		if strings.HasPrefix(kind, "goal") {
+			method, fields := "thread/goal/cleared", map[string]any{"threadId": replayThread}
+			if kind == "goal-nonempty" || kind == "goal-cleared-with-goal" {
+				fields["goal"] = map[string]any{"objective": "unauthorized autonomous work", "status": "active"}
+				if kind == "goal-nonempty" {
+					method = "thread/goal/updated"
+				}
+			}
+			if kind == "goal-cleared-with-turn" {
+				fields["turnId"] = "session-turn-1"
+			}
+			notify(method, fields)
+		}
+		if kind == "usage" || kind == "goal-and-usage" || strings.HasPrefix(kind, "usage-") {
+			oldTurn := history[0].(map[string]any)["id"]
+			if kind == "usage-unverified" {
+				oldTurn = "unverified-turn"
+			}
+			if kind == "usage-future-turn" {
+				oldTurn = fmt.Sprintf("session-turn-%d", len(history)+1)
+			}
+			usage := map[string]any{"totalTokens": 2, "inputTokens": 1, "cachedInputTokens": 0, "outputTokens": 1, "reasoningOutputTokens": 0}
+			fields := map[string]any{"threadId": replayThread, "turnId": oldTurn, "tokenUsage": map[string]any{"total": usage, "last": usage, "modelContextWindow": 1024}}
+			if kind == "usage-without-turn" {
+				delete(fields, "turnId")
+			}
+			count := 1
+			if kind == "usage-overflow" {
+				count = executionFramesCountLimit + 1
+			}
+			if kind == "usage-byte-overflow" {
+				fields["tokenUsage"].(map[string]any)["opaque"] = strings.Repeat("x", codexRPCFrameLimit/2)
+				count = executionFramesByteLimit/(codexRPCFrameLimit/2) + 1
+			}
+			for range count {
+				notify("thread/tokenUsage/updated", fields)
+			}
+		}
+	}
+	replay("before-response")
 	respond(threadRequest, map[string]any{"thread": responseThread, "approvalPolicy": "never", "approvalsReviewer": "user",
 		"sandbox": map[string]any{"type": sandbox, "networkAccess": false}, "cwd": cwd, "model": model, "modelProvider": provider, "reasoningEffort": effort})
+	replay("after-response")
 	respond(expect("config/read"), config())
 	statusRequest := expect("mcpServerStatus/list")
 	tools := make(map[string]any)
@@ -167,12 +226,14 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 		case "old-server-drift":
 			history[0].(map[string]any)["items"].([]any)[1].(map[string]any)["server"] = "foreign-server"
 		}
+		replay("before-history")
 		if mode == "duplicate-history" {
 			raw := string(mustCodexAppServerJSON(map[string]any{"id": request.ID, "result": map[string]any{"thread": thread(before)}}))
 			_, _ = fmt.Fprintln(os.Stdout, strings.Replace(raw, `"status":"completed"`, `"status":"completed","status":"completed"`, 1))
 		} else {
 			respond(request, map[string]any{"thread": thread(before)})
 		}
+		replay("after-history")
 		request = read()
 	}
 	if request.Method == nil || *request.Method != "turn/start" {
@@ -185,8 +246,11 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	turn := func(status string, items []any) map[string]any {
 		return map[string]any{"id": turnID, "status": status, "items": items, "error": nil}
 	}
+	replay("before-turn-response")
 	respond(request, map[string]any{"turn": turn("inProgress", []any{})})
+	replay("after-turn-response")
 	notify("turn/started", map[string]any{"threadId": threadID, "turn": turn("inProgress", []any{})})
+	replay("after-turn-started")
 	_ = json.Unmarshal(request.Params, &params)
 	var currentInput []any
 	_ = json.Unmarshal(params["input"], &currentInput)
@@ -198,6 +262,9 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 		notify("item/completed", map[string]any{"threadId": threadID, "turnId": turnID, "item": call})
 	}
 	answer := map[string]any{"id": "answer-" + turnID, "type": "agentMessage", "text": "synthetic session answer", "phase": "final_answer"}
+	if mode == "empty-answer" {
+		answer["text"] = ""
+	}
 	notify("item/completed", map[string]any{"threadId": threadID, "turnId": turnID, "item": answer})
 	items := []any{user, call, answer}
 	history = append(history, turn("completed", items))
@@ -221,11 +288,53 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	if mode == "capture-wrong-turn" {
 		history[len(history)-1].(map[string]any)["id"] = "foreign-turn"
 	}
-	if mode == "capture-prefix-drift" {
+	if mode == "capture-prefix-drift" || mode == "capture-prefix-drift-unsupported" {
 		oldItems := history[0].(map[string]any)["items"].([]any)
 		oldItems[len(oldItems)-1].(map[string]any)["text"] = "changed prefix after new Turn"
 	}
-	respond(capture, map[string]any{"thread": thread(history)})
+	last := history[len(history)-1].(map[string]any)
+	switch mode {
+	case "capture-external-item", "capture-external-unsupported", "capture-external-oversized-anchor":
+		if mode == "capture-external-unsupported" {
+			last["itemsView"] = "notLoaded"
+		}
+		if mode == "capture-external-oversized-anchor" {
+			for i := len(last["items"].([]any)); i <= codexSessionHistoryItemLimit; i++ {
+				last["items"] = append(last["items"].([]any), map[string]any{"id": fmt.Sprintf("passive-%d", i), "type": "reasoning", "summary": []any{}, "content": []any{}})
+			}
+		}
+		last["items"] = append(last["items"].([]any), map[string]any{"id": "unobserved-command", "type": "commandExecution", "status": "completed", "command": "synthetic", "cwd": cwd, "commandActions": []any{}, "aggregatedOutput": "", "exitCode": 0})
+	case "capture-unobserved-mcp", "capture-unobserved-mcp-invalid-tool":
+		unobserved := make(map[string]any, len(call))
+		for key, value := range call {
+			unobserved[key] = value
+		}
+		unobserved["id"] = "unobserved-mcp"
+		if mode == "capture-unobserved-mcp-invalid-tool" {
+			unobserved["tool"] = "unissued-tool"
+		}
+		last["items"] = append(last["items"].([]any), unobserved)
+	case "capture-in-progress":
+		last["status"] = "inProgress"
+	case "capture-extra-turn":
+		history = append(history, map[string]any{"id": "unobserved-turn", "status": "completed", "items": []any{}, "error": nil})
+	case "capture-unsupported-anchor", "capture-wrong-turn-unsupported", "capture-answer-drift-unsupported", "capture-prefix-drift-unsupported":
+		last["itemsView"] = "notLoaded"
+		if mode == "capture-wrong-turn-unsupported" {
+			last["id"] = "foreign-turn"
+		}
+		if mode == "capture-answer-drift-unsupported" {
+			answer["text"] = "contradicts the observed completed item"
+		}
+	}
+	captureThread := thread(history)
+	switch mode {
+	case "capture-active":
+		captureThread["status"] = map[string]any{"type": "active", "activeFlags": []any{}}
+	case "capture-wrong-thread":
+		captureThread["id"] = "foreign-thread"
+	}
+	respond(capture, map[string]any{"thread": captureThread})
 	_, _ = io.Copy(io.Discard, input)
 	_ = os.WriteFile("eof-"+pid, nil, 0600)
 	if mode == "nonzero-exit" {
@@ -376,7 +485,7 @@ func TestCodexSessionLatestWithoutSuccessfulReferenceIsBarrier(t *testing.T) {
 			}
 			r := e.Execute(context.Background(), request, nil)
 			want := OutcomeUnknown
-			if mode == "capture-error" || mode == "capture-wrong-turn" {
+			if mode == "capture-error" {
 				want = OutcomeSucceeded
 			}
 			if mode == "failed-turn" {
@@ -439,7 +548,7 @@ func TestCodexSessionPendingReferenceWaitsForDeliveryFence(t *testing.T) {
 }
 
 func TestCodexSessionReusedTurnIDAndCapturePrefixDrift(t *testing.T) {
-	for _, mode := range []string{"reused-turn", "capture-prefix-drift"} {
+	for _, mode := range []string{"reused-turn", "capture-prefix-drift", "capture-prefix-drift-unsupported"} {
 		t.Run(mode, func(t *testing.T) {
 			selected, config, request := appServerSessionFixture(t)
 			e, err := NewCodexAppServerSessionExecutor(selected, config, []string{"read_channel"}, CodexAppServerSessionOptions{}, 5*time.Second)
@@ -457,11 +566,7 @@ func TestCodexSessionReusedTurnIDAndCapturePrefixDrift(t *testing.T) {
 			}
 			request.RunID, request.Prompt = "second", "second independent input"
 			r := e.Execute(context.Background(), request, nil)
-			want := OutcomeSucceeded
-			if mode == "reused-turn" {
-				want = OutcomeUnknown
-			}
-			if r.Outcome != want || r.NativeRef != nil || !r.DirectChildReaped {
+			if r.Outcome != OutcomeUnknown || r.NativeRef != nil || !r.DirectChildReaped {
 				t.Fatal("old turn acceptance or changed history prefix was adopted")
 			}
 		})

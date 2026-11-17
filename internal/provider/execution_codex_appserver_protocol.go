@@ -249,6 +249,8 @@ type codexAppServerProtocol struct {
 	before                codexAppServerConfigSnapshot
 	buffer                []codexRPCMessage
 	bufferBytes           int
+	resumeUsageTurnIDs    []string
+	resumeUsageBytes      int
 	items                 map[string]codexAppServerItem
 	requests              map[string]bool
 	damaged               bool
@@ -286,7 +288,8 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 	}
 	if message.Method != nil {
 		method := *message.Method
-		provisional := p.awaiting == 3 && slices.Contains([]string{"thread/status/changed", "thread/name/updated", "thread/project/updated", "mcpServer/startupStatus/updated"}, method) || p.awaiting == 5 &&
+		resumeMetadata := p.session != nil && p.session.resume != nil && (method == "thread/goal/cleared" || method == "thread/tokenUsage/updated")
+		provisional := p.awaiting == 3 && (resumeMetadata || slices.Contains([]string{"thread/status/changed", "thread/name/updated", "thread/project/updated", "mcpServer/startupStatus/updated"}, method)) || p.awaiting == 5 &&
 			(strings.HasPrefix(method, "turn/") || strings.HasPrefix(method, "item/") || strings.HasPrefix(method, "hook/") || strings.HasPrefix(method, "model/") || method == "thread/tokenUsage/updated" || method == "error")
 		if provisional {
 			size := len(method) + len(message.Params) + len(message.ID)
@@ -363,6 +366,8 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			}
 			method := "thread/start"
 			if p.session != nil {
+				// Disable persisted autonomous goals before native thread initialization.
+				threadConfig["features"].(map[string]any)["goals"] = false
 				params["modelProvider"] = p.session.provider
 				params["approvalsReviewer"] = "user"
 				threadConfig["approvals_reviewer"] = "user"
@@ -454,8 +459,8 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 		}
 		p.startTurn()
 	case 9:
-		// Capture is optional. A well-formed read error or unavailable anchor
-		// drops only the reference, never invents or erases native evidence.
+		// Optional anchor unavailability drops only the reference. Positive
+		// contradictory evidence instead fences settlement inside verification.
 		if message.Error == nil {
 			p.verifySessionHistory(message.Result, true)
 		}
@@ -600,6 +605,39 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 	if !valid || threadID != p.threadID || p.threadID == "" {
 		p.fail()
 		return
+	}
+	if p.session != nil && p.session.resume != nil {
+		if method == "thread/goal/cleared" {
+			// 0.166's empty goal snapshot is thread-only passive metadata, not
+			// permission to adopt a goal or native autonomous work.
+			goal, err := codexAppServerMap(message.Params)
+			if err != nil || message.ID != nil || len(goal) != 1 {
+				p.fail()
+			}
+			return
+		}
+		if method == "thread/tokenUsage/updated" {
+			id, valid := codexAppServerString(fields, "turnId")
+			if message.ID != nil || !valid {
+				p.fail()
+				return
+			}
+			if p.session.priorTurnIDs == nil {
+				// Retain only bounded attribution IDs until the writer-held full
+				// history matches the supplied anchor. No current identity is granted.
+				size := len(method) + len(message.Params)
+				if len(p.resumeUsageTurnIDs) >= executionFramesCountLimit || size > executionFramesByteLimit-p.resumeUsageBytes {
+					p.fail()
+					return
+				}
+				p.resumeUsageTurnIDs = append(p.resumeUsageTurnIDs, id)
+				p.resumeUsageBytes += size
+				return
+			}
+			if p.session.priorTurnIDs[id] {
+				return // Delayed replay may race the new turn; only verified old IDs qualify.
+			}
+		}
 	}
 	if method == "thread/name/updated" || method == "thread/project/updated" {
 		key := "threadName"
@@ -938,43 +976,101 @@ func (h codexSessionPublicHistory) matches(ref *CodexNativeSessionReference) boo
 	return last["id"] == ref.NativeTurnID && last["status"] == "completed"
 }
 
+type codexSessionHistoryEvidence uint8
+
+const (
+	codexSessionHistoryUnavailable codexSessionHistoryEvidence = iota
+	codexSessionHistoryComplete
+	codexSessionHistoryConflict
+)
+
 func (p *codexAppServerProtocol) sessionHistory(raw json.RawMessage) (codexSessionPublicHistory, bool) {
+	history, evidence := p.sessionHistoryEvidence(raw, false)
+	return history, evidence == codexSessionHistoryComplete
+}
+
+func (p *codexAppServerProtocol) sessionHistoryEvidence(raw json.RawMessage, capture bool) (codexSessionPublicHistory, codexSessionHistoryEvidence) {
 	var history codexSessionPublicHistory
 	if len(raw) > codexRPCFrameLimit {
-		return history, false
+		return history, codexSessionHistoryUnavailable
 	}
 	decoded, err := nativeSessionJSON(raw, 64, false)
 	response, ok := decoded.(map[string]any)
 	if err != nil || !ok {
-		return history, false
+		return history, codexSessionHistoryUnavailable
 	}
 	thread, ok := response["thread"].(map[string]any)
-	if !ok || thread["id"] != p.threadID || thread["ephemeral"] != false || thread["parentThreadId"] != nil || thread["forkedFromId"] != nil ||
-		thread["cliVersion"] != "0.166.0" || thread["source"] != "appServer" || thread["cwd"] != p.request.CWD || thread["modelProvider"] != p.session.provider {
-		return history, false
+	if !ok {
+		return history, codexSessionHistoryUnavailable
 	}
+	if thread["id"] != p.threadID || thread["ephemeral"] != false || thread["parentThreadId"] != nil || thread["forkedFromId"] != nil ||
+		thread["cliVersion"] != "0.166.0" || thread["source"] != "appServer" || thread["cwd"] != p.request.CWD || thread["modelProvider"] != p.session.provider {
+		return history, codexSessionHistoryConflict
+	}
+	// Active is a native projection, not proof of newly spawned work. It still
+	// prevents proving absence of other activity after the observed terminal.
 	status, ok := thread["status"].(map[string]any)
-	if !ok || len(status) != 1 || status["type"] != "idle" {
-		return history, false
+	if ok && status["type"] != "idle" {
+		return history, codexSessionHistoryConflict
+	}
+	evidence := codexSessionHistoryComplete
+	if !ok || len(status) != 1 {
+		evidence = codexSessionHistoryUnavailable
 	}
 	turns, ok := thread["turns"].([]any)
-	if !ok || len(turns) == 0 || len(turns) > codexSessionHistoryTurnLimit {
-		return history, false
+	if !ok {
+		return history, codexSessionHistoryUnavailable
+	}
+	if len(turns) > codexSessionHistoryTurnLimit {
+		evidence = codexSessionHistoryUnavailable
+	}
+	if len(turns) == 0 {
+		return history, codexSessionHistoryConflict
+	}
+	if capture {
+		expectedTurns := 1
+		if p.session.resume != nil {
+			expectedTurns += p.session.resume.HistoryTurns
+		}
+		last, ok := turns[len(turns)-1].(map[string]any)
+		if len(turns) != expectedTurns || !ok || last["id"] != p.turnID {
+			return history, codexSessionHistoryConflict
+		}
+		if p.session.resume != nil {
+			prior, ok := turns[len(turns)-2].(map[string]any)
+			if !ok || prior["id"] != p.session.resume.NativeTurnID {
+				return history, codexSessionHistoryConflict
+			}
+		}
 	}
 	turnIDs, itemIDs := map[string]bool{}, map[string]bool{}
 	history.turns = make([]any, 0, len(turns))
-	for _, value := range turns {
+	prefixComplete := true
+	for index, value := range turns {
+		if capture && index == len(turns)-1 && p.session.resume != nil && prefixComplete && !history.matches(p.session.resume) {
+			return codexSessionPublicHistory{}, codexSessionHistoryConflict
+		}
 		turn, ok := value.(map[string]any)
 		id, idOK := turn["id"].(string)
 		items, itemsOK := turn["items"].([]any)
-		if !ok || !idOK || !codexAppServerIdentity(id) || turnIDs[id] || turn["status"] != "completed" || turn["error"] != nil || !itemsOK ||
-			turn["itemsView"] != nil && turn["itemsView"] != "full" || len(items) > codexSessionHistoryItemLimit-history.items {
-			return codexSessionPublicHistory{}, false
+		if !ok || !idOK || !codexAppServerIdentity(id) || turnIDs[id] || turn["status"] != "completed" || turn["error"] != nil {
+			return codexSessionPublicHistory{}, codexSessionHistoryConflict
+		}
+		if capture && index < len(turns)-1 && !p.session.priorTurnIDs[id] {
+			return codexSessionPublicHistory{}, codexSessionHistoryConflict
+		}
+		if !itemsOK || turn["itemsView"] != nil && turn["itemsView"] != "full" {
+			evidence, prefixComplete = codexSessionHistoryUnavailable, false
+		}
+		if len(items) > codexSessionHistoryItemLimit-history.items {
+			// The frame is already bounded to 1 MiB. Stop anchor qualification,
+			// not evidence inspection: later items can still prove external work.
+			evidence = codexSessionHistoryUnavailable
 		}
 		if root := turn["rootTurnId"]; root != nil {
 			rootID, ok := root.(string)
 			if !ok || !codexAppServerIdentity(rootID) {
-				return codexSessionPublicHistory{}, false
+				return codexSessionPublicHistory{}, codexSessionHistoryConflict
 			}
 		}
 		turnIDs[id] = true
@@ -982,20 +1078,36 @@ func (p *codexAppServerProtocol) sessionHistory(raw json.RawMessage) (codexSessi
 		for _, value := range items {
 			item, ok := value.(map[string]any)
 			if !ok {
-				return codexSessionPublicHistory{}, false
+				evidence, prefixComplete = codexSessionHistoryUnavailable, false
+				continue
+			}
+			kind, _ := item["type"].(string)
+			if kind != "" && !slices.Contains([]string{"userMessage", "agentMessage", "reasoning", "plan", "contextCompaction", "mcpToolCall"}, kind) ||
+				kind == "mcpToolCall" && item["status"] != "completed" {
+				return codexSessionPublicHistory{}, codexSessionHistoryConflict
 			}
 			projected, valid := codexSessionPublicItem(item, p.member.names)
-			id, _ := projected["id"].(string)
-			if !valid || itemIDs[id] {
-				return codexSessionPublicHistory{}, false
+			id, _ := item["id"].(string)
+			if itemIDs[id] {
+				return codexSessionPublicHistory{}, codexSessionHistoryConflict
 			}
 			itemIDs[id] = true
+			if !valid {
+				if kind == "mcpToolCall" {
+					return codexSessionPublicHistory{}, codexSessionHistoryConflict
+				}
+				evidence, prefixComplete = codexSessionHistoryUnavailable, false
+				continue // Unsupported passive content must not hide later external evidence.
+			}
+			if capture && index == len(turns)-1 && !p.capturedSessionItemMatches(projected) {
+				return codexSessionPublicHistory{}, codexSessionHistoryConflict
+			}
 			projectedItems = append(projectedItems, projected)
 		}
-		history.items += len(projectedItems)
+		history.items += len(items)
 		history.turns = append(history.turns, map[string]any{"id": id, "rootTurnId": turn["rootTurnId"], "status": "completed", "items": projectedItems, "error": nil})
 	}
-	return history, true
+	return history, evidence
 }
 
 func codexSessionPublicItem(item map[string]any, tools []string) (map[string]any, bool) {
@@ -1083,9 +1195,33 @@ func codexSessionPublicItem(item map[string]any, tools []string) (map[string]any
 	return projected, true
 }
 
-func (p *codexAppServerProtocol) verifySessionHistory(raw json.RawMessage, capture bool) bool {
-	history, valid := p.sessionHistory(raw)
-	if !valid {
+func (p *codexAppServerProtocol) capturedSessionItemMatches(item map[string]any) bool {
+	id, kind := item["id"].(string), item["type"].(string)
+	known, exists := p.items[id]
+	if exists && (known.kind != kind || !known.completed) {
+		return false
+	}
+	switch kind {
+	case "userMessage":
+		content := item["content"].([]any)
+		return len(content) == 1 && content[0].(map[string]any)["text"] == p.request.Prompt
+	case "mcpToolCall":
+		_, valid := p.memberItem(mustCodexAppServerJSON(item), true)
+		return valid
+	case "agentMessage":
+		return exists && known.kind == kind && known.textHash == sha256.Sum256([]byte(item["text"].(string)))
+	case "reasoning":
+		return exists && known.kind == kind
+	}
+	return false
+}
+
+func (p *codexAppServerProtocol) verifySessionHistory(raw json.RawMessage, capture bool) (verified bool) {
+	history, evidence := p.sessionHistoryEvidence(raw, capture)
+	if evidence != codexSessionHistoryComplete {
+		if capture && evidence == codexSessionHistoryConflict {
+			p.external = true
+		}
 		return false
 	}
 	s := p.session
@@ -1097,51 +1233,30 @@ func (p *codexAppServerProtocol) verifySessionHistory(raw json.RawMessage, captu
 		for _, value := range history.turns {
 			s.priorTurnIDs[value.(map[string]any)["id"].(string)] = true
 		}
+		for _, id := range p.resumeUsageTurnIDs {
+			if !s.priorTurnIDs[id] {
+				return false
+			}
+		}
+		p.resumeUsageTurnIDs, p.resumeUsageBytes = nil, 0
 		return true
 	}
-	expectedTurns := 1
-	if s.resume != nil {
-		expectedTurns += s.resume.HistoryTurns
-	}
-	if len(history.turns) != expectedTurns {
-		return false
-	}
+	defer func() {
+		if !verified {
+			// Preserve the real terminal and normal close/drain/join/Wait path,
+			// but never release based on success contradicted by full history.
+			p.external = true
+		}
+	}()
 	last := history.turns[len(history.turns)-1].(map[string]any)
 	items := last["items"].([]any)
-	if last["id"] != p.turnID || last["status"] != "completed" {
-		return false
-	}
-	if s.resume != nil {
-		prefix := codexSessionPublicHistory{turns: history.turns[:len(history.turns)-1], items: history.items - len(items)}
-		if !prefix.matches(s.resume) {
-			return false
-		}
-	}
 	seen, users := map[string]bool{}, 0
 	for _, value := range items {
 		item := value.(map[string]any)
 		id, kind := item["id"].(string), item["type"].(string)
 		seen[id] = true
-		known, exists := p.items[id]
-		switch kind {
-		case "userMessage":
+		if kind == "userMessage" {
 			users++
-			content := item["content"].([]any)
-			if len(content) != 1 || content[0].(map[string]any)["text"] != p.request.Prompt {
-				return false
-			}
-		case "mcpToolCall":
-			if _, ok := p.memberItem(mustCodexAppServerJSON(item), true); !ok {
-				return false
-			}
-		case "agentMessage":
-			if !exists || !known.completed || known.kind != kind || known.textHash != sha256.Sum256([]byte(item["text"].(string))) {
-				return false
-			}
-		case "reasoning":
-			if !exists || !known.completed || known.kind != kind {
-				return false
-			}
 		}
 	}
 	if users != 1 {
