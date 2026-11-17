@@ -121,6 +121,7 @@ async function fillMembers() {
 async function fillDiscussion() {
   await screen.findByText("尚无消息，可发送第一条讨论。");
   change("消息内容", "  保留消息\n原文  ");
+  fireEvent.click(screen.getByText("发送选项", { selector: "summary" }));
   fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: "selected" } });
   fireEvent.click(screen.getByRole("checkbox", { name: `${member.name} · ${member.role} · ${member.id}` }));
 }
@@ -225,6 +226,7 @@ it("Discussion keeps content and routing locked through 404/409 without reroutin
   const original = form("发送消息"); submit("发送消息"); await unknown("发送消息");
   frozen("发送消息", "重试同一次发送");
   view.rerender(frame(other.id)); change("消息内容", "B 消息草稿");
+  fireEvent.click(within(form("发送消息")).getByText("发送选项", { selector: "summary" }));
   fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: "public" } });
   view.rerender(frame(group.id));
   for (const status of [404, 409]) {

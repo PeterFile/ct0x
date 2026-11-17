@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { Tasks } from "./Tasks";
 import type { Group } from "./api";
@@ -118,22 +118,37 @@ beforeEach(() => {
   });
   vi.stubGlobal("fetch", requests);
 });
-afterEach(() => { vi.unstubAllGlobals(); expect(unexpected).toEqual([]); });
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); expect(unexpected).toEqual([]); });
 
 async function lookupKnown(id = receiptFor().id) {
   change(dispatch().getByRole("textbox", { name: "已知分派请求标识" }), id);
   fireEvent.submit(dispatch().getByRole("form", { name: "读取已知请求" })); await flush();
 }
-it("mounts an explicit execution read for a known request without changing dispatch or user Review", async () => {
+it("automatically reads known execution receipts and retains explicit refresh without changing dispatch or user Review", async () => {
   await open(); await lookupKnown();
   const execution = within(dispatch().getByRole("region", { name: "执行回执" }));
   expect(execution.getByText(/执行不等于任务提交或用户验收/)).toBeVisible();
   expect(execution.getByRole("button", { name: "刷新执行回执" })).toBeEnabled();
-  expect(executionReads).not.toHaveBeenCalled();
-  fireEvent.click(execution.getByRole("button", { name: "刷新执行回执" })); await flush();
   expect(executionReads).toHaveBeenCalledTimes(1);
+  fireEvent.click(execution.getByRole("button", { name: "刷新执行回执" })); await flush();
+  expect(executionReads).toHaveBeenCalledTimes(2);
   expect(executionReads.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/tasks/${currentTask.id}/dispatch-requests/${receiptFor().id}/execution`);
   expect(execution.getAllByText(/尚未观测到轮次/)).toHaveLength(2);
+  expect(dispatchWrites).not.toHaveBeenCalled(); expect(taskWrites).not.toHaveBeenCalled();
+});
+it("automatically follows a known request while expanded, and stops its reads when hidden", async () => {
+  vi.useFakeTimers(); const view = render(ui(group)); await flush();
+  fireEvent.click(panel().getByRole("button", { name: `${currentTask.title}，待交付` })); await flush();
+  const execution = deferred<Response>(); executionReads.mockReturnValueOnce(execution.promise);
+  await expand(); await lookupKnown(); const executionSignal = executionReads.mock.calls[0][1]?.signal;
+  const receipt = receiptFor(); views.set(receipt.id, viewFor(receipt, "enqueued", 2));
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(state().getByText("已进入协调员投递队列")).toBeVisible();
+  expect(stateReads).toHaveBeenCalledTimes(2);
+  expect(executionSignal?.aborted).toBe(false); expect(executionReads).toHaveBeenCalledTimes(1);
+  view.rerender(ui(null)); expect(executionSignal?.aborted).toBe(true); const count = requests.mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(20000); });
+  expect(requests).toHaveBeenCalledTimes(count);
   expect(dispatchWrites).not.toHaveBeenCalled(); expect(taskWrites).not.toHaveBeenCalled();
 });
 it.each(["7.0000000000000001", "9007199254740991.4"])("[repair 1] rejects the raw Task revision %s before any POST", async token => {

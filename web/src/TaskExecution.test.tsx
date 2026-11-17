@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { TaskExecution } from "./TaskExecution";
 import type { DispatchExecution, ExecutionTurnState } from "./dispatch-execution-api";
@@ -23,14 +23,14 @@ const panel = () => within(screen.getByRole("region", { name: "执行回执" }))
 const refresh = () => fireEvent.click(panel().getByRole("button", { name: "刷新执行回执" }));
 const flush = async () => { await act(async () => {}); };
 beforeEach(() => { transport.mockReset(); vi.stubGlobal("fetch", transport); });
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-it("reads only on explicit refresh and distinguishes coordinator, worker, submission and user Review", async () => {
+it("reads on opening and distinguishes coordinator, worker, submission and user Review", async () => {
   transport.mockResolvedValueOnce(json(execution()));
   render(<TaskExecution {...props} />);
-  expect(transport).not.toHaveBeenCalled();
+  expect(transport).toHaveBeenCalledTimes(1);
   expect(panel().getByText(/执行不等于任务提交或用户验收/)).toBeVisible();
-  refresh(); await flush();
+  await flush();
   const coordinator = within(panel().getByRole("region", { name: "协调员执行" }));
   const worker = within(panel().getByRole("region", { name: "执行成员执行" }));
   expect(coordinator.getByText("执行成功")).toBeVisible();
@@ -46,7 +46,7 @@ it.each([
   ["truncated", "执行输出被截断"], ["not_started", "执行未启动"],
 ] as const)("renders the actual %s state without deriving it from assignment or receipt absence", async (state, label) => {
   transport.mockResolvedValueOnce(json(execution(state)));
-  render(<TaskExecution {...props} />); refresh(); await flush();
+  render(<TaskExecution {...props} />); await flush();
   expect(within(panel().getByRole("region", { name: "执行成员执行" })).getByText(label)).toBeVisible();
 });
 it("shows native terminal separately from unknown outcome and reports output, direct child, logs and delivery observations", async () => {
@@ -54,7 +54,7 @@ it("shows native terminal separately from unknown outcome and reports output, di
   const receipt = { started: true, accepted: false, outcome: "unknown", terminal: "succeeded", delivery_failed: true, native_session_id: "native-worker",
     direct_child_reaped: false, output_complete: false, exit_code: -1, logs_truncated: true };
   transport.mockResolvedValueOnce(json({ ...value, worker_turn: { ...value.worker_turn, receipt } }));
-  render(<TaskExecution {...props} />); refresh(); await flush();
+  render(<TaskExecution {...props} />); await flush();
   const worker = within(panel().getByRole("region", { name: "执行成员执行" }));
   expect(worker.getByText("执行结果未知，需对账")).toBeVisible();
   expect(worker.getByText(/原生终态证据：执行成功/)).toBeVisible();
@@ -68,40 +68,41 @@ it("shows native terminal separately from unknown outcome and reports output, di
 it("does not turn a queued assignment or absent Turn into not_started or running", async () => {
   const value = { ...execution(), assignment_dispatch_status: "pending", binding: null, worker_turn: null };
   transport.mockResolvedValueOnce(json(value));
-  render(<TaskExecution {...props} />); refresh(); await flush();
+  render(<TaskExecution {...props} />); await flush();
   const worker = within(panel().getByRole("region", { name: "执行成员执行" }));
   expect(worker.getByText(/尚未观测到轮次/)).toBeVisible();
   expect(worker.queryByText("运行中")).not.toBeInTheDocument(); expect(worker.queryByText("执行未启动")).not.toBeInTheDocument();
 });
 it.each(["requestId", "groupId", "taskId"] as const)("clears evidence synchronously and aborts/ignores old work when %s changes", async field => {
-  const result = render(<TaskExecution {...props} />);
-  transport.mockResolvedValueOnce(json(execution("running"))); refresh(); await flush();
+  transport.mockResolvedValueOnce(json(execution("running")));
+  const result = render(<TaskExecution {...props} />); await flush();
   expect(panel().getByText("native-worker")).toBeVisible();
   const late = deferred<Response>(); transport.mockReturnValueOnce(late.promise); refresh();
   const oldSignal = transport.mock.calls[1][1]?.signal;
-  result.rerender(<TaskExecution {...props} {...{ [field]: "other" }} />);
+  const current = { ...props, [field]: "other" }, fresh = deferred<Response>(); transport.mockReturnValueOnce(fresh.promise);
+  result.rerender(<TaskExecution {...current} />);
   expect(oldSignal?.aborted).toBe(true);
   expect(panel().queryByText("native-worker")).not.toBeInTheDocument();
   await act(async () => late.resolve(json(execution("succeeded"))));
   expect(panel().queryByText("native-worker")).not.toBeInTheDocument();
-  const current = { ...props, [field]: "other" };
-  transport.mockResolvedValueOnce(json(execution("failed", current.requestId, current.groupId, current.taskId))); refresh(); await flush();
+  await act(async () => fresh.resolve(json(execution("failed", current.requestId, current.groupId, current.taskId))));
   expect(panel().getByText("执行失败")).toBeVisible();
 });
-it("drops displayed and in-flight evidence when hidden and does not restore it on reopening", async () => {
-  const result = render(<TaskExecution {...props} />);
-  transport.mockResolvedValueOnce(json(execution("running"))); refresh(); await flush();
+it("drops hidden evidence and automatically reads a fresh sample on reopening", async () => {
+  transport.mockResolvedValueOnce(json(execution("running")));
+  const result = render(<TaskExecution {...props} />); await flush();
   const late = deferred<Response>(); transport.mockReturnValueOnce(late.promise); refresh();
   const signal = transport.mock.calls[1][1]?.signal;
   result.rerender(<TaskExecution {...props} active={false} />);
   expect(signal?.aborted).toBe(true); expect(screen.queryByRole("region", { name: "执行回执" })).not.toBeInTheDocument();
   await act(async () => late.resolve(json(execution("succeeded"))));
-  result.rerender(<TaskExecution {...props} />);
-  expect(panel().queryByText("native-worker")).not.toBeInTheDocument(); expect(transport).toHaveBeenCalledTimes(2);
+  transport.mockResolvedValueOnce(json(execution("failed"))); result.rerender(<TaskExecution {...props} />);
+  expect(panel().queryByText("native-worker")).not.toBeInTheDocument(); expect(transport).toHaveBeenCalledTimes(3);
+  await flush(); expect(panel().getByText("执行失败")).toBeVisible();
 });
 it.each(["failure", "malformed", "wrong-group", "wrong-task", "wrong-request"])("removes stale evidence after %s without writes", async fault => {
-  render(<TaskExecution {...props} />);
-  transport.mockResolvedValueOnce(json(execution("running"))); refresh(); await flush();
+  transport.mockResolvedValueOnce(json(execution("running")));
+  render(<TaskExecution {...props} />); await flush();
   if (fault === "failure") transport.mockRejectedValueOnce(new Error("PRIVATE"));
   else transport.mockResolvedValueOnce(json(fault === "malformed" ? {} : { ...execution(),
     [fault === "wrong-group" ? "group_id" : fault === "wrong-task" ? "task_id" : "request_id"]: "foreign" }));
@@ -111,8 +112,8 @@ it.each(["failure", "malformed", "wrong-group", "wrong-task", "wrong-request"])(
   expect(panel().getByRole("alert")).not.toHaveTextContent("PRIVATE");
 });
 it("ignores a superseded refresh even if transport resolves after abort", async () => {
+  const late = deferred<Response>(); transport.mockReturnValueOnce(late.promise);
   render(<TaskExecution {...props} />);
-  const late = deferred<Response>(); transport.mockReturnValueOnce(late.promise); refresh();
   const signal = transport.mock.calls[0][1]?.signal;
   transport.mockResolvedValueOnce(json(execution("failed"))); refresh(); await flush();
   expect(signal?.aborted).toBe(true);
@@ -121,8 +122,29 @@ it("ignores a superseded refresh even if transport resolves after abort", async 
 });
 it("aborts and ignores an unmounted read", async () => {
   const late = deferred<Response>(); transport.mockReturnValueOnce(late.promise);
-  const result = render(<TaskExecution {...props} />); refresh(); const signal = transport.mock.calls[0][1]?.signal;
+  const result = render(<TaskExecution {...props} />); const signal = transport.mock.calls[0][1]?.signal;
   result.unmount(); expect(signal?.aborted).toBe(true);
   await act(async () => late.resolve(json(execution())));
   expect(screen.queryByRole("region", { name: "执行回执" })).not.toBeInTheDocument();
+});
+it("automatically reads active execution evidence and polls without requiring a refresh click", async () => {
+  vi.useFakeTimers(); transport.mockResolvedValueOnce(json(execution("running")));
+  render(<TaskExecution {...props} />); await flush();
+  expect(panel().getByText("运行中")).toBeVisible();
+  transport.mockResolvedValueOnce(json(execution("unknown")));
+  await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+  expect(panel().getByText("执行结果未知，需对账")).toBeVisible();
+  expect(panel().queryByText("运行中")).not.toBeInTheDocument();
+  expect(transport).toHaveBeenCalledTimes(2);
+  expect(transport.mock.calls.every(([, init]) => init?.method === "GET")).toBe(true);
+});
+it("waits for a slow execution read before scheduling another and clears the timer when hidden", async () => {
+  vi.useFakeTimers(); const pending = deferred<Response>(); transport.mockReturnValueOnce(pending.promise);
+  const view = render(<TaskExecution {...props} />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(20000); });
+  expect(transport).toHaveBeenCalledTimes(1);
+  await act(async () => pending.resolve(json(execution("running"))));
+  view.rerender(<TaskExecution {...props} active={false} />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(20000); });
+  expect(transport).toHaveBeenCalledTimes(1);
 });

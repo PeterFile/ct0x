@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { ApiError } from "./api";
 import { TaskExecution } from "./TaskExecution";
+import { useActiveRefresh } from "./useActiveRefresh";
 import type { Task } from "./task-api";
 import { getDispatchRequest, getDispatchTask, getTaskCoordination, isDispatchRequestDefinitiveRejection, requestDispatch } from "./dispatch-request-api";
 import type { DispatchRequest, DispatchRequestInput, DispatchState, DispatchView, TaskCoordinationView } from "./dispatch-request-api";
@@ -65,12 +66,13 @@ export function TaskDispatch({ groupId, taskId, active }: { groupId: string; tas
   const readRound = useRef(0);
   const recoveryRound = useRef(0);
   const [knownId, setKnownId] = useState("");
-  const [lookup, setLookup] = useState({ id: "", version: 0 });
+  const [lookup, setLookup] = useState<{ id: string; version: number; background?: boolean }>({ id: "", version: 0 });
   const [reading, setReading] = useState<{ pending: boolean; error: string; view: DispatchView | null }>({ pending: false, error: "", view: null });
   const observed = useRef(new Map<string, DispatchView>());
   const enabled = active && expanded;
   const visible = useRef(enabled);
   visible.current = enabled;
+  useActiveRefresh(enabled && !!lookup.id, reading.pending, () => setLookup(value => ({ ...value, version: value.version + 1, background: true })));
   function updateMutation(change: (previous: Mutation) => Mutation) {
     const next = change(mutationRef.current); mutationRef.current = next; setMutation(next);
   }
@@ -102,7 +104,7 @@ export function TaskDispatch({ groupId, taskId, active }: { groupId: string; tas
     if (!enabled || !lookup.id) return;
     let ignore = false;
     const controller = new AbortController(), id = lookup.id;
-    setReading({ pending: true, error: "", view: null });
+    setReading(previous => ({ pending: true, error: "", view: lookup.background && previous.view?.request.id === id ? previous.view : null }));
     void getDispatchRequest(groupId, taskId, id, controller.signal).then(incoming => {
       if (ignore) return;
       const old = observed.current.get(id), receipt = mutationRef.current.receipt;
@@ -196,7 +198,7 @@ export function TaskDispatch({ groupId, taskId, active }: { groupId: string; tas
             <legend>显式发起分派</legend><label htmlFor={`${formId}-reason`}>分派理由</label>
             <textarea id={`${formId}-reason`} required value={reason} onChange={event => setReason(event.target.value)} />
           </fieldset>
-          <p className="tasks-note">任务与授权为分开读取；最终由服务端核对当前版本。配置保存、消息或授权登记都不会自动发起分派。</p>
+          <p className="tasks-note">此处仅显式登记分派。任务与授权为分开读取，最终由服务端核对当前版本。</p>
           <button type="submit" disabled={blocked}>确认发起分派</button>
         </form>
         {mutation.pending ? <p role="status">正在等待原分派登记回执…</p> : null}
@@ -235,12 +237,12 @@ export function TaskDispatch({ groupId, taskId, active }: { groupId: string; tas
             {view.state.last_error_code ? <p>协调检查错误：{view.state.last_error_code}</p> : null}
             {view.state.delivery ? <dl><dt>协调员投递回执</dt><dd className="tasks-meta">{view.state.delivery.delivery_id}</dd>
               <dt>协调消息</dt><dd className="tasks-meta">{view.state.delivery.message_id}</dd></dl> : null}
-            <p className="tasks-note">投递或分配不表示 CLI 已接收、执行成员已运行或成果已接纳；执行证据请显式刷新下方执行回执，提交与用户验收仍独立。</p>
+            <p className="tasks-note">投递或分配不表示 CLI 已接收、执行成员已运行或成果已接纳；当前面板自动读取已知请求与执行回执，提交与用户验收仍独立。</p>
           </> : null}
-          <button type="button" disabled={!enabled || !lookup.id} onClick={() => setLookup(value => ({ ...value, version: value.version + 1 }))}>刷新请求状态</button>
+          <button type="button" disabled={!enabled || !lookup.id} onClick={() => setLookup(value => ({ ...value, version: value.version + 1, background: false }))}>刷新请求状态</button>
         </section>
         {lookup.id ? <TaskExecution groupId={groupId} taskId={taskId} requestId={lookup.id}
-          active={enabled && !reading.pending && !reading.error && view?.request.id === lookup.id} /> : null}
+          active={enabled && !reading.error && view?.request.id === lookup.id} /> : null}
       </div>
     </div>
   </section>;

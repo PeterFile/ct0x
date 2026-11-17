@@ -13,7 +13,11 @@ const change = (value: string) => fireEvent.change(content(), { target: { value 
 const submit = () => fireEvent.submit(panel().getByRole("form", { name: "发送消息" }));
 const select = (name: string) => fireEvent.click(screen.getByRole("button", { name }));
 const article = (id = message.id) => panel().getByRole("article", { name: `消息 ${id}` });
-const route = (value: string) => fireEvent.change(panel().getByRole("combobox", { name: "接收方式" }), { target: { value } });
+const route = (value: string) => {
+  const options = panel().getByText("发送选项", { selector: "summary" });
+  if (!options.closest("details")!.open) fireEvent.click(options);
+  fireEvent.change(panel().getByRole("combobox", { name: "接收方式" }), { target: { value } });
+};
 function expandDetails(record: HTMLElement) {
   const disclosure = record.querySelector("details");
   expect(disclosure).toBeInTheDocument();

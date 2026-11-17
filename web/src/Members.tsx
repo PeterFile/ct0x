@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { ApiError, createMember, isDefinitiveRejection, listMembers, listProviders } from "./api";
 import type { Member, MemberInput, Provider } from "./api";
 import { CreationDisclosure } from "./CreationDisclosure";
+import { MemberAvatar } from "./MemberAvatar";
 
 function unique<T extends { id: string }>(items: T[]) {
   const seen = new Set<string>();
@@ -34,8 +35,9 @@ function useCatalogue(enabled: boolean) {
 }
 
 type MemberListener = (groupId: string, members: Member[]) => void;
-export function Members({ groupId, onMembers, catalogueActive = true }: {
-  groupId?: string; onMembers?: MemberListener; catalogueActive?: boolean;
+type RecipientListener = (groupId: string, memberId: string) => void;
+export function Members({ groupId, onMembers, onRecipient, catalogueActive = true }: {
+  groupId?: string; onMembers?: MemberListener; onRecipient?: RecipientListener; catalogueActive?: boolean;
 }) {
   const [visited, setVisited] = useState<string[]>([]);
   useEffect(() => {
@@ -46,12 +48,14 @@ export function Members({ groupId, onMembers, catalogueActive = true }: {
     {!groupId ? <p className="empty-panel">请先选择群组，再查看成员。</p> : null}
     {/* Keep per-group operations alive across switches; hidden scopes cannot leak into the active UI. */}
     {visited.map(id => <div key={id} hidden={id !== groupId}>
-      <MemberScope groupId={id} active={id === groupId} catalogue={catalogue} onMembers={onMembers} />
+      <MemberScope groupId={id} active={id === groupId} catalogue={catalogue} onMembers={onMembers} onRecipient={onRecipient} />
     </div>)}
   </>;
 }
 
-function MemberScope({ groupId, active, catalogue, onMembers }: { groupId: string; active: boolean; catalogue: ReturnType<typeof useCatalogue>; onMembers?: MemberListener }) {
+function MemberScope({ groupId, active, catalogue, onMembers, onRecipient }: {
+  groupId: string; active: boolean; catalogue: ReturnType<typeof useCatalogue>; onMembers?: MemberListener; onRecipient?: RecipientListener;
+}) {
   const formId = useId();
   const [items, setItems] = useState<Member[]>([]);
   useEffect(() => { onMembers?.(groupId, items); }, [groupId, items, onMembers]);
@@ -127,7 +131,8 @@ function MemberScope({ groupId, active, catalogue, onMembers }: { groupId: strin
       {page.pending ? <p role="status">正在载入成员…</p> : null}
       {page.error ? <div role="alert"><p>{page.error}</p><button type="button" onClick={() => load(request.before)}>重试载入成员</button></div> : null}
       {!page.pending && !page.error && !items.length ? <p>尚无成员，可创建群内成员。</p> : null}
-      <ul className="group-list" aria-label="成员列表">{items.map(member => <li key={member.id}>
+      <ul className="group-list" aria-label="成员列表">{items.map(member => <li key={member.id} className={onRecipient ? "member-with-avatar" : undefined}>
+        {onRecipient && member.group_id === groupId ? <MemberAvatar member={member} onRecipient={() => onRecipient(groupId, member.id)} /> : null}
         <button type="button" aria-pressed={selectedId === member.id} onClick={() => setSelectedId(member.id)}>{member.name}</button>
       </li>)}</ul>
       {page.next ? <button type="button" disabled={page.pending} onClick={() => load(page.next)}>加载更多成员</button> : null}

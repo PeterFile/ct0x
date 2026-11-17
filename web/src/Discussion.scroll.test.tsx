@@ -91,6 +91,8 @@ async function openFallback() {
 function send() {
   const panel = within(scope());
   fireEvent.change(panel.getByRole("textbox", { name: "消息内容" }), { target: { value: raw } });
+  const options = panel.getByText("发送选项", { selector: "summary" });
+  if (!options.closest("details")!.open) fireEvent.click(options);
   fireEvent.change(panel.getByRole("combobox", { name: "接收方式" }), { target: { value: "public" } });
   fireEvent.submit(panel.getByRole("form", { name: "发送消息" }));
 }

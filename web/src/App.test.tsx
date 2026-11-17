@@ -402,6 +402,7 @@ describe("IM shell", () => {
     await screen.findByText("尚无消息，可发送第一条讨论。");
     expect(within(main()).getByRole("heading", { name: group.name })).toHaveFocus();
     expect(content()).toHaveAttribute("rows", "2");
+    fireEvent.click(screen.getByText("发送选项", { selector: "summary" }));
     fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: "selected" } });
     fireEvent.click(await screen.findByRole("checkbox", { name: recipientName }));
     expect(catalogue).not.toHaveBeenCalled(); expect(taskReads).not.toHaveBeenCalled(); expect(taskDetails).not.toHaveBeenCalled();
@@ -482,6 +483,7 @@ describe("IM shell", () => {
     expect(catalogue.mock.calls[0][1]?.signal?.aborted).toBe(true);
     expect(memberReads.mock.calls[0][1]?.signal?.aborted).toBe(false);
     await act(async () => roster.resolve(page([member])));
+    fireEvent.click(screen.getByText("发送选项", { selector: "summary" }));
     fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: "selected" } });
     fireEvent.click(await screen.findByRole("checkbox", { name: recipientName })); change(content(), "给指定成员的草稿");
     openMemberForm(); await screen.findByRole("option", { name: /pi.*账户已登录/ });
@@ -550,6 +552,7 @@ describe("IM shell", () => {
     await screen.findByText("尚无消息，可发送第一条讨论。");
     const originalInput = content(), composer = screen.getByRole("region", { name: "撰写消息" });
     const raw = "  切换期间保留\n原始消息  "; change(originalInput, raw);
+    fireEvent.click(screen.getByText("发送选项", { selector: "summary" }));
     fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: "selected" } });
     fireEvent.click(await screen.findByRole("checkbox", { name: recipientName }));
     showContext("任务"); showContext("搜索"); expect(composer).toBeInTheDocument(); expect(composer.closest("[hidden]") !== null).toBe(mobile);
@@ -628,6 +631,7 @@ describe("IM shell", () => {
     expect(JSON.parse(String(identity(memberWrites.mock.calls[0]).body))).toEqual({ name: member.name, role: member.role, provider_id: provider.id });
     expect(identity(memberWrites.mock.calls[0]).key).toMatch(/^[\da-f-]{36}$/);
     expect(field).toHaveValue(""); closeContext();
+    fireEvent.click(within(screen.getByRole("form", { name: "发送消息" })).getByText("发送选项", { selector: "summary" }));
     fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: "selected" } });
     expect(await screen.findByRole("checkbox", { name: recipientName })).toBeVisible();
     selectGroup(other.name); openMemberForm(); expect(screen.getByRole("textbox", { name: "成员名称" })).toHaveValue("B 的成员草稿");

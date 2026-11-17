@@ -164,6 +164,7 @@ describe("real Openbot rail interactions", () => {
     await screen.findByText("尚无消息，可发送第一条讨论。");
     const input = content(), composer = screen.getByRole("region", { name: "撰写消息" });
     const raw = "  保留原始消息\n切换不重发  "; change(input, raw);
+    fireEvent.click(screen.getByText("发送选项", { selector: "summary" }));
     fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: "selected" } });
     const recipientName = `${member.name} · ${member.role} · ${member.id}`;
     fireEvent.click(await screen.findByRole("checkbox", { name: recipientName }));

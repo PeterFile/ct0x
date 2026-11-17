@@ -1,9 +1,10 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection } from "./api";
 import type { Group } from "./api";
 import { CoordinationSettings } from "./CoordinationSettings";
 import { TaskDispatch } from "./TaskDispatch";
+import { useActiveRefresh } from "./useActiveRefresh";
 import { createTask, getTask, getTaskAttempt, getTaskSubmission, listTasks, registerTaskAttempt, reviewTask, submitTask } from "./task-api";
 import type { Task, TaskAttempt, TaskAttemptInput, TaskInput, TaskReview, TaskReviewInput, TaskSubmission, TaskSubmissionInput } from "./task-api";
 import "./tasks.css";
@@ -31,11 +32,15 @@ export function Tasks({ group }: { group: Group | null }) {
 function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
   const formId = useId();
   const [items, setItems] = useState<Task[]>([]);
-  const [request, setRequest] = useState({ before: "", version: 0 });
+  const [request, setRequest] = useState({ before: "", version: 0, background: false });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
-  const [selection, setSelection] = useState<{ id: string | null; version: number }>({ id: null, version: 0 });
+  const [selection, setSelection] = useState<{ id: string | null; version: number; background: boolean }>({ id: null, version: 0, background: false });
   const [detail, setDetail] = useState<{ task: Task | null; pending: boolean; error: string }>({ task: null, pending: false, error: "" });
   const [openedTasks, setOpenedTasks] = useState<string[]>([]);
+  const [evidencePending, setEvidencePending] = useState<Record<string, boolean>>({});
+  const reportEvidencePending = useCallback((id: string, pending: boolean) => {
+    setEvidencePending(previous => previous[id] === pending ? previous : { ...previous, [id]: pending });
+  }, []);
   const visible = useRef({ active, taskId: selection.id });
   visible.current = { active, taskId: selection.id };
   useEffect(() => {
@@ -50,8 +55,10 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
   const operation = useRef<{ key: string; input: TaskInput } | null>(null);
   const posting = useRef<AbortController | null>(null);
   const mounted = useRef(false);
-  const load = (before = "") => setRequest(previous => ({ before, version: previous.version + 1 }));
-  const select = (id: string | null = selection.id) => setSelection(previous => ({ id, version: previous.version + 1 }));
+  const load = (before = "", background = false) => setRequest(previous => ({ before, version: previous.version + 1, background }));
+  const select = (id: string | null = selection.id, background = false) => setSelection(previous => ({ id, version: previous.version + 1, background }));
+  useActiveRefresh(active, page.pending || detail.pending || Boolean(selection.id && evidencePending[selection.id]),
+    () => { load("", true); select(selection.id, true); });
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; posting.current?.abort(); };
@@ -75,9 +82,9 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
       });
       const protectedTasks = confirmed.current.map(receipt => receipt.task);
       const protectedIds = new Set(protectedTasks.map(task => task.id));
-      setItems(previous => [...protectedTasks, ...mergeTasks([...(request.before ? previous : []), ...result.items])
+      setItems(previous => [...protectedTasks, ...mergeTasks([...(request.before || request.background ? previous : []), ...result.items])
         .filter(task => !protectedIds.has(task.id))]);
-      setPage({ pending: false, error: "", next: result.next_cursor });
+      setPage(previous => ({ pending: false, error: "", next: request.background ? previous.next : result.next_cursor }));
     }, error => {
       if (!ignore) setPage(previous => ({ ...previous, pending: false, error: errorText(error) }));
     });
@@ -87,7 +94,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
     if (!active || !selection.id) { setDetail({ task: null, pending: false, error: "" }); return; }
     let ignore = false;
     const controller = new AbortController();
-    setDetail({ task: null, pending: true, error: "" });
+    setDetail(previous => ({ task: selection.background ? previous.task : null, pending: true, error: "" }));
     getTask(groupId, selection.id, controller.signal).then(task => {
       if (!ignore) setDetail({ task, pending: false, error: "" });
     }, error => {
@@ -134,6 +141,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
   const selected = detail.task?.id === selection.id ? detail.task : null;
   return <section className="tasks-scope" aria-label="群组任务">
     <header className="tasks-toolbar"><h2>任务</h2><button type="button" onClick={() => { load(); select(); }}>刷新任务</button></header>
+    <p className="tasks-note">当前面板自动读取任务与所选任务详情。</p>
     <p className="tasks-note">“待交付”不代表已开始执行；“已接纳”表示成果被接纳，不等同于 CLI 运行成功。</p>
     <CoordinationSettings groupId={groupId} active={active} />
     <div className="tasks-layout">
@@ -167,7 +175,8 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
         </> : null}
         {/* Retain each task's drafts and immutable operation without reading hidden tasks. */}
         {openedTasks.map(id => <div key={id} hidden={id !== selection.id}>
-          <TaskLifecycle groupId={groupId} taskId={id} task={active && selected?.id === id ? selected : null} onReceipt={refreshAfterReceipt} />
+          <TaskLifecycle groupId={groupId} taskId={id} task={active && selected?.id === id ? selected : null}
+            onReceipt={refreshAfterReceipt} onReading={reportEvidencePending} />
           <TaskDispatch groupId={groupId} taskId={id} active={active && selection.id === id} />
         </div>)}
       </section> : <p className="tasks-note">选择任务以读取最新详情。</p>}
@@ -195,8 +204,8 @@ type LifecycleOperation = { key: string } & (
 );
 type LifecycleReceipt = TaskAttempt | TaskSubmission | TaskReview;
 
-function TaskLifecycle({ groupId, taskId, task, onReceipt }: {
-  groupId: string; taskId: string; task: Task | null; onReceipt: (taskId: string) => void;
+function TaskLifecycle({ groupId, taskId, task, onReceipt, onReading }: {
+  groupId: string; taskId: string; task: Task | null; onReceipt: (taskId: string) => void; onReading: (taskId: string, pending: boolean) => void;
 }) {
   const formId = useId();
   const [summary, setSummary] = useState("");
@@ -242,6 +251,12 @@ function TaskLifecycle({ groupId, taskId, task, onReceipt }: {
   // Each authoritative Task object is a read epoch, also fencing the render before effects run.
   const loaded = content.task === task ? content : null;
   const attempt = loaded?.attempt, submission = loaded?.submission;
+  const reading = Boolean(task && (!loaded || loaded.pending));
+  useEffect(() => {
+    // Do not replace a Task read epoch while its authoritative evidence is still loading.
+    onReading(taskId, reading);
+    return () => onReading(taskId, false);
+  }, [taskId, reading, onReading]);
   const blocked = mutation.pending || mutation.uncertain;
   async function mutate(kind?: LifecycleOperation["kind"], outcome?: TaskReview["outcome"]) {
     if (posting.current || (operation.current && kind)) return;
@@ -326,12 +341,12 @@ function TaskLifecycle({ groupId, taskId, task, onReceipt }: {
           </ul> : <p className="tasks-note">无冻结成果版本，仅文本交付。</p>}
         </> : null}
       </section>
-      {task.status === "submitted" ? <fieldset disabled={blocked || !submission}>
+      {task.status === "submitted" ? <fieldset disabled={blocked || Boolean(loaded?.error)}>
         <legend>人工验收</legend><label htmlFor={`${formId}-reason`}>验收说明（可选）</label>
         <textarea id={`${formId}-reason`} value={reason} onChange={event => setReason(event.target.value)} />
         <div className="tasks-actions">
-          <button type="button" onClick={() => void mutate("review", "accepted")}>接纳交付</button>
-          <button type="button" onClick={() => void mutate("review", "rejected")}>退回修改</button>
+          <button type="button" disabled={!submission} onClick={() => void mutate("review", "accepted")}>接纳交付</button>
+          <button type="button" disabled={!submission} onClick={() => void mutate("review", "rejected")}>退回修改</button>
         </div>
       </fieldset> : null}
     </> : null}
