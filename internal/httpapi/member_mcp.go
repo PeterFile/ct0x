@@ -220,9 +220,10 @@ func memberMCPParams(raw json.RawMessage, names ...string) (map[string]json.RawM
 	}
 	if meta, exists := object["_meta"]; exists {
 		var fields map[string]json.RawMessage
-		if json.Unmarshal(meta, &fields) != nil || !memberMCPFields(fields, "progressToken") {
+		if json.Unmarshal(meta, &fields) != nil || fields == nil {
 			return nil, false
 		}
+		// MCP metadata extensions are opaque, never identity, arguments or authority.
 		if progress, exists := fields["progressToken"]; exists {
 			if _, ok := memberMCPID(progress); !ok {
 				return nil, false
