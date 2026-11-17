@@ -26,11 +26,17 @@ func workspaceGrantValidation(input AuthorizeWorkspaceGrantInput) func([]Workspa
 }
 
 func TestWorkspaceGrantDurableReplayAndIdentityIsolation(t *testing.T) {
+	testWorkspaceGrantDurableReplayAndIdentityIsolation(t, "read_only")
+}
+
+func testWorkspaceGrantDurableReplayAndIdentityIsolation(t *testing.T, grantScope string) {
+	t.Helper()
 	s, path := openTestStore(t)
 	input := workspaceGrantInput(t, s)
+	input.Scope = grantScope
 	first, err := s.AuthorizeWorkspaceGrant(ctx, input, workspaceGrantValidation(input))
 	if err != nil || first.ID == "" || first.GroupID != input.GroupID || first.MemberID != input.MemberID || first.Root != input.Root ||
-		first.ResolvedRoot != input.Root || first.ResourceKey != "workspace:1:2" || first.Scope != "read_only" || first.NodeID != "local" || first.AuthorizedBy != "user" || first.CreatedAt.IsZero() {
+		first.ResolvedRoot != input.Root || first.ResourceKey != "workspace:1:2" || first.Scope != input.Scope || first.NodeID != "local" || first.AuthorizedBy != "user" || first.CreatedAt.IsZero() {
 		t.Fatalf("invalid durable authorization: %+v, %v", first, err)
 	}
 	m, err := s.GetMember(ctx, input.GroupID, input.MemberID)
@@ -88,7 +94,11 @@ func TestWorkspaceGrantDurableReplayAndIdentityIsolation(t *testing.T) {
 	if _, err := s.AuthorizeWorkspaceGrant(ctx, changed, neverValidate); !errors.Is(err, ErrConflict) {
 		t.Fatalf("D1 silently replaced an immutable recipient grant: %v", err)
 	}
-	for _, sql := range []string{"UPDATE workspace_grants SET scope='read_write'", "DELETE FROM workspace_grants"} {
+	table := "workspace_grants"
+	if grantScope == "read_write" {
+		table = "workspace_write_grants"
+	}
+	for _, sql := range []string{"UPDATE " + table + " SET scope='read_write'", "DELETE FROM " + table} {
 		if _, err := s.db.Exec(sql); err == nil {
 			t.Fatalf("receipt is not immutable: %s", sql)
 		}
@@ -96,10 +106,20 @@ func TestWorkspaceGrantDurableReplayAndIdentityIsolation(t *testing.T) {
 }
 
 func TestWorkspaceGrantTransactionFailuresLeaveNoAuthority(t *testing.T) {
+	testWorkspaceGrantTransactionFailuresLeaveNoAuthority(t, "read_only")
+}
+
+func testWorkspaceGrantTransactionFailuresLeaveNoAuthority(t *testing.T, grantScope string) {
+	t.Helper()
+	table := "workspace_grants"
+	if grantScope == "read_write" {
+		table = "workspace_write_grants"
+	}
 	for _, fault := range []string{"validation", "insert", "preference", "receipt-ignore", "receipt-rewrite", "commit"} {
 		t.Run(fault, func(t *testing.T) {
 			s, _ := openTestStore(t)
 			input := workspaceGrantInput(t, s)
+			input.Scope = grantScope
 			before, _ := s.GetMember(ctx, input.GroupID, input.MemberID)
 			validate := workspaceGrantValidation(input)
 			var trigger string
@@ -109,7 +129,7 @@ func TestWorkspaceGrantTransactionFailuresLeaveNoAuthority(t *testing.T) {
 					return WorkspaceGrantDirectory{}, ErrInvalid
 				}
 			case "insert":
-				trigger = "BEFORE INSERT ON workspace_grants BEGIN SELECT RAISE(IGNORE); END"
+				trigger = "BEFORE INSERT ON " + table + " BEGIN SELECT RAISE(IGNORE); END"
 			case "preference":
 				trigger = "BEFORE UPDATE OF workspace ON members BEGIN SELECT RAISE(IGNORE); END"
 			case "receipt-ignore":
@@ -130,7 +150,7 @@ func TestWorkspaceGrantTransactionFailuresLeaveNoAuthority(t *testing.T) {
 			if got, err := s.AuthorizeWorkspaceGrant(ctx, input, validate); err == nil || got.ID != "" {
 				t.Fatalf("partial authorization invented success: %+v, %v", got, err)
 			}
-			for _, table := range []string{"workspace_grants", "mutation_idempotency"} {
+			for _, table := range []string{table, "mutation_idempotency"} {
 				var count int
 				if err := s.db.QueryRow("SELECT count(*) FROM " + table).Scan(&count); err != nil || count != 0 {
 					t.Fatalf("failed authorization left %s rows: %d, %v", table, count, err)

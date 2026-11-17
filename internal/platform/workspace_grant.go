@@ -13,7 +13,8 @@ import (
 )
 
 // WorkspaceGrantInput is explicit local-user authorization, separate from the
-// member's workspace preference. D1 supports one immutable read-only directory.
+// member's workspace preference. Each member has one immutable directory grant;
+// a read_write scope alone does not enable file tools or authorize a task.
 type WorkspaceGrantInput struct {
 	Root  string `json:"root"`
 	Scope string `json:"scope"`
@@ -58,7 +59,7 @@ func (p *Preparer) validateDurableWorkspaceRoots(grants []store.WorkspaceGrantRe
 	}
 	roots := slices.Clone(p.roots)
 	for _, grant := range grants {
-		if grant.Scope != "read_only" || grant.NodeID != "local" || grant.AuthorizedBy != "user" ||
+		if (grant.Scope != "read_only" && grant.Scope != "read_write") || grant.NodeID != "local" || grant.AuthorizedBy != "user" ||
 			!filepath.IsAbs(grant.Root) || !filepath.IsAbs(grant.ResolvedRoot) || !strings.HasPrefix(grant.ResourceKey, "workspace:") {
 			return nil, errPrepareWorkspace
 		}
