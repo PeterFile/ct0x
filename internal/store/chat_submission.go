@@ -70,10 +70,9 @@ func chatWorkspaceSubmissionInTx(ctx context.Context, tx *sql.Tx, input SubmitTa
 			return ErrMemberToolDenied
 		}
 	}
-	// F4/F5 seam: replace this denial with same-tx validation of immutable,
-	// execution-bound publication receipts. Legacy trusted metadata alone does
-	// not prove bytes, resource locks, or the publishing worker's bound role.
-	return fmt.Errorf("%w：目录成果缺少执行绑定的可信发布回执", ErrMemberToolDenied)
+	// Validate immutable execution-bound publication receipts in this SAME tx.
+	// Legacy trusted artifact metadata is not proof of scoped filesystem IO.
+	return workerArtifactPublicationsInTx(ctx, tx, input)
 }
 
 // A durable Submission is returned to its chat origin in the same transaction.

@@ -203,6 +203,9 @@ func (s *Store) PublishWorkerArtifact(ctx context.Context, role CoordinationTool
 		if blob.Hash != o.Input.AfterHash || blob.Size != o.Input.AfterSize {
 			return out, ErrConflict
 		}
+		if err := chatRepairArtifactBaseInTx(ctx, tx, o.GroupID, o.TaskID, input.ArtifactID, input.ExpectedVersionID); err != nil {
+			return out, err
+		}
 		phase = "write"
 		v, err = publishArtifactInTx(ctx, tx, PublishArtifactInput{GroupID: o.GroupID, ActorID: o.MemberID, SourceTaskID: o.TaskID,
 			ArtifactID: input.ArtifactID, Name: input.Name, ExpectedVersionID: input.ExpectedVersionID, BlobHash: blob.Hash, Size: blob.Size})

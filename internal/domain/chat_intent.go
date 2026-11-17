@@ -41,17 +41,18 @@ type ChatPolicy struct {
 type ChatCandidate struct {
 	ID string `json:"id"`
 	ThreadRef
-	MessageID              string     `json:"message_id"`
-	SourceSenderID         string     `json:"source_sender_id"`
-	MemberID               string     `json:"member_id"`
-	TurnID                 string     `json:"turn_id"`
-	Generation             int64      `json:"generation"`
-	Policy                 ChatPolicy `json:"policy"`
-	BindingRevision        int64      `json:"binding_revision"`
-	DispatchPolicyRevision int64      `json:"dispatch_policy_revision"`
-	Purpose                string     `json:"purpose"`
-	SourceID               string     `json:"source_id"`
-	SourceKind             string     `json:"source_kind"`
+	MessageID              string            `json:"message_id"`
+	SourceSenderID         string            `json:"source_sender_id"`
+	MemberID               string            `json:"member_id"`
+	TurnID                 string            `json:"turn_id"`
+	Generation             int64             `json:"generation"`
+	Policy                 ChatPolicy        `json:"policy"`
+	BindingRevision        int64             `json:"binding_revision"`
+	DispatchPolicyRevision int64             `json:"dispatch_policy_revision"`
+	Purpose                string            `json:"purpose"`
+	SourceID               string            `json:"source_id"`
+	SourceKind             string            `json:"source_kind"`
+	RepairSource           *ChatRepairSource `json:"repair_source,omitempty"`
 }
 
 // TaskWorkspaceScope records admission facts, not execution permission or a
@@ -85,13 +86,14 @@ type TaskWorkspaceGrant struct {
 // request_work requires an actual user source; prepare_work requires enabled
 // written preauthorization. discuss/clarify do not create tasks or dispatches.
 type ChatAssessment struct {
-	Disposition string `json:"disposition"`
-	Action      string `json:"action,omitempty"`
-	Title       string `json:"title,omitempty"`
-	Description string `json:"description,omitempty"`
-	Acceptance  string `json:"acceptance,omitempty"`
-	Reason      string `json:"reason"`
-	Question    string `json:"question,omitempty"`
+	Disposition string                `json:"disposition"`
+	Action      string                `json:"action,omitempty"`
+	Title       string                `json:"title,omitempty"`
+	Description string                `json:"description,omitempty"`
+	Acceptance  string                `json:"acceptance,omitempty"`
+	Reason      string                `json:"reason"`
+	Question    string                `json:"question,omitempty"`
+	Repair      *ChatRepairAssessment `json:"repair,omitempty"`
 }
 
 // ChatAssessmentReceipt preserves the real assessor and source separately from
@@ -124,4 +126,5 @@ type ChatAssessmentReceipt struct {
 	AuthorityEvidenceVerified bool      `json:"authority_evidence_verified"`
 
 	WorkspaceScope *TaskWorkspaceScope `json:"workspace_scope,omitempty"`
+	RepairLink     *ChatRepairLink     `json:"repair_link,omitempty"`
 }

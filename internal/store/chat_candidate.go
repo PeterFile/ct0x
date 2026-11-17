@@ -55,9 +55,15 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 			}
 			digest := sha256.Sum256([]byte(scope.Claim.Token))
 			err = coordinationDispatchWrite(ctx, tx, `INSERT INTO chat_intake_executions(candidate_id,turn_id,purpose,claim_digest,source_id,source_kind) VALUES(?,?,?,?,?,?)`, id, scope.Claim.TurnID, domain.ChatIntakePurpose, digest[:], sourceID, kind)
+			if err == nil {
+				err = captureChatRepairCandidateInTx(ctx, tx, scope, id)
+			}
 		}
 	}
 	if err != nil {
+		if errors.Is(err, ErrChatRepairSourceEncoding) {
+			return domain.ChatCandidate{}, err
+		}
 		return domain.ChatCandidate{}, memberToolOperationError("保存聊天候选失败", err)
 	}
 	candidate, err := chatCandidateInTx(ctx, tx, scope, id)
@@ -91,6 +97,9 @@ func chatCandidateInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, i
 	} else {
 		// Revision zero stays a disabled snapshot, never the current policy.
 		c.Policy.WorkspaceChangesSupported, err = chatWorkspaceSupportedInTx(ctx, tx)
+	}
+	if err == nil {
+		c.RepairSource, err = chatRepairCandidateInTx(ctx, tx, c.ID)
 	}
 	return c, err
 }

@@ -102,6 +102,9 @@ func reviewTaskInTx(ctx context.Context, tx *sql.Tx, input ReviewTaskInput) (dom
 	if err := chatReviewNoticeInTx(ctx, tx, decision); err != nil {
 		return domain.ReviewDecision{}, err
 	}
+	if err := chatRepairReviewIntakeInTx(ctx, tx, decision); err != nil {
+		return domain.ReviewDecision{}, err
+	}
 	return decision, nil
 }
 
