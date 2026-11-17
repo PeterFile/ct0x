@@ -6,7 +6,6 @@ import (
 	"net/http"
 
 	"agentworkspace/internal/platform"
-	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
 )
 
@@ -32,7 +31,7 @@ func ProviderRoute(catalog *platform.ProviderCatalog) Route {
 			}
 			id = cursor.ID
 		}
-		items, nextID, err := catalog.List(limit, id)
+		items, nextID, err := catalog.ListWithAdapters(limit, id)
 		if err != nil {
 			operationError(w, err)
 			return
@@ -47,8 +46,8 @@ func ProviderRoute(catalog *platform.ProviderCatalog) Route {
 			next = base64.RawURLEncoding.EncodeToString(raw)
 		}
 		WriteJSON(w, http.StatusOK, struct {
-			Items      []provider.Provider `json:"items"`
-			NextCursor string              `json:"next_cursor"`
+			Items      []platform.ProviderAdapterView `json:"items"`
+			NextCursor string                         `json:"next_cursor"`
 		}{items, next})
 	}}
 }
