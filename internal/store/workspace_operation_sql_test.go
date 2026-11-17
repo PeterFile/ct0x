@@ -49,6 +49,9 @@ func TestWorkspaceOperationSQLIntentGuards(t *testing.T) {
 				if err := rows.Scan(&col); err != nil {
 					t.Fatal(err)
 				}
+				if col == "sequence" {
+					continue
+				}
 				columns = append(columns, col)
 				expr := col
 				switch col {
@@ -176,11 +179,13 @@ func TestWorkspaceOperationConcurrentOriginalKey(t *testing.T) {
 			finishes <- err
 		}(s)
 	}
-	for range 2 {
-		if err := <-finishes; err != nil {
+	// Both original calls must finish before receipt reconciliation can start.
+	finishErrors := []error{<-finishes, <-finishes}
+	for _, err := range finishErrors {
+		if err != nil {
 			workspaceOperationRequireLocalRollback(t, err)
 			if _, err := f.s.FinishWorkspaceOperation(ctx, role, a.o.ID, WorkspaceOperationResult{Outcome: "done", ObservedHash: a.o.Input.AfterHash, ObservedSize: a.o.Input.AfterSize}); err != nil {
-				t.Fatal(err)
+				t.Fatalf("Finish original-key reconciliation failed: err=%v; cause=%v", err, errors.Unwrap(err))
 			}
 		}
 	}

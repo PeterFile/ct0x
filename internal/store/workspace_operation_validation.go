@@ -3,6 +3,7 @@ package store
 import (
 	"path"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -11,7 +12,7 @@ func workspaceOperationText(value string, max int, empty bool) bool {
 		return false
 	}
 	for _, c := range value {
-		if c < 32 || c == 127 {
+		if unicode.IsControl(c) {
 			return false
 		}
 	}
