@@ -650,7 +650,7 @@ func TestTrustedIntentPassRetainsSweepAcrossCallbacks(t *testing.T) {
 		intentExec(t, f.db, `CREATE TRIGGER trusted_intent_prefix_fault BEFORE UPDATE ON coordination_dispatch_state
 	 WHEN NEW.request_id='`+first.RequestID+`' BEGIN SELECT RAISE(ABORT,'persistent trusted intent fault'); END`)
 		// A real next-kind query failure pauses the sweep without a production seam.
-		intentExec(t, f.db, `ALTER TABLE coordination_assignment_dispatch RENAME TO trusted_intent_hidden_assignments`)
+		intentExec(t, f.db, `ALTER TABLE coordination_assignment_dispatch RENAME COLUMN next_attempt_at TO trusted_intent_hidden_next_attempt_at`)
 		callback = trustedIntentCallback(t, New(f.s))
 		setups++
 		interrupted = false
@@ -675,7 +675,7 @@ func TestTrustedIntentPassRetainsSweepAcrossCallbacks(t *testing.T) {
 			}
 			code, ok := leaf.(interface{ Code() int })
 			return ok && (code.Code()&255 == 19 && strings.Contains(leaf.Error(), "persistent trusted intent fault") ||
-				code.Code()&255 == 1 && strings.Contains(leaf.Error(), "no such table: coordination_assignment_dispatch"))
+				code.Code()&255 == 1 && strings.Contains(leaf.Error(), "no such column: next_attempt_at"))
 		})
 		trustedIntentWalkError(reported, func(node error, _ int) {
 			if len(trustedIntentErrorChildren(node)) == 0 && (node == context.Canceled || node == context.DeadlineExceeded) {
@@ -710,7 +710,7 @@ func TestTrustedIntentPassRetainsSweepAcrossCallbacks(t *testing.T) {
 		if seen > 1 {
 			t.Fatal("callback reconstructed its pass and rescanned the proven failed original candidate")
 		}
-		if strings.Contains(reported.Error(), "no such table: coordination_assignment_dispatch") {
+		if strings.Contains(reported.Error(), "no such column: next_attempt_at") {
 			if seen == 0 {
 				if !interrupted {
 					t.Fatalf("query pause without a prefix fault or real cancellation evidence: %v", reported)
@@ -727,7 +727,7 @@ func TestTrustedIntentPassRetainsSweepAcrossCallbacks(t *testing.T) {
 	if err != nil || v.State.Status != domain.DispatchStatusPending || v.State.Delivery != nil {
 		t.Fatalf("query failure did not leave a genuine pending tail: %+v, %v", v, err)
 	}
-	intentExec(t, f.db, `ALTER TABLE trusted_intent_hidden_assignments RENAME TO coordination_assignment_dispatch`)
+	intentExec(t, f.db, `ALTER TABLE coordination_assignment_dispatch RENAME COLUMN trusted_intent_hidden_next_attempt_at TO next_attempt_at`)
 	tailObserved := false
 	for {
 		if ctx.Err() != nil {
