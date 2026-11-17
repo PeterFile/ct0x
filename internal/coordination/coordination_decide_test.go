@@ -100,10 +100,29 @@ func TestCoordinationDecideCallsiteClassification(t *testing.T) {
 	const sessionPath = "internal/platform/member_tool_roles.go"
 	const httpPath = "internal/httpapi/member_role_tools.go"
 	const storeCall = "s.db.DecideDispatch(ctx, scope, input, key)"
+	const registrationCall = "s.db.DecideDispatchWithCapabilities(ctx, entry.role, input, key, entry.dispatchCapabilities)"
 	const httpCall = `a.tools.DecideDispatch(r.Context(), token, store.CoordinatorDecisionInput{
 		Kind: input.Kind.value, WorkerMemberID: input.WorkerMemberID.value, Reason: input.Reason.value,
 	}, key)`
 	// Fixtures are parsed, not type-checked, just like the production scan.
+	const registrationSource = `package platform
+func (s *MemberTools) DecideDispatch(ctx context.Context, token string, input store.CoordinatorDecisionInput, key string) (domain.DecisionReceipt, error) {
+	var result domain.DecisionReceipt
+	err := s.withCoordinationRoleRegistration(token, "decide_dispatch", store.CoordinationRoleCoordinator, func(entry memberToolRegistration) error {
+		var err error
+		result, err = ` + registrationCall + `
+		return err
+	})
+	return result, err
+}
+`
+	const ungatedRegistrationSource = `package platform
+func (s *MemberTools) DecideDispatch(ctx context.Context, token string, input store.CoordinatorDecisionInput, key string) (domain.DecisionReceipt, error) {
+	result, err := ` + registrationCall + `
+	return result, err
+}
+`
+	// The old role-gated Store shape is no longer an authorized production call.
 	const sessionSource = `package platform
 func (s *MemberTools) DecideDispatch(ctx context.Context, token string, input store.CoordinatorDecisionInput, key string) (domain.DecisionReceipt, error) {
 	var result domain.DecisionReceipt
@@ -130,8 +149,12 @@ func (s *MemberTools) DecideDispatch(ctx context.Context, scope store.Coordinati
 		want               decideDispatchCallsiteCounts
 	}{
 		{
-			name: "canonical/session callback", path: sessionPath, source: sessionSource,
+			name: "canonical/registration callback", path: sessionPath, source: registrationSource,
 			want: decideDispatchCallsiteCounts{sessionGated: 1},
+		},
+		{
+			name: "session/legacy role-gated Store", path: sessionPath, source: sessionSource,
+			want: decideDispatchCallsiteCounts{forbidden: 1},
 		},
 		{
 			name: "canonical/HTTP handler", path: httpPath, source: httpSource,
@@ -187,6 +210,18 @@ func (s *MemberTools) DecideDispatch(ctx context.Context, scope store.Coordinati
 		},
 		{
 			name: "cardinality/duplicate session call", path: sessionPath, source: strings.Replace(sessionSource, storeCall, storeCall+"\n\t\t_, _ = "+storeCall, 1),
+			want: decideDispatchCallsiteCounts{forbidden: 2},
+		},
+		{
+			name: "cardinality/duplicate registration call", path: sessionPath, source: strings.Replace(registrationSource, registrationCall, registrationCall+"\n\t\t_, _ = "+registrationCall, 1),
+			want: decideDispatchCallsiteCounts{sessionGated: 1, forbidden: 1},
+		},
+		{
+			name: "cardinality/second registration call elsewhere", path: sessionPath, source: registrationSource + "\nfunc other() { _, _ = " + registrationCall + " }\n",
+			want: decideDispatchCallsiteCounts{sessionGated: 1, forbidden: 1},
+		},
+		{
+			name: "cardinality/legacy call beside registration call", path: sessionPath, source: strings.Replace(registrationSource, registrationCall, registrationCall+"\n\t\t_, _ = "+storeCall, 1),
 			want: decideDispatchCallsiteCounts{sessionGated: 1, forbidden: 1},
 		},
 		{
@@ -212,6 +247,134 @@ func (s *MemberTools) DecideDispatch(ctx context.Context, scope store.Coordinati
 		{
 			name: "session/wrong Store scope", path: sessionPath, source: strings.Replace(sessionSource, storeCall, "s.db.DecideDispatch(ctx, otherScope, input, key)", 1),
 			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong file", path: "internal/platform/member_tools.go", source: registrationSource,
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong method", path: sessionPath, source: strings.Replace(registrationSource, ") DecideDispatch(", ") OtherMethod(", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong receiver type", path: sessionPath, source: strings.Replace(registrationSource, "s *MemberTools", "s *OtherTools", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/value receiver", path: sessionPath, source: strings.Replace(registrationSource, "s *MemberTools", "s MemberTools", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong context parameter", path: sessionPath, source: strings.Replace(registrationSource, "ctx context.Context", "ctx other.Context", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong input parameter", path: sessionPath, source: strings.Replace(registrationSource, "input store.CoordinatorDecisionInput", "input store.OtherInput", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong token parameter", path: sessionPath, source: strings.Replace(registrationSource, "token string", "callerToken string", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong key parameter", path: sessionPath, source: strings.Replace(registrationSource, "key string", "otherKey string", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/ungated Store", path: sessionPath, source: ungatedRegistrationSource,
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/legacy Store in new gate", path: sessionPath, source: strings.Replace(registrationSource, registrationCall, "s.db.DecideDispatch(ctx, entry.role, input, key)", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/new Store in old gate", path: sessionPath, source: strings.Replace(sessionSource, storeCall, "s.db.DecideDispatchWithCapabilities(ctx, scope, input, key, facts)", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong gate receiver", path: sessionPath, source: strings.Replace(registrationSource, "s.withCoordinationRoleRegistration", "other.withCoordinationRoleRegistration", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong operation", path: sessionPath, source: strings.Replace(registrationSource, `"decide_dispatch"`, `"other_operation"`, 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong role", path: sessionPath, source: strings.Replace(registrationSource, "store.CoordinationRoleCoordinator", "store.CoordinationRoleWorker", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong token", path: sessionPath, source: strings.Replace(registrationSource, "Registration(token,", "Registration(callerToken,", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong callback type", path: sessionPath, source: strings.Replace(registrationSource, "entry memberToolRegistration", "entry otherRegistration", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong callback binding", path: sessionPath, source: strings.Replace(registrationSource, "entry memberToolRegistration", "otherEntry memberToolRegistration", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong Store receiver", path: sessionPath, source: strings.Replace(registrationSource, "s.db.DecideDispatchWithCapabilities", "other.db.DecideDispatchWithCapabilities", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong context", path: sessionPath, source: strings.Replace(registrationSource, "WithCapabilities(ctx,", "WithCapabilities(otherCtx,", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong Store scope", path: sessionPath, source: strings.Replace(registrationSource, "ctx, entry.role,", "ctx, scope,", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong scope field", path: sessionPath, source: strings.Replace(registrationSource, "entry.role", "entry.scope", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong scope registration", path: sessionPath, source: strings.Replace(registrationSource, "entry.role", "otherEntry.role", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong input", path: sessionPath, source: strings.Replace(registrationSource, "entry.role, input,", "entry.role, otherInput,", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong key", path: sessionPath, source: strings.Replace(registrationSource, "input, key, entry.", "input, otherKey, entry.", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/missing frozen facts", path: sessionPath, source: strings.Replace(registrationSource, "entry.dispatchCapabilities", "nil", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong facts field", path: sessionPath, source: strings.Replace(registrationSource, "entry.dispatchCapabilities", "entry.otherCapabilities", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "registration/wrong facts registration", path: sessionPath, source: strings.Replace(registrationSource, "entry.dispatchCapabilities", "otherEntry.dispatchCapabilities", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "HTTP/guarded tool bypass", path: httpPath, source: strings.Replace(httpSource, "a.tools.DecideDispatch", "a.tools.DecideDispatchWithCapabilities", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "HTTP/direct guarded Store", path: httpPath, source: strings.Replace(httpSource, httpCall, "a.db.DecideDispatchWithCapabilities(r.Context(), scope, input, key, facts)", 1),
+			want: decideDispatchCallsiteCounts{forbidden: 1},
+		},
+		{
+			name: "forbidden/guarded paren and index wrappers", path: "internal/other.go", source: `package other
+func calls() {
+	other.DecideDispatchWithCapabilities(ctx, scope, input, key, facts)
+	DecideDispatchWithCapabilities(ctx, scope, input, key, facts)
+	(other.DecideDispatchWithCapabilities)(ctx, scope, input, key, facts)
+	other.DecideDispatchWithCapabilities[T](ctx, scope, input, key, facts)
+	(DecideDispatchWithCapabilities[T, U])(ctx, scope, input, key, facts)
+}
+`,
+			want: decideDispatchCallsiteCounts{forbidden: 5},
 		},
 		{
 			name: "forbidden/paren and index wrappers", path: "internal/other.go", source: `package other
@@ -320,9 +483,9 @@ func isDecideDispatchTarget(target ast.Expr) bool {
 		case *ast.IndexListExpr:
 			target = expr.X
 		case *ast.SelectorExpr:
-			return expr.Sel.Name == "DecideDispatch"
+			return expr.Sel.Name == "DecideDispatch" || expr.Sel.Name == "DecideDispatchWithCapabilities"
 		case *ast.Ident:
-			return expr.Name == "DecideDispatch"
+			return expr.Name == "DecideDispatch" || expr.Name == "DecideDispatchWithCapabilities"
 		default:
 			return false
 		}
@@ -403,26 +566,37 @@ func sessionGatedMemberDecideCall(file *ast.File) *ast.CallExpr {
 		if !ok || !isIdent(pointer.X, "MemberTools") || len(receiver.Names) != 1 || receiver.Names[0].Name != "s" {
 			continue
 		}
+		params := method.Type.Params
+		if params == nil || len(params.List) != 4 {
+			continue
+		}
+		ctxParam, tokenParam, inputParam, keyParam := params.List[0], params.List[1], params.List[2], params.List[3]
+		if len(ctxParam.Names) != 1 || ctxParam.Names[0].Name != "ctx" || !isSelector(ctxParam.Type, "context", "Context") ||
+			len(tokenParam.Names) != 1 || tokenParam.Names[0].Name != "token" || !isIdent(tokenParam.Type, "string") ||
+			len(inputParam.Names) != 1 || inputParam.Names[0].Name != "input" || !isSelector(inputParam.Type, "store", "CoordinatorDecisionInput") ||
+			len(keyParam.Names) != 1 || keyParam.Names[0].Name != "key" || !isIdent(keyParam.Type, "string") {
+			continue
+		}
 		for _, statement := range method.Body.List {
 			assignment, ok := statement.(*ast.AssignStmt)
 			if !ok || len(assignment.Rhs) != 1 {
 				continue
 			}
 			gate, ok := assignment.Rhs[0].(*ast.CallExpr)
-			if !ok || !isSelector(gate.Fun, "s", "withCoordinationRole") || len(gate.Args) != 5 || gate.Ellipsis.IsValid() {
+			if !ok || !isSelector(gate.Fun, "s", "withCoordinationRoleRegistration") || len(gate.Args) != 4 || gate.Ellipsis.IsValid() {
 				continue
 			}
-			operation, ok := gate.Args[2].(*ast.BasicLit)
-			if !isIdent(gate.Args[0], "ctx") || !isIdent(gate.Args[1], "token") || !ok || operation.Kind != token.STRING || operation.Value != `"decide_dispatch"` ||
-				!isSelector(gate.Args[3], "store", "CoordinationRoleCoordinator") {
+			operation, ok := gate.Args[1].(*ast.BasicLit)
+			if !isIdent(gate.Args[0], "token") || !ok || operation.Kind != token.STRING || operation.Value != `"decide_dispatch"` ||
+				!isSelector(gate.Args[2], "store", "CoordinationRoleCoordinator") {
 				continue
 			}
-			callback, ok := gate.Args[4].(*ast.FuncLit)
+			callback, ok := gate.Args[3].(*ast.FuncLit)
 			if !ok || callback.Type.Params == nil || len(callback.Type.Params.List) != 1 || callback.Body == nil {
 				continue
 			}
-			scope := callback.Type.Params.List[0]
-			if len(scope.Names) != 1 || scope.Names[0].Name != "scope" || !isSelector(scope.Type, "store", "CoordinationToolScope") {
+			entry := callback.Type.Params.List[0]
+			if len(entry.Names) != 1 || entry.Names[0].Name != "entry" || !isIdent(entry.Type, "memberToolRegistration") {
 				continue
 			}
 			for _, statement := range callback.Body.List {
@@ -431,12 +605,13 @@ func sessionGatedMemberDecideCall(file *ast.File) *ast.CallExpr {
 					continue
 				}
 				call, ok := assignment.Rhs[0].(*ast.CallExpr)
-				if !ok || len(call.Args) != 4 || call.Ellipsis.IsValid() {
+				if !ok || len(call.Args) != 5 || call.Ellipsis.IsValid() {
 					continue
 				}
 				target, ok := call.Fun.(*ast.SelectorExpr)
-				if ok && target.Sel.Name == "DecideDispatch" && isSelector(target.X, "s", "db") &&
-					isIdent(call.Args[0], "ctx") && isIdent(call.Args[1], "scope") && isIdent(call.Args[2], "input") && isIdent(call.Args[3], "key") {
+				if ok && target.Sel.Name == "DecideDispatchWithCapabilities" && isSelector(target.X, "s", "db") &&
+					isIdent(call.Args[0], "ctx") && isSelector(call.Args[1], "entry", "role") && isIdent(call.Args[2], "input") && isIdent(call.Args[3], "key") &&
+					isSelector(call.Args[4], "entry", "dispatchCapabilities") {
 					return call
 				}
 			}
