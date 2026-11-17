@@ -193,6 +193,9 @@ func (r *Root) write(ctx context.Context, name, expected, text string, create bo
 		return receipt, err
 	}
 	defer parent.Close()
+	if err := checkReservedTarget(parent, leaf); err != nil {
+		return receipt, err
+	}
 	var before os.FileInfo
 	mode := os.FileMode(0600)
 	if create {
@@ -265,6 +268,10 @@ func (r *Root) write(ctx context.Context, name, expected, text string, create bo
 		return receipt, err
 	}
 	if err := r.verifyDir(dirName, parent); err != nil {
+		return receipt, err
+	}
+	// This call may have created the canonical namespace since the first check.
+	if err := checkReservedTarget(parent, leaf); err != nil {
 		return receipt, err
 	}
 	if create {

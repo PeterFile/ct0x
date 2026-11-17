@@ -47,8 +47,8 @@ type Entry struct {
 	Size int64
 }
 
-// Use one conservative Unicode simple-fold policy on every volume, including
-// case-sensitive ones. This also covers ASCII-related folds such as K/K and S/ſ.
+// This is a conservative lexical prefilter, not filesystem name equivalence.
+// Existing components also require the same-parent physical namespace check.
 func reservedComponent(name string) bool {
 	return strings.EqualFold(name, stagingDirName)
 }
@@ -66,10 +66,39 @@ func validPath(name string, directory bool) bool {
 	return fs.ValidPath(name) && !strings.ContainsAny(name, "\\\x00") && (directory || name != ".") && !reservedPath(name)
 }
 
-// openDir rejects symlinks in every path component, then pins the final directory.
-// Ancestor stability remains a caller requirement; these checks are not a CAS.
-func (r *Root) openDir(name string) (*os.Root, error) {
-	info, err := r.root.Stat(".")
+// namespaceInfo asks the target filesystem to resolve the canonical spelling in
+// the same parent. No Unicode normalization table can substitute for this lookup.
+func namespaceInfo(root *os.Root, parent string) (os.FileInfo, error) {
+	info, err := root.Lstat(path.Join(parent, stagingDirName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	return info, err
+}
+
+func reservedEntry(name string, info, namespace os.FileInfo) bool {
+	return reservedComponent(name) || info != nil && namespace != nil && os.SameFile(info, namespace)
+}
+
+func checkReservedTarget(parent *os.Root, name string) error {
+	namespace, err := namespaceInfo(parent, ".")
+	if err != nil {
+		return err
+	}
+	info, err := parent.Lstat(name)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if reservedEntry(name, info, namespace) {
+		return ErrPath
+	}
+	return nil
+}
+
+// openDirAt rejects symlinks and physical namespace aliases in every component,
+// then pins the final directory. Stable ancestors remain required; this is not CAS.
+func openDirAt(root *os.Root, name string) (*os.Root, error) {
+	info, err := root.Stat(".")
 	if err != nil {
 		return nil, err
 	}
@@ -77,16 +106,23 @@ func (r *Root) openDir(name string) (*os.Root, error) {
 		prefix := ""
 		for _, part := range strings.Split(name, "/") {
 			prefix = path.Join(prefix, part)
-			info, err = r.root.Lstat(prefix)
+			info, err = root.Lstat(prefix)
 			if err != nil {
 				return nil, err
+			}
+			namespace, err := namespaceInfo(root, path.Dir(prefix))
+			if err != nil {
+				return nil, err
+			}
+			if reservedEntry(part, info, namespace) {
+				return nil, ErrPath
 			}
 			if !info.IsDir() {
 				return nil, ErrNotDirectory
 			}
 		}
 	}
-	dir, err := r.root.OpenRoot(name)
+	dir, err := root.OpenRoot(name)
 	if err != nil {
 		return nil, err
 	}
@@ -95,6 +131,10 @@ func (r *Root) openDir(name string) (*os.Root, error) {
 		return nil, errors.Join(ErrConflict, err, dir.Close())
 	}
 	return dir, nil
+}
+
+func (r *Root) openDir(name string) (*os.Root, error) {
+	return openDirAt(r.root, name)
 }
 
 func (r *Root) verifyDir(name string, held *os.Root) error {
@@ -200,6 +240,9 @@ func (r *Root) Read(ctx context.Context, name string) (snapshot Snapshot, err er
 		return Snapshot{}, err
 	}
 	defer parent.Close()
+	if err := checkReservedTarget(parent, path.Base(name)); err != nil {
+		return Snapshot{}, err
+	}
 	observed, _, err := readText(ctx, parent, path.Base(name))
 	if err != nil {
 		return Snapshot{}, err
@@ -211,7 +254,7 @@ func (r *Root) Read(ctx context.Context, name string) (snapshot Snapshot, err er
 }
 
 // List returns at most MaxEntries sorted public entries, or ErrTooManyEntries
-// and no partial list. Reserved simple-fold aliases are hidden and do not count.
+// and no partial list. Lexical and physical namespace aliases are hidden.
 // At most MaxEntries+3 raw entries are scanned; exceeding that budget without
 // confirming EOF also fails, even if hidden aliases consume the budget.
 // It is nonrecursive, accepts ".", and is not a point-in-time view.
@@ -242,6 +285,10 @@ func (r *Root) List(ctx context.Context, name string) (entries []Entry, err erro
 		return nil, err
 	}
 	defer file.Close()
+	namespace, err := namespaceInfo(dir, ".")
+	if err != nil {
+		return nil, err
+	}
 	items, err := file.ReadDir(MaxEntries + 2)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
@@ -262,7 +309,11 @@ func (r *Root) List(ctx context.Context, name string) (entries []Entry, err erro
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if reservedComponent(item.Name()) {
+		info, err := item.Info()
+		if err != nil {
+			return nil, err
+		}
+		if reservedEntry(item.Name(), info, namespace) {
 			continue
 		}
 		if len(result) == MaxEntries {
@@ -270,10 +321,6 @@ func (r *Root) List(ctx context.Context, name string) (entries []Entry, err erro
 		}
 		if !validPath(item.Name(), false) {
 			return nil, ErrPath
-		}
-		info, err := item.Info()
-		if err != nil {
-			return nil, err
 		}
 		result = append(result, Entry{Name: item.Name(), Mode: info.Mode(), Size: info.Size()})
 	}

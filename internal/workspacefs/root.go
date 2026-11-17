@@ -34,6 +34,8 @@ type Root struct {
 // expected must be obtained by the trusted caller from the actual directory.
 // The caller must keep the directory's ancestors trusted and stable, and reserve
 // .workspacefs-staging below writable directories exclusively for this protocol.
+// Open walks resolved root ancestors; public paths and listings also reject the
+// same physical namespace entry under filesystem-equivalent names.
 // Public operations cannot address or list that namespace. Nonprotocol writers
 // must be excluded from it for the whole write, using OS-level exclusivity if
 // needed; this package does not isolate arbitrary same-UID processes.
@@ -49,7 +51,22 @@ func Open(path string, expected os.FileInfo) (*Root, error) {
 	if err != nil || !info.IsDir() || !os.SameFile(expected, info) {
 		return nil, errors.Join(ErrRootChanged, err)
 	}
-	handle, err := os.OpenRoot(path)
+	// Preserve trusted ancestor symlink compatibility, but inspect the resolved
+	// ancestry so a symlink cannot conceal a physical namespace component.
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return nil, errors.Join(ErrRootChanged, err)
+	}
+	name, err := filepath.Rel("/", resolved)
+	if err != nil {
+		return nil, errors.Join(ErrRootChanged, err)
+	}
+	filesystem, err := os.OpenRoot("/")
+	if err != nil {
+		return nil, errors.Join(ErrRootChanged, err)
+	}
+	defer filesystem.Close()
+	handle, err := openDirAt(filesystem, filepath.ToSlash(name))
 	if err != nil {
 		return nil, errors.Join(ErrRootChanged, err)
 	}
