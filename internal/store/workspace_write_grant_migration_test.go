@@ -7,10 +7,19 @@ import (
 	"testing"
 )
 
-func TestWorkspaceWriteGrantV18ToV19PreservesEvidence(t *testing.T) {
-	if len(migrations) != 19 {
+// Pin historical write-authority contracts to v19, not future migrations.
+func workspaceWriteGrantV19Migrations(t *testing.T) {
+	t.Helper()
+	if len(migrations) < 19 {
 		t.Fatalf("write authority requires appended v19; got %d migrations", len(migrations))
 	}
+	original := migrations
+	migrations = original[:19]
+	t.Cleanup(func() { migrations = original })
+}
+
+func TestWorkspaceWriteGrantV18ToV19PreservesEvidence(t *testing.T) {
+	workspaceWriteGrantV19Migrations(t)
 	s, path := workspaceWriteGrantV18(t)
 	input := workspaceGrantInput(t, s)
 	first, err := s.AuthorizeWorkspaceGrant(ctx, input, workspaceGrantValidation(input))
@@ -57,9 +66,7 @@ func TestWorkspaceWriteGrantV18ToV19PreservesEvidence(t *testing.T) {
 }
 
 func TestWorkspaceWriteGrantV19MigrationRollbackAndRetry(t *testing.T) {
-	if len(migrations) != 19 {
-		t.Fatalf("write authority requires appended v19; got %d migrations", len(migrations))
-	}
+	workspaceWriteGrantV19Migrations(t)
 	s, path := workspaceWriteGrantV18(t)
 	input := workspaceGrantInput(t, s)
 	first, err := s.AuthorizeWorkspaceGrant(ctx, input, workspaceGrantValidation(input))

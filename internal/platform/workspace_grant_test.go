@@ -159,7 +159,7 @@ func TestWorkspaceGrantRejectsUnsafeRootsAndForeignMembers(t *testing.T) {
 					authorizeWorkspace(t, f.preparer(t), group, other.ID, root)
 				}
 			case "scope":
-				input.Scope = "read_write"
+				input.Scope = "read_execute"
 			case "missing-key":
 				key = ""
 			case "foreign":
