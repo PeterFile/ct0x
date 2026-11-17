@@ -60,7 +60,7 @@ it("keeps discussion inactive before selection, then distinguishes loading, fail
   expect(await panel().findByText("尚无消息，可发送第一条讨论。")).toBeVisible();
 });
 it.each([
-  { identity: "local user", sender: "user", roster: [{ ...member, id: "user", name: "不能覆盖本地身份" }], author: "我" },
+  { identity: "unverified legacy user", sender: "user", roster: [{ ...member, id: "user", name: "不能覆盖本地身份" }], author: "用户（来源未核验）" },
   { identity: "scoped member", sender: member.id, roster: [member], author: member.name },
   { identity: "unloaded member", sender: "missing-member", roster: [], author: "未载入成员" },
   { identity: "foreign same-ID member", sender: member.id, roster: [{ ...member, group_id: other.id, name: "外群名称" }], author: "未载入成员" },
@@ -93,7 +93,7 @@ it("renders exact inert raw text with a truthful topic and folded technical reco
   await open(); const record = await panel().findByRole("article");
   expect(record.querySelector(".message-content")?.textContent).toBe(received);
   expect(record.querySelector("script")).toBeNull();
-  expect(within(record).getByText("我", { exact: true })).toBeVisible();
+  expect(within(record).getByText("用户（来源未核验）", { exact: true })).toBeVisible();
   expect(within(record).getByText("话题消息", { exact: true })).toBeVisible();
   expect(record.querySelector("details")).not.toHaveAttribute("open");
   for (const value of [message.id, message.sender_id, "topic-A", message.created_at]) expect(within(record).getByText(value, { exact: true })).not.toBeVisible();

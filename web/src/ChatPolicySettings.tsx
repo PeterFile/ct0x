@@ -1,24 +1,23 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { ApiError, getMessage, listMessages } from "./api";
-import type { Message } from "./api";
-import { getChatPolicy, isChatPolicyDefinitiveRejection, setChatPolicy } from "./chat-api";
+import { ApiError } from "./api";
+import { getChatPolicy, hasChatPolicyMetadata, isChatPolicyDefinitiveRejection, setChatPolicy } from "./chat-api";
 import type { ChatPolicy, ChatPolicyInput } from "./chat-api";
 
-type Draft = { enabled: boolean; allowPreparation: boolean; sourceId: string; budget: string };
-type Operation = Readonly<{ key: string; input: ChatPolicyInput; source: Message | null }>;
+type Draft = { enabled: boolean; allowPreparation: boolean; scopeKind: string; budget: string };
+type Operation = Readonly<{ key: string; input: ChatPolicyInput; source?: Readonly<{ id: string; content: string; created_at: string }> | null }>;
 type State = {
   policy: ChatPolicy | null; read: "idle" | "pending" | "ready" | "unavailable"; readError: string;
   draft: Draft; dirty: boolean; operation: Operation | null; phase: "idle" | "pending" | "unknown";
   receipt: ChatPolicy | null; error: string; conflict: boolean;
 };
 const draftOf = (policy?: ChatPolicy): Draft => ({ enabled: policy?.enabled ?? false, allowPreparation: policy?.allow_preparation ?? false,
-  sourceId: policy?.preauthorization_message_id ?? "", budget: policy?.revision ? String(policy.max_admissions) : "1" });
+  scopeKind: policy?.preparation_supported ? policy.preparation_scope_kind ?? "" : "", budget: policy?.revision ? String(policy.max_admissions) : "1" });
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请保留草稿后重试。";
 const samePolicy = (left: ChatPolicy, right: ChatPolicy) => (["revision", "enabled", "allow_preparation", "preauthorization_message_id", "action", "max_admissions", "authorized_by"] as const)
-  .every(field => left[field] === right[field]) && (left.preauthorization_text ?? "") === (right.preauthorization_text ?? "");
-const sourceValid = (message: Message | null, groupId: string) => message?.group_id === groupId && message.topic_id === "" && message.sender_id === "user"
-  && /\P{White_Space}/u.test(message.content) && !/[\0\ud800-\udfff]/u.test(message.content) && new TextEncoder().encode(message.content).length <= 8192;
-const preview = (message: Message) => `${message.content.slice(0, 100)}${message.content.length > 100 ? "…" : ""} · ${message.created_at}`;
+  .every(field => left[field] === right[field]) && (left.preauthorization_text ?? "") === (right.preauthorization_text ?? "")
+  && (left.preparation_scope_kind ?? "") === (right.preparation_scope_kind ?? "")
+  && (left.preparation_supported ?? false) === (right.preparation_supported ?? false)
+  && (left.configuration_source_id ?? "") === (right.configuration_source_id ?? "");
 
 // One instance per visited group; visibility only suspends reads, never an owned PUT.
 export function ChatPolicySettings({ groupId, active }: { groupId: string; active: boolean }) {
@@ -31,9 +30,6 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
   function update(change: (previous: State) => State) {
     const next = change(current.current); current.current = next; setState(next);
   }
-  const [before, setBefore] = useState("");
-  const [messages, setMessages] = useState({ items: [] as Message[], pending: false, error: "", next: "" });
-  const [source, setSource] = useState<{ id: string; value: Message | null; pending: boolean; error: string }>({ id: "", value: null, pending: false, error: "" });
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => {
     if (!enabled) return;
@@ -56,29 +52,6 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
     });
     return () => { ignore = true; controller.abort(); };
   }, [enabled, groupId, version]);
-  useEffect(() => {
-    if (!enabled || !state.draft.allowPreparation) { setBefore(""); return; }
-    let ignore = false;
-    const controller = new AbortController();
-    setMessages(previous => ({ ...previous, pending: true, error: "" }));
-    void listMessages(groupId, before, controller.signal).then(page => {
-      if (!ignore) setMessages(previous => ({ items: [...new Map([...(before ? previous.items : []), ...page.items]
-        .filter(message => sourceValid(message, groupId)).map(message => [message.id, message])).values()], pending: false, error: "", next: page.next_cursor }));
-    }, error => { if (!ignore) setMessages(previous => ({ ...previous, pending: false, error: errorText(error) })); });
-    return () => { ignore = true; controller.abort(); };
-  }, [enabled, groupId, state.draft.allowPreparation, before, version]);
-  useEffect(() => {
-    const sourceId = state.draft.sourceId;
-    if (!enabled || !state.draft.allowPreparation || !sourceId) return;
-    let ignore = false;
-    const controller = new AbortController();
-    setSource({ id: sourceId, value: null, pending: true, error: "" });
-    void getMessage(groupId, sourceId, controller.signal).then(message => {
-      if (!ignore) setSource({ id: sourceId, value: sourceValid(message, groupId) ? message : null, pending: false,
-        error: sourceValid(message, groupId) ? "" : "授权来源必须是本群主话题的真实用户书面消息（非空、无 NUL，最多 8192 UTF-8 字节）。" });
-    }, error => { if (!ignore) setSource({ id: sourceId, value: null, pending: false, error: errorText(error) }); });
-    return () => { ignore = true; controller.abort(); };
-  }, [enabled, groupId, state.draft.allowPreparation, state.draft.sourceId, version]);
 
   function change(patch: Partial<Draft>) {
     if (!enabled || current.current.operation) return;
@@ -89,14 +62,14 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
     if (!enabled || previous.phase === "pending") return;
     let operation = previous.operation;
     if (!operation) {
-      if (previous.read !== "ready" || !previous.policy || previous.policy.revision >= Number.MAX_SAFE_INTEGER) return;
+      if (previous.read !== "ready" || !previous.policy || !hasChatPolicyMetadata(previous.policy)
+        || previous.policy.revision >= Number.MAX_SAFE_INTEGER) return;
       const maxAdmissions = Number(previous.draft.budget);
-      const chosen = source.id === previous.draft.sourceId && !source.pending ? source.value : null;
       if (!Number.isSafeInteger(maxAdmissions) || maxAdmissions < 1 || maxAdmissions > 100) {
         update(value => ({ ...value, error: "本版本累计任务上限必须是 1 至 100 的整数。" })); return;
       }
-      if (previous.draft.allowPreparation && !sourceValid(chosen, groupId)) {
-        update(value => ({ ...value, error: "请从本群主话题的真实用户消息中选择并确认书面授权来源。" })); return;
+      if (previous.draft.allowPreparation && previous.draft.scopeKind !== "topic_summary") {
+        update(value => ({ ...value, error: "请明确选择本群主话题已有消息的纯文本摘要范围；历史规则不能自动升级。" })); return;
       }
       let key: string;
       try {
@@ -105,10 +78,9 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
       } catch {
         update(value => ({ ...value, error: "无法生成保存标识，尚未提交；草稿已保留，请重试。" })); return;
       }
-      operation = Object.freeze({ key, source: chosen ? Object.freeze({ ...chosen }) : null,
-        input: Object.freeze({ enabled: previous.draft.enabled, allow_preparation: previous.draft.allowPreparation,
-          preauthorization_message_id: previous.draft.allowPreparation ? previous.draft.sourceId : "", action: "text_submission",
-          max_admissions: maxAdmissions, expected_revision: previous.policy.revision }) });
+      operation = Object.freeze({ key, input: Object.freeze({ enabled: previous.draft.enabled, allow_preparation: previous.draft.allowPreparation,
+        ...(previous.draft.allowPreparation ? { preparation_scope_kind: "topic_summary" as const } : {}), action: "text_submission",
+        max_admissions: maxAdmissions, expected_revision: previous.policy.revision }) });
     }
     update(value => ({ ...value, operation, phase: "pending", dirty: true, error: "" }));
     try {
@@ -129,11 +101,8 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
       if (conflict) setVersion(value => value + 1);
     }
   }
-  const locked = Boolean(state.operation), draft = state.draft;
-  const chosen = source.id === draft.sourceId ? source.value : null;
-  const shownSource = state.operation?.source ?? chosen;
-  const choices = [...messages.items];
-  if (chosen && !choices.some(message => message.id === chosen.id)) choices.unshift(chosen);
+  const locked = Boolean(state.operation), draft = state.draft, policy = state.policy;
+  const metadata = Boolean(policy && hasChatPolicyMetadata(policy));
   return <section className="group-panel chat-policy-settings" aria-label="自然聊天工作配置">
     <button type="button" aria-expanded={expanded} aria-controls={id} onClick={() => setExpanded(value => !value)}>
       {expanded ? "收起自然聊天工作配置" : "展开自然聊天工作配置"}</button>
@@ -143,40 +112,46 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
       <p className="tasks-note">任务预算按策略版本累计，不按消息或评估轮次重置。保存会产生新版本和新的累计预算；停用只阻止后续准入，不取消在途工作。</p>
       <p className="tasks-note">普通明确请求不需要选择书面预授权消息。不会固定模型或强制独立审查，最终接纳仍由用户完成。</p>
       <section aria-label="当前聊天策略">
-        {state.read === "ready" && state.policy ? <p>版本 {state.policy.revision} · {state.policy.enabled ? "已启用" : "未启用"}
-          {state.policy.revision ? ` · 本版本累计最多 ${state.policy.max_admissions} 项任务` : "（尚未配置）"}</p> : <p role="status">当前策略未确认。{state.readError}</p>}
-        {state.policy?.preauthorization_text && state.read === "ready" ? <p className="tasks-copy">当前书面授权：{state.policy.preauthorization_text}</p> : null}
+        {state.read === "ready" && policy ? <>
+          <p>版本 {policy.revision} · {policy.revision && !policy.configuration_source_id ? `历史启用标记：${policy.enabled ? "开启" : "关闭"}` : policy.enabled ? "已启用" : "未启用"}
+            {policy.revision ? ` · 本版本累计最多 ${policy.max_admissions} 项任务` : "（尚未配置）"}</p>
+          {!metadata ? <p role="status">旧实例未提供范围与来源字段，新配置能力未确认；保留历史事实，不能据此保存新授权。</p> : null}
+          {policy.allow_preparation && !policy.preparation_supported ? <p role="status">历史准备规则当前不支持，不会自动升级为 topic_summary；请明确选择新范围或关闭准备工作后保存。</p> : null}
+          <dl><dt>当前受支持的准备范围</dt><dd>{policy.preparation_supported ? "本群主话题已有消息的纯文本摘要（topic_summary）" : "无已确认的受支持准备范围"}</dd>
+            {policy.preparation_scope_kind ? <><dt>服务端范围标识</dt><dd>{policy.preparation_scope_kind}</dd></> : null}
+            <dt>策略配置命令 Source ID</dt><dd className="tasks-meta">{policy.configuration_source_id || "未提供（未核验历史配置来源）"}</dd>
+            {policy.preauthorization_message_id ? <><dt>规范规则 / 历史书面消息 ID（只读）</dt><dd className="tasks-meta">{policy.preauthorization_message_id}</dd></> : null}</dl>
+          {policy.preauthorization_text ? <p className="tasks-copy">{policy.preparation_supported ? "服务端规范书面规则" : "历史书面规则（不作为当前支持的准备授权）"}：{policy.preauthorization_text}</p> : null}
+        </> : <p role="status">当前策略未确认。{state.readError}</p>}
         <p className="tasks-note">接口未提供已用数量，不推算剩余预算。以下为配置草稿，保存后才生效。</p>
       </section>
       <button type="button" onClick={() => setVersion(value => value + 1)}>读取当前聊天策略并保留草稿</button>
       <form aria-label="保存聊天策略" onSubmit={event => { event.preventDefault(); void submit(); }}>
-        <fieldset disabled={locked || state.read === "unavailable"}>
+        <fieldset disabled={locked || state.read === "unavailable" || !metadata}>
           <legend>自然聊天工作</legend>
           <label className="chat-policy-toggle"><input type="checkbox" checked={draft.enabled} onChange={event => change({ enabled: event.target.checked })} />启用自然聊天工作</label>
-          <label className="chat-policy-toggle"><input type="checkbox" checked={draft.allowPreparation} onChange={event => change({ allowPreparation: event.target.checked })} />允许按书面预授权开展准备工作</label>
+          <label className="chat-policy-toggle"><input type="checkbox" checked={draft.allowPreparation} onChange={event => change({ allowPreparation: event.target.checked })} />允许受限准备工作</label>
           <label htmlFor={`${id}-budget`}>本版本累计任务上限</label>
           <input id={`${id}-budget`} type="number" min={1} max={100} step={1} required value={draft.budget} onChange={event => change({ budget: event.target.value })} />
           {draft.allowPreparation ? <>
-            <label htmlFor={`${id}-source`}>书面授权来源</label>
-            <select id={`${id}-source`} value={draft.sourceId} disabled={messages.pending || Boolean(messages.error)} onChange={event => change({ sourceId: event.target.value })}>
-              <option value="">请选择本群主话题的用户书面消息</option>
-              {draft.sourceId && !choices.some(message => message.id === draft.sourceId) ? <option value={draft.sourceId} disabled>正在确认原授权来源</option> : null}
-              {choices.map(message => <option key={message.id} value={message.id}>{preview(message)} · {message.id}</option>)}
+            <label htmlFor={`${id}-scope`}>准备工作范围</label>
+            <select id={`${id}-scope`} value={draft.scopeKind ?? ""} onChange={event => change({ scopeKind: event.target.value })}>
+              <option value="">请明确选择新的受支持范围</option>
+              <option value="topic_summary">本群主话题已有消息的纯文本摘要（topic_summary）</option>
             </select>
-            {messages.error ? <p role="alert">授权消息未载入。{messages.error}</p> : null}
-            {messages.next ? <button type="button" disabled={messages.pending} onClick={() => setBefore(messages.next)}>加载更多授权消息</button> : null}
           </> : null}
         </fieldset>
-        {draft.allowPreparation ? <section aria-label="授权来源预览">
-          {source.pending ? <p role="status">正在确认真实授权消息…</p> : null}
-          {shownSource ? <><p className="tasks-copy">{shownSource.content}</p><time dateTime={shownSource.created_at}>{shownSource.created_at}</time>
-            <details><summary>来源标识</summary><p className="tasks-meta">{shownSource.id}</p></details></> : null}
-          {source.error ? <p role="alert">{source.error}</p> : null}
-        </section> : null}
+        <p className="tasks-note">topic_summary 由服务端固定任务标题“本话题纯文本摘要”、绑定本群主话题与实际来源及策略版本的描述；验收要求区分事实、建议、未决问题并引用消息依据。不能自行填写更窄自由文字授权、目标或验收。</p>
+        <p className="tasks-note">topic_summary 结构限制：摘要须非空有效 UTF-8、最多 8192 UTF-8 字节且无 Artifact 引用，不允许文件或外部动作；这些检查不代表摘要语义质量合格或用户接纳。</p>
+        {state.operation ? <details><summary>原未确认保存（仅对账，不是新授权）</summary>
+          <pre className="tasks-copy">{JSON.stringify(state.operation.input)}</pre>
+          {state.operation.source ? <><p className="tasks-copy">原引用消息快照：{state.operation.source.content}</p>
+            <p className="tasks-meta">{state.operation.source.id}</p><time dateTime={state.operation.source.created_at}>{state.operation.source.created_at}</time></> : null}
+        </details> : null}
         {state.conflict ? <p role="status">{state.operation ? "当前版本仅供核对；原保存仍未确认，不能换键或替换草稿。"
           : "版本冲突后已保留草稿；请核对真实当前版本，再由你决定是否保存。"}</p> : null}
         {state.error ? <p role="alert">{state.error}</p> : null}
-        <button type="submit" disabled={state.phase === "pending" || (!state.operation && state.read !== "ready")}>{state.phase === "pending" ? "正在保存聊天策略…"
+        <button type="submit" disabled={state.phase === "pending" || (!state.operation && (state.read !== "ready" || !metadata))}>{state.phase === "pending" ? "正在保存聊天策略…"
           : state.phase === "unknown" ? "重试同一次聊天策略保存" : "保存聊天策略"}</button>
       </form>
       {state.receipt ? <p role="status">聊天策略保存已确认（历史版本 {state.receipt.revision}）；当前值以重新读取为准。</p> : null}

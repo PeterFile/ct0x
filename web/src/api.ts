@@ -1,3 +1,6 @@
+import { hasValidMessageSource } from "./message-source";
+import type { MessageSource } from "./message-source";
+
 export type Group = { id: string; name: string; description: string; created_at: string };
 export type GroupInput = Readonly<{ name: string; description?: string }>;
 export type Member = {
@@ -14,7 +17,7 @@ export type Delivery = {
   id: string; message_id: string; conversation_id: string; recipient_id: string;
   state: string; turn_id: string; error: string; created_at: string;
 };
-export type Message = {
+export type Message = MessageSource & {
   id: string; group_id: string; topic_id: string; sender_id: string; content: string; created_at: string; deliveries: Delivery[];
 };
 export type MessageInput = Readonly<{ content: string; recipient_ids?: readonly string[]; topic_id?: string }>;
@@ -35,7 +38,8 @@ const memberIn = (groupId: string) => (value: unknown): value is Member => isRec
     .every(key => typeof value[key] === "string") && value.id !== "" && value.group_id === groupId;
 const messageIn = (groupId: string, topicId?: string) => (value: unknown): value is Message => isRecord(value)
   && ["id", "group_id", "topic_id", "sender_id", "content", "created_at"].every(key => typeof value[key] === "string")
-  && value.id !== "" && value.group_id === groupId && (topicId === undefined || value.topic_id === topicId) && Array.isArray(value.deliveries)
+  && value.id !== "" && value.group_id === groupId && (topicId === undefined || value.topic_id === topicId)
+  && hasValidMessageSource(value) && Array.isArray(value.deliveries)
   && value.deliveries.every(delivery => isRecord(delivery)
     && ["id", "message_id", "conversation_id", "recipient_id", "state", "turn_id", "error", "created_at"]
       .every(key => typeof delivery[key] === "string") && delivery.id !== "" && delivery.message_id === value.id);

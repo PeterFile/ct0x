@@ -1,12 +1,18 @@
 import { ApiError } from "./api";
+import { isMessageSourceKind } from "./message-source";
+import type { MessageSourceKind } from "./message-source";
 
+// Experimental local chat-authority contract; absent legacy metadata is never promoted into authority.
 export type ChatPolicy = Readonly<{
   group_id: string; topic_id: string; enabled: boolean; allow_preparation: boolean;
   preauthorization_message_id: string; action: "" | "text_submission"; max_admissions: number;
   revision: number; authorized_by: "" | "user"; preauthorization_text?: string;
+  preparation_scope_kind?: string; preparation_supported?: boolean; configuration_source_id?: string;
 }>;
 export type ChatPolicyInput = Readonly<{
-  enabled: boolean; allow_preparation: boolean; preauthorization_message_id: string;
+  enabled: boolean; allow_preparation: boolean; preparation_scope_kind?: "topic_summary";
+  // Retained only for an already-submitted v16 operation; new UI commands never populate this field.
+  preauthorization_message_id?: string;
   action: "text_submission"; max_admissions: number; expected_revision: number;
 }>;
 export type ChatAdmission = Readonly<{
@@ -15,6 +21,8 @@ export type ChatAdmission = Readonly<{
   disposition: "request_work" | "prepare_work"; authority: "explicit_request" | "written_preauthorization";
   authorization_message_id: string; action: "text_submission"; task_id: string; mandate_id: string;
   dispatch_request_id: string; notice_message_id: string; created_at: string;
+  source_id?: string; source_kind?: MessageSourceKind; purpose?: string; authority_evidence_verified?: boolean;
+  outcome?: "" | "admitted"; reason_code?: string; question?: string;
 }>;
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === "string" && !/[\ud800-\udfff]/u.test(value);
@@ -27,31 +35,58 @@ const positive = (value: unknown): value is number => integer(value) && value > 
 const budget = (value: unknown): value is number => integer(value) && value >= 1 && value <= 100;
 const keyValid = (value: string) => value.length > 0 && value.length <= 128 && !/[^\x21-\x7e]|,/.test(value);
 const policyFields = ["group_id", "topic_id", "enabled", "allow_preparation", "preauthorization_message_id", "action", "max_admissions", "revision", "authorized_by"];
+export const hasChatPolicyMetadata = (policy: ChatPolicy) => typeof policy.preparation_supported === "boolean"
+  && typeof policy.configuration_source_id === "string";
+const policyMetadata = ["preauthorization_text", "preparation_scope_kind", "preparation_supported", "configuration_source_id"];
 function isPolicy(value: unknown, groupId: string, topicId: string): value is ChatPolicy {
   if (!record(value) || !policyFields.every(field => Object.hasOwn(value, field))
-    || Object.keys(value).some(field => !policyFields.includes(field) && field !== "preauthorization_text")
+    || Object.keys(value).some(field => !policyFields.includes(field) && !policyMetadata.includes(field))
     || value.group_id !== groupId || value.topic_id !== topicId || !integer(value.revision)
     || typeof value.enabled !== "boolean" || typeof value.allow_preparation !== "boolean"
     || !text(value.preauthorization_message_id) || (value.preauthorization_text !== undefined && !text(value.preauthorization_text))) return false;
+  const metadata = ["preparation_scope_kind", "preparation_supported", "configuration_source_id"].some(field => Object.hasOwn(value, field));
+  if (metadata && (typeof value.preparation_supported !== "boolean" || !text(value.configuration_source_id)
+    || (value.preparation_scope_kind !== undefined && !text(value.preparation_scope_kind)))) return false;
+  const scope = value.preparation_scope_kind ?? "";
   if (value.revision === 0) return !value.enabled && !value.allow_preparation && value.preauthorization_message_id === ""
-    && value.action === "" && value.max_admissions === 0 && value.authorized_by === "" && !value.preauthorization_text;
-  return value.action === "text_submission" && value.authorized_by === "user" && budget(value.max_admissions)
-    && (!value.allow_preparation || identifier(value.preauthorization_message_id))
-    && (value.preauthorization_message_id === "" ? !value.preauthorization_text
-      : identifier(value.preauthorization_message_id) && nonblank(value.preauthorization_text) && !value.preauthorization_text.includes("\0")
-        && new TextEncoder().encode(value.preauthorization_text).length <= 8192);
+    && value.action === "" && value.max_admissions === 0 && value.authorized_by === "" && !value.preauthorization_text
+    && (!metadata || (!value.preparation_supported && value.configuration_source_id === "" && scope === ""));
+  if (value.action !== "text_submission" || value.authorized_by !== "user" || !budget(value.max_admissions)
+    || (value.allow_preparation && !identifier(value.preauthorization_message_id))
+    || (value.preauthorization_message_id === "" ? Boolean(value.preauthorization_text)
+      : !identifier(value.preauthorization_message_id) || !nonblank(value.preauthorization_text) || value.preauthorization_text.includes("\0")
+        || new TextEncoder().encode(value.preauthorization_text).length > 8192)) return false;
+  if (!metadata) return true;
+  if (value.configuration_source_id === "") return !value.preparation_supported && scope === "";
+  if (!identifier(value.configuration_source_id)) return false;
+  if (!value.allow_preparation) return !value.preparation_supported && scope === "" && value.preauthorization_message_id === "";
+  return value.preparation_supported === (scope === "topic_summary");
 }
 const admissionFields = ["id", "candidate_id", "group_id", "topic_id", "message_id", "source_sender_id", "assessed_by", "turn_id",
   "policy_revision", "candidate_generation", "disposition", "authority", "authorization_message_id", "action", "task_id", "mandate_id",
   "dispatch_request_id", "notice_message_id", "created_at"];
 function isAdmission(value: unknown, groupId: string, taskId: string): value is ChatAdmission {
-  if (!record(value) || Object.keys(value).length !== admissionFields.length || !admissionFields.every(field => Object.hasOwn(value, field))
+  const metadata = ["source_id", "source_kind", "purpose", "authority_evidence_verified", "outcome", "reason_code", "question"];
+  if (!record(value) || Object.keys(value).some(field => !admissionFields.includes(field) && !metadata.includes(field))
+    || !admissionFields.every(field => Object.hasOwn(value, field))
     || value.group_id !== groupId || value.task_id !== taskId || !text(value.topic_id) || value.action !== "text_submission"
     || !positive(value.policy_revision) || !positive(value.candidate_generation)
     || !["id", "candidate_id", "message_id", "source_sender_id", "assessed_by", "turn_id", "authorization_message_id", "mandate_id", "notice_message_id"].every(field => identifier(value[field]))
     || !pathId(value.dispatch_request_id) || !text(value.created_at)
     || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value.created_at)
     || !Number.isFinite(Date.parse(value.created_at))) return false;
+  if ((value.source_kind !== undefined && !isMessageSourceKind(value.source_kind))
+    || (value.source_id !== undefined && value.source_id !== "" && !identifier(value.source_id))
+    || (value.purpose !== undefined && value.purpose !== "" && value.purpose !== "chat_intake/v1")
+    || (value.authority_evidence_verified !== undefined && typeof value.authority_evidence_verified !== "boolean")
+    || (value.outcome !== undefined && value.outcome !== "" && value.outcome !== "admitted")
+    || (value.reason_code !== undefined && value.reason_code !== "") || (value.question !== undefined && value.question !== "")) return false;
+  const knownSource = value.source_kind !== undefined && value.source_kind !== "unknown";
+  if (knownSource ? !identifier(value.source_id) : value.source_id !== undefined && value.source_id !== "") return false;
+  if ((value.source_kind === "local_user_chat" || value.source_kind === "local_user_policy") && value.source_sender_id !== "user") return false;
+  if (value.authority_evidence_verified === true && (value.purpose !== "chat_intake/v1"
+    || (value.source_kind !== "local_user_chat" && value.source_kind !== "member")
+    || (value.disposition === "request_work" && value.source_kind !== "local_user_chat"))) return false;
   return value.disposition === "request_work" ? value.authority === "explicit_request" && value.source_sender_id === "user"
     && value.authorization_message_id === value.message_id
     : value.disposition === "prepare_work" && value.authority === "written_preauthorization";
@@ -106,17 +141,26 @@ export async function getChatPolicy(groupId: string, signal?: AbortSignal, topic
 }
 export async function setChatPolicy(groupId: string, input: ChatPolicyInput, key: string, topicId = ""): Promise<ChatPolicy> {
   if (!pathId(groupId) || !text(topicId) || !keyValid(key) || !record(input)) throw invalid();
+  // This branch must preserve the old wire order and DTO for an unknown v16 write's same-key replay.
+  // The server checks persisted replay before validating a new command against the new scope contract.
+  const legacy = Object.hasOwn(input, "preauthorization_message_id") && input.preparation_scope_kind === undefined;
   const sent: ChatPolicyInput = Object.freeze({ enabled: input.enabled, allow_preparation: input.allow_preparation,
-    preauthorization_message_id: input.preauthorization_message_id, action: input.action,
-    max_admissions: input.max_admissions, expected_revision: input.expected_revision });
+    ...(legacy ? { preauthorization_message_id: input.preauthorization_message_id }
+      : input.preparation_scope_kind === undefined ? {} : { preparation_scope_kind: input.preparation_scope_kind }),
+    action: input.action, max_admissions: input.max_admissions, expected_revision: input.expected_revision });
   if (typeof sent.enabled !== "boolean" || typeof sent.allow_preparation !== "boolean" || sent.action !== "text_submission"
-    || !budget(sent.max_admissions) || !integer(sent.expected_revision) || sent.expected_revision >= Number.MAX_SAFE_INTEGER
-    || !text(sent.preauthorization_message_id) || (sent.preauthorization_message_id !== "" && !identifier(sent.preauthorization_message_id))
-    || (sent.allow_preparation && !sent.preauthorization_message_id)) throw invalid();
+    || !budget(sent.max_admissions) || !integer(sent.expected_revision) || sent.expected_revision >= Number.MAX_SAFE_INTEGER) throw invalid();
+  if (legacy ? !text(sent.preauthorization_message_id) || (sent.preauthorization_message_id !== "" && !identifier(sent.preauthorization_message_id))
+      || (sent.allow_preparation && !sent.preauthorization_message_id)
+    : Boolean(input.preauthorization_message_id) || (sent.allow_preparation ? sent.preparation_scope_kind !== "topic_summary"
+      : sent.preparation_scope_kind !== undefined)) throw invalid();
   return request(policyPath(groupId, topicId), { method: "PUT", headers: { "Content-Type": "application/json", "Idempotency-Key": key },
     body: JSON.stringify(sent) }, (value): value is ChatPolicy => isPolicy(value, groupId, topicId)
       && value.revision === sent.expected_revision + 1 && value.enabled === sent.enabled && value.allow_preparation === sent.allow_preparation
-      && value.preauthorization_message_id === sent.preauthorization_message_id && value.action === sent.action && value.max_admissions === sent.max_admissions);
+      && value.action === sent.action && value.max_admissions === sent.max_admissions
+      && (legacy ? value.preauthorization_message_id === sent.preauthorization_message_id && !value.preparation_scope_kind && !value.preparation_supported
+        : hasChatPolicyMetadata(value) && identifier(value.configuration_source_id)
+          && (value.preparation_scope_kind ?? "") === (sent.preparation_scope_kind ?? "") && value.preparation_supported === sent.allow_preparation));
 }
 export async function getChatAdmission(groupId: string, taskId: string, signal?: AbortSignal): Promise<ChatAdmission | null> {
   if (!pathId(groupId) || !pathId(taskId)) throw invalid();

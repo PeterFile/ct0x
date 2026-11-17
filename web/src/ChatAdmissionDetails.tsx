@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { ApiError } from "./api";
+import { ApiError, getMessage } from "./api";
+import type { Message } from "./api";
+import { messageSourceLabel } from "./message-source";
 import { getChatAdmission } from "./chat-api";
 import type { ChatAdmission } from "./chat-api";
 import { getDispatchRequest } from "./dispatch-request-api";
@@ -35,9 +37,17 @@ function AdmissionSample({ groupId, taskId }: { groupId: string; taskId: string 
   return <section className="tasks-lifecycle" aria-label="聊天自动准入依据">
     <h3>来自普通群聊的工作</h3>
     <p className="tasks-note">以下来自服务端不可变准入回执，不是模型正文推断。已登记分派不表示执行成功、交付或用户接纳。</p>
-    <dl><dt>授权方式</dt><dd>{receipt.authority === "explicit_request" ? "本地用户明确请求" : "已启用的用户书面预授权"}</dd>
+    <p className="tasks-note">来源核验不证明自然语言意图零误判，也不等同人类签批；最终用户审查与接纳仍独立。</p>
+    {!receipt.authority_evidence_verified ? <p role="status">历史来源未核验或当前评估证据待确认。保留原授权声明，不补成真人批准；既有任务、交付与用户审查不因此受阻。</p> : null}
+    <dl><dt>服务端意图判定</dt><dd>{receipt.authority_evidence_verified
+      ? receipt.authority === "explicit_request" ? "受信意图判定为明确请求" : "受信意图判定为策略授权的准备工作"
+      : receipt.authority === "explicit_request" ? "历史声明：明确请求（未核验）" : "历史声明：书面预授权（未核验）"}</dd>
+      <dt>来源 / 职责核验</dt><dd>{receipt.authority_evidence_verified ? "来源与评估职责已核验" : "未确认"}</dd>
+      <dt>来源类型</dt><dd>{messageSourceLabel(receipt.source_kind)}{receipt.source_kind ? `（${receipt.source_kind}）` : ""}</dd>
+      <dt>来源命令 / 回执 ID</dt><dd className="tasks-meta">{receipt.source_id || "未提供"}</dd>
+      <dt>评估 purpose</dt><dd className="tasks-meta">{receipt.purpose || "未提供（历史未核验）"}</dd>
       <dt>来源消息</dt><dd className="tasks-meta">{receipt.message_id}</dd>
-      <dt>来源发送者</dt><dd>{receipt.source_sender_id === "user" ? "本地用户（user）" : `群成员 ${receipt.source_sender_id}`}</dd>
+      <dt>来源发送者 ID</dt><dd className="tasks-meta">{receipt.source_sender_id}</dd>
       <dt>授权来源消息</dt><dd className="tasks-meta">{receipt.authorization_message_id}</dd>
       <dt>范围</dt><dd>当前群 / {receipt.topic_id ? `话题 ${receipt.topic_id}` : "主话题"} · 仅文本提交</dd>
       <dt>聊天策略</dt><dd>聊天策略版本 {receipt.policy_revision}</dd>
@@ -47,11 +57,42 @@ function AdmissionSample({ groupId, taskId }: { groupId: string; taskId: string 
     <details><summary>准入技术依据</summary><dl>
       <dt>准入回执</dt><dd className="tasks-meta">{receipt.id}</dd><dt>候选</dt><dd className="tasks-meta">{receipt.candidate_id}</dd>
       <dt>候选代次</dt><dd>{receipt.candidate_generation}</dd><dt>评估轮次</dt><dd className="tasks-meta">{receipt.turn_id}</dd>
+      <dt>原 authority</dt><dd>{receipt.authority}</dd><dt>原 disposition</dt><dd>{receipt.disposition}</dd>
+      <dt>原核验标记</dt><dd>{receipt.authority_evidence_verified === undefined ? "未提供" : String(receipt.authority_evidence_verified)}</dd>
       <dt>群内行动说明消息</dt><dd className="tasks-meta">{receipt.notice_message_id}</dd>
       <dt>任务</dt><dd className="tasks-meta">{receipt.task_id}</dd>
     </dl></details>
+    <SourceMessage receipt={receipt} />
     <AutomaticDispatch receipt={receipt} />
   </section>;
+}
+function SourceMessage({ receipt }: { receipt: ChatAdmission }) {
+  const [expanded, setExpanded] = useState(false), [version, setVersion] = useState(0);
+  const [read, setRead] = useState<{ pending: boolean; value: Message | null; error: string }>({ pending: false, value: null, error: "" });
+  useEffect(() => {
+    if (!expanded) return;
+    let ignore = false;
+    const controller = new AbortController();
+    setRead({ pending: true, value: null, error: "" });
+    void getMessage(receipt.group_id, receipt.message_id, controller.signal).then(message => {
+      if (ignore) return;
+      if (message.topic_id !== receipt.topic_id || (receipt.source_kind && receipt.source_kind !== "unknown" && message.source_kind !== undefined
+        && (message.source_kind !== receipt.source_kind || message.source_id !== receipt.source_id))) {
+        setRead({ pending: false, value: null, error: "来源原文与准入所绑定的话题或来源不一致，原文查阅未确认。" }); return;
+      }
+      setRead({ pending: false, value: message, error: "" });
+    }, error => { if (!ignore) setRead({ pending: false, value: null, error: `来源原文查阅未确认。${errorText(error)}` }); });
+    return () => { ignore = true; controller.abort(); };
+  }, [expanded, receipt, version]);
+  return <div>
+    <button type="button" aria-expanded={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? "收起来源消息" : "检查来源消息"}</button>
+    {expanded ? <section aria-label="来源消息原文">
+      {read.pending ? <p role="status">正在读取绑定的来源消息…</p> : null}
+      {read.error ? <><p role="status">{read.error}</p><button type="button" onClick={() => setVersion(value => value + 1)}>重新读取来源消息</button></> : null}
+      {read.value ? <><p className="tasks-copy">{read.value.content}</p><time dateTime={read.value.created_at}>{read.value.created_at}</time>
+        <p className="tasks-note">消息来源事实：{messageSourceLabel(read.value.source_kind)}；不以正文替代授权证据。</p></> : null}
+    </section> : null}
+  </div>;
 }
 function AutomaticDispatch({ receipt }: { receipt: ChatAdmission }) {
   const [version, setVersion] = useState(0);
