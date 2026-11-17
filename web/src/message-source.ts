@@ -4,11 +4,14 @@ const kinds: readonly string[] = ["local_user_chat", "local_user_policy", "membe
 export const isMessageSourceKind = (value: unknown): value is MessageSourceKind => typeof value === "string" && kinds.includes(value);
 const sourceId = (value: unknown): value is string => typeof value === "string" && value !== ""
   && !/^\p{White_Space}|\p{White_Space}$|[\0\r\n\ud800-\udfff]/u.test(value) && new TextEncoder().encode(value).length <= 4096;
+// Missing/unknown provenance does not infer an identity from the sender.
+export const sourceMatchesSender = (kind: MessageSourceKind | undefined, sender: unknown) =>
+  kind === "local_user_chat" || kind === "local_user_policy" ? sender === "user" : kind !== "member" || sender !== "user";
 export function hasValidMessageSource(value: Record<string, unknown>): boolean {
   if (value.source_kind === undefined) return value.source_id === undefined || value.source_id === "";
   if (!isMessageSourceKind(value.source_kind)) return false;
   if (value.source_kind === "unknown") return value.source_id === undefined || value.source_id === "";
-  return sourceId(value.source_id) && (!["local_user_chat", "local_user_policy"].includes(value.source_kind) || value.sender_id === "user");
+  return sourceId(value.source_id) && sourceMatchesSender(value.source_kind, value.sender_id);
 }
 export const messageSourceLabel = (kind?: MessageSourceKind) => kind === "local_user_chat" ? "本机用户聊天命令"
   : kind === "local_user_policy" ? "用户策略配置命令" : kind === "member" ? "成员消息" : kind === "platform" ? "系统消息" : "来源未核验";

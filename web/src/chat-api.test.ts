@@ -63,3 +63,21 @@ it("quietly supports legacy plain 404 admission reads but never treats a malform
   const error = await setChatPolicy(group.id, input, "exact-policy-key").catch(error => error);
   expect(error).toMatchObject({ status: 404, code: "invalid_response" }); expect(isChatPolicyDefinitiveRejection(error)).toBe(false);
 });
+it.each([
+  { label: "unexpected code", body: JSON.stringify({ error: { code: "unexpected_code", message: "not not_found" } }), type: "application/json" },
+  { label: "malformed envelope", body: JSON.stringify({ error: { code: "not_found" } }), type: "application/json" },
+  { label: "extra envelope fields", body: JSON.stringify({ error: { code: "not_found", message: "missing" }, extra: true }), type: "application/json" },
+  { label: "invalid JSON", body: '{"error":', type: "application/json" },
+  { label: "unknown plain body", body: "not a recognizable legacy response", type: "text/plain" },
+  { label: "JSON mime with plain legacy text", body: "404 page not found", type: "application/json" },
+])("PUI-4 does not silence a 404 with $label", async ({ body, type }) => {
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(body, { status: 404, headers: { "Content-Type": type } }));
+  vi.stubGlobal("fetch", transport);
+  await expect(getChatAdmission(group.id, task.id)).rejects.toMatchObject({ status: 404 }); expect(transport).toHaveBeenCalledTimes(1);
+});
+it("PUI-4 still silences a protocol not_found and the identifiable Go plain 404", async () => {
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(json({ error: { code: "not_found", message: "旧任务" } }, 404))
+    .mockResolvedValueOnce(new Response("404 page not found\n", { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } }));
+  vi.stubGlobal("fetch", transport);
+  await expect(getChatAdmission(group.id, task.id)).resolves.toBeNull(); await expect(getChatAdmission(group.id, task.id)).resolves.toBeNull();
+});

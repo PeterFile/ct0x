@@ -1,5 +1,5 @@
 import { ApiError } from "./api";
-import { isMessageSourceKind } from "./message-source";
+import { isMessageSourceKind, sourceMatchesSender } from "./message-source";
 import type { MessageSourceKind } from "./message-source";
 
 // Experimental local chat-authority contract; absent legacy metadata is never promoted into authority.
@@ -83,7 +83,7 @@ function isAdmission(value: unknown, groupId: string, taskId: string): value is 
     || (value.reason_code !== undefined && value.reason_code !== "") || (value.question !== undefined && value.question !== "")) return false;
   const knownSource = value.source_kind !== undefined && value.source_kind !== "unknown";
   if (knownSource ? !identifier(value.source_id) : value.source_id !== undefined && value.source_id !== "") return false;
-  if ((value.source_kind === "local_user_chat" || value.source_kind === "local_user_policy") && value.source_sender_id !== "user") return false;
+  if (!sourceMatchesSender(value.source_kind, value.source_sender_id)) return false;
   if (value.authority_evidence_verified === true && (value.purpose !== "chat_intake/v1"
     || (value.source_kind !== "local_user_chat" && value.source_kind !== "member")
     || (value.disposition === "request_work" && value.source_kind !== "local_user_chat"))) return false;
@@ -107,6 +107,13 @@ function decode(buffer: ArrayBuffer): unknown {
   return JSON.parse(source);
 }
 class ChatRejection extends ApiError {}
+class LegacyPlainNotFound extends ApiError {}
+function isLegacyPlainNotFound(response: Response, body: ArrayBuffer | null): boolean {
+  const mediaType = response.headers.get("Content-Type")?.split(";")[0].trim().toLowerCase();
+  if (response.status !== 404 || body === null || (mediaType && mediaType !== "text/plain")) return false;
+  try { return /^404 page not found(?:\r?\n)?$/.test(new TextDecoder("utf-8", { fatal: true }).decode(body)); }
+  catch { return false; }
+}
 export const isChatPolicyDefinitiveRejection = (error: unknown) => error instanceof ChatRejection;
 const invalid = () => new ChatRejection("聊天策略输入无效，请检查范围、版本、任务预算和授权来源。", 400, "invalid_input");
 const refusals: Record<number, readonly string[]> = { 400: ["invalid_input", "invalid_json"], 403: ["invalid_host", "invalid_origin"],
@@ -121,7 +128,9 @@ async function request<T>(path: string, init: RequestInit, valid: (value: unknow
   let response: Response;
   try { response = await fetch(path, { ...init, redirect: "error" }); }
   catch { throw new ApiError("聊天配置信息或保存结果未确认，请保留原操作后重试。", 0, "disconnected"); }
-  const value: unknown = await response.arrayBuffer().then(decode).catch(() => null);
+  const body = await response.arrayBuffer().catch(() => null);
+  let value: unknown = null;
+  if (body !== null) { try { value = decode(body); } catch { /* Invalid bodies remain unconfirmed. */ } }
   if (response.status === 200 && valid(value)) return value;
   if (!response.ok && record(value) && Object.keys(value).length === 1 && record(value.error) && Object.keys(value.error).length === 2
     && nonblank(value.error.code) && nonblank(value.error.message)) {
@@ -130,7 +139,8 @@ async function request<T>(path: string, init: RequestInit, valid: (value: unknow
     const reason = definitive ? rejectionText[response.status] : "聊天请求未完成，配置或保存结果未确认";
     throw new ErrorType(`${reason}（HTTP ${response.status}）。`, response.status, value.error.code);
   }
-  throw new ApiError(`聊天响应不符合约定，读取或保存结果未确认（HTTP ${response.status}）。`, response.status, "invalid_response");
+  const ErrorType = isLegacyPlainNotFound(response, body) ? LegacyPlainNotFound : ApiError;
+  throw new ErrorType(`聊天响应不符合约定，读取或保存结果未确认（HTTP ${response.status}）。`, response.status, "invalid_response");
 }
 function policyPath(groupId: string, topicId: string) {
   return `/api/v1/groups/${encodeURIComponent(groupId)}/coordination/chat-policy${topicId ? `?${new URLSearchParams({ topic_id: topicId })}` : ""}`;
@@ -168,8 +178,8 @@ export async function getChatAdmission(groupId: string, taskId: string, signal?:
     return await request(`/api/v1/groups/${encodeURIComponent(groupId)}/tasks/${encodeURIComponent(taskId)}/chat-admission`, { signal },
       (value): value is ChatAdmission => isAdmission(value, groupId, taskId));
   } catch (error) {
-    // Both legacy Tasks and older instances legitimately lack this read capability.
-    if (error instanceof ApiError && error.status === 404) return null;
+    // Only a recognized absence is quiet; malformed or unexpected 404s remain unreadable.
+    if (error instanceof LegacyPlainNotFound || (error instanceof ChatRejection && error.status === 404 && error.code === "not_found")) return null;
     throw error;
   }
 }

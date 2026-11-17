@@ -10,6 +10,7 @@ import { message } from "./test/messages";
 afterEach(() => { cleanup(); vi.unstubAllGlobals(); });
 it.each([
   { kind: "platform", sender: "user", author: "系统", local: false },
+  { kind: "platform", sender: member.id, author: "系统", local: false },
   { kind: "local_user_policy", sender: "user", author: "我·策略设置", local: true },
   { kind: "local_user_chat", sender: "user", author: "我", local: true },
   { kind: "member", sender: member.id, author: member.name, local: false },
@@ -52,4 +53,13 @@ it("does not confirm contradictory new origin metadata or silently upgrade it to
   const error = await sendMessage(group.id, { content: message.content }, "original-key").catch(error => error);
   expect(error).toMatchObject({ code: "invalid_response", status: 201 }); expect(isDefinitiveRejection(error)).toBe(false);
   expect(transport).toHaveBeenCalledTimes(1);
+});
+it("PUI-1 rejects a member source with the reserved user sender on list, detail and write receipts", async () => {
+  const contradictory = { ...message, source_kind: "member", source_id: "member-command", sender_id: "user" };
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(page([contradictory])).mockResolvedValueOnce(json(contradictory))
+    .mockResolvedValueOnce(json(contradictory, 201)); vi.stubGlobal("fetch", transport);
+  await expect(listMessages(group.id)).rejects.toMatchObject({ status: 200, code: "invalid_response" });
+  await expect(getMessage(group.id, message.id)).rejects.toMatchObject({ status: 200, code: "invalid_response" });
+  const error = await sendMessage(group.id, { content: message.content }, "original-unknown-key").catch(error => error);
+  expect(error).toMatchObject({ status: 201, code: "invalid_response" }); expect(isDefinitiveRejection(error)).toBe(false);
 });
