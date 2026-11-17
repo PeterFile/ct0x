@@ -12,7 +12,7 @@ The architecture direction selected on 2026-11-01 follows the pinned dsh-superag
 - `internal/store`: SQLite transactions, migrations, indexed bounded reads, identity and resource constraints.
 - `internal/provider`: CLI discovery, capability contracts, native/one-shot transport, execution receipts. No group-specific routing.
 - `internal/platform`: shared operations, actor binding, discussion routing, task lifecycle, artifacts, skills, and context.
-- `internal/coordination`: Engine for source intake, versioned admission, Mandates, Assignment bindings, follow-up ownership, and structured attention through one transactional module. Coordination storage and role-scoped primitives exist; production role composition remains gated. It reuses the existing Store, queue, and scheduler, not a parallel execution system.
+- `internal/coordination`: Engine for source intake, versioned admission, Mandates, Assignment bindings, follow-up ownership, and structured attention through one transactional module. Coordination storage and role-scoped primitives exist; opt-in `--enable-coordination-roles` wires `NewTrustedIntentPass` and bound coordinator/worker execution into the existing scheduler for registered Dispatch/Assignment work. Natural-chat assessment/admission and automatic Dispatch registration remain unwired; file tools/Artifact publication are not connected to that text Submission path, and Project migration is not implemented. It reuses the existing Store, queue, and scheduler, not a parallel execution system.
 - `internal/scheduler`: durable claims, fair inbox/work scheduling, cancellation, and recovery.
 - `internal/httpapi`, `cmd/workspace`: loopback HTTP, SSE, process lifecycle, and platform CLI entry.
 - `web`: design tokens, accessible interaction, and server-backed views.
@@ -93,6 +93,8 @@ The primary screen is an IM: conversations on the left, messages and a persisten
 - [Go database/sql](https://go.dev/doc/database/execute-transactions): transactions own one connection; all operations inside a transaction use that transaction.
 
 ## Delivery and regression gates
+
+The development-model convention in `AGENTS.md` and this repository's independent-verification arrangements constrain repository development, not runtime product policy. Local Sol execution with external Terra verification is one development-validation configuration, not a mandatory CLI/model sequence or verifier node for product chats or Tasks.
 
 Deliver independently reviewable contracts, storage, provider discovery, execution, UI, scheduler, resources, context, and acceptance slices. Aim for 300–500 effective lines per review; record justified exceptions. Each slice needs behavior-specific tests, independent review, and a rollback commit. Publish small PRs to the configured repository and merge only after independent review and the applicable checks pass.
 

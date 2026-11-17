@@ -2,13 +2,17 @@
 
 [PRD.md](../PRD.md) is the product authority for the accepted `Workspace → Project → Channel` target. This document retains the coordination direction selected on 2026-11-01 and defines its compatibility migration. Current runtime and persistence remain `Group/Conversation`, one Go process, SQLite, and the existing CLI adapters.
 
-Coordination storage and role-scoped primitives already exist, including local Source/admission and group-bound coordinator configuration. The private intent pass remains unwired; production coordinator/worker composition and Project migration are not enabled. Inspect is diagnostic, not execution authorization. The flows and interfaces below are target contracts unless explicitly described as current.
+Coordination storage, local Source/admission, and group-bound coordinator configuration exist. With the opt-in `--enable-coordination-roles`, `NewTrustedIntentPass` is wired into the same scheduler to advance already recorded Dispatch requests and Assignments; the bound coordinator `decide_dispatch` → worker `submit_result` composition is implemented. Real local CLI text-result validation covers this explicitly admitted path, not the natural-chat experience. Inspect remains diagnostic, not execution authorization; Project migration is not implemented.
+
+Today `CreateMessage` routes to the earliest active member when `recipient_ids` is omitted. Ordinary Turns with member tools expose only six discussion tools and no task-admission operation; `RequestWork` and `RequestDispatch` remain local-user-only. Natural chat → contextual intent/source/authority assessment → admission → automatic Dispatch registration is not wired. Current role delivery is a text Submission path: file tools and Artifact publication are not connected to that path. The flows and interfaces below are target contracts unless explicitly described as current.
 
 The principal reference is [dsh-superagent-prototype at 6337fc8](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/6337fc823ce20251c8de8085948165c81aaa701e). Its implementation provides a domain Engine, versioned admission policy, durable effects, persistent worker inputs, and source-specific replies. Its underlying Sessions, Inbox, Jobs, and Subagents are services of DeepSeek Harness; this repository does not independently implement that runtime. Our Go application adapts the orchestration responsibilities instead of embedding the DSH plugin.
 
 ## Product and execution flow
 
 The conversation is the primary interface. Ordinary discussion can produce an Agent Turn without creating a Task. A request becomes authorized work only through a recorded admission decision. Follow-ups for existing work stay with that work unless its executor hands them back.
+
+Product CLI/model selection follows user configuration, task needs, verified adapter capabilities, and authorization. Permanent and temporary Agent responsibilities and collaboration are composed as needed. The coordinator/worker flow below is one composition, not a required Agent lineup for every Task or a claim of new runtime capabilities. Testing, technical review, or independent verification is not mandatory for every chat or Task; its necessity and timing, and the conditions for acceptance, follow the task's acceptance agreement or a user-enabled Policy. Pending verification alone does not bar rejection as agreed; acceptance must still satisfy the applicable conditions.
 
 ```mermaid
 flowchart TD
@@ -30,8 +34,9 @@ flowchart TD
     Engine --> Outbox[Reply intent and receipt]
     Outbox --> IM
     Report --> Submission[Immutable Submission]
-    Submission --> Verify[Independent verification evidence]
-    Verify --> Review[Separate local-user ReviewDecision]
+    Submission --> Review[Separate local-user ReviewDecision]
+    Submission -. "Evidence per task agreement or user-enabled Policy" .-> Verify[Verification evidence]
+    Verify -. "Informs Review" .-> Review
 ```
 
 The initial Source is the local IM. **Reply destination** means the authorized response destination, called Channel in the pinned DSH reference; it is not the PRD's Project Channel. Local replies use the existing group/topic scope; Project Channel mapping is not yet implemented.
@@ -73,7 +78,7 @@ Engine is the only writer of the new coordination aggregates. Its small role-sco
 
 The Store supplies a transactional seam through which one Engine command changes all affected records and queues its intents. Extract and reuse existing in-transaction helpers; do not call public Store operations that open a second transaction from inside an Engine transaction. File copies, model calls, native process launches, and network writes happen after commit.
 
-Policy is deterministic and versioned. Assessment proposes a decision under a captured Policy revision and candidate generation. A stale result cannot accept work after either changes. Explicit local-user requests are supported first. Inferred work begins in observation mode and requires an enabled written rule before automatic execution.
+Policy is deterministic and versioned. Assessment proposes a decision under a captured Policy revision and candidate generation. A stale result cannot accept work after either changes. Explicit local-user requests, including contextually clear conversational requests, are an authorization source, not a requirement to submit an admission form. Work inferred from Agent discussion remains observational unless an enabled, scoped, versioned written local-user rule authorizes it; that rule can permit autonomous preparation without a new “start” per task. Trusted intake must carry the actual source and authority into the same Engine, not expose local-user-only `RequestWork` or `RequestDispatch` to ordinary members as a user-impersonation shortcut.
 
 A trusted Policy change invalidates stale evaluations and notifies the work it affects. An ended Task's coordination may resume only after its original Mandate is revalidated against the current Policy. A human stop persistently withdraws that Mandate: ordinary follow-up, attach, or retry cannot restore it; newly authorized work requires a new decision and Mandate. This authorization transition does not release an uncertain native Turn's resource claims.
 
@@ -132,11 +137,15 @@ In particular, do not adopt the reference's timeout-based worker-slot release wh
 
 The UI uses a conversation list, a central chronological message timeline, and a composer that remains reachable. Members, Tasks, deliverables, search, and conversation details are contextual panels or drawers. They do not replace the conversation with a dashboard or a collection of administrative pages.
 
+The target everyday path is normal group conversation: Agents proactively respond and discuss with one another within relevance, authority, and budget bounds. When local-user says “可以开始开发了” or makes an equivalent explicit request, Agents interpret the conversation's decisions, tasks, and constraint changes to derive goals and acceptance criteria. The same Engine evaluates the trusted source and authority; within the intersection of the request/enabled preauthorization and resource grants, it records the source, Task and Mandate, and automatically registers Dispatch for the existing execution path. Actions and their basis, progress, and results return to the originating authorized group/topic.
+
+Choosing a delivery mode, clicking “转为任务”, filling itemized authorization/dispatch forms, or manually refreshing must not be prerequisites. Unclear scope or a request beyond authority calls for one concrete question; Agent suggestions or consensus are not user permission. Enabled, scoped, versioned preauthorization still permits autonomous preparation. “Start” is not a required per-task button; keyword/regex matching or relabeling existing controls cannot replace contextual intent and authority assessment.
+
 Use the existing charcoal, warm-white, and vermilion tokens. Display the local author as the user and a member by its real known identity. Put technical identifiers and detailed execution evidence in expandable details. Keep source identity separate from the selected Agent provider.
 
 Panel or conversation changes must preserve pending and uncertain mutations, their original input, and their idempotency keys. Hidden, unused reads may stop; shared roster data still needed by the active composer must remain available. Closing a panel must not cancel a submitted write or change the chosen recipients.
 
-Message visibility and wakeups stay separate: default routing, explicitly public-only, and explicitly selected recipients retain their existing meanings. Textual mentions do not silently alter delivery. Receipts distinguish saved, accepted by the CLI, terminal, submitted, and accepted result; no unproven read or typing indicator is shown.
+Message visibility and wakeups stay separate. Default routing, explicitly public-only, and explicitly selected recipients retain their compatibility meanings as internal routing and optional low-frequency controls, not a required pre-send mode picker. To address a member, select an `@` suggestion in the composer or choose a recipient through the member avatar's right-click menu; both bind stable member IDs, not display names. Plain text containing the same name is not a structured mention and does not alter delivery or authority. Receipts distinguish saved, accepted by the CLI, terminal, submitted, and accepted result; no unproven read or typing indicator is shown.
 
 Task and attention cards require durable typed references and real actions. Their immutable event history is separate from any clearly labeled current-state projection. Until the backend supplies those references, show the actual Task in a contextual panel rather than inventing an event in the chat.
 
@@ -144,11 +153,13 @@ Unread counts, last-message previews, coordinator badges, external-source labels
 
 ## Incremental acceptance
 
-Completing the existing Group workflow establishes a reusable execution baseline, not Project compatibility or full PRD acceptance.
+The opt-in, explicitly admitted Group execution path is an implemented baseline with real CLI text-result evidence, not completion of the group-chat experience or Project compatibility. Unimplemented Project migration must not block the next text loop on existing Group/Conversation.
 
-1. Retain the IM shell on the existing working message flow, with desktop, short-window, narrow-screen, keyboard, and delayed-response validation.
-2. Complete trusted group-scoped execution and coordinator/worker composition over the implemented admission and coordination primitives, using the existing queue and receipts. Explicit work admission remains the first executable path.
-3. Verify real local CLI coordinator and worker collaboration, including follow-up during execution, structured reports, an attention question, an actual versioned Submission, independent verification, and a separate local-user ReviewDecision. Include controlled restart and unknown/cancellation/resource-claim protection.
+Acceptance here is this repository's development validation, including independent checks of actual results and receipts; it does not require an independent-verifier model node in the product runtime.
+
+1. Retain the IM shell and the implemented trusted intent pass/coordinator/worker composition on the same queue and receipts. Preserve desktop, short-window, narrow-screen, keyboard, and delayed-response validation.
+2. **Next priority: verify normal group chat through a real local CLI text Submission and automatic return to the group.** Begin with ordinary discussion and proactive Agent replies and exchanges, without creating a Task or choosing a delivery mode. A contextual “可以开始开发了” or equivalent explicit local-user request must produce goals, acceptance criteria, trusted source/authority assessment, admitted Task/Mandate, and automatic Dispatch registration through the same Engine and existing scheduler. Actions and their basis, progress, and results must return to the authorized group/topic without conversion, itemized authorization/dispatch forms, or manual refresh. File writes and Artifact publication require separate implementation and acceptance; this text scenario does not prove them.
+3. Verify equivalent phrasings and enabled, versioned, scoped preauthorization for autonomous preparation; Agent consensus alone must not authorize work. Unclear scope or excess authority must produce one concrete question, not a generic form. Verify structured `@` and avatar right-click selection by stable member ID, plain-name text without routing effects, and compatibility routing semantics. Include follow-up and constraint changes during execution, structured reports, a concrete versioned Submission, any verification required by the task agreement or user-enabled Policy, and a separate local-user ReviewDecision. Retain idempotency, group isolation, controlled restart, unknown/cancellation/resource-claim protection, and existing submission fences.
 4. Verify each Project/Channel and later Task/member/Session compatibility slice's integrity, isolation, and recovery before exposing dependent product operations. Hierarchy labels alone do not satisfy migration or real product acceptance.
 5. Extend provider continuity and external Sources one adapter at a time, only after their actual capabilities and authority are verified.
 
