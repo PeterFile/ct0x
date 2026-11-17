@@ -6,7 +6,9 @@ const workspaceOperationSchemaV21 = workspaceOperationIntentSchemaV21 + workerAr
 
 const workspaceOperationIntentSchemaV21 = `
 CREATE TABLE workspace_operations (
-    id TEXT PRIMARY KEY NOT NULL CHECK(id<>'' AND length(CAST(id AS BLOB))<=256),
+    -- SQLite serializes writers; this declared ordinal survives VACUUM/reopen.
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK(sequence > 0),
+    id TEXT NOT NULL UNIQUE CHECK(id<>'' AND length(CAST(id AS BLOB))<=256),
     group_id TEXT NOT NULL,
     task_id TEXT NOT NULL REFERENCES chat_workspace_scopes(task_id),
     task_revision INTEGER NOT NULL CHECK(typeof(task_revision)='integer' AND task_revision>0),
@@ -24,7 +26,7 @@ CREATE TABLE workspace_operations (
         AND instr(relative_path,char(0))=0 AND instr(relative_path,'\')=0 AND instr(relative_path,':')=0
         AND instr(relative_path,'//')=0 AND instr('/'||relative_path||'/','/./')=0
         AND instr('/'||relative_path||'/','/../')=0
-        AND relative_path NOT GLOB ('*['||char(1)||'-'||char(31)||char(127)||']*')),
+        AND relative_path NOT GLOB ('*['||char(1)||'-'||char(31)||char(127)||'-'||char(159)||']*')),
     kind TEXT NOT NULL CHECK(kind IN ('create','replace')),
     expected_hash TEXT NOT NULL,
     after_hash TEXT NOT NULL CHECK(length(after_hash)=64 AND length(CAST(after_hash AS BLOB))=64 AND after_hash NOT GLOB '*[^0-9a-f]*'),
@@ -45,6 +47,7 @@ CREATE TABLE workspace_operations (
 );
 CREATE INDEX workspace_operations_task ON workspace_operations(group_id,task_id,id);
 CREATE INDEX workspace_operations_turn ON workspace_operations(group_id,turn_id,created_at DESC,id DESC);
+CREATE INDEX workspace_operations_path ON workspace_operations(group_id,task_id,turn_id,relative_path,sequence DESC);
 CREATE TABLE workspace_operation_receipts (
     operation_id TEXT PRIMARY KEY NOT NULL REFERENCES workspace_operations(id),
     outcome TEXT NOT NULL CHECK(outcome IN ('unchanged','done','unknown','applied_sync_error')),
@@ -58,7 +61,7 @@ CREATE TABLE workspace_operation_receipts (
 CREATE TRIGGER workspace_operations_insert BEFORE INSERT ON workspace_operations
 BEGIN
     SELECT RAISE(ABORT, '文件操作意图不可替换') WHERE EXISTS(SELECT 1 FROM workspace_operations
-        WHERE id=NEW.id OR (group_id=NEW.group_id AND member_id=NEW.member_id AND idempotency_key=NEW.idempotency_key)
+        WHERE sequence=NEW.sequence OR id=NEW.id OR (group_id=NEW.group_id AND member_id=NEW.member_id AND idempotency_key=NEW.idempotency_key)
         OR notice_message_id=NEW.notice_message_id)
         OR EXISTS(SELECT 1 FROM workspace_operation_receipts WHERE notice_message_id=NEW.notice_message_id);
     SELECT RAISE(ABORT, '任务或轮次存在未确认文件操作') WHERE EXISTS(
@@ -98,6 +101,7 @@ CREATE TRIGGER workspace_operation_receipts_insert BEFORE INSERT ON workspace_op
 BEGIN
     SELECT RAISE(ABORT, '文件操作结果不可替换') WHERE EXISTS(SELECT 1 FROM workspace_operation_receipts WHERE operation_id=NEW.operation_id OR notice_message_id=NEW.notice_message_id)
         OR EXISTS(SELECT 1 FROM workspace_operations WHERE notice_message_id=NEW.notice_message_id);
+    -- The intent FK and immutable receipt establish causality, not wall-clock order.
     SELECT RAISE(ABORT, '文件操作结果必须绑定原意图及仍有效的执行资源') WHERE NOT EXISTS(
         SELECT 1 FROM workspace_operations o JOIN turns t ON t.id=o.turn_id
         JOIN members m ON m.id=o.member_id AND m.group_id=o.group_id AND m.status='active'
@@ -105,7 +109,7 @@ BEGIN
         JOIN resource_claims rc ON rc.resource_key=o.resource_key AND rc.turn_id=o.turn_id
         WHERE o.id=NEW.operation_id AND t.state IN ('starting','running') AND t.cancel_requested_at IS NULL AND t.candidate_terminal=''
         AND task.status='open' AND task.revision=o.task_revision AND task.active_attempt_id=o.attempt_id AND task.current_submission_id IS NULL
-        AND NEW.finished_at>=o.created_at AND ((NEW.outcome IN ('done','applied_sync_error') AND NEW.observed_hash=o.after_hash AND NEW.observed_size=o.after_size)
+        AND ((NEW.outcome IN ('done','applied_sync_error') AND NEW.observed_hash=o.after_hash AND NEW.observed_size=o.after_size)
         OR (NEW.outcome='unchanged' AND NEW.observed_hash=o.preimage_hash AND NEW.observed_size=o.preimage_size) OR NEW.outcome='unknown'));
     SELECT RAISE(ABORT, '文件操作结果通知必须关联原群话题') WHERE NOT EXISTS(
         SELECT 1 FROM workspace_operations o JOIN chat_workspace_scopes s ON s.task_id=o.task_id

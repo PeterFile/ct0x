@@ -33,7 +33,7 @@ func workspaceOperationPublicationInTx(ctx context.Context, tx *sql.Tx, role Coo
 		o, err = workspaceOperationInTx(ctx, tx, role.Member.Claim.GroupID, input.OperationID)
 	} else {
 		// Select the latest intent first, not the latest qualifying done receipt.
-		o, err = scanWorkspaceOperation(tx.QueryRowContext(ctx, "SELECT "+workspaceOperationColumns+workspaceOperationFrom+` WHERE o.group_id=? AND o.task_id=? AND o.turn_id=? AND o.relative_path=? ORDER BY o.created_at DESC,o.id DESC LIMIT 1`, role.Member.Claim.GroupID, role.Provenance.TaskID, role.Member.Claim.TurnID, input.RelativePath))
+		o, err = scanWorkspaceOperation(tx.QueryRowContext(ctx, "SELECT "+workspaceOperationColumns+workspaceOperationFrom+` WHERE o.group_id=? AND o.task_id=? AND o.turn_id=? AND o.relative_path=? ORDER BY o.sequence DESC LIMIT 1`, role.Member.Claim.GroupID, role.Provenance.TaskID, role.Member.Claim.TurnID, input.RelativePath))
 	}
 	if err != nil {
 		return WorkspaceOperation{}, err

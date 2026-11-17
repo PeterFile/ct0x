@@ -42,7 +42,7 @@ BEGIN
         AND ((NEW.requested_operation_id=o.id AND NEW.requested_relative_path='')
             OR (NEW.requested_operation_id='' AND NEW.requested_relative_path=o.relative_path AND NOT EXISTS(
                 SELECT 1 FROM workspace_operations later WHERE later.group_id=o.group_id AND later.task_id=o.task_id
-                AND later.turn_id=o.turn_id AND later.relative_path=o.relative_path AND (later.created_at,later.id)>(o.created_at,o.id))))
+                AND later.turn_id=o.turn_id AND later.relative_path=o.relative_path AND later.sequence>o.sequence)))
         AND t.state IN ('starting','running') AND t.cancel_requested_at IS NULL AND t.candidate_terminal=''
         AND task.status='open' AND task.revision=o.task_revision AND task.active_attempt_id=o.attempt_id AND task.current_submission_id IS NULL
         AND NOT EXISTS(SELECT 1 FROM workspace_operations pending LEFT JOIN workspace_operation_receipts pr ON pr.operation_id=pending.id
