@@ -18,7 +18,7 @@ var codexAppServerDisabledFeatures = []string{
 }
 
 func codexAppServerConfig(names []string) map[string]any {
-	features := make(map[string]bool, len(codexAppServerDisabledFeatures))
+	features := make(map[string]any, len(codexAppServerDisabledFeatures))
 	for _, name := range codexAppServerDisabledFeatures {
 		features[name] = false
 	}
