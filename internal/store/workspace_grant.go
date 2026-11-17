@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -11,7 +10,8 @@ import (
 )
 
 // WorkspaceGrantReceipt is immutable local-user authority, not a member preference.
-// Directory identity is revalidated by the platform before preparation.
+// It is neither task authority nor proof of provider write capability. Directory
+// identity is revalidated by the platform before preparation.
 type WorkspaceGrantReceipt struct {
 	ID           string    `json:"id"`
 	GroupID      string    `json:"group_id"`
@@ -40,11 +40,14 @@ const workspaceGrantColumns = "id, group_id, member_id, root, resolved_root, res
 // Replay returns historical evidence without validating or selecting a new CWD.
 func (s *Store) AuthorizeWorkspaceGrant(ctx context.Context, input AuthorizeWorkspaceGrantInput,
 	validate func([]WorkspaceGrantReceipt) (WorkspaceGrantDirectory, error)) (WorkspaceGrantReceipt, error) {
-	const action = "授权只读目录失败"
+	action, table := "授权只读目录失败", "workspace_grants"
+	if input.Scope == "read_write" {
+		action, table = "授权读写目录失败", "workspace_write_grants"
+	}
 	var empty WorkspaceGrantReceipt
 	if !validTriggerID(input.GroupID) || !validTriggerID(input.MemberID) || !validWorkspaceGrantPath(input.Root) ||
-		input.Scope != "read_only" || strings.TrimSpace(input.IdempotencyKey) == "" || validate == nil {
-		return empty, fmt.Errorf("%w：须明确指定群组、成员、绝对目录、只读范围和幂等键", ErrInvalid)
+		(input.Scope != "read_only" && input.Scope != "read_write") || strings.TrimSpace(input.IdempotencyKey) == "" || validate == nil {
+		return empty, fmt.Errorf("%w：须明确指定群组、成员、绝对目录、只读或读写范围和幂等键", ErrInvalid)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -62,12 +65,19 @@ func (s *Store) AuthorizeWorkspaceGrant(ctx context.Context, input AuthorizeWork
 	if err != nil {
 		return empty, storeError(action, err)
 	}
+	if !replay && status != "active" {
+		return empty, storeError(action, ErrNotFound)
+	}
+	source, writeSupported, err := workspaceGrantSource(ctx, tx)
+	if err != nil {
+		return empty, storeError(action, err)
+	}
+	if input.Scope == "read_write" && !writeSupported {
+		return empty, fmt.Errorf("%s：%w：当前数据库版本不支持读写目录授权", action, ErrInvalid)
+	}
 	if !replay {
-		if status != "active" {
-			return empty, storeError(action, ErrNotFound)
-		}
 		var exists bool
-		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM workspace_grants WHERE group_id=? AND member_id=?)", input.GroupID, input.MemberID).Scan(&exists); err != nil {
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM "+source+" WHERE group_id=? AND member_id=?)", input.GroupID, input.MemberID).Scan(&exists); err != nil {
 			return empty, storeError(action, err)
 		}
 		if exists {
@@ -89,9 +99,9 @@ func (s *Store) AuthorizeWorkspaceGrant(ctx context.Context, input AuthorizeWork
 			return empty, storeError(action, err)
 		}
 		var inserted string
-		err = tx.QueryRowContext(ctx, `INSERT INTO workspace_grants(`+workspaceGrantColumns+`)
-		 VALUES(?,?,?,?,?,?,'read_only','local','user',?) RETURNING id`, id, input.GroupID, input.MemberID,
-			input.Root, directory.ResolvedRoot, directory.ResourceKey, time.Now().UTC().Format(timestampLayout)).Scan(&inserted)
+		err = tx.QueryRowContext(ctx, `INSERT INTO `+table+`(`+workspaceGrantColumns+`)
+		 VALUES(?,?,?,?,?,?,?,'local','user',?) RETURNING id`, id, input.GroupID, input.MemberID,
+			input.Root, directory.ResolvedRoot, directory.ResourceKey, input.Scope, time.Now().UTC().Format(timestampLayout)).Scan(&inserted)
 		if err != nil || inserted != id {
 			if err == nil {
 				err = ErrConflict
@@ -108,7 +118,7 @@ func (s *Store) AuthorizeWorkspaceGrant(ctx context.Context, input AuthorizeWork
 			return empty, storeError(action, err)
 		}
 	}
-	receipt, err := scanWorkspaceGrant(tx.QueryRowContext(ctx, "SELECT "+workspaceGrantColumns+" FROM workspace_grants WHERE group_id=? AND member_id=? AND id=?", input.GroupID, input.MemberID, id))
+	receipt, err := scanWorkspaceGrant(tx.QueryRowContext(ctx, "SELECT "+workspaceGrantColumns+" FROM "+table+" WHERE group_id=? AND member_id=? AND id=?", input.GroupID, input.MemberID, id))
 	if err != nil {
 		return empty, storeError(action, err)
 	}
@@ -137,7 +147,11 @@ func (s *Store) AuthorizeWorkspaceGrant(ctx context.Context, input AuthorizeWork
 }
 
 func (s *Store) GetWorkspaceGrant(ctx context.Context, groupID, memberID string) (WorkspaceGrantReceipt, error) {
-	receipt, err := scanWorkspaceGrant(s.db.QueryRowContext(ctx, "SELECT "+workspaceGrantColumns+" FROM workspace_grants WHERE group_id=? AND member_id=?", groupID, memberID))
+	source, _, err := workspaceGrantSource(ctx, s.db)
+	if err != nil {
+		return WorkspaceGrantReceipt{}, storeError("读取目录授权回执失败", err)
+	}
+	receipt, err := scanWorkspaceGrant(s.db.QueryRowContext(ctx, "SELECT "+workspaceGrantColumns+" FROM "+source+" WHERE group_id=? AND member_id=?", groupID, memberID))
 	return receipt, storeError("读取目录授权回执失败", err)
 }
 
@@ -155,10 +169,12 @@ func (s *Store) WorkspaceGrantSnapshot(ctx context.Context) ([]WorkspaceGrantRec
 	return workspaceGrantSnapshot(ctx, s.db)
 }
 
-func workspaceGrantSnapshot(ctx context.Context, q interface {
-	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
-}) ([]WorkspaceGrantReceipt, error) {
-	rows, err := q.QueryContext(ctx, "SELECT "+workspaceGrantColumns+" FROM workspace_grants ORDER BY group_id,member_id")
+func workspaceGrantSnapshot(ctx context.Context, q workspaceGrantQuerier) ([]WorkspaceGrantReceipt, error) {
+	source, _, err := workspaceGrantSource(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := q.QueryContext(ctx, "SELECT "+workspaceGrantColumns+" FROM "+source+" ORDER BY group_id,member_id")
 	if err != nil {
 		return nil, err
 	}
