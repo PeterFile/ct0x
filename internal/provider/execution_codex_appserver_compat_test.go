@@ -273,7 +273,7 @@ func TestCodexAppServerStartupOverridesDenyExternalCapabilities(t *testing.T) {
 		}
 	}
 	for _, restriction := range []string{
-		"features.plugins=false", "features.apps=false", "features.hooks=false", "features.shell_tool=false",
+		"features.plugins=false", "features.apps=false", "features.hooks=false", "features.shell_tool=false", "features.view_image=false",
 		"features.multi_agent=false", "features.multi_agent_v2=false", "features.code_mode=false", "features.code_mode_only=false",
 		"features.code_mode_host=false", "features.tool_suggest=false", "agents.enabled=false", "notify=[]",
 		`web_search="disabled"`, `approval_policy="never"`, `sandbox_mode="read-only"`,
