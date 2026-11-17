@@ -38,6 +38,7 @@ func codexAppServerConfig(names []string) map[string]any {
 type codexAppServerConfigSnapshot struct {
 	names   []string
 	origins [32]byte
+	layers  [32]byte
 }
 
 func readCodexAppServerConfig(raw json.RawMessage) (codexAppServerConfigSnapshot, error) {
@@ -46,9 +47,33 @@ func readCodexAppServerConfig(raw json.RawMessage) (codexAppServerConfigSnapshot
 	if err != nil || fields["config"] == nil || fields["origins"] == nil {
 		return snapshot, errCodexRPCFrame
 	}
-	if layers := fields["layers"]; layers != nil && !bytes.Equal(bytes.TrimSpace(layers), []byte("null")) && !bytes.Equal(bytes.TrimSpace(layers), []byte("[]")) {
+	// Winning origins can omit a shadowed managed layer. Require the complete
+	// includeLayers metadata before creating a thread; never retain layer config.
+	var layers []json.RawMessage
+	if json.Unmarshal(fields["layers"], &layers) != nil || len(layers) == 0 || len(layers) > 256 {
 		return snapshot, errCodexRPCFrame
 	}
+	layerNames := make(map[string]bool, len(layers))
+	ordered := make([]string, 0, len(layers))
+	sessionFlags := false
+	for _, layer := range layers {
+		metadata, err := codexAppServerConfigMetadata(layer)
+		if err != nil || layerNames[metadata] {
+			return snapshot, errCodexRPCFrame
+		}
+		name, _ := codexRPCObject(layer, "name")
+		source, _ := codexRPCObject(name["name"], "type")
+		var kind string
+		_ = json.Unmarshal(source["type"], &kind)
+		sessionFlags = sessionFlags || kind == "sessionFlags"
+		layerNames[metadata] = true
+		ordered = append(ordered, metadata)
+	}
+	if !sessionFlags {
+		return snapshot, errCodexRPCFrame
+	}
+	encodedLayers, _ := json.Marshal(ordered)
+	snapshot.layers = sha256.Sum256(encodedLayers)
 	config, err := codexRPCObject(fields["config"], "mcp_servers")
 	if err != nil {
 		return snapshot, errCodexRPCFrame
@@ -76,52 +101,11 @@ func readCodexAppServerConfig(raw json.RawMessage) (codexAppServerConfigSnapshot
 	}
 	canonical := make(map[string]bool, len(origins))
 	for _, raw := range origins {
-		metadata, err := codexRPCObject(raw, "name", "version")
-		if err != nil {
+		metadata, err := codexAppServerConfigMetadata(raw)
+		if err != nil || !layerNames[metadata] {
 			return snapshot, errCodexRPCFrame
 		}
-		var version string
-		if json.Unmarshal(metadata["version"], &version) != nil || version == "" {
-			return snapshot, errCodexRPCFrame
-		}
-		name, err := codexAppServerMap(metadata["name"])
-		if err != nil {
-			return snapshot, errCodexRPCFrame
-		}
-		var kind string
-		if json.Unmarshal(name["type"], &kind) != nil {
-			return snapshot, errCodexRPCFrame
-		}
-		// Only static, understood local layers are supported in this first slice.
-		var pathKey string
-		switch kind {
-		case "packagedDefaults", "system", "user", "legacyManagedConfigTomlFromFile":
-			pathKey = "file"
-		case "project":
-			pathKey = "dotCodexFolder"
-		case "sessionFlags":
-		default:
-			return snapshot, errCodexRPCFrame
-		}
-		for key := range name {
-			if key != "type" && key != pathKey && !(kind == "user" && key == "profile") {
-				return snapshot, errCodexRPCFrame
-			}
-		}
-		if pathKey != "" {
-			var path string
-			if json.Unmarshal(name[pathKey], &path) != nil || !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
-				return snapshot, errCodexRPCFrame
-			}
-		}
-		if profile := name["profile"]; profile != nil {
-			var value *string
-			if json.Unmarshal(profile, &value) != nil {
-				return snapshot, errCodexRPCFrame
-			}
-		}
-		metadataJSON, _ := json.Marshal(map[string]any{"name": name, "version": version})
-		canonical[string(metadataJSON)] = true
+		canonical[metadata] = true
 	}
 	if len(snapshot.names) != 0 && len(origins) == 0 {
 		return snapshot, errCodexRPCFrame
@@ -129,6 +113,59 @@ func readCodexAppServerConfig(raw json.RawMessage) (codexAppServerConfigSnapshot
 	encoded, _ := json.Marshal(canonical)
 	snapshot.origins = sha256.Sum256(encoded)
 	return snapshot, nil
+}
+
+// Only understood, non-managed local sources can be overridden safely. Reject
+// managed sources even when they are disabled or absent from winning origins.
+func codexAppServerConfigMetadata(raw json.RawMessage) (string, error) {
+	metadata, err := codexRPCObject(raw, "name", "version")
+	if err != nil {
+		return "", errCodexRPCFrame
+	}
+	var version string
+	if json.Unmarshal(metadata["version"], &version) != nil || version == "" {
+		return "", errCodexRPCFrame
+	}
+	name, err := codexAppServerMap(metadata["name"])
+	if err != nil {
+		return "", errCodexRPCFrame
+	}
+	var kind string
+	if json.Unmarshal(name["type"], &kind) != nil {
+		return "", errCodexRPCFrame
+	}
+	var pathKey string
+	switch kind {
+	case "packagedDefaults", "user":
+		pathKey = "file"
+	case "project":
+		pathKey = "dotCodexFolder"
+	case "sessionFlags":
+	default:
+		return "", errCodexRPCFrame
+	}
+	for key := range name {
+		if key != "type" && key != pathKey && !(kind == "user" && key == "profile") {
+			return "", errCodexRPCFrame
+		}
+	}
+	if pathKey != "" {
+		var path string
+		if json.Unmarshal(name[pathKey], &path) != nil || !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
+			return "", errCodexRPCFrame
+		}
+	}
+	if profile := name["profile"]; profile != nil {
+		var value *string
+		if json.Unmarshal(profile, &value) != nil {
+			return "", errCodexRPCFrame
+		}
+		if value == nil {
+			delete(name, "profile")
+		}
+	}
+	encoded, _ := json.Marshal(map[string]any{"name": name, "version": version})
+	return string(encoded), nil
 }
 
 // Dynamic config keys must reject duplicates without quadratic key matching.
@@ -174,6 +211,7 @@ func codexAppServerString(fields map[string]json.RawMessage, key string) (string
 
 type codexAppServerItem struct {
 	kind      string
+	status    string
 	completed bool
 	textHash  [32]byte
 }
@@ -186,6 +224,7 @@ type codexAppServerProtocol struct {
 	request               ExecuteRequest
 	receipt               *ExecutionReceipt
 	delivery              *executionDelivery
+	lifecycle             func(Event)
 	send                  func(int, string, any) bool
 	reply                 func(codexRPCMessage, any) bool
 	summary               func(codexAppServerConfigSnapshot)
@@ -221,6 +260,9 @@ func (p *codexAppServerProtocol) next(id int, method string, params any) {
 
 func (p *codexAppServerProtocol) emit(event Event) {
 	event.NativeSessionID = p.threadID
+	if p.lifecycle != nil {
+		p.lifecycle(event)
+	}
 	p.delivery.enqueue(event)
 }
 
@@ -230,7 +272,7 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 	}
 	if message.Method != nil {
 		method := *message.Method
-		provisional := p.awaiting == 3 && method == "thread/status/changed" || p.awaiting == 5 &&
+		provisional := p.awaiting == 3 && slices.Contains([]string{"thread/status/changed", "thread/name/updated", "thread/project/updated"}, method) || p.awaiting == 5 &&
 			(strings.HasPrefix(method, "turn/") || strings.HasPrefix(method, "item/") || strings.HasPrefix(method, "hook/") || strings.HasPrefix(method, "model/") || method == "thread/tokenUsage/updated" || method == "error")
 		if provisional {
 			size := len(method) + len(message.Params) + len(message.ID)
@@ -275,7 +317,7 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			p.fail()
 			return
 		}
-		p.next(2, "config/read", map[string]any{"cwd": p.request.CWD, "includeLayers": false})
+		p.next(2, "config/read", map[string]any{"cwd": p.request.CWD, "includeLayers": true})
 	case 2, 4:
 		config, err := readCodexAppServerConfig(message.Result)
 		if err != nil {
@@ -291,7 +333,7 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			}
 			p.next(3, "thread/start", params)
 		} else {
-			if config.origins != p.before.origins || !slices.Equal(config.names, p.before.names) {
+			if config.origins != p.before.origins || config.layers != p.before.layers || !slices.Equal(config.names, p.before.names) {
 				p.fail()
 				return
 			}
@@ -325,7 +367,7 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 		p.threadID, p.receipt.NativeSessionID = threadID, threadID
 		p.emit(Event{Kind: SessionEvent})
 		p.replayBuffer()
-		p.next(4, "config/read", map[string]any{"cwd": p.request.CWD, "includeLayers": false})
+		p.next(4, "config/read", map[string]any{"cwd": p.request.CWD, "includeLayers": true})
 	case 5:
 		fields, err := codexRPCObject(message.Result, "turn")
 		turn, turnErr := codexRPCObject(fields["turn"], "id", "status", "items", "error")
@@ -392,7 +434,44 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 		}
 		return
 	}
-	fields, err := codexRPCObject(message.Params, "thread", "threadId", "turn", "turnId", "item", "itemId", "requestId", "willRetry")
+	if method == "account/updated" || method == "account/rateLimits/updated" {
+		// Passive connection metadata is not platform account readiness or a grant.
+		fields, err := codexAppServerMap(message.Params)
+		if err != nil || message.ID != nil {
+			p.fail()
+			return
+		}
+		if method == "account/rateLimits/updated" {
+			if _, err := codexAppServerMap(fields["rateLimits"]); err != nil || len(fields) != 1 {
+				p.fail()
+			}
+			return // Quota values are opaque; do not retain, log or act on them.
+		}
+		for key, raw := range fields {
+			if key != "authMode" && key != "planType" {
+				p.fail()
+				return
+			}
+			var value *string
+			if json.Unmarshal(raw, &value) != nil {
+				p.fail()
+				return
+			}
+			if value == nil {
+				continue
+			}
+			allowed := []string{"apikey", "chatgpt", "chatgptAuthTokens", "headers", "agentIdentity", "personalAccessToken", "bedrockApiKey", "bedrockAccessKeys"}
+			if key == "planType" {
+				allowed = []string{"free", "go", "plus", "pro", "prolite", "promax", "team", "self_serve_business_prolite", "self_serve_business_usage_based", "business", "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based", "enterprise", "edu", "edu_plus", "edu_pro", "sci", "sci_plus", "unknown"}
+			}
+			if !slices.Contains(allowed, *value) {
+				p.fail()
+				return
+			}
+		}
+		return
+	}
+	fields, err := codexRPCObject(message.Params, "thread", "threadId", "turn", "turnId", "item", "itemId", "requestId", "willRetry", "message", "threadName", "projectId")
 	if err != nil {
 		p.fail()
 		return
@@ -407,16 +486,35 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 		p.threadSeen = id
 		return
 	}
-	// These connection diagnostics cannot accept a turn or change grants.
-	if message.ID == nil && (method == "configWarning" || method == "deprecationNotice" || method == "warning") {
-		if fields["threadId"] == nil {
+	// Missing and null threadId both mean an unscoped warning in 0.166.
+	if method == "warning" {
+		var text *string
+		if message.ID != nil || json.Unmarshal(fields["message"], &text) != nil || text == nil {
+			p.fail()
 			return
 		}
+		if codexAppServerNoError(fields["threadId"]) {
+			return
+		}
+	}
+	if message.ID == nil && (method == "configWarning" || method == "deprecationNotice") && fields["threadId"] == nil {
+		return
 	}
 	threadID, valid := codexAppServerString(fields, "threadId")
 	if !valid || threadID != p.threadID || p.threadID == "" {
 		p.fail()
 		return
+	}
+	if method == "thread/name/updated" || method == "thread/project/updated" {
+		key := "threadName"
+		if method == "thread/project/updated" {
+			key = "projectId"
+		}
+		var value *string
+		if message.ID != nil || (fields[key] != nil || key == "projectId") && json.Unmarshal(fields[key], &value) != nil || fields["turnId"] != nil {
+			p.fail()
+		}
+		return // Bound native metadata never changes platform identity or policy.
 	}
 	if method == "thread/status/changed" || method == "thread/closed" || method == "thread/tokenUsage/updated" || method == "serverRequest/resolved" || method == "warning" {
 		if message.ID != nil {
@@ -477,13 +575,14 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 	switch method {
 	case "item/started", "item/completed":
 		p.item(fields["item"], method == "item/completed")
-	case "item/agentMessage/delta", "item/reasoning/summaryTextDelta", "item/reasoning/textDelta", "item/reasoning/summaryPartAdded", "item/plan/delta", "turn/plan/updated", "model/rerouted", "model/verification", "model/safetyBuffering/updated":
-		if id := fields["itemId"]; id != nil {
-			var itemID string
-			if json.Unmarshal(id, &itemID) != nil || !codexAppServerIdentity(itemID) || p.items[itemID].completed {
-				p.fail()
-			}
+	case "item/agentMessage/delta", "item/reasoning/summaryTextDelta", "item/reasoning/textDelta", "item/reasoning/summaryPartAdded", "item/plan/delta":
+		kind := map[string]string{"item/agentMessage/delta": "agentMessage", "item/reasoning/summaryTextDelta": "reasoning", "item/reasoning/textDelta": "reasoning", "item/reasoning/summaryPartAdded": "reasoning", "item/plan/delta": "plan"}[method]
+		id, valid := codexAppServerString(fields, "itemId")
+		item, exists := p.items[id]
+		if !valid || !exists || item.completed || item.kind != kind {
+			p.fail()
 		}
+	case "turn/plan/updated", "model/rerouted", "model/verification", "model/safetyBuffering/updated":
 	case "error":
 		// A diagnostic (including a retry) is not a terminal receipt.
 	default:
@@ -526,14 +625,21 @@ func (p *codexAppServerProtocol) turnNotification(method string, raw json.RawMes
 		p.fail()
 		return
 	}
+	seen := make(map[string]bool, len(items))
 	for _, raw := range items {
-		fields, err := codexRPCObject(raw, "id", "type", "text")
+		fields, err := codexRPCObject(raw, "id", "type", "text", "status")
 		id, idOK := codexAppServerString(fields, "id")
 		kind, kindOK := codexAppServerString(fields, "type")
-		if err != nil || !idOK || !kindOK {
+		status, statusOK := "", true
+		if fields["status"] != nil {
+			status, statusOK = codexAppServerString(fields, "status")
+		}
+		known, exists := p.items[id]
+		if err != nil || !idOK || !kindOK || !statusOK || seen[id] || exists && (known.kind != kind || known.status != status || !known.completed) {
 			p.fail()
 			return
 		}
+		seen[id] = true
 		if kind == "agentMessage" {
 			var text string
 			item := p.items[id]
@@ -550,15 +656,19 @@ func (p *codexAppServerProtocol) turnNotification(method string, raw json.RawMes
 }
 
 func (p *codexAppServerProtocol) item(raw json.RawMessage, completed bool) {
-	fields, err := codexRPCObject(raw, "id", "type", "text")
+	fields, err := codexRPCObject(raw, "id", "type", "text", "status")
 	id, idOK := codexAppServerString(fields, "id")
 	kind, kindOK := codexAppServerString(fields, "type")
+	status, statusOK := "", true
+	if fields["status"] != nil {
+		status, statusOK = codexAppServerString(fields, "status")
+	}
 	previous, exists := p.items[id]
-	if err != nil || !idOK || !kindOK || len(p.items) >= 4096 || (exists && (previous.completed || previous.kind != kind || !completed)) {
+	if err != nil || !idOK || !kindOK || !statusOK || len(p.items) >= 4096 || (exists && (previous.completed || previous.kind != kind || !completed)) {
 		p.fail()
 		return
 	}
-	item := codexAppServerItem{kind: kind, completed: completed}
+	item := codexAppServerItem{kind: kind, status: status, completed: completed}
 	switch kind {
 	case "agentMessage":
 		if completed {

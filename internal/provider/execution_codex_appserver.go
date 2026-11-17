@@ -32,15 +32,14 @@ func NewCodexAppServerExecutor(path string, timeout time.Duration) (Executor, er
 
 type codexAppServerRead struct {
 	message  codexRPCMessage
-	raw      []byte
 	damaged  bool
 	done     bool
 	complete bool
 }
 
-// All raw responses (especially secret-bearing config/read), unknown methods and
-// malformed frames are omitted. Only selected native lifecycle notifications are
-// raw-logged; configuration gets a separate count/provenance-digest summary.
+// No native frame is raw-logged. The protocol owner records only validated
+// lifecycle identity/outcome and config provenance summaries; free-form native
+// errors, details, configuration and response text never enter stdout logs.
 func readCodexAppServerOutput(source io.Reader, output chan<- codexAppServerRead) {
 	reader := newCodexRPCReader(source)
 	for {
@@ -55,14 +54,7 @@ func readCodexAppServerOutput(source io.Reader, output chan<- codexAppServerRead
 			}
 			return
 		}
-		result := codexAppServerRead{message: message}
-		if message.Method != nil && message.ID == nil {
-			switch *message.Method {
-			case "thread/started", "turn/started", "item/started", "item/completed", "turn/completed":
-				result.raw = append(append([]byte(nil), reader.frame...), '\n')
-			}
-		}
-		output <- result
+		output <- codexAppServerRead{message: message}
 	}
 }
 
@@ -234,9 +226,16 @@ func (e codexAppServerExecutor) Execute(ctx context.Context, request ExecuteRequ
 			return enqueue(message)
 		},
 		summary: func(snapshot codexAppServerConfigSnapshot) {
-			raw := mustCodexAppServerJSON(map[string]any{"type": "config_summary", "mcp_count": len(snapshot.names), "origins_sha256": hex.EncodeToString(snapshot.origins[:])})
+			raw := mustCodexAppServerJSON(map[string]any{"type": "config_summary", "mcp_count": len(snapshot.names), "origins_sha256": hex.EncodeToString(snapshot.origins[:]), "layers_sha256": hex.EncodeToString(snapshot.layers[:])})
 			_, _ = outLog.Write(append(raw, '\n'))
 		},
+	}
+	protocol.lifecycle = func(event Event) {
+		// Explicit projection, not a reconstructed native frame. In particular,
+		// never persist Event.Text or nested terminal error/details.
+		raw := mustCodexAppServerJSON(map[string]any{"type": "lifecycle_summary", "kind": event.Kind,
+			"thread_id": event.NativeSessionID, "turn_id": protocol.turnID, "terminal": event.Terminal})
+		_, _ = outLog.Write(append(raw, '\n'))
 	}
 	protocol.next(1, "initialize", map[string]any{"clientInfo": map[string]string{"name": "agent_workspace", "title": "Agent Workspace", "version": "0.1.0"}})
 	var exitTimer, drainTimer, interruptTimer *time.Timer
@@ -275,9 +274,6 @@ func (e codexAppServerExecutor) Execute(ctx context.Context, request ExecuteRequ
 			} else if result.damaged {
 				protocol.fail()
 			} else {
-				if len(result.raw) != 0 {
-					_, _ = outLog.Write(result.raw)
-				}
 				protocol.receive(result.message)
 				if stopping && !inputClosed {
 					protocol.interrupt()

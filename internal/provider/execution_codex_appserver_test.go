@@ -96,9 +96,22 @@ func TestCodexAppServerProcessHelper(t *testing.T) {
 			servers["late-inherited"] = map[string]bool{"enabled": true}
 			origins["version"] = "stable-v1"
 		}
+		if mode == "managed" {
+			origins["name"] = map[string]any{"type": "legacyManagedConfigTomlFromFile", "file": "/synthetic/managed.toml"}
+		}
+		layers := []any{
+			map[string]any{"name": map[string]string{"type": "sessionFlags"}, "version": "flags-v1", "config": map[string]string{"private": appServerFixtureSecret}},
+			map[string]any{"name": origins["name"], "version": origins["version"], "config": map[string]string{"private": appServerFixtureSecret}},
+		}
+		if mode == "hidden-managed" {
+			layers = append(layers, map[string]any{"name": map[string]string{"type": "legacyManagedConfigTomlFromFile", "file": "/synthetic/managed.toml"}, "version": "managed-v1", "config": map[string]bool{"enabled": true}})
+		}
+		if mode == "missing-layers" {
+			layers = nil
+		}
 		return map[string]any{
 			"config":  map[string]any{"mcp_servers": servers, "model_provider": appServerFixtureSecret},
-			"origins": map[string]any{"mcp_servers": origins}, "layers": nil,
+			"origins": map[string]any{"mcp_servers": origins}, "layers": layers,
 		}
 	}
 	_ = os.WriteFile("pid", []byte(strconv.Itoa(os.Getpid())), 0600)
@@ -134,11 +147,28 @@ func TestCodexAppServerProcessHelper(t *testing.T) {
 	read("initialized")
 	before := read("config/read")
 	respond(before, config(false))
-	if mode == "unknown-origin" {
-		_, _ = io.Copy(io.Discard, input)
+	if mode == "unknown-origin" || mode == "managed" || mode == "hidden-managed" || mode == "missing-layers" {
+		tail, _ := io.ReadAll(io.LimitReader(input, 2<<20))
+		_ = os.WriteFile("after-rejected-config", tail, 0600)
 		return
 	}
 	thread := read("thread/start")
+	if mode == "account-update" {
+		notify("account/updated", map[string]any{"authMode": "chatgpt", "planType": "plus"})
+	}
+	if mode == "account-rate-limits" {
+		notify("account/rateLimits/updated", map[string]any{"rateLimits": map[string]any{"primary": map[string]int{"usedPercent": 20}}})
+	}
+	if mode == "global-warning" {
+		notify("warning", map[string]any{"threadId": nil, "message": appServerFixtureSecret})
+	}
+	if mode == "thread-name" || mode == "cross-thread-name" {
+		id := appServerFixtureThread
+		if mode == "cross-thread-name" {
+			id = "unrelated-thread"
+		}
+		notify("thread/name/updated", map[string]any{"threadId": id, "threadName": appServerFixtureSecret})
+	}
 	cwd, _ := os.Getwd()
 	threadValue := map[string]any{"id": appServerFixtureThread, "cwd": cwd, "ephemeral": false, "turns": []any{}, "path": "/synthetic/original-home/session.jsonl"}
 	notify("thread/started", map[string]any{"thread": threadValue})
@@ -226,6 +256,18 @@ func TestCodexAppServerProcessHelper(t *testing.T) {
 		if mode == "duplicate-item" {
 			answer()
 		}
+		if mode == "orphan-delta" {
+			notify("item/agentMessage/delta", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "itemId": "unfinished", "delta": "unfinished answer"})
+		}
+		if mode == "active-delta" || mode == "delta-kind-mismatch" {
+			kind := "agentMessage"
+			if mode == "delta-kind-mismatch" {
+				kind = "reasoning"
+			}
+			notify("item/started", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "item": map[string]string{"id": "active", "type": kind, "text": ""}})
+			notify("item/agentMessage/delta", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "itemId": "active", "delta": "partial answer"})
+			notify("item/completed", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "item": map[string]string{"id": "active", "type": kind, "text": "complete answer"}})
+		}
 		if mode == "cancel" || mode == "interrupt-ack-only" || mode == "approval" {
 			if mode == "approval" {
 				notifyRequest := map[string]any{"id": "approval", "method": "item/commandExecution/requestApproval", "params": map[string]any{
@@ -243,7 +285,7 @@ func TestCodexAppServerProcessHelper(t *testing.T) {
 			}
 		} else if mode == "failed" {
 			failed := turn("failed")
-			failed["error"] = map[string]string{"message": appServerFixtureSecret}
+			failed["error"] = map[string]string{"message": appServerFixtureSecret, "additionalDetails": appServerFixtureSecret}
 			notify("turn/completed", map[string]any{"threadId": appServerFixtureThread, "turn": failed})
 		} else if mode == "interrupted" {
 			terminal("interrupted")
@@ -254,6 +296,16 @@ func TestCodexAppServerProcessHelper(t *testing.T) {
 		} else if mode == "partial" {
 			_, _ = os.Stdout.Write([]byte(`{"method":"turn/completed","params":{"threadId":"` + appServerFixtureThread + `","turn":{"id":"` + appServerFixtureTurn + `","status":"completed","items":[]}}}`))
 			return
+		} else if mode == "terminal-item-mismatch" || mode == "terminal-item-duplicate" {
+			completed := turn("completed")
+			item := map[string]string{"id": "answer", "type": "reasoning"}
+			items := []any{item}
+			if mode == "terminal-item-duplicate" {
+				item["type"], item["text"] = "agentMessage", "合成\u2028完整回答"
+				items = append(items, item)
+			}
+			completed["items"] = items
+			notify("turn/completed", map[string]any{"threadId": appServerFixtureThread, "turn": completed})
 		} else if mode != "missing-terminal" {
 			terminal("completed")
 		}
@@ -377,8 +429,8 @@ func TestCodexAppServerLiteralHandshakeAndConfiguration(t *testing.T) {
 		_ = json.Unmarshal(message.Params, &params)
 		switch *message.Method {
 		case "config/read":
-			if string(params["includeLayers"]) != "false" || string(params["cwd"]) != string(mustAppServerFixtureJSON(request.CWD)) {
-				t.Error("configuration must be read for the explicit workspace without raw layers")
+			if string(params["includeLayers"]) != "true" || string(params["cwd"]) != string(mustAppServerFixtureJSON(request.CWD)) {
+				t.Error("configuration must request complete source metadata for the explicit workspace")
 			}
 		case "thread/start":
 			var model string

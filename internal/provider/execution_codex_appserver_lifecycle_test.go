@@ -58,7 +58,64 @@ func TestCodexAppServerNativeFailureAndInterruptedTerminals(t *testing.T) {
 			if receipt.Outcome != want || receipt.Terminal != want || !receipt.OutputComplete || !receipt.DirectChildReaped || strings.Contains(receipt.Reason, appServerFixtureSecret) {
 				t.Fatalf("native failure was guessed or leaked: %+v", receipt)
 			}
+			data, err := os.ReadFile(receipt.StdoutPath)
+			if err != nil || strings.Contains(string(data), appServerFixtureSecret) || strings.Contains(string(data), "additionalDetails") {
+				t.Fatal("native terminal error/details were persisted in stdout")
+			}
 		})
+	}
+}
+
+func TestCodexAppServerReviewRegressions(t *testing.T) {
+	for _, mode := range []string{"managed", "hidden-managed", "missing-layers", "orphan-delta", "delta-kind-mismatch", "terminal-item-mismatch", "terminal-item-duplicate", "cross-thread-name"} {
+		t.Run(mode, func(t *testing.T) {
+			e, request := appServerFixture(t, mode)
+			receipt := e.Execute(context.Background(), request, nil)
+			if receipt.Outcome != OutcomeUnknown || !receipt.DirectChildReaped {
+				t.Fatalf("review regression was settled: %+v", receipt)
+			}
+			if strings.Contains(mode, "managed") || mode == "missing-layers" {
+				data, _ := os.ReadFile(filepath.Join(request.CWD, "after-rejected-config"))
+				if receipt.NativeSessionID != "" || receipt.Accepted || len(data) != 0 {
+					t.Fatal("thread/start was sent without safe, complete config layer metadata")
+				}
+			}
+		})
+	}
+	for _, mode := range []string{"account-update", "account-rate-limits", "global-warning", "thread-name", "active-delta"} {
+		t.Run(mode, func(t *testing.T) {
+			e, request := appServerFixture(t, mode)
+			receipt := e.Execute(context.Background(), request, nil)
+			if receipt.Outcome != OutcomeSucceeded || !receipt.OutputComplete || !receipt.DirectChildReaped {
+				t.Fatalf("valid passive metadata or bound item lifecycle was rejected: %+v", receipt)
+			}
+		})
+	}
+}
+
+func TestCodexAppServerConfigRequiresAllLayerMetadata(t *testing.T) {
+	flags := map[string]any{"name": map[string]string{"type": "sessionFlags"}, "version": "v1", "config": map[string]any{}}
+	for _, kind := range []string{"legacyManagedConfigTomlFromFile", "legacyManagedConfigTomlFromMdm", "mdm", "enterpriseManaged", "system", "futureLayer"} {
+		config := map[string]any{"config": map[string]any{}, "origins": map[string]any{}, "layers": []any{flags,
+			map[string]any{"name": map[string]string{"type": kind, "file": "/synthetic/managed.toml"}, "version": "managed-v1", "config": map[string]string{"private": appServerFixtureSecret}}}}
+		if _, err := readCodexAppServerConfig(mustCodexAppServerJSON(config)); err == nil {
+			t.Fatal("a managed/unknown layer absent from winning origins was accepted")
+		}
+	}
+	for _, layers := range []any{nil, []any{}, []any{map[string]any{"name": map[string]string{"type": "user", "file": "/synthetic/config.toml"}, "version": "v1"}}} {
+		config := map[string]any{"config": map[string]any{}, "origins": map[string]any{}, "layers": layers}
+		if _, err := readCodexAppServerConfig(mustCodexAppServerJSON(config)); err == nil {
+			t.Fatal("missing layers/session override evidence was accepted")
+		}
+	}
+}
+
+func TestCodexAppServerLayerVersionDriftDoesNotStartTurn(t *testing.T) {
+	p, receive, _ := appServerCompatThreadPending(t)
+	receive(appServerCompatThreadResponse)
+	receive(`{"id":4,"result":{"config":{"mcp_servers":{}},"origins":{},"layers":[{"name":{"type":"sessionFlags"},"version":"flags-v2","config":{}}]}}`)
+	if !p.damaged || p.ctx.Err() == nil || p.receipt.Accepted || p.turnID != "" {
+		t.Fatal("layer-only version drift was missed because winning origins stayed unchanged")
 	}
 }
 
@@ -313,8 +370,12 @@ func TestCodexAppServerInputValidationDoesNotCreateRunState(t *testing.T) {
 
 func TestCodexAppServerConfigUsesUniqueStaticProvenance(t *testing.T) {
 	metadata := map[string]any{"name": map[string]any{"type": "user", "file": "/synthetic/config.toml", "profile": nil}, "version": "v1"}
+	layers := []any{
+		map[string]any{"name": map[string]string{"type": "sessionFlags"}, "version": "flags-v1", "config": map[string]any{}},
+		map[string]any{"name": metadata["name"], "version": metadata["version"], "config": map[string]string{"private": appServerFixtureSecret}},
+	}
 	config := func(origins any) json.RawMessage {
-		return mustCodexAppServerJSON(map[string]any{"config": map[string]any{"mcp_servers": map[string]any{"literal.name": map[string]any{"env": map[string]string{"TOKEN": appServerFixtureSecret}}}}, "origins": origins})
+		return mustCodexAppServerJSON(map[string]any{"config": map[string]any{"mcp_servers": map[string]any{"literal.name": map[string]any{"env": map[string]string{"TOKEN": appServerFixtureSecret}}}}, "origins": origins, "layers": layers})
 	}
 	a, err := readCodexAppServerConfig(config(map[string]any{"first": metadata}))
 	if err != nil {
@@ -332,7 +393,14 @@ func TestCodexAppServerConfigUsesUniqueStaticProvenance(t *testing.T) {
 		`{"config":{},"origins":{"a":{"name":{"type":"sessionFlags"},"version":null}}}`,
 		`{"config":{},"origins":{},"layers":[{"config":"` + appServerFixtureSecret + `"}]}`,
 	} {
-		if _, err := readCodexAppServerConfig(json.RawMessage(raw)); err == nil {
+		var fields map[string]json.RawMessage
+		if json.Unmarshal([]byte(raw), &fields) != nil {
+			t.Fatal("invalid synthetic config fixture")
+		}
+		if fields["layers"] == nil {
+			fields["layers"] = mustCodexAppServerJSON(layers)
+		}
+		if _, err := readCodexAppServerConfig(mustCodexAppServerJSON(fields)); err == nil {
 			t.Fatal("unknown or damaged configuration was trusted")
 		}
 	}
