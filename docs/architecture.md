@@ -94,6 +94,8 @@ The primary screen is an IM: conversations on the left, messages and a persisten
 
 ## Delivery and regression gates
 
+The development-model convention in `AGENTS.md` and this repository's independent-verification arrangements constrain repository development, not runtime product policy. Local Sol execution with external Terra verification is one development-validation configuration, not a mandatory CLI/model sequence or verifier node for product chats or Tasks.
+
 Deliver independently reviewable contracts, storage, provider discovery, execution, UI, scheduler, resources, context, and acceptance slices. Aim for 300–500 effective lines per review; record justified exceptions. Each slice needs behavior-specific tests, independent review, and a rollback commit. Publish small PRs to the configured repository and merge only after independent review and the applicable checks pass.
 
 Required validation grows with the slice: Go tests and race detector, web type checks/unit tests/build, database reopen/recovery tests, real browser flows, and two real CLI executions. Benchmark durable message insertion and bounded history retrieval before optimization. Store raw evidence locally; do not replace evidence with successful mocks.

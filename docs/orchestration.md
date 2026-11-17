@@ -12,6 +12,8 @@ The principal reference is [dsh-superagent-prototype at 6337fc8](https://github.
 
 The conversation is the primary interface. Ordinary discussion can produce an Agent Turn without creating a Task. A request becomes authorized work only through a recorded admission decision. Follow-ups for existing work stay with that work unless its executor hands them back.
 
+Product CLI/model selection follows user configuration, task needs, verified adapter capabilities, and authorization. Permanent and temporary Agent responsibilities and collaboration are composed as needed. The coordinator/worker flow below is one composition, not a required Agent lineup for every Task or a claim of new runtime capabilities. Testing, technical review, or independent verification is not mandatory for every chat or Task; its necessity and timing, and the conditions for acceptance, follow the task's acceptance agreement or a user-enabled Policy. Pending verification alone does not bar rejection as agreed; acceptance must still satisfy the applicable conditions.
+
 ```mermaid
 flowchart TD
     IM[Local IM Source] --> Intake[Engine: receive and classify]
@@ -32,8 +34,9 @@ flowchart TD
     Engine --> Outbox[Reply intent and receipt]
     Outbox --> IM
     Report --> Submission[Immutable Submission]
-    Submission --> Verify[Independent verification evidence]
-    Verify --> Review[Separate local-user ReviewDecision]
+    Submission --> Review[Separate local-user ReviewDecision]
+    Submission -. "Evidence per task agreement or user-enabled Policy" .-> Verify[Verification evidence]
+    Verify -. "Informs Review" .-> Review
 ```
 
 The initial Source is the local IM. **Reply destination** means the authorized response destination, called Channel in the pinned DSH reference; it is not the PRD's Project Channel. Local replies use the existing group/topic scope; Project Channel mapping is not yet implemented.
@@ -152,9 +155,11 @@ Unread counts, last-message previews, coordinator badges, external-source labels
 
 The opt-in, explicitly admitted Group execution path is an implemented baseline with real CLI text-result evidence, not completion of the group-chat experience or Project compatibility. Unimplemented Project migration must not block the next text loop on existing Group/Conversation.
 
+Acceptance here is this repository's development validation, including independent checks of actual results and receipts; it does not require an independent-verifier model node in the product runtime.
+
 1. Retain the IM shell and the implemented trusted intent pass/coordinator/worker composition on the same queue and receipts. Preserve desktop, short-window, narrow-screen, keyboard, and delayed-response validation.
 2. **Next priority: verify normal group chat through a real local CLI text Submission and automatic return to the group.** Begin with ordinary discussion and proactive Agent replies and exchanges, without creating a Task or choosing a delivery mode. A contextual “可以开始开发了” or equivalent explicit local-user request must produce goals, acceptance criteria, trusted source/authority assessment, admitted Task/Mandate, and automatic Dispatch registration through the same Engine and existing scheduler. Actions and their basis, progress, and results must return to the authorized group/topic without conversion, itemized authorization/dispatch forms, or manual refresh. File writes and Artifact publication require separate implementation and acceptance; this text scenario does not prove them.
-3. Verify equivalent phrasings and enabled, versioned, scoped preauthorization for autonomous preparation; Agent consensus alone must not authorize work. Unclear scope or excess authority must produce one concrete question, not a generic form. Verify structured `@` and avatar right-click selection by stable member ID, plain-name text without routing effects, and compatibility routing semantics. Include follow-up and constraint changes during execution, structured reports, a concrete versioned Submission, independent verification, and a separate local-user ReviewDecision. Retain idempotency, group isolation, controlled restart, unknown/cancellation/resource-claim protection, and existing submission fences.
+3. Verify equivalent phrasings and enabled, versioned, scoped preauthorization for autonomous preparation; Agent consensus alone must not authorize work. Unclear scope or excess authority must produce one concrete question, not a generic form. Verify structured `@` and avatar right-click selection by stable member ID, plain-name text without routing effects, and compatibility routing semantics. Include follow-up and constraint changes during execution, structured reports, a concrete versioned Submission, any verification required by the task agreement or user-enabled Policy, and a separate local-user ReviewDecision. Retain idempotency, group isolation, controlled restart, unknown/cancellation/resource-claim protection, and existing submission fences.
 4. Verify each Project/Channel and later Task/member/Session compatibility slice's integrity, isolation, and recovery before exposing dependent product operations. Hierarchy labels alone do not satisfy migration or real product acceptance.
 5. Extend provider continuity and external Sources one adapter at a time, only after their actual capabilities and authority are verified.
 
