@@ -62,9 +62,28 @@ func TestCoordinationsBorrowedEngineAndFiveLocalUserMethods(t *testing.T) {
 	if _, err := service.ListTriggers(ctx, thread, store.ListOptions{Limit: 201}); !errors.Is(err, store.ErrInvalid) {
 		t.Fatalf("unbounded list: %v", err)
 	}
-	// The service has no lifecycle methods and leaves the shared Engine/Store usable.
-	if reflect.TypeOf(service).NumMethod() != 5 {
-		t.Fatal("coordination service must expose only five narrow local-user operations")
+	// The five original operations plus three chat APIs remain local-user only;
+	// exact signatures and the complete method set exclude lifecycle/tool APIs.
+	type localUserAPI interface {
+		RequestWork(context.Context, string, domain.RequestWorkRequest, string) (domain.AdmissionReceipt, error)
+		SetChatPolicy(context.Context, domain.ThreadRef, domain.ChatPolicyRequest, int64, string) (domain.ChatPolicy, error)
+		GetChatPolicy(context.Context, domain.ThreadRef) (domain.ChatPolicy, error)
+		GetChatAdmission(context.Context, string, string) (domain.ChatAssessmentReceipt, error)
+		GetTrigger(context.Context, domain.ThreadRef, string) (domain.Trigger, error)
+		ListTriggers(context.Context, domain.ThreadRef, store.ListOptions) (store.Page[domain.Trigger], error)
+		GetAdmissionReceipt(context.Context, domain.ThreadRef, string) (domain.AdmissionReceipt, error)
+		GetTaskCoordination(context.Context, string, string) (domain.TaskCoordinationView, error)
+	}
+	wantAPI := reflect.TypeOf((*localUserAPI)(nil)).Elem()
+	if service.engine != engine || reflect.TypeOf(service).NumMethod() != wantAPI.NumMethod() {
+		t.Fatal("coordination service must borrow the Engine and expose only eight narrow local-user operations")
+	}
+	for i := range wantAPI.NumMethod() {
+		want := wantAPI.Method(i)
+		got := reflect.ValueOf(service).MethodByName(want.Name)
+		if !got.IsValid() || got.Type() != want.Type {
+			t.Fatalf("local-user operation signature changed: %s", want.Name)
+		}
 	}
 	if got, err := engine.ReceiveLocalMessage(ctx, thread, m.ID); err != nil || got != trigger {
 		t.Fatalf("borrowed engine is unusable: %+v, %v", got, err)

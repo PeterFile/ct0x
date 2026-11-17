@@ -121,8 +121,10 @@ func TestQueueV3UpgradePreservesMessagesAndReceipts(t *testing.T) {
 	if err := s.db.QueryRow("SELECT count(*) FROM schema_migrations WHERE version=4").Scan(&version); err != nil || version != 1 {
 		t.Fatalf("missing v4: %d, %v", version, err)
 	}
+	expectedMessage := before
+	expectedMessage.SourceKind = "unknown"
 	after, found, err := s.LookupMessageReceipt(ctx, r)
-	if err != nil || !found || !reflect.DeepEqual(before, after) {
+	if err != nil || !found || !reflect.DeepEqual(expectedMessage, after) {
 		t.Fatalf("upgrade changed message receipt: %+v, %v, %v", after, found, err)
 	}
 	if got, err := s.CreateGroup(ctx, keyedGroup()); err != nil || got.ID != g.ID {

@@ -93,13 +93,15 @@ func appendPreparationMessages(in *contextpack.Input, topic string, trigger doma
 			return errPrepareBinding
 		}
 		body, err := json.Marshal(struct {
-			ID        string    `json:"id"`
-			GroupID   string    `json:"group_id"`
-			TopicID   string    `json:"topic_id"`
-			SenderID  string    `json:"sender_id"`
-			CreatedAt time.Time `json:"created_at"`
-			Content   string    `json:"content"`
-		}{message.ID, message.GroupID, message.TopicID, message.SenderID, message.CreatedAt, message.Content})
+			ID         string    `json:"id"`
+			GroupID    string    `json:"group_id"`
+			TopicID    string    `json:"topic_id"`
+			SenderID   string    `json:"sender_id"`
+			CreatedAt  time.Time `json:"created_at"`
+			Content    string    `json:"content"`
+			SourceID   string    `json:"source_id,omitempty"`
+			SourceKind string    `json:"source_kind,omitempty"`
+		}{message.ID, message.GroupID, message.TopicID, message.SenderID, message.CreatedAt, message.Content, message.SourceID, message.SourceKind})
 		if err != nil {
 			return &preparationFailure{category: errPrepareRead, cause: err}
 		}

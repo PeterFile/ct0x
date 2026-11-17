@@ -234,12 +234,29 @@ func TestInspectRoleReadinessIdentityAndFailures(t *testing.T) {
 	t.Run("real resolver database failure", func(t *testing.T) {
 		f := newRolePrepareFixture(t)
 		p := f.preparer(t)
-		f.exec(t, "DROP TABLE coordination_assignment_dispatch")
+		// Isolate the resolver's lookup failure from the message source projection.
+		f.exec(t, "ALTER TABLE coordination_assignment_dispatch RENAME COLUMN delivery_id TO unavailable_delivery_id")
+		message, readErr := f.s.GetMessage(context.Background(), f.group.ID, f.trigger.ID)
+		prepareRoleOK(t, readErr)
+		if !reflect.DeepEqual(message, f.trigger) {
+			t.Fatal("resolver fault changed the independently readable message")
+		}
+		_, resolverErr := f.s.ResolveCoordinationDelivery(context.Background(), f.group.ID, f.pending.Delivery.ID)
+		var resolverCause interface{ Code() int }
+		if !errors.As(resolverErr, &resolverCause) || resolverCause.Code() == 0 {
+			t.Fatal("fixture did not inject a real resolver database failure")
+		}
+		before := f.snapshot(t)
 		err := assertInspectionFailure(t, p, context.Background(), f.pending, errPrepareRead)
 		var databaseError interface{ Code() int }
-		if !errors.As(err, &databaseError) || databaseError.Code() == 0 || strings.Contains(err.Error(), "SQL") {
+		if !errors.As(err, &databaseError) || databaseError.Code() != resolverCause.Code() || strings.Contains(err.Error(), "SQL") || strings.Contains(err.Error(), "unavailable_delivery_id") {
 			t.Fatal("Inspect lost its real database cause or exposed SQL")
 		}
+		prepared, prepareErr := p.Prepare(context.Background(), f.pending)
+		if prepared.Executor != nil || !errors.Is(prepareErr, errPrepareRead) || errors.Is(prepareErr, scheduler.ErrNotReady) || !errors.As(prepareErr, &databaseError) || databaseError.Code() != resolverCause.Code() || strings.Contains(prepareErr.Error(), "SQL") || strings.Contains(prepareErr.Error(), "unavailable_delivery_id") {
+			t.Fatal("resolver failure became an executor or lost its sanitized database cause")
+		}
+		f.assertUnchanged(t, before, false)
 		memberToolRuntimeEmpty(t, f.opts.PrivateWorkspaceRoot)
 	})
 }

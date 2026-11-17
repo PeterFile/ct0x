@@ -378,7 +378,7 @@ func TestTrustedMessageRowUsesOuterTransaction(t *testing.T) {
 	defer observer.Close()
 	for _, commit := range []bool{true, false} {
 		historical := domain.Message{
-			ID: fmt.Sprintf("historical-%t", commit), GroupID: g.ID, SenderID: m.ID,
+			ID: fmt.Sprintf("historical-%t", commit), GroupID: g.ID, SenderID: m.ID, SourceKind: "unknown",
 			TopicID: r.TopicID, Content: r.Content, CreatedAt: time.Now().UTC(), Deliveries: []domain.Delivery{},
 		}
 		tx, err := s.db.BeginTx(ctx, nil)

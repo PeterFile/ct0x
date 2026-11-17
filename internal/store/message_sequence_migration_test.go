@@ -82,14 +82,22 @@ func messageSequenceV7Fixture(t *testing.T) (*Store, string, func(*Store)) {
 	}
 	check := func(current *Store) {
 		t.Helper()
+		expectedMessage := beforeMessage
+		var hasProvenance bool
+		if err := current.db.QueryRow("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='message_command_sources')").Scan(&hasProvenance); err != nil {
+			t.Fatal(err)
+		}
+		if hasProvenance {
+			expectedMessage.SourceKind = "unknown"
+		}
 		for _, read := range []struct {
 			name string
 			want any
 			call func() (any, error)
 		}{
 			{"group receipt", g, func() (any, error) { return current.CreateGroup(ctx, keyedGroup()) }},
-			{"message", beforeMessage, func() (any, error) { return current.GetMessage(ctx, g.ID, message.ID) }},
-			{"message replay", beforeMessage, func() (any, error) { return current.CreateMessage(ctx, request, nil) }},
+			{"message", expectedMessage, func() (any, error) { return current.GetMessage(ctx, g.ID, message.ID) }},
+			{"message replay", expectedMessage, func() (any, error) { return current.CreateMessage(ctx, request, nil) }},
 			{"unknown native turn", beforeTurn, func() (any, error) { return current.GetTurn(ctx, g.ID, turn.ID) }},
 			{"task state", beforeTask, func() (any, error) { return current.GetTask(ctx, g.ID, task.ID) }},
 			{"attempt replay", attempt, func() (any, error) { return current.ActivateTaskAttempt(ctx, activate) }},
@@ -101,7 +109,7 @@ func messageSequenceV7Fixture(t *testing.T) (*Store, string, func(*Store)) {
 				t.Fatalf("migration changed %s: %+v, %v; want %+v", read.name, got, err, read.want)
 			}
 		}
-		if got, found, err := current.LookupMessageReceipt(ctx, request); err != nil || !found || !reflect.DeepEqual(got, beforeMessage) {
+		if got, found, err := current.LookupMessageReceipt(ctx, request); err != nil || !found || !reflect.DeepEqual(got, expectedMessage) {
 			t.Fatalf("migration changed message receipt: %+v, %t, %v", got, found, err)
 		}
 		var held string

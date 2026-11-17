@@ -13,6 +13,8 @@ import (
 	"agentworkspace/internal/store"
 )
 
+func coordinationCompositionToolBudget() time.Duration { return 3 * time.Second }
+
 // Ordinary runs must use the real production one-second intent pass for both kinds.
 func coordinationCompositionAssignmentPrerequisite(*testing.T, *coordinationCompositionFixture, coordinationCompositionReport) {
 }

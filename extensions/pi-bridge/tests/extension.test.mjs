@@ -61,7 +61,8 @@ test("actual Pi 1.4.0 loader registers exactly eight native tools with the froze
     assert.equal(schema.properties.before.type, "string");
   }
   const send = tools.get("send_message").parameters;
-  assert.deepEqual(Object.keys(send.properties).sort(), ["content", "recipient_ids"]);
+  assert.deepEqual(Object.keys(send.properties).sort(), ["content", "intent_assessment", "recipient_ids"]);
+  assert.equal(send.properties.intent_assessment.additionalProperties, false);
   assert.deepEqual(send.required, ["content"]);
   assert.equal(send.properties.content.type, "string");
   assert.equal(send.properties.recipient_ids.type, "array");
@@ -70,6 +71,20 @@ test("actual Pi 1.4.0 loader registers exactly eight native tools with the froze
   assert.deepEqual(Object.keys(create.properties).sort(), ["name", "reason", "role"]);
   assert.deepEqual([...create.required].sort(), ["name", "reason", "role"]);
   for (const schema of Object.values(create.properties)) assert.equal(schema.type, "string");
+});
+
+test("contextual chat assessment uses the existing send transport without caller or grants", async t => {
+  const receipt = { message_id: "notice", created_at: "2026-11-17T00:00:00Z", delivery_count: 0, content_omitted: true,
+    intent_assessment: { task_id: "task", dispatch_request_id: "dispatch" } };
+  const { tools, requests } = await toolsFor(t, (_, response) => json(response, receipt, 201));
+  const assessment = { disposition: "request_work", action: "text_submission", title: "摘要", acceptance: "三条结论", reason: "用户结合前文要求交付" };
+  const payload = { content: "将按约定交付文本。", intent_assessment: assessment };
+  assert.deepEqual((await execute(tools.get("send_message"), payload)).content, [{ type: "text", text: JSON.stringify(receipt) }]);
+  assert.deepEqual(JSON.parse(requests[0].body), payload);
+  for (const extra of [{ caller: "user" }, { authorized_by: "user" }, { grants: ["write"] }, { policy_revision: 999 }, { source_id: "forged" }, { source_kind: "local_user_chat" }, { purpose: "chat_intake/v1" }, { action: "write_files" }]) {
+    await assert.rejects(execute(tools.get("send_message"), { ...payload, intent_assessment: { ...assessment, ...extra } }), error => safeFailure(error, /参数/));
+  }
+  assert.equal(requests.length, 1);
 });
 
 test("invalid or absent initialization config registers no usable tools and exposes no private path", async t => {

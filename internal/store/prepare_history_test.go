@@ -13,7 +13,7 @@ import (
 
 func preparationHistoryMessage(id, groupID, topicID string, stamp time.Time) domain.Message {
 	return domain.Message{
-		ID: id, GroupID: groupID, TopicID: topicID, SenderID: "user",
+		ID: id, GroupID: groupID, TopicID: topicID, SenderID: "user", SourceKind: "unknown",
 		Content: "原文 " + id + "🙂", CreatedAt: stamp, Deliveries: []domain.Delivery{},
 	}
 }

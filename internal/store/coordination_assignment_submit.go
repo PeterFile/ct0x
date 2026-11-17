@@ -81,6 +81,9 @@ func (s *Store) SubmitAssignmentResult(ctx context.Context, scope CoordinationTo
 			task.ActiveAttemptID != binding.AttemptID || task.CurrentSubmissionID != result.ID {
 			return out, ErrConflict
 		}
+		if err := chatSubmissionNoticeInTx(ctx, tx, result, scope.Member.TopicID); err != nil {
+			return out, err
+		}
 	}
 	if key != "" {
 		// Verify the original helper's receipt, without reserving a second key.

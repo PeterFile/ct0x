@@ -234,7 +234,7 @@ func TestWorkspaceGrantV15UpgradePreservesUnknownClaims(t *testing.T) {
 				t.Fatalf("migration changed an existing schema object: %v", object)
 			}
 		}
-		messageSequenceLedger(t, reopened, 15)
+		messageSequenceLedger(t, reopened, len(migrations))
 		var grants int
 		if err := reopened.db.QueryRow("SELECT count(*) FROM workspace_grants").Scan(&grants); err != nil || grants != 0 {
 			t.Fatal("migration inferred authorization from a member preference")

@@ -392,6 +392,11 @@ func TestCoordinationReadinessHTTPRealFailuresNeverBecomeOrdinary(t *testing.T) 
 		t.Run(fault, func(t *testing.T) {
 			f := newReadinessHTTPFixture(t)
 			ctx := context.Background()
+			var resolverMessage domain.Message
+			var resolverCause interface {
+				error
+				Code() int
+			}
 			switch fault {
 			case "stale-claim":
 				turn, err := f.a.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group.ID, DeliveryID: f.pending.Delivery.ID,
@@ -417,7 +422,11 @@ func TestCoordinationReadinessHTTPRealFailuresNeverBecomeOrdinary(t *testing.T) 
 				readinessHTTPOK(t, os.Symlink(loop, loop))
 				f.options.Providers[0].Path = loop
 			case "resolver-database":
-				_, err := f.raw.Exec("DROP TABLE coordination_assignment_dispatch")
+				var err error
+				resolverMessage, err = f.a.db.GetMessage(ctx, f.pending.GroupID, f.pending.Delivery.MessageID)
+				readinessHTTPOK(t, err)
+				// Keep the message source projection readable; only the resolver needs this column.
+				_, err = f.raw.Exec("ALTER TABLE coordination_assignment_dispatch RENAME COLUMN delivery_id TO PRIVATE_unavailable_delivery_id")
 				readinessHTTPOK(t, err)
 			}
 			p := f.preparer(t)
@@ -427,6 +436,17 @@ func TestCoordinationReadinessHTTPRealFailuresNeverBecomeOrdinary(t *testing.T) 
 			f.a.handler = mustServer(t, DefaultAddress, CoordinationReadinessRoutes(f.a.db, p)...).Handler
 			check := f.unchanged(t)
 			defer check()
+			if fault == "resolver-database" {
+				message, readErr := f.a.db.GetMessage(ctx, f.pending.GroupID, f.pending.Delivery.MessageID)
+				readinessHTTPOK(t, readErr)
+				if !reflect.DeepEqual(message, resolverMessage) {
+					t.Fatal("resolver fault changed the independently readable message")
+				}
+				state, resolverErr := f.a.db.ResolveCoordinationDelivery(ctx, f.pending.GroupID, f.pending.Delivery.ID)
+				if !reflect.ValueOf(state).IsZero() || !errors.As(resolverErr, &resolverCause) || resolverCause.Code() == 0 || !strings.Contains(resolverCause.Error(), "s.delivery_id") {
+					t.Fatal("fixture did not isolate a real typed resolver SQL failure")
+				}
+			}
 			got, err := p.InspectRoleReadiness(ctx, f.pending)
 			if err == nil || !reflect.ValueOf(got).IsZero() || errors.Is(err, scheduler.ErrNotReady) {
 				t.Fatal("real identity/system failure was downgraded to ordinary or blocked readiness")
@@ -441,10 +461,25 @@ func TestCoordinationReadinessHTTPRealFailuresNeverBecomeOrdinary(t *testing.T) 
 				}
 			}
 			if fault == "resolver-database" {
-				var cause interface{ Code() int }
-				if !errors.As(err, &cause) || cause.Code() == 0 {
-					t.Fatal("resolver fixture did not preserve its real typed database failure")
+				assertCause := func(err error) {
+					t.Helper()
+					var cause interface {
+						error
+						Code() int
+					}
+					if !errors.As(err, &cause) || cause.Code() != resolverCause.Code() || cause.Error() != resolverCause.Error() {
+						t.Fatal("resolver fixture did not preserve its real typed database cause/code")
+					}
+					if strings.Contains(err.Error(), "SQL") || strings.Contains(err.Error(), "delivery_id") || strings.Contains(err.Error(), "coordination_assignment_dispatch") {
+						t.Fatal("resolver failure exposed SQL instead of a sanitized preparation error")
+					}
 				}
+				assertCause(err)
+				prepared, prepareErr := p.Prepare(ctx, f.pending)
+				if prepared.Executor != nil || errors.Is(prepareErr, scheduler.ErrNotReady) {
+					t.Fatal("resolver failure fell back to an executor or ordinary readiness")
+				}
+				assertCause(prepareErr)
 			}
 			readinessHTTPError(t, f.a.request("GET", f.target(), ""), 500, "internal_error")
 		})

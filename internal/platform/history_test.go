@@ -35,6 +35,13 @@ func TestHistoryLocalUserStoreParity(t *testing.T) {
 		}
 		messages = append(messages, m)
 	}
+	// Keep the unverified Store-created rows above and compare a real local-user
+	// command too: parity must preserve verified provenance, not synthesize it.
+	command, err := local.CreateMessage(ctx, group.ID, MessageInput{TopicID: "topic", Content: "中文%_ history", RecipientIDs: []string{member.ID}}, "history-command")
+	if err != nil || command.SourceKind != "local_user_chat" || command.SourceID == "" {
+		t.Fatalf("actual local-user command fixture: %+v, %v", command, err)
+	}
+	messages = append(messages, command)
 	empty, topic := "", "topic"
 	first, err := db.SearchHistory(ctx, group.ID, store.HistoryQuery{Query: "中文%_", Limit: 1})
 	if err != nil || first.NextCursor == "" {

@@ -138,7 +138,7 @@ func newPrepareBenchmarkFixture(b *testing.B) *prepareBenchmarkFixture {
 	f.conversation = domain.Conversation{ID: "prepare-bench-conversation", GroupID: f.group.ID,
 		MemberID: f.member.ID, TopicID: "prepare-bench-topic", CreatedAt: created}
 	f.trigger = domain.Message{ID: "prepare-bench-trigger", GroupID: f.group.ID, TopicID: f.conversation.TopicID,
-		SenderID: "user", Content: "请核对当前话题，保留消息来源。", CreatedAt: base.Add(50 * time.Second)}
+		SenderID: "user", SourceKind: "unknown", Content: "请核对当前话题，保留消息来源。", CreatedAt: base.Add(50 * time.Second)}
 	f.trigger.Deliveries = []domain.Delivery{{ID: "prepare-bench-delivery", MessageID: f.trigger.ID,
 		ConversationID: f.conversation.ID, RecipientID: f.member.ID, State: domain.DeliveryStateQueued, CreatedAt: f.trigger.CreatedAt}}
 	f.pending = store.PendingDelivery{GroupID: f.group.ID, SenderID: f.trigger.SenderID, Delivery: f.trigger.Deliveries[0]}
@@ -166,7 +166,7 @@ func newPrepareBenchmarkFixture(b *testing.B) *prepareBenchmarkFixture {
 	for i := range 50 {
 		message := domain.Message{ID: fmt.Sprintf("prepare-bench-history-%02d", i), GroupID: f.group.ID,
 			TopicID: f.conversation.TopicID, SenderID: "user", Content: fmt.Sprintf("历史 %02d：固定短消息。", i),
-			CreatedAt: base.Add(time.Duration(i) * time.Second), Deliveries: []domain.Delivery{}}
+			SourceKind: "unknown", CreatedAt: base.Add(time.Duration(i) * time.Second), Deliveries: []domain.Delivery{}}
 		f.history = append(f.history, message)
 		exec("INSERT INTO messages(id,group_id,topic_id,sender_id,content,created_at) VALUES(?,?,?,?,?,?)",
 			message.ID, message.GroupID, message.TopicID, message.SenderID, message.Content, stamp(message.CreatedAt))

@@ -115,12 +115,14 @@ func TestTaskArtifactV6UpgradePreservesTextHistoryAndClaims(t *testing.T) {
 	if err := s.db.QueryRow("SELECT max(version),count(*),count(CASE WHEN version=7 THEN 1 END) FROM schema_migrations").Scan(&latest, &count, &v7); err != nil || latest != len(migrations) || count != len(migrations) || v7 != 1 {
 		t.Fatalf("v7 ledger: %d/%d, v7=%d, %v", latest, count, v7, err)
 	}
+	expectedMessage := beforeMessage
+	expectedMessage.SourceKind = "unknown"
 	for _, check := range []struct {
 		want any
 		read func() (any, error)
 	}{
 		{g, func() (any, error) { return s.CreateGroup(ctx, keyedGroup()) }},
-		{beforeMessage, func() (any, error) { return s.CreateMessage(ctx, messageInput, nil) }},
+		{expectedMessage, func() (any, error) { return s.CreateMessage(ctx, messageInput, nil) }},
 		{beforeTurn, func() (any, error) { return s.GetTurn(ctx, g.ID, turn.ID) }},
 		{beforeTask, func() (any, error) { return s.CreateTask(ctx, create) }},
 		{attempt, func() (any, error) { return s.ActivateTaskAttempt(ctx, activate) }},

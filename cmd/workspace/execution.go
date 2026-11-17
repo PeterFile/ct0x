@@ -44,6 +44,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		}
 		if config.enableCoordinationRoles {
 			toolOptions.RoleMaxActive, toolOptions.RoleExecutionRoot = schedulerOptions.MaxActive, schedulerOptions.RuntimeDir
+			toolOptions.ChatIntake = engine
 			options.RoleThinking = config.roleThinking
 		}
 		tools, err = platform.NewMemberToolRuntime(db, toolOptions)

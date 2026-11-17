@@ -90,7 +90,7 @@ func assertRolePacket(t *testing.T, prompt string, f *rolePrepareFixture, histor
 		prepareRoleOK(t, json.Unmarshal([]byte(item.Content), &body))
 		if item.Source != (contextpack.Source{Scope: scope, ID: message.ID, Sequence: uint64(sequence), Kind: contextpack.MessageKind}) ||
 			body.ID != message.ID || body.GroupID != message.GroupID || body.TopicID != message.TopicID || body.SenderID != message.SenderID ||
-			!body.CreatedAt.Equal(message.CreatedAt) || body.Content != message.Content {
+			!body.CreatedAt.Equal(message.CreatedAt) || body.Content != message.Content || body.SourceKind != message.SourceKind || body.SourceID != message.SourceID {
 			t.Fatal("role packet changed full materialized content or source provenance")
 		}
 	}
@@ -118,7 +118,7 @@ func seedRoleContextHistory(t *testing.T, f *rolePrepareFixture, padding int) []
 	for i := range 49 {
 		message := domain.Message{ID: fmt.Sprintf("history-%02d-%s", i, strings.Repeat("r", padding)), GroupID: f.group.ID,
 			TopicID: f.trigger.TopicID, SenderID: "user", Content: fmt.Sprintf("原文 %02d 🙂 <&> \\", i), CreatedAt: base.Add(time.Duration(i) * time.Second),
-			Deliveries: []domain.Delivery{}}
+			SourceKind: "unknown", Deliveries: []domain.Delivery{}}
 		// Normal message rows with the real append-log trigger; no delivery or
 		// role/capability records are fabricated for history visibility.
 		f.exec(t, "INSERT INTO messages(id,group_id,topic_id,sender_id,content,created_at) VALUES(?,?,?,?,?,?)",
@@ -126,7 +126,7 @@ func seedRoleContextHistory(t *testing.T, f *rolePrepareFixture, padding int) []
 		history = append(history, message)
 	}
 	before := domain.Message{ID: "!" + strings.Repeat("b", padding), GroupID: f.group.ID, TopicID: f.trigger.TopicID,
-		SenderID: "user", Content: "同时间更小 ID 原文", CreatedAt: base.Add(50 * time.Second), Deliveries: []domain.Delivery{}}
+		SenderID: "user", Content: "同时间更小 ID 原文", CreatedAt: base.Add(50 * time.Second), SourceKind: "unknown", Deliveries: []domain.Delivery{}}
 	f.exec(t, "INSERT INTO messages(id,group_id,topic_id,sender_id,content,created_at) VALUES(?,?,?,?,?,?)",
 		before.ID, before.GroupID, before.TopicID, before.SenderID, before.Content, stamp(before.CreatedAt))
 	history = append(history, before)

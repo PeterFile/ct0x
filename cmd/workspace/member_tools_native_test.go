@@ -92,7 +92,7 @@ func memberToolsKey(operation, callID string) string {
 	return fmt.Sprintf("%x", sha256.Sum256([]byte(operation+callID)))
 }
 
-func memberToolsHTTP(t *testing.T, endpoint, token, operation string, input any, key string, status int, code string) []byte {
+func memberToolsHTTP(t *testing.T, endpoint, token, operation string, input any, key string, status int, code string, timeouts ...time.Duration) []byte {
 	t.Helper()
 	data, err := json.Marshal(input)
 	if err != nil {
@@ -108,7 +108,11 @@ func memberToolsHTTP(t *testing.T, endpoint, token, operation string, input any,
 	if key != "" {
 		request.Header.Set("Idempotency-Key", key)
 	}
-	client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	timeout := 3 * time.Second
+	if len(timeouts) == 1 {
+		timeout = timeouts[0]
+	}
+	client := &http.Client{Timeout: timeout, Transport: &http.Transport{Proxy: nil}}
 	defer client.CloseIdleConnections()
 	response, err := client.Do(request)
 	if err != nil {

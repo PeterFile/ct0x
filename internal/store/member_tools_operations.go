@@ -104,6 +104,9 @@ func (s *Store) ReadChannelForTool(ctx context.Context, scope MemberToolScope, o
 			return Page[domain.Message]{}, memberToolOperationError(action, err)
 		}
 	}
+	if err := messageSourcesInTx(ctx, tx, page.Items); err != nil {
+		return Page[domain.Message]{}, memberToolOperationError(action, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return Page[domain.Message]{}, memberToolOperationError(action, err)
 	}
@@ -112,6 +115,15 @@ func (s *Store) ReadChannelForTool(ctx context.Context, scope MemberToolScope, o
 
 // SendMessageForTool never default-routes: both omitted and empty recipients are public-only.
 func (s *Store) SendMessageForTool(ctx context.Context, scope MemberToolScope, input MemberToolMessageInput, key string) (domain.Message, error) {
+	return s.sendMemberMessage(ctx, scope, input, key, "")
+}
+
+// A separate operation gate allows bounded discussion only after durable intake.
+func (s *Store) SendMessageForChatIntake(ctx context.Context, scope MemberToolScope, candidateID string, input MemberToolMessageInput, key string) (domain.Message, error) {
+	return s.sendMemberMessage(ctx, scope, input, key, candidateID)
+}
+
+func (s *Store) sendMemberMessage(ctx context.Context, scope MemberToolScope, input MemberToolMessageInput, key, candidateID string) (domain.Message, error) {
 	const action = "发送成员消息失败"
 	tx, err := s.beginMemberToolTx(ctx, scope)
 	if err != nil {
@@ -121,12 +133,26 @@ func (s *Store) SendMessageForTool(ctx context.Context, scope MemberToolScope, i
 	if !memberToolKeyValid(key) {
 		return domain.Message{}, ErrInvalid
 	}
-	message, err := createMessageInTx(ctx, tx, MessageRequest{
-		GroupID: scope.Claim.GroupID, TopicID: scope.TopicID, ActorID: scope.MemberID,
-		Content: input.Content, RecipientIDs: input.RecipientIDs, IdempotencyKey: key,
-	}, input.RecipientIDs)
+	r := MessageRequest{GroupID: scope.Claim.GroupID, TopicID: scope.TopicID, ActorID: scope.MemberID, Content: input.Content, RecipientIDs: input.RecipientIDs, IdempotencyKey: key}
+	_, replay, err := lookupMutation(ctx, tx, r.scope(), r.payload())
 	if err != nil {
 		return domain.Message{}, memberToolOperationError(action, err)
+	}
+	if candidateID != "" {
+		if err := chatDiscussionGateInTx(ctx, tx, scope, candidateID, input, replay); err != nil {
+			return domain.Message{}, memberToolOperationError(action, err)
+		}
+	}
+	message, err := createMessageInTx(ctx, tx, r, input.RecipientIDs)
+	if err != nil {
+		return domain.Message{}, memberToolOperationError(action, err)
+	}
+	if !replay {
+		sourceID, err := messageCommandSourceInTx(ctx, tx, message.ID, "member", r.payload(), key, &scope)
+		if err != nil {
+			return domain.Message{}, memberToolOperationError(action, err)
+		}
+		message.SourceID, message.SourceKind = sourceID, "member"
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Message{}, memberToolOperationError(action, err)
