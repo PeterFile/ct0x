@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select, verify and aggregate fixed Store64/Platform4 race shards from Go JSON evidence."""
+"""Select, verify and aggregate fixed Store64/Platform4/HTTPAPI8 race shards from Go JSON evidence."""
 import argparse
 from collections import Counter
 import hashlib
@@ -21,6 +21,7 @@ ARTIFACT_PREFIX = "store-shard-v1-"
 PROFILES = {
     "store": (TOTAL, "agentworkspace/internal/store", SUMMARY, ARTIFACT_PREFIX),
     "platform": (4, "agentworkspace/internal/platform", "platform-summary.json", "platform-shard-v1-"),
+    "httpapi": (8, "agentworkspace/internal/httpapi", "httpapi-summary.json", "httpapi-shard-v1-"),
 }
 
 
