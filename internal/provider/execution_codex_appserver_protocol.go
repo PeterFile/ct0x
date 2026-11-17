@@ -65,6 +65,14 @@ func readCodexAppServerConfig(raw json.RawMessage) (codexAppServerConfigSnapshot
 		source, _ := codexRPCObject(name["name"], "type")
 		var kind string
 		_ = json.Unmarshal(source["type"], &kind)
+		if kind == "system" {
+			// A version claiming emptiness is not proof; inspect the complete object.
+			fields, fieldsErr := codexRPCObject(layer, "config")
+			config, configErr := codexAppServerMap(fields["config"])
+			if fieldsErr != nil || configErr != nil || len(config) != 0 {
+				return snapshot, errCodexRPCFrame
+			}
+		}
 		sessionFlags = sessionFlags || kind == "sessionFlags"
 		layerNames[metadata] = true
 		ordered = append(ordered, metadata)
@@ -115,8 +123,9 @@ func readCodexAppServerConfig(raw json.RawMessage) (codexAppServerConfigSnapshot
 	return snapshot, nil
 }
 
-// Only understood, non-managed local sources can be overridden safely. Reject
-// managed sources even when they are disabled or absent from winning origins.
+// Accept known local provenance only. readCodexAppServerConfig additionally
+// requires every system layer's full config to be empty. Managed/unknown sources
+// remain unsupported even when disabled or absent from winning origins.
 func codexAppServerConfigMetadata(raw json.RawMessage) (string, error) {
 	metadata, err := codexRPCObject(raw, "name", "version")
 	if err != nil {
@@ -136,7 +145,7 @@ func codexAppServerConfigMetadata(raw json.RawMessage) (string, error) {
 	}
 	var pathKey string
 	switch kind {
-	case "packagedDefaults", "user":
+	case "packagedDefaults", "user", "system":
 		pathKey = "file"
 	case "project":
 		pathKey = "dotCodexFolder"

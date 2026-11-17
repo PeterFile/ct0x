@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -167,6 +168,99 @@ func TestCodexAppServerPassiveMetadataIsNotAuthority(t *testing.T) {
 		if !p.damaged || p.ctx.Err() == nil || p.receipt.Accepted || p.receipt.Terminal != "" {
 			t.Fatal("request, invalid metadata, unknown method or cross-session identity was silently trusted")
 		}
+	}
+}
+
+const appServerCompatEmptySystemLayer = `{"name":{"type":"system","file":"/etc/codex/config.toml"},"version":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","config":{}}`
+
+// Match root's installed-0.166 layer order and empty system object. User/flags
+// contents and versions are synthetic; no original config values are replayed.
+const appServerCompatEmptySystemConfig = `{"config":{"mcp_servers":{}},"origins":{
+"sandbox_mode":{"name":{"type":"sessionFlags"},"version":"flags-v1"},
+"model":{"name":{"type":"user","file":"/synthetic/config.toml"},"version":"user-v1"}},"layers":[
+{"name":{"type":"sessionFlags"},"version":"flags-v1","config":{"sandbox_mode":"read-only"}},
+{"name":{"type":"user","file":"/synthetic/config.toml"},"version":"user-v1","config":{"model":"synthetic/model"}},` + appServerCompatEmptySystemLayer + `]}`
+
+func TestCodexAppServerEmptySystemLayer(t *testing.T) {
+	if _, err := readCodexAppServerConfig(json.RawMessage(appServerCompatEmptySystemConfig)); err != nil {
+		t.Fatal("installed-0.166 default empty system layer blocked config validation")
+	}
+}
+
+func TestCodexAppServerSystemLayerRequiresEmptyObject(t *testing.T) {
+	for name, field := range map[string]string{
+		"missing":   "",
+		"null":      `,"config":null`,
+		"array":     `,"config":[]`,
+		"nonempty":  `,"config":{"features":{"shell_tool":true}}`,
+		"unknown":   `,"config":{"future":null}`,
+		"duplicate": `,"config":{},"config":{}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			layer := strings.Replace(appServerCompatEmptySystemLayer, `,"config":{}`, field, 1)
+			raw := strings.Replace(appServerCompatEmptySystemConfig, appServerCompatEmptySystemLayer, layer, 1)
+			if _, err := readCodexAppServerConfig(json.RawMessage(raw)); err == nil {
+				t.Fatal("system config was trusted without a complete, unambiguous empty object")
+			}
+		})
+	}
+	for _, kind := range []string{"legacyManagedConfigTomlFromFile", "futureLayer"} {
+		raw := strings.Replace(appServerCompatEmptySystemConfig, `"type":"system"`, `"type":"`+kind+`"`, 1)
+		if _, err := readCodexAppServerConfig(json.RawMessage(raw)); err == nil {
+			t.Fatal("empty config bypassed the managed/unknown source rejection")
+		}
+	}
+}
+
+func TestCodexAppServerSystemLayerDriftDoesNotStartTurn(t *testing.T) {
+	before, err := readCodexAppServerConfig(json.RawMessage(appServerCompatEmptySystemConfig))
+	if err != nil {
+		t.Fatal("empty system fixture was rejected")
+	}
+	var fields map[string]json.RawMessage
+	var layers []json.RawMessage
+	if json.Unmarshal([]byte(appServerCompatEmptySystemConfig), &fields) != nil || json.Unmarshal(fields["layers"], &layers) != nil {
+		t.Fatal("invalid synthetic layers")
+	}
+	layers[0], layers[2] = layers[2], layers[0]
+	fields["layers"] = mustAppServerFixtureJSON(layers)
+	nonempty := strings.Replace(appServerCompatEmptySystemLayer, `"config":{}`, `"config":{"future":null}`, 1)
+	for name, raw := range map[string]string{
+		"stable":   appServerCompatEmptySystemConfig,
+		"order":    string(mustAppServerFixtureJSON(fields)),
+		"version":  strings.Replace(appServerCompatEmptySystemConfig, "sha256:44136", "sha256:54136", 1),
+		"nonempty": strings.Replace(appServerCompatEmptySystemConfig, appServerCompatEmptySystemLayer, nonempty, 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			sent := false
+			p := codexAppServerProtocol{
+				ctx: ctx, cancel: cancel, awaiting: 4,
+				before: before, threadID: appServerFixtureThread,
+				request: ExecuteRequest{CWD: "/synthetic/workspace", Prompt: "synthetic prompt"},
+				receipt: &ExecutionReceipt{Outcome: OutcomeUnknown},
+				summary: func(codexAppServerConfigSnapshot) {},
+				send: func(id int, method string, _ any) bool {
+					if id != 5 || method != "turn/start" {
+						t.Fatal("unexpected request after configuration validation")
+					}
+					sent = true
+					return true
+				},
+			}
+			p.receive(codexRPCMessage{ID: json.RawMessage(`4`), Result: json.RawMessage(raw)})
+			if name == "stable" {
+				if p.damaged || ctx.Err() != nil || !sent || p.awaiting != 5 {
+					t.Fatal("stable empty system layer prevented the turn request")
+				}
+			} else if !p.damaged || ctx.Err() == nil || sent {
+				t.Fatal("system layer content/order/version drift allowed a turn request")
+			}
+			if p.receipt.Accepted || p.receipt.Terminal != "" || p.receipt.Outcome != OutcomeUnknown {
+				t.Fatal("config validation manufactured execution evidence")
+			}
+		})
 	}
 }
 
