@@ -11,7 +11,10 @@ import (
 
 // ProviderCatalog is a startup-only, memory-only snapshot. It grants no execution
 // capability; a member's provider preference can outlive a discovery result.
-type ProviderCatalog struct{ items []provider.Provider }
+type ProviderCatalog struct {
+	items          []provider.Provider
+	adapterReports map[string]ProviderAdapterReport
+}
 
 func DiscoverProviders(ctx context.Context, search provider.Search, runner provider.Runner) *ProviderCatalog {
 	items := provider.Discover(search)

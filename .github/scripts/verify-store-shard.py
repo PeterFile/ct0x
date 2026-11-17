@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select, verify and aggregate fixed Store18/Platform4 race shards from Go JSON evidence."""
+"""Select, verify and aggregate fixed Store32/Platform4 race shards from Go JSON evidence."""
 import argparse
 from collections import Counter
 import hashlib
@@ -11,7 +11,7 @@ import sys
 import unicodedata
 
 
-TOTAL = 18
+TOTAL = 32
 SCHEMA = 1
 MAX_NAME_BYTES = 4096
 # Stay below Linux's per-argument limit, including for multibyte identifiers.
