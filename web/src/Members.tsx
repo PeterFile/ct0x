@@ -4,6 +4,7 @@ import { ApiError, createMember, isDefinitiveRejection, listMembers, listProvide
 import type { Member, MemberInput, Provider } from "./api";
 import { CreationDisclosure } from "./CreationDisclosure";
 import { MemberAvatar } from "./MemberAvatar";
+import { MemberAdapterDetails } from "./MemberAdapterDetails";
 
 function unique<T extends { id: string }>(items: T[]) {
   const seen = new Set<string>();
@@ -142,6 +143,7 @@ function MemberScope({ groupId, active, catalogue, onMembers, onRecipient }: {
       <dl><dt>群内状态</dt><dd>{selected.status === "active" ? "在群" : selected.status === "left" ? "已离开" : "状态未知"}</dd>
         <dt>运行器配置</dt><dd>{selected.provider_id ? catalogue.items.find(provider => provider.id === selected.provider_id)?.name || "已有配置，目录未验证" : "未绑定"}</dd>
         <dt>模型配置</dt><dd>{selected.model || "未指定"}</dd><dt>工作目录配置</dt><dd>{selected.workspace || "未配置"}</dd></dl>
+      <MemberAdapterDetails provider={catalogue.items.find(provider => provider.id === selected.provider_id)} />
     </section> : null}
     <CreationDisclosure label="创建成员" pending={mutation.pending} error={mutation.error} onSubmit={submit}>
       <fieldset disabled={mutation.pending || mutation.uncertain}>

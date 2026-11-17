@@ -8,10 +8,21 @@ export type Member = {
   creator_id: string; owner_id: string; status: string; workspace: string; created_at: string;
 };
 export type MemberInput = Readonly<{ name: string; role: string; provider_id?: string; model?: string; workspace?: string }>;
+export type AdapterProtocol = "one_shot" | "pi_extension" | "codex_app_server";
+export type AdapterSupport = "supported" | "unsupported" | "unknown";
+export type ProviderAdapterCapabilities = {
+  platform_tools: AdapterSupport; native_resume: AdapterSupport; permission_interaction: AdapterSupport;
+  cancel: AdapterSupport; terminal_evidence: AdapterSupport; steer: AdapterSupport;
+  evidence: { source: "builtin_contract"; provider_id: string; name: string; path: string; version: string; protocol: AdapterProtocol };
+};
+export type ProviderAdapter = {
+  id: string; protocol: AdapterProtocol; enabled: boolean; capabilities?: ProviderAdapterCapabilities;
+};
 export type Provider = {
   id: string; name: string; path: string; version: string; installation: string; account: string; connectivity: string;
   capabilities: { one_shot: boolean; resume: boolean; tools: boolean };
   evidence: { at: string; type: string; reason: string }[];
+  adapter?: ProviderAdapter;
 };
 export type Delivery = {
   id: string; message_id: string; conversation_id: string; recipient_id: string;
@@ -46,13 +57,26 @@ const messageIn = (groupId: string, topicId?: string) => (value: unknown): value
   && value.deliveries.every(delivery => isRecord(delivery)
     && ["id", "message_id", "conversation_id", "recipient_id", "state", "turn_id", "error", "created_at"]
       .every(key => typeof delivery[key] === "string") && delivery.id !== "" && delivery.message_id === value.id);
+function validProviderAdapter(value: unknown, current: Record<string, unknown>): value is ProviderAdapter {
+  if (!isRecord(value) || typeof value.id !== "string" || !value.id || value.id.trim() !== value.id || value.id.includes("\0")
+    || !["one_shot", "pi_extension", "codex_app_server"].some(protocol => protocol === value.protocol)
+    || typeof value.enabled !== "boolean") return false;
+  if (!("capabilities" in value)) return true;
+  const capabilities = value.capabilities;
+  if (!isRecord(capabilities) || !["platform_tools", "native_resume", "permission_interaction", "cancel", "terminal_evidence", "steer"]
+    .every(key => ["supported", "unsupported", "unknown"].some(state => state === capabilities[key]))) return false;
+  const evidence = capabilities.evidence;
+  return isRecord(evidence) && evidence.source === "builtin_contract" && evidence.provider_id === current.id
+    && ["name", "path", "version"].every(key => evidence[key] === current[key]) && evidence.protocol === value.protocol;
+}
 function isProvider(value: unknown): value is Provider {
   if (!isRecord(value) || !["id", "name", "path", "version", "installation", "account", "connectivity"]
     .every(key => typeof value[key] === "string") || value.id === "") return false;
   const capabilities = value.capabilities;
   return isRecord(capabilities) && ["one_shot", "resume", "tools"].every(key => typeof capabilities[key] === "boolean")
     && Array.isArray(value.evidence) && value.evidence.every(entry => isRecord(entry)
-      && ["at", "type", "reason"].every(key => typeof entry[key] === "string"));
+      && ["at", "type", "reason"].every(key => typeof entry[key] === "string"))
+    && (!("adapter" in value) || validProviderAdapter(value.adapter, value));
 }
 
 async function request<T>(path: string, init: RequestInit, valid: (value: unknown) => value is T, expectedStatus = 200): Promise<T> {

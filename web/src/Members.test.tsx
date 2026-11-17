@@ -11,6 +11,8 @@ const panel = () => {
   const form = within(landmark).queryByRole("form", { name: "创建成员" });
   return within(form?.closest(".group-panel") ?? landmark);
 };
+const detailValue = (label: string) => within(panel().getByRole("region", { name: "成员详情" }))
+  .getByText(label, { selector: "dt" }).nextElementSibling;
 const field = (name: string) => panel().getByRole("textbox", { name });
 const change = (name: string, value: string) => fireEvent.change(field(name), { target: { value } });
 const submit = () => fireEvent.submit(panel().getByRole("form", { name: "创建成员" }));
@@ -203,6 +205,70 @@ it("pages the catalogue explicitly and renders unknown future account strings ho
   fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
   expect(await panel().findByRole("option", { name: /codex.*1.2.3.*未登录/ })).toHaveValue("actual-second-id");
   expect(catalogue.mock.calls[1][0]).toBe("/api/v1/providers?limit=50&before=next%2B%2F");
+});
+const adapterCapabilityLabels = ["平台工具", "原生会话恢复", "权限交互", "原生取消", "终态证据", "运行中追加"];
+function memberAdapter() {
+  return { id: "pi_fixture", protocol: "pi_extension", enabled: false,
+    capabilities: { platform_tools: "supported", native_resume: "unknown", permission_interaction: "unsupported",
+      cancel: "unknown", terminal_evidence: "supported", steer: "unsupported",
+      evidence: { source: "builtin_contract", provider_id: provider.id, name: provider.name,
+        path: provider.path, version: "1.4.0", protocol: "pi_extension" } } };
+}
+it.each([false, true])("keeps absent adapter capabilities unknown despite authenticated legacy tools/resume (report=%s)", async hasReport => {
+  reads.mockResolvedValueOnce(page([{ ...member, provider_id: provider.id }]));
+  catalogue.mockResolvedValueOnce(page([{ ...provider, capabilities: { one_shot: true, tools: true, resume: true },
+    ...(hasReport ? { adapter: { id: "pi_fixture", protocol: "pi_extension", enabled: true } } : {}) }]));
+  await open(); await panel().findByRole("option", { name: /pi.*账户已登录/ });
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  for (const label of adapterCapabilityLabels) expect(detailValue(label)).toHaveTextContent(/^未知$/);
+  if (!hasReport) expect(panel().getByText("接入信息未提供/能力未知")).toBeVisible();
+  expect(detailValue("账户状态")).toHaveTextContent("已登录（运行未验证）");
+  expect(detailValue("连通性")).toHaveTextContent("未检查");
+  expect(panel().queryByText(/^支持（实现合同）$/)).not.toBeInTheDocument();
+  expect(panel().queryByText(/已就绪/)).not.toBeInTheDocument();
+});
+it("shows version-bound contract support, disabled process and unsupported permissions separately", async () => {
+  reads.mockResolvedValueOnce(page([{ ...member, provider_id: provider.id, model: "configured-model" }]));
+  catalogue.mockResolvedValueOnce(page([{ ...provider, version: "1.4.0", adapter: memberAdapter() }]));
+  await open(); await panel().findByRole("option", { name: /pi.*1.4.0/ });
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  expect(detailValue("CLI 版本")).toHaveTextContent("1.4.0");
+  expect(detailValue("当前接入方式")).toHaveTextContent("pi_extension");
+  expect(detailValue("进程启用状态")).toHaveTextContent("未启用");
+  expect(detailValue("平台工具")).toHaveTextContent(/^支持（实现合同）$/);
+  expect(detailValue("原生会话恢复")).toHaveTextContent(/^未知$/);
+  expect(detailValue("权限交互")).toHaveTextContent(/^不支持$/);
+  expect(detailValue("原生取消")).toHaveTextContent(/^未知$/);
+  expect(detailValue("终态证据")).toHaveTextContent(/^支持（实现合同）$/);
+  expect(detailValue("运行中追加")).toHaveTextContent(/^不支持$/);
+  expect(panel().getByText(/实现合同只证明此版本的接入实现/)).toHaveTextContent("并非握手或实际运行证明");
+  expect(panel().queryByRole("button", { name: /批准|授权|启用接入/ })).not.toBeInTheDocument();
+});
+it("labels refreshed CLI/model selection as current configuration, not historical Turn or actual model evidence", async () => {
+  const hostilePath = '<img src=x onerror="alert(1)">';
+  const hostileModel = '<script>alert("model")</script>';
+  const selected = { ...member, provider_id: provider.id, model: "old-model" };
+  reads.mockResolvedValueOnce(page([selected]));
+  catalogue.mockResolvedValueOnce(page([{ ...provider, adapter: { id: "pi_baseline", protocol: "one_shot", enabled: true } }], "next"));
+  await open(); await panel().findByRole("option", { name: /pi.*账户已登录/ });
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  expect(detailValue("当前接入方式")).toHaveTextContent("one_shot");
+  const newProvider = { ...provider, id: "codex_current", name: "codex", version: "0.162.1", path: hostilePath,
+    adapter: { id: "codex_native", protocol: "codex_app_server", enabled: false } };
+  catalogue.mockResolvedValueOnce(page([newProvider]));
+  fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+  await panel().findByRole("option", { name: /codex.*0.162.1/ });
+  reads.mockResolvedValueOnce(page([{ ...selected, provider_id: newProvider.id, model: hostileModel }]));
+  fireEvent.click(panel().getByRole("button", { name: "刷新成员" }));
+  await panel().findByText(hostileModel);
+  expect(detailValue("当前接入方式")).toHaveTextContent("codex_app_server");
+  expect(detailValue("模型配置")).toHaveTextContent(hostileModel);
+  expect(detailValue("CLI 路径")).toHaveTextContent(hostilePath);
+  expect(panel().getByText(/以上为当前目录与成员配置/)).toHaveTextContent("不证明历史 Turn 的接入协议、实际模型或运行结果");
+  expect(panel().queryByText("old-model")).not.toBeInTheDocument();
+  expect(panel().queryByRole("img")).not.toBeInTheDocument();
+  expect(panel().getByRole("region", { name: "成员详情" }).querySelector("script")).toBeNull();
+  expect(writes).not.toHaveBeenCalled();
 });
 it("shows a real empty catalogue, retries a network failure, and aborts on full unmount", async () => {
   catalogue.mockRejectedValueOnce(new TypeError("offline")); await open();
