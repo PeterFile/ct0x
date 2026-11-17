@@ -13,6 +13,32 @@ import (
 	"agentworkspace/internal/provider"
 )
 
+// Synthetic trusted fixture evidence only, not a real CLI capability probe.
+// Freeze current member metadata against the admitted Task's exact worker grant.
+func workspaceOperationCapabilityFact(t *testing.T, s *Store, r domain.DispatchRequest, workerID string) DispatchWorkerCapabilityFact {
+	t.Helper()
+	worker, err := s.GetMember(ctx, r.GroupID, workerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := s.GetTaskWorkspaceScope(ctx, r.GroupID, r.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scope.TaskRevision != r.TaskRevision || scope.DispatchRequestID != r.ID || scope.MandateID != r.MandateID {
+		t.Fatalf("fixture workspace scope does not match dispatch request: scope=%+v request=%+v", scope, r)
+	}
+	for _, grant := range scope.Grants {
+		if grant.MemberID == worker.ID {
+			return DispatchWorkerCapabilityFact{GroupID: worker.GroupID, MemberID: worker.ID, ProviderID: worker.ProviderID, Model: worker.Model,
+				RequiredProfile: DispatchWorkspaceWorkerProfile, TaskID: scope.TaskID, TaskRevision: scope.TaskRevision,
+				ResourceKey: scope.ResourceKey, NodeID: scope.NodeID, GrantID: grant.GrantID}
+		}
+	}
+	t.Fatalf("fixture worker %s has no grant in Task workspace scope: %+v", worker.ID, scope)
+	return DispatchWorkerCapabilityFact{}
+}
+
 // This fixture admits real chat work, then uses the existing materialization,
 // claim and Assignment/Attempt path. The directory/blob metadata is trusted
 // fixture data only: it proves no physical IO, durability or CLI capability.
@@ -71,7 +97,8 @@ func workspaceOperationFixture(t *testing.T) (requestDispatchFixture, domain.Dis
 	}
 	r := view.Request
 	coordinator := coordinationDecideBindRequest(t, f.s, r)
-	decision, err := f.s.DecideDispatch(ctx, coordinator, CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: f.b, Reason: "分派已准入的目录工作"}, "assign-workspace")
+	fact := workspaceOperationCapabilityFact(t, f.s, r, f.b)
+	decision, err := f.s.DecideDispatchWithCapabilities(ctx, coordinator, CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: f.b, Reason: "分派已准入的目录工作"}, "assign-workspace", []DispatchWorkerCapabilityFact{fact})
 	if err != nil || decision.Assignment == nil {
 		t.Fatalf("workspace Assignment: %+v, %v", decision, err)
 	}

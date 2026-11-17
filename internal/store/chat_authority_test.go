@@ -248,9 +248,16 @@ func chatAuthorityWorker(t *testing.T, f chatFixture) CoordinationToolScope {
 		t.Fatal(err)
 	}
 	coordinator := coordinationDecideBindRequest(t, f.s, dispatch.Request)
-	decision, err := f.s.DecideDispatch(ctx, coordinator, CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: f.b, Reason: "文本成员"}, "assign")
-	if err != nil {
-		t.Fatal(err)
+	input := CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: f.b, Reason: "文本成员"}
+	var decision domain.DecisionReceipt
+	if admitted.WorkspaceScope != nil {
+		fact := workspaceOperationCapabilityFact(t, f.s, dispatch.Request, f.b)
+		decision, err = f.s.DecideDispatchWithCapabilities(ctx, coordinator, input, "assign", []DispatchWorkerCapabilityFact{fact})
+	} else {
+		decision, err = f.s.DecideDispatch(ctx, coordinator, input, "assign")
+	}
+	if err != nil || decision.Assignment == nil {
+		t.Fatalf("chat worker assignment: %+v, %v", decision, err)
 	}
 	worker := coordinationDecideWorker(t, requestDispatchFixture{s: f.s, worker: f.b}, dispatch.Request, decision, false)
 	binding, err := f.s.BindAssignmentAttempt(ctx, worker)

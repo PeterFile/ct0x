@@ -76,7 +76,8 @@ func chatRepairBoundWorkspaceWorker(t *testing.T, s *Store, receipt domain.ChatA
 		t.Fatal(err)
 	}
 	coordinator := coordinationDecideBindRequest(t, s, view.Request)
-	decision, err := s.DecideDispatch(ctx, coordinator, CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: workerID, Reason: "原物理范围修复"}, "assign-repair-file")
+	fact := workspaceOperationCapabilityFact(t, s, view.Request, workerID)
+	decision, err := s.DecideDispatchWithCapabilities(ctx, coordinator, CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: workerID, Reason: "原物理范围修复"}, "assign-repair-file", []DispatchWorkerCapabilityFact{fact})
 	if err != nil || decision.Assignment == nil {
 		t.Fatalf("repair workspace assignment: %+v, %v", decision, err)
 	}
