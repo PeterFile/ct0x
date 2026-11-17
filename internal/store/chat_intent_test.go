@@ -47,13 +47,9 @@ func chatSetupSource(t *testing.T, sender string, preparation bool, content stri
 	f := setupMessages(t)
 	api := chatIntake(t, f.s)
 	thread := domain.ThreadRef{GroupID: f.groupID, TopicID: "chat-topic"}
-	written, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: thread.TopicID, ActorID: "user", Content: "允许在本话题内自主准备文本草稿，最多两项，不写文件、不执行外部动作。"}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	policyInput := domain.ChatPolicyRequest{Enabled: true, Action: domain.ChatActionTextSubmission, MaxAdmissions: 2, AllowPreparation: preparation}
 	if preparation {
-		policyInput.PreauthorizationMessageID = written.ID
+		policyInput.PreparationScopeKind = domain.ChatPreparationTopicSummary
 	}
 	policy, err := api.SetChatPolicy(ctx, thread, policyInput, 0, "policy")
 	if err != nil {
@@ -68,10 +64,26 @@ func chatSetupSource(t *testing.T, sender string, preparation bool, content stri
 	if sender == "agent" {
 		sender = f.b
 	}
-	message, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: thread.TopicID, ActorID: sender,
-		Content: content, RecipientIDs: []string{f.a}}, []string{f.a})
-	if err != nil {
-		t.Fatal(err)
+	var message domain.Message
+	if sender == "user" {
+		message = chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: thread.TopicID, ActorID: "user", Content: content, RecipientIDs: []string{f.a}}, []string{f.a})
+	} else {
+		invitation := chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: thread.TopicID, ActorID: "user", Content: "请先提出摘要建议。", RecipientIDs: []string{f.b}}, []string{f.b})
+		peer, err := f.s.ClaimTurn(ctx, ClaimTurnInput{GroupID: f.groupID, DeliveryID: invitation.Deliveries[0].ID, MaxActive: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		peerScope, err := f.s.BindMemberTool(ctx, TurnClaim{GroupID: f.groupID, TurnID: peer.ID, Token: peer.ClaimToken})
+		if err != nil {
+			t.Fatal(err)
+		}
+		message, err = f.s.SendMessageForTool(ctx, peerScope, MemberToolMessageInput{Content: content, RecipientIDs: []string{f.a}}, "member-proposal")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.s.ApplyTurnReceipt(ctx, peerScope.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted, ExitCode: -1}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	turn, err := f.s.ClaimTurn(ctx, ClaimTurnInput{GroupID: f.groupID, DeliveryID: message.Deliveries[0].ID, MaxActive: 1, ResourceKeys: []string{"chat-resource"}})
 	if err != nil {
@@ -143,7 +155,7 @@ func TestChatIntentQueuedRequestSurvivesEarlierDiscussionReply(t *testing.T) {
 		t.Run(change, func(t *testing.T) {
 			f := chatSetupSource(t, "user", false, "先讨论摘要可能的结构，暂时不要形成任务。")
 			queueEvent(t, f.s, f.scope.Claim, provider.AcceptedEvent, "", "")
-			request, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID, ActorID: "user",
+			request, err := f.s.CreateLocalUserMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID, ActorID: "user",
 				Content: "现在按刚才的边界形成摘要，交付三条可核对的结论。", RecipientIDs: []string{f.a}}, []string{f.a})
 			if err != nil {
 				t.Fatal(err)
@@ -171,7 +183,7 @@ func TestChatIntentQueuedRequestSurvivesEarlierDiscussionReply(t *testing.T) {
 			}
 			newUser := func(groupID, topicID string) {
 				t.Helper()
-				if _, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: groupID, TopicID: topicID, ActorID: "user", Content: "先不要落实，约束变了。"}, nil); err != nil {
+				if _, err := f.s.CreateLocalUserMessage(ctx, MessageRequest{GroupID: groupID, TopicID: topicID, ActorID: "user", Content: "先不要落实，约束变了。"}, nil); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -208,13 +220,9 @@ func TestChatIntentQueuedRequestSurvivesEarlierDiscussionReply(t *testing.T) {
 				newUser(f.groupID, "other-topic")
 			}
 			t.Logf("source sequence=%d, earlier reply sequence=%d, candidate generation=%d, new user=%s", sourceSequence, replySequence, candidate.Generation, change)
-			before := messageSequenceSnapshot(t, f.s)
 			got, err := f.api.ApplyChatAssessment(ctx, scope, candidate.ID, f.input, "我会据此形成文本交付。", "queued-request")
 			if change == "before-capture" || change == "after-capture" {
-				if !errors.Is(err, ErrConflict) || !reflect.ValueOf(got).IsZero() {
-					t.Fatalf("new user requirement did not fence queued assessment: %+v err=%v", got, err)
-				}
-				messageSequencePreserved(t, f.s, before)
+				chatAssertNotAdmitted(t, got, err, "stale_source")
 				return
 			}
 			if err != nil {
@@ -236,6 +244,7 @@ func TestChatIntentMemberDiscussionPreservesUserAuthority(t *testing.T) {
 			f := chatSetup(t, sender, sender == "agent")
 			if sender == "agent" {
 				f.input.Disposition = "prepare_work"
+				f.input.Title, f.input.Description, f.input.Acceptance = "", "", ""
 			}
 			public, err := f.s.SendMessageForTool(ctx, f.scope, MemberToolMessageInput{Content: "补充讨论，不代替用户更改要求。"}, "public-reply")
 			if err != nil || public.SenderID != f.a || len(public.Deliveries) != 0 {
@@ -287,6 +296,7 @@ func TestChatIntentDeterministicAuthorityAndStaleFences(t *testing.T) {
 			f := chatSetup(t, sender, scenario == "preparation-generation")
 			if scenario == "preparation-generation" {
 				f.input.Disposition = "prepare_work"
+				f.input.Title, f.input.Description, f.input.Acceptance = "", "", ""
 			}
 			want := ErrConflict
 			switch scenario {
@@ -297,7 +307,7 @@ func TestChatIntentDeterministicAuthorityAndStaleFences(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "generation", "preparation-generation":
-				if _, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID, ActorID: "user", Content: "先不要落实，约束变了。"}, nil); err != nil {
+				if _, err := f.s.CreateLocalUserMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID, ActorID: "user", Content: "先不要落实，约束变了。"}, nil); err != nil {
 					t.Fatal(err)
 				}
 			case "dispatch-policy":
@@ -336,6 +346,17 @@ func TestChatIntentDeterministicAuthorityAndStaleFences(t *testing.T) {
 			}
 			before := messageSequenceSnapshot(t, f.s)
 			got, err := f.api.ApplyChatAssessment(ctx, f.scope, f.candidate.ID, f.input, "评估回复", "assessment")
+			if want != ErrMemberToolDenied {
+				codes := map[string]string{"agent-consensus": "user_request_required", "disabled": "policy_disabled", "policy-revision": "stale_policy", "generation": "stale_source", "preparation-generation": "stale_source", "dispatch-policy": "stale_dispatch_configuration", "coordinator-binding": "stale_dispatch_configuration", "file-action": "unsupported_action"}
+				chatAssertNotAdmitted(t, got, err, codes[scenario])
+				after := messageSequenceSnapshot(t, f.s)
+				for _, table := range []string{"tasks", "mandates", "routing_decisions", "coordination_dispatch_requests", "coordination_triggers", "resource_claims"} {
+					if !reflect.DeepEqual(before[table], after[table]) {
+						t.Fatalf("non-admission changed %s", table)
+					}
+				}
+				return
+			}
 			if !errors.Is(err, want) || !reflect.ValueOf(got).IsZero() {
 				t.Fatalf("gate got=%+v err=%v want=%v", got, err, want)
 			}
@@ -348,11 +369,10 @@ func TestChatIntentPreparationRequiresEnabledWrittenUserPolicy(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
 		f := chatSetup(t, "agent", enabled)
 		f.input.Disposition = "prepare_work"
+		f.input.Title, f.input.Description, f.input.Acceptance = "", "", ""
 		got, err := f.api.ApplyChatAssessment(ctx, f.scope, f.candidate.ID, f.input, "准备文本草稿", "preparation")
 		if !enabled {
-			if !errors.Is(err, ErrConflict) || got.TaskID != "" {
-				t.Fatalf("unapproved inferred work=%+v err=%v", got, err)
-			}
+			chatAssertNotAdmitted(t, got, err, "preparation_not_authorized")
 		} else if err != nil || got.Authority != "written_preauthorization" || got.SourceSenderID != f.b || got.AssessedBy != f.a || got.AuthorizationMessageID != f.policy.PreauthorizationMessageID {
 			t.Fatalf("preauthorized work=%+v err=%v", got, err)
 		}
@@ -389,7 +409,9 @@ func TestChatIntentDiscussionNeverAdmitsAndDispatchFailureRollsBack(t *testing.T
 
 func TestChatIntentPolicyEvidenceBudgetAndImmutability(t *testing.T) {
 	f := chatSetup(t, "user", true)
-	if _, err := f.api.SetChatPolicy(ctx, f.candidate.ThreadRef, f.policy.ChatPolicyRequest, 0, "policy"); err != nil {
+	originalPolicyInput := f.policy.ChatPolicyRequest
+	originalPolicyInput.PreauthorizationMessageID = ""
+	if _, err := f.api.SetChatPolicy(ctx, f.candidate.ThreadRef, originalPolicyInput, 0, "policy"); err != nil {
 		t.Fatalf("same policy key replay failed: %v", err)
 	}
 	for _, source := range []struct{ groupID, topicID, actor string }{{f.groupID, f.scope.TopicID, f.b}, {f.otherID, f.scope.TopicID, "user"}, {f.groupID, "other-topic", "user"}} {
@@ -399,7 +421,7 @@ func TestChatIntentPolicyEvidenceBudgetAndImmutability(t *testing.T) {
 		}
 		input := f.policy.ChatPolicyRequest
 		input.PreauthorizationMessageID = m.ID
-		if _, err := f.api.SetChatPolicy(ctx, f.candidate.ThreadRef, input, 1, "bad-written-source"); !errors.Is(err, ErrNotFound) {
+		if _, err := f.api.SetChatPolicy(ctx, f.candidate.ThreadRef, input, 1, "bad-written-source"); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("wrong written policy source accepted: %v", err)
 		}
 	}
@@ -408,7 +430,7 @@ func TestChatIntentPolicyEvidenceBudgetAndImmutability(t *testing.T) {
 		if _, err := f.s.ApplyTurnReceipt(ctx, f.scope.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted, ExitCode: -1}); err != nil {
 			t.Fatal(err)
 		}
-		message, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID, ActorID: "user", Content: "请形成另一份文本摘要", RecipientIDs: []string{f.a}}, []string{f.a})
+		message, err := f.s.CreateLocalUserMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID, ActorID: "user", Content: "请形成另一份文本摘要", RecipientIDs: []string{f.a}}, []string{f.a})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -428,8 +450,8 @@ func TestChatIntentPolicyEvidenceBudgetAndImmutability(t *testing.T) {
 		if i < 2 && (err != nil || got.TaskID == "") {
 			t.Fatalf("authorized budget item %d: %+v %v", i, got, err)
 		}
-		if i == 2 && !errors.Is(err, ErrConflict) {
-			t.Fatalf("persistent policy budget exceeded: %+v %v", got, err)
+		if i == 2 {
+			chatAssertNotAdmitted(t, got, err, "budget_exhausted")
 		}
 	}
 	for table, assignment := range map[string]string{"chat_policy_revisions": "enabled=enabled", "chat_candidates": "id=id", "chat_assessments": "id=id"} {

@@ -33,6 +33,7 @@ type memberToolRegistration struct {
 	skills    *memberSkillState
 	role      store.CoordinationToolScope
 	candidate *domain.ChatCandidate
+	purpose   string
 }
 
 // MemberTools owns process-local capabilities; durable claims authorize every use.
@@ -51,6 +52,20 @@ func NewMemberTools(db *store.Store) *MemberTools {
 // Issue is called by the trusted runtime only AFTER ClaimTurn, never during preparation.
 // It refuses duplicate registrations rather than silently rotating a live capability.
 func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants) (string, error) {
+	return s.issue(ctx, claim, grants, "generic")
+}
+
+// IssueChatIntake is a separate trusted runtime seam, never a tool/API input.
+// It freezes a restricted profile and persists the exact claim-bound purpose.
+func (s *MemberTools) IssueChatIntake(ctx context.Context, claim store.TurnClaim) (string, error) {
+	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose)
+}
+
+func chatIntakeOperations() []string {
+	return []string{"list_members", "read_channel", "send_message", "search_history", "read_history"}
+}
+
+func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string) (string, error) {
 	grants.Operations = slices.Clone(grants.Operations)
 	if grants.Skills != nil {
 		// Freeze the source even if the caller overwrites its exported wrapper.
@@ -91,14 +106,20 @@ func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants M
 		skillState = &memberSkillState{snapshots: make(map[string]*skills.Snapshot)}
 	}
 	var candidate *domain.ChatCandidate
-	if s.chatEngine != nil && slices.Contains(grants.Operations, "send_message") {
+	if purpose == domain.ChatIntakePurpose {
+		if s.chatEngine == nil {
+			return "", store.ErrMemberToolDenied
+		}
 		captured, err := s.chatEngine.CaptureChatCandidate(ctx, scope)
 		if err != nil {
 			return "", err
 		}
+		if captured.Purpose != domain.ChatIntakePurpose {
+			return "", store.ErrMemberToolDenied
+		}
 		candidate = &captured
 	}
-	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate}
+	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate, purpose: purpose}
 	return token, nil
 }
 

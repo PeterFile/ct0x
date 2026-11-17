@@ -770,6 +770,12 @@ func TestCoordinationCompositionNativeHelper(t *testing.T) {
 		t.Fatal("native invocations exceeded the process-wide M=1 capacity")
 	}
 	tools := "list_members,read_channel,send_message,create_member,search_history,read_history"
+	if kind == "ordinary" && expected.Mode != "roles-disabled" {
+		tools = "list_members,read_channel,send_message,search_history,read_history"
+		if coordinationCompositionCount(t, raw, "SELECT count(*) FROM chat_intake_executions WHERE turn_id=? AND purpose=?", runID, domain.ChatIntakePurpose) != 1 {
+			t.Fatal("intake native execution lacks a distinct durable purpose issuance")
+		}
+	}
 	if kind == "coordinator" {
 		tools = "list_members,read_channel,search_history,read_history,decide_dispatch"
 	} else if kind == "worker" {
@@ -835,7 +841,7 @@ func TestCoordinationCompositionNativeHelper(t *testing.T) {
 		call("decide_dispatch", map[string]any{"kind": "assign", "worker_member_id": expected.WorkerID, "reason": "forged role"}, "ordinary-decide", status)
 		call("submit_result", map[string]any{"summary": "forged role"}, "ordinary-submit", status)
 		if expected.Mode == "chat-intake" {
-			if page.ChatCandidate == nil || page.ChatCandidate.SourceSenderID != "user" || page.ChatCandidate.Policy.Revision != 1 || !bytes.Contains(prompt, []byte("intent_assessment")) {
+			if page.ChatCandidate == nil || page.ChatCandidate.SourceSenderID != "user" || page.ChatCandidate.SourceKind != "local_user_chat" || page.ChatCandidate.SourceID == "" || page.ChatCandidate.Purpose != domain.ChatIntakePurpose || page.ChatCandidate.Policy.Revision != 1 || !bytes.Contains(prompt, []byte("intent_assessment")) {
 				t.Fatal("ordinary semantic assessment lacks a captured source/policy and prompt contract")
 			}
 			var sourceContent string

@@ -73,6 +73,9 @@ func submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (dom
 	if actorID != input.ActorID || (input.ActorID != "user" && attempt.TurnID != turnID) {
 		return domain.Submission{}, ErrMemberToolDenied
 	}
+	if err := chatTextSubmissionInTx(ctx, tx, input); err != nil {
+		return domain.Submission{}, err
+	}
 	next, submission, err := task.Submit(domain.Submission{
 		ID: id, TaskID: task.ID, GroupID: task.GroupID, TaskRevision: task.Revision,
 		AttemptID: attempt.ID, Summary: input.Summary, SubmittedBy: actorID,

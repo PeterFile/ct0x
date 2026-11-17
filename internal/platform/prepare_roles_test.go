@@ -378,7 +378,14 @@ func TestPrepareRolesResolverFailuresNeverFallback(t *testing.T) {
 	})
 	t.Run("ordinary resolver SQL failure", func(t *testing.T) {
 		f := newPrepareFixture(t)
-		f.exec(t, "DROP TABLE coordination_assignment_dispatch")
+		// Break only the resolver's delivery lookup, not the independent message
+		// provenance projection used by the unchanged-state assertion below.
+		f.exec(t, "ALTER TABLE coordination_assignment_dispatch RENAME COLUMN delivery_id TO unavailable_delivery_id")
+		_, readErr := f.s.GetMessage(context.Background(), f.group.ID, f.trigger.ID)
+		prepareRoleOK(t, readErr)
+		if _, err := f.s.ResolveCoordinationDelivery(context.Background(), f.group.ID, f.pending.Delivery.ID); err == nil {
+			t.Fatal("fixture did not inject a role resolver SQL failure")
+		}
 		got, err := f.preparer(t).Prepare(context.Background(), f.pending)
 		if err == nil || got.Executor != nil || errors.Is(err, scheduler.ErrNotReady) || !errors.Is(err, errPrepareRead) || strings.Contains(err.Error(), "SELECT") {
 			t.Fatalf("resolver SQL error became ordinary or leaked: %v", err)

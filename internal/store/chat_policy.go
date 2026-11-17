@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"strconv"
 
@@ -13,9 +14,7 @@ import (
 
 // SetChatPolicy is local-user-only. Member tools cannot enable or revise policy.
 func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, input domain.ChatPolicyRequest, expected int64, key string) (domain.ChatPolicy, error) {
-	if !validTriggerID(thread.GroupID) || !memberToolKeyValid(key) || expected < 0 || expected == math.MaxInt64 ||
-		input.Action != domain.ChatActionTextSubmission || input.MaxAdmissions < 1 || input.MaxAdmissions > 100 ||
-		(input.AllowPreparation && input.PreauthorizationMessageID == "") {
+	if !validTriggerID(thread.GroupID) || !memberToolKeyValid(key) || expected < 0 || expected == math.MaxInt64 {
 		return domain.ChatPolicy{}, ErrInvalid
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -43,6 +42,12 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 			return domain.ChatPolicy{}, ErrConflict
 		}
 	} else {
+		if input.Action != domain.ChatActionTextSubmission || input.MaxAdmissions < 1 || input.MaxAdmissions > 100 ||
+			input.PreauthorizationMessageID != "" ||
+			(input.AllowPreparation && input.PreparationScopeKind != domain.ChatPreparationTopicSummary) ||
+			(!input.AllowPreparation && input.PreparationScopeKind != "") {
+			return domain.ChatPolicy{}, fmt.Errorf("%w：只支持显式配置本话题文本摘要范围，不支持聊天消息ID或自由文本预授权", ErrInvalid)
+		}
 		current, err := chatPolicyInTx(ctx, tx, thread, 0)
 		if err != nil {
 			return domain.ChatPolicy{}, admissionError("读取聊天策略失败", err)
@@ -50,20 +55,29 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 		if current.Revision != expected {
 			return domain.ChatPolicy{}, ErrConflict
 		}
-		if input.PreauthorizationMessageID != "" {
-			var content string
-			if err := tx.QueryRowContext(ctx, `SELECT content FROM messages WHERE id=? AND group_id=? AND topic_id=? AND sender_id='user'`,
-				input.PreauthorizationMessageID, thread.GroupID, thread.TopicID).Scan(&content); err != nil {
-				return domain.ChatPolicy{}, admissionError("验证书面预授权失败", err)
-			}
-			if !memberToolTextValid(content, 8192) {
-				return domain.ChatPolicy{}, ErrInvalid
-			}
+		rule := fmt.Sprintf("本机用户已配置本群、本话题聊天准入策略：启用=%t；仅允许纯文本交付；本版总准入额度=%d。", input.Enabled, input.MaxAdmissions)
+		if input.AllowPreparation {
+			rule += "\n预授权范围 topic_summary：仅依据本群本话题已有消息准备纯文本摘要；目标与验收由服务端固定。不得改为其他目标、引用Artifact版本、读写文件或执行外部动作。"
+		}
+		command, err := createMessageInTx(ctx, tx, MessageRequest{GroupID: thread.GroupID, TopicID: thread.TopicID, ActorID: "user", Content: rule, RecipientIDs: []string{}}, nil)
+		if err != nil {
+			return domain.ChatPolicy{}, admissionError("保存策略规范规则失败", err)
+		}
+		sourceID, err := messageCommandSourceInTx(ctx, tx, command.ID, "local_user_policy", payload, key, nil)
+		if err != nil {
+			return domain.ChatPolicy{}, admissionError("保存策略命令来源失败", err)
+		}
+		preauthorizationID := ""
+		if input.AllowPreparation {
+			preauthorizationID = command.ID
 		}
 		if err := coordinatorWrite(ctx, tx, `INSERT INTO chat_policy_revisions(group_id,topic_id,revision,enabled,allow_preparation,preauthorization_message_id,action,max_admissions,authorized_by)
 		 VALUES(?,?,?,?,?,nullif(?,''),?,?, 'user')`, thread.GroupID, thread.TopicID, revision, input.Enabled, input.AllowPreparation,
-			input.PreauthorizationMessageID, input.Action, input.MaxAdmissions); err != nil {
+			preauthorizationID, input.Action, input.MaxAdmissions); err != nil {
 			return domain.ChatPolicy{}, admissionError("保存聊天策略版本失败", err)
+		}
+		if err := coordinatorWrite(ctx, tx, `INSERT INTO chat_policy_scopes(group_id,topic_id,revision,scope_kind,command_source_id) VALUES(?,?,?,?,?)`, thread.GroupID, thread.TopicID, revision, input.PreparationScopeKind, sourceID); err != nil {
+			return domain.ChatPolicy{}, admissionError("保存策略可执行范围失败", err)
 		}
 		if expected == 0 {
 			err = coordinatorWrite(ctx, tx, "INSERT INTO chat_policies(group_id,topic_id,revision) VALUES(?,?,?)", thread.GroupID, thread.TopicID, revision)
@@ -125,6 +139,13 @@ func chatPolicyInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, re
 		&policy.PreauthorizationMessageID, &policy.Action, &policy.MaxAdmissions, &policy.AuthorizedBy, &policy.PreauthorizationText)
 	if revision == 0 && errors.Is(err, sql.ErrNoRows) {
 		return policy, nil
+	}
+	if err == nil {
+		scopeErr := tx.QueryRowContext(ctx, `SELECT scope_kind,command_source_id FROM chat_policy_scopes WHERE group_id=? AND topic_id=? AND revision=?`, thread.GroupID, thread.TopicID, policy.Revision).Scan(&policy.PreparationScopeKind, &policy.ConfigurationSourceID)
+		if scopeErr != nil && !errors.Is(scopeErr, sql.ErrNoRows) {
+			return domain.ChatPolicy{}, scopeErr
+		}
+		policy.PreparationSupported = policy.AllowPreparation && policy.PreparationScopeKind == domain.ChatPreparationTopicSummary && policy.ConfigurationSourceID != ""
 	}
 	return policy, err
 }

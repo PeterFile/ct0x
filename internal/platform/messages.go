@@ -33,7 +33,7 @@ func (s *LocalUser) CreateMessage(ctx context.Context, groupID string, input Mes
 		}
 	}
 	// Routing only persists deliveries; it never creates a member or starts a model.
-	return s.db.CreateMessage(ctx, request, resolved)
+	return s.db.CreateLocalUserMessage(ctx, request, resolved)
 }
 
 func (s *LocalUser) GetMessage(ctx context.Context, groupID, messageID string) (domain.Message, error) {

@@ -47,7 +47,7 @@ func (s *MemberTools) AssessChatIntent(ctx context.Context, token string, input 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry, found := s.capabilities[sha256.Sum256([]byte(token))]
-	if !found || s.chatEngine == nil || entry.candidate == nil || !slices.Contains(entry.grants.Operations, "send_message") {
+	if !found || entry.purpose != domain.ChatIntakePurpose || s.chatEngine == nil || entry.candidate == nil || !slices.Contains(entry.grants.Operations, "send_message") {
 		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
 	}
 	return s.chatEngine.AssessChatIntent(ctx, entry.scope, entry.candidate.ID, input, content, key)

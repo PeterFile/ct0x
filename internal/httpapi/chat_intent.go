@@ -19,6 +19,9 @@ type chatIntentToolReceipt struct {
 	MandateID           string `json:"mandate_id"`
 	DispatchRequestID   string `json:"dispatch_request_id"`
 	NoticeMessageID     string `json:"notice_message_id"`
+	Outcome             string `json:"outcome"`
+	ReasonCode          string `json:"reason_code,omitempty"`
+	Question            string `json:"question,omitempty"`
 }
 
 func (a coordinationAPI) getChatPolicy(w http.ResponseWriter, r *http.Request) {

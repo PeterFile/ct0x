@@ -3,14 +3,18 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/platform"
+	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
 )
 
@@ -39,8 +43,19 @@ func chatHTTPSetup(t *testing.T) *memberToolHTTPFixture {
 	if _, err := f.db.SetDispatchPolicy(context.Background(), f.groupID, []string{f.peer.ID}, 0, "workers"); err != nil {
 		t.Fatal(err)
 	}
-	var err error
-	f.token, err = f.tools.Issue(context.Background(), f.claim, platform.MemberToolGrants{Operations: []string{"read_channel", "send_message"}})
+	if _, err := f.db.ApplyTurnReceipt(context.Background(), f.claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted, ExitCode: -1}); err != nil {
+		t.Fatal(err)
+	}
+	message, err := platform.NewLocalUser(f.db).CreateMessage(context.Background(), f.groupID, platform.MessageInput{TopicID: thread.TopicID, Content: "请按前文边界整理三条文本摘要。", RecipientIDs: []string{f.caller.ID}}, "trusted-intake-request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn, err := f.db.ClaimTurn(context.Background(), store.ClaimTurnInput{GroupID: f.groupID, DeliveryID: message.Deliveries[0].ID, MaxActive: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.claim = store.TurnClaim{GroupID: f.groupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	f.token, err = f.tools.IssueChatIntake(context.Background(), f.claim)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +64,204 @@ func chatHTTPSetup(t *testing.T) *memberToolHTTPFixture {
 
 func chatHTTPBody(extra string) string {
 	return `{"content":"将按讨论结论交付文本。","intent_assessment":{"disposition":"request_work","action":"text_submission","title":"三条摘要","description":"只生成文本","acceptance":"有三条可核对结论","reason":"当前用户结合上下文明确要求交付"` + extra + `}}`
+}
+
+func TestChatAuthorityReadOnlyMessageSources(t *testing.T) {
+	f := chatHTTPSetup(t)
+	routes := append(f.routes, MessageRoutes(platform.NewLocalUser(f.db))...)
+	f.handler = mustServer(t, DefaultAddress, routes...).Handler
+	response := f.request(t, "send_message", chatHTTPBody(""), "metadata-admit")
+	var admitted struct {
+		Assessment domain.ChatAssessmentReceipt `json:"intent_assessment"`
+	}
+	if response.Code != 201 || json.Unmarshal(response.Body.Bytes(), &admitted) != nil || admitted.Assessment.TaskID == "" {
+		t.Fatalf("admit: %d %s", response.Code, response.Body)
+	}
+	dispatch, err := f.db.MaterializeDispatchRequest(context.Background(), admitted.Assessment.DispatchRequestID, 1, time.Now())
+	if err != nil || dispatch.Delivery == nil {
+		t.Fatalf("materialize: %+v %v", dispatch, err)
+	}
+	unknown, err := f.db.CreateMessage(context.Background(), store.MessageRequest{GroupID: f.groupID, TopicID: "trusted-topic", ActorID: "user", Content: "unproven legacy-shaped data"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := f.db.SetChatPolicy(context.Background(), domain.ThreadRef{GroupID: f.groupID, TopicID: "trusted-topic"}, domain.ChatPolicyRequest{Enabled: true, AllowPreparation: true, PreparationScopeKind: domain.ChatPreparationTopicSummary, Action: domain.ChatActionTextSubmission, MaxAdmissions: 2}, 1, "summary-policy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, kind := range map[string]string{dispatch.Delivery.MessageID: "platform", unknown.ID: "unknown", policy.PreauthorizationMessageID: "local_user_policy"} {
+		r := httptest.NewRequest("GET", "http://"+DefaultAddress+"/api/v1/groups/"+f.groupID+"/messages/"+id, nil)
+		w := httptest.NewRecorder()
+		f.handler.ServeHTTP(w, r)
+		var message map[string]any
+		if json.Unmarshal(w.Body.Bytes(), &message) != nil || w.Code != 200 || message["source_kind"] != kind {
+			t.Fatalf("read-only provenance missing for %s: %d %s", kind, w.Code, w.Body)
+		}
+		if kind != "unknown" && (message["source_id"] == nil || message["source_id"] == "") {
+			t.Fatal("proven message omitted its durable source")
+		}
+	}
+	channel := f.request(t, "read_channel", `{}`)
+	var page struct {
+		Items     []map[string]any      `json:"items"`
+		Candidate *domain.ChatCandidate `json:"chat_candidate"`
+	}
+	if json.Unmarshal(channel.Body.Bytes(), &page) != nil || page.Candidate == nil {
+		t.Fatal("missing channel")
+	}
+	found := false
+	for _, message := range page.Items {
+		if message["id"] == dispatch.Delivery.MessageID {
+			found = message["source_kind"] == "platform"
+		}
+	}
+	if !found {
+		t.Fatal("intake history still presents platform user sender without source metadata")
+	}
+	for _, extra := range []string{`"source_kind":"local_user_chat"`, `"source_id":"forged"`, `"purpose":"chat_intake/v1"`} {
+		r := httptest.NewRequest("POST", "http://"+DefaultAddress+"/api/v1/groups/"+f.groupID+"/messages", strings.NewReader(`{"content":"x",`+extra+`}`))
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		f.handler.ServeHTTP(w, r)
+		if w.Code != 400 {
+			t.Fatalf("client chose provenance: %d %s", w.Code, w.Body)
+		}
+	}
+}
+
+func TestChatAuthorityIntakeDiscussionHasBoundedInvitations(t *testing.T) {
+	f := chatHTTPSetup(t)
+	if w := f.request(t, "list_members", `{}`); w.Code != 200 {
+		t.Fatalf("read-only roster unavailable: %d", w.Code)
+	}
+	if w := f.request(t, "create_member", `{"name":"extra","role":"worker","reason":"x"}`, "no-create"); w.Code != 403 {
+		t.Fatalf("intake gained member creation: %d", w.Code)
+	}
+	if w := f.request(t, "send_message", `{"content":"skip assessment"}`, "skip"); w.Code != 403 {
+		t.Fatalf("intake skipped bound assessment: %d %s", w.Code, w.Body)
+	}
+	assessment := `{"content":"先讨论结构，不创建任务。","intent_assessment":{"disposition":"discuss","reason":"用户当前只要求讨论"}}`
+	if w := f.request(t, "send_message", assessment, "discussion"); w.Code != 201 {
+		t.Fatalf("discussion assessment: %d %s", w.Code, w.Body)
+	}
+	if w := f.request(t, "send_message", `{"content":"公开补充讨论，不代表授权。"}`, "public"); w.Code != 201 {
+		t.Fatalf("public discussion blocked: %d %s", w.Code, w.Body)
+	}
+	body := `{"content":"请补充摘要结构建议。","recipient_ids":["` + f.peer.ID + `"]}`
+	first := f.request(t, "send_message", body, "one-peer")
+	var receipt memberToolHTTPSendResult
+	if first.Code != 201 || json.Unmarshal(first.Body.Bytes(), &receipt) != nil {
+		t.Fatalf("fixed-ID peer invitation blocked: %d %s", first.Code, first.Body)
+	}
+	if replay := f.request(t, "send_message", body, "one-peer"); replay.Code != 201 || replay.Body.String() != first.Body.String() {
+		t.Fatal("invitation replay changed")
+	}
+	if w := f.request(t, "send_message", body, "second-peer"); w.Code != 403 {
+		t.Fatalf("per-turn invitation bound bypassed: %d %s", w.Code, w.Body)
+	}
+	message, err := f.db.GetMessage(context.Background(), f.groupID, receipt.MessageID)
+	if err != nil || len(message.Deliveries) != 1 {
+		t.Fatal("invitation not durably routed")
+	}
+	turn, err := f.db.ClaimTurn(context.Background(), store.ClaimTurnInput{GroupID: f.groupID, DeliveryID: message.Deliveries[0].ID, MaxActive: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.claim = store.TurnClaim{GroupID: f.groupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	f.token, err = f.tools.IssueChatIntake(context.Background(), f.claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := f.request(t, "send_message", assessment, "peer-discussion"); w.Code != 201 {
+		t.Fatalf("peer discussion blocked: %d %s", w.Code, w.Body)
+	}
+	body = `{"content":"邀请回去形成循环","recipient_ids":["` + f.caller.ID + `"]}`
+	if w := f.request(t, "send_message", body, "no-ping-pong"); w.Code != 403 {
+		t.Fatalf("member source created an automatic invitation loop: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestChatAuthorityIntakeAfterAdmissionCanDiscuss(t *testing.T) {
+	f := chatHTTPSetup(t)
+	if w := f.request(t, "send_message", chatHTTPBody(""), "admission"); w.Code != 201 {
+		t.Fatalf("assessment: %d %s", w.Code, w.Body)
+	}
+	if w := f.request(t, "send_message", `{"content":"公开补充，不改变已保存目标。"}`, "after-admit-public"); w.Code != 201 {
+		t.Fatalf("admission forced monologue: %d %s", w.Code, w.Body)
+	}
+	body := `{"content":"请补充讨论意见，不授新工作权限。","recipient_ids":["` + f.peer.ID + `"]}`
+	if w := f.request(t, "send_message", body, "after-admit-peer"); w.Code != 201 {
+		t.Fatalf("bounded peer discussion after admission blocked: %d %s", w.Code, w.Body)
+	}
+}
+
+func TestChatAuthorityBudgetDenialHTTPReceiptIsDurable(t *testing.T) {
+	f := chatHTTPSetup(t)
+	for i := 0; i < 3; i++ {
+		if i > 0 {
+			f.tools.Revoke(f.token)
+			if _, err := f.db.ApplyTurnReceipt(context.Background(), f.claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted, ExitCode: -1}); err != nil {
+				t.Fatal(err)
+			}
+			m, err := platform.NewLocalUser(f.db).CreateMessage(context.Background(), f.groupID, platform.MessageInput{TopicID: "trusted-topic", Content: "请落实本话题下一项文本摘要。", RecipientIDs: []string{f.caller.ID}}, fmt.Sprintf("source-%d", i))
+			if err != nil {
+				t.Fatal(err)
+			}
+			turn, err := f.db.ClaimTurn(context.Background(), store.ClaimTurnInput{GroupID: f.groupID, DeliveryID: m.Deliveries[0].ID, MaxActive: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.claim = store.TurnClaim{GroupID: f.groupID, TurnID: turn.ID, Token: turn.ClaimToken}
+			f.token, err = f.tools.IssueChatIntake(context.Background(), f.claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		key := fmt.Sprintf("assessment-%d", i)
+		w := f.request(t, "send_message", chatHTTPBody(""), key)
+		var receipt struct {
+			Assessment chatIntentToolReceipt `json:"intent_assessment"`
+		}
+		if w.Code != 201 || json.Unmarshal(w.Body.Bytes(), &receipt) != nil {
+			t.Fatalf("receipt: %d %s", w.Code, w.Body)
+		}
+		if i < 2 {
+			if receipt.Assessment.TaskID == "" || receipt.Assessment.Outcome != "admitted" {
+				t.Fatalf("unexpected denial: %s", w.Body)
+			}
+			continue
+		}
+		r := receipt.Assessment
+		if r.Outcome != "not_admitted" || r.ReasonCode != "budget_exhausted" || r.Question == "" || r.TaskID != "" || r.MandateID != "" || r.DispatchRequestID != "" {
+			t.Fatalf("known budget denial lost in projection: %s", w.Body)
+		}
+		before := coordinationHTTPSnapshot(t, f.raw)
+		if replay := f.request(t, "send_message", chatHTTPBody(""), key); replay.Code != 201 || replay.Body.String() != w.Body.String() {
+			t.Fatal("durable denial replay changed")
+		}
+		if !reflect.DeepEqual(before, coordinationHTTPSnapshot(t, f.raw)) {
+			t.Fatal("denial replay duplicated state")
+		}
+	}
+}
+
+func TestChatAuthorityGenericCannotEvaluate(t *testing.T) {
+	f := chatHTTPSetup(t)
+	// A prior intake record cannot upgrade a newly issued generic token.
+	f.tools.Revoke(f.token)
+	var err error
+	f.token, err = f.tools.Issue(context.Background(), f.claim, platform.MemberToolGrants{Operations: []string{"read_channel", "send_message"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := f.counts(t)
+	response := f.request(t, "send_message", chatHTTPBody(""), "generic-cannot-authorize")
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("generic capability promoted a proposal to user authority: %d %s", response.Code, response.Body)
+	}
+	if f.counts(t) != before {
+		t.Fatal("denied generic proposal changed durable state")
+	}
 }
 
 func TestChatIntentHTTPBoundSemanticAssessmentAndLegacyCompatibility(t *testing.T) {
@@ -129,7 +342,7 @@ func TestChatIntentHTTPCommittedReceiptOmitsLongBoundTopic(t *testing.T) {
 	if _, err := f.db.SetChatPolicy(ctx, thread, domain.ChatPolicyRequest{Enabled: true, Action: domain.ChatActionTextSubmission, MaxAdmissions: 2}, 0, "long-policy"); err != nil {
 		t.Fatal(err)
 	}
-	question, err := f.db.CreateMessage(ctx, store.MessageRequest{GroupID: f.groupID, TopicID: thread.TopicID, ActorID: "user", Content: "按约定落实文本", RecipientIDs: []string{f.peer.ID}}, []string{f.peer.ID})
+	question, err := f.db.CreateLocalUserMessage(ctx, store.MessageRequest{GroupID: f.groupID, TopicID: thread.TopicID, ActorID: "user", Content: "按约定落实文本", RecipientIDs: []string{f.peer.ID}}, []string{f.peer.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +351,7 @@ func TestChatIntentHTTPCommittedReceiptOmitsLongBoundTopic(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.claim = store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
-	f.token, err = f.tools.Issue(ctx, f.claim, platform.MemberToolGrants{Operations: []string{"send_message"}})
+	f.token, err = f.tools.IssueChatIntake(ctx, f.claim)
 	if err != nil {
 		t.Fatal(err)
 	}

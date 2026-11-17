@@ -65,6 +65,9 @@ func (s *Store) ListMessages(ctx context.Context, groupID string, options Messag
 			return Page[domain.Message]{}, storeError("读取消息投递记录失败", err)
 		}
 	}
+	if err := messageSourcesInTx(ctx, tx, page.Items); err != nil {
+		return Page[domain.Message]{}, storeError("读取消息来源失败", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return Page[domain.Message]{}, storeError("读取消息历史失败", err)
 	}

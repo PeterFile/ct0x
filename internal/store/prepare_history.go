@@ -49,6 +49,9 @@ func (s *Store) ListPreparationHistory(ctx context.Context, groupID, triggerMess
 	if err := rows.Close(); err != nil {
 		return nil, queueError(action, err)
 	}
+	if err := messageSourcesInTx(ctx, tx, history); err != nil {
+		return nil, queueError(action, err)
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, queueError(action, err)
 	}

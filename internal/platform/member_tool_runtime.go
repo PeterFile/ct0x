@@ -145,6 +145,19 @@ func (r *MemberToolRuntime) Wrap(binding MemberToolRunBinding, factory MemberToo
 	return &memberToolRuntimeRun{runtime: r, binding: binding, factory: factory}, nil
 }
 
+// WrapChatIntake is selected by trusted preparation, not by model arguments.
+func (r *MemberToolRuntime) WrapChatIntake(binding MemberToolRunBinding, factory MemberToolExecutorFactory) (provider.Executor, error) {
+	if r.tools.chatEngine == nil {
+		return nil, errMemberToolRuntimeBinding
+	}
+	executor, err := r.Wrap(binding, factory)
+	if err != nil {
+		return nil, err
+	}
+	executor.(*memberToolRuntimeRun).intake = true
+	return executor, nil
+}
+
 func memberToolRuntimeText(value string) bool {
 	return value != "" && utf8.ValidString(value) && strings.TrimSpace(value) == value && !strings.ContainsAny(value, "\x00\r\n")
 }
@@ -155,6 +168,7 @@ type memberToolRuntimeRun struct {
 	factory MemberToolExecutorFactory
 	used    atomic.Bool
 	role    *store.CoordinationRoleProvenance
+	intake  bool
 }
 
 func memberToolRuntimeReceipt(outcome provider.Outcome, reason string) provider.ExecutionReceipt {
@@ -183,7 +197,12 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 		return unknown
 	}
 	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
-	token, err := r.tools.Issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers, ProviderID: e.binding.ProviderID, Model: e.binding.Model})
+	var token string
+	if e.intake {
+		token, err = r.tools.IssueChatIntake(ctx, claim)
+	} else {
+		token, err = r.tools.Issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers, ProviderID: e.binding.ProviderID, Model: e.binding.Model})
+	}
 	if err != nil {
 		// Duplicate authority, stale generation and uncertain reads are not proof
 		// that this RunID never executed. Never revoke somebody else's registration.
@@ -203,7 +222,7 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	if err != nil {
 		return memberToolRuntimeReceipt(provider.OutcomeNotStarted, "无法安全准备成员工具凭证，执行未启动")
 	}
-	native, err := e.factory(filepath.Join(r.configRoot, config.name), claim.TurnID, slices.Clone(r.operations))
+	native, err := e.factory(filepath.Join(r.configRoot, config.name), claim.TurnID, e.toolOperations())
 	// Recheck uncertainty before classifying even a failed factory as not_started.
 	if receipt := e.preflight(ctx, request, claim, token, config); receipt != nil {
 		return *receipt
@@ -215,6 +234,13 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	return native.Execute(ctx, request, onEvent)
 }
 
+func (e *memberToolRuntimeRun) toolOperations() []string {
+	if e.intake {
+		return chatIntakeOperations()
+	}
+	return slices.Clone(e.runtime.operations)
+}
+
 func (e *memberToolRuntimeRun) preflight(ctx context.Context, request provider.ExecuteRequest, claim store.TurnClaim, token string, config *memberToolRuntimeConfigFile) *provider.ExecutionReceipt {
 	r := e.runtime
 	outcome, reason := provider.OutcomeUnknown, "成员工具执行归属或历史结果未知，需对账后再处理"
@@ -224,7 +250,7 @@ func (e *memberToolRuntimeRun) preflight(ctx context.Context, request provider.E
 	defer cancel()
 	turn, err := r.tools.db.GetTurn(checkCtx, claim.GroupID, claim.TurnID)
 	if err == nil && e.fresh(turn) && turn.ClaimToken == claim.Token && r.clearRunDirectory(request) &&
-		r.tools.withAuthorized(checkCtx, token, r.operations[0], func(scope store.MemberToolScope, _ MemberToolGrants) error {
+		r.tools.withAuthorized(checkCtx, token, e.toolOperations()[0], func(scope store.MemberToolScope, _ MemberToolGrants) error {
 			if scope.Claim != claim || scope.MemberID != e.binding.MemberID || scope.ConversationID != e.binding.ConversationID {
 				return store.ErrMemberToolDenied
 			}

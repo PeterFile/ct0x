@@ -54,6 +54,8 @@ type Message struct {
 	GroupID    string     `json:"group_id"`
 	TopicID    string     `json:"topic_id"`
 	SenderID   string     `json:"sender_id"`
+	SourceID   string     `json:"source_id,omitempty"`
+	SourceKind string     `json:"source_kind,omitempty"`
 	Content    string     `json:"content"`
 	CreatedAt  time.Time  `json:"created_at"`
 	Deliveries []Delivery `json:"deliveries"`

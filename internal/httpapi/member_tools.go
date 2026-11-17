@@ -238,7 +238,8 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 		}
 		assessmentReceipt := chatIntentToolReceipt{ID: receipt.ID, Disposition: receipt.Disposition,
 			PolicyRevision: receipt.PolicyRevision, CandidateGeneration: receipt.CandidateGeneration, Authority: receipt.Authority,
-			TaskID: receipt.TaskID, MandateID: receipt.MandateID, DispatchRequestID: receipt.DispatchRequestID, NoticeMessageID: receipt.NoticeMessageID}
+			TaskID: receipt.TaskID, MandateID: receipt.MandateID, DispatchRequestID: receipt.DispatchRequestID, NoticeMessageID: receipt.NoticeMessageID,
+			Outcome: receipt.Outcome, ReasonCode: receipt.ReasonCode, Question: receipt.Question}
 		WriteJSON(w, http.StatusCreated, struct {
 			MessageID      string                `json:"message_id"`
 			CreatedAt      time.Time             `json:"created_at"`

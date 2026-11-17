@@ -2,6 +2,8 @@ package platform
 
 import (
 	"context"
+	"crypto/sha256"
+	"slices"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/store"
@@ -39,6 +41,20 @@ func (s *MemberTools) ReadChannel(ctx context.Context, token string, options sto
 }
 
 func (s *MemberTools) SendMessage(ctx context.Context, token string, input MemberMessageInput, key string) (domain.Message, error) {
+	s.mu.RLock()
+	entry, found := s.capabilities[sha256.Sum256([]byte(token))]
+	if found && entry.purpose == domain.ChatIntakePurpose {
+		defer s.mu.RUnlock()
+		if entry.candidate == nil || !slices.Contains(entry.grants.Operations, "send_message") {
+			return domain.Message{}, store.ErrMemberToolDenied
+		}
+		result, err := s.db.SendMessageForChatIntake(ctx, entry.scope, entry.candidate.ID, input, key)
+		if err != nil {
+			return domain.Message{}, memberRoleError(ctx, err)
+		}
+		return result, nil
+	}
+	s.mu.RUnlock()
 	var result domain.Message
 	err := s.withAuthorized(ctx, token, "send_message", func(scope store.MemberToolScope, _ MemberToolGrants) error {
 		var err error

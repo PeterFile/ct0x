@@ -175,6 +175,11 @@ func messageInTx(ctx context.Context, tx *sql.Tx, groupID, messageID string) (do
 	if err == nil {
 		err = messageDeliveries(ctx, tx, &m)
 	}
+	if err == nil {
+		messages := []domain.Message{m}
+		err = messageSourcesInTx(ctx, tx, messages)
+		m = messages[0]
+	}
 	return m, err
 }
 

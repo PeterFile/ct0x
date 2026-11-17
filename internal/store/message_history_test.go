@@ -40,7 +40,7 @@ func TestMessageHistoryBeforeAndIncrementalAfter(t *testing.T) {
 		if _, err := tx.Exec(`INSERT INTO deliveries(id,message_id,conversation_id,recipient_id,group_id,topic_id,created_at) VALUES(?,?,?,?,?,'',?)`, d.ID, id, c.ID, f.a, f.groupID, stamp.Format(timestampLayout)); err != nil {
 			t.Fatal(err)
 		}
-		want = append(want, domain.Message{ID: id, GroupID: f.groupID, SenderID: "user", Content: "fixture", CreatedAt: stamp, Deliveries: []domain.Delivery{d}})
+		want = append(want, domain.Message{ID: id, GroupID: f.groupID, SenderID: "user", SourceKind: "unknown", Content: "fixture", CreatedAt: stamp, Deliveries: []domain.Delivery{d}})
 	}
 	if _, err := tx.Exec(`INSERT INTO messages(id,group_id,sender_id,content,created_at) VALUES('foreign',?,'user','secret',?)`, f.otherID, base.Add(time.Hour).Format(timestampLayout)); err != nil {
 		t.Fatal(err)

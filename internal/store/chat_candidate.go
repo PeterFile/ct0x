@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 
@@ -47,6 +48,14 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 		id = rand.Text()
 		err = coordinationDispatchWrite(ctx, tx, `INSERT INTO chat_candidates(id,group_id,topic_id,message_id,member_id,turn_id,generation,policy_revision,binding_revision,dispatch_policy_revision)
 		 VALUES(?,?,?,?,?,?,?,nullif(?,0),?,?)`, id, thread.GroupID, thread.TopicID, messageID, scope.MemberID, scope.Claim.TurnID, generation, policy.Revision, binding, dispatchPolicy)
+		if err == nil {
+			kind, sourceID, sourceErr := messageSourceInTx(ctx, tx, messageID)
+			if sourceErr != nil {
+				return domain.ChatCandidate{}, memberToolOperationError("读取真实来源失败", sourceErr)
+			}
+			digest := sha256.Sum256([]byte(scope.Claim.Token))
+			err = coordinationDispatchWrite(ctx, tx, `INSERT INTO chat_intake_executions(candidate_id,turn_id,purpose,claim_digest,source_id,source_kind) VALUES(?,?,?,?,?,?)`, id, scope.Claim.TurnID, domain.ChatIntakePurpose, digest[:], sourceID, kind)
+		}
 	}
 	if err != nil {
 		return domain.ChatCandidate{}, memberToolOperationError("保存聊天候选失败", err)
@@ -65,10 +74,11 @@ func chatCandidateInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, i
 	var c domain.ChatCandidate
 	var revision int64
 	err := tx.QueryRowContext(ctx, `SELECT c.id,c.group_id,c.topic_id,c.message_id,m.sender_id,c.member_id,c.turn_id,c.generation,
-	 coalesce(c.policy_revision,0),c.binding_revision,c.dispatch_policy_revision FROM chat_candidates c JOIN messages m ON m.id=c.message_id
+	 coalesce(c.policy_revision,0),c.binding_revision,c.dispatch_policy_revision,coalesce(e.purpose,''),coalesce(e.source_id,''),coalesce(e.source_kind,'unknown')
+	 FROM chat_candidates c JOIN messages m ON m.id=c.message_id LEFT JOIN chat_intake_executions e ON e.candidate_id=c.id
 	 WHERE c.id=? AND c.group_id=? AND c.topic_id=? AND c.member_id=? AND c.turn_id=?`,
 		id, scope.Claim.GroupID, scope.TopicID, scope.MemberID, scope.Claim.TurnID).Scan(&c.ID, &c.GroupID, &c.TopicID, &c.MessageID, &c.SourceSenderID, &c.MemberID, &c.TurnID,
-		&c.Generation, &revision, &c.BindingRevision, &c.DispatchPolicyRevision)
+		&c.Generation, &revision, &c.BindingRevision, &c.DispatchPolicyRevision, &c.Purpose, &c.SourceID, &c.SourceKind)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.ChatCandidate{}, ErrMemberToolDenied
 	}
@@ -80,6 +90,17 @@ func chatCandidateInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, i
 		c.Policy, err = chatPolicyInTx(ctx, tx, c.ThreadRef, revision)
 	}
 	return c, err
+}
+
+func chatIntakePurposeInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, candidateID string) error {
+	digest := sha256.Sum256([]byte(scope.Claim.Token))
+	var valid int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM chat_intake_executions e JOIN chat_candidates c ON c.id=e.candidate_id
+	 WHERE e.candidate_id=? AND e.turn_id=? AND e.purpose=? AND e.claim_digest=?
+	 AND c.group_id=? AND c.topic_id=? AND c.member_id=? AND c.turn_id=e.turn_id`, candidateID, scope.Claim.TurnID, domain.ChatIntakePurpose, digest[:], scope.Claim.GroupID, scope.TopicID, scope.MemberID).Scan(&valid); err != nil {
+		return ErrMemberToolDenied
+	}
+	return nil
 }
 
 func chatDispatchRevisionsInTx(ctx context.Context, tx *sql.Tx, groupID string) (binding, policy int64, err error) {

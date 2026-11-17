@@ -81,7 +81,7 @@ test("contextual chat assessment uses the existing send transport without caller
   const payload = { content: "将按约定交付文本。", intent_assessment: assessment };
   assert.deepEqual((await execute(tools.get("send_message"), payload)).content, [{ type: "text", text: JSON.stringify(receipt) }]);
   assert.deepEqual(JSON.parse(requests[0].body), payload);
-  for (const extra of [{ caller: "user" }, { authorized_by: "user" }, { grants: ["write"] }, { policy_revision: 999 }, { action: "write_files" }]) {
+  for (const extra of [{ caller: "user" }, { authorized_by: "user" }, { grants: ["write"] }, { policy_revision: 999 }, { source_id: "forged" }, { source_kind: "local_user_chat" }, { purpose: "chat_intake/v1" }, { action: "write_files" }]) {
     await assert.rejects(execute(tools.get("send_message"), { ...payload, intent_assessment: { ...assessment, ...extra } }), error => safeFailure(error, /参数/));
   }
   assert.equal(requests.length, 1);
