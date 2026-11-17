@@ -47,9 +47,15 @@ type Entry struct {
 	Size int64
 }
 
+// Use one conservative Unicode simple-fold policy on every volume, including
+// case-sensitive ones. This also covers ASCII-related folds such as K/K and S/ſ.
+func reservedComponent(name string) bool {
+	return strings.EqualFold(name, stagingDirName)
+}
+
 func reservedPath(name string) bool {
 	for _, part := range strings.Split(name, "/") {
-		if part == stagingDirName {
+		if reservedComponent(part) {
 			return true
 		}
 	}
@@ -204,8 +210,10 @@ func (r *Root) Read(ctx context.Context, name string) (snapshot Snapshot, err er
 	return observed, nil
 }
 
-// List returns at most MaxEntries sorted entries, or ErrTooManyEntries and no
-// partial list. The reserved staging directory is hidden and does not count.
+// List returns at most MaxEntries sorted public entries, or ErrTooManyEntries
+// and no partial list. Reserved simple-fold aliases are hidden and do not count.
+// At most MaxEntries+3 raw entries are scanned; exceeding that budget without
+// confirming EOF also fails, even if hidden aliases consume the budget.
 // It is nonrecursive, accepts ".", and is not a point-in-time view.
 func (r *Root) List(ctx context.Context, name string) (entries []Entry, err error) {
 	r.mu.Lock()
@@ -234,17 +242,27 @@ func (r *Root) List(ctx context.Context, name string) (entries []Entry, err erro
 		return nil, err
 	}
 	defer file.Close()
-	// At most one entry can have the reserved name; scanning remains bounded.
 	items, err := file.ReadDir(MaxEntries + 2)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
+	}
+	if len(items) == MaxEntries+2 {
+		// Case-sensitive volumes may have multiple hidden aliases. A full batch
+		// cannot establish completeness from its public entry count alone.
+		extra, err := file.ReadDir(1)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		if len(extra) != 0 || !errors.Is(err, io.EOF) {
+			return nil, ErrTooManyEntries
+		}
 	}
 	result := make([]Entry, 0, len(items))
 	for _, item := range items {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if item.Name() == stagingDirName {
+		if reservedComponent(item.Name()) {
 			continue
 		}
 		if len(result) == MaxEntries {

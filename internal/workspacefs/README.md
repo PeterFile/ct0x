@@ -3,7 +3,7 @@
 仅提供真实目录的有界文本 IO，不是用户授权、执行器或 Artifact 版本库。
 
 - 可信 server 调用 `Open(absolutePath, expectedFileInfo)`；物理身份取自可信 caller 的实际目录观察，不能由模型选择根、用户、群或 grants。每次操作核对当前根路径与持有句柄的物理身份；句柄由本包持有，`Close` 等待同实例操作完成。
-- `List(ctx, relativeDir)` 非递归、按名称排序，最多 200 个公开项（含 symlink/特殊项），超限整体失败；保留暂存目录隐藏且不计入上限，最多读取 202 个目录项，仍有界。根目录用 `.`，列表不是一致性快照。
+- `List(ctx, relativeDir)` 非递归、按名称排序，最多 200 个公开项（含 symlink/特殊项）；保留暂存目录及其 simple-fold 别名隐藏且不计入公开项上限。最多读取 203 个原始目录项（包括确认尾部的一项）；公开项超限，或隐藏别名过多而无法在该扫描预算内确认完整时，整体返回 `ErrTooManyEntries`，绝不返回假完整的部分列表。根目录用 `.`，列表不是一致性快照。
 - `Read(ctx, relativeFile)` 返回 `Snapshot{Text, SHA256, Mode}`；只读取普通文件、有效 UTF-8，最多 64 KiB（按字节，包含边界），SHA256 为实际字节的小写十六进制。Snapshot 是观察，不是授权或 OS snapshot。
 - `Replace(ctx, relativeFile, expectedSHA256, text)` 检查实际 preimage，staging 后重新检查字节、inode、大小、mtime、mode，再以同一父目录下私有暂存区的 `Root.Rename` 发布完整的新 inode。保留普通权限位 `0777`；不承诺保留 owner/group、ACL、xattr、特殊权限位、时间或 hardlink 关系。
 - `Create(ctx, relativeFile, text)` 以私有暂存区内独占 staging + `Root.Link` 原子发布完整文本，目标存在则不覆盖（包括 symlink/目录），新文件权限为 `0600`。不递归建目标目录，不提供任意删除、重命名或命令功能。发布前观察到已存在返回 unchanged；发布尝试后任何错误（包括 `EEXIST`）均保守 unknown。
@@ -11,7 +11,7 @@
 
 ## 强制的暂存协议边界
 
-每个目标父目录保留固定 `.workspacefs-staging` 命名空间，首次写入时创建，要求是当前有效 UID 所有的 `0700` 普通目录；已有非私有目录/文件/symlink 拒绝，不改其权限。`Open` 拒绝根路径包含该保留组件，公共 `List/Read/Replace/Create` 拒绝任何包含该组件的相对路径，列表隐藏该项。因此另一 `Root` 即使知道随机 payload 名，也不能通过这些 API 观察或替换活动暂存。
+每个目标父目录保留固定 `.workspacefs-staging` 命名空间，首次写入时创建，要求是当前有效 UID 所有的 `0700` 普通目录；已有非私有目录/文件/symlink 拒绝，不改其权限。组件等价性统一采用 `strings.EqualFold` 的 Unicode simple fold：包括 ASCII 大小写及 `K/K`、`S/ſ` 等 ASCII 相关折叠，在大小写敏感卷上也保守拒绝这些别名。`Open` 拒绝根路径包含等价保留组件，公共 `List/Read/Replace/Create` 拒绝任何深度包含该组件的相对路径，列表按同一判断隐藏所有等价项。因此另一 `Root` 即使知道随机 payload 名，也不能通过这些 API 观察或替换活动暂存；不宣称该判断实现任意文件系统全部名称规范化规则。
 
 写入持有私有目录的独立 `os.Root` 句柄、独占随机文件及其 inode 身份；发布前复核实际请求字节、inode 和暂存目录身份。清理只相对此私有句柄、对仍匹配本次 inode 的 payload 执行，**从不按公共目录名删除暂存目录**；该空目录保留复用，失败时不匹配的文件留下而不删除。成功时同步源私有目录及目标父目录。
 
