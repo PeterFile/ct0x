@@ -71,14 +71,19 @@ func TestCodexAppServerMemberProcessHelper(t *testing.T) {
 	respond(read("config/read"), config())
 	threadRequest := read("thread/start")
 	var params struct {
-		Config struct {
+		ApprovalPolicy string `json:"approvalPolicy"`
+		Sandbox        string `json:"sandbox"`
+		Config         struct {
 			Features map[string]json.RawMessage `json:"features"`
 			Servers  map[string]struct {
-				Enabled  bool     `json:"enabled"`
-				URL      string   `json:"url"`
-				TokenEnv string   `json:"bearer_token_env_var"`
-				Tools    []string `json:"enabled_tools"`
-				Omit     []string `json:"omit_tools_from"`
+				Enabled   bool     `json:"enabled"`
+				URL       string   `json:"url"`
+				TokenEnv  string   `json:"bearer_token_env_var"`
+				Tools     []string `json:"enabled_tools"`
+				Omit      []string `json:"omit_tools_from"`
+				Approvals map[string]struct {
+					Mode string `json:"approval_mode"`
+				} `json:"tools"`
 			} `json:"mcp_servers"`
 		} `json:"config"`
 	}
@@ -187,6 +192,58 @@ func TestCodexAppServerMemberProcessHelper(t *testing.T) {
 			return
 		}
 		_ = os.WriteFile("direct-mcp-invoked", nil, 0600)
+	}
+	if strings.HasPrefix(mode, "native-approval") {
+		if params.ApprovalPolicy != "never" || params.Sandbox != "read-only" {
+			os.Exit(8)
+		}
+		selected := params.Config.Servers[server]
+		names := selected.Tools
+		if mode == "native-approval-unknown-tool" {
+			names = []string{"future_member_tool"}
+		}
+		approved := []string{}
+		items := []any{}
+		failed := false
+		for _, name := range names {
+			// Replay 0.166's per-tool Approve branch with Never/ManagedReadOnly.
+			// Missing approval stops before the synthetic platform invocation.
+			failure := ""
+			if selected.Approvals[name].Mode != "approve" {
+				failure = "MCP tool call requires approval, but approval policy is never"
+				_ = os.WriteFile("native-approval-denied", nil, 0600)
+			} else {
+				approved = append(approved, name)
+				_ = os.WriteFile("native-approved-tools.json", mustAppServerFixtureJSON(approved), 0600)
+				if mode == "native-approval-platform-rejected" {
+					failure = "synthetic platform token/claim rejected"
+					_ = os.WriteFile("platform-rejected", nil, 0600)
+				}
+			}
+			item := map[string]any{"id": "approval-call-" + name, "type": "mcpToolCall", "server": server, "tool": name,
+				"status": "inProgress", "arguments": map[string]any{}, "result": nil, "error": nil}
+			notify("item/started", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "item": item})
+			if failure != "" {
+				item["status"], item["error"] = "failed", map[string]string{"message": failure}
+			} else {
+				item["status"], item["result"] = "completed", map[string]any{"content": []any{map[string]string{"type": "text", "text": "synthetic approved member result"}}}
+			}
+			notify("item/completed", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "item": item})
+			items = append(items, item)
+			if failure != "" {
+				failed = true
+				break
+			}
+		}
+		if !failed {
+			answer := map[string]string{"id": "answer", "type": "agentMessage", "text": "synthetic approved member answer"}
+			notify("item/completed", map[string]any{"threadId": appServerFixtureThread, "turnId": appServerFixtureTurn, "item": answer})
+			items = append(items, answer)
+		}
+		notify("turn/completed", map[string]any{"threadId": appServerFixtureThread, "turn": turn("completed", items)})
+		_, _ = io.Copy(io.Discard, input)
+		_ = os.WriteFile("stdin-eof", nil, 0600)
+		return
 	}
 	item := map[string]any{"id": "member-call", "type": "mcpToolCall", "server": server, "tool": "read_channel", "status": "inProgress", "arguments": map[string]int{"limit": 1}, "result": nil, "error": nil}
 	itemEvent := func(method string) {

@@ -216,9 +216,15 @@ func (m *codexAppServerMemberSession) configure(inherited []string, config map[s
 	features := config["features"].(map[string]any)
 	features["code_mode"] = map[string]any{"enabled": false, "direct_only_tool_namespaces": []string{}}
 	features["code_mode_only_strict_3p_tools"] = false
+	// Native Approve removes the redundant prompt only for issued tools. The
+	// platform still checks the original token, claim, purpose and grants per call.
+	toolApprovals := make(map[string]map[string]string, len(m.names))
+	for _, tool := range m.names {
+		toolApprovals[tool] = map[string]string{"approval_mode": "approve"}
+	}
 	config["mcp_servers"].(map[string]any)[name] = map[string]any{
 		"url": m.endpoint, "bearer_token_env_var": m.tokenEnv, "enabled": true, "enabled_tools": m.names,
-		"omit_tools_from": []string{"code_mode", "deferred"},
+		"omit_tools_from": []string{"code_mode", "deferred"}, "tools": toolApprovals,
 	}
 	return nil
 }
