@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box Store/Platform shard gate regressions; never invokes Go."""
+"""Black-box Store/Platform/HTTPAPI shard gate regressions; never invokes Go."""
 import json
 import os
 from pathlib import Path
@@ -34,10 +34,15 @@ SLOTS = {"TestCoordination": 23, "TestAlpha": 27, "TestBeta": 51, "TestGamma": 1
          "TestVector123": 62, "TestVector151": 54, "TestVector152": 9, "TestVector194": 29,
          "TestVector201": 32, "TestVector202": 63, "TestVector282": 59, "TestVector283": 4}
 PLATFORM_PACKAGE = "agentworkspace/internal/platform"
+HTTPAPI_PACKAGE = "agentworkspace/internal/httpapi"
 COORDINATION_PACKAGE = "agentworkspace/internal/coordination"
 # Fixed SHA-256 first-eight-byte big-endian mod-4 vectors.
 PLATFORM_SLOTS = {"TestCoordination": 3, "TestAlpha": 3, "TestBeta": 3, "TestGamma": 0,
                   "Test新入口": 2, "Example": 1, "FuzzBytes": 0}
+# Fixed SHA-256 first-eight-byte big-endian mod-8 vectors.
+HTTPAPI_SLOTS = {"TestVector6": 0, "TestVector0": 1, "Test新入口": 2, "TestAlpha": 3,
+                 "FuzzBytes": 4, "Example": 5, "TestIota": 6, "TestCoordination": 7,
+                 "TestMemberMCPCodexMetadataCoordinatorDecision": 6}
 
 
 def event(action, name="", **fields):
@@ -49,6 +54,10 @@ def event(action, name="", **fields):
 
 def platform_event(action, name="", **fields):
     return event(action, name, Package=PLATFORM_PACKAGE, **fields)
+
+
+def httpapi_event(action, name="", **fields):
+    return event(action, name, Package=HTTPAPI_PACKAGE, **fields)
 
 
 class VerifierTests(unittest.TestCase):
@@ -73,7 +82,7 @@ class VerifierTests(unittest.TestCase):
                               capture_output=True, timeout=10)
 
     def verify(self, rows, names=(ROOT,), slot=23, profile=None):
-        package = PLATFORM_PACKAGE if profile == "platform" else PACKAGE
+        package = HTTPAPI_PACKAGE if profile == "httpapi" else (PLATFORM_PACKAGE if profile == "platform" else PACKAGE)
         listed = self.inventory(names, package)
         run = self.json_lines("run.json", [event("start", Package=package), *rows, event("pass", Package=package)])
         options = ["--profile", profile] if profile else []
@@ -86,8 +95,8 @@ class VerifierTests(unittest.TestCase):
     def artifacts(self, names=tuple(SLOTS), profile=None):
         directory = self.directory / "summaries"
         suite = profile or "store"
-        slots, total = (PLATFORM_SLOTS, 4) if profile == "platform" else (SLOTS, 64)
-        make_event = platform_event if profile == "platform" else event
+        slots, total = (HTTPAPI_SLOTS, 8) if profile == "httpapi" else ((PLATFORM_SLOTS, 4) if profile == "platform" else (SLOTS, 64))
+        make_event = httpapi_event if profile == "httpapi" else (platform_event if profile == "platform" else event)
         for slot in range(total):
             selected = [name for name in names if slots[name] == slot]
             rows = [row for name in selected for row in (make_event("run", name), make_event("pass", name))]
@@ -105,7 +114,8 @@ class VerifierTests(unittest.TestCase):
         path.write_text(json.dumps(summary), encoding="utf-8")
 
     def aggregate(self, directory, identity=IDENTITY, package=None, profile=None):
-        package = package if package is not None else (PLATFORM_PACKAGE if profile == "platform" else PACKAGE)
+        if package is None:
+            package = HTTPAPI_PACKAGE if profile == "httpapi" else (PLATFORM_PACKAGE if profile == "platform" else PACKAGE)
         options = ["--profile", profile] if profile else []
         return self.invoke("aggregate", package, directory, *identity, *options)
 
@@ -616,6 +626,211 @@ class VerifierTests(unittest.TestCase):
             self.reject(self.aggregate(directory, profile="platform"))
 
 
+    def test_httpapi_fixed_vectors_full_coverage_and_empty_slots(self):
+        self.assertEqual(set(HTTPAPI_SLOTS.values()), set(range(8)))
+        listed = self.inventory(HTTPAPI_SLOTS, HTTPAPI_PACKAGE)
+        for slot in range(8):
+            result = self.invoke("select", slot, HTTPAPI_PACKAGE, listed, "--profile", "httpapi")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            pattern = result.stdout.strip()
+            expected = sorted(name for name, assigned in HTTPAPI_SLOTS.items() if assigned == slot)
+            self.assertEqual(pattern, "^(" + "|".join(expected) + ")$")
+            self.assertNotIn("/", pattern)
+            for name, assigned in HTTPAPI_SLOTS.items():
+                self.assertEqual(re.fullmatch(pattern, name) is not None, assigned == slot)
+                self.assertIsNone(re.fullmatch(pattern, name + "Extra"))
+        directory = self.artifacts(HTTPAPI_SLOTS, "httpapi")
+        summary = self.success(self.aggregate(directory, profile="httpapi"))
+        self.assertEqual((summary["schema"], summary["total"], summary["package"]), (1, 8, HTTPAPI_PACKAGE))
+        for field in ["compiled", "runs", "passes"]:
+            self.assertEqual(summary[field], {name: 1 for name in HTTPAPI_SLOTS})
+        self.assertEqual(summary["skips"], {})
+        directory.rename(self.directory / "full-slots")
+        directory = self.artifacts([ROOT], "httpapi")
+        self.success(self.aggregate(directory, profile="httpapi"))
+        listed = self.inventory([ROOT], HTTPAPI_PACKAGE)
+        empty = self.invoke("select", 0, HTTPAPI_PACKAGE, listed, "--profile", "httpapi")
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertEqual(empty.stdout.strip(), "^$")
+        summary = json.loads((directory / "httpapi-shard-v1-0/httpapi-summary.json").read_text())
+        self.assertEqual(summary["compiled"], {ROOT: 1})
+        for field in ["selected", "runs", "passes", "skips"]:
+            self.assertEqual(summary[field], {})
+        (directory / "httpapi-shard-v1-0").rename(self.directory / "empty-slot")
+        self.reject(self.aggregate(directory, profile="httpapi"))
+
+    def test_httpapi_bounds_and_all_profile_package_pairs(self):
+        listed = self.inventory([ROOT], HTTPAPI_PACKAGE)
+        run = self.json_lines("run.json", [httpapi_event("start"), httpapi_event("run", ROOT),
+                                            httpapi_event("pass", ROOT), httpapi_event("pass")])
+        for command, args in [("select", [listed]), ("verify", [listed, run, *IDENTITY])]:
+            for slot in [-1, 8, 64]:
+                with self.subTest(command=command, slot=slot):
+                    result = self.invoke(command, slot, HTTPAPI_PACKAGE, *args, "--profile", "httpapi")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("invalid choice", result.stderr)
+        for total in [4, 8, 64]:
+            result = self.invoke("select", 0, HTTPAPI_PACKAGE, listed, "--profile", "httpapi", "--total", total)
+            self.assertEqual(result.returncode, 2, result.stderr)
+        packages = {"store": PACKAGE, "platform": PLATFORM_PACKAGE, "httpapi": HTTPAPI_PACKAGE}
+        for profile, expected in packages.items():
+            for package in packages.values():
+                if package == expected:
+                    continue
+                listed = self.inventory([ROOT], package)
+                run = self.json_lines("run.json", [event("start", Package=package), event("run", ROOT, Package=package),
+                                                    event("pass", ROOT, Package=package), event("pass", Package=package)])
+                for command, args in [("select", [listed]), ("verify", [listed, run, *IDENTITY])]:
+                    with self.subTest(command=command, profile=profile, package=package):
+                        self.reject(self.invoke(command, 3, package, *args, "--profile", profile))
+
+    def test_httpapi_nested_lifecycle_and_bad_execution_evidence(self):
+        child = ROOT + "/child/embedded/slash#00"
+        rows = [httpapi_event("run", ROOT), httpapi_event("run", child), httpapi_event("pause", child),
+                httpapi_event("pause", ROOT), httpapi_event("output", child, Output="background log\n"),
+                httpapi_event("cont", ROOT), httpapi_event("cont", child), httpapi_event("pass", child), httpapi_event("pass", ROOT)]
+        summary = self.success(self.verify(rows, slot=7, profile="httpapi"))
+        for field in ["selected", "runs", "passes"]:
+            self.assertEqual(summary[field], {ROOT: 1})
+        for root, slot in [("Example", 5), ("FuzzBytes", 4)]:
+            rows = [httpapi_event("run", root)]
+            if root == "FuzzBytes":
+                rows += [httpapi_event("run", root + "/seed#0"), httpapi_event("pass", root + "/seed#0")]
+            self.success(self.verify([*rows, httpapi_event("pass", root)], names=[root], slot=slot, profile="httpapi"))
+        good = [httpapi_event("run", ROOT), httpapi_event("pass", ROOT)]
+        cases = [[], good * 2, [httpapi_event("run", ROOT)], [httpapi_event("pass", ROOT)],
+                 [httpapi_event("run", ROOT), httpapi_event("pause", ROOT), httpapi_event("pass", ROOT)],
+                 [httpapi_event("run", child), *good],
+                 [httpapi_event("run", ROOT), httpapi_event("run", child), httpapi_event("pass", ROOT)],
+                 [httpapi_event("run", ROOT), httpapi_event("run", "TestVector6"), httpapi_event("pass", "TestVector6"), httpapi_event("pass", ROOT)],
+                 [event("run", ROOT), event("pass", ROOT)]]
+        for action in ["skip", "fail"]:
+            cases.extend([[httpapi_event("run", ROOT), httpapi_event(action, ROOT)],
+                          [httpapi_event("run", ROOT), httpapi_event("run", child), httpapi_event(action, child), httpapi_event("pass", ROOT)]])
+        for rows in cases:
+            with self.subTest(rows=rows):
+                self.reject(self.verify(rows, names=[ROOT, "TestVector6"], slot=7, profile="httpapi"))
+        listed = self.inventory([ROOT], HTTPAPI_PACKAGE)
+        for rows in [[httpapi_event("start"), *good], [httpapi_event("start"), httpapi_event("skip")],
+                     [httpapi_event("start"), httpapi_event("fail")]]:
+            run = self.json_lines("run.json", rows)
+            self.reject(self.invoke("verify", 7, HTTPAPI_PACKAGE, listed, run, *IDENTITY, "--profile", "httpapi"))
+        run = self.json_lines("run.json", [httpapi_event("start"), *good, httpapi_event("pass")])
+        run.write_bytes(run.read_bytes()[:-1])
+        self.reject(self.invoke("verify", 7, HTTPAPI_PACKAGE, listed, run, *IDENTITY, "--profile", "httpapi"))
+        listed.write_bytes(listed.read_bytes()[:-1])
+        self.reject(self.invoke("select", 7, HTTPAPI_PACKAGE, listed, "--profile", "httpapi"))
+        for names in [[], [ROOT, ROOT]]:
+            self.reject(self.invoke("select", 7, HTTPAPI_PACKAGE, self.inventory(names, HTTPAPI_PACKAGE), "--profile", "httpapi"))
+
+    def test_httpapi_aggregate_external_identity_and_namespace_binding(self):
+        directory = self.artifacts(HTTPAPI_SLOTS, "httpapi")
+        for index, value in [(1, "42566516009"), (3, "c" * 40), (5, "d" * 40)]:
+            identity = list(IDENTITY)
+            identity[index] = value
+            self.reject(self.aggregate(directory, identity=identity, profile="httpapi"))
+        for field, value, original in [("run_id", "42566516009", IDENTITY[1]), ("checkout_sha", "c" * 40, IDENTITY[3]),
+                                       ("checkout_tree", "d" * 40, IDENTITY[5]), ("package", PLATFORM_PACKAGE, HTTPAPI_PACKAGE)]:
+            # Even unanimous stale/foreign summaries must fail against the current checkout.
+            for slot in range(8):
+                self.mutate(directory, slot, lambda summary: summary.update({field: value}), "httpapi")
+            self.reject(self.aggregate(directory, profile="httpapi"))
+            if field == "package":
+                self.reject(self.aggregate(directory, package=PLATFORM_PACKAGE, profile="httpapi"))
+            for slot in range(8):
+                self.mutate(directory, slot, lambda summary: summary.update({field: original}), "httpapi")
+        for profile in [None, "platform"]:
+            self.reject(self.aggregate(directory, profile=profile))
+        path = directory / "httpapi-shard-v1-0/httpapi-summary.json"
+        path.rename(path.with_name("platform-summary.json"))
+        self.reject(self.aggregate(directory, profile="httpapi"))
+        path.with_name("platform-summary.json").rename(path)
+        for slot in range(8):
+            (directory / f"httpapi-shard-v1-{slot}").rename(directory / f"platform-shard-v1-{slot}")
+        self.reject(self.aggregate(directory, profile="httpapi"))
+
+    def test_httpapi_aggregate_all_slots_and_path_safety(self):
+        directory = self.artifacts(HTTPAPI_SLOTS, "httpapi")
+        artifact = directory / "httpapi-shard-v1-7"
+        target = self.directory / "outside-artifact"
+        artifact.rename(target)
+        self.reject(self.aggregate(directory, profile="httpapi"))
+        artifact.symlink_to(target, target_is_directory=True)
+        self.reject(self.aggregate(directory, profile="httpapi"))
+        artifact.unlink()
+        target.rename(artifact)
+        self.mutate(directory, 7, lambda summary: summary.update(slot=0), "httpapi")
+        self.reject(self.aggregate(directory, profile="httpapi"))
+        self.mutate(directory, 7, lambda summary: summary.update(slot=7), "httpapi")
+        extra = directory / "httpapi-shard-v1-8"
+        extra.mkdir()
+        self.reject(self.aggregate(directory, profile="httpapi"))
+        extra.rmdir()
+        path = artifact / "httpapi-summary.json"
+        unknown = artifact / "second-summary.json"
+        unknown.write_bytes(path.read_bytes())
+        self.reject(self.aggregate(directory, profile="httpapi"))
+        unknown.unlink()
+        outside = self.directory / "outside.json"
+        path.rename(outside)
+        self.reject(self.aggregate(directory, profile="httpapi"))
+        path.symlink_to(outside)
+        self.reject(self.aggregate(directory, profile="httpapi"))
+        path.unlink()
+        outside.rename(path)
+        alias = self.directory / "summary-link"
+        alias.symlink_to(directory, target_is_directory=True)
+        self.reject(self.aggregate(alias, profile="httpapi"))
+        self.success(self.aggregate(directory, profile="httpapi"))
+
+    def test_httpapi_aggregate_counters_compiled_and_mixed_totals(self):
+        directory = self.artifacts(HTTPAPI_SLOTS, "httpapi")
+        for slot in range(8):
+            path = directory / f"httpapi-shard-v1-{slot}/httpapi-summary.json"
+            original = path.read_text()
+            name = next(name for name, assigned in HTTPAPI_SLOTS.items() if assigned == slot)
+            for field in ["compiled", "selected", "runs", "passes", "skips"]:
+                with self.subTest(slot=slot, field=field):
+                    self.mutate(directory, slot, lambda summary: summary[field].update({name: 2}), "httpapi")
+                    self.reject(self.aggregate(directory, profile="httpapi"))
+                    path.write_text(original)
+        path = directory / "httpapi-shard-v1-7/httpapi-summary.json"
+        original = path.read_text()
+        for field, value in [("schema", True), ("slot", 7.0), ("total", 8.0), ("compiled", {}),
+                             ("selected", {}), ("runs", {}), ("passes", {}), ("skips", {ROOT: 1}),
+                             ("selected", {ROOT: True}), ("runs", {ROOT: 0}), ("passes", {ROOT: 1.0})]:
+            with self.subTest(field=field, value=value):
+                self.mutate(directory, 7, lambda summary: summary.update({field: value}), "httpapi")
+                self.reject(self.aggregate(directory, profile="httpapi"))
+                path.write_text(original)
+        for total in [4, 18, 32, 64]:
+            for slots in [[7], range(8)]:
+                with self.subTest(total=total, slots=list(slots)):
+                    for slot in slots:
+                        self.mutate(directory, slot, lambda summary: summary.update(total=total), "httpapi")
+                    self.reject(self.aggregate(directory, profile="httpapi"))
+                    for slot in slots:
+                        self.mutate(directory, slot, lambda summary: summary.update(total=8), "httpapi")
+        self.success(self.aggregate(directory, profile="httpapi"))
+        self.mutate(directory, 0, lambda summary: summary["compiled"].pop(ROOT), "httpapi")
+        self.reject(self.aggregate(directory, profile="httpapi"))
+        for slot in range(8):
+            self.mutate(directory, slot, lambda summary: summary.update(compiled={}, selected={}, runs={}, passes={}), "httpapi")
+        self.reject(self.aggregate(directory, profile="httpapi"))
+
+    def test_httpapi_aggregate_recomputes_hash_despite_complete_union(self):
+        directory = self.artifacts(HTTPAPI_SLOTS, "httpapi")
+        # A complete, duplicate-free union is not sufficient without the fixed hash.
+        combined = {}
+        for slot in range(8):
+            selected = {name: 1 for name, assigned in HTTPAPI_SLOTS.items() if (assigned + 1) % 8 == slot}
+            self.assertFalse(combined.keys() & selected.keys())
+            combined.update(selected)
+            self.mutate(directory, slot, lambda summary: summary.update(selected=selected, runs=selected, passes=selected), "httpapi")
+        self.assertEqual(combined, {name: 1 for name in HTTPAPI_SLOTS})
+        self.reject(self.aggregate(directory, profile="httpapi"))
+
+
 class WorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -626,20 +841,21 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNotNone(match)
         job = match.group("job")
         self.assertIn("name: Go\n", job)
-        self.assertIn("needs: [go-store, go-platform]", job)
+        self.assertIn("needs: [go-store, go-platform, go-httpapi]", job)
         self.assertIn("if: ${{ always() }}", job)
-        gate = re.search(r"steps:\n      - name: Check Store and Platform shards\n        env:\n          STORE_RESULT: \$\{\{ needs.go-store.result \}\}\n          PLATFORM_RESULT: \$\{\{ needs.go-platform.result \}\}\n        run: ([^\n]+)", job)
-        self.assertIsNotNone(gate, "both matrix results must be checked in the first step")
+        gate = re.search(r"steps:\n      - name: Check Store, Platform and HTTPAPI shards\n        env:\n          STORE_RESULT: \$\{\{ needs.go-store.result \}\}\n          PLATFORM_RESULT: \$\{\{ needs.go-platform.result \}\}\n          HTTPAPI_RESULT: \$\{\{ needs.go-httpapi.result \}\}\n        run: ([^\n]+)", job)
+        self.assertIsNotNone(gate, "all three matrix results must be checked in the first step")
         states = ["success", "failure", "cancelled", "skipped", "", "unknown"]
         for store_state in states:
             for platform_state in states:
-                with self.subTest(store=store_state, platform=platform_state):
-                    result = subprocess.run(["bash", "-c", gate.group(1)],
-                                            env={**os.environ, "STORE_RESULT": store_state, "PLATFORM_RESULT": platform_state},
-                                            capture_output=True, timeout=5)
-                    self.assertEqual(result.returncode == 0, store_state == platform_state == "success")
-        positions = [job.index(text) for text in ["Check Store and Platform shards", "actions/checkout@v7", "actions/download-artifact@v7",
-                                                 "Verify Store shard coverage", "Verify Platform shard coverage",
+                for httpapi_state in states:
+                    with self.subTest(store=store_state, platform=platform_state, httpapi=httpapi_state):
+                        result = subprocess.run(["bash", "-c", gate.group(1)],
+                                                env={**os.environ, "STORE_RESULT": store_state, "PLATFORM_RESULT": platform_state,
+                                                     "HTTPAPI_RESULT": httpapi_state}, capture_output=True, timeout=5)
+                        self.assertEqual(result.returncode == 0, store_state == platform_state == httpapi_state == "success")
+        positions = [job.index(text) for text in ["Check Store, Platform and HTTPAPI shards", "actions/checkout@v7", "actions/download-artifact@v7",
+                                                 "Verify Store shard coverage", "Verify Platform shard coverage", "Verify HTTPAPI shard coverage",
                                                  "Ordinary test coordination package", "Race test coordination package",
                                                  "Ordinary test cmd package", "Race test all other packages", "go vet ./...", "Record benchmark metrics"]]
         self.assertEqual(positions, sorted(positions))
@@ -682,7 +898,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("fixture", self.workflow.lower())
 
     def test_platform_matrix_and_independent_aggregate(self):
-        platform = re.search(r"\n  go-platform:\n(.*?)(?=\n  go:)", self.workflow, re.S)
+        platform = re.search(r"\n  go-platform:\n(.*?)(?=\n  go-httpapi:)", self.workflow, re.S)
         self.assertIsNotNone(platform)
         for text in ["fail-fast: false", "slot: [0, 1, 2, 3]", "timeout-minutes: 15",
                      "go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/platform",
@@ -704,6 +920,37 @@ class WorkflowTests(unittest.TestCase):
                 self.assertIn(text, aggregate.group(1))
             self.assertIn("verify-store-shard.py aggregate" + (" --profile platform" if suite == "platform" else ""), aggregate.group(1))
 
+    def test_httpapi_matrix_and_independent_aggregate(self):
+        match = re.search(r"\n  go-httpapi:\n(.*?)(?=\n  go:)", self.workflow, re.S)
+        self.assertIsNotNone(match)
+        job = match.group(1)
+        matrices = re.findall(r"^        slot: (\[[^\n]+\])$", job, re.M)
+        self.assertEqual(len(matrices), 1)
+        self.assertEqual(json.loads(matrices[0]), list(range(8)))
+        for text in ["fail-fast: false", "timeout-minutes: 15", "runs-on: ubuntu-latest",
+                     "HTTPAPI_SLOT: ${{ matrix.slot }}", "set -euo pipefail", "actions/checkout@v7", "persist-credentials: false",
+                     "actions/setup-go@v7", 'package=$(go list ./internal/httpapi)', 'sha=$(git rev-parse HEAD)', 'tree=$(git rev-parse HEAD^{tree})',
+                     'verify-store-shard.py select --profile httpapi "$HTTPAPI_SLOT" "$package" "$RUNNER_TEMP/httpapi-list.json"',
+                     'verify-store-shard.py verify --profile httpapi "$HTTPAPI_SLOT" "$package" "$RUNNER_TEMP/httpapi-list.json" "$RUNNER_TEMP/httpapi-run.json"',
+                     '--run-id "$GITHUB_RUN_ID" --sha "$sha" --tree "$tree" > "$RUNNER_TEMP/httpapi-summary.json"',
+                     'tee "$RUNNER_TEMP/httpapi-list.json"', 'tee "$RUNNER_TEMP/httpapi-run.json"', "actions/upload-artifact@v7",
+                     "name: httpapi-shard-v1-${{ matrix.slot }}", "path: ${{ runner.temp }}/httpapi-summary.json",
+                     "overwrite: true", "if-no-files-found: error", "retention-days: 7"]:
+            self.assertIn(text, job)
+        commands = re.findall(r"^[ \t]+(?:run: )?(go test[^\n]*)$", self.workflow, re.M)
+        self.assertEqual([command for command in commands if "./internal/httpapi" in command.split()],
+                         ["go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/httpapi | tee \"$RUNNER_TEMP/httpapi-list.json\"",
+                          'go test -count=1 -race -json -run "$pattern" ./internal/httpapi | tee "$RUNNER_TEMP/httpapi-run.json"'])
+        self.assertNotIn("-timeout", job)
+        self.assertEqual(self.workflow.count("pattern: httpapi-shard-v1-*"), 1)
+        self.assertIn("pattern: httpapi-shard-v1-*\n          path: ${{ runner.temp }}/httpapi-shards\n          merge-multiple: false", self.workflow)
+        aggregates = re.findall(r"- name: Verify HTTPAPI shard coverage\n        run: \|\n(.*?)(?=\n      -)", self.workflow, re.S)
+        self.assertEqual(len(aggregates), 1)
+        for text in ['package=$(go list ./internal/httpapi)',
+                     'verify-store-shard.py aggregate --profile httpapi "$package" "$RUNNER_TEMP/httpapi-shards"',
+                     '--run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"']:
+            self.assertIn(text, aggregates[0])
+
     def test_remaining_package_exclusion_executes_actual_shell_without_go(self):
         match = re.search(r"- name: Race test all other packages\n        run: \|\n(.*?)(?=\n      -)", self.workflow, re.S)
         self.assertIsNotNone(match)
@@ -714,6 +961,7 @@ class WorkflowTests(unittest.TestCase):
             case "$2" in
               ./internal/store) printf '%s\\n' "$STUB_STORE" ;;
               ./internal/platform) printf '%s\\n' "$STUB_PLATFORM" ;;
+              ./internal/httpapi) printf '%s\\n' "$STUB_HTTPAPI" ;;
               ./internal/coordination) printf '%s\\n' "$STUB_COORDINATION" ;;
               ./...) printf '%s\\n' "$STUB_ALL" ;;
               *) return 90 ;;
@@ -726,40 +974,25 @@ class WorkflowTests(unittest.TestCase):
         }
         readonly -f go
         '''
-        remainder = ["agentworkspace/other", PACKAGE + "extra", PLATFORM_PACKAGE + "/child",
-                     COORDINATION_PACKAGE + "/child", COORDINATION_PACKAGE + "extra"]
-        valid = "\n".join([PACKAGE, *remainder, PLATFORM_PACKAGE, COORDINATION_PACKAGE])
-        cases = [("valid", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE, valid, True),
-                 ("empty-store", "", PLATFORM_PACKAGE, COORDINATION_PACKAGE, valid, False),
-                 ("empty-platform", PACKAGE, "", COORDINATION_PACKAGE, valid, False),
-                 ("multiline-store", PACKAGE + "\nother", PLATFORM_PACKAGE, COORDINATION_PACKAGE, valid, False),
-                 ("multiline-platform", PACKAGE, PLATFORM_PACKAGE + "\nother", COORDINATION_PACKAGE, valid, False),
-                 ("equal", PACKAGE, PACKAGE, COORDINATION_PACKAGE, valid, False),
-                 ("missing-store", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
-                  "\n".join([PLATFORM_PACKAGE, COORDINATION_PACKAGE, "other"]), False),
-                 ("missing-platform", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
-                  "\n".join([PACKAGE, COORDINATION_PACKAGE, "other"]), False),
-                 ("duplicate-store", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE, valid + "\n" + PACKAGE, False),
-                 ("duplicate-platform", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE, valid + "\n" + PLATFORM_PACKAGE, False),
-                 ("empty-remainder", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE, PACKAGE + "\n" + PLATFORM_PACKAGE, False),
-                 ("blank-remainder", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
-                  PACKAGE + "\n\n" + PLATFORM_PACKAGE + "\n" + COORDINATION_PACKAGE, False),
-                 ("empty-coordination", PACKAGE, PLATFORM_PACKAGE, "", valid, False),
-                 ("multiline-coordination", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE + "\nother", valid, False),
-                 ("coordination-equals-store", PACKAGE, PLATFORM_PACKAGE, PACKAGE, valid, False),
-                 ("coordination-equals-platform", PACKAGE, PLATFORM_PACKAGE, PLATFORM_PACKAGE, valid, False),
-                 ("missing-coordination", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
-                  "\n".join([PACKAGE, *remainder, PLATFORM_PACKAGE]), False),
-                 ("duplicate-coordination", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
-                  valid + "\n" + COORDINATION_PACKAGE, False),
-                 ("coordination-empty-remainder", PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE,
-                  "\n".join([PACKAGE, PLATFORM_PACKAGE, COORDINATION_PACKAGE]), False)]
-        for label, store, platform, coordination, all_packages, accepted in cases:
+        packages = {"STORE": PACKAGE, "PLATFORM": PLATFORM_PACKAGE, "HTTPAPI": HTTPAPI_PACKAGE, "COORDINATION": COORDINATION_PACKAGE}
+        remainder = ["agentworkspace/other", PACKAGE + "extra", PLATFORM_PACKAGE + "/child", HTTPAPI_PACKAGE + "extra",
+                     HTTPAPI_PACKAGE + "/child", COORDINATION_PACKAGE + "/child", COORDINATION_PACKAGE + "extra"]
+        valid = [PACKAGE, *remainder, PLATFORM_PACKAGE, HTTPAPI_PACKAGE, COORDINATION_PACKAGE]
+        cases = [("valid", packages, valid, True), ("empty-remainder", packages, list(packages.values()), False),
+                 ("blank-remainder", packages, [*valid, "", "other"], False), ("empty-all", packages, [], False)]
+        for suite, package in packages.items():
+            cases.extend([(f"empty-{suite}", {**packages, suite: ""}, valid, False),
+                          (f"multiline-{suite}", {**packages, suite: package + "\nother"}, valid, False),
+                          (f"missing-{suite}", packages, [name for name in valid if name != package], False),
+                          (f"duplicate-{suite}", packages, [*valid, package], False)])
+            for other, identity in packages.items():
+                if other != suite:
+                    cases.append((f"{suite}-equals-{other}", {**packages, suite: identity}, valid, False))
+        for label, identities, all_packages, accepted in cases:
             with self.subTest(case=label):
                 result = subprocess.run(["/bin/bash", "-c", stub + script],
-                                        env={**os.environ, "PATH": "", "STUB_STORE": store, "STUB_PLATFORM": platform,
-                                             "STUB_COORDINATION": coordination, "STUB_ALL": all_packages},
-                                        text=True, capture_output=True, timeout=5)
+                                        env={**os.environ, "PATH": "", **{"STUB_" + suite: package for suite, package in identities.items()},
+                                             "STUB_ALL": "\n".join(all_packages)}, text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), ["race:" + package for package in remainder] if accepted else [])
 
