@@ -57,3 +57,7 @@ cmp public/licenses/openbot/SOURCE.json dist/licenses/openbot/SOURCE.json
 构建结果位于 `web/dist/`。HTML 仍只静态引用共享 JS/CSS；经典入口仅使用共享资源，默认入口还会下载 Openbot JS/CSS 分块。因此默认总下载量包括共享资源与 Openbot 分块，不能只按 HTML 的静态引用计算。比较体积时分别记录 raw 与同一 Node `gzipSync` 方法下的逐资源 gzip 大小；包体积不代表运行时耗时。来源页面位于 `/licenses/openbot/index.html`，完整法律文件及源码清单从同一目录提供；上述 `cmp` 命令核对分发副本与 public 源文件逐字节一致。
 
 兼容入口：使用 `/?shell=classic` 并重新加载；去掉该参数则回到默认 Openbot 外壳。重载前应处理当前页草稿与未确认操作，不把重载当成取消或重试。
+
+## 产品目标与现有流程的区别
+
+以上记录的是外壳复用和现有业务流程，不是完整群聊体验的验收结论。现有接收方式控件、消息转任务及手动授权/分派入口是实现事实；若日常讨论到执行仍依赖这些步骤或手动刷新，属于待纠正的产品偏差，而非必须保留的 UX。目标见 [PRD](../PRD.md) 与 [IM interaction contract](orchestration.md#im-interaction-contract)：正常群聊、结构化 `@`/头像右键选人、结合上下文在授权交集内自动准入/分派并回群。外壳复用和显式准入后的文本 Submission 均不证明该闭环或文件工具/Artifact 发布已接通。
