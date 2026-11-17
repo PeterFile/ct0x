@@ -20,19 +20,25 @@ function useCatalogue(enabled: boolean) {
   const [request, setRequest] = useState({ before: "", version: 0 });
   const [state, setState] = useState({ items: [] as Provider[], pending: true, error: "", next: "" });
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled) {
+      // Reactivation starts a fresh snapshot, not a continuation of an old cursor.
+      setState({ items: [], pending: true, error: "", next: "" });
+      if (request.before) setRequest(previous => ({ ...previous, before: "" }));
+      return;
+    }
     let ignore = false;
     const controller = new AbortController();
-    setState(previous => ({ ...previous, pending: true, error: "" }));
+    setState(previous => ({ items: request.before ? previous.items : [], pending: true, error: "",
+      next: request.before ? previous.next : "" }));
     listProviders(request.before, controller.signal).then(result => {
       if (!ignore) setState(previous => ({ items: unique([...(request.before ? previous.items : []), ...result.items]),
         pending: false, error: "", next: result.next_cursor }));
     }, error => {
-      if (!ignore) setState(previous => ({ ...previous, pending: false, error: errorText(error) }));
+      if (!ignore) setState(previous => ({ ...previous, pending: false, error: errorText(error), next: "" }));
     });
     return () => { ignore = true; controller.abort(); };
   }, [enabled, request]);
-  return { ...state, load: (before = request.before) => setRequest(previous => ({ before, version: previous.version + 1 })) };
+  return { ...state, load: (before = "") => setRequest(previous => ({ before, version: previous.version + 1 })) };
 }
 
 type MemberListener = (groupId: string, members: Member[]) => void;
@@ -62,6 +68,8 @@ function MemberScope({ groupId, active, catalogue, onMembers, onRecipient }: {
   useEffect(() => { onMembers?.(groupId, items); }, [groupId, items, onMembers]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selected = items.find(member => member.id === selectedId);
+  const selectedProvider = !catalogue.pending && !catalogue.error
+    ? catalogue.items.find(provider => provider.id === selected?.provider_id) : undefined;
   const [draft, setDraft] = useState(emptyDraft);
   const [request, setRequest] = useState({ before: "", version: 0 });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
@@ -138,12 +146,15 @@ function MemberScope({ groupId, active, catalogue, onMembers, onRecipient }: {
       </li>)}</ul>
       {page.next ? <button type="button" disabled={page.pending} onClick={() => load(page.next)}>加载更多成员</button> : null}
     </div>
+    {catalogue.pending ? <p role="status">正在载入运行器目录，接入信息与能力尚未确认…</p> : catalogue.error
+      ? <div role="status">运行器目录暂不可用，接入信息与能力按未知显示。{catalogue.error}<button type="button" onClick={() => catalogue.load()}>重试运行器目录</button></div>
+      : !catalogue.items.length ? <p>未检测到运行器条目。</p> : null}
     {selected ? <section className="empty-panel member-detail" aria-label="成员详情">
       <h3>{selected.name}</h3><p>{selected.role}</p>
       <dl><dt>群内状态</dt><dd>{selected.status === "active" ? "在群" : selected.status === "left" ? "已离开" : "状态未知"}</dd>
-        <dt>运行器配置</dt><dd>{selected.provider_id ? catalogue.items.find(provider => provider.id === selected.provider_id)?.name || "已有配置，目录未验证" : "未绑定"}</dd>
+        <dt>运行器配置</dt><dd>{selected.provider_id ? selectedProvider?.name || "已有配置，目录未验证" : "未绑定"}</dd>
         <dt>模型配置</dt><dd>{selected.model || "未指定"}</dd><dt>工作目录配置</dt><dd>{selected.workspace || "未配置"}</dd></dl>
-      <MemberAdapterDetails provider={catalogue.items.find(provider => provider.id === selected.provider_id)} />
+      <MemberAdapterDetails provider={selectedProvider} />
     </section> : null}
     <CreationDisclosure label="创建成员" pending={mutation.pending} error={mutation.error} onSubmit={submit}>
       <fieldset disabled={mutation.pending || mutation.uncertain}>
@@ -157,9 +168,6 @@ function MemberScope({ groupId, active, catalogue, onMembers, onRecipient }: {
           <option value="">暂不绑定运行器</option>
           {catalogue.items.map(provider => <option key={provider.id} value={provider.id}>{providerLabel(provider)}</option>)}
         </select>
-        {catalogue.pending ? <p role="status">正在载入运行器目录…</p> : catalogue.error
-          ? <div role="status">运行器目录暂不可用，未检测。{catalogue.error}<button type="button" onClick={() => catalogue.load()}>重试运行器目录</button></div>
-          : !catalogue.items.length ? <p>未检测到运行器条目。</p> : null}
         {catalogue.next ? <button type="button" disabled={catalogue.pending} onClick={() => catalogue.load(catalogue.next)}>加载更多运行器</button> : null}
       </fieldset>
       <p id={`${formId}-runtime-help`}>未检测连接状态；目录账户状态与运行器、模型配置不代表运行就绪。</p>

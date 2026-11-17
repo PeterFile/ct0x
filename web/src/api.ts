@@ -62,6 +62,7 @@ function validProviderAdapter(value: unknown, current: Record<string, unknown>):
     || !["one_shot", "pi_extension", "codex_app_server"].some(protocol => protocol === value.protocol)
     || typeof value.enabled !== "boolean") return false;
   if (!("capabilities" in value)) return true;
+  if (typeof current.version !== "string" || !current.version.trim()) return false;
   const capabilities = value.capabilities;
   if (!isRecord(capabilities) || !["platform_tools", "native_resume", "permission_interaction", "cancel", "terminal_evidence", "steer"]
     .every(key => ["supported", "unsupported", "unknown"].some(state => state === capabilities[key]))) return false;

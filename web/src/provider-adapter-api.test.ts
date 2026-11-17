@@ -32,6 +32,19 @@ it.each(["one_shot", "pi_extension", "codex_app_server"])("accepts an unknown %s
   transport.mockResolvedValueOnce(page([value]));
   expect((await listProviders()).items[0]).toEqual(value);
 });
+it.each(["", " \t\n", "\u3000"])("rejects equally unknown provider/evidence versions %j without rejecting unknown capabilities", async version => {
+  const value = adapter();
+  transport.mockResolvedValueOnce(page([{ ...currentProvider, version, adapter: { ...value,
+    capabilities: { ...value.capabilities, evidence: { ...value.capabilities.evidence, version } },
+  } }]));
+  await expect(listProviders()).rejects.toMatchObject({ code: "invalid_response" });
+  const unknown = { ...currentProvider, version, adapter: { id: value.id, protocol: value.protocol, enabled: false } };
+  transport.mockResolvedValueOnce(page([unknown]));
+  expect((await listProviders()).items[0]).toEqual(unknown);
+  const legacy = { ...provider, version };
+  transport.mockResolvedValueOnce(page([legacy]));
+  expect((await listProviders()).items[0]).toEqual(legacy);
+});
 it("preserves explicit unknown states independently of account and enablement", async () => {
   const value = { ...currentProvider, account: "authenticated", adapter: adapter() };
   transport.mockResolvedValueOnce(page([value]));

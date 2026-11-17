@@ -127,6 +127,28 @@ func TestProviderAdapterUnknownAndLegacyPagination(t *testing.T) {
 	}
 }
 
+func TestProviderAdapterReportsRequireKnownVersion(t *testing.T) {
+	for _, version := range []string{"", " \t\n", "\u3000"} {
+		t.Run(version, func(t *testing.T) {
+			catalog, report := adapterCatalogFixture()
+			catalog.items[0].Version = version
+			report.Capabilities.Evidence.Version = version
+			if snapshot, err := catalog.WithAdapterReports(map[string]ProviderAdapterReport{"pi_a": report}); snapshot != nil || !errors.Is(err, provider.ErrAdapterConfiguration) {
+				t.Fatalf("unknown version accepted capability evidence: %q %v", version, err)
+			}
+			report.Capabilities = nil
+			snapshot, err := catalog.WithAdapterReports(map[string]ProviderAdapterReport{"pi_a": report})
+			if err != nil {
+				t.Fatalf("unknown version rejected a report without capabilities: %v", err)
+			}
+			views, _, err := snapshot.ListWithAdapters(0, "")
+			if err != nil || views[0].Version != version || views[0].Adapter.Capabilities != nil {
+				t.Fatal("unknown version must retain metadata without inferring capabilities")
+			}
+		})
+	}
+}
+
 func TestProviderAdapterSnapshotConcurrentReads(t *testing.T) {
 	catalog, report := adapterCatalogFixture()
 	snapshot, err := catalog.WithAdapterReports(map[string]ProviderAdapterReport{"pi_a": report})

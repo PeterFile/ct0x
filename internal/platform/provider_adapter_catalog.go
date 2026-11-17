@@ -40,6 +40,9 @@ func (c *ProviderCatalog) WithAdapterReports(reports map[string]ProviderAdapterR
 			return nil, provider.ErrAdapterConfiguration
 		}
 		if report.Capabilities != nil {
+			if strings.TrimSpace(p.Version) == "" {
+				return nil, provider.ErrAdapterConfiguration
+			}
 			caps := report.Capabilities
 			e := caps.Evidence
 			if e.Source != provider.BuiltinContractEvidence || e.ProviderID != p.ID || e.Name != p.Name ||

@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { App } from "./App";
+import { Members } from "./Members";
 import { deferred, group, json, other, page } from "./test/groups";
 import { member, provider } from "./test/members";
 const reads = vi.fn<typeof fetch>();
@@ -269,6 +270,89 @@ it("labels refreshed CLI/model selection as current configuration, not historica
   expect(panel().queryByRole("img")).not.toBeInTheDocument();
   expect(panel().getByRole("region", { name: "成员详情" }).querySelector("script")).toBeNull();
   expect(writes).not.toHaveBeenCalled();
+});
+function catalogueScope(active: boolean) {
+  return <aside aria-label="成员" hidden={!active}><Members groupId={group.id} catalogueActive={active} /></aside>;
+}
+it("downgrades unconfirmed catalogue reactivation and exposes failure outside collapsed creation while preserving selection and draft", async () => {
+  const current = { ...provider, version: "1.4.0", adapter: { ...memberAdapter(), enabled: true } };
+  reads.mockResolvedValueOnce(page([{ ...member, provider_id: provider.id, model: "configured-model" }]));
+  catalogue.mockResolvedValueOnce(page([current]));
+  const mounted = render(catalogueScope(true));
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  expect(await panel().findByText("已启用（不代表运行就绪）")).toBeVisible();
+  fireEvent.click(panel().getByRole("button", { name: "展开创建成员" }));
+  change("成员名称", "保留的草稿");
+  fireEvent.click(panel().getByRole("button", { name: "收起创建成员" }));
+  const reload = deferred<Response>(); catalogue.mockReturnValueOnce(reload.promise);
+  mounted.rerender(catalogueScope(false)); mounted.rerender(catalogueScope(true));
+  expect(await panel().findByText(/正在载入运行器目录/)).toBeVisible();
+  expect(detailValue("进程启用状态")).toHaveTextContent(/^未知$/);
+  expect(detailValue("平台工具")).toHaveTextContent(/^未知$/);
+  await act(async () => reload.resolve(json({}, 503)));
+  expect(await panel().findByText(/运行器目录暂不可用/)).toBeVisible();
+  expect(detailValue("进程启用状态")).toHaveTextContent(/^未知$/);
+  expect(detailValue("平台工具")).toHaveTextContent(/^未知$/);
+  expect(detailValue("模型配置")).toHaveTextContent("configured-model");
+  expect(panel().getByRole("button", { name: member.name })).toHaveAttribute("aria-pressed", "true");
+  expect(panel().getByRole("button", { name: "展开创建成员" })).toHaveAttribute("aria-expanded", "false");
+  catalogue.mockResolvedValueOnce(page([{ ...current, adapter: { ...current.adapter, enabled: false } }]));
+  fireEvent.click(panel().getByRole("button", { name: "重试运行器目录" }));
+  expect(await panel().findByText("未启用")).toBeVisible();
+  expect(detailValue("平台工具")).toHaveTextContent(/^支持（实现合同）$/);
+  expect(catalogue.mock.calls.map(([url]) => url)).toEqual(Array(3).fill("/api/v1/providers?limit=50"));
+  fireEvent.click(panel().getByRole("button", { name: "展开创建成员" }));
+  expect(field("成员名称")).toHaveValue("保留的草稿");
+  expect(writes).not.toHaveBeenCalled();
+});
+const pagedProvider = (number: number, enabled = false) => ({ ...provider, id: `pi_${String(number).padStart(2, "0")}`,
+  path: `/fixture/pi${number}`, version: "1.4.0", adapter: { id: "pi_fixture", protocol: "pi_extension", enabled } });
+it("starts a new catalogue generation from page one after paging and never retains the previous first-page enabled state", async () => {
+  reads.mockResolvedValueOnce(page([{ ...member, provider_id: "pi_01" }]));
+  catalogue.mockResolvedValueOnce(page(Array.from({ length: 50 }, (_, i) => pagedProvider(i + 1, i === 0)), "old-cursor"));
+  const mounted = render(catalogueScope(true));
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  expect(await panel().findByText("已启用（不代表运行就绪）")).toBeVisible();
+  fireEvent.click(panel().getByRole("button", { name: "展开创建成员" }));
+  catalogue.mockResolvedValueOnce(page([pagedProvider(51)]));
+  fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+  await panel().findByRole("option", { name: /\/fixture\/pi51/ });
+  catalogue.mockResolvedValueOnce(page(Array.from({ length: 50 }, (_, i) => pagedProvider(i + 1)), "new-cursor"));
+  mounted.rerender(catalogueScope(false)); mounted.rerender(catalogueScope(true));
+  expect(await panel().findByText("未启用")).toBeVisible();
+  expect(catalogue.mock.calls[2][0]).toBe("/api/v1/providers?limit=50");
+  expect(panel().queryByRole("option", { name: /\/fixture\/pi51/ })).not.toBeInTheDocument();
+  catalogue.mockResolvedValueOnce(page([pagedProvider(50), pagedProvider(51)]));
+  fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+  await panel().findByRole("option", { name: /\/fixture\/pi51/ });
+  expect(catalogue.mock.calls[3][0]).toBe("/api/v1/providers?limit=50&before=new-cursor");
+  expect(panel().getAllByRole("option")).toHaveLength(52);
+  expect(detailValue("进程启用状态")).toHaveTextContent(/^未启用$/);
+});
+it("fences late previous-generation pages and retries failed pagination from page one", async () => {
+  reads.mockResolvedValueOnce(page([{ ...member, provider_id: "pi_01" }]));
+  catalogue.mockResolvedValueOnce(page([pagedProvider(1, true)], "old-cursor"));
+  const mounted = render(catalogueScope(true));
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  await panel().findByText("已启用（不代表运行就绪）");
+  fireEvent.click(panel().getByRole("button", { name: "展开创建成员" }));
+  const oldPage = deferred<Response>(); catalogue.mockReturnValueOnce(oldPage.promise);
+  fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+  catalogue.mockResolvedValueOnce(page([pagedProvider(1)], "new-cursor"));
+  mounted.rerender(catalogueScope(false)); mounted.rerender(catalogueScope(true));
+  await panel().findByText("未启用");
+  expect(catalogue.mock.calls[1][1]?.signal?.aborted).toBe(true);
+  await act(async () => oldPage.resolve(page([pagedProvider(51)], "stale-next")));
+  expect(panel().queryByRole("option", { name: /\/fixture\/pi51/ })).not.toBeInTheDocument();
+  catalogue.mockResolvedValueOnce(json({}, 503));
+  fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+  expect(catalogue.mock.calls[3][0]).toBe("/api/v1/providers?limit=50&before=new-cursor");
+  expect(await panel().findByText(/运行器目录暂不可用/)).toBeVisible();
+  expect(detailValue("进程启用状态")).toHaveTextContent(/^未知$/);
+  catalogue.mockResolvedValueOnce(page([pagedProvider(1)]));
+  fireEvent.click(panel().getByRole("button", { name: "重试运行器目录" }));
+  await panel().findByText("未启用");
+  expect(catalogue.mock.calls[4][0]).toBe("/api/v1/providers?limit=50");
 });
 it("shows a real empty catalogue, retries a network failure, and aborts on full unmount", async () => {
   catalogue.mockRejectedValueOnce(new TypeError("offline")); await open();
