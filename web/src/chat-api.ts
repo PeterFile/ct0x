@@ -1,0 +1,131 @@
+import { ApiError } from "./api";
+
+export type ChatPolicy = Readonly<{
+  group_id: string; topic_id: string; enabled: boolean; allow_preparation: boolean;
+  preauthorization_message_id: string; action: "" | "text_submission"; max_admissions: number;
+  revision: number; authorized_by: "" | "user"; preauthorization_text?: string;
+}>;
+export type ChatPolicyInput = Readonly<{
+  enabled: boolean; allow_preparation: boolean; preauthorization_message_id: string;
+  action: "text_submission"; max_admissions: number; expected_revision: number;
+}>;
+export type ChatAdmission = Readonly<{
+  id: string; candidate_id: string; group_id: string; topic_id: string; message_id: string;
+  source_sender_id: string; assessed_by: string; turn_id: string; policy_revision: number; candidate_generation: number;
+  disposition: "request_work" | "prepare_work"; authority: "explicit_request" | "written_preauthorization";
+  authorization_message_id: string; action: "text_submission"; task_id: string; mandate_id: string;
+  dispatch_request_id: string; notice_message_id: string; created_at: string;
+}>;
+const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const text = (value: unknown): value is string => typeof value === "string" && !/[\ud800-\udfff]/u.test(value);
+const nonblank = (value: unknown): value is string => text(value) && /\P{White_Space}/u.test(value);
+const identifier = (value: unknown): value is string => text(value) && value !== "" && !/^\p{White_Space}|\p{White_Space}$/u.test(value)
+  && !/[\0\r\n]/u.test(value) && new TextEncoder().encode(value).length <= 4096;
+const pathId = (value: unknown): value is string => identifier(value) && value !== "." && value !== "..";
+const integer = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+const positive = (value: unknown): value is number => integer(value) && value > 0;
+const budget = (value: unknown): value is number => integer(value) && value >= 1 && value <= 100;
+const keyValid = (value: string) => value.length > 0 && value.length <= 128 && !/[^\x21-\x7e]|,/.test(value);
+const policyFields = ["group_id", "topic_id", "enabled", "allow_preparation", "preauthorization_message_id", "action", "max_admissions", "revision", "authorized_by"];
+function isPolicy(value: unknown, groupId: string, topicId: string): value is ChatPolicy {
+  if (!record(value) || !policyFields.every(field => Object.hasOwn(value, field))
+    || Object.keys(value).some(field => !policyFields.includes(field) && field !== "preauthorization_text")
+    || value.group_id !== groupId || value.topic_id !== topicId || !integer(value.revision)
+    || typeof value.enabled !== "boolean" || typeof value.allow_preparation !== "boolean"
+    || !text(value.preauthorization_message_id) || (value.preauthorization_text !== undefined && !text(value.preauthorization_text))) return false;
+  if (value.revision === 0) return !value.enabled && !value.allow_preparation && value.preauthorization_message_id === ""
+    && value.action === "" && value.max_admissions === 0 && value.authorized_by === "" && !value.preauthorization_text;
+  return value.action === "text_submission" && value.authorized_by === "user" && budget(value.max_admissions)
+    && (!value.allow_preparation || identifier(value.preauthorization_message_id))
+    && (value.preauthorization_message_id === "" ? !value.preauthorization_text
+      : identifier(value.preauthorization_message_id) && nonblank(value.preauthorization_text) && !value.preauthorization_text.includes("\0")
+        && new TextEncoder().encode(value.preauthorization_text).length <= 8192);
+}
+const admissionFields = ["id", "candidate_id", "group_id", "topic_id", "message_id", "source_sender_id", "assessed_by", "turn_id",
+  "policy_revision", "candidate_generation", "disposition", "authority", "authorization_message_id", "action", "task_id", "mandate_id",
+  "dispatch_request_id", "notice_message_id", "created_at"];
+function isAdmission(value: unknown, groupId: string, taskId: string): value is ChatAdmission {
+  if (!record(value) || Object.keys(value).length !== admissionFields.length || !admissionFields.every(field => Object.hasOwn(value, field))
+    || value.group_id !== groupId || value.task_id !== taskId || !text(value.topic_id) || value.action !== "text_submission"
+    || !positive(value.policy_revision) || !positive(value.candidate_generation)
+    || !["id", "candidate_id", "message_id", "source_sender_id", "assessed_by", "turn_id", "authorization_message_id", "mandate_id", "notice_message_id"].every(field => identifier(value[field]))
+    || !pathId(value.dispatch_request_id) || !text(value.created_at)
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value.created_at)
+    || !Number.isFinite(Date.parse(value.created_at))) return false;
+  return value.disposition === "request_work" ? value.authority === "explicit_request" && value.source_sender_id === "user"
+    && value.authorization_message_id === value.message_id
+    : value.disposition === "prepare_work" && value.authority === "written_preauthorization";
+}
+function decode(buffer: ArrayBuffer): unknown {
+  const source = new TextDecoder("utf-8", { fatal: true }).decode(buffer), maximum = String(Number.MAX_SAFE_INTEGER);
+  // Every numeric wire field in these contracts is a nonnegative integer. Reject rounding before parse.
+  const tokens = /"(?:[^"\\]|\\.)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/uy;
+  for (let index = 0; index < source.length; index++) {
+    if (!/["\d-]/u.test(source[index])) continue;
+    tokens.lastIndex = index;
+    const token = tokens.exec(source)?.[0];
+    if (token === undefined) return null;
+    index = tokens.lastIndex - 1;
+    if (token.startsWith('"')) continue;
+    if (!/^(?:0|[1-9]\d*)$/.test(token) || token.length > maximum.length || (token.length === maximum.length && token > maximum)) return null;
+  }
+  return JSON.parse(source);
+}
+class ChatRejection extends ApiError {}
+export const isChatPolicyDefinitiveRejection = (error: unknown) => error instanceof ChatRejection;
+const invalid = () => new ChatRejection("聊天策略输入无效，请检查范围、版本、任务预算和授权来源。", 400, "invalid_input");
+const refusals: Record<number, readonly string[]> = { 400: ["invalid_input", "invalid_json"], 403: ["invalid_host", "invalid_origin"],
+  404: ["not_found"], 405: ["method_not_allowed"], 409: ["conflict"], 413: ["body_too_large"], 415: ["unsupported_media_type"] };
+const rejectionText: Record<number, string> = {
+  400: "聊天策略输入未通过验证，请检查任务预算、授权来源和版本", 403: "本地访问校验失败，无法保存聊天策略",
+  404: "当前实例的聊天配置能力或关联记录不可用", 405: "当前服务不支持此聊天请求接口",
+  409: "聊天策略版本或原请求发生冲突，请读取真实当前配置并核对草稿",
+  413: "聊天策略请求内容过大", 415: "服务仅接受 JSON 格式的聊天策略请求",
+};
+async function request<T>(path: string, init: RequestInit, valid: (value: unknown) => value is T): Promise<T> {
+  let response: Response;
+  try { response = await fetch(path, { ...init, redirect: "error" }); }
+  catch { throw new ApiError("聊天配置信息或保存结果未确认，请保留原操作后重试。", 0, "disconnected"); }
+  const value: unknown = await response.arrayBuffer().then(decode).catch(() => null);
+  if (response.status === 200 && valid(value)) return value;
+  if (!response.ok && record(value) && Object.keys(value).length === 1 && record(value.error) && Object.keys(value.error).length === 2
+    && nonblank(value.error.code) && nonblank(value.error.message)) {
+    const definitive = refusals[response.status]?.includes(value.error.code) ?? false;
+    const ErrorType = definitive ? ChatRejection : ApiError;
+    const reason = definitive ? rejectionText[response.status] : "聊天请求未完成，配置或保存结果未确认";
+    throw new ErrorType(`${reason}（HTTP ${response.status}）。`, response.status, value.error.code);
+  }
+  throw new ApiError(`聊天响应不符合约定，读取或保存结果未确认（HTTP ${response.status}）。`, response.status, "invalid_response");
+}
+function policyPath(groupId: string, topicId: string) {
+  return `/api/v1/groups/${encodeURIComponent(groupId)}/coordination/chat-policy${topicId ? `?${new URLSearchParams({ topic_id: topicId })}` : ""}`;
+}
+export async function getChatPolicy(groupId: string, signal?: AbortSignal, topicId = ""): Promise<ChatPolicy> {
+  if (!pathId(groupId) || !text(topicId)) throw invalid();
+  return request(policyPath(groupId, topicId), { signal }, (value): value is ChatPolicy => isPolicy(value, groupId, topicId));
+}
+export async function setChatPolicy(groupId: string, input: ChatPolicyInput, key: string, topicId = ""): Promise<ChatPolicy> {
+  if (!pathId(groupId) || !text(topicId) || !keyValid(key) || !record(input)) throw invalid();
+  const sent: ChatPolicyInput = Object.freeze({ enabled: input.enabled, allow_preparation: input.allow_preparation,
+    preauthorization_message_id: input.preauthorization_message_id, action: input.action,
+    max_admissions: input.max_admissions, expected_revision: input.expected_revision });
+  if (typeof sent.enabled !== "boolean" || typeof sent.allow_preparation !== "boolean" || sent.action !== "text_submission"
+    || !budget(sent.max_admissions) || !integer(sent.expected_revision) || sent.expected_revision >= Number.MAX_SAFE_INTEGER
+    || !text(sent.preauthorization_message_id) || (sent.preauthorization_message_id !== "" && !identifier(sent.preauthorization_message_id))
+    || (sent.allow_preparation && !sent.preauthorization_message_id)) throw invalid();
+  return request(policyPath(groupId, topicId), { method: "PUT", headers: { "Content-Type": "application/json", "Idempotency-Key": key },
+    body: JSON.stringify(sent) }, (value): value is ChatPolicy => isPolicy(value, groupId, topicId)
+      && value.revision === sent.expected_revision + 1 && value.enabled === sent.enabled && value.allow_preparation === sent.allow_preparation
+      && value.preauthorization_message_id === sent.preauthorization_message_id && value.action === sent.action && value.max_admissions === sent.max_admissions);
+}
+export async function getChatAdmission(groupId: string, taskId: string, signal?: AbortSignal): Promise<ChatAdmission | null> {
+  if (!pathId(groupId) || !pathId(taskId)) throw invalid();
+  try {
+    return await request(`/api/v1/groups/${encodeURIComponent(groupId)}/tasks/${encodeURIComponent(taskId)}/chat-admission`, { signal },
+      (value): value is ChatAdmission => isAdmission(value, groupId, taskId));
+  } catch (error) {
+    // Both legacy Tasks and older instances legitimately lack this read capability.
+    if (error instanceof ApiError && error.status === 404) return null;
+    throw error;
+  }
+}

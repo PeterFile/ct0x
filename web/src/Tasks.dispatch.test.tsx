@@ -6,6 +6,7 @@ import type { DispatchRequest, DispatchState, DispatchView, TaskCoordinationView
 import type { Task } from "./task-api";
 import { deferred, group, json, other, page } from "./test/groups";
 import { secondTask, submittedTask, task } from "./test/tasks";
+import { chatAdmission } from "./test/chat";
 
 // Real Tasks/TaskLifecycle/TaskDispatch/settings/clients; only HTTP transport is replaced.
 const reason = "  按明确授权协调。\n保留理由原文。  ";
@@ -42,7 +43,7 @@ function viewFor(receipt = receiptFor(), status: DispatchState["status"] = "pend
 const tasks = new Map<string, Task>(), authorities = new Map<string, TaskCoordinationView>(), views = new Map<string, DispatchView>();
 const details = vi.fn<typeof fetch>(), authorityReads = vi.fn<typeof fetch>(), stateReads = vi.fn<typeof fetch>(), executionReads = vi.fn<typeof fetch>();
 const dispatchWrites = vi.fn<typeof fetch>(), taskWrites = vi.fn<typeof fetch>(), configWrites = vi.fn<typeof fetch>();
-const requests = vi.fn<typeof fetch>();
+const requests = vi.fn<typeof fetch>(), admissionReads = vi.fn<typeof fetch>();
 let unexpected: string[];
 const urlOf = (value: RequestInfo | URL) => new URL(String(value), "http://fixture.invalid");
 const idsOf = (value: RequestInfo | URL) => urlOf(value).pathname.split("/").map(decodeURIComponent);
@@ -91,6 +92,7 @@ beforeEach(() => {
     return json({ group_id: ids[4], task_id: ids[6], request_id: ids[8], dispatch_status: "pending", coordinator_turn: null,
       decision: null, assignment: null, assignment_dispatch_status: null, binding: null, worker_turn: null });
   });
+  admissionReads.mockReset().mockResolvedValue(refusal(404));
   dispatchWrites.mockReset().mockResolvedValue(json(receiptFor(), 201));
   taskWrites.mockReset().mockRejectedValue(new TypeError("Lost lifecycle receipt"));
   configWrites.mockReset().mockRejectedValue(new TypeError("Lost settings receipt"));
@@ -101,6 +103,7 @@ beforeEach(() => {
     if (method === "PUT" && /\/coordination\/(coordinator|dispatch-policy)$/.test(url.pathname)) return configWrites(input, init);
     if (method === "GET") {
       if (url.pathname.endsWith("/tasks")) return Promise.resolve(page([...tasks.values()].filter(value => value.group_id === groupId)));
+      if (url.pathname.endsWith("/chat-admission")) return admissionReads(input, init);
       if (/\/tasks\/[^/]+\/coordination$/.test(url.pathname)) return authorityReads(input, init);
       if (/\/coordination\/dispatch-requests\/[^/]+$/.test(url.pathname)) return stateReads(input, init);
       if (/\/tasks\/[^/]+\/dispatch-requests\/[^/]+\/execution$/.test(url.pathname)) return executionReads(input, init);
@@ -500,7 +503,7 @@ it("reports an unknown future status as unreadable, not completion, and preserve
   expect(detail().getByText("待交付")).toBeVisible();
   expect(dispatchWrites).toHaveBeenCalledTimes(1); expect(taskWrites).not.toHaveBeenCalled();
 });
-it("states the page-only recovery boundary and can read an explicitly known ID after full unmount, never discovering by Task", async () => {
+it("states the page-only manual recovery boundary and reads an exact known ID after unmount without guessing a manual request", async () => {
   dispatchWrites.mockRejectedValueOnce(new TypeError("Lost receipt"));
   const result = await open(); editReason(); submit(); await flush(); result.unmount();
   await open();
@@ -512,4 +515,16 @@ it("states the page-only recovery boundary and can read an explicitly known ID a
   expect(dispatch().queryByRole("region", { name: "分派登记历史回执" })).not.toBeInTheDocument();
   expect(dispatchWrites).toHaveBeenCalledTimes(1);
   expect(requests.mock.calls.every(([url]) => !String(url).includes("by-task") && !String(url).includes("/coordination/decisions"))).toBe(true);
+});
+it("discovers automatic evidence without replacing an unresolved manual operation or its retry key", async () => {
+  dispatchWrites.mockRejectedValueOnce(new TypeError("Lost manual receipt"));
+  const result = await open(); editReason(); submit(); await flush(); const original = captured(0);
+  const automatic = receiptFor(currentTask, authorityFor(), "独立的自动分派依据", "automatic-different-request");
+  views.set(automatic.id, viewFor(automatic));
+  admissionReads.mockResolvedValueOnce(json({ ...chatAdmission, mandate_id: automatic.mandate_id, dispatch_request_id: automatic.id }));
+  result.rerender(ui(null)); await flush(); result.rerender(ui(group)); await flush();
+  expect(detail().getByRole("region", { name: "聊天自动准入依据" })).toHaveTextContent(automatic.id);
+  expect(dispatchWrites).toHaveBeenCalledTimes(1); expect(dispatch().getByRole("button", { name: "重试原分派登记" })).toBeEnabled();
+  retry(); await flush(); expect(captured(1)).toEqual(original);
+  expect(history().getByText(receiptFor().id)).toBeVisible(); expect(configWrites).not.toHaveBeenCalled(); expect(taskWrites).not.toHaveBeenCalled();
 });

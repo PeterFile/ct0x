@@ -98,6 +98,7 @@ beforeEach(() => {
       if (url.pathname === "/api/v1/groups") return Promise.resolve(page([group, other]));
       if (url.pathname.endsWith("/members")) return members(input, init);
       if (url.pathname.endsWith("/messages")) return Promise.resolve(page());
+      if (url.pathname.endsWith("/chat-admission")) return Promise.resolve(json({ error: { code: "not_found", message: "旧任务无聊天准入依据" } }, 404));
       if (/\/tasks\/[^/]+\/(attempts|submissions)\/[^/]+$/.test(url.pathname)) return evidence(input, init);
       if (url.pathname.endsWith("/tasks")) return taskReads(input, init);
       if (/\/tasks\/[^/]+$/.test(url.pathname)) return details(input, init);
