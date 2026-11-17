@@ -17,8 +17,27 @@ type CoordinatorDecisionInput struct {
 	Reason         string `json:"reason"`
 }
 
-// DecideDispatch is an unwired primitive; business callers require the reviewed N3b3/N4 gates.
-func (s *Store) DecideDispatch(ctx context.Context, scope CoordinationToolScope, input CoordinatorDecisionInput, key string) (out domain.DecisionReceipt, err error) {
+// DispatchWorkerCapabilityFact is trusted server-sampled implementation support,
+// not authorization, account readiness or a reservation. Model input cannot set it.
+type DispatchWorkerCapabilityFact struct {
+	GroupID    string `json:"-"`
+	MemberID   string `json:"-"`
+	ProviderID string `json:"-"`
+	Model      string `json:"-"`
+}
+
+// DecideDispatchWithCapabilities additionally binds a new assignment to frozen
+// server capability facts. Historical receipts retain the original replay order.
+func (s *Store) DecideDispatchWithCapabilities(ctx context.Context, scope CoordinationToolScope, input CoordinatorDecisionInput, key string, facts []DispatchWorkerCapabilityFact) (domain.DecisionReceipt, error) {
+	return s.decideDispatch(ctx, scope, input, key, facts, true)
+}
+
+// DecideDispatch is the legacy trusted primitive; automatic tools use the guarded entry.
+func (s *Store) DecideDispatch(ctx context.Context, scope CoordinationToolScope, input CoordinatorDecisionInput, key string) (domain.DecisionReceipt, error) {
+	return s.decideDispatch(ctx, scope, input, key, nil, false)
+}
+
+func (s *Store) decideDispatch(ctx context.Context, scope CoordinationToolScope, input CoordinatorDecisionInput, key string, facts []DispatchWorkerCapabilityFact, requireCapabilities bool) (out domain.DecisionReceipt, err error) {
 	defer func() { err = coordinationDecideError(err) }()
 	if !memberToolKeyValid(key) || strings.TrimSpace(input.Reason) == "" ||
 		(input.Kind != "assign" && input.Kind != "decline") ||
@@ -63,6 +82,11 @@ func (s *Store) DecideDispatch(ctx context.Context, scope CoordinationToolScope,
 		}
 		if err := coordinationDecideEligibleInTx(ctx, tx, r, input.WorkerMemberID, ""); err != nil {
 			return out, err
+		}
+		if requireCapabilities && input.Kind == "assign" {
+			if err := coordinationDecideCapabilityInTx(ctx, tx, r.GroupID, input.WorkerMemberID, facts); err != nil {
+				return out, err
+			}
 		}
 		at := time.Now().UTC()
 		stamp := at.Format(timestampLayout)
@@ -153,6 +177,11 @@ func (s *Store) DecideDispatch(ctx context.Context, scope CoordinationToolScope,
 		if err := coordinationDecideEligibleInTx(ctx, tx, r, input.WorkerMemberID, want.Decision.AssignmentID); err != nil {
 			return out, err
 		}
+		if requireCapabilities && input.Kind == "assign" {
+			if err := coordinationDecideCapabilityInTx(ctx, tx, r.GroupID, input.WorkerMemberID, facts); err != nil {
+				return out, err
+			}
+		}
 	}
 	result, err := coordinationDecideReceiptInTx(ctx, tx, r.GroupID, r.ID)
 	if err != nil {
@@ -167,6 +196,26 @@ func (s *Store) DecideDispatch(ctx context.Context, scope CoordinationToolScope,
 		return out, &coordinationDecideFailure{cause: err, unknown: true}
 	}
 	return result, nil
+}
+
+// Only compare immutable server facts with current rows here. Capability
+// sampling, filesystem validation and adapter code must stay outside SQL txs.
+func coordinationDecideCapabilityInTx(ctx context.Context, tx *sql.Tx, groupID, workerID string, facts []DispatchWorkerCapabilityFact) error {
+	for _, fact := range facts {
+		if fact.GroupID != groupID || fact.MemberID != workerID || fact.ProviderID == "" || fact.Model == "" {
+			continue
+		}
+		var matches bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM members
+		 WHERE group_id=? AND id=? AND provider_id=? AND model=? AND status='active')`,
+			groupID, workerID, fact.ProviderID, fact.Model).Scan(&matches); err != nil {
+			return err
+		}
+		if matches {
+			return nil
+		}
+	}
+	return ErrConflict
 }
 
 func coordinationDecideEligibleInTx(ctx context.Context, tx *sql.Tx, r domain.DispatchRequest, worker, ownAssignment string) error {

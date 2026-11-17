@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"agentworkspace/internal/contextpack"
@@ -124,9 +123,11 @@ func validatePreparationRole(state store.CoordinationRoleState, group domain.Gro
 // The plan and formatter are the single private computation seam for future
 // read-only diagnostics. They never promise a later claim or reserve capacity.
 type rolePreparationPlan struct {
-	state    store.CoordinationRoleState
-	selected provider.Provider
-	input    contextpack.Input
+	state                store.CoordinationRoleState
+	selected             provider.Provider
+	selection            provider.AdapterSelection
+	dispatchCapabilities []store.DispatchWorkerCapabilityFact
+	input                contextpack.Input
 }
 
 func (p *Preparer) planCoordinationRole(ctx context.Context, state store.CoordinationRoleState, group domain.Group,
@@ -145,23 +146,11 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 	if r.tools == nil || r.tools.db != p.store || !r.rootValid() {
 		return empty, preparationFailureWithCause(ctx, errPrepareConfig, errMemberToolRuntimeConfig)
 	}
-	selected, ok := p.providers[state.ProviderID]
-	if !ok || selected.Name != provider.Pi || !memberToolRuntimeText(selected.ID) ||
-		selected.Installation != provider.Installed || selected.Version != "1.4.0" ||
-		!filepath.IsAbs(selected.Path) || strings.ContainsRune(selected.Path, 0) ||
-		len(member.Model) > 256 || !memberToolRuntimeText(member.Model) {
-		return empty, rolePreparationBlocked(state, "unsupported_provider", nil)
-	}
-	// Keep the explicit preflight and provider validation stats separate. If
-	// validation's own stat fails, classify its captured error, not a later path.
-	info, err := os.Stat(selected.Path)
-	if errors.Is(err, os.ErrNotExist) || err == nil && (!info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0) {
+	selected, selection, err := p.sampleMemberToolMember(member, memberToolRoleOperations(state.Provenance.Kind))
+	if errors.Is(err, errMemberToolAdapterUnsupported) {
 		return empty, rolePreparationBlocked(state, "unsupported_provider", nil)
 	}
 	if err != nil {
-		return empty, preparationFailureWithCause(ctx, errPrepareRead, err)
-	}
-	if err := provider.ValidateExecutor(selected, p.executionTimeout); err != nil {
 		return empty, roleExecutorPreparationError(ctx, state, err)
 	}
 	if err := r.CheckCoordinationRoleCapacity(ctx); err != nil {
@@ -174,11 +163,23 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 	if err != nil {
 		return empty, preparationResolutionError(ctx, err)
 	}
-	in, err := rolePreparationContext(state.Provenance, group, member, conversation, trigger, history, p.roleMaxContextBytes)
+	var facts []store.DispatchWorkerCapabilityFact
+	if state.Provenance.Kind == store.CoordinationRoleCoordinator {
+		facts, err = p.sampleDispatchCandidates(ctx, group.ID, member.ID)
+		if err != nil {
+			return empty, err
+		}
+	}
+	in, err := rolePreparationContext(state.Provenance, group, member, conversation, trigger, history, p.roleMaxContextBytes, facts)
 	if err != nil {
 		return empty, err
 	}
-	return rolePreparationPlan{state: state, selected: selected, input: in}, nil
+	if selection.Protocol == provider.CodexAppServerProtocol {
+		in.Permissions[0] = "仅支持所选 Codex AppServer 版本的全新单轮角色执行；不支持恢复或运行中追加输入。"
+		in.Permissions[1] = "本轮角色平台工具仅有 " + strings.Join(memberToolRoleOperations(state.Provenance.Kind), "、") + "；调用者、群组、会话、话题和任务关系由服务端绑定，模型不能改选身份或授权。"
+		in.Permissions = append(in.Permissions, codexNativeTextPermission)
+	}
+	return rolePreparationPlan{state: state, selected: selected, selection: selection, dispatchCapabilities: facts, input: in}, nil
 }
 
 func (plan rolePreparationPlan) format() ([]byte, error) {
@@ -218,15 +219,17 @@ func (p *Preparer) prepareCoordinationRole(ctx context.Context, state store.Coor
 		return empty, preparationReadError(ctx, err)
 	}
 	selected := plan.selected
-	executor, err := p.memberTools.WrapCoordinationRole(MemberToolRunBinding{GroupID: group.ID, MemberID: member.ID,
+	executor, err := p.memberTools.WrapCoordinationRoleWithCapabilities(MemberToolRunBinding{GroupID: group.ID, MemberID: member.ID,
 		ConversationID: conversation.ID, DeliveryID: state.Provenance.DeliveryID, ProviderID: selected.ID,
-		ProviderName: selected.Name, Model: member.Model}, state.Provenance,
-		func(configPath, _ string, names []string) (provider.Executor, error) {
-			return provider.NewPiMemberToolExecutorWithTools(selected, p.piMemberToolsExtension, configPath, names, p.executionTimeout)
-		})
+		ProviderName: selected.Name, Model: member.Model}, state.Provenance, plan.dispatchCapabilities,
+		p.memberToolExecutorFactory(selected, plan.selection))
 	if err != nil {
 		return empty, preparationFailureWithCause(ctx, errPrepareBinding, err)
 	}
+	thinking := ""
+	if plan.selection.Protocol == provider.PiExtensionProtocol {
+		thinking = p.roleThinking
+	}
 	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{key},
-		Request: provider.ExecuteRequest{CWD: cwd, Prompt: string(packet), Model: member.Model, Thinking: p.roleThinking}}, nil
+		Request: provider.ExecuteRequest{CWD: cwd, Prompt: string(packet), Model: member.Model, Thinking: thinking}}, nil
 }

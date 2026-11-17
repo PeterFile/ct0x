@@ -15,7 +15,17 @@ import (
 // immutable server selections without claiming, issuing, creating files or calling
 // the factory. Role support is opt-in; no failure falls back to ordinary tools.
 func (r *MemberToolRuntime) WrapCoordinationRole(binding MemberToolRunBinding, expected store.CoordinationRoleProvenance, factory MemberToolExecutorFactory) (provider.Executor, error) {
-	if r.roleFence == nil || binding.ProviderName != provider.Pi || !memberToolRuntimeText(binding.ProviderID) || factory == nil || len(binding.Model) > 256 || !memberToolRuntimeText(binding.Model) ||
+	if binding.ProviderName != provider.Pi {
+		return nil, errMemberToolRuntimeBinding
+	}
+	return r.WrapCoordinationRoleWithCapabilities(binding, expected, nil, factory)
+}
+
+// WrapCoordinationRoleWithCapabilities freezes server-sampled worker support,
+// never grants. The caller must sample adapters before entering this runtime.
+// The legacy wrapper supplies no facts and cannot create new assignments.
+func (r *MemberToolRuntime) WrapCoordinationRoleWithCapabilities(binding MemberToolRunBinding, expected store.CoordinationRoleProvenance, facts []store.DispatchWorkerCapabilityFact, factory MemberToolExecutorFactory) (provider.Executor, error) {
+	if r.roleFence == nil || (binding.ProviderName != provider.Pi && binding.ProviderName != provider.Codex) || !memberToolRuntimeText(binding.ProviderID) || factory == nil || len(binding.Model) > 256 || !memberToolRuntimeText(binding.Model) ||
 		expected.GroupID != binding.GroupID || expected.MemberID != binding.MemberID || expected.ConversationID != binding.ConversationID || expected.DeliveryID != binding.DeliveryID ||
 		expected.TaskRevision < 1 || (expected.Kind != store.CoordinationRoleCoordinator && expected.Kind != store.CoordinationRoleWorker) ||
 		(expected.Kind == store.CoordinationRoleCoordinator && expected.AssignmentID != "") || (expected.Kind == store.CoordinationRoleWorker && !memberToolRuntimeText(expected.AssignmentID)) {
@@ -26,7 +36,7 @@ func (r *MemberToolRuntime) WrapCoordinationRole(binding MemberToolRunBinding, e
 			return nil, errMemberToolRuntimeBinding
 		}
 	}
-	return &memberToolRuntimeRun{runtime: r, binding: binding, factory: factory, role: &expected}, nil
+	return &memberToolRuntimeRun{runtime: r, binding: binding, factory: factory, role: &expected, dispatchCapabilities: slices.Clone(facts)}, nil
 }
 
 // CheckCoordinationRoleCapacity only performs bounded memory GC and Store reads;
@@ -89,7 +99,7 @@ func (e *memberToolRuntimeRun) rolePreflight(ctx context.Context, request provid
 	r.tools.mu.RLock()
 	entry, found := r.tools.capabilities[sha256.Sum256([]byte(token))]
 	valid := found && entry.scope == scope.Member && entry.role == scope && slices.Equal(entry.grants.Operations, memberToolRoleOperations(e.role.Kind)) &&
-		entry.grants.Skills == nil && entry.grants.Artifacts == nil
+		entry.grants.Skills == nil && entry.grants.Artifacts == nil && slices.Equal(entry.dispatchCapabilities, e.dispatchCapabilities)
 	r.tools.mu.RUnlock()
 	return valid && r.roleFence.rootValid(request.RuntimeDir) && r.rootValid() && config.valid() && checkCtx.Err() == nil && ctx.Err() == nil
 }
@@ -132,7 +142,7 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 		}
 		scope.AttemptID = binding.AttemptID
 	}
-	token, err = r.tools.issueCoordinationRole(ctx, scope)
+	token, err = r.tools.issueCoordinationRoleWithCapabilities(ctx, scope, e.dispatchCapabilities)
 	if err != nil {
 		return unknown
 	}

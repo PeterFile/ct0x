@@ -169,6 +169,8 @@ type memberToolRuntimeRun struct {
 	used    atomic.Bool
 	role    *store.CoordinationRoleProvenance
 	intake  bool
+	// Cloned at trusted wrapping and again when the claimed token is registered.
+	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
 
 func memberToolRuntimeReceipt(outcome provider.Outcome, reason string) provider.ExecutionReceipt {
