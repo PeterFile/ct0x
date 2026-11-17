@@ -59,6 +59,38 @@ it("reads only while active and expanded, and enables an explicit-request revisi
   fireEvent.click(screen.getByRole("button", { name: "收起自然聊天工作配置" }));
   const count = policyReads.mock.calls.length; view.rerender(<Tasks group={null} />); await flush(); expect(policyReads).toHaveBeenCalledTimes(count);
 });
+it("requires verified workspace capability for the once-per-policy opt-in without blocking legacy text settings", async () => {
+  await open();
+  expect(form().getByRole("checkbox", { name: "允许明确请求使用已授权写目录" })).toBeDisabled();
+  expect(screen.getByText(/目录工作协议能力未确认/)).toBeVisible();
+  check("启用自然聊天工作"); submit(); await flush();
+  expect(attempt(0).body).not.toContain("allow_workspace_changes"); expect(attempt(0).body).not.toContain("workspace_changes_supported");
+});
+it("saves an explicit workspace opt-in only with supported metadata and leaves preparation text-only", async () => {
+  saved.set(policyURL(), { ...blank(), workspace_changes_supported: true }); await open();
+  check("启用自然聊天工作"); check("允许明确请求使用已授权写目录"); check("允许受限准备工作"); chooseScope();
+  writes.mockImplementationOnce(async (url, init) => {
+    const actual = { ...receipt(String(init?.body)), workspace_changes_supported: true, allow_workspace_changes: true };
+    saved.set(String(url), actual); return json(actual);
+  });
+  submit(); await flush();
+  expect(JSON.parse(attempt(0).body)).toEqual({ enabled: true, allow_preparation: true, preparation_scope_kind: "topic_summary",
+    action: "text_submission", max_admissions: 1, expected_revision: 0, allow_workspace_changes: true });
+  expect(screen.getByRole("region", { name: "当前聊天策略" })).toHaveTextContent("允许明确请求使用已授权写目录");
+  expect(screen.getByText(/已有同群.*读写授权.*当前已验证.*适配器/)).toBeVisible();
+  expect(screen.getByText(/topic_summary 结构限制/)).toHaveTextContent("不允许文件或外部动作");
+});
+it("keeps an unknown workspace opt-in body while newer reads remove capability", async () => {
+  saved.set(policyURL(), { ...blank(), workspace_changes_supported: true }); await open();
+  check("启用自然聊天工作"); check("允许明确请求使用已授权写目录"); writes.mockRejectedValueOnce(new TypeError("Receipt lost"));
+  submit(); await flush(); const original = attempt(0);
+  saved.set(policyURL(), { ...receipt(original.body), revision: 8, workspace_changes_supported: false });
+  fireEvent.click(screen.getByRole("button", { name: "读取当前聊天策略并保留草稿" })); await flush();
+  expect(form().getByRole("checkbox", { name: "允许明确请求使用已授权写目录" })).toBeChecked();
+  writes.mockResolvedValueOnce(refusal(409)); submit(); await flush(); expect(attempt(1)).toEqual(original);
+  expect(form().getByRole("button", { name: "重试同一次聊天策略保存" })).toBeEnabled();
+});
+
 it("requires an explicit topic-summary scope and displays the server-generated rule and command IDs read-only", async () => {
   await open(); check("启用自然聊天工作"); check("允许受限准备工作");
   expect(form().queryByRole("combobox", { name: "书面授权来源" })).not.toBeInTheDocument();

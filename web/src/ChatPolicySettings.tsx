@@ -3,7 +3,7 @@ import { ApiError } from "./api";
 import { getChatPolicy, hasChatPolicyMetadata, isChatPolicyDefinitiveRejection, setChatPolicy } from "./chat-api";
 import type { ChatPolicy, ChatPolicyInput } from "./chat-api";
 
-type Draft = { enabled: boolean; allowPreparation: boolean; scopeKind: string; budget: string };
+type Draft = { enabled: boolean; allowPreparation: boolean; allowWorkspaceChanges: boolean; scopeKind: string; budget: string };
 type Operation = Readonly<{ key: string; input: ChatPolicyInput; source?: Readonly<{ id: string; content: string; created_at: string }> | null }>;
 type State = {
   policy: ChatPolicy | null; read: "idle" | "pending" | "ready" | "unavailable"; readError: string;
@@ -11,13 +11,16 @@ type State = {
   receipt: ChatPolicy | null; error: string; conflict: boolean;
 };
 const draftOf = (policy?: ChatPolicy): Draft => ({ enabled: policy?.enabled ?? false, allowPreparation: policy?.allow_preparation ?? false,
+  allowWorkspaceChanges: policy?.workspace_changes_supported === true && policy.allow_workspace_changes === true,
   scopeKind: policy?.preparation_supported ? policy.preparation_scope_kind ?? "" : "", budget: policy?.revision ? String(policy.max_admissions) : "1" });
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请保留草稿后重试。";
 const samePolicy = (left: ChatPolicy, right: ChatPolicy) => (["revision", "enabled", "allow_preparation", "preauthorization_message_id", "action", "max_admissions", "authorized_by"] as const)
   .every(field => left[field] === right[field]) && (left.preauthorization_text ?? "") === (right.preauthorization_text ?? "")
   && (left.preparation_scope_kind ?? "") === (right.preparation_scope_kind ?? "")
   && (left.preparation_supported ?? false) === (right.preparation_supported ?? false)
-  && (left.configuration_source_id ?? "") === (right.configuration_source_id ?? "");
+  && (left.configuration_source_id ?? "") === (right.configuration_source_id ?? "")
+  && (left.allow_workspace_changes ?? false) === (right.allow_workspace_changes ?? false)
+  && left.workspace_changes_supported === right.workspace_changes_supported;
 
 // One instance per visited group; visibility only suspends reads, never an owned PUT.
 export function ChatPolicySettings({ groupId, active }: { groupId: string; active: boolean }) {
@@ -71,6 +74,9 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
       if (previous.draft.allowPreparation && previous.draft.scopeKind !== "topic_summary") {
         update(value => ({ ...value, error: "请明确选择本群主话题已有消息的纯文本摘要范围；历史规则不能自动升级。" })); return;
       }
+      if (previous.draft.allowWorkspaceChanges && previous.policy.workspace_changes_supported !== true) {
+        update(value => ({ ...value, error: "目录工作协议能力未确认，不能开启目录改动许可。" })); return;
+      }
       let key: string;
       try {
         key = crypto.randomUUID();
@@ -80,7 +86,8 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
       }
       operation = Object.freeze({ key, input: Object.freeze({ enabled: previous.draft.enabled, allow_preparation: previous.draft.allowPreparation,
         ...(previous.draft.allowPreparation ? { preparation_scope_kind: "topic_summary" as const } : {}), action: "text_submission",
-        max_admissions: maxAdmissions, expected_revision: previous.policy.revision }) });
+        max_admissions: maxAdmissions, expected_revision: previous.policy.revision,
+        ...(previous.draft.allowWorkspaceChanges ? { allow_workspace_changes: true } : {}) }) });
     }
     update(value => ({ ...value, operation, phase: "pending", dirty: true, error: "" }));
     try {
@@ -103,12 +110,14 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
   }
   const locked = Boolean(state.operation), draft = state.draft, policy = state.policy;
   const metadata = Boolean(policy && hasChatPolicyMetadata(policy));
+  const workspaceSupported = policy?.workspace_changes_supported === true;
   return <section className="group-panel chat-policy-settings" aria-label="自然聊天工作配置">
     <button type="button" aria-expanded={expanded} aria-controls={id} onClick={() => setExpanded(value => !value)}>
       {expanded ? "收起自然聊天工作配置" : "展开自然聊天工作配置"}</button>
     {state.phase !== "idle" ? <p role="status">{state.phase === "pending" ? "正在等待聊天策略保存回执。" : "聊天策略保存结果未知，请保留原操作。"}</p> : null}
     <div id={id} hidden={!enabled} className="tasks-lifecycle">
-      <p className="tasks-note">范围：仅本群主话题 · 文本提交。不授予文件写入、命令执行或文件成果发布权限；执行仍受已有成员与资源授权约束。</p>
+      <p className="tasks-note">范围：仅本群主话题 · 默认文本提交。目录工作须单独开启下方许可；策略本身不授予目录、命令执行或全局权限。</p>
+      <p className="tasks-note">目录工作仅限明确聊天请求，必须同时具备已有同群成员读写授权与当前已验证的适配器工具能力；由服务端核对目录、任务与权限，不以配置路径或模型建议作为授权。</p>
       <p className="tasks-note">任务预算按策略版本累计，不按消息或评估轮次重置。保存会产生新版本和新的累计预算；停用只阻止后续准入，不取消在途工作。</p>
       <p className="tasks-note">普通明确请求不需要选择书面预授权消息。不会固定模型或强制独立审查，最终接纳仍由用户完成。</p>
       <section aria-label="当前聊天策略">
@@ -116,6 +125,8 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
           <p>版本 {policy.revision} · {policy.revision && !policy.configuration_source_id ? `历史启用标记：${policy.enabled ? "开启" : "关闭"}` : policy.enabled ? "已启用" : "未启用"}
             {policy.revision ? ` · 本版本累计最多 ${policy.max_admissions} 项任务` : "（尚未配置）"}</p>
           {!metadata ? <p role="status">旧实例未提供范围与来源字段，新配置能力未确认；保留历史事实，不能据此保存新授权。</p> : null}
+          {!workspaceSupported ? <p role="status">目录工作协议能力未确认或当前实例不支持，不能开启目录改动许可；原有文本配置不受影响。</p> : null}
+          <p>目录改动许可：{policy.allow_workspace_changes ? workspaceSupported ? "允许明确请求使用已授权写目录" : "历史许可标记开启（协议能力未确认）" : "未开启"}。许可不代表已执行、已交付或用户接纳。</p>
           {policy.allow_preparation && !policy.preparation_supported ? <p role="status">历史准备规则当前不支持，不会自动升级为 topic_summary；请明确选择新范围或关闭准备工作后保存。</p> : null}
           <dl><dt>当前受支持的准备范围</dt><dd>{policy.preparation_supported ? "本群主话题已有消息的纯文本摘要（topic_summary）" : "无已确认的受支持准备范围"}</dd>
             {policy.preparation_scope_kind ? <><dt>服务端范围标识</dt><dd>{policy.preparation_scope_kind}</dd></> : null}
@@ -130,6 +141,8 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
         <fieldset disabled={locked || state.read === "unavailable" || !metadata}>
           <legend>自然聊天工作</legend>
           <label className="chat-policy-toggle"><input type="checkbox" checked={draft.enabled} onChange={event => change({ enabled: event.target.checked })} />启用自然聊天工作</label>
+          <label className="chat-policy-toggle"><input type="checkbox" disabled={!workspaceSupported} checked={draft.allowWorkspaceChanges}
+            onChange={event => change({ allowWorkspaceChanges: event.target.checked })} />允许明确请求使用已授权写目录</label>
           <label className="chat-policy-toggle"><input type="checkbox" checked={draft.allowPreparation} onChange={event => change({ allowPreparation: event.target.checked })} />允许受限准备工作</label>
           <label htmlFor={`${id}-budget`}>本版本累计任务上限</label>
           <input id={`${id}-budget`} type="number" min={1} max={100} step={1} required value={draft.budget} onChange={event => change({ budget: event.target.value })} />
