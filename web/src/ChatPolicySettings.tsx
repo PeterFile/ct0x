@@ -14,13 +14,13 @@ const draftOf = (policy?: ChatPolicy): Draft => ({ enabled: policy?.enabled ?? f
   allowWorkspaceChanges: policy?.workspace_changes_supported === true && policy.allow_workspace_changes === true,
   scopeKind: policy?.preparation_supported ? policy.preparation_scope_kind ?? "" : "", budget: policy?.revision ? String(policy.max_admissions) : "1" });
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请保留草稿后重试。";
+// Workspace support reflects current schema capability, not an immutable policy fact.
 const samePolicy = (left: ChatPolicy, right: ChatPolicy) => (["revision", "enabled", "allow_preparation", "preauthorization_message_id", "action", "max_admissions", "authorized_by"] as const)
   .every(field => left[field] === right[field]) && (left.preauthorization_text ?? "") === (right.preauthorization_text ?? "")
   && (left.preparation_scope_kind ?? "") === (right.preparation_scope_kind ?? "")
   && (left.preparation_supported ?? false) === (right.preparation_supported ?? false)
   && (left.configuration_source_id ?? "") === (right.configuration_source_id ?? "")
-  && (left.allow_workspace_changes ?? false) === (right.allow_workspace_changes ?? false)
-  && left.workspace_changes_supported === right.workspace_changes_supported;
+  && (left.allow_workspace_changes ?? false) === (right.allow_workspace_changes ?? false);
 
 // One instance per visited group; visibility only suspends reads, never an owned PUT.
 export function ChatPolicySettings({ groupId, active }: { groupId: string; active: boolean }) {
@@ -93,7 +93,8 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
     try {
       const receipt = await setChatPolicy(groupId, operation.input, operation.key);
       if (!mounted.current) return;
-      update(value => ({ ...value, receipt, operation: null, phase: "idle", error: "", conflict: false, read: "pending" }));
+      // Edits stay locked until this operation receives a matching receipt.
+      update(value => ({ ...value, receipt, operation: null, phase: "idle", dirty: false, error: "", conflict: false, read: "pending" }));
       setVersion(value => value + 1);
     } catch (error) {
       if (!mounted.current) return;

@@ -140,7 +140,7 @@ function isRepairLink(value: unknown, admission: Record<string, unknown>): value
   if (admission.source_kind !== "platform" || admission.source_id !== `review:${value.parent_review_id}`) return false;
   return value.authorization === "review_request" ? value.authorization_source_kind === "local_user_review"
     && value.authorization_source_id === value.parent_review_id && value.authorization_policy_revision === admission.policy_revision
-    : value.authorization === "original_agreement";
+    : value.authorization === "original_agreement" && positive(admission.policy_revision) && value.authorization_policy_revision <= admission.policy_revision;
 }
 function isAdmission(value: unknown, groupId: string, taskId: string): value is ChatAdmission {
   const metadata = ["source_id", "source_kind", "purpose", "authority_evidence_verified", "outcome", "reason_code", "question", "workspace_scope", "repair_link"];

@@ -304,3 +304,27 @@ it("delta-4 accepts canonical WriteJSON escaping and key-like text inside an err
   vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValueOnce(new Response(raw, { status: 404, headers: { "Content-Type": "application/json" } })));
   await expect(getChatAdmission(group.id, task.id)).resolves.toBeNull();
 });
+
+const originalAgreements = [
+  ["chat", { ...reviewRepair, authorization_message_id: "original-chat-message", repair_link: { ...repairLink,
+    authorization: "original_agreement", authorization_source_kind: "local_user_chat", authorization_source_id: "original-chat-command",
+    authorization_message_id: "original-chat-message", authorization_policy_revision: 1, artifact_versions: [] } }],
+  ["Policy", policyRepair],
+  ["Review", { ...reviewRepair, repair_link: { ...repairLink, authorization: "original_agreement",
+    authorization_source_id: "earlier-original-review", authorization_policy_revision: 1 } }],
+] as const;
+it.each(originalAgreements)("repair: accepts earlier and equal original %s policy revisions", async (_, receipt) => {
+  for (const revision of [1, receipt.policy_revision]) {
+    const actual = { ...receipt, repair_link: { ...receipt.repair_link, authorization_policy_revision: revision } };
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValueOnce(json(actual)));
+    await expect(getChatAdmission(group.id, task.id)).resolves.toEqual(actual);
+  }
+});
+it.each(originalAgreements)("repair: rejects future original %s policy revisions in the same topic", async (_, receipt) => {
+  for (const topic of ["", "topic-雪"]) await rejectRepair({ ...receipt, topic_id: topic,
+    repair_link: { ...receipt.repair_link, topic_id: topic, authorization_policy_revision: receipt.policy_revision + 1 } });
+});
+it.each([["Review", reviewRepair], ["chat", chatRepair]] as const)("repair: still requires current %s authorization to equal the receipt policy revision", async (_, receipt) => {
+  for (const revision of [receipt.policy_revision - 1, receipt.policy_revision + 1])
+    await rejectRepair({ ...receipt, repair_link: { ...receipt.repair_link, authorization_policy_revision: revision } });
+});
