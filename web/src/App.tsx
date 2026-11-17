@@ -3,6 +3,7 @@ import type { ComponentType } from "react";
 import type { Group, Member } from "./api";
 import type { AppShellProps, ShellContext } from "./openbot-shell/types";
 import { Discussion } from "./Discussion";
+import type { RecipientSelection } from "./Discussion";
 import { Groups } from "./Groups";
 import { HistorySearch } from "./HistorySearch";
 import { Members } from "./Members";
@@ -31,6 +32,7 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
   const [viewVersion, setViewVersion] = useState(0);
   const [selected, setSelected] = useState<Group | null>(null);
   const [members, setMembers] = useState<Record<string, Member[]>>({});
+  const [recipientSelection, setRecipientSelection] = useState<RecipientSelection>();
   const groups = useRef<HTMLElement>(null), groupsHeading = useRef<HTMLHeadingElement>(null);
   const chatHeading = useRef<HTMLHeadingElement>(null), contextHeading = useRef<HTMLHeadingElement>(null);
   const membersTrigger = useRef<HTMLButtonElement>(null), tasksTrigger = useRef<HTMLButtonElement>(null), historyTrigger = useRef<HTMLButtonElement>(null);
@@ -72,6 +74,11 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
     if (next === "history") setHistoryVisited(true);
     if (Shell) setPane("chat");
     setContext(next); setViewVersion(previous => previous + 1);
+  }
+  function selectRecipient(groupId: string, memberId: string) {
+    if (groupId !== selected?.id) return;
+    setRecipientSelection(previous => ({ groupId, memberId, version: (previous?.version ?? 0) + 1 }));
+    showChat();
   }
   function showChat() {
     focusNext.current = "chat";
@@ -115,7 +122,7 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
           </div> : null}
         </div>
         <div className="discussion-content">
-          <Discussion groupId={chatVisible ? selected?.id : undefined} members={members} />
+          <Discussion groupId={chatVisible ? selected?.id : undefined} members={members} recipientSelection={recipientSelection} />
         </div>
       </main>,
 
@@ -128,7 +135,7 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
         {/* Visibility suspends reads, not group-scoped drafts or mutations. The roster also feeds the composer. */}
         <div className="im-context-body">
           <div id="im-members" hidden={context !== "members"}>
-            <Members groupId={selected?.id} onMembers={rememberMembers} catalogueActive={contextVisible && context === "members"} />
+            <Members groupId={selected?.id} onMembers={rememberMembers} onRecipient={selectRecipient} catalogueActive={contextVisible && context === "members"} />
           </div>
           <div id="im-tasks" hidden={context !== "tasks"}>
             {tasksVisited ? <Tasks group={contextVisible && context === "tasks" ? selected : null} /> : null}

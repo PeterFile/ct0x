@@ -154,6 +154,7 @@ it.each([local, agent])("opens the exact persisted source $id in one stable hist
   await screen.findByRole("article", { name: `消息 ${source.id}` });
   const composer = screen.getByRole("textbox", { name: "消息内容" });
   change(composer, "  未发送的消息草稿\n不能当作来源  ");
+  fireEvent.click(screen.getByText("发送选项", { selector: "summary" }));
   fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: "selected" } });
   const recipient = screen.getByRole("checkbox", { name: `${member.name} · ${member.role} · ${member.id}` });
   fireEvent.click(recipient);
@@ -253,6 +254,7 @@ it.each([false, true])("isolates a pending admission and late 201 across actual 
 it("preserves an actual 503 unknown through mobile details/groups and retries only the frozen original source/key/payload", async () => {
   workWrites.mockResolvedValueOnce(json({}, 503)); await openApp(true);
   const composer = screen.getByRole("textbox", { name: "消息内容" }); change(composer, "原来的消息草稿");
+  fireEvent.click(screen.getByText("发送选项", { selector: "summary" }));
   fireEvent.change(screen.getByRole("combobox", { name: "接收方式" }), { target: { value: "selected" } });
   const recipient = await screen.findByRole("checkbox", { name: `${member.name} · ${member.role} · ${member.id}` }); fireEvent.click(recipient);
   openSource(agent); fill(); const originalRegion = region(), title = field(); submitWork();

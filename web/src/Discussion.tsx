@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection, sendMessage } from "./api";
 import type { Delivery, Member, MessageInput } from "./api";
@@ -29,7 +29,11 @@ function shortTime(value: string) {
   });
 }
 
-export function Discussion({ groupId, members }: { groupId?: string; members: Record<string, Member[]> }) {
+export type RecipientSelection = { groupId: string; memberId: string; version: number };
+
+export function Discussion({ groupId, members, recipientSelection }: {
+  groupId?: string; members: Record<string, Member[]>; recipientSelection?: RecipientSelection;
+}) {
   const [visited, setVisited] = useState<string[]>([]);
   useEffect(() => {
     if (groupId) setVisited(previous => previous.includes(groupId) ? previous : [...previous, groupId]);
@@ -37,15 +41,21 @@ export function Discussion({ groupId, members }: { groupId?: string; members: Re
   return <>
     {!groupId ? <p className="empty-panel">请先选择群组，再查看讨论和发送消息。</p> : null}
     {visited.map(id => <div key={id} className="discussion-scope" hidden={id !== groupId}>
-      <DiscussionScope groupId={id} active={id === groupId} members={members[id] ?? emptyMembers} />
+      <DiscussionScope groupId={id} active={id === groupId} members={members[id] ?? emptyMembers} recipientSelection={recipientSelection} />
     </div>)}
   </>;
 }
-function DiscussionScope({ groupId, active, members }: { groupId: string; active: boolean; members: Member[] }) {
+function DiscussionScope({ groupId, active, members, recipientSelection }: {
+  groupId: string; active: boolean; members: Member[]; recipientSelection?: RecipientSelection;
+}) {
   const formId = useId(), feed = useMessageFeed(groupId, active);
   const scroll = useMessageScroll(active, feed.items, feed.page);
   const [content, setContent] = useState("");
   const [route, setRoute] = useState("default"), [recipients, setRecipients] = useState<string[]>([]);
+  const [mention, setMention] = useState<{ start: number; end: number; query: string } | null>(null);
+  const [highlight, setHighlight] = useState(0);
+  const textarea = useRef<HTMLTextAreaElement>(null), caret = useRef<number | null>(null);
+  const composing = useRef(false), receivedSelection = useRef<RecipientSelection | undefined>(undefined);
   const [mutation, setMutation] = useState({ pending: false, uncertain: false, error: "", notice: "" });
   const requestWork = useRef<RequestWorkHandle>(null);
   const operation = useRef<{ key: string; input: MessageInput } | null>(null);
@@ -53,6 +63,44 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
   const eligible = members.filter(member => member.group_id === groupId && member.status === "active");
   const memberNames = new Map(members.filter(member => member.group_id === groupId).map(member => [member.id, member.name]));
   const authorName = (id: string) => id === "user" ? "我" : memberNames.get(id) ?? "未载入成员";
+  const blocked = mutation.pending || mutation.uncertain;
+  const suggestions = mention && active && !blocked ? eligible.filter(member => (route !== "selected" || !recipients.includes(member.id))
+    && `${member.name} ${member.role} ${member.id}`.toLocaleLowerCase().includes(mention.query.toLocaleLowerCase())) : [];
+  const highlighted = Math.min(highlight, suggestions.length - 1);
+  useLayoutEffect(() => {
+    if (caret.current === null || !active) return;
+    textarea.current?.focus(); textarea.current?.setSelectionRange(caret.current, caret.current); caret.current = null;
+  }, [content, active]);
+  useEffect(() => {
+    if (!recipientSelection || recipientSelection.groupId !== groupId || receivedSelection.current === recipientSelection) return;
+    receivedSelection.current = recipientSelection;
+    if (posting.current || operation.current) {
+      setMutation(previous => ({ ...previous, notice: "原发送尚未确认，不能替换接收者。" })); return;
+    }
+    if (!eligible.some(member => member.id === recipientSelection.memberId)) return;
+    setRecipients(previous => route !== "selected" ? [recipientSelection.memberId]
+      : previous.includes(recipientSelection.memberId) ? previous : [...previous, recipientSelection.memberId]);
+    setRoute("selected"); setMention(null); textarea.current?.focus();
+  }, [recipientSelection, groupId, members, route]);
+  function updateMention(input: HTMLTextAreaElement) {
+    const end = input.selectionStart, match = /@([^\s@]*)$/u.exec(input.value.slice(0, end));
+    setMention(!composing.current && input.selectionStart === input.selectionEnd && match
+      ? { start: end - match[1].length - 1, end, query: match[1] } : null);
+    setHighlight(0);
+  }
+  function selectMention(id: string) {
+    const member = eligible.find(member => member.id === id);
+    if (blocked || posting.current || operation.current || !member || !mention) return;
+    setRecipients(previous => route !== "selected" ? [id] : previous.includes(id) ? previous : [...previous, id]); setRoute("selected");
+    const insertion = `@${member.name} `;
+    caret.current = mention.start + insertion.length;
+    setContent(previous => previous.slice(0, mention.start) + insertion + previous.slice(mention.end)); setMention(null);
+  }
+  function removeRecipient(id: string) {
+    if (blocked) return;
+    setRecipients(previous => previous.filter(value => value !== id));
+    if (recipients.length === 1) setRoute("default");
+  }
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; posting.current?.abort(); };
@@ -64,8 +112,9 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
     if (!operation.current && (!content.trim() || invalidRecipients)) {
       setMutation({ pending: false, uncertain: false, notice: "", error: !content.trim() ? "请输入消息内容。" : "请选择本群已载入的在群成员，或清除选择后重选。" }); return;
     }
-    operation.current ??= { key: crypto.randomUUID(), input: { content,
-      ...(route === "default" ? {} : { recipient_ids: route === "public" ? [] : [...recipients] }) } };
+    operation.current ??= { key: crypto.randomUUID(), input: Object.freeze({ content,
+      ...(route === "default" ? {} : { recipient_ids: Object.freeze(route === "public" ? [] : [...recipients]) }) }) };
+    setMention(null);
     const current = operation.current, controller = new AbortController(); posting.current = controller;
     setMutation({ pending: true, uncertain: false, error: "", notice: "" });
     const attempt = feed.beginSend();
@@ -139,28 +188,60 @@ function DiscussionScope({ groupId, active, members }: { groupId: string; active
     <section className="message-composer" aria-label="撰写消息" tabIndex={0}>
     <form aria-label="发送消息" onSubmit={submit}>
       {scroll.windowReset ? <p className="feed-note">历史窗口已更新，可加载更早消息</p> : null}
-      <fieldset disabled={mutation.pending || mutation.uncertain}>
+      <fieldset disabled={blocked}>
         <label htmlFor={`${formId}-content`}>消息内容</label>
-        <textarea id={`${formId}-content`} required rows={2} value={content} onChange={event => setContent(event.target.value)} />
+        <textarea ref={textarea} id={`${formId}-content`} required rows={2} value={content} placeholder="直接发消息，输入 @ 选择成员"
+          aria-autocomplete="list" aria-controls={suggestions.length ? `${formId}-mentions` : undefined}
+          aria-activedescendant={suggestions.length ? `${formId}-mention-${highlighted}` : undefined}
+          aria-describedby={`${formId}-help`}
+          onChange={event => { if (!blocked) { setContent(event.target.value); updateMention(event.currentTarget); } }}
+          onSelect={event => { if (!blocked) updateMention(event.currentTarget); }}
+          onCompositionStart={() => { composing.current = true; setMention(null); }}
+          onCompositionEnd={event => { composing.current = false; updateMention(event.currentTarget); }}
+          onKeyDown={event => {
+            if (event.nativeEvent.isComposing || composing.current || !mention) return;
+            if (event.key === "Escape") { event.preventDefault(); setMention(null); }
+            else if (suggestions.length && ["ArrowDown", "ArrowUp", "Enter"].includes(event.key)) {
+              event.preventDefault();
+              if (event.key === "Enter") selectMention(suggestions[highlighted].id);
+              else setHighlight((highlighted + (event.key === "ArrowDown" ? 1 : -1) + suggestions.length) % suggestions.length);
+            }
+          }} />
       </fieldset>
+      {mention && active && !blocked ? suggestions.length ? <ul className="mention-suggestions" id={`${formId}-mentions`} role="listbox" aria-label="选择消息接收者">
+        {suggestions.map((member, index) => <li key={member.id} role="none"><button type="button" role="option" tabIndex={-1}
+          id={`${formId}-mention-${index}`} aria-selected={index === highlighted}
+          onMouseDown={event => event.preventDefault()} onClick={() => selectMention(member.id)}>
+          <strong>{member.name}</strong><span>{member.role} · {member.id}</span>
+        </button></li>)}
+      </ul> : <p className="feed-note" role="status">没有匹配的已载入在群成员；可打开成员详情加载。</p> : null}
+      {route === "selected" && recipients.length ? <fieldset disabled={blocked}>
+        <ul className="selected-recipients" aria-label="已选接收者">{recipients.map(id => <li key={id}>
+          <span>{memberNames.get(id) ?? "未载入成员"} · {id}{!eligible.some(member => member.id === id) ? "（已失效，请移除或重新载入）" : ""}</span>
+          <button type="button" aria-label={`移除接收者 ${id}`} onClick={() => removeRecipient(id)}>移除</button>
+        </li>)}</ul>
+      </fieldset> : null}
       <div className="composer-actions">
-        <fieldset disabled={mutation.pending || mutation.uncertain}>
-          <label htmlFor={`${formId}-route`}>接收方式</label>
-          <select id={`${formId}-route`} value={route} onChange={event => setRoute(event.target.value)}>
-            <option value="default">默认路由（由服务决定）</option><option value="public">仅公开可见（不唤醒）</option><option value="selected">指定本群成员</option>
-          </select>
-        </fieldset>
+        <p className="feed-note" id={`${formId}-help`}>@ 选择接收者 · ↑↓ 选择，Enter 确认</p>
         <button className="primary-send" type="submit" disabled={mutation.pending}>{mutation.pending ? "正在发送…" : mutation.uncertain ? "重试同一次发送" : "发送消息"}</button>
       </div>
-      {route === "selected" ? <fieldset disabled={mutation.pending || mutation.uncertain}>
-        <div className="recipient-list">
-          <p className="feed-note">仅列出已载入的在群成员；更多成员请打开成员详情加载。</p>
-          {eligible.map(member => <label key={member.id}><input type="checkbox" checked={recipients.includes(member.id)}
-            onChange={event => setRecipients(previous => event.target.checked ? [...previous, member.id] : previous.filter(id => id !== member.id))} />
-            <span>{member.name} · {member.role} · {member.id}</span></label>)}
-          <button type="button" onClick={() => setRecipients([])}>清除所选成员</button>
-        </div>
-      </fieldset> : null}
+      {route === "public" ? <p className="feed-note">仅公开可见，不唤醒成员。</p> : null}
+      <details className="composer-options">
+        <summary>发送选项</summary>
+        <fieldset disabled={blocked}>
+          <label htmlFor={`${formId}-route`}>接收方式</label>
+          <select id={`${formId}-route`} value={route} onChange={event => { if (!blocked) setRoute(event.target.value); }}>
+            <option value="default">默认路由（由服务决定）</option><option value="public">仅公开可见（不唤醒）</option><option value="selected">指定本群成员</option>
+          </select>
+          {route === "selected" ? <div className="recipient-list">
+            <p className="feed-note">仅列出已载入的在群成员；更多成员请打开成员详情加载。</p>
+            {eligible.map(member => <label key={member.id}><input type="checkbox" checked={recipients.includes(member.id)}
+              onChange={event => { if (!blocked) setRecipients(previous => event.target.checked ? [...previous, member.id] : previous.filter(id => id !== member.id)); }} />
+              <span>{member.name} · {member.role} · {member.id}</span></label>)}
+            <button type="button" onClick={() => { if (!blocked) setRecipients([]); }}>清除所选成员</button>
+          </div> : null}
+        </fieldset>
+      </details>
       {content.length > 0 || mutation.uncertain ? <p className="feed-note">草稿与未确认发送仅保留在本页，重载会丢失。</p> : null}
       {mutation.error ? <p role="alert">{mutation.error}</p> : null}
       {mutation.notice ? <p role="status">{mutation.notice}</p> : null}

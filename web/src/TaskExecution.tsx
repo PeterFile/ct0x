@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { ApiError } from "./api";
 import { getDispatchExecution } from "./dispatch-execution-api";
 import type { DispatchExecution, ExecutionTurn, ExecutionTurnState } from "./dispatch-execution-api";
+import { useActiveRefresh } from "./useActiveRefresh";
 
 type Identity = { groupId: string; taskId: string; requestId: string };
 const stateText: Record<ExecutionTurnState, string> = {
@@ -39,11 +40,11 @@ export function TaskExecution({ active, ...identity }: Identity & { active: bool
   return active ? <ExecutionSample key={JSON.stringify([identity.groupId, identity.taskId, identity.requestId])} {...identity} /> : null;
 }
 function ExecutionSample({ groupId, taskId, requestId }: Identity) {
-  const [round, setRound] = useState(0);
+  const [round, setRound] = useState(1);
   const [sample, setSample] = useState<{ round: number; view: DispatchExecution | null; error: string }>({ round: 0, view: null, error: "" });
   const current = sample.round === round, view = current ? sample.view : null, pending = !current;
+  useActiveRefresh(true, pending, () => setRound(value => value + 1));
   useEffect(() => {
-    if (!round) return;
     let ignore = false;
     const controller = new AbortController();
     void getDispatchExecution(groupId, taskId, requestId, controller.signal).then(view => {
@@ -55,10 +56,9 @@ function ExecutionSample({ groupId, taskId, requestId }: Identity) {
   }, [groupId, taskId, requestId, round]);
   return <section className="tasks-lifecycle" aria-label="执行回执" aria-busy={pending}>
     <h3>执行回执</h3>
-    <p className="tasks-note">以下为显式刷新时的只读样本，不会自动追踪。执行不等于任务提交或用户验收。</p>
+    <p className="tasks-note">当前面板自动读取执行回执，仅展示服务端观测。执行不等于任务提交或用户验收。</p>
     <p className="tasks-meta">请求标识：{requestId}</p>
     <button type="button" onClick={() => setRound(value => value + 1)}>刷新执行回执</button>
-    {!round ? <p className="tasks-note">尚未读取执行回执，不能从登记、分配或接收推断正在运行。</p> : null}
     {pending ? <p role="status">正在读取执行回执…</p> : null}
     {current && sample.error ? <p role="alert">{sample.error}</p> : null}
     {view ? <>
