@@ -25,7 +25,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        slot: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+        slot: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -92,18 +92,56 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  go-httpapi:
+    name: Go HTTPAPI ${{ matrix.slot }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run and verify HTTPAPI shard
+        env:
+          HTTPAPI_SLOT: ${{ matrix.slot }}
+        run: |
+          set -euo pipefail
+          package=$(go list ./internal/httpapi)
+          sha=$(git rev-parse HEAD)
+          tree=$(git rev-parse HEAD^{tree})
+          go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/httpapi | tee "$RUNNER_TEMP/httpapi-list.json"
+          pattern=$(python3 .github/scripts/verify-store-shard.py select --profile httpapi "$HTTPAPI_SLOT" "$package" "$RUNNER_TEMP/httpapi-list.json")
+          go test -count=1 -race -json -run "$pattern" ./internal/httpapi | tee "$RUNNER_TEMP/httpapi-run.json"
+          python3 .github/scripts/verify-store-shard.py verify --profile httpapi "$HTTPAPI_SLOT" "$package" "$RUNNER_TEMP/httpapi-list.json" "$RUNNER_TEMP/httpapi-run.json" \
+            --run-id "$GITHUB_RUN_ID" --sha "$sha" --tree "$tree" > "$RUNNER_TEMP/httpapi-summary.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: httpapi-shard-v1-${{ matrix.slot }}
+          path: ${{ runner.temp }}/httpapi-summary.json
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+
   go:
     name: Go
-    needs: [go-store, go-platform]
+    needs: [go-store, go-platform, go-httpapi]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - name: Check Store and Platform shards
+      - name: Check Store, Platform and HTTPAPI shards
         env:
           STORE_RESULT: ${{ needs.go-store.result }}
           PLATFORM_RESULT: ${{ needs.go-platform.result }}
-        run: test "$STORE_RESULT" = success && test "$PLATFORM_RESULT" = success
+          HTTPAPI_RESULT: ${{ needs.go-httpapi.result }}
+        run: test "$STORE_RESULT" = success && test "$PLATFORM_RESULT" = success && test "$HTTPAPI_RESULT" = success
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -135,6 +173,17 @@ jobs:
           package=$(go list ./internal/platform)
           python3 .github/scripts/verify-store-shard.py aggregate --profile platform "$package" "$RUNNER_TEMP/platform-shards" \
             --run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: httpapi-shard-v1-*
+          path: ${{ runner.temp }}/httpapi-shards
+          merge-multiple: false
+      - name: Verify HTTPAPI shard coverage
+        run: |
+          set -euo pipefail
+          package=$(go list ./internal/httpapi)
+          python3 .github/scripts/verify-store-shard.py aggregate --profile httpapi "$package" "$RUNNER_TEMP/httpapi-shards" \
+            --run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"
       - name: Ordinary test coordination package
         run: go test -count=1 ./internal/coordination
       - name: Race test coordination package
@@ -146,15 +195,19 @@ jobs:
           set -euo pipefail
           store=$(go list ./internal/store)
           platform=$(go list ./internal/platform)
+          httpapi=$(go list ./internal/httpapi)
           coordination=$(go list ./internal/coordination)
           [[ -n "$store" && "$store" != *$'\n'* &&
              -n "$platform" && "$platform" != *$'\n'* &&
+             -n "$httpapi" && "$httpapi" != *$'\n'* &&
              -n "$coordination" && "$coordination" != *$'\n'* &&
-             "$store" != "$platform" && "$store" != "$coordination" && "$platform" != "$coordination" ]] || exit 1
+             "$store" != "$platform" && "$store" != "$coordination" && "$platform" != "$coordination" &&
+             "$httpapi" != "$store" && "$httpapi" != "$platform" && "$httpapi" != "$coordination" ]] || exit 1
           all=$(go list ./...)
           rest=()
           store_count=0
           platform_count=0
+          httpapi_count=0
           coordination_count=0
           while IFS= read -r package; do
             [[ -n "$package" ]] || exit 1
@@ -162,13 +215,15 @@ jobs:
               store_count=$((store_count + 1))
             elif [[ "$package" == "$platform" ]]; then
               platform_count=$((platform_count + 1))
+            elif [[ "$package" == "$httpapi" ]]; then
+              httpapi_count=$((httpapi_count + 1))
             elif [[ "$package" == "$coordination" ]]; then
               coordination_count=$((coordination_count + 1))
             else
               rest+=("$package")
             fi
           done <<< "$all"
-          [[ "$store_count" -eq 1 && "$platform_count" -eq 1 && "$coordination_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
+          [[ "$store_count" -eq 1 && "$platform_count" -eq 1 && "$httpapi_count" -eq 1 && "$coordination_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
           go test -race "${rest[@]}"
       - run: go vet ./...
       - name: Record benchmark metrics
