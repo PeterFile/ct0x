@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { App } from "./App";
+import { Members } from "./Members";
 import { deferred, group, json, other, page } from "./test/groups";
 import { member, provider } from "./test/members";
 const reads = vi.fn<typeof fetch>();
@@ -11,6 +12,8 @@ const panel = () => {
   const form = within(landmark).queryByRole("form", { name: "创建成员" });
   return within(form?.closest(".group-panel") ?? landmark);
 };
+const detailValue = (label: string) => within(panel().getByRole("region", { name: "成员详情" }))
+  .getByText(label, { selector: "dt" }).nextElementSibling;
 const field = (name: string) => panel().getByRole("textbox", { name });
 const change = (name: string, value: string) => fireEvent.change(field(name), { target: { value } });
 const submit = () => fireEvent.submit(panel().getByRole("form", { name: "创建成员" }));
@@ -203,6 +206,185 @@ it("pages the catalogue explicitly and renders unknown future account strings ho
   fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
   expect(await panel().findByRole("option", { name: /codex.*1.2.3.*未登录/ })).toHaveValue("actual-second-id");
   expect(catalogue.mock.calls[1][0]).toBe("/api/v1/providers?limit=50&before=next%2B%2F");
+});
+const adapterCapabilityLabels = ["平台工具", "原生会话恢复", "权限交互", "原生取消", "终态证据", "运行中追加"];
+function memberAdapter() {
+  return { id: "pi_fixture", protocol: "pi_extension", enabled: false,
+    capabilities: { platform_tools: "supported", native_resume: "unknown", permission_interaction: "unsupported",
+      cancel: "unknown", terminal_evidence: "supported", steer: "unsupported",
+      evidence: { source: "builtin_contract", provider_id: provider.id, name: provider.name,
+        path: provider.path, version: "1.4.0", protocol: "pi_extension" } } };
+}
+it.each([false, true])("keeps absent adapter capabilities unknown despite authenticated legacy tools/resume (report=%s)", async hasReport => {
+  reads.mockResolvedValueOnce(page([{ ...member, provider_id: provider.id }]));
+  catalogue.mockResolvedValueOnce(page([{ ...provider, capabilities: { one_shot: true, tools: true, resume: true },
+    ...(hasReport ? { adapter: { id: "pi_fixture", protocol: "pi_extension", enabled: true } } : {}) }]));
+  await open(); await panel().findByRole("option", { name: /pi.*账户已登录/ });
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  for (const label of adapterCapabilityLabels) expect(detailValue(label)).toHaveTextContent(/^未知$/);
+  if (!hasReport) expect(panel().getByText("接入信息未提供/能力未知")).toBeVisible();
+  expect(detailValue("账户状态")).toHaveTextContent("已登录（运行未验证）");
+  expect(detailValue("连通性")).toHaveTextContent("未检查");
+  expect(panel().queryByText(/^支持（实现合同）$/)).not.toBeInTheDocument();
+  expect(panel().queryByText(/已就绪/)).not.toBeInTheDocument();
+});
+it("shows version-bound contract support, disabled process and unsupported permissions separately", async () => {
+  reads.mockResolvedValueOnce(page([{ ...member, provider_id: provider.id, model: "configured-model" }]));
+  catalogue.mockResolvedValueOnce(page([{ ...provider, version: "1.4.0", adapter: memberAdapter() }]));
+  await open(); await panel().findByRole("option", { name: /pi.*1.4.0/ });
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  expect(detailValue("CLI 版本")).toHaveTextContent("1.4.0");
+  expect(detailValue("当前接入方式")).toHaveTextContent("pi_extension");
+  expect(detailValue("进程启用状态")).toHaveTextContent("未启用");
+  expect(detailValue("平台工具")).toHaveTextContent(/^支持（实现合同）$/);
+  expect(detailValue("原生会话恢复")).toHaveTextContent(/^未知$/);
+  expect(detailValue("权限交互")).toHaveTextContent(/^不支持$/);
+  expect(detailValue("原生取消")).toHaveTextContent(/^未知$/);
+  expect(detailValue("终态证据")).toHaveTextContent(/^支持（实现合同）$/);
+  expect(detailValue("运行中追加")).toHaveTextContent(/^不支持$/);
+  expect(panel().getByText(/实现合同只证明此版本的接入实现/)).toHaveTextContent("并非握手或实际运行证明");
+  expect(panel().queryByRole("button", { name: /批准|授权|启用接入/ })).not.toBeInTheDocument();
+});
+it("labels refreshed CLI/model selection as current configuration, not historical Turn or actual model evidence", async () => {
+  const hostilePath = '<img src=x onerror="alert(1)">';
+  const hostileModel = '<script>alert("model")</script>';
+  const selected = { ...member, provider_id: provider.id, model: "old-model" };
+  reads.mockResolvedValueOnce(page([selected]));
+  catalogue.mockResolvedValueOnce(page([{ ...provider, adapter: { id: "pi_baseline", protocol: "one_shot", enabled: true } }], "next"));
+  await open(); await panel().findByRole("option", { name: /pi.*账户已登录/ });
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  expect(detailValue("当前接入方式")).toHaveTextContent("one_shot");
+  const newProvider = { ...provider, id: "codex_current", name: "codex", version: "0.162.1", path: hostilePath,
+    adapter: { id: "codex_native", protocol: "codex_app_server", enabled: false } };
+  catalogue.mockResolvedValueOnce(page([newProvider]));
+  fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+  await panel().findByRole("option", { name: /codex.*0.162.1/ });
+  reads.mockResolvedValueOnce(page([{ ...selected, provider_id: newProvider.id, model: hostileModel }]));
+  fireEvent.click(panel().getByRole("button", { name: "刷新成员" }));
+  await panel().findByText(hostileModel);
+  expect(detailValue("当前接入方式")).toHaveTextContent("codex_app_server");
+  expect(detailValue("模型配置")).toHaveTextContent(hostileModel);
+  expect(detailValue("CLI 路径")).toHaveTextContent(hostilePath);
+  expect(panel().getByText(/以上为当前目录与成员配置/)).toHaveTextContent("不证明历史 Turn 的接入协议、实际模型或运行结果");
+  expect(panel().queryByText("old-model")).not.toBeInTheDocument();
+  expect(panel().queryByRole("img")).not.toBeInTheDocument();
+  expect(panel().getByRole("region", { name: "成员详情" }).querySelector("script")).toBeNull();
+  expect(writes).not.toHaveBeenCalled();
+});
+function catalogueScope(active: boolean) {
+  return <aside aria-label="成员" hidden={!active}><Members groupId={group.id} catalogueActive={active} /></aside>;
+}
+it.each([["failed", false], ["first-page", false], ["failed", true]] as const)(
+  "keeps provider draft selection aligned with its DTO after %s reload (clear=%s)", async (reload, clear) => {
+    const firstPage = { ...provider, id: "first-page-provider", name: "codex", path: "/fixture/codex" };
+    catalogue.mockResolvedValueOnce(page([firstPage], "provider-page"));
+    const mounted = render(catalogueScope(true));
+    fireEvent.click(await panel().findByRole("button", { name: "展开创建成员" }));
+    await draft(); await panel().findByRole("option", { name: /\/fixture\/codex/ });
+    catalogue.mockResolvedValueOnce(page([provider]));
+    fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+    await panel().findByRole("option", { name: /\/opt\/bin\/pi/ });
+    const select = panel().getByRole("combobox", { name: "运行器（可选）" }) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: provider.id } });
+    catalogue.mockResolvedValueOnce(reload === "failed" ? json({}, 503) : page([firstPage], "new-provider-page"));
+    mounted.rerender(catalogueScope(false)); mounted.rerender(catalogueScope(true));
+    if (reload === "failed") expect(await panel().findByText(/运行器目录暂不可用/)).toBeVisible();
+    else await panel().findByRole("option", { name: /\/fixture\/codex/ });
+    expect(select).toHaveValue(provider.id);
+    expect(select.selectedOptions[0].textContent).toBe(`原选择，目录未确认（${provider.id}）`);
+    if (clear) {
+      fireEvent.change(select, { target: { value: "" } });
+      expect(select).toHaveValue("");
+      expect(select.selectedOptions[0]).toHaveTextContent("暂不绑定运行器");
+    }
+    const shown = select.value;
+    writes.mockResolvedValueOnce(json({ ...member, provider_id: clear ? "" : provider.id }, 201));
+    submit();
+    const sent = JSON.parse(String(writes.mock.calls[0][1]?.body));
+    expect(sent.provider_id ?? "").toBe(shown);
+    expect(sent).toEqual({ name: member.name, role: member.role, ...(clear ? {} : { provider_id: provider.id }) });
+    await panel().findByRole("button", { name: member.name });
+  },
+);
+it("downgrades unconfirmed catalogue reactivation and exposes failure outside collapsed creation while preserving selection and draft", async () => {
+  const current = { ...provider, version: "1.4.0", adapter: { ...memberAdapter(), enabled: true } };
+  reads.mockResolvedValueOnce(page([{ ...member, provider_id: provider.id, model: "configured-model" }]));
+  catalogue.mockResolvedValueOnce(page([current]));
+  const mounted = render(catalogueScope(true));
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  expect(await panel().findByText("已启用（不代表运行就绪）")).toBeVisible();
+  fireEvent.click(panel().getByRole("button", { name: "展开创建成员" }));
+  change("成员名称", "保留的草稿");
+  fireEvent.click(panel().getByRole("button", { name: "收起创建成员" }));
+  const reload = deferred<Response>(); catalogue.mockReturnValueOnce(reload.promise);
+  mounted.rerender(catalogueScope(false)); mounted.rerender(catalogueScope(true));
+  expect(await panel().findByText(/正在载入运行器目录/)).toBeVisible();
+  expect(detailValue("进程启用状态")).toHaveTextContent(/^未知$/);
+  expect(detailValue("平台工具")).toHaveTextContent(/^未知$/);
+  await act(async () => reload.resolve(json({}, 503)));
+  expect(await panel().findByText(/运行器目录暂不可用/)).toBeVisible();
+  expect(detailValue("进程启用状态")).toHaveTextContent(/^未知$/);
+  expect(detailValue("平台工具")).toHaveTextContent(/^未知$/);
+  expect(detailValue("模型配置")).toHaveTextContent("configured-model");
+  expect(panel().getByRole("button", { name: member.name })).toHaveAttribute("aria-pressed", "true");
+  expect(panel().getByRole("button", { name: "展开创建成员" })).toHaveAttribute("aria-expanded", "false");
+  catalogue.mockResolvedValueOnce(page([{ ...current, adapter: { ...current.adapter, enabled: false } }]));
+  fireEvent.click(panel().getByRole("button", { name: "重试运行器目录" }));
+  expect(await panel().findByText("未启用")).toBeVisible();
+  expect(detailValue("平台工具")).toHaveTextContent(/^支持（实现合同）$/);
+  expect(catalogue.mock.calls.map(([url]) => url)).toEqual(Array(3).fill("/api/v1/providers?limit=50"));
+  fireEvent.click(panel().getByRole("button", { name: "展开创建成员" }));
+  expect(field("成员名称")).toHaveValue("保留的草稿");
+  expect(writes).not.toHaveBeenCalled();
+});
+const pagedProvider = (number: number, enabled = false) => ({ ...provider, id: `pi_${String(number).padStart(2, "0")}`,
+  path: `/fixture/pi${number}`, version: "1.4.0", adapter: { id: "pi_fixture", protocol: "pi_extension", enabled } });
+it("starts a new catalogue generation from page one after paging and never retains the previous first-page enabled state", async () => {
+  reads.mockResolvedValueOnce(page([{ ...member, provider_id: "pi_01" }]));
+  catalogue.mockResolvedValueOnce(page(Array.from({ length: 50 }, (_, i) => pagedProvider(i + 1, i === 0)), "old-cursor"));
+  const mounted = render(catalogueScope(true));
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  expect(await panel().findByText("已启用（不代表运行就绪）")).toBeVisible();
+  fireEvent.click(panel().getByRole("button", { name: "展开创建成员" }));
+  catalogue.mockResolvedValueOnce(page([pagedProvider(51)]));
+  fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+  await panel().findByRole("option", { name: /\/fixture\/pi51/ });
+  catalogue.mockResolvedValueOnce(page(Array.from({ length: 50 }, (_, i) => pagedProvider(i + 1)), "new-cursor"));
+  mounted.rerender(catalogueScope(false)); mounted.rerender(catalogueScope(true));
+  expect(await panel().findByText("未启用")).toBeVisible();
+  expect(catalogue.mock.calls[2][0]).toBe("/api/v1/providers?limit=50");
+  expect(panel().queryByRole("option", { name: /\/fixture\/pi51/ })).not.toBeInTheDocument();
+  catalogue.mockResolvedValueOnce(page([pagedProvider(50), pagedProvider(51)]));
+  fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+  await panel().findByRole("option", { name: /\/fixture\/pi51/ });
+  expect(catalogue.mock.calls[3][0]).toBe("/api/v1/providers?limit=50&before=new-cursor");
+  expect(panel().getAllByRole("option")).toHaveLength(52);
+  expect(detailValue("进程启用状态")).toHaveTextContent(/^未启用$/);
+});
+it("fences late previous-generation pages and retries failed pagination from page one", async () => {
+  reads.mockResolvedValueOnce(page([{ ...member, provider_id: "pi_01" }]));
+  catalogue.mockResolvedValueOnce(page([pagedProvider(1, true)], "old-cursor"));
+  const mounted = render(catalogueScope(true));
+  fireEvent.click(await panel().findByRole("button", { name: member.name }));
+  await panel().findByText("已启用（不代表运行就绪）");
+  fireEvent.click(panel().getByRole("button", { name: "展开创建成员" }));
+  const oldPage = deferred<Response>(); catalogue.mockReturnValueOnce(oldPage.promise);
+  fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+  catalogue.mockResolvedValueOnce(page([pagedProvider(1)], "new-cursor"));
+  mounted.rerender(catalogueScope(false)); mounted.rerender(catalogueScope(true));
+  await panel().findByText("未启用");
+  expect(catalogue.mock.calls[1][1]?.signal?.aborted).toBe(true);
+  await act(async () => oldPage.resolve(page([pagedProvider(51)], "stale-next")));
+  expect(panel().queryByRole("option", { name: /\/fixture\/pi51/ })).not.toBeInTheDocument();
+  catalogue.mockResolvedValueOnce(json({}, 503));
+  fireEvent.click(panel().getByRole("button", { name: "加载更多运行器" }));
+  expect(catalogue.mock.calls[3][0]).toBe("/api/v1/providers?limit=50&before=new-cursor");
+  expect(await panel().findByText(/运行器目录暂不可用/)).toBeVisible();
+  expect(detailValue("进程启用状态")).toHaveTextContent(/^未知$/);
+  catalogue.mockResolvedValueOnce(page([pagedProvider(1)]));
+  fireEvent.click(panel().getByRole("button", { name: "重试运行器目录" }));
+  await panel().findByText("未启用");
+  expect(catalogue.mock.calls[4][0]).toBe("/api/v1/providers?limit=50");
 });
 it("shows a real empty catalogue, retries a network failure, and aborts on full unmount", async () => {
   catalogue.mockRejectedValueOnce(new TypeError("offline")); await open();
