@@ -14,7 +14,7 @@ func (a memberToolAPI) workspaceList(w http.ResponseWriter, r *http.Request, tok
 	var input struct {
 		Path memberToolField[string] `json:"path"`
 	}
-	if !decodeMemberToolJSON(w, r, &input) {
+	if !decodeMemberWorkspaceJSON(w, r, &input) {
 		return
 	}
 	if !input.Path.present {
@@ -33,7 +33,7 @@ func (a memberToolAPI) workspaceRead(w http.ResponseWriter, r *http.Request, tok
 	var input struct {
 		Path memberToolField[string] `json:"path"`
 	}
-	if !decodeMemberToolJSON(w, r, &input) {
+	if !decodeMemberWorkspaceJSON(w, r, &input) {
 		return
 	}
 	if !input.Path.present {
@@ -63,7 +63,7 @@ func (a memberToolAPI) workspaceWrite(w http.ResponseWriter, r *http.Request, to
 		Text     memberToolField[string] `json:"text"`
 		Expected memberToolField[string] `json:"expected_sha256"`
 	}
-	if !decodeMemberToolJSON(w, r, &input) {
+	if !decodeMemberWorkspaceJSON(w, r, &input) {
 		return
 	}
 	if !input.Path.present || !input.Create.present || !input.Text.present || input.Create.value == input.Expected.present {
@@ -97,7 +97,7 @@ func (a memberToolAPI) publishWorkspaceArtifact(w http.ResponseWriter, r *http.R
 		Name      memberToolField[string] `json:"name"`
 		Expected  memberToolField[string] `json:"expected_version_id"`
 	}
-	if !decodeMemberToolJSON(w, r, &input) {
+	if !decodeMemberWorkspaceJSON(w, r, &input) {
 		return
 	}
 	if !input.Operation.present || input.Artifact.present && (input.Name.present || !input.Expected.present) || !input.Artifact.present && (!input.Name.present || input.Expected.present) {
