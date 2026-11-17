@@ -280,3 +280,42 @@ it("still rejects policy revision rollback even when workspace capability become
   expect(screen.getByRole("region", { name: "当前聊天策略" })).toHaveTextContent("当前策略读取过期或内容不一致");
   submit(); expect(writes).not.toHaveBeenCalled();
 });
+it("preserves historical workspace permission in a budget-only draft when same-revision capability becomes known", async () => {
+  saved.set(policyURL(), { ...workspacePolicy(), workspace_changes_supported: undefined }); await open();
+  const workspace = form().getByRole("checkbox", { name: "允许明确请求使用已授权写目录" });
+  expect(workspace).toBeDisabled(); budget("4");
+  saved.set(policyURL(), workspacePolicy());
+  fireEvent.click(screen.getByRole("button", { name: "读取当前聊天策略并保留草稿" })); await flush();
+  expect(workspace).toBeEnabled(); expect(form().getByRole("spinbutton")).toHaveValue(4);
+  expect(screen.getByRole("region", { name: "当前聊天策略" })).toHaveTextContent("目录改动许可：允许明确请求使用已授权写目录");
+  writes.mockImplementationOnce(async (url, init) => {
+    const input = JSON.parse(String(init?.body));
+    const actual = workspacePolicy(input.expected_revision + 1, input.allow_workspace_changes === true, input.max_admissions);
+    saved.set(String(url), actual); return json(actual);
+  });
+  submit(); await flush();
+  expect(JSON.parse(attempt(0).body)).toEqual({ enabled: true, allow_preparation: false, action: "text_submission",
+    max_admissions: 4, expected_revision: 1, allow_workspace_changes: true });
+  expect(workspace).toBeChecked(); expect(screen.getByText(/保存已确认.*历史版本 2/)).toBeVisible();
+});
+it("blocks a budget-only save of historical workspace permission while capability remains unconfirmed", async () => {
+  saved.set(policyURL(), { ...workspacePolicy(), workspace_changes_supported: undefined }); await open();
+  budget("4"); submit(); await flush();
+  expect(writes).not.toHaveBeenCalled(); expect(screen.getByRole("alert")).toHaveTextContent("目录工作协议能力未确认，不能开启目录改动许可");
+  const workspace = form().getByRole("checkbox", { name: "允许明确请求使用已授权写目录" });
+  expect(workspace).toBeChecked(); expect(workspace).toBeDisabled(); expect(form().getByRole("spinbutton")).toHaveValue(4);
+  expect(screen.getByRole("region", { name: "当前聊天策略" })).toHaveTextContent("历史许可标记开启");
+});
+it("preserves an explicit workspace opt-out across temporarily unconfirmed same-revision capability", async () => {
+  saved.set(policyURL(), workspacePolicy()); await open();
+  check("允许明确请求使用已授权写目录"); budget("4");
+  saved.set(policyURL(), { ...workspacePolicy(), workspace_changes_supported: undefined });
+  fireEvent.click(screen.getByRole("button", { name: "读取当前聊天策略并保留草稿" })); await flush();
+  const workspace = form().getByRole("checkbox", { name: "允许明确请求使用已授权写目录" });
+  expect(workspace).toBeDisabled(); expect(workspace).not.toBeChecked();
+  saved.set(policyURL(), workspacePolicy());
+  fireEvent.click(screen.getByRole("button", { name: "读取当前聊天策略并保留草稿" })); await flush();
+  expect(workspace).toBeEnabled(); expect(workspace).not.toBeChecked(); expect(form().getByRole("spinbutton")).toHaveValue(4);
+  submit(); await flush();
+  expect(JSON.parse(attempt(0).body)).toEqual({ enabled: true, allow_preparation: false, action: "text_submission", max_admissions: 4, expected_revision: 1 });
+});

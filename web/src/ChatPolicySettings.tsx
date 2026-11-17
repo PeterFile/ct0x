@@ -10,8 +10,9 @@ type State = {
   draft: Draft; dirty: boolean; operation: Operation | null; phase: "idle" | "pending" | "unknown";
   receipt: ChatPolicy | null; error: string; conflict: boolean;
 };
+// Preserve existing authorization independently of capability; submit still requires confirmed support.
 const draftOf = (policy?: ChatPolicy): Draft => ({ enabled: policy?.enabled ?? false, allowPreparation: policy?.allow_preparation ?? false,
-  allowWorkspaceChanges: policy?.workspace_changes_supported === true && policy.allow_workspace_changes === true,
+  allowWorkspaceChanges: policy?.allow_workspace_changes === true,
   scopeKind: policy?.preparation_supported ? policy.preparation_scope_kind ?? "" : "", budget: policy?.revision ? String(policy.max_admissions) : "1" });
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请保留草稿后重试。";
 // Workspace support reflects current schema capability, not an immutable policy fact.
