@@ -25,16 +25,25 @@ var memberToolEndpoint = regexp.MustCompile(`^http://(127\.0\.0\.1|\[::1\]):([0-
 var memberToolBearer = regexp.MustCompile(`^[A-Za-z0-9._~+/-]+=*$`)
 
 type memberToolConfig struct {
-	endpoint string
-	origin   string
-	token    string
-	file     os.FileInfo
-	digest   [32]byte
+	endpoint           string
+	origin             string
+	token              string
+	file               os.FileInfo
+	digest             [32]byte
+	investigationTools []string // Pi strict mode only.
 }
 
 // Trusted, stable ancestors are required. Descriptor and path checks detect
 // replacement/metadata drift, not hostile ancestor mutation or ABA writes.
 func readMemberToolConfig(path string) (memberToolConfig, error) {
+	return readMemberToolConfigMode(path, false, false)
+}
+
+func readPiMemberToolConfig(path string, strict bool) (memberToolConfig, error) {
+	return readMemberToolConfigMode(path, true, strict)
+}
+
+func readMemberToolConfigMode(path string, pi, strict bool) (memberToolConfig, error) {
 	var config memberToolConfig
 	if !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
 		return config, errPiMemberToolConfiguration
@@ -68,9 +77,26 @@ func readMemberToolConfig(path string) (memberToolConfig, error) {
 		return config, errPiMemberToolConfiguration
 	}
 	fields, err := codexAppServerMap(raw)
-	// The optional Pi schema hint is not authority; Codex discovers its schema
-	// from MCP under the same bound token rather than reading the hint.
-	if err != nil || len(fields) != 2 && !(len(fields) == 3 && string(fields["continue_work"]) == "true") ||
+	count := 2
+	if strict {
+		count++
+		if json.Unmarshal(fields["investigation_tools"], &config.investigationTools) != nil || len(config.investigationTools) == 0 {
+			return memberToolConfig{}, errPiMemberToolConfiguration
+		}
+	} else {
+		// Optional schema hints are not authority. Codex discovers its schema
+		// through MCP, and never accepts the strict config or investigation hint.
+		if string(fields["continue_work"]) == "true" {
+			count++
+		}
+		if pi && string(fields["discussion_only_excerpt"]) == "true" {
+			count++
+		}
+		if pi && string(fields["intake_assessment_action"]) == `"read_only_investigation"` {
+			count++
+		}
+	}
+	if err != nil || len(fields) != count ||
 		json.Unmarshal(fields["endpoint"], &config.endpoint) != nil || json.Unmarshal(fields["token"], &config.token) != nil {
 		return memberToolConfig{}, errPiMemberToolConfiguration
 	}

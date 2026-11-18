@@ -53,7 +53,10 @@ func (p *Preparer) InspectRoleReadiness(ctx context.Context, pending store.Pendi
 	if err != nil || ctx.Err() != nil {
 		return roleInspectionResult(ctx, result, err)
 	}
-	if plan.workspace != nil && provenance.Kind == store.CoordinationRoleWorker {
+	if plan.investigation != nil {
+		result.HistoryLimit, result.MaxContextBytes = 0, plan.input.MaxBytes
+		_, err = plan.investigation.resolveCWD(provenance, false)
+	} else if plan.workspace != nil && provenance.Kind == store.CoordinationRoleWorker {
 		_, _, _, err = p.workspacePreparationGrant(ctx, *plan.workspace, input.member.ID)
 	} else {
 		_, _, err = p.resolvePreparationWorkspace(ctx, input.member, input.conversation, false)

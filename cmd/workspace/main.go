@@ -48,6 +48,9 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if err := os.MkdirAll(config.dataDir, 0700); err != nil {
 		return fmt.Errorf("创建数据目录失败：%w", err)
 	}
+	if err := config.validateInvestigationDataDir(); err != nil {
+		return err
+	}
 	lock, err := lockDataDir(config.dataDir)
 	if err != nil {
 		return err
@@ -133,6 +136,10 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if memberTools != nil {
 		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)
 		routes = append(routes, httpapi.MemberHistoryToolRoutes(memberTools.Tools())...)
+		if config.enableInvestigationExecution {
+			routes = append(routes, httpapi.MemberInvestigationToolRoutes(memberTools.Tools())...)
+			toolStatus += "；只读调查仅支持选定 Pi 1.4.0、单收件人的真实本机用户原始消息与首次正式分派的角色；仅按策略读取指定资料，不授予续接或文件工具"
+		}
 		if config.enableCodexAppServer {
 			routes = append(routes, httpapi.MemberMCPRoutes(memberTools.Tools())...)
 		}
@@ -164,6 +171,11 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	}
 	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录、任务创建、列表与详情、成果版本只读查询与下载及 CLI 目录；目录仅启动时探测、证据仅存内存；%s；%s；%s；工作目录不是主机读取沙箱，数据目录及祖先必须可信且目录身份稳定；其他功能尚未启用）\n", listener.Addr(), executionStatus, sessionStatus, toolStatus); err != nil {
 		return fmt.Errorf("输出启动信息失败：%w", err)
+	}
+	if config.enableInvestigationExecution {
+		// Opt in to B only after the exact adapter, blob owner and routes have
+		// been composed. There is still no local-user policy or per-turn grant.
+		engine.EnableInvestigationExecution()
 	}
 	return serve(ctx, server, listener, 5*time.Second, schedule)
 }

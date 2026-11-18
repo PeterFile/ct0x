@@ -167,8 +167,11 @@ func (p *Preparer) resolvePreparationWorkspaceSnapshot(ctx context.Context, memb
 }
 
 func (p *Preparer) privatePreparationPath(member domain.Member, conversation domain.Conversation) string {
-	// JSON makes the three opaque authoritative IDs unambiguous. Only the hash,
-	// never any ID or model-selected path component, enters the private path.
-	identity, _ := json.Marshal([]string{member.GroupID, member.ID, conversation.ID})
-	return filepath.Join(p.privateRoot, fmt.Sprintf("scope-%x", sha256.Sum256(identity)))
+	return privatePreparationWorkspacePath(p.privateRoot, member.GroupID, member.ID, conversation.ID)
+}
+
+func privatePreparationWorkspacePath(root, groupID, memberID, conversationID string) string {
+	// Only the hash, never any ID or model-selected path component, enters the path.
+	identity, _ := json.Marshal([]string{groupID, memberID, conversationID})
+	return filepath.Join(root, fmt.Sprintf("scope-%x", sha256.Sum256(identity)))
 }

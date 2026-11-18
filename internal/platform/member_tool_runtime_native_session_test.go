@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -8,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -32,12 +34,35 @@ func useReleasePiBridge(t *testing.T, f *rolePrepareFixture) {
 	f.opts.PiMemberToolsExtension = path
 }
 
+func useLegacyNativePiBridge(t *testing.T, f *rolePrepareFixture) {
+	t.Helper()
+	// Exact #193 pair from efa169acc35929f308ba12a4d2a7a7ca0188691d.
+	archive, err := zip.OpenReader("testdata/pi-bridge-193.zip")
+	prepareRoleOK(t, err)
+	defer archive.Close()
+	root := t.TempDir()
+	for _, name := range []string{"index.ts", "bridge.mjs"} {
+		data, err := fs.ReadFile(archive, "extensions/pi-bridge/"+name)
+		prepareRoleOK(t, err)
+		prepareRoleOK(t, os.WriteFile(filepath.Join(root, name), data, 0600))
+	}
+	path := filepath.Join(root, "index.ts")
+	if !provider.PiNativeSessionBridgeSupported(path) || provider.PiInvestigationBridgeSupported(path) {
+		t.Fatal("fixture must qualify as the #193 pair only")
+	}
+	f.opts.PiMemberToolsExtension = path
+}
+
 // These are offline trusted-wiring fixtures, not native CLI or UI acceptance.
 func nativeSessionPreparation(t *testing.T, purpose string) (*rolePrepareFixture, scheduler.PreparedExecution) {
 	t.Helper()
 	f := newRolePrepareFixture(t)
 	f.enableRuntime(t)
-	useReleasePiBridge(t, f)
+	if purpose == "generic" || purpose == domain.ChatIntakePurpose {
+		useLegacyNativePiBridge(t, f)
+	} else {
+		useReleasePiBridge(t, f)
+	}
 	f.opts.EnableNativeSessionResume, f.opts.NativePiThinking, f.opts.RoleThinking = true, "off", "max"
 	const model = "fixture/model"
 	f.exec(t, "UPDATE members SET model=? WHERE id IN (?, ?)", model, f.coordinator.ID, f.worker.ID)
@@ -83,7 +108,7 @@ func runNativeSessionFixture(t *testing.T, f *rolePrepareFixture, prepared sched
 			t.Fatalf("actual native-session constructor failed: %v", err)
 		}
 		call.issued = config
-		_, call.token = memberToolRuntimeConfig(t, config.Path)
+		_, call.token = memberToolRuntimeConfigWithDiscussion(t, config.Path, run.intakeSchema.piDiscussionExcerpt)
 		prepareRoleOK(t, json.Unmarshal(binding, &call.binding))
 		call.resume = cloneMemberToolNativeReference(resume)
 		sortedNames := slices.Clone(names)

@@ -41,13 +41,13 @@ type NativeMemberToolConfig struct {
 	SHA256 [sha256.Size]byte `json:"-"`
 }
 
-// This release pair is the audited index.ts (passes the digest before registering
-// tools) and its exact ./bridge.mjs (reads, verifies and consumes the same bytes).
-// Refresh both together after review and offline loader/config tests:
-// shasum -a 256 extensions/pi-bridge/{index.ts,bridge.mjs}.
+// Keep #193's exact pair eligible for its existing native text profile.
+// Only the new pair understands the strict config. Never mix pairs.
 const (
-	piDigestBridgeEntrySHA = "321fd2bc30c71322a140f5e022d96b2c005e90c0b5b4468697b59978decc8356"
-	piDigestBridgeImplSHA  = "f983651f525fb411d9e8f50843b15447558f6d6b1f9f1a13563d96f3528a3061"
+	piDigestBridgeEntrySHA        = "321fd2bc30c71322a140f5e022d96b2c005e90c0b5b4468697b59978decc8356"
+	piDigestBridgeImplSHA         = "f983651f525fb411d9e8f50843b15447558f6d6b1f9f1a13563d96f3528a3061"
+	piInvestigationBridgeEntrySHA = "39d5528abee0b6b39d0088d265dbe4d51c9c00eb9f43fe1d4d6be9d2383a7a82"
+	piInvestigationBridgeImplSHA  = "c6e571fbeed7b6f78ea1a8b7b044babca691923297d1803a3aaaeb5b6c6eeb2b"
 )
 
 // PiNativeSessionBridgeSupported qualifies only the actual trusted native release
@@ -57,14 +57,29 @@ func PiNativeSessionBridgeSupported(extensionPath string) bool {
 }
 
 func qualifyPiNativeBridge(extensionPath string) string {
+	if entry := qualifyPiInvestigationBridge(extensionPath); entry != "" {
+		return entry
+	}
+	return qualifyPiBridgePair(extensionPath, piDigestBridgeEntrySHA, piDigestBridgeImplSHA)
+}
+
+func PiInvestigationBridgeSupported(extensionPath string) bool {
+	return qualifyPiInvestigationBridge(extensionPath) != ""
+}
+
+func qualifyPiInvestigationBridge(extensionPath string) string {
+	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeEntrySHA, piInvestigationBridgeImplSHA)
+}
+
+func qualifyPiBridgePair(extensionPath, entrySHA, implSHA string) string {
 	if !filepath.IsAbs(extensionPath) {
 		return ""
 	}
 	// Pass the physical entry to Pi so the loader and this check agree on the
 	// base of the relative import, even with a configured symlink alias.
 	entry, err := filepath.EvalSymlinks(extensionPath)
-	if err != nil || filepath.Base(entry) != "index.ts" || !piBridgeBytesMatch(entry, piDigestBridgeEntrySHA) ||
-		!piBridgeBytesMatch(filepath.Join(filepath.Dir(entry), "bridge.mjs"), piDigestBridgeImplSHA) {
+	if err != nil || filepath.Base(entry) != "index.ts" || !piBridgeBytesMatch(entry, entrySHA) ||
+		!piBridgeBytesMatch(filepath.Join(filepath.Dir(entry), "bridge.mjs"), implSHA) {
 		return ""
 	}
 	return entry
@@ -153,7 +168,7 @@ func (a nativeSessionMemberToolAdapter) NewExecutor(selected Provider, timeout t
 	}
 	if a.pi != nil {
 		path := filepath.Clean(a.configPath)
-		if !memberToolConfigMatches(path, a.configSHA256) {
+		if !piMemberToolConfigMatches(path, a.configSHA256, false) {
 			return nil, errPiMemberToolConfiguration
 		}
 		native, err := NewPiSessionExecutor(selected, bridge, path, a.toolNames, *a.pi, timeout)
@@ -179,20 +194,25 @@ func (a nativeSessionMemberToolAdapter) NewExecutor(selected Provider, timeout t
 
 type piDigestBoundExecutor struct {
 	piExecutor
-	configuredBridge string
+	configuredBridge    string
+	investigationBridge bool
 }
 
 func (e piDigestBoundExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error) ExecutionReceipt {
 	// Reconfirm both bytes and the exact import location at invocation. The
 	// selected CLI/loader, its environment and the trusted extension ancestry
 	// must still be stable through load; this is not a same-UID code sandbox.
-	if qualifyPiNativeBridge(e.configuredBridge) != e.memberTools.extensionPath {
-		return ExecutionReceipt{Outcome: OutcomeUnknown, ExitCode: -1, Reason: "原生会话成员工具扩展无法确认，未调用进程，需对账"}
+	qualify := qualifyPiNativeBridge
+	if e.investigationBridge {
+		qualify = qualifyPiInvestigationBridge
+	}
+	if qualify(e.configuredBridge) != e.memberTools.extensionPath {
+		return ExecutionReceipt{Outcome: OutcomeUnknown, ExitCode: -1, Reason: "成员工具扩展无法确认，未调用进程，需对账"}
 	}
 	return e.piExecutor.Execute(ctx, request, onEvent)
 }
 
-func memberToolConfigMatches(path string, digest [sha256.Size]byte) bool {
-	config, err := readMemberToolConfig(path)
+func piMemberToolConfigMatches(path string, digest [sha256.Size]byte, investigation bool) bool {
+	config, err := readPiMemberToolConfig(path, investigation)
 	return err == nil && config.digest == digest
 }

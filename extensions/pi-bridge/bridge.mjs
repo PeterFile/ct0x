@@ -3,10 +3,14 @@ import { isAbsolute } from "node:path";
 import { createHash } from "node:crypto";
 import { request } from "node:http";
 
+export const INVESTIGATION_ASSESSMENT_ACTION = "read_only_investigation";
+export const INVESTIGATION_CHANNEL = "read_investigation_channel";
+export const INVESTIGATION_ARTIFACT = "read_investigation_artifact";
+
 const CONFIG_LIMIT = 4096;
 const BYTE_LIMIT = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 25_000;
-export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", "read_work_inputs", "ack_work_input", "hand_back_work_input"]);
+export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", "read_work_inputs", "ack_work_input", "hand_back_work_input", INVESTIGATION_CHANNEL, INVESTIGATION_ARTIFACT]);
 
 /** @typedef {{ text: string, json: unknown }} Reply */
 /** @typedef {(toolName: string, params: unknown, toolCallId: string, signal?: AbortSignal) => Promise<Reply>} Client */
@@ -53,7 +57,7 @@ function endpointURL(value) {
  * selects the bound profile; it covers exactly the bytes this bridge consumes.
  * @param {string | undefined} path
  * @param {string} [expectedSHA256]
- * @returns {{ invoke: Client, continueWork: boolean }}
+ * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[] }}
  */
 export function openBridge(path, expectedSHA256) {
   let fd;
@@ -80,19 +84,39 @@ export function openBridge(path, expectedSHA256) {
     }
     const config = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
     if (!isRecord(config)) throw new Error(CONFIG_ERROR);
-    const fields = Object.keys(config).sort().join(",");
-    const continueWork = fields === "continue_work,endpoint,token" && config.continue_work === true;
-    if ((fields !== "endpoint,token" && !continueWork) ||
+    const continueWork = Object.hasOwn(config, "continue_work");
+    const discussionOnlyExcerpt = Object.hasOwn(config, "discussion_only_excerpt");
+    const investigationIntake = Object.hasOwn(config, "intake_assessment_action");
+    const strict = Object.hasOwn(config, "investigation_tools");
+    if (!Object.hasOwn(config, "endpoint") || !Object.hasOwn(config, "token") ||
+        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) + Number(strict) ||
+        (continueWork && config.continue_work !== true) || (discussionOnlyExcerpt && config.discussion_only_excerpt !== true) ||
+        (investigationIntake && config.intake_assessment_action !== INVESTIGATION_ASSESSMENT_ACTION) ||
         typeof config.token !== "string" || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token)) {
       throw new Error(CONFIG_ERROR);
+    }
+    /** @type {string[] | undefined} */
+    let investigationTools;
+    if (strict) {
+      const names = config.investigation_tools;
+      if (expectedSHA256 === undefined || continueWork || discussionOnlyExcerpt || investigationIntake || !Array.isArray(names)) throw new Error(CONFIG_ERROR);
+      const reads = [INVESTIGATION_CHANNEL, INVESTIGATION_ARTIFACT].filter(name => names.includes(name));
+      if (!reads.length || names.length !== reads.length + 1 || !reads.every((name, i) => names[i] === name) ||
+          !["decide_dispatch", "submit_result"].includes(names.at(-1))) throw new Error(CONFIG_ERROR);
+      investigationTools = [...names];
     }
     const endpoint = endpointURL(config.endpoint);
     const token = config.token;
     /** @type {WriteState} */
     const writes = {};
     return {
-      invoke: (toolName, params, toolCallId, signal) => requestTool(endpoint, token, writes, toolName, params, toolCallId, signal),
-      continueWork,
+      invoke: async (toolName, params, toolCallId, signal) => {
+        if (investigationTools ? !investigationTools.includes(toolName) : toolName === INVESTIGATION_CHANNEL || toolName === INVESTIGATION_ARTIFACT) {
+          throw new Error("工具不在本轮授权范围内，未发送请求。");
+        }
+        return requestTool(endpoint, token, writes, toolName, params, toolCallId, signal);
+      },
+      continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools,
     };
   } catch {
     throw new Error(CONFIG_ERROR);
