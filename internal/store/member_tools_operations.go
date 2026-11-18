@@ -120,6 +120,9 @@ func (s *Store) SendMessageForTool(ctx context.Context, scope MemberToolScope, i
 
 // A separate operation gate allows bounded discussion only after durable intake.
 func (s *Store) SendMessageForChatIntake(ctx context.Context, scope MemberToolScope, candidateID string, input MemberToolMessageInput, key string) (domain.Message, error) {
+	if candidateID == "" {
+		return domain.Message{}, ErrMemberToolDenied
+	}
 	return s.sendMemberMessage(ctx, scope, input, key, candidateID)
 }
 
