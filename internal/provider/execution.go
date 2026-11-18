@@ -285,11 +285,11 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	}
 	writeUnknown := out.piTypedWork != nil && out.piTypedWork.unknown != nil
 	if writeUnknown {
-		outLog.failed = !out.piTypedWork.unknown.retain(outLog, piTypedWriteUnknown)
+		outLog.failed = !out.piTypedWork.unknown.retain(outLog, piTypedWriteUnknown, nil)
 	} else if s := out.piInvestigation; s != nil && !r.Accepted && outLog.truncated {
 		if evidence := s.unverifiedWrites.unknown; evidence != nil {
 			// Best effort; diagnostic retention does not update execution state.
-			_ = evidence.retain(outLog, piTypedWriteUnverified)
+			_ = evidence.retain(outLog, piTypedWriteUnverified, &s.bearer)
 		}
 	}
 	outClose, errClose := stdout.Close(), stderr.Close()

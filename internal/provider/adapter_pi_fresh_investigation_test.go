@@ -348,6 +348,7 @@ func TestPiFreshInvestigationWriteUncertainty(t *testing.T) {
 func TestPiFreshInvestigationWriteEvidenceAtStdoutCap(t *testing.T) {
 	const runID, op = "turn-investigation", "report_work"
 	const unverified = "agent_workspace_write_unknown_unverified_v1"
+	const escapingSuffix = "ABCDEFGHIJKLMNOPQRSTUVWX"
 	profile := PiFreshInvestigationProfile{Action: domain.ChatActionReadOnlyInvestigation,
 		SourceKind: domain.TaskWorkSourceDelegation, Operations: []string{op}}
 	_, digest := investigationTestConfig(t, runID, profile)
@@ -375,7 +376,7 @@ func TestPiFreshInvestigationWriteEvidenceAtStdoutCap(t *testing.T) {
 	// falls outside the retained prefix without overflowing the parser queue.
 	large := `{"type":"message_update","delta":"` + strings.Repeat("x", executionLogLimit/2) + `"}` + "\n"
 	for _, c := range []struct {
-		name, proof, write, late, wantType string
+		name, proof, write, late, wantType, token string
 	}{
 		{name: "missing ready", write: valid, wantType: unverified},
 		{name: "wrong ready digest", proof: wrongReady, write: valid, wantType: unverified},
@@ -391,12 +392,17 @@ func TestPiFreshInvestigationWriteEvidenceAtStdoutCap(t *testing.T) {
 		{name: "duplicate decoded marker field", write: strings.Replace(valid, `"role":`, `"\u0072ole":"delegation","role":`, 1)},
 		{name: "marker in message", write: `{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":` + memberToolJSON(t, valid) + `}]}}`},
 		{name: "bearer in call ID", write: pair(withCallID("call_" + investigationTestToken))},
+		{name: "bearer introduced by JSON escaping", write: pair(withCallID("&" + escapingSuffix)), token: "26" + escapingSuffix},
 		{name: "late duplicate keeps verified format", proof: ready, write: valid, late: ready, wantType: typedWriteTestField},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			stream := investigationTestHeader(runID) + "\n" + c.proof + executionStart + "\n" + large + large + c.write + "\n" +
 				executionAssistant("stop") + "\n" + executionSettled + "\n" + c.late
-			e, req := investigationTestExecutor(t, profile, runID, stream)
+			token := c.token
+			if token == "" {
+				token = investigationTestToken
+			}
+			e, req := investigationTestExecutorWithToken(t, profile, runID, stream, token)
 			var events []Event
 			got := e.Execute(t.Context(), req, func(event Event) error { events = append(events, event); return nil })
 			accepted := c.late != ""
@@ -421,6 +427,9 @@ func TestPiFreshInvestigationWriteEvidenceAtStdoutCap(t *testing.T) {
 				t.Fatal("diagnostic evidence lost private file permissions", err)
 			}
 			tail := log[len(prefix):]
+			if bytes.Contains(tail, []byte(token)) {
+				t.Fatal("private stdout tail contains the synthetic bearer")
+			}
 			if c.wantType == "" {
 				if len(tail) != 0 {
 					t.Fatal("retained malformed or foreign evidence")
@@ -439,9 +448,17 @@ func TestPiFreshInvestigationWriteEvidenceAtStdoutCap(t *testing.T) {
 
 func investigationTestExecutor(t *testing.T, profile PiFreshInvestigationProfile, runID, stream string) (Executor, ExecuteRequest) {
 	t.Helper()
+	return investigationTestExecutorWithToken(t, profile, runID, stream, investigationTestToken)
+}
+
+func investigationTestExecutorWithToken(t *testing.T, profile PiFreshInvestigationProfile, runID, stream, token string) (Executor, ExecuteRequest) {
+	t.Helper()
 	selected, req, bridges := typedWriteTestChild(t, stream)
 	req.RunID = runID
-	config, digest := investigationTestConfig(t, runID, profile)
+	config, digest, err := PiFreshInvestigationConfig("http://127.0.0.1:7310/api/v1/member-tools", token, runID, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
 	path := filepath.Join(req.CWD, "issued.json")
 	if err := os.WriteFile(path, config, 0600); err != nil {
 		t.Fatal(err)
