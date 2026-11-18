@@ -273,14 +273,14 @@ func (f *coordinationCompositionFixture) args(t *testing.T, thinking string) []s
 	return args
 }
 
-func (f *coordinationCompositionFixture) admission(t *testing.T) domain.AdmissionReceipt {
+func coordinationCompositionAdmission(t *testing.T, db *store.Store, groupID string) domain.AdmissionReceipt {
 	t.Helper()
-	ctx := context.Background()
-	source, err := f.db.CreateMessage(ctx, store.MessageRequest{GroupID: f.group.ID, ActorID: "user", TopicID: "role-topic", Content: "明确开展文本任务", RecipientIDs: []string{}}, []string{})
+	ctx := t.Context()
+	source, err := db.CreateMessage(ctx, store.MessageRequest{GroupID: groupID, ActorID: "user", TopicID: "role-topic", Content: "明确开展文本任务", RecipientIDs: []string{}}, []string{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	admission, err := f.db.RequestWork(ctx, f.group.ID, domain.RequestWorkRequest{TopicID: source.TopicID, MessageID: source.ID,
+	admission, err := db.RequestWork(ctx, groupID, domain.RequestWorkRequest{TopicID: source.TopicID, MessageID: source.ID,
 		Mode: domain.RoutingDecisionCreateNew, Reason: "显式本地授权", NewTask: &domain.NewTaskRequest{Title: "角色组合文本", Acceptance: "保存真实工具提交而非自动接纳"}}, "admit-"+source.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -290,12 +290,17 @@ func (f *coordinationCompositionFixture) admission(t *testing.T) domain.Admissio
 
 func (f *coordinationCompositionFixture) request(t *testing.T) domain.DispatchRequest {
 	t.Helper()
-	admission := f.admission(t)
-	view, err := f.db.GetTaskCoordination(context.Background(), f.group.ID, admission.Task.ID)
+	return coordinationCompositionRequest(t, f.db, f.group.ID)
+}
+
+func coordinationCompositionRequest(t *testing.T, db *store.Store, groupID string) domain.DispatchRequest {
+	t.Helper()
+	admission := coordinationCompositionAdmission(t, db, groupID)
+	view, err := db.GetTaskCoordination(t.Context(), groupID, admission.Task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request, err := f.db.RequestDispatch(context.Background(), f.group.ID, admission.Task.ID, admission.Task.RevisionAtAdmission, view.Coordination.AuthorityGeneration, "fixture setup", "dispatch-"+admission.Task.ID)
+	request, err := db.RequestDispatch(t.Context(), groupID, admission.Task.ID, admission.Task.RevisionAtAdmission, view.Coordination.AuthorityGeneration, "fixture setup", "dispatch-"+admission.Task.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +309,7 @@ func (f *coordinationCompositionFixture) request(t *testing.T) domain.DispatchRe
 
 func (f *coordinationCompositionFixture) dispatchHTTP(t *testing.T, base string) domain.DispatchRequest {
 	t.Helper()
-	admission := f.admission(t)
+	admission := coordinationCompositionAdmission(t, f.db, f.group.ID)
 	view, err := f.db.GetTaskCoordination(context.Background(), f.group.ID, admission.Task.ID)
 	if err != nil {
 		t.Fatal(err)

@@ -44,7 +44,7 @@ while [ "$#" -gt 0 ]; do
 done
 printf '{"type":"session","version":3,"id":"%s","cwd":"%s"}\n' "$run" "$PWD"
 printf '%s\n' '{"type":"agent_start"}'
-while [ -f "$root/hold" ]; do :; done
+while [ -f "$root/hold" ]; do sleep 0.05; done
 printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"本地合成回复"}]}}'
 printf '%s\n' '{"type":"agent_settled","aborted":false}'
 `
