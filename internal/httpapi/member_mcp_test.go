@@ -127,7 +127,7 @@ func TestMemberMCPProtocolOptInLifecycleAndProfile(t *testing.T) {
 				AdditionalProperties bool                       `json:"additionalProperties"`
 				Required             []string                   `json:"required"`
 			}
-			if err := json.Unmarshal(tool.InputSchema.Properties["intent_assessment"], &assessment); err != nil || len(assessment.Properties) != 8 || assessment.AdditionalProperties || !slices.Equal(assessment.Required, []string{"disposition", "reason"}) {
+			if err := json.Unmarshal(tool.InputSchema.Properties["intent_assessment"], &assessment); err != nil || len(assessment.Properties) != 9 || assessment.AdditionalProperties || !slices.Equal(assessment.Required, []string{"disposition", "reason"}) {
 				t.Fatal("source-chat schema lost the complete bridge contract")
 			}
 			var action struct {
@@ -149,6 +149,14 @@ func TestMemberMCPProtocolOptInLifecycleAndProfile(t *testing.T) {
 			}
 			if json.Unmarshal(repair.Properties["authorization"], &authorization) != nil || !slices.Equal(authorization.Enum, []string{"review_request", "original_agreement", "chat_request"}) {
 				t.Fatal("repair authorization labels changed")
+			}
+			var followup struct {
+				Properties           map[string]json.RawMessage `json:"properties"`
+				Required             []string                   `json:"required"`
+				AdditionalProperties bool                       `json:"additionalProperties"`
+			}
+			if json.Unmarshal(assessment.Properties["followup"], &followup) != nil || len(followup.Properties) != 2 || followup.Properties["task_id"] == nil || followup.Properties["constraint"] == nil || len(followup.Required) != 0 || followup.AdditionalProperties {
+				t.Fatal("followup schema must contain only the optional reference and constraint")
 			}
 		}
 	}

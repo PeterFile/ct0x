@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { loadExtensions } from "./pi-loader.mjs";
@@ -40,9 +41,9 @@ function execute(tool, params, signal, callId = "native-call") {
   });
 }
 
-test("actual Pi 1.4.0 loader registers exactly twelve native tools with the frozen schemas", async t => {
+test("actual Pi 1.4.0 loader registers the native tools with closed schemas", async t => {
   const { tools } = await toolsFor(t);
-  assert.deepEqual([...tools.keys()], [...names, "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact"]);
+  assert.deepEqual([...tools.keys()], [...names, "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", "read_work_inputs", "ack_work_input", "hand_back_work_input"]);
   for (const tool of tools.values()) {
     assert.match(tool.label, /[\u3400-\u9fff]/u);
     assert.match(tool.description, /[\u3400-\u9fff]/u);
@@ -85,6 +86,28 @@ test("contextual chat assessment uses the existing send transport without caller
     await assert.rejects(execute(tools.get("send_message"), { ...payload, intent_assessment: { ...assessment, ...extra } }), error => safeFailure(error, /参数/));
   }
   assert.equal(requests.length, 1);
+});
+
+test("trusted intake can forward continue_work with only a task reference and constraint", async t => {
+  const receipt = { message_id: "notice", created_at: "2026-11-18T00:00:00Z", delivery_count: 0, content_omitted: true };
+  const { tools, requests } = await toolsFor(t, (_, response) => json(response, receipt, 201));
+  const assessment = { disposition: "continue_work", reason: "用户明确要求继续当前工作" };
+  const send = intent_assessment => ({ content: "已记录续办评估。", intent_assessment });
+  const followup = { task_id: "referenced-task", constraint: " 仅校对文字\n" };
+  for (const input of [assessment, { ...assessment, followup }, { ...assessment, followup: { constraint: "仅校对" } }]) {
+    await execute(tools.get("send_message"), send(input), undefined, `continue-${requests.length}`);
+    assert.deepEqual(JSON.parse(requests.at(-1).body), send(input));
+  }
+  for (const input of [
+    { ...assessment, task_id: "not-a-reference" }, { ...assessment, followup: null },
+    { ...assessment, followup: { ...followup, member_id: "forged" } },
+    { ...assessment, followup: { ...followup, constraint: null } },
+    { ...assessment, action: "workspace_change", followup },
+    { ...assessment, disposition: "discuss", followup },
+  ]) {
+    await assert.rejects(execute(tools.get("send_message"), send(input)), error => safeFailure(error, /参数/));
+  }
+  assert.equal(requests.length, 3);
 });
 
 test("invalid or absent initialization config registers no usable tools and exposes no private path", async t => {
@@ -155,6 +178,42 @@ test("runtime serialization cannot change validated types or introduce fields", 
     error => safeFailure(error, /参数/));
   await assert.rejects(execute(tools.get("read_channel"), new Date()), error => safeFailure(error, /参数/));
   assert.equal(requests.length, 0);
+});
+
+test("work input tools send only handles and preserve write identity; untrusted receipts keep writes unknown", async t => {
+  const { tools, requests } = await toolsFor(t, (request, response, body) => {
+    const name = request.url.slice(BASE.length + 1);
+    const { input_id: id } = JSON.parse(body);
+    if (name === "read_work_inputs") return json(response, { items: [{ input_id: "bound-input", content: "继续校对" }] });
+    json(response, { input_id: name === "ack_work_input" ? id : "different-input" }, 201);
+  });
+  const read = tools.get("read_work_inputs");
+  const ack = tools.get("ack_work_input");
+  const back = tools.get("hand_back_work_input");
+  const id = { input_id: "bound-input" };
+  const reason = { ...id, reason: " 约束需要再确认\n" };
+  assert.equal(read.defaultActive, false);
+  assert.equal(ack.defaultActive, false);
+  assert.equal(back.defaultActive, false);
+  for (const [tool, invalid] of [[read, { task_id: "foreign" }], [ack, { ...id, reason: "unexpected" }],
+    [ack, { input_id: null }], [back, id], [back, { ...reason, reason: "  " }], [back, { ...reason, turn_id: "foreign" }]]) {
+    await assert.rejects(execute(tool, invalid), error => safeFailure(error, /未发送/));
+  }
+  assert.equal(requests.length, 0);
+  await execute(read, {});
+  assert.equal(requests[0].headers["idempotency-key"], undefined);
+  for (let n = 0; n < 2; n++) {
+    assert.deepEqual((await execute(ack, id, undefined, "ack-1")).content, [{ type: "text", text: JSON.stringify(id) }]);
+    assert.equal(requests.at(-1).headers["idempotency-key"], createHash("sha256").update("ack_work_inputack-1").digest("hex"));
+  }
+  await assert.rejects(execute(back, reason, undefined, "back-1"), error => safeFailure(error, /结果未知/));
+  assert.deepEqual(JSON.parse(requests.at(-1).body), reason);
+  assert.equal(requests.at(-1).headers["idempotency-key"], createHash("sha256").update("hand_back_work_inputback-1").digest("hex"));
+  await assert.rejects(execute(back, reason, undefined, "back-1"), error => safeFailure(error, /结果未知/));
+  await assert.rejects(execute(ack, id, undefined, "ack-after-unknown"), error => safeFailure(error, /阻止后续写入/));
+  assert.equal(requests.length, 4);
+  await execute(read, {});
+  assert.equal(requests.length, 5);
 });
 
 test("exceptions from runtime argument access cannot leak their raw messages", async t => {

@@ -1,6 +1,6 @@
 # 原生 Pi 成员工具扩展
 
-Pi 1.4.0 扩展，注册 `list_members`、`read_channel`、`send_message`、`create_member`、`search_history`、`read_history` 六项 schema。注册不代表启用：可信启动器的精确 `--tools` allowlist 决定实际可用项。**H2 只提供可选 profile，不包含 H3 cmd/HTTP 组合，不代表产品六工具或真实模型验收。**
+Pi 1.4.0 成员工具扩展。普通工具为 `list_members`、`read_channel`、`send_message`、`create_member`、`search_history`、`read_history`；角色工具另由服务端绑定。注册不代表启用：可信启动器的精确 `--tools` allowlist 决定实际可用项。
 
 ## 加载与配置
 
@@ -28,6 +28,7 @@ Pi 提供 `typebox` 和 ExtensionAPI，无需安装开发依赖即可加载。�
 
 - 参数只有冻结的业务字段；执行时用同一原生 schema 校验原始值及 JSON 快照，拒绝额外字段、错误类型和显式 `undefined`。调用者、群组、话题、运行配置与 grants 均不能由参数提供。`recipient_ids` 省略或为空数组时是公开消息，不创建投递、不唤醒成员；仅显式列出的成员进入投递队列。
 - `search_history` 必需 `query`，可选整数 `limit:1..50`（默认 20）和原样 `before`（省略/空字符串均为起始页）；结果 excerpt 是最多 256 Unicode rune 的消息前缀，不保证包含命中词。`read_history` 必需 `message_id`，可选整数 `offset>=0`（默认 0）、`length:1..4096`（默认 1024）；返回显式 `[offset,next_offset)` 片段及完整性信息，不能冒充全文。两项均受服务端绑定身份和精确话题限制，原样转发结果；都是读操作，没有写入 key/fingerprint，不触发或解除既有 write fuse。
+- 工作输入工具默认不激活。正式工作轮只有在服务端逐项授予时才可调用：`read_work_inputs {}` 只读，`ack_work_input {input_id}` 显式确认，`hand_back_work_input {input_id,reason}` 显式交回。写入的 201 收据只返回同一 `input_id`。已启用的受信 intake 可在 `send_message.intent_assessment` 使用 `continue_work`、`reason` 和可选 `followup {task_id?,constraint?}`；引用不是实际工作范围，也不授予权限。
 - 使用 `node:http.request`，没有 Origin/Fetch Metadata，也不继承代理；token 只进入 `Authorization: Bearer`。写操作的 `Idempotency-Key` 固定为 `sha256(toolName + toolCallId)` 小写十六进制；空调用 ID 被拒绝。
 - 请求在联网前按 **JSON 编码后的 UTF-8 字节**检查；请求及响应上限均为 **65536 字节（含边界）**。响应不解压、不截断；超限明确报错 `tool_result_too_large`。服务端读/list 超限应返回 HTTP 413，可缩小 `limit` 后重新读取。
 - 完整成功 JSON 原文进入文本 content，不投影、不静默裁剪；`details: undefined`，不重复写入完整载荷。服务端负责返回小型写收据：send 201 至少为 `{message_id,created_at,delivery_count,content_omitted:true}`；create 201 创建 / 200 复用，收据为 `{member_id,reused,join_message_id}`，复用的 `join_message_id` 为 `""`。扩展不额外限制成功收据字段，仍原样转发服务端 JSON。

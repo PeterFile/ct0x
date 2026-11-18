@@ -6,7 +6,7 @@ import { request } from "node:http";
 const CONFIG_LIMIT = 4096;
 const BYTE_LIMIT = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 25_000;
-export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact"]);
+export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", "read_work_inputs", "ack_work_input", "hand_back_work_input"]);
 
 /** @typedef {{ text: string, json: unknown }} Reply */
 /** @typedef {(toolName: string, params: unknown, toolCallId: string, signal?: AbortSignal) => Promise<Reply>} Client */
@@ -136,14 +136,23 @@ function validReceiptTime(value) {
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 19) === wall;
 }
 
-/** @param {string} toolName @param {number} status @param {unknown} value @param {unknown} requestKind */
-function validWriteReceipt(toolName, status, value, requestKind) {
+/** @param {string} toolName */
+function isWorkInputWrite(toolName) {
+  return toolName === "ack_work_input" || toolName === "hand_back_work_input";
+}
+
+/** @param {string} toolName @param {number} status @param {unknown} value @param {unknown} requestValue */
+function validWriteReceipt(toolName, status, value, requestValue) {
   // Role receipts are fixed projections; ordinary receipts remain additive.
+  if (isWorkInputWrite(toolName)) {
+    return status === 201 && isRecord(value) && Object.keys(value).join(",") === "input_id" &&
+      typeof value.input_id === "string" && value.input_id !== "" && value.input_id === requestValue;
+  }
   if (toolName === "decide_dispatch" || toolName === "submit_result") {
     if (status !== 201 || !isRecord(value) || !validReceiptTime(value.created_at)) return false;
     if (toolName === "decide_dispatch") {
       return Object.keys(value).sort().join(",") === "assignment_id,created_at,decision_id,kind" &&
-        typeof value.decision_id === "string" && value.decision_id.length > 0 && value.kind === requestKind &&
+        typeof value.decision_id === "string" && value.decision_id.length > 0 && value.kind === requestValue &&
         (value.kind === "assign" ? typeof value.assignment_id === "string" && value.assignment_id.length > 0 :
           value.kind === "decline" && value.assignment_id === "");
     }
@@ -197,21 +206,22 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
   if (!TOOL_NAMES.some(name => name === toolName)) throw safeError("成员工具名称无效，未发送请求。");
   if (typeof toolCallId !== "string" || !toolCallId.trim()) throw safeError("工具调用标识无效，未发送请求。");
   let body;
+  const workInputWrite = isWorkInputWrite(toolName);
   /** @type {unknown} */
-  let requestKind;
+  let requestValue;
   try {
     const text = JSON.stringify(params);
     if (typeof text !== "string" || text.includes(token)) throw new Error();
     body = Buffer.from(text, "utf8");
-    if (toolName === "decide_dispatch") {
+    if (toolName === "decide_dispatch" || workInputWrite) {
       const snapshot = JSON.parse(text);
-      if (isRecord(snapshot)) requestKind = snapshot.kind;
+      if (isRecord(snapshot)) requestValue = workInputWrite ? snapshot.input_id : snapshot.kind;
     }
   } catch {
     throw safeError("成员工具参数无效，未发送请求。");
   }
   if (body.length > BYTE_LIMIT) throw safeError("工具请求超过 64 KiB 限制，未发送请求。");
-  const roleWrite = toolName === "decide_dispatch" || toolName === "submit_result";
+  const roleWrite = toolName === "decide_dispatch" || toolName === "submit_result" || workInputWrite;
   const workspaceWrite = toolName === "workspace_write" || toolName === "publish_workspace_artifact";
   const write = roleWrite || workspaceWrite || toolName === "send_message" || toolName === "create_member";
   const fingerprint = write ? createHash("sha256").update(body).digest("hex") : "";
@@ -302,9 +312,9 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
             return fail(message ? message + suffix : invalidResponse, rejected ? "rejected" : "unknown");
           }
           if (sensitive) return fail(`成员工具返回了敏感数据，已拒绝显示；${unknown}`);
-          if (!validWriteReceipt(toolName, status, result.json, requestKind)) return fail(invalidResponse);
+          if (!validWriteReceipt(toolName, status, result.json, requestValue)) return fail(invalidResponse);
           if (roleWrite || workspaceWrite) {
-            if (!validRoleReceiptWire(result.text, workspaceWrite ? 5 : 4)) return fail(invalidResponse);
+            if (!validRoleReceiptWire(result.text, workInputWrite ? 1 : workspaceWrite ? 5 : 4)) return fail(invalidResponse);
             result = { text: JSON.stringify(result.json), json: result.json };
           }
           settled = true;

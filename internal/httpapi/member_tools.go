@@ -224,16 +224,12 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 		return
 	}
 	if input.Assessment.present {
-		var assessment domain.ChatAssessment
-		decoder := json.NewDecoder(bytes.NewReader(input.Assessment.value))
-		decoder.DisallowUnknownFields()
-		if input.RecipientIDs.present || decoder.Decode(&assessment) != nil {
+		if input.RecipientIDs.present {
 			memberToolError(w, store.ErrInvalid)
 			return
 		}
-		receipt, err := a.tools.AssessChatIntent(r.Context(), token, assessment, input.Content.value, key)
-		if err != nil {
-			memberToolError(w, err)
+		receipt, ok := a.assessMemberChatIntent(w, r, token, input.Assessment.value, input.Content.value, key)
+		if !ok {
 			return
 		}
 		assessmentReceipt := chatIntentToolReceipt{ID: receipt.ID, Disposition: receipt.Disposition,

@@ -17,7 +17,7 @@ import (
 // Use the same trusted post-claim MemberTools registry as MemberToolRoutes.
 func MemberRoleToolRoutes(tools *platform.MemberTools) []Route {
 	a := memberToolAPI{tools}
-	return []Route{
+	routes := []Route{
 		{http.MethodPost, "/api/v1/member-tools/decide_dispatch", memberToolNative(a.decideDispatch)},
 		{http.MethodPost, "/api/v1/member-tools/submit_result", memberToolNative(a.submitResult)},
 		{http.MethodPost, "/api/v1/member-tools/workspace_list", memberToolNative(a.workspaceList)},
@@ -25,6 +25,14 @@ func MemberRoleToolRoutes(tools *platform.MemberTools) []Route {
 		{http.MethodPost, "/api/v1/member-tools/workspace_write", memberToolNative(a.workspaceWrite)},
 		{http.MethodPost, "/api/v1/member-tools/publish_workspace_artifact", memberToolNative(a.publishWorkspaceArtifact)},
 	}
+	if tools.WorkInputsEnabled() {
+		routes = append(routes,
+			Route{http.MethodPost, "/api/v1/member-tools/read_work_inputs", memberToolNative(a.readWorkInputs)},
+			Route{http.MethodPost, "/api/v1/member-tools/ack_work_input", memberToolNative(a.ackWorkInput)},
+			Route{http.MethodPost, "/api/v1/member-tools/hand_back_work_input", memberToolNative(a.handBackWorkInput)},
+		)
+	}
+	return routes
 }
 
 func (a memberToolAPI) decideDispatch(w http.ResponseWriter, r *http.Request, token string) {
@@ -145,7 +153,8 @@ func memberRoleToolError(w http.ResponseWriter, operation string, err error) {
 		// Negative outcome evidence dominates every business cause in the chain.
 	case err == store.ErrMemberToolDenied:
 		status, code, message = http.StatusForbidden, "forbidden", "无权访问成员工具"
-	case confirmed && (operation == "submit_result" || operation == "workspace_write" || operation == "publish_workspace_artifact"):
+	case confirmed && (operation == "submit_result" || operation == "workspace_write" || operation == "publish_workspace_artifact" ||
+		operation == "ack_work_input" || operation == "hand_back_work_input" || operation == "continue_work"):
 		switch {
 		case errors.Is(err, store.ErrMemberToolDenied):
 			status, code, message = http.StatusForbidden, "forbidden", "无权访问成员工具"

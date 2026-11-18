@@ -75,7 +75,7 @@ test("repair assessment accepts the exact final-plan chat_request label without 
 
 test("workspace schemas expose only task-local file data and semantic workspace_change intake", async t => {
   const server = await setup(t);
-  assert.deepEqual(TOOL_NAMES.slice(-4), fileNames);
+  assert.deepEqual(TOOL_NAMES.filter(name => name.startsWith("workspace_") || name === "publish_workspace_artifact"), fileNames);
   for (const name of fileNames) {
     const tool = server.tools.get(name);
     assert.ok(tool, name);

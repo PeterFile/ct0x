@@ -32,6 +32,9 @@ type MemberToolRuntimeOptions struct {
 	RoleExecutionRoot string
 	// ChatIntake reuses the same Engine and requires the role execution path.
 	ChatIntake *coordination.Engine
+	// WorkInputs is trusted startup composition. Nil keeps work inputs closed.
+	// ContinueWork additionally requires ChatIntake on the issuing registry.
+	WorkInputs MemberWorkInputService
 }
 
 type MemberToolRunBinding struct {
@@ -102,7 +105,11 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 			return nil, errMemberToolRuntimeConfig
 		}
 	}
+	if options.WorkInputs != nil && roleFence == nil {
+		return nil, errMemberToolRuntimeConfig
+	}
 	tools := NewMemberTools(db)
+	tools.workInputs = options.WorkInputs
 	if options.ChatIntake != nil {
 		if roleFence == nil {
 			return nil, errMemberToolRuntimeConfig
@@ -163,13 +170,12 @@ func memberToolRuntimeText(value string) bool {
 }
 
 type memberToolRuntimeRun struct {
-	runtime   *MemberToolRuntime
-	binding   MemberToolRunBinding
-	factory   MemberToolExecutorFactory
-	used      atomic.Bool
-	role      *store.CoordinationRoleProvenance
-	intake    bool
-	workspace bool
+	runtime *MemberToolRuntime
+	binding MemberToolRunBinding
+	factory MemberToolExecutorFactory
+	used    atomic.Bool
+	role    *store.CoordinationRoleProvenance
+	intake  bool
 	// Cloned at trusted wrapping and again when the claimed token is registered.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }

@@ -44,11 +44,17 @@ func (s *MemberTools) ChatCandidate(ctx context.Context, token string) (*domain.
 // AssessChatIntent shares send_message's transport, not the local-user actor.
 // Only the server-captured candidate from this exact execution can be assessed.
 func (s *MemberTools) AssessChatIntent(ctx context.Context, token string, input domain.ChatAssessment, content, key string) (domain.ChatAssessmentReceipt, error) {
+	return s.withChatIntake(token, func(scope store.MemberToolScope, candidateID string) (domain.ChatAssessmentReceipt, error) {
+		return s.chatEngine.AssessChatIntent(ctx, scope, candidateID, input, content, key)
+	})
+}
+
+func (s *MemberTools) withChatIntake(token string, use func(store.MemberToolScope, string) (domain.ChatAssessmentReceipt, error)) (domain.ChatAssessmentReceipt, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry, found := s.capabilities[sha256.Sum256([]byte(token))]
 	if !found || entry.purpose != domain.ChatIntakePurpose || s.chatEngine == nil || entry.candidate == nil || !slices.Contains(entry.grants.Operations, "send_message") {
 		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
 	}
-	return s.chatEngine.AssessChatIntent(ctx, entry.scope, entry.candidate.ID, input, content, key)
+	return use(entry.scope, entry.candidate.ID)
 }

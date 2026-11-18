@@ -399,6 +399,9 @@ func (p *Preparer) buildContext(group domain.Group, member domain.Member, conver
 				"根据工具outcome区分admitted、not_admitted、discuss、clarify；not_admitted的reason_code/question和原话题说明是持久事实，不能自动加额度、换key重复准入或用模型最终文字改称成功。真正HTTP结果未知时保留原key对账，不自动重试业务操作。",
 				"intake本轮不授予文件IO、Artifact发布或外部动作权限；语义评估登记Task不等于工作成员获准执行。CWD不是主机读取沙箱。Task/分派持久化不等于执行成功，具体Submission不等于用户接纳或Review；最终文字必须有效UTF-8且最多65536字节。",
 			}
+			if p.memberTools.tools.WorkInputsEnabled() {
+				in.Permissions = append(in.Permissions, "仅当绑定的本机用户消息明确要求续办已有工作时，才用 continue_work 和 reason，可在 followup 中提供明确引用的 task_id 及 constraint。省略 task_id 时由服务器判定能否唯一确定活跃工作；引用不授予权限，不另建 Task 或选择负责人。")
+			}
 		}
 		if selected, ok := p.providers[member.ProviderID]; ok {
 			if selection, enabled := p.memberToolAdapter(selected); enabled && selection.Protocol == provider.CodexAppServerProtocol {

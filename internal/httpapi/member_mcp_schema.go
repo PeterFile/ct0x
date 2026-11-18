@@ -26,15 +26,19 @@ var memberMCPTools = []memberMCPTool{
 			"content":{"type":"string"},
 			"recipient_ids":{"type":"array","items":{"type":"string"}},
 			"intent_assessment":{"type":"object","properties":{
-				"disposition":{"enum":["discuss","clarify","request_work","prepare_work"]},
+				"disposition":{"enum":["discuss","clarify","request_work","prepare_work","continue_work"]},
 				"action":{"enum":["text_submission","workspace_change"]},
 				"title":{"type":"string","maxLength":256},
 				"description":{"type":"string","maxLength":8192},
 				"acceptance":{"type":"string","maxLength":4096},
 				"reason":{"type":"string","minLength":1,"maxLength":4096},
 				"question":{"type":"string","maxLength":2048},
-				"repair":{"type":"object","properties":{"review_id":{"type":"string","minLength":1,"maxLength":256},"authorization":{"enum":["review_request","original_agreement","chat_request"]}},"required":["review_id","authorization"],"additionalProperties":false}
-			},"required":["disposition","reason"],"additionalProperties":false,"if":{"required":["repair"]},"then":{"properties":{"disposition":{"const":"request_work"}}}}
+				"repair":{"type":"object","properties":{"review_id":{"type":"string","minLength":1,"maxLength":256},"authorization":{"enum":["review_request","original_agreement","chat_request"]}},"required":["review_id","authorization"],"additionalProperties":false},
+				"followup":{"type":"object","description":"仅用于已启用的受信续办评估；task_id 只是用户明确引用，服务器选定实际工作。","properties":{"task_id":{"type":"string","minLength":1,"maxLength":256},"constraint":{"type":"string"}},"additionalProperties":false}
+			},"required":["disposition","reason"],"additionalProperties":false,"allOf":[
+				{"if":{"required":["repair"]},"then":{"properties":{"disposition":{"const":"request_work"}}}},
+				{"if":{"properties":{"disposition":{"const":"continue_work"}}},"then":{"properties":{"action":false,"title":false,"description":false,"acceptance":false,"question":false,"repair":false}},"else":{"properties":{"followup":false}}}
+			]}
 		},"required":["content"],"additionalProperties":false
 	}`), memberToolAPI.sendMessage, true},
 	{"create_member", "按职责与原因创建或复用成员；配置、权限与容量由服务端决定，不自动创建原生子 Agent 的平台身份。", json.RawMessage(`{
@@ -70,4 +74,11 @@ var memberMCPTools = []memberMCPTool{
 	 "required":["operation_id"],"additionalProperties":false,
 	 "oneOf":[{"required":["name"],"not":{"anyOf":[{"required":["artifact_id"]},{"required":["expected_version_id"]}]}},{"required":["artifact_id","expected_version_id"],"not":{"required":["name"]}}]
 	}`), memberToolAPI.publishWorkspaceArtifact, true},
+	{"read_work_inputs", "读取本轮绑定的工作输入；读取不会确认已处理。", json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`), memberToolAPI.readWorkInputs, false},
+	{"ack_work_input", "显式确认本轮已处理指定工作输入；未知时保留原 id 并先对账。", json.RawMessage(`{
+		"type":"object","properties":{"input_id":{"type":"string","minLength":1,"maxLength":256}},"required":["input_id"],"additionalProperties":false
+	}`), memberToolAPI.ackWorkInput, true},
+	{"hand_back_work_input", "将未处理的工作输入交回并说明原因；未知时保留原 id 并先对账。", json.RawMessage(`{
+		"type":"object","properties":{"input_id":{"type":"string","minLength":1,"maxLength":256},"reason":{"type":"string","minLength":1}},"required":["input_id","reason"],"additionalProperties":false
+	}`), memberToolAPI.handBackWorkInput, true},
 }

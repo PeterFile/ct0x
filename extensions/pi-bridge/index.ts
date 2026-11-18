@@ -9,7 +9,7 @@ const pagination = Type.Object({
 }, { additionalProperties: false });
 
 const chatAssessment = Type.Object({
-  disposition: Type.Union([Type.Literal("discuss"), Type.Literal("clarify"), Type.Literal("request_work"), Type.Literal("prepare_work")], { description: "仅受信chat_intake/v1解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。prepare_work仅限受支持的topic_summary。" }),
+  disposition: Type.Union([Type.Literal("discuss"), Type.Literal("clarify"), Type.Literal("request_work"), Type.Literal("prepare_work"), Type.Literal("continue_work")], { description: "仅受信chat_intake/v1解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。prepare_work仅限受支持的topic_summary；continue_work须已启用且来自当前本机用户的明确续办请求。" }),
   action: Type.Optional(Type.Union([Type.Literal("text_submission"), Type.Literal("workspace_change")], { description: "结合可信来源和上下文提出文本交付或目录文件修改；只是一项语义建议，当前 Policy、目录授权和 Task 范围由服务器核定，模型不能授予 IO 权限。" })),
   title: Type.Optional(Type.String({ maxLength: 256, description: "仅request_work填写目标；prepare_work须省略。" })),
   description: Type.Optional(Type.String({ maxLength: 8192, description: "仅request_work填写边界；prepare_work须省略。" })),
@@ -20,7 +20,13 @@ const chatAssessment = Type.Object({
     review_id: Type.String({ minLength: 1, maxLength: 256, description: "仅引用服务器 repair_source 中的真实本机用户评审；不能选择调用者、目录或授权。" }),
     authorization: Type.Union([Type.Literal("review_request"), Type.Literal("original_agreement"), Type.Literal("chat_request")], { description: "解释实际评审修复请求、原冻结同范围约定或当前真人聊天修复请求；chat_request还须服务器核对当前真实聊天命令和正式Review引用。拒收本身、Agent共识、平台消息标签均不自动授权。服务器重验许可和版本范围。" }),
   }, { additionalProperties: false })),
+  followup: Type.Optional(Type.Object({
+    task_id: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "仅填写用户明确引用的任务；实际工作和权限由服务器核定。" })),
+    constraint: Type.Optional(Type.String({ description: "当前用户对续办的附加约束，不授予权限。" })),
+  }, { additionalProperties: false, description: "仅用于受信 continue_work 评估。" })),
 }, { additionalProperties: false });
+
+const workInputId = Type.String({ minLength: 1, maxLength: 256, description: "服务器返回的本轮工作输入标识。" });
 
 const tools = [
   {
@@ -131,6 +137,27 @@ const tools = [
       expected_version_id: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "更新时必须提供实际基于的精确版本。" })),
     }, { additionalProperties: false }),
   },
+  {
+    name: "read_work_inputs",
+    label: "读取工作输入",
+    description: "只读取本轮绑定的工作输入；读取不会确认已处理。",
+    defaultActive: false,
+    parameters: Type.Object({}, { additionalProperties: false }),
+  },
+  {
+    name: "ack_work_input",
+    label: "确认工作输入",
+    description: "显式确认本轮已处理指定工作输入；结果未知时保留原调用标识并先对账，不自动重试。",
+    defaultActive: false,
+    parameters: Type.Object({ input_id: workInputId }, { additionalProperties: false }),
+  },
+  {
+    name: "hand_back_work_input",
+    label: "交回工作输入",
+    description: "将未处理的工作输入交回并说明原因；结果未知时保留原调用标识并先对账，不自动重试。",
+    defaultActive: false,
+    parameters: Type.Object({ input_id: workInputId, reason: Type.String({ minLength: 1 }) }, { additionalProperties: false }),
+  },
 ] as const;
 
 function workspacePath(value: string, directory: boolean): boolean {
@@ -140,6 +167,10 @@ function workspacePath(value: string, directory: boolean): boolean {
 
 function workspaceText(value: string, limit: number): boolean {
   return !/[\ud800-\udfff]/u.test(value) && Buffer.byteLength(value, "utf8") <= limit;
+}
+
+function validWorkInputID(value: string): boolean {
+  return value !== "" && value.trim() === value && workspaceText(value, 256) && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
 }
 
 export default function piBridge(pi: ExtensionAPI) {
@@ -159,15 +190,28 @@ export default function piBridge(pi: ExtensionAPI) {
             payload = JSON.parse(encoded);
             valid = Value.Check(tool.parameters, payload);
             if (valid && tool.name === "send_message") {
-              const message = payload as { recipient_ids?: string[]; intent_assessment?: { disposition: string; repair?: { review_id: string } } };
+              const message = payload as { recipient_ids?: string[]; intent_assessment?: {
+                disposition: string; reason: string; repair?: { review_id: string }; followup?: { task_id?: string };
+              } };
               if (Object.hasOwn(message, "intent_assessment")) {
                 valid = !Object.hasOwn(message, "recipient_ids");
                 const assessment = message.intent_assessment!;
                 if (Object.hasOwn(assessment, "repair")) {
                   const id = assessment.repair!.review_id;
-                  valid = valid && assessment.disposition === "request_work" && workspaceText(id, 256) && id.trim() === id && id !== "" && !/[\u0000-\u001f\u007f-\u009f]/u.test(id);
+                  valid = valid && assessment.disposition === "request_work" && validWorkInputID(id);
+                }
+                if (assessment.disposition === "continue_work") {
+                  const reference = assessment.followup?.task_id;
+                  valid = valid && assessment.reason.trim() !== "" && (reference === undefined || validWorkInputID(reference)) &&
+                    Object.keys(assessment).every(key => ["disposition", "reason", "followup"].includes(key));
+                } else {
+                  valid = valid && !Object.hasOwn(assessment, "followup");
                 }
               }
+            }
+            if (valid && (tool.name === "ack_work_input" || tool.name === "hand_back_work_input")) {
+              const input = payload as { input_id: string; reason?: string };
+              valid = validWorkInputID(input.input_id) && (tool.name !== "hand_back_work_input" || input.reason!.trim() !== "");
             }
             if (valid && tool.name === "decide_dispatch") {
               // Keep an object schema for Pi; check the conditional field on the safe snapshot.
