@@ -247,6 +247,40 @@ it.each(["wheel", "keyboard", "touch", "scrollbar"])("lets newer %s reading inte
   expect(screen.getByText(/消息已持久化/)).toBeVisible(); expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages`]);
 });
 
+it.each([["send", "原始问题", 2], ["reset", "对应邀请", 4]] as const)(
+  "keeps a native discussion reference ahead of a late %s completion", async (operation, label, index) => {
+    const invite = { kind: "invite" as const, root_message_id: row(2).id, invitation_message_id: row(4).id,
+      inviter_id: "inviter", assignee_id: "assignee", expected_reply: "" };
+    const items = [...initial];
+    items[1] = { ...row(2), source_kind: "local_user_chat", source_id: "question-command" };
+    items[3] = { ...row(4), sender_id: invite.inviter_id, discussion: invite,
+      deliveries: [{ ...delivery, message_id: row(4).id, recipient_id: invite.assignee_id, state: "accepted" }] };
+    items[6] = { ...row(7), sender_id: invite.assignee_id, discussion: { ...invite, kind: "reply" } };
+    await open(items);
+    const pending = deferred<Response>();
+    if (operation === "send") { writes.mockReturnValueOnce(pending.promise); send(); }
+    else { reads.mockReturnValueOnce(pending.promise); fireEvent.click(button("刷新并重置历史窗口")); }
+
+    const disclosure = item(row(7).id).querySelector<HTMLDetailsElement>(".message-discussion")!;
+    fireEvent.click(disclosure.querySelector("summary")!);
+    const id = row(index).id, container = history(), top = container.scrollTop + offset(id);
+    const link = within(disclosure).getByRole("link", { name: label });
+    expect(link).toHaveAttribute("href", `#${item(id).querySelector("article")!.id}`);
+    expect(fireEvent.click(link, { detail: 0 })).toBe(true); // Keyboard activation must keep the native default.
+    // Model the native fragment jump; the scroll event can be delivered after the response.
+    tops.set(container, top);
+    await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(items.slice(1))));
+    fireEvent.scroll(container);
+    expect(offset(id)).toBe(0);
+    if (operation === "send") {
+      expect(container.scrollTop).toBe(top);
+      expect(item(row(9).id)).toHaveTextContent("公开原文");
+      expect(screen.getByText(/消息已持久化/)).toBeVisible();
+    }
+    expectRequests(operation === "send" ? [latestURL(), `/api/v1/groups/${group.id}/messages`] : [latestURL(), latestURL()]);
+  },
+);
+
 it("does not suppress a confirmed send merely because the reader clicked a message without scrolling", async () => {
   await open(); readAt(history(), 230); const pending = deferred<Response>(); writes.mockReturnValueOnce(pending.promise); send();
   fireEvent.pointerDown(item(row(3).id));

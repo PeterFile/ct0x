@@ -163,7 +163,8 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
           <span className="feed-note">{messageSourceLabel(message.source_kind)}</span></header>
         {message.topic_id ? <p className="eyebrow accent">话题消息</p> : null}
         <p className="message-content">{message.content}</p>
-        {message.discussion ? <DiscussionContext message={message} loaded={loaded} members={membersById} scopeId={formId} /> : null}
+        {message.discussion ? <DiscussionContext message={message} loaded={loaded} members={membersById} scopeId={formId}
+          onNavigateReference={scroll.onNavigateReference} /> : null}
         <div className="message-actions">
         <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
           onClick={event => requestWork.current?.open(message, event.currentTarget)}>转为任务</button>
@@ -271,8 +272,9 @@ function discussionPreview(content: string) {
   return text;
 }
 
-function DiscussionContext({ message, loaded, members, scopeId }: {
+function DiscussionContext({ message, loaded, members, scopeId, onNavigateReference }: {
   message: Message; loaded: ReadonlyMap<string, Message>; members: ReadonlyMap<string, Member>; scopeId: string;
+  onNavigateReference: (id: string) => void;
 }) {
   const facts = message.discussion;
   if (!facts) return null;
@@ -301,9 +303,11 @@ function DiscussionContext({ message, loaded, members, scopeId }: {
   return <details className="message-details message-discussion">
     <summary><strong>{discussionLabels[kind]}</strong> · {summary}</summary>
     <dl className="message-technical">
-      <DiscussionReference label="原始问题" id={root_message_id} target={root} scopeId={scopeId} />
-      <DiscussionReference label="对应邀请" id={invitation_message_id} target={invitation} scopeId={scopeId} self={kind === "invite"} />
-      {parent_invitation_message_id ? <DiscussionReference label="上级邀请" id={parent_invitation_message_id} target={parent} scopeId={scopeId} /> : null}
+      <DiscussionReference label="原始问题" id={root_message_id} target={root} scopeId={scopeId} onNavigate={onNavigateReference} />
+      <DiscussionReference label="对应邀请" id={invitation_message_id} target={invitation} scopeId={scopeId} self={kind === "invite"}
+        onNavigate={onNavigateReference} />
+      {parent_invitation_message_id ? <DiscussionReference label="上级邀请" id={parent_invitation_message_id} target={parent} scopeId={scopeId}
+        onNavigate={onNavigateReference} /> : null}
       <div><dt>邀请者 ID</dt><dd><code>{inviter_id}</code></dd></div>
       <div><dt>受邀者 ID</dt><dd><code>{assignee_id}</code></dd></div>
       {expected_reply.trim() ? <div><dt>预期答复</dt><dd>{expected_reply}</dd></div> : null}
@@ -311,11 +315,13 @@ function DiscussionContext({ message, loaded, members, scopeId }: {
   </details>;
 }
 
-function DiscussionReference({ label, id, target, scopeId, self }: {
-  label: string; id: string; target?: Message; scopeId: string; self?: boolean;
+function DiscussionReference({ label, id, target, scopeId, self, onNavigate }: {
+  label: string; id: string; target?: Message; scopeId: string; self?: boolean; onNavigate: (id: string) => void;
 }) {
   return <div>
-    <dt>{target ? <a href={`#${messageAnchor(scopeId, id)}`}>{label}</a> : label}</dt>
+    <dt>{target ? <a href={`#${messageAnchor(scopeId, id)}`} onClick={event => {
+      if (!event.defaultPrevented && event.button === 0 && !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey) onNavigate(id);
+    }}>{label}</a> : label}</dt>
     <dd><code>{id}</code>{self ? "（本条消息）" : !target ? "（未在当前窗口载入）" : null}
       {target ? <p className="discussion-reference-preview">{discussionPreview(target.content)}</p> : null}
     </dd>

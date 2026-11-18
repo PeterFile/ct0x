@@ -320,13 +320,46 @@ func TestChatDiscussionFlow(t *testing.T) {
 			if _, err := reopened.GetMessage(ctx, f.otherID, answer.Message.ID); !errors.Is(err, ErrNotFound) {
 				t.Fatalf("foreign group read discussion answer: %v", err)
 			}
+			// Bypass write guards only to exercise damaged or older optional evidence.
+			coordinationDecideExec(t, reopened, `PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;
+				DROP TRIGGER chat_discussion_events_update;`)
 			if hops == 1 {
-				// Damaged invitation evidence must neither project across topics nor hide public messages.
-				coordinationDecideExec(t, reopened, `PRAGMA foreign_keys=OFF; DROP TRIGGER chat_discussion_events_update;`)
-				coordinationDecideExec(t, reopened, `UPDATE chat_discussion_events SET topic_id='other-topic' WHERE message_id=?`, first.Message.ID)
+				plain, err := reopened.GetMessage(ctx, f.groupID, first.Message.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				coordinationDecideExec(t, reopened, `DROP TRIGGER message_command_sources_update;
+					DROP TRIGGER messages_identity; DROP TRIGGER chat_discussion_deliveries_identity;`)
 				for id := range want {
 					want[id] = nil
 				}
+				for _, fault := range []struct {
+					name, update, id string
+					bad, good        any
+				}{
+					{"event_topic", `UPDATE chat_discussion_events SET topic_id=? WHERE message_id=?`, first.Message.ID, "other-topic", topic},
+					{"invitation_message_topic", `UPDATE messages SET topic_id=? WHERE id=?`, first.Message.ID, "other-topic", topic},
+					{"original_topic", `UPDATE messages SET topic_id=? WHERE id=?`, origin.ID, "other-topic", topic},
+					{"original_source", `UPDATE message_command_sources SET kind=? WHERE message_id=?`, origin.ID, "local_user_policy", "local_user_chat"},
+					{"delivery_topic", `UPDATE deliveries SET topic_id=? WHERE id=?`, first.Event.DeliveryID, "other-topic", topic},
+					{"wrong_delivery", `UPDATE chat_discussion_events SET delivery_id=? WHERE message_id=?`, first.Message.ID, origin.Deliveries[0].ID, first.Event.DeliveryID},
+					{"null_recipient", `UPDATE chat_discussion_events SET recipient_id=? WHERE message_id=?`, first.Message.ID, nil, f.b},
+				} {
+					t.Run(fault.name, func(t *testing.T) {
+						coordinationDecideExec(t, reopened, fault.update, fault.bad, fault.id)
+						defer coordinationDecideExec(t, reopened, fault.update, fault.good, fault.id)
+						discussionCheckTimeline(t, reopened, f.groupID, want)
+						if m, err := reopened.GetMessage(ctx, f.groupID, first.Message.ID); err != nil ||
+							m.Content != plain.Content || !reflect.DeepEqual(m.Deliveries, plain.Deliveries) {
+							t.Fatalf("bad relation changed the public message or live deliveries: %+v, %v", m, err)
+						}
+					})
+				}
+			} else {
+				// A relay missing its recorded parent is not a new root invitation.
+				child, returned := events[1].Event, events[2].Event
+				coordinationDecideExec(t, reopened, `UPDATE chat_discussion_events SET related_invitation_id=NULL WHERE message_id=?`, child.MessageID)
+				want[child.MessageID], want[returned.MessageID] = nil, nil
 				discussionCheckTimeline(t, reopened, f.groupID, want)
 			}
 		})
