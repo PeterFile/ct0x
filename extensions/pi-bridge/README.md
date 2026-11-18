@@ -10,7 +10,9 @@ Pi 1.4.0 成员工具扩展。普通工具为 `list_members`、`read_channel`、
 {"endpoint":"http://127.0.0.1:7310/api/v1/member-tools","token":"SERVER_ISSUED_CAPABILITY"}
 ```
 
-环境变量只保存该文件的**绝对路径**，不是 JSON 或 token。启动器仅在实际工作服务已接入且发行的能力绑定受信 `chat_intake/v1` 时，在同一文件写入 `"continue_work":true`。否则省略此字段并保留旧 `send_message` schema。Pi 只从该文件选择 schema，不额外发起 HTTP；Codex 的 MCP `tools/list` 按同一受信能力发布 schema。该字段不是授权，不能由模型参数或额外环境变量启用。不要把 token 放入参数、提示词、命令行或日志。启动器负责文件生命周期；扩展初始化读取一次，之后不重读、不删除。文件超过 4096 字节、末级符号链接、权限/所有者不符或配置无效时，加载失败且不注册工具。
+`AGENT_WORKSPACE_MEMBER_TOOL_CONFIG` 只保存该文件的**绝对路径**，不是 JSON 或 token。启动器仅在实际工作服务已接入且发行的能力绑定受信 `chat_intake/v1` 时，在同一文件写入 `"continue_work":true`。否则省略此字段并保留旧 `send_message` schema。Pi 只从该文件选择 schema，不额外发起 HTTP；Codex 的 MCP `tools/list` 按同一受信能力发布 schema。该字段不是授权，不能由模型参数或额外环境变量启用。不要把 token 放入参数、提示词、命令行或日志。启动器负责文件生命周期；扩展初始化读取一次，之后不重读、不删除。文件超过 4096 字节、末级符号链接、权限/所有者不符或配置无效时，加载失败且不注册工具。
+
+普通启动只传 `AGENT_WORKSPACE_MEMBER_TOOL_CONFIG`。显式选择原生文本会话的可信运行时还会传 `AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256`：发证配置原始字节的 SHA-256，以 64 个小写十六进制字符表示。只要该变量存在（即使为空），扩展就在解析前校验同一份字节；格式错误或摘要不匹配会拒绝注册工具，不回退到仅路径模式。摘要不是额外授权，不改变工具 allowlist、`continue_work` 或工作输入范围。原生会话保持默认关闭。
 
 从仓库根目录显式加载（仅说明独立扩展调用方式，不代表已有启动器）：
 

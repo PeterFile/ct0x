@@ -49,11 +49,13 @@ function endpointURL(value) {
 }
 
 /**
- * Read once; the launcher owns the config file's lifetime.
+ * Read once; the launcher owns the config file's lifetime. An expected digest
+ * selects the bound profile; it covers exactly the bytes this bridge consumes.
  * @param {string | undefined} path
+ * @param {string} [expectedSHA256]
  * @returns {{ invoke: Client, continueWork: boolean }}
  */
-export function openBridge(path) {
+export function openBridge(path, expectedSHA256) {
   let fd;
   try {
     if (!path || !isAbsolute(path)) throw new Error(CONFIG_ERROR);
@@ -71,7 +73,12 @@ export function openBridge(path) {
       size += count;
     }
     if (size > CONFIG_LIMIT) throw new Error(CONFIG_ERROR);
-    const config = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, size)));
+    const bytes = buffer.subarray(0, size);
+    if (expectedSHA256 !== undefined &&
+        (!/^[0-9a-f]{64}$/.test(expectedSHA256) || createHash("sha256").update(bytes).digest("hex") !== expectedSHA256)) {
+      throw new Error(CONFIG_ERROR);
+    }
+    const config = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
     if (!isRecord(config)) throw new Error(CONFIG_ERROR);
     const fields = Object.keys(config).sort().join(",");
     const continueWork = fields === "continue_work,endpoint,token" && config.continue_work === true;

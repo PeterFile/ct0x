@@ -200,7 +200,10 @@ function validWorkInputID(value: string): boolean {
 }
 
 export default function piBridge(pi: ExtensionAPI) {
-  const { invoke, continueWork } = openBridge(process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG);
+  const { invoke, continueWork } = openBridge(
+    process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG,
+    process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256,
+  );
   for (const tool of tools) {
     const parameters = tool.name === "send_message" && continueWork ? sendMessageParameters(true) : tool.parameters;
     pi.registerTool<typeof parameters>({

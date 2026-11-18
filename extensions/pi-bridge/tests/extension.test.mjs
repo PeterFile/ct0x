@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFile, unlink } from "node:fs/promises";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { loadExtensions } from "./pi-loader.mjs";
@@ -8,15 +9,23 @@ import { BASE, TOKEN, json, loopback, privateConfig, safeFailure } from "./helpe
 const entry = fileURLToPath(new URL("../index.ts", import.meta.url));
 const names = ["list_members", "read_channel", "send_message", "create_member"];
 
-async function load(config) {
-  const previous = process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG;
+async function load(config, digest) {
+  const env = [
+    ["AGENT_WORKSPACE_MEMBER_TOOL_CONFIG", config],
+    ["AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256", digest],
+  ];
+  const previous = env.map(([key]) => [key, process.env[key]]);
+  const setEnv = entries => {
+    for (const [key, value] of entries) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
   try {
-    if (config === undefined) delete process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG;
-    else process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG = config;
+    setEnv(env);
     return await loadExtensions([entry], process.cwd());
   } finally {
-    if (previous === undefined) delete process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG;
-    else process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG = previous;
+    setEnv(previous);
   }
 }
 
@@ -152,6 +161,47 @@ test("invalid or absent initialization config registers no usable tools and expo
     assert.match(result.errors[0].error, /配置/);
     assert.ok(!result.errors[0].error.includes(TOKEN));
     assert.ok(!result.errors[0].error.includes(path));
+  }
+});
+
+test("loader rejects malformed or mismatched runtime digests before registering tools", async t => {
+  const path = await privateConfig(t);
+  const digest = createHash("sha256").update(await readFile(path)).digest("hex");
+  const mismatch = (digest[0] === "a" ? "b" : "a") + digest.slice(1);
+  for (const invalid of ["", "A".repeat(64), digest.slice(1), `${digest}0`, ` ${digest}`, `${digest}\n`, `sha256:${digest}`, mismatch]) {
+    const result = await load(path, invalid);
+    assert.equal(result.extensions.length, 0, "invalid marker must not fall back to path-only mode");
+    assert.equal(result.errors.length, 1);
+    assert.match(result.errors[0].error, /配置/);
+    for (const secret of [path, TOKEN, digest, mismatch]) assert.ok(!result.errors[0].error.includes(secret));
+  }
+});
+
+test("matching runtime digest preserves strict caller scope and exact legacy output", async t => {
+  const text = '{ "items": [], "next_cursor": "" }\n';
+  const { endpoint, requests } = await loopback(t, (_, response) => {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(text);
+  });
+  const path = await privateConfig(t, { endpoint });
+  const digest = createHash("sha256").update(await readFile(path)).digest("hex");
+  const loaded = [await load(path), await load(path, digest)];
+  await unlink(path); // Both modes must keep using the initialized bytes.
+  for (const result of loaded) {
+    assert.deepEqual(result.errors, []);
+    const tools = result.extensions[0].tools;
+    assert.ok(!JSON.stringify(tools.get("send_message").definition.parameters).includes("continue_work"));
+    const tool = tools.get("read_channel").definition;
+    await assert.rejects(execute(tool, { group_id: "outside-scope" }), error => safeFailure(error, /未发送/));
+    assert.deepEqual(await execute(tool, {}), { content: [{ type: "text", text }], details: undefined });
+  }
+  assert.equal(requests.length, 2);
+  for (const request of requests) {
+    assert.equal(request.url, `${BASE}/read_channel`);
+    assert.equal(request.headers.authorization, `Bearer ${TOKEN}`);
+    assert.equal(request.headers["idempotency-key"], undefined);
+    assert.equal(request.body.toString("utf8"), "{}");
+    assert.ok(!JSON.stringify(request.headers).includes(digest));
   }
 });
 
