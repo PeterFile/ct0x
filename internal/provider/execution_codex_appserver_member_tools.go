@@ -94,10 +94,11 @@ func readMemberToolConfig(path string) (memberToolConfig, error) {
 
 type codexAppServerMemberToolExecutor struct {
 	codexAppServerExecutor
-	configPath string
-	configFile os.FileInfo
-	digest     [32]byte
-	names      []string
+	configPath     string
+	configFile     os.FileInfo
+	digest         [32]byte
+	names          []string
+	sessionOptions *CodexAppServerSessionOptions
 }
 
 // NewCodexAppServerMemberToolExecutor is experimental and explicitly opt-in on
@@ -131,7 +132,48 @@ func NewCodexAppServerMemberToolExecutor(selected Provider, configPath string, t
 		configPath: configPath, configFile: config.file, digest: config.digest, names: names}, nil
 }
 
-func (e codexAppServerMemberToolExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error) ExecutionReceipt {
+// NewCodexAppServerSessionExecutor experimentally opts into bounded capture and
+// exact-thread cold resume on Codex 0.166.0. The caller must qualify the latest
+// platform receipt and freeze current grants before supplying Resume. A reference
+// is not authorization. Nil Resume means fresh-and-capture; errors never fall back.
+// Each Execute retains the original HOME/auth and uses a new process and MCP token.
+func NewCodexAppServerSessionExecutor(selected Provider, configPath string, toolNames []string, options CodexAppServerSessionOptions, timeout time.Duration) (Executor, error) {
+	if !validNativeSessionBinding(options.Binding) || options.Resume != nil && !validCodexNativeReference(options.Resume) {
+		return nil, errExecutorConfiguration
+	}
+	base, err := NewCodexAppServerMemberToolExecutor(selected, configPath, toolNames, timeout)
+	if err != nil {
+		return nil, err
+	}
+	e := base.(codexAppServerMemberToolExecutor)
+	if !nativeSessionPath(selected.Path) || options.Resume != nil &&
+		(options.Resume.Codex.CLIPath != selected.Path || options.Resume.Codex.ToolsProfileSHA256 != codexSessionToolsProfile(e.names)) {
+		return nil, errExecutorConfiguration
+	}
+	options.Binding = bytes.Clone(options.Binding)
+	options.Resume = cloneNativeSessionReference(options.Resume)
+	e.sessionOptions = &options
+	return e, nil
+}
+
+func (e codexAppServerMemberToolExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error) (receipt ExecutionReceipt) {
+	var native *codexAppServerSession
+	if e.sessionOptions != nil {
+		options := e.sessionOptions
+		defer func() {
+			if receipt.NativeRef == nil && options.Binding != nil {
+				receipt.NativeRef = &NativeSessionReference{Version: NativeSessionReferenceVersion, Binding: bytes.Clone(options.Binding)}
+			}
+		}()
+		if !codexAppServerIdentity(request.Model) || !nativeSessionPath(request.CWD) || options.Resume != nil &&
+			(options.Resume.Codex.Model != request.Model || options.Resume.Codex.CWD != request.CWD) {
+			return ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "原生会话模型或目录不匹配，执行未启动"}
+		}
+		native = &codexAppServerSession{cliPath: e.path, toolsProfile: codexSessionToolsProfile(e.names), binding: bytes.Clone(options.Binding)}
+		if options.Resume != nil {
+			native.resume = cloneNativeSessionReference(options.Resume).Codex
+		}
+	}
 	config, err := readMemberToolConfig(e.configPath)
 	if err != nil || !os.SameFile(e.configFile, config.file) || config.digest != e.digest || !e.configFile.ModTime().Equal(config.file.ModTime()) {
 		return ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "成员工具配置无效或已变化，执行未启动"}
@@ -140,7 +182,7 @@ func (e codexAppServerMemberToolExecutor) Execute(ctx context.Context, request E
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "无法创建成员工具执行配置"}
 	}
-	session := &codexAppServerMemberSession{endpoint: config.endpoint + "/mcp", origin: config.origin, names: e.names,
+	session := &codexAppServerMemberSession{endpoint: config.endpoint + "/mcp", origin: config.origin, names: e.names, native: native,
 		tokenEnv: "AGENT_WORKSPACE_MCP_TOKEN_" + strings.ToUpper(hex.EncodeToString(nonce))}
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, value := range os.Environ() {
@@ -160,6 +202,7 @@ type codexAppServerMemberSession struct {
 	server   string
 	startup  string
 	ready    bool
+	native   *codexAppServerSession
 }
 
 func codexAppServerMemberName(inherited []string, entropy io.Reader) (string, error) {
@@ -232,7 +275,11 @@ func (p *codexAppServerProtocol) memberStatus(raw json.RawMessage) {
 		}
 	}
 	p.member.ready = true
-	p.startTurn()
+	if p.session != nil && p.session.resume != nil {
+		p.next(8, "thread/read", map[string]any{"threadId": p.threadID, "includeTurns": true})
+	} else {
+		p.startTurn()
+	}
 }
 
 // Startup notifications are bound to the selected thread and random server.
@@ -284,7 +331,7 @@ func (p *codexAppServerProtocol) memberNotification(message codexRPCMessage) boo
 }
 
 func (p *codexAppServerProtocol) memberItem(raw json.RawMessage, completed bool) (codexAppServerItem, bool) {
-	fields, err := codexRPCObject(raw, "id", "status", "server", "tool", "arguments", "result", "error", "appContext", "mcpAppUi", "pluginId", "mcpAppResourceUri")
+	fields, err := codexRPCObject(raw, "id", "status", "server", "tool", "arguments", "result", "error", "readOnlyHint", "appContext", "mcpAppUi", "pluginId", "mcpAppResourceUri")
 	id, idOK := codexAppServerString(fields, "id")
 	server, serverOK := codexAppServerString(fields, "server")
 	tool, toolOK := codexAppServerString(fields, "tool")
@@ -317,6 +364,13 @@ func (p *codexAppServerProtocol) memberItem(raw json.RawMessage, completed bool)
 		if err != nil || !bytes.Equal(bytes.TrimSpace(part["type"]), []byte(`"text"`)) || json.Unmarshal(part["text"], &text) != nil {
 			return item, false
 		}
+	}
+	// Fingerprint the completion notification, not the later terminal or
+	// history copy. Neither tool payload survives in per-item state.
+	item.mcp = &codexSessionMCPContent{
+		arguments:    codexSessionHashField(fields["arguments"]),
+		result:       codexSessionHashField(fields["result"]),
+		readOnlyHint: codexSessionHashField(fields["readOnlyHint"]),
 	}
 	return item, true
 }
