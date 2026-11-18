@@ -102,7 +102,8 @@ func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 	for _, name := range []string{"default", "opt-in", "combined"} {
 		t.Run(name, func(t *testing.T) {
 			enabled, combined := name != "default", name == "combined"
-			dir := t.TempDir()
+			dir := filepath.Join(t.TempDir(), "private")
+			ok(t, os.Mkdir(dir, 0700))
 			db, err := store.Open(filepath.Join(dir, "workspace.db"))
 			ok(t, err)
 			defer db.Close()

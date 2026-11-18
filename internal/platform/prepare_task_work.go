@@ -105,11 +105,14 @@ func (p *Preparer) prepareFreshTaskWork(ctx context.Context, input preparationIn
 		return scheduler.PreparedExecution{}, err
 	}
 	d := plan.delivery
-	base := memberToolRuntimeRun{runtime: p.memberTools, binding: MemberToolRunBinding{
-		GroupID: d.GroupID, MemberID: d.MemberID, ConversationID: d.ConversationID, DeliveryID: d.DeliveryID,
-		ProviderID: plan.selected.ID, Model: plan.request.Model,
-	}}
-	return scheduler.PreparedExecution{Executor: &taskWorkRun{base: base, plan: plan},
+	run := &taskWorkRun{
+		base: memberToolRuntimeRun{runtime: p.memberTools, binding: MemberToolRunBinding{
+			GroupID: d.GroupID, MemberID: d.MemberID, ConversationID: d.ConversationID, DeliveryID: d.DeliveryID,
+			ProviderID: plan.selected.ID, Model: plan.request.Model,
+		}},
+		plan: plan,
+	}
+	return scheduler.PreparedExecution{Executor: run,
 		Request: plan.request, ResourceKeys: []string{plan.workspace.key}}, nil
 }
 

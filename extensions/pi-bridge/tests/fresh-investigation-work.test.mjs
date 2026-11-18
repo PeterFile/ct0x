@@ -4,9 +4,10 @@ import { EventEmitter } from "node:events";
 import { readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { syncBuiltinESMExports } from "node:module";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { BASE, TOKEN, privateConfig, safeFailure } from "./helpers.mjs";
 import { loadExtensions, loadSessionSDK, runJSONPrint } from "./pi-loader.mjs";
 
@@ -249,6 +250,43 @@ test("investigation input gate neither swallows valid JSON nor intercepts TUI in
   await tui.bindExtensions({ mode: "tui", onError: () => {} });
   assert.deepEqual(tui.getActiveToolNames(), []);
   await assert.rejects(tui.prompt("interactive input"), /synthetic model admission/);
+});
+
+test("Pi JSON print pairs report_work and retains the delegation uncertainty marker", async t => {
+  const sent = intercept(t, () => [201, undefined]);
+  const fx = await issueFile(t, issue("delegation", [report]));
+  let requests = 0;
+  const session = await openSession(t, fx, [report], { modelRuntime: {
+    hasConfiguredAuth: () => true, // Synthetic provider, never credentials.
+    streamSimple(model) {
+      const first = requests++ === 0;
+      assert.ok(requests <= 2);
+      const stream = createAssistantMessageEventStream();
+      const stopReason = first ? "toolUse" : "stop";
+      const content = first ? [{ type: "toolCall", id: "fixture-call", name: report, arguments: reportArgs }] : [{ type: "text", text: "native stop" }];
+      stream.push({ type: "done", reason: stopReason, message: {
+        role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), stopReason, content,
+        usage: { input: 1, output: 1, totalTokens: 2, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0 } },
+      } });
+      return stream;
+    },
+  } });
+  const { frames, jsonl, errors, exit } = await runJSONPrint(t, session, "synthetic report");
+  assert.deepEqual(errors, []);
+  assert.equal(exit, 0);
+  assert.equal(requests, 2);
+  assert.equal(sent.length, 1);
+  const [start, end, ...extra] = frames.filter(f => /^tool_execution_(start|end)$/.test(f.type));
+  assert.deepEqual(extra, []);
+  assert.deepEqual(start, { type: "tool_execution_start", toolCallId: "fixture-call", toolName: report, args: reportArgs });
+  assert.equal(end.type, "tool_execution_end");
+  assert.equal(end.toolName, report);
+  assert.equal(end.toolCallId, start.toolCallId);
+  assert.equal(end.isError, true);
+  checkUnknown(end.result, "delegation", sent[0]);
+  assert.deepEqual(frames.at(-1), { type: "agent_settled", aborted: false });
+  const dir = process.env.TEST_PI_TYPED_PRINT_FIXTURES;
+  if (dir) await writeFile(join(dir, "delegation-unknown.jsonl"), jsonl, { mode: 0o600, flag: "wx" });
 });
 
 test("report owner denies selectors, mixed work input reads, versions on submit, and malformed evidence", async t => {

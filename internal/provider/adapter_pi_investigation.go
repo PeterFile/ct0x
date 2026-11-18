@@ -69,9 +69,9 @@ func (a piInvestigationAdapter) NewExecutor(selected Provider, timeout time.Dura
 	return piDigestBoundExecutor{piExecutor: native, configuredBridge: a.extension, investigationBridge: true}, nil
 }
 
-// NewPiInvestigationIntakeExecutor binds the existing, fresh intake tool set
-// to the reviewed bridge and issued config. It never selects a native session.
-// If the claim captured a different policy, the config need not offer the action.
+// NewPiInvestigationIntakeExecutor binds the fresh intake tool set to the
+// qualified Pi bridge and issued config. It never selects a native session.
+// The issued schema can offer discussion_only_excerpt without the investigation action.
 func NewPiInvestigationIntakeExecutor(selected Provider, extension string, issued NativeMemberToolConfig, timeout time.Duration) (Executor, error) {
 	bridge, path := qualifyPiInvestigationBridge(extension), filepath.Clean(issued.Path)
 	if bridge == "" || !piMemberToolConfigMatches(path, issued.SHA256, false) {

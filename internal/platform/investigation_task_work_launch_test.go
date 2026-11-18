@@ -205,14 +205,17 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 						sourceText != "" && strings.Contains(req.Prompt, sourceText) || tc.kind == domain.TaskWorkSourceDelegation && !strings.Contains(req.Prompt, f.delegation.Question) {
 						t.Fatal("native context exceeded or lost the typed plan")
 					}
+					roleOK(t, emit(provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: req.RunID}))
+					f.expectHTTP(t, token, "read_channel", `{}`, "", http.StatusForbidden)
 					switch tc.kind {
 					case domain.TaskWorkSourceFollowup:
 						f.expectHTTP(t, token, "read_work_inputs", fmt.Sprintf(`{"input_id":%q}`, work.SourceID), "", http.StatusOK)
+					case domain.TaskWorkSourceDelegation:
+						f.expectHTTP(t, token, platform.ReportWorkOperation, `{"kind":"delivered","summary":"已核对委派材料。"}`, "delegate-report", http.StatusCreated)
 					case domain.TaskWorkSourceReport:
 						f.expectHTTP(t, token, platform.ReadWorkReportOperation, `{}`, "", http.StatusOK)
+						f.expectHTTP(t, token, "submit_result", `{"summary":"已核对本轮正式报告。"}`, "owner-submit", http.StatusCreated)
 					}
-					f.expectHTTP(t, token, "read_channel", `{}`, "", http.StatusForbidden)
-					roleOK(t, emit(provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: req.RunID}))
 					roleOK(t, emit(provider.Event{Kind: provider.TerminalEvent, NativeSessionID: req.RunID, Terminal: provider.OutcomeSucceeded}))
 					return provider.ExecutionReceipt{Outcome: provider.OutcomeSucceeded, Started: true, Accepted: true,
 						Terminal: provider.OutcomeSucceeded, NativeSessionID: req.RunID, DirectChildReaped: true, OutputComplete: true}

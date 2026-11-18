@@ -267,6 +267,9 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	if r.DirectChildReaped {
 		r.ExitCode = cmd.ProcessState.ExitCode()
 	}
+	if out.piTypedWork != nil && out.piTypedWork.hasOpenWrite() {
+		out.damaged = true
+	}
 	writeUnknown := out.piTypedWork != nil && out.piTypedWork.unknown != nil
 	if writeUnknown {
 		out.piTypedWork.retain(outLog)

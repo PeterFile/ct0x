@@ -146,8 +146,8 @@ func (e *memberToolRuntimeRun) nativeRoleAuthority(ctx context.Context, role sto
 
 func (e *memberToolRuntimeRun) constructExecutor(ctx context.Context, request provider.ExecuteRequest, claim store.TurnClaim, token string, config *memberToolRuntimeConfigFile, names []string) (provider.Executor, *memberToolNativeTurn, error) {
 	configPath := filepath.Join(e.runtime.configRoot, config.name)
-	if e.intakeBuilder != nil {
-		if e.nativeSession != nil || e.role != nil || !e.intake || !e.intakeSchema.investigation {
+	if bound := e.intakeSchema.requiresIssuedPiConfig(); bound || e.intakeBuilder != nil {
+		if !bound || e.intakeBuilder == nil || e.nativeSession != nil || e.role != nil || !e.intake {
 			return nil, nil, errMemberToolRuntimeBinding
 		}
 		native, err := e.intakeBuilder(provider.NativeMemberToolConfig{Path: configPath, SHA256: config.digest})

@@ -1,11 +1,13 @@
 package provider
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"regexp"
 	"slices"
+	"strings"
 )
 
 const piTypedWriteUnknown = "agent_workspace_write_unknown_v1"
@@ -24,32 +26,126 @@ type piTypedWriteEvidence struct {
 }
 
 type piTypedWorkOutput struct {
-	role    string
-	tools   []string
+	role  string
+	tools []string
+	// Pi can end parallel calls out of order. Keep only bounded native write
+	// IDs and their names; a closed ID retains an empty name to reject reuse.
+	writes  map[string]string
 	unknown *piTypedWriteEvidence
 }
 
-// Only called on a native tool_execution_end from the exact typed launch. The
-// pinned bridge exclusively owns result.details. Assistant messages, tool args
-// and result text are never marker carriers. The control can only deny settlement.
-func (p *piTypedWorkOutput) observe(line []byte, runID string, active bool) bool {
+// After recordPi validates the JSON, require one exact top-level discriminator
+// before dispatch. Leave nested payloads opaque to this check.
+func piTypedWorkHasExactType(line []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return false
+	}
+	var seen bool
+	var value json.RawMessage
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return false
+		}
+		if strings.EqualFold(key, "type") {
+			if key != "type" || seen {
+				return false
+			}
+			seen = true
+		}
+		if decoder.Decode(&value) != nil {
+			return false
+		}
+	}
+	return seen
+}
+
+func (p *piTypedWorkOutput) boundWrite(name string) bool {
+	switch name {
+	case "ack_work_input", "hand_back_work_input", "submit_result", "report_work":
+		return slices.Contains(p.tools, name)
+	default:
+		return false
+	}
+}
+
+func (p *piTypedWorkOutput) observeStart(line []byte, active bool) bool {
+	// Pi prints args before tool validation. Read only the exact envelope
+	// fields, rejecting duplicates there without interpreting raw model args.
+	fields, err := codexRPCObject(line, "type", "toolName", "toolCallId")
+	var kind, name, id string
+	if err != nil || json.Unmarshal(fields["type"], &kind) != nil || kind != "tool_execution_start" ||
+		json.Unmarshal(fields["toolName"], &name) != nil || name == "" ||
+		json.Unmarshal(fields["toolCallId"], &id) != nil || id == "" {
+		return false
+	}
+	if _, seen := p.writes[id]; seen {
+		return false
+	}
+	if !p.boundWrite(name) {
+		return true
+	}
+	if !active || !piTypedWriteCallID.MatchString(id) || len(p.writes) >= executionFramesCountLimit {
+		return false
+	}
+	if p.writes == nil {
+		p.writes = make(map[string]string)
+	}
+	p.writes[id] = name
+	return true
+}
+
+func (p *piTypedWorkOutput) hasOpenWrite() bool {
+	for _, name := range p.writes {
+		if name != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *piTypedWorkOutput) observeEnd(line []byte, runID string, active bool) bool {
 	value, err := nativeSessionJSON(line, 16, false)
 	event, _ := value.(map[string]any)
+	name, id := piSessionString(event, "toolName"), piSessionString(event, "toolCallId")
 	result, ok := event["result"].(map[string]any)
-	if err != nil || event["type"] != "tool_execution_end" || !ok ||
+	isError, hasErrorFlag := event["isError"].(bool)
+	if err != nil || event["type"] != "tool_execution_end" || !ok || !hasErrorFlag || name == "" || id == "" ||
 		piSessionHasFieldAlias(event, "type", "toolName", "toolCallId", "result", "isError") ||
 		piSessionHasFieldAlias(result, "details", "isError") {
 		return false
 	}
-	details, empty := result["details"].(map[string]any)
-	if result["details"] == nil || (empty && len(details) == 0) {
-		// Pi puts isError on the outer frame for a thrown error, including
-		// definite business denials. A bridge-returned error needs its marker.
-		return result["isError"] != true
+	bound := p.boundWrite(name)
+	start, seen := p.writes[id]
+	if bound && (!active || start != name) || !bound && seen {
+		return false
 	}
+	if _, hasContent := result["content"].([]any); bound && !hasContent {
+		return false
+	}
+	details, _ := result["details"].(map[string]any)
+	if result["details"] == nil || details != nil && len(details) == 0 {
+		// Pi sets only the outer flag for a thrown denial. Without a marker,
+		// an explicit inner flag must be false and agree with the outer flag.
+		if flag, present := result["isError"]; present && (flag != false || isError) {
+			return false
+		}
+	} else if !bound || !isError || result["isError"] != true || !p.observeMarker(details, runID, name, id) {
+		return false
+	}
+	if bound {
+		p.writes[id] = ""
+	}
+	return true
+}
+
+// The pinned bridge exclusively owns result.details. A marker can only be
+// retained from the matched native end, never from args, messages or text.
+func (p *piTypedWorkOutput) observeMarker(details map[string]any, runID, name, id string) bool {
 	fields, ok := details[piTypedWriteUnknown].(map[string]any)
-	if !active || !ok || len(details) != 1 || len(fields) != 6 || p.unknown != nil ||
-		event["isError"] != true || result["isError"] != true {
+	if !ok || len(details) != 1 || len(fields) != 6 || p.unknown != nil {
 		return false
 	}
 	e := piTypedWriteEvidence{
@@ -57,14 +153,8 @@ func (p *piTypedWorkOutput) observe(line []byte, runID string, active bool) bool
 		Operation: piSessionString(fields, "operation"), ToolCallID: piSessionString(fields, "tool_call_id"),
 		IdempotencyKey: piSessionString(fields, "idempotency_key"), RequestSHA256: piSessionString(fields, "request_sha256"),
 	}
-	switch e.Operation {
-	case "ack_work_input", "hand_back_work_input", "submit_result", "report_work":
-	default:
-		return false
-	}
-	if e.Role != p.role || e.RunID != runID || e.Operation != piSessionString(event, "toolName") ||
-		!slices.Contains(p.tools, e.Operation) || e.ToolCallID != piSessionString(event, "toolCallId") ||
-		!piTypedWriteCallID.MatchString(e.ToolCallID) || !piTypedWriteRequestSHA.MatchString(e.RequestSHA256) {
+	if e.Role != p.role || e.RunID != runID || e.Operation != name || e.ToolCallID != id ||
+		!piTypedWriteRequestSHA.MatchString(e.RequestSHA256) {
 		return false
 	}
 	key := sha256.Sum256([]byte(e.Operation + e.ToolCallID))
