@@ -12,7 +12,14 @@ import (
 )
 
 func TestCodexSessionReviewCaptureContradictionsStayUnknown(t *testing.T) {
-	for _, mode := range []string{"capture-active", "capture-external-item", "capture-external-unsupported", "capture-external-oversized-anchor", "capture-unobserved-mcp", "capture-unobserved-mcp-invalid-tool", "capture-wrong-thread", "capture-wrong-turn", "capture-wrong-turn-unsupported", "capture-answer-drift-unsupported", "capture-in-progress", "capture-extra-turn"} {
+	for _, mode := range []string{
+		"capture-active", "capture-external-item", "capture-external-unsupported", "capture-external-oversized-anchor",
+		"capture-unobserved-mcp", "capture-unobserved-mcp-invalid-tool", "capture-wrong-thread", "capture-wrong-turn",
+		"capture-wrong-turn-unsupported", "capture-answer-drift-unsupported", "capture-in-progress", "capture-extra-turn",
+		"capture-budget-users", "capture-questions-text-drift", "capture-plan-missing-observed", "capture-plan-kind-drift",
+		"capture-partial-multi-user", "capture-partial-text-drift", "capture-late-external-safe-prefix",
+		"capture-deep-active", "capture-deep-idle", "capture-deep-external",
+	} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("AW_SESSION_MODE", mode)
 			selected, config, request := appServerSessionFixture(t)
@@ -55,6 +62,7 @@ func TestCodexSessionReviewCaptureContradictionsStayUnknown(t *testing.T) {
 			}
 			releaseDelivery()
 			<-done
+			assertCodexCaptureFixture(t, request.CWD, mode)
 			if receipt.Outcome != OutcomeUnknown || !receipt.Accepted || receipt.Terminal != OutcomeSucceeded || !receipt.DirectChildReaped || !receipt.OutputComplete || receipt.ExitCode != 0 || receipt.DeliveryFailed || receipt.NativeRef == nil || receipt.NativeRef.Codex != nil || string(receipt.NativeRef.Binding) != string(binding) {
 				t.Fatalf("contradictory capture must retain terminal/drain/wait but not settle: outcome=%s terminal=%s accepted=%v reaped=%v outputComplete=%v exit=%d deliveryFailed=%v", receipt.Outcome, receipt.Terminal, receipt.Accepted, receipt.DirectChildReaped, receipt.OutputComplete, receipt.ExitCode, receipt.DeliveryFailed)
 			}
@@ -75,7 +83,7 @@ func TestCodexSessionReviewCaptureContradictionsStayUnknown(t *testing.T) {
 }
 
 func TestCodexSessionReviewOptionalCaptureUnavailableStillSucceeds(t *testing.T) {
-	for _, mode := range []string{"capture-error", "capture-unsupported-anchor"} {
+	for _, mode := range []string{"capture-error", "capture-unsupported-anchor", "capture-questions-no-drift", "capture-plan-complete", "capture-partial-missing-observed"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("AW_SESSION_MODE", mode)
 			selected, config, request := appServerSessionFixture(t)
@@ -85,10 +93,64 @@ func TestCodexSessionReviewOptionalCaptureUnavailableStillSucceeds(t *testing.T)
 				t.Fatal(err)
 			}
 			r := executor.Execute(context.Background(), request, nil)
+			if mode != "capture-error" {
+				assertCodexCaptureFixture(t, request.CWD, mode)
+			}
 			if r.Outcome != OutcomeSucceeded || r.Terminal != OutcomeSucceeded || !r.OutputComplete || !r.DirectChildReaped || r.ExitCode != 0 || r.NativeRef == nil || r.NativeRef.Codex != nil || string(r.NativeRef.Binding) != string(binding) {
 				t.Fatal("optional anchor unavailability erased real success or invented a resumable reference")
 			}
 		})
+	}
+}
+
+func assertCodexCaptureFixture(t *testing.T, cwd, mode string) {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(cwd, "capture-meta-*.json"))
+	if err != nil || len(paths) != 1 {
+		t.Fatal("missing bounded child capture metadata")
+	}
+	data, err := os.ReadFile(paths[0])
+	var meta struct {
+		Mode           string         `json:"mode"`
+		FrameBytes     int            `json:"frame_bytes"`
+		Items          int            `json:"items"`
+		Counts         map[string]int `json:"counts"`
+		ObservedMCP    bool           `json:"observed_mcp_present"`
+		ObservedAnswer bool           `json:"observed_answer_present"`
+		AnswerMatches  bool           `json:"answer_text_matches"`
+		QuestionsEmpty bool           `json:"questions_empty"`
+		ArgumentsDepth int            `json:"arguments_nesting"`
+		CommandIndex   int            `json:"command_index"`
+	}
+	if err != nil || json.Unmarshal(data, &meta) != nil || meta.Mode != mode || meta.FrameBytes <= 0 || meta.FrameBytes >= codexRPCFrameLimit {
+		t.Fatal("fixture did not send a valid sub-limit capture frame")
+	}
+	t.Logf("synthetic capture metadata: %s", data)
+	switch mode {
+	case "capture-budget-users":
+		if meta.Counts["userMessage"] != codexSessionHistoryItemLimit+1 || meta.Counts["reasoning"] != 0 || !meta.ObservedMCP || !meta.ObservedAnswer || !meta.AnswerMatches {
+			t.Fatal("budget fixture must contain distinct matching users and observed items, without earlier reasoning/text conflicts")
+		}
+	case "capture-late-external-safe-prefix":
+		if meta.Counts["plan"] != 16 || meta.Counts["reasoning"] != 0 || meta.CommandIndex != meta.Items-1 || !meta.ObservedMCP || !meta.ObservedAnswer || !meta.AnswerMatches {
+			t.Fatal("late external fixture must have only nonconflicting unsupported plans before the command")
+		}
+	case "capture-questions-text-drift", "capture-partial-text-drift":
+		if !meta.QuestionsEmpty || meta.AnswerMatches {
+			t.Fatal("questions must be schema-valid and must not conceal text drift")
+		}
+	case "capture-questions-no-drift":
+		if !meta.QuestionsEmpty || !meta.AnswerMatches {
+			t.Fatal("unsupported questions control must preserve observed text")
+		}
+	case "capture-plan-missing-observed", "capture-partial-missing-observed":
+		if meta.ObservedMCP || !meta.ObservedAnswer || !meta.AnswerMatches {
+			t.Fatal("coverage fixture must omit the observed MCP item without changing the observed answer")
+		}
+	case "capture-deep-active", "capture-deep-idle", "capture-deep-external":
+		if meta.ArgumentsDepth <= 64 || !meta.ObservedMCP || !meta.ObservedAnswer || !meta.AnswerMatches {
+			t.Fatal("deep fixture must exceed strict parsing depth without losing observed items")
+		}
 	}
 }
 

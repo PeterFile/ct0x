@@ -990,42 +990,39 @@ func (p *codexAppServerProtocol) sessionHistory(raw json.RawMessage) (codexSessi
 }
 
 func (p *codexAppServerProtocol) sessionHistoryEvidence(raw json.RawMessage, capture bool) (codexSessionPublicHistory, codexSessionHistoryEvidence) {
-	var history codexSessionPublicHistory
+	// Uninspectable input cannot prove absence of external activity. This is
+	// distinct from a safely inspected history whose optional anchor is unsupported.
 	if len(raw) > codexRPCFrameLimit {
-		return history, codexSessionHistoryUnavailable
+		return codexSessionPublicHistory{}, codexSessionHistoryConflict
 	}
 	decoded, err := nativeSessionJSON(raw, 64, false)
 	response, ok := decoded.(map[string]any)
 	if err != nil || !ok {
-		return history, codexSessionHistoryUnavailable
+		return codexSessionPublicHistory{}, codexSessionHistoryConflict
 	}
 	thread, ok := response["thread"].(map[string]any)
-	if !ok {
-		return history, codexSessionHistoryUnavailable
+	if !ok || !p.inspectSessionHistory(thread, capture) {
+		return codexSessionPublicHistory{}, codexSessionHistoryConflict
 	}
+	return p.projectSessionHistory(thread, capture)
+}
+
+// Inspect raw execution evidence before any optional anchor projection. Safety
+// budgets fence an uninspectable capture rather than making it binding-only success.
+func (p *codexAppServerProtocol) inspectSessionHistory(thread map[string]any, capture bool) bool {
 	if thread["id"] != p.threadID || thread["ephemeral"] != false || thread["parentThreadId"] != nil || thread["forkedFromId"] != nil ||
 		thread["cliVersion"] != "0.166.0" || thread["source"] != "appServer" || thread["cwd"] != p.request.CWD || thread["modelProvider"] != p.session.provider {
-		return history, codexSessionHistoryConflict
+		return false
 	}
 	// Active is a native projection, not proof of newly spawned work. It still
 	// prevents proving absence of other activity after the observed terminal.
 	status, ok := thread["status"].(map[string]any)
-	if ok && status["type"] != "idle" {
-		return history, codexSessionHistoryConflict
-	}
-	evidence := codexSessionHistoryComplete
-	if !ok || len(status) != 1 {
-		evidence = codexSessionHistoryUnavailable
+	if !ok || status["type"] != "idle" {
+		return false
 	}
 	turns, ok := thread["turns"].([]any)
-	if !ok {
-		return history, codexSessionHistoryUnavailable
-	}
-	if len(turns) > codexSessionHistoryTurnLimit {
-		evidence = codexSessionHistoryUnavailable
-	}
-	if len(turns) == 0 {
-		return history, codexSessionHistoryConflict
+	if !ok || len(turns) == 0 || len(turns) > codexSessionHistoryTurnLimit {
+		return false
 	}
 	if capture {
 		expectedTurns := 1
@@ -1034,78 +1031,114 @@ func (p *codexAppServerProtocol) sessionHistoryEvidence(raw json.RawMessage, cap
 		}
 		last, ok := turns[len(turns)-1].(map[string]any)
 		if len(turns) != expectedTurns || !ok || last["id"] != p.turnID {
-			return history, codexSessionHistoryConflict
+			return false
 		}
 		if p.session.resume != nil {
+			if len(turns) < 2 {
+				return false
+			}
 			prior, ok := turns[len(turns)-2].(map[string]any)
 			if !ok || prior["id"] != p.session.resume.NativeTurnID {
-				return history, codexSessionHistoryConflict
+				return false
 			}
 		}
 	}
 	turnIDs, itemIDs := map[string]bool{}, map[string]bool{}
+	itemCount := 0
+	for index, value := range turns {
+		turn, ok := value.(map[string]any)
+		id, idOK := turn["id"].(string)
+		items, itemsOK := turn["items"].([]any)
+		if !ok || !idOK || !codexAppServerIdentity(id) || turnIDs[id] || turn["status"] != "completed" || turn["error"] != nil || !itemsOK ||
+			len(items) > codexSessionHistoryItemLimit-itemCount {
+			return false
+		}
+		if capture && index < len(turns)-1 && !p.session.priorTurnIDs[id] {
+			return false
+		}
+		if root := turn["rootTurnId"]; root != nil {
+			rootID, ok := root.(string)
+			if !ok || !codexAppServerIdentity(rootID) {
+				return false
+			}
+		}
+		turnIDs[id], itemCount = true, itemCount+len(items)
+		current := capture && index == len(turns)-1
+		seen, users := map[string]bool{}, 0
+		for _, value := range items {
+			item, ok := value.(map[string]any)
+			id, idOK := item["id"].(string)
+			kind, kindOK := item["type"].(string)
+			if !ok || !idOK || !codexAppServerIdentity(id) || itemIDs[id] || !kindOK ||
+				!slices.Contains([]string{"userMessage", "agentMessage", "reasoning", "plan", "contextCompaction", "mcpToolCall"}, kind) ||
+				kind == "mcpToolCall" && item["status"] != "completed" {
+				return false
+			}
+			itemIDs[id] = true
+			if current {
+				seen[id] = true
+				if !p.capturedSessionItemMatches(item) {
+					return false
+				}
+				if kind == "userMessage" {
+					users++
+					if users > 1 {
+						return false
+					}
+				}
+			}
+		}
+		// The schema defaults an omitted itemsView to full. Partial views can
+		// prove visible contradictions, but cannot prove that an item is absent.
+		if current && (turn["itemsView"] == nil || turn["itemsView"] == "full") {
+			if users != 1 {
+				return false
+			}
+			for id := range p.items {
+				if !seen[id] {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// Projection runs only after all bounded execution evidence has been inspected.
+// Unsupported anchor fields must not bypass the independent capture checks.
+func (p *codexAppServerProtocol) projectSessionHistory(thread map[string]any, capture bool) (codexSessionPublicHistory, codexSessionHistoryEvidence) {
+	var history codexSessionPublicHistory
+	evidence := codexSessionHistoryComplete
+	if len(thread["status"].(map[string]any)) != 1 {
+		evidence = codexSessionHistoryUnavailable
+	}
+	turns := thread["turns"].([]any)
 	history.turns = make([]any, 0, len(turns))
 	prefixComplete := true
 	for index, value := range turns {
 		if capture && index == len(turns)-1 && p.session.resume != nil && prefixComplete && !history.matches(p.session.resume) {
 			return codexSessionPublicHistory{}, codexSessionHistoryConflict
 		}
-		turn, ok := value.(map[string]any)
-		id, idOK := turn["id"].(string)
-		items, itemsOK := turn["items"].([]any)
-		if !ok || !idOK || !codexAppServerIdentity(id) || turnIDs[id] || turn["status"] != "completed" || turn["error"] != nil {
-			return codexSessionPublicHistory{}, codexSessionHistoryConflict
-		}
-		if capture && index < len(turns)-1 && !p.session.priorTurnIDs[id] {
-			return codexSessionPublicHistory{}, codexSessionHistoryConflict
-		}
-		if !itemsOK || turn["itemsView"] != nil && turn["itemsView"] != "full" {
+		turn := value.(map[string]any)
+		items := turn["items"].([]any)
+		if turn["itemsView"] != nil && turn["itemsView"] != "full" {
 			evidence, prefixComplete = codexSessionHistoryUnavailable, false
 		}
-		if len(items) > codexSessionHistoryItemLimit-history.items {
-			// The frame is already bounded to 1 MiB. Stop anchor qualification,
-			// not evidence inspection: later items can still prove external work.
-			evidence = codexSessionHistoryUnavailable
-		}
-		if root := turn["rootTurnId"]; root != nil {
-			rootID, ok := root.(string)
-			if !ok || !codexAppServerIdentity(rootID) {
-				return codexSessionPublicHistory{}, codexSessionHistoryConflict
-			}
-		}
-		turnIDs[id] = true
 		projectedItems := make([]any, 0, len(items))
 		for _, value := range items {
-			item, ok := value.(map[string]any)
-			if !ok {
-				evidence, prefixComplete = codexSessionHistoryUnavailable, false
-				continue
-			}
-			kind, _ := item["type"].(string)
-			if kind != "" && !slices.Contains([]string{"userMessage", "agentMessage", "reasoning", "plan", "contextCompaction", "mcpToolCall"}, kind) ||
-				kind == "mcpToolCall" && item["status"] != "completed" {
-				return codexSessionPublicHistory{}, codexSessionHistoryConflict
-			}
+			item := value.(map[string]any)
 			projected, valid := codexSessionPublicItem(item, p.member.names)
-			id, _ := item["id"].(string)
-			if itemIDs[id] {
-				return codexSessionPublicHistory{}, codexSessionHistoryConflict
-			}
-			itemIDs[id] = true
 			if !valid {
-				if kind == "mcpToolCall" {
+				if item["type"] == "mcpToolCall" {
 					return codexSessionPublicHistory{}, codexSessionHistoryConflict
 				}
 				evidence, prefixComplete = codexSessionHistoryUnavailable, false
-				continue // Unsupported passive content must not hide later external evidence.
-			}
-			if capture && index == len(turns)-1 && !p.capturedSessionItemMatches(projected) {
-				return codexSessionPublicHistory{}, codexSessionHistoryConflict
+				continue
 			}
 			projectedItems = append(projectedItems, projected)
 		}
 		history.items += len(items)
-		history.turns = append(history.turns, map[string]any{"id": id, "rootTurnId": turn["rootTurnId"], "status": "completed", "items": projectedItems, "error": nil})
+		history.turns = append(history.turns, map[string]any{"id": turn["id"], "rootTurnId": turn["rootTurnId"], "status": "completed", "items": projectedItems, "error": nil})
 	}
 	return history, evidence
 }
@@ -1203,20 +1236,28 @@ func (p *codexAppServerProtocol) capturedSessionItemMatches(item map[string]any)
 	}
 	switch kind {
 	case "userMessage":
-		content := item["content"].([]any)
-		return len(content) == 1 && content[0].(map[string]any)["text"] == p.request.Prompt
+		content, ok := item["content"].([]any)
+		if !ok || len(content) != 1 {
+			return false
+		}
+		part, ok := content[0].(map[string]any)
+		text, textOK := part["text"].(string)
+		return ok && textOK && part["type"] == "text" && text == p.request.Prompt
 	case "mcpToolCall":
 		_, valid := p.memberItem(mustCodexAppServerJSON(item), true)
 		return valid
 	case "agentMessage":
-		return exists && known.kind == kind && known.textHash == sha256.Sum256([]byte(item["text"].(string)))
+		text, ok := item["text"].(string)
+		return exists && ok && known.textHash == sha256.Sum256([]byte(text))
 	case "reasoning":
 		return exists && known.kind == kind
+	case "plan", "contextCompaction":
+		return true // Unsupported passive anchors still require identity and coverage checks.
 	}
 	return false
 }
 
-func (p *codexAppServerProtocol) verifySessionHistory(raw json.RawMessage, capture bool) (verified bool) {
+func (p *codexAppServerProtocol) verifySessionHistory(raw json.RawMessage, capture bool) bool {
 	history, evidence := p.sessionHistoryEvidence(raw, capture)
 	if evidence != codexSessionHistoryComplete {
 		if capture && evidence == codexSessionHistoryConflict {
@@ -1240,32 +1281,6 @@ func (p *codexAppServerProtocol) verifySessionHistory(raw json.RawMessage, captu
 		}
 		p.resumeUsageTurnIDs, p.resumeUsageBytes = nil, 0
 		return true
-	}
-	defer func() {
-		if !verified {
-			// Preserve the real terminal and normal close/drain/join/Wait path,
-			// but never release based on success contradicted by full history.
-			p.external = true
-		}
-	}()
-	last := history.turns[len(history.turns)-1].(map[string]any)
-	items := last["items"].([]any)
-	seen, users := map[string]bool{}, 0
-	for _, value := range items {
-		item := value.(map[string]any)
-		id, kind := item["id"].(string), item["type"].(string)
-		seen[id] = true
-		if kind == "userMessage" {
-			users++
-		}
-	}
-	if users != 1 {
-		return false
-	}
-	for id := range p.items {
-		if !seen[id] {
-			return false
-		}
 	}
 	s.pending = &NativeSessionReference{Version: NativeSessionReferenceVersion, Binding: bytes.Clone(s.binding),
 		Codex: &CodexNativeSessionReference{Adapter: codexSessionAdapter, Protocol: codexSessionProtocol, CLIPath: s.cliPath, CLIVersion: "0.166.0",

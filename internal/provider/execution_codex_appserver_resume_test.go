@@ -265,6 +265,7 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	if mode == "empty-answer" {
 		answer["text"] = ""
 	}
+	observedAnswerText := answer["text"]
 	notify("item/completed", map[string]any{"threadId": threadID, "turnId": turnID, "item": answer})
 	items := []any{user, call, answer}
 	history = append(history, turn("completed", items))
@@ -293,7 +294,53 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 		oldItems[len(oldItems)-1].(map[string]any)["text"] = "changed prefix after new Turn"
 	}
 	last := history[len(history)-1].(map[string]any)
+	argumentsNesting := 0
 	switch mode {
+	case "capture-budget-users":
+		last["items"] = []any{}
+		for i := 0; i <= codexSessionHistoryItemLimit; i++ {
+			last["items"] = append(last["items"].([]any), map[string]any{"id": fmt.Sprintf("budget-user-%d", i), "type": "userMessage", "content": currentInput})
+		}
+		last["items"] = append(last["items"].([]any), call, answer)
+	case "capture-questions-text-drift", "capture-questions-no-drift", "capture-partial-text-drift":
+		answer["questions"] = []any{}
+		if mode != "capture-questions-no-drift" {
+			answer["text"] = "contradicts the observed answer with valid questions"
+		}
+		if mode == "capture-partial-text-drift" {
+			last["itemsView"] = "summary"
+		}
+	case "capture-plan-missing-observed", "capture-plan-complete", "capture-plan-kind-drift", "capture-late-external-safe-prefix":
+		plan := map[string]any{"id": "unsupported-plan", "type": "plan", "text": "synthetic plan"}
+		switch mode {
+		case "capture-plan-missing-observed":
+			last["items"] = []any{user, answer, plan}
+		case "capture-plan-kind-drift":
+			answer["type"] = "plan"
+		case "capture-late-external-safe-prefix":
+			for i := 0; i < 16; i++ {
+				last["items"] = append(last["items"].([]any), map[string]any{"id": fmt.Sprintf("unsupported-plan-%d", i), "type": "plan", "text": "synthetic plan"})
+			}
+			last["items"] = append(last["items"].([]any), map[string]any{"id": "late-command", "type": "commandExecution", "status": "completed", "command": "synthetic", "cwd": cwd, "commandActions": []any{}, "aggregatedOutput": "", "exitCode": 0})
+		default:
+			last["items"] = append(last["items"].([]any), plan)
+		}
+	case "capture-partial-missing-observed", "capture-partial-multi-user":
+		last["itemsView"] = "summary"
+		last["items"] = []any{user, answer}
+		if mode == "capture-partial-multi-user" {
+			last["items"] = append(last["items"].([]any), map[string]any{"id": "second-user", "type": "userMessage", "content": currentInput})
+		}
+	case "capture-deep-active", "capture-deep-idle", "capture-deep-external":
+		var nested any = "synthetic"
+		argumentsNesting = 70
+		for i := 0; i < argumentsNesting; i++ {
+			nested = map[string]any{"nested": nested}
+		}
+		call["arguments"] = map[string]any{"deep": nested}
+		if mode == "capture-deep-external" {
+			last["items"] = append(last["items"].([]any), map[string]any{"id": "deep-command", "type": "commandExecution", "status": "completed", "command": "synthetic", "cwd": cwd, "commandActions": []any{}, "aggregatedOutput": "", "exitCode": 0})
+		}
 	case "capture-external-item", "capture-external-unsupported", "capture-external-oversized-anchor":
 		if mode == "capture-external-unsupported" {
 			last["itemsView"] = "notLoaded"
@@ -329,12 +376,34 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	}
 	captureThread := thread(history)
 	switch mode {
-	case "capture-active":
+	case "capture-active", "capture-deep-active":
 		captureThread["status"] = map[string]any{"type": "active", "activeFlags": []any{}}
 	case "capture-wrong-thread":
 		captureThread["id"] = "foreign-thread"
 	}
-	respond(capture, map[string]any{"thread": captureThread})
+	captureResult := map[string]any{"thread": captureThread}
+	frameBytes := len(mustCodexAppServerJSON(map[string]any{"id": capture.ID, "result": captureResult}))
+	if frameBytes >= codexRPCFrameLimit {
+		os.Exit(8)
+	}
+	counts, observed := map[string]int{}, map[string]bool{}
+	commandIndex := -1
+	for i, value := range last["items"].([]any) {
+		item := value.(map[string]any)
+		counts[item["type"].(string)]++
+		observed[item["id"].(string)] = true
+		if item["type"] == "commandExecution" {
+			commandIndex = i
+		}
+	}
+	questions, hasQuestions := answer["questions"].([]any)
+	_ = os.WriteFile("capture-meta-"+pid+".json", mustCodexAppServerJSON(map[string]any{
+		"mode": mode, "frame_bytes": frameBytes, "items": len(last["items"].([]any)), "counts": counts,
+		"observed_mcp_present": observed[call["id"].(string)], "observed_answer_present": observed["answer-"+turnID],
+		"answer_text_matches": answer["text"] == observedAnswerText, "questions_empty": hasQuestions && len(questions) == 0,
+		"arguments_nesting": argumentsNesting, "command_index": commandIndex,
+	}), 0600)
+	respond(capture, captureResult)
 	_, _ = io.Copy(io.Discard, input)
 	_ = os.WriteFile("eof-"+pid, nil, 0600)
 	if mode == "nonzero-exit" {
