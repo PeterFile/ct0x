@@ -7,6 +7,24 @@ import (
 	"agentworkspace/internal/domain"
 )
 
+// VerifyQueuedTaskWorkDelivery checks the physical wake for the runtime's
+// delegation fallback. It neither verifies typed provenance nor grants a claim.
+func (s *Store) VerifyQueuedTaskWorkDelivery(ctx context.Context, d domain.TaskWorkDelivery) error {
+	var exact bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM deliveries d INDEXED BY deliveries_turn_identity
+	 WHERE (d.id,d.group_id,d.conversation_id,d.recipient_id,d.message_id,d.topic_id)=(?,?,?,?,?,?)
+	 AND d.state='queued' AND d.turn_id=''
+	 AND NOT EXISTS(SELECT 1 FROM turns WHERE delivery_id=d.id))`,
+		d.DeliveryID, d.GroupID, d.ConversationID, d.MemberID, d.MessageID, d.TopicID).Scan(&exact)
+	if err != nil {
+		return err
+	}
+	if !exact {
+		return ErrMemberToolDenied
+	}
+	return ctx.Err()
+}
+
 // FreshTaskWorkLaunch is the runtime's frozen plan and issued scope, not a
 // launch permit. AttemptID is empty only for verification before B binds it.
 type FreshTaskWorkLaunch struct {

@@ -43,7 +43,14 @@ func (p *Preparer) resolveUnsupportedTaskWork(ctx context.Context, input prepara
 		if !matches || work.SourceKind != domain.TaskWorkSourceDelegation {
 			return empty, preparationResolutionError(ctx, coordinationErr)
 		}
-		// The delegate has typed provenance but no owner role or Attempt.
+		// The delegate has no owner role, but the typed peek alone does not
+		// prove that no Turn targets the wake. Verify before overriding denial.
+		if err := p.store.VerifyQueuedTaskWorkDelivery(ctx, work); err != nil {
+			if err == store.ErrMemberToolDenied {
+				err = coordinationErr
+			}
+			return empty, preparationResolutionError(ctx, err)
+		}
 	} else {
 		state := input.state
 		prov.Kind, prov.RequestID = store.CoordinationRoleWorker, state.Provenance.RequestID

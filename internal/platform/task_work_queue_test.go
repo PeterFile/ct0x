@@ -188,6 +188,82 @@ func TestUnsupportedV30TaskWorkDoesNotStopScheduler(t *testing.T) {
 	}
 }
 
+func TestUnsupportedV30TaskWorkRejectsCorruptQueuedIdentity(t *testing.T) {
+	ctx := t.Context()
+	f, work := queueUnsupportedTaskWork(t, domain.TaskWorkSourceDelegation)
+	// Corrupt just this wake in the fixture DB: a terminal Turn targets it,
+	// but both identity columns are empty. A terminal row leaves the wake
+	// visible to the scheduler's pending scan.
+	inserted, err := f.raw.ExecContext(ctx, `INSERT INTO turns
+	 (id,group_id,delivery_id,conversation_id,member_id,claim_token,state,created_at,updated_at)
+	 SELECT '',group_id,id,conversation_id,recipient_id,'fixture-token','not_started',created_at,created_at
+	 FROM deliveries WHERE id=? AND group_id=? AND state='queued' AND turn_id=''`, work.DeliveryID, f.group)
+	roleOK(t, err)
+	n, err := inserted.RowsAffected()
+	roleOK(t, err)
+	if n != 1 {
+		t.Fatalf("corruption did not target exactly one queued wake: %d", n)
+	}
+	_, roleErr := f.db.ResolveCoordinationDelivery(ctx, f.group, work.DeliveryID)
+	if !errors.Is(roleErr, store.ErrMemberToolDenied) {
+		t.Fatalf("expected the strict role resolver to deny the wake: %v", roleErr)
+	}
+	peek, peekErr := f.db.ResolveTaskWorkDelivery(ctx, f.group, work.DeliveryID)
+	t.Logf("B coordination denied the wake; B typed peek resolved the wake=%t, blocked=%q, err=%v",
+		peek.DeliveryID == work.DeliveryID, peek.Blocked, peekErr)
+
+	p, private := queuePreparer(t, f)
+	page, err := f.db.ListPendingDeliveries(ctx, store.PendingOptions{Lane: "work"})
+	roleOK(t, err)
+	if len(page.Items) != 1 || page.Items[0].Delivery.ID != work.DeliveryID {
+		t.Fatal("corrupted wake is not visible to the pending scan")
+	}
+	wake := page.Items[0]
+	if got, err := p.Prepare(ctx, wake); !reflect.ValueOf(got).IsZero() || !errors.Is(err, store.ErrMemberToolDenied) || errors.Is(err, scheduler.ErrNotReady) {
+		t.Errorf("Prepare did not preserve the queued identity denial: executor=%T, err=%v, ErrNotReady=%t", got.Executor, err, errors.Is(err, scheduler.ErrNotReady))
+	}
+	if got, err := p.InspectRoleReadiness(ctx, wake); !reflect.ValueOf(got).IsZero() || !errors.Is(err, store.ErrMemberToolDenied) || errors.Is(err, scheduler.ErrNotReady) {
+		t.Errorf("Inspect did not preserve the queued identity denial: blocked=%v, err=%v", got.Blocked, err)
+	}
+
+	runCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+	defer stop()
+	var scans int
+	err = scheduler.Run(runCtx, f.db, scheduler.Options{Recovered: true, RuntimeDir: f.root, MaxActive: 1, PollInterval: time.Hour},
+		func(ctx context.Context, pending store.PendingDelivery) (scheduler.PreparedExecution, error) {
+			scans++
+			got, err := p.Prepare(ctx, pending)
+			if pending.Delivery.ID != work.DeliveryID || !reflect.ValueOf(got).IsZero() {
+				t.Error("unexpected delivery or prepared execution while scanning a corrupt wake")
+			}
+			// Never pass a provider executor to the scheduler, even on regression.
+			return scheduler.PreparedExecution{}, err
+		})
+	t.Logf("scheduler after %d prepare call(s): %v", scans, err)
+	if err == nil || runCtx.Err() != nil || scans != 1 {
+		t.Errorf("scheduler did not stop on the damaged binding: %v", err)
+	}
+
+	page, err = f.db.ListPendingDeliveries(ctx, store.PendingOptions{Lane: "work"})
+	roleOK(t, err)
+	if len(page.Items) != 1 || !reflect.DeepEqual(page.Items[0], wake) {
+		t.Fatal("scheduler modified the corrupt wake")
+	}
+	var turns, resources int
+	roleOK(t, f.raw.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM turns WHERE delivery_id=?),
+	 (SELECT count(*) FROM resource_claims)`, work.DeliveryID).Scan(&turns, &resources))
+	if turns != 1 || resources != 0 {
+		t.Fatalf("corrupt wake changed its Turn or resource count: %d Turns, %d claims", turns, resources)
+	}
+	for _, dir := range []string{private, f.root} {
+		entries, err := os.ReadDir(dir)
+		roleOK(t, err)
+		if len(entries) != 0 {
+			t.Fatal("corrupt wake allocated a workspace or runtime files")
+		}
+	}
+}
+
 func TestUnsupportedV30TaskWorkRequiresPersistedSource(t *testing.T) {
 	ctx := t.Context()
 	f, work := queueUnsupportedTaskWork(t, domain.TaskWorkSourceDelegation)
