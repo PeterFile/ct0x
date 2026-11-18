@@ -32,7 +32,8 @@ const legacy = mode === "legacy-193";
 const path = process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG;
 const digest = process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256;
 if (legacy ? digest !== undefined : !/^[a-f0-9]{64}$/.test(digest)) process.exit(51);
-if (process.argv.includes("--session") || flag("--tools") !== "list_members,read_channel,send_message,search_history,read_history") process.exit(52);
+if (process.argv.includes("--session") || process.argv.includes("--continue") ||
+    flag("--tools") !== "list_members,read_channel,send_message,search_history,read_history") process.exit(52);
 const { openBridge } = await import(pathToFileURL(join(dirname(flag("--extension")), "bridge.mjs")));
 readFileSync(0); // Drain the synthetic prompt; do not echo it.
 if (mode === "bridge-recheck") {
@@ -46,8 +47,10 @@ let config;
 try { config = openBridge(path, digest); } catch (error) {
   process.exit(mode === "bridge-recheck" && error.message === "成员工具配置无效，未启用任何成员工具。" ? 42 : 54);
 }
+const combined = mode === "combined";
 if (mode === "bridge-recheck" || Boolean(config.discussionOnlyExcerpt) !== !legacy ||
-    config.continueWork !== (mode === "excerpt-and-continue") || config.investigationIntake || config.investigationTools) process.exit(55);
+    config.continueWork !== (mode === "excerpt-and-continue" || combined) ||
+    Boolean(config.investigationIntake) !== combined || config.investigationTools) process.exit(55);
 for (const event of [
   { type: "session", version: 3, id: flag("--session-id"), cwd: process.cwd() },
   { type: "agent_start" },
@@ -56,7 +59,8 @@ for (const event of [
 ]) console.log(JSON.stringify(event));
 `
 
-func TestPiIntakeIssuedConfigDigest(t *testing.T) {
+func installPiIntakeDigestReader(t *testing.T) (string, error) {
+	t.Helper()
 	node, nodeErr := exec.LookPath("node")
 	root := t.TempDir()
 	launcher, reader := filepath.Join(root, "pi"), filepath.Join(root, "reader.mjs")
@@ -66,7 +70,11 @@ func TestPiIntakeIssuedConfigDigest(t *testing.T) {
 	t.Setenv("FIXTURE_READER", reader)
 	t.Setenv("NODE_OPTIONS", "")
 	t.Setenv("AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256", "must-not-reach-child")
+	return launcher, nodeErr
+}
 
+func TestPiIntakeIssuedConfigDigest(t *testing.T) {
+	launcher, nodeErr := installPiIntakeDigestReader(t)
 	for _, tc := range []struct {
 		mode    string
 		outcome provider.Outcome

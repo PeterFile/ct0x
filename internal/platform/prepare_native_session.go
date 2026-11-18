@@ -29,7 +29,7 @@ func (p *Preparer) piNativeSessionConfigured(selected provider.Provider) bool {
 
 func (p *Preparer) codexNativeIntakeConfigured(selected provider.Provider) bool {
 	return p.enableNativeSessionResume && p.enableCodexAppServer && selected.Name == provider.Codex &&
-		p.memberTools.tools.chatEngine != nil && !p.memberTools.tools.WorkInputsEnabled()
+		p.memberTools.tools.chatEngine != nil && !p.memberTools.tools.continueWorkEnabled()
 }
 
 func (p *Preparer) nativeSessionEligible(selected provider.Provider, member domain.Member, thinking string) bool {
@@ -171,6 +171,10 @@ func (p *Preparer) nativeSessionAdapterRegistry(selection provider.AdapterSelect
 	return provider.NewAdapterRegistry(provider.AdapterRegistration{ID: selection.ID, Protocol: selection.Protocol, Adapter: adapter})
 }
 
+func (p *Preparer) piIntakeChangesNativeSchema() bool {
+	return p.piDiscussionSchema || p.memberTools.tools.continueWorkEnabled()
+}
+
 // Provider-wide reporting describes the process configuration only. It cannot
 // assert any member's model, claim, resources, or resumable history.
 func (p *Preparer) nativeReportTools(selected provider.Provider) []string {
@@ -185,7 +189,7 @@ func (p *Preparer) nativeReportTools(selected provider.Provider) []string {
 		if r.tools.chatEngine == nil {
 			return r.operations
 		}
-		if !p.piDiscussionSchema && !r.tools.WorkInputsEnabled() {
+		if !p.piIntakeChangesNativeSchema() {
 			return chatIntakeOperations()
 		}
 	}

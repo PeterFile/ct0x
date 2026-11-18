@@ -16,6 +16,9 @@ import (
 )
 
 func executionRunner(config config, db *store.Store, engine *coordination.Engine, catalog *platform.ProviderCatalog, endpoint string, output io.Writer, workspace ...platform.MemberWorkspaceOptions) (func(context.Context) error, *platform.MemberToolRuntime, *platform.Preparer, error) {
+	if err := config.validatePiFreshTaskWork(); err != nil {
+		return nil, nil, nil, err
+	}
 	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
 		return nil, nil, nil, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
 	}
@@ -37,6 +40,10 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		return nil, nil, nil, err
 	}
 	providers, err := providerSnapshot(catalog)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	freshTaskWork, err := config.piFreshTaskWorkLaunch(db, engine, providers)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -84,6 +91,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			toolOptions.ChatIntake = engine
 			options.RoleThinking = config.roleThinking
 		}
+		toolOptions.FreshTaskWork = freshTaskWork
 		tools, err = platform.NewMemberToolRuntime(db, toolOptions)
 		if err != nil {
 			return nil, nil, nil, err
@@ -116,6 +124,11 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			}
 			return nil, nil, nil, err
 		}
+	}
+	if freshTaskWork != nil {
+		// B's process-local readiness assertion, not Policy or authority. Set
+		// it only after successful composition and before accepting requests.
+		engine.EnableTaskWorkExecution()
 	}
 	return func(ctx context.Context) error {
 		return scheduler.Run(ctx, db, schedulerOptions, preparer.Prepare)

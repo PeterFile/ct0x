@@ -386,6 +386,31 @@ test("issued discussion excerpt is verbatim and cannot be coerced or normalized"
   assert.deepEqual(JSON.parse(requests[0].body), payload);
 });
 
+test("issued intake guidance separates continuation, new investigation, and literal discussion", async t => {
+  const config = await privateConfig(t, {
+    continue_work: true, discussion_only_excerpt: true, intake_assessment_action: "read_only_investigation",
+  });
+  const digest = createHash("sha256").update(await readFile(config)).digest("hex");
+  const loaded = await load(config, digest);
+  assert.deepEqual(loaded.errors, []);
+  const send = loaded.extensions[0].tools.get("send_message").definition;
+  const fields = send.parameters.properties.intent_assessment.properties;
+  assert.deepEqual(fields.disposition.anyOf.map(v => v.const), ["discuss", "clarify", "request_work", "prepare_work", "continue_work"]);
+  assert.deepEqual(fields.action.anyOf.map(v => v.const), ["text_submission", "workspace_change", "read_only_investigation"]);
+  assert.match(fields.disposition.description, /仅讨论时优先选discuss.*逐字保留discussion_only_excerpt/u);
+  assert.match(fields.disposition.description, /continue_work仅用于.*续办.*followup\.task_id/u);
+  assert.match(fields.disposition.description, /text_submission仅用于受支持的topic_summary；read_only_investigation仅用于获准范围内明确的新调查/u);
+  assert.match(fields.action.description, /chat_candidate\.policy.*单收件人本机用户原文明确要求另开/u);
+  assert.doesNotMatch(fields.disposition.description, /prepare_work仅限受支持的topic_summary/u);
+  for (const intent_assessment of [
+    { disposition: "continue_work", action: "read_only_investigation", reason: "不能混用动作" },
+    { disposition: "prepare_work", action: "read_only_investigation", reason: "不能续办", followup: { task_id: "old" } },
+    { disposition: "prepare_work", action: "read_only_investigation", reason: "仅讨论", discussion_only_excerpt: " 只讨论。\n" },
+  ]) {
+    await assert.rejects(execute(send, { content: "fixture", intent_assessment }), error => safeFailure(error, /未发送/));
+  }
+});
+
 test("strict investigation registers only the digested tool set and blocks host calls", async t => {
   const names = ["read_investigation_artifact", "submit_result"];
   const config = await privateConfig(t, { investigation_tools: names });

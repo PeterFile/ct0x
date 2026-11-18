@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"agentworkspace/internal/platform"
+	"agentworkspace/internal/store"
 )
 
 const memberMCPVersion = "2025-06-18"
@@ -33,6 +34,12 @@ func MemberMCPRoutes(tools *platform.MemberTools) []Route {
 }
 
 func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token string) {
+	// Fresh Pi uses its own native wire. Keep #181's unpaged MCP schema and
+	// legacy receipts; never execute a fresh command through that schema.
+	if a.tools.IsFreshTaskWorkCapability(token) {
+		memberToolError(w, store.ErrMemberToolDenied)
+		return
+	}
 	if !memberMCPAccept(r.Header) {
 		WriteError(w, http.StatusNotAcceptable, "not_acceptable", "Accept 必须同时支持 application/json 和 text/event-stream；本接口仅返回 JSON")
 		return

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -108,6 +109,37 @@ func TestCodexNativeIntakeTypedAndUnknownRemainUnqualified(t *testing.T) {
 	if _, err := p.Prepare(t.Context(), f.ordinary); !errors.Is(err, scheduler.ErrNotReady) ||
 		p.AdapterReports()[f.member.ProviderID].Capabilities != nil {
 		t.Fatal("unverified AppServer version selected a native or one-shot fallback")
+	}
+}
+
+func TestCodexNativeIntakeFreshTaskWorkSchemaStaysFresh(t *testing.T) {
+	f, _ := codexNativeIntakePreparation(t)
+	prepareRoleOK(t, f.opts.MemberTools.Close())
+	useReleasePiBridge(t, f)
+	entry := filepath.Join(filepath.Dir(f.opts.PiMemberToolsExtension), "fresh-task-work.ts")
+	f.runtimeOptions.FreshTaskWork = NewPiFreshTaskWorkLaunch(entry, 0)
+	if !f.runtimeOptions.FreshTaskWork.Supports(f.opts.Providers[0]) {
+		t.Fatal("fixture must support the opt-in Pi Task Work profile")
+	}
+	runtime, err := NewMemberToolRuntime(f.s, f.runtimeOptions)
+	prepareRoleOK(t, err)
+	f.opts.MemberTools = runtime
+	p, ctx := f.preparer(t), t.Context()
+	prepared, err := p.Prepare(ctx, f.ordinary)
+	prepareRoleOK(t, err)
+	_, claim := claimNativeFenceFixture(t, f, prepared)
+	token, err := runtime.Tools().IssueChatIntake(ctx, claim)
+	prepareRoleOK(t, err)
+	defer runtime.Tools().Revoke(token)
+	profile, err := runtime.Tools().TransportProfile(ctx, token)
+	prepareRoleOK(t, err)
+	if !profile.ContinueWork || !profile.DiscussionOnlyExcerpt || !slices.Equal(profile.Operations, chatIntakeOperations()) {
+		t.Fatal("fixture must issue a continuation schema with the same intake tools")
+	}
+	caps := p.AdapterReports()[f.member.ProviderID].Capabilities
+	if prepared.Executor.(*memberToolRuntimeRun).nativeSession != nil || strings.Contains(prepared.Request.Prompt, nativeSessionTextPermission) ||
+		caps == nil || caps.NativeResume != provider.SupportUnsupported {
+		t.Fatal("Pi Task Work changed the issued Codex schema, but Codex still offered native resume")
 	}
 }
 
