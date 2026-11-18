@@ -136,11 +136,28 @@ func (s *Store) taskWorkReadinessForOwnerInTx(ctx context.Context, tx *sql.Tx, f
 var errTaskWorkChatScope = errors.New("原任务不属于可继续的文本范围")
 
 func (s *Store) taskWorkOwnerChatActionInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts) (string, error) {
+	basis, err := taskWorkOwnerChatBasisInTx(ctx, tx, f)
+	if err == nil && basis.action == domain.ChatActionReadOnlyInvestigation {
+		err = s.checkTaskInvestigationReadyInTx(ctx, tx, basis.investigation, "", false)
+	}
+	return basis.action, err
+}
+
+// The chat policy and admitted action are bound to the original dispatch and
+// Mandate. Investigation evidence still needs the current authorization fence.
+type taskWorkChatBasis struct {
+	action         string
+	policyRevision int64
+	policySourceID string
+	investigation  taskInvestigationEvidence
+}
+
+func taskWorkOwnerChatBasisInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts) (basis taskWorkChatBasis, err error) {
 	d := f.d
-	var action, messageID, sourceKind, sourceID string
+	var messageID, sourceKind, sourceID string
 	// Reuse the original admitted action and trusted source. Neither a model
 	// proposal nor the current Task's text can select a new scope.
-	err := tx.QueryRowContext(ctx, `SELECT coalesce(json_extract(a.receipt_json,'$.action'),''),c.message_id,e.source_kind,e.source_id
+	err = tx.QueryRowContext(ctx, `SELECT coalesce(json_extract(a.receipt_json,'$.action'),''),c.message_id,e.source_kind,e.source_id
 	 FROM chat_assessments a JOIN chat_candidates c ON c.id=a.candidate_id
 	 JOIN mandates m ON m.id=:mandate AND m.decision_id=a.decision_id
 	 JOIN coordination_triggers origin ON (origin.id,origin.group_id,origin.topic_id,origin.message_id,origin.message_sequence)=
@@ -152,40 +169,49 @@ func (s *Store) taskWorkOwnerChatActionInTx(ctx context.Context, tx *sql.Tx, f t
 	 AND json_extract(a.receipt_json,'$.policy_revision') IS c.policy_revision
 	 AND json_extract(a.receipt_json,'$.source_kind') IS e.source_kind AND json_extract(a.receipt_json,'$.source_id') IS e.source_id
 	 AND NOT EXISTS(SELECT 1 FROM chat_workspace_scopes WHERE task_id=:task)`, sql.Named("request", f.v.r.ID),
-		sql.Named("mandate", d.MandateID), sql.Named("grp", d.GroupID), sql.Named("topic", d.TopicID), sql.Named("task", d.TaskID)).Scan(&action, &messageID, &sourceKind, &sourceID)
+		sql.Named("mandate", d.MandateID), sql.Named("grp", d.GroupID), sql.Named("topic", d.TopicID), sql.Named("task", d.TaskID)).Scan(&basis.action, &messageID, &sourceKind, &sourceID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", errTaskWorkChatScope
+		return taskWorkChatBasis{}, errTaskWorkChatScope
 	}
 	if err != nil {
-		return "", err
+		return taskWorkChatBasis{}, err
 	}
-	switch action {
+	switch basis.action {
 	case domain.ChatActionTextSubmission:
 		kind, id, err := messageSourceInTx(ctx, tx, messageID)
 		if err != nil {
-			return "", err
+			return taskWorkChatBasis{}, err
 		}
 		if sourceID == "" || id != sourceID || kind != sourceKind {
-			return "", errTaskWorkChatScope
+			return taskWorkChatBasis{}, errTaskWorkChatScope
 		}
-		var current bool
-		err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM chat_assessments a JOIN chat_candidates c ON c.id=a.candidate_id
+		err = tx.QueryRowContext(ctx, `SELECT r.revision,coalesce(s.command_source_id,'') FROM chat_assessments a JOIN chat_candidates c ON c.id=a.candidate_id
 		 JOIN chat_policies p ON (p.group_id,p.topic_id,p.revision)=(c.group_id,c.topic_id,c.policy_revision)
 		 JOIN chat_policy_revisions r ON (r.group_id,r.topic_id,r.revision)=(p.group_id,p.topic_id,p.revision)
-		 WHERE a.dispatch_request_id=? AND r.enabled=1)`, f.v.r.ID).Scan(&current)
-		if err == nil && !current {
+		 LEFT JOIN chat_policy_scopes s ON (s.group_id,s.topic_id,s.revision)=(p.group_id,p.topic_id,p.revision)
+		 WHERE a.dispatch_request_id=? AND r.enabled=1`, f.v.r.ID).Scan(&basis.policyRevision, &basis.policySourceID)
+		if errors.Is(err, sql.ErrNoRows) {
 			err = errTaskWorkChatScope
 		}
-		return action, err
+		return basis, err
 	case domain.ChatActionReadOnlyInvestigation:
-		_, err := s.taskWorkInvestigationInTx(ctx, tx, f)
-		return action, err
+		e, err := taskWorkInvestigationEvidenceInTx(ctx, tx, f)
+		basis.investigation, basis.policyRevision, basis.policySourceID = e, e.PolicyRevision, e.ConfigurationSourceID
+		return basis, err
 	default:
-		return "", errTaskWorkChatScope
+		return taskWorkChatBasis{}, errTaskWorkChatScope
 	}
 }
 
 func (s *Store) taskWorkInvestigationInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts) (taskInvestigationEvidence, error) {
+	e, err := taskWorkInvestigationEvidenceInTx(ctx, tx, f)
+	if err == nil {
+		err = s.checkTaskInvestigationReadyInTx(ctx, tx, e, "", false)
+	}
+	return e, err
+}
+
+func taskWorkInvestigationEvidenceInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts) (taskInvestigationEvidence, error) {
 	d := f.d
 	e, err := taskInvestigationInTx(ctx, tx, d.GroupID, d.TaskID)
 	if errors.Is(err, ErrNotFound) {
@@ -197,7 +223,7 @@ func (s *Store) taskWorkInvestigationInTx(ctx context.Context, tx *sql.Tx, f tas
 	if !e.matchesDispatch(f.v.r) {
 		return e, ErrTaskInvestigationNotReady
 	}
-	return e, s.checkTaskInvestigationReadyInTx(ctx, tx, e, "", false)
+	return e, nil
 }
 
 // Include claims that never reached Attempt binding, starting from each raw

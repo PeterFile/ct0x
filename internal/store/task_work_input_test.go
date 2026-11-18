@@ -42,7 +42,7 @@ func newWorkInputCandidate(t *testing.T, f chatFixture, body string, recipients 
 }
 
 func TestTaskWorkInputUnsafeRouting(t *testing.T) {
-	for _, kind := range []string{"legacy-unknown", "two-real-ids", "unquoted-constraint", "workspace", "discussion-only"} {
+	for _, kind := range []string{"legacy-unknown", "legacy-original-task", "two-real-ids", "mixed-invalid-ids", "mixed-foreign-ids-with-hint", "unquoted-constraint", "workspace", "discussion-only"} {
 		t.Run(kind, func(t *testing.T) {
 			f := chatSetup(t, "user", false)
 			worker := chatAuthorityWorker(t, f)
@@ -51,9 +51,13 @@ func TestTaskWorkInputUnsafeRouting(t *testing.T) {
 			var reason string
 			var discussionLimit string
 			switch kind {
-			case "legacy-unknown":
-				if turn, err := f.s.ApplyTurnReceipt(ctx, worker.Member.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown}); err != nil || turn.State != domain.TurnStateUnknown {
-					t.Fatalf("unknown worker Turn: %+v %v", turn, err)
+			case "legacy-unknown", "legacy-original-task":
+				queueEvent(t, f.s, worker.Member.Claim, provider.AcceptedEvent, "", "")
+				unknown := queueReceipt(provider.OutcomeUnknown)
+				unknown.DirectChildReaped = false
+				taskWorkTestReceipt(t, f.s, worker.Member, unknown, domain.TurnStateUnknown)
+				if kind == "legacy-original-task" {
+					body = "请给原任务加一条引用"
 				}
 				input = f.input // Pre-B1a caller with no Followup field.
 				reason = "existing_task_reference"
@@ -64,6 +68,19 @@ func TestTaskWorkInputUnsafeRouting(t *testing.T) {
 				}
 				body = "应继续任务 " + worker.Provenance.TaskID + " 还是 " + other.ID + "？"
 				input.Followup = &domain.ChatFollowupAssessment{TaskID: worker.Provenance.TaskID}
+				reason = "ambiguous_followup_task"
+			case "mixed-invalid-ids", "mixed-foreign-ids-with-hint":
+				f.s.EnableTaskWorkExecution() // A misroute would actually record and wake work.
+				id := worker.Provenance.TaskID
+				body = "继续任务 `" + id + "` 还是 `" + strings.Repeat("A", 26) + "`？"
+				if kind == "mixed-foreign-ids-with-hint" {
+					other, err := f.s.CreateTask(ctx, taskInput(f.otherID))
+					if err != nil {
+						t.Fatal(err)
+					}
+					body = "继续任务 <" + id + "> 还是 <" + other.ID + ">？"
+					input.Followup = &domain.ChatFollowupAssessment{TaskID: id}
+				}
 				reason = "ambiguous_followup_task"
 			case "unquoted-constraint":
 				input.Followup = &domain.ChatFollowupAssessment{Constraint: "删除全部引用"}
@@ -89,11 +106,20 @@ func TestTaskWorkInputUnsafeRouting(t *testing.T) {
 				}
 				scope, candidate = workInputCandidate(t, f, message, 1)
 			}
-			got, err := f.s.ApplyChatAssessment(ctx, scope, candidate.ID, input, "记录原要求。", "followup-guard")
+			protected := make(map[string][][]any)
+			for _, table := range []string{"tasks", "mandates", "coordination_dispatch_requests", "task_work_inputs", "task_work_deliveries", "task_attempts", "resource_claims", "turns"} {
+				protected[table] = messageSequenceTableRows(t, f.s, table)
+			}
+			const note, key = "记录原要求。", "followup-guard"
+			got, err := f.s.ApplyChatAssessment(ctx, scope, candidate.ID, input, note, key)
 			chatAssertNotAdmitted(t, got, err, reason)
-			if got.MessageID != candidate.MessageID || got.ThreadRef != candidate.ThreadRef || got.WorkInputID != "" {
+			if got.MessageID != candidate.MessageID || got.ThreadRef != candidate.ThreadRef || got.WorkInputID != "" || got.WorkDeliveryID != "" {
 				t.Fatalf("clarification escaped the original topic/source: %+v", got)
 			}
+			if again, err := f.s.ApplyChatAssessment(ctx, scope, candidate.ID, input, note, key); err != nil || !reflect.DeepEqual(again, got) {
+				t.Fatalf("clarification did not replay: %+v %v", again, err)
+			}
+			messageSequencePreserved(t, f.s, protected)
 		})
 	}
 }
@@ -277,6 +303,22 @@ func TestTaskWorkInputForeignReferenceAndIndependentLegacyWork(t *testing.T) {
 	input := domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork, Reason: "继续原任务", Followup: &domain.ChatFollowupAssessment{TaskID: foreign.ID}}
 	r, err := f.s.ApplyChatAssessment(ctx, s, c.ID, input, "评估后续。", "foreign")
 	chatAssertNotAdmitted(t, r, err, "followup_target_unavailable")
+	stopped := provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}
+	taskWorkTestReceipt(t, f.s, s, stopped, domain.TurnStateNotStarted)
+
+	input.Followup = &domain.ChatFollowupAssessment{TaskID: worker.Provenance.TaskID}
+	s, c = newWorkInputCandidate(t, f, "请继续原任务。")
+	r, err = f.s.ApplyChatAssessmentDormant(ctx, s, c.ID, input, "评估后续。", "unproven")
+	chatAssertNotAdmitted(t, r, err, "unproven_task_reference")
+	taskWorkTestReceipt(t, f.s, s, stopped, domain.TurnStateNotStarted)
+
+	s, c = newWorkInputCandidate(t, f, "继续任务 <"+worker.Provenance.TaskID+">，备注码 <"+foreign.ID+">。")
+	r, err = f.s.ApplyChatAssessmentDormant(ctx, s, c.ID, input, "评估后续。", "explicit")
+	if err != nil || r.Outcome != "continued" || r.TaskID != worker.Provenance.TaskID || r.WorkInputID == "" {
+		t.Fatalf("unrelated ID-shaped note prevented an explicit single target: %+v %v", r, err)
+	}
+	taskWorkTestReceipt(t, f.s, s, stopped, domain.TurnStateNotStarted)
+
 	s, c = newWorkInputCandidate(t, f, "请整理下周议程，参考编号 "+foreign.ID+"。")
 	independent := f.input
 	independent.Title, independent.Acceptance = "下周议程", "列出会议事项"

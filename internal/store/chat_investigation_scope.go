@@ -210,6 +210,12 @@ func (s *Store) checkTaskInvestigationReadyInTx(ctx context.Context, tx *sql.Tx,
 	if !s.investigationExecution.Load() {
 		return ErrTaskInvestigationNotReady
 	}
+	return checkTaskInvestigationAuthorizationInTx(ctx, tx, scope, submissionID, allowNoEligibleWorker)
+}
+
+// This is the durable half of the execution fence. It can explain a handback,
+// but by itself never authorizes investigation execution or tools.
+func checkTaskInvestigationAuthorizationInTx(ctx context.Context, tx *sql.Tx, scope taskInvestigationEvidence, submissionID string, allowNoEligibleWorker bool) error {
 	status := domain.TaskStatusOpen
 	if submissionID != "" {
 		status = domain.TaskStatusSubmitted

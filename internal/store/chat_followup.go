@@ -177,11 +177,21 @@ func workTaskTokenSeparator(r rune) bool {
 	return !(r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_')
 }
 
-// A labeled, unresolved ID warrants clarification. A bare ID-shaped token
-// (such as an unrelated reference number) is not evidence of an existing task.
+const (
+	workTaskLabel    = `(?:任务|\btask\b)`
+	workTaskIDLabel  = `(?:任务[ \t]*(?:编号|id\b|#)|\btask[ \t]+(?:id\b|#))`
+	workTaskIDOpen   = `[ \t:#：<"'“‘\x60]*`
+	workTaskIDShape  = `([a-z2-7]{26})`
+	workTaskTokenEnd = `(?:$|[^a-z0-9_-])`
+)
+
 var (
-	labeledWorkTaskID = regexp.MustCompile(`(?i)(?:任务|\btask\b)[ \t:#："'“‘\x60]*([a-z2-7]{26})(?:$|[^a-z0-9_-])`)
-	markedWorkTaskID  = regexp.MustCompile(`(?i)(?:任务[ \t]*(?:编号|id\b|#)|\btask[ \t]+(?:id\b|#))[ \t:#："'“‘\x60]*([a-z0-9_-]+)(?:$|[^a-z0-9_-])`)
+	labeledWorkTaskID = regexp.MustCompile(`(?i)` + workTaskLabel + workTaskIDOpen + workTaskIDShape + workTaskTokenEnd)
+	markedWorkTaskID  = regexp.MustCompile(`(?i)` + workTaskIDLabel + workTaskIDOpen + `([a-z0-9_-]+)` + workTaskTokenEnd)
+	// A choice inherits its first task label across the choice operator, not
+	// across arbitrary prose. An unrelated ID-shaped token remains just a token.
+	workTaskIDChoice = regexp.MustCompile(`(?i)(?:` + workTaskIDLabel + `|` + workTaskLabel + `)` + workTaskIDOpen + workTaskIDShape +
+		`[ \t>"'”’\x60]*(?:还是|或者?|\bor\b)[ \t]*(?:` + workTaskIDLabel + `|` + workTaskLabel + `)?` + workTaskIDOpen + workTaskIDShape + workTaskTokenEnd)
 )
 
 func unresolvedWorkTaskReference(body, hint string, refs []string) bool {
@@ -229,6 +239,13 @@ func chatTaskReferencesInTx(ctx context.Context, tx *sql.Tx, groupID, body, hint
 	refs, err := workTaskIDsInTx(ctx, tx, `SELECT id FROM tasks WHERE group_id=? AND id IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT 2`, groupID, string(data))
 	if err != nil || len(refs) > 1 {
 		return refs, true, err
+	}
+	for _, choice := range workTaskIDChoice.FindAllStringSubmatch(body, -1) {
+		if choice[1] != choice[2] {
+			// Neither lookup failure nor an assessor hint can resolve a user
+			// choice. Do not report an unverified ID as a candidate task.
+			return refs, true, chatAmbiguousWorkInput()
+		}
 	}
 	if unresolvedWorkTaskReference(body, hint, refs) {
 		return refs, true, chatUnavailableWorkInputTarget()
@@ -289,37 +306,71 @@ func workTaskIDsInTx(ctx context.Context, tx *sql.Tx, query string, args ...any)
 	return ids, rows.Err()
 }
 
-// Only a strong contextual reference or an edit naming prior same-topic work
-// warrants a question. An ordinary add/edit verb alone does not relate work,
-// and none of these cues can select a target or confer authority.
+const (
+	legacyWorkSeparators = "，。！？、；,.!?;\r\n"
+	legacyWorkPolite     = `(?:请[ \t]*|please[ \t]+)?`
+	legacyWorkContinue   = `(?:继续(?:做|处理)?|接着(?:做|处理)?|\b(?:continue|resume)\b)`
+	legacyWorkAddress    = `(?:给|对|为|在|把|将|补充|追加|\b(?:revise|append[ \t]+to)\b)`
+)
+
+var (
+	legacyWorkHead       = regexp.MustCompile(`(?i)^` + legacyWorkPolite + `(?:(` + legacyWorkContinue + `)|` + legacyWorkAddress + `)[ \t]*`)
+	legacyPriorTask      = regexp.MustCompile(`(?i)^(?:原(?:来的)?任务|已有任务|当前任务|正在执行的任务|the (?:original|same|existing|current) task\b)`)
+	legacyPriorObject    = regexp.MustCompile(`(?i)^(?:刚才的|前面的|之前的|这份|那份|上一版|that summary\b|the previous[ \t]+)`)
+	legacyWorkTitleLabel = regexp.MustCompile(`(?i)^` + workTaskLabel + `(?:[ \t]*[:：][ \t]*|[ \t]+)`)
+	legacyQuotedTitle    = regexp.MustCompile(`(?i)(?:^|[` + legacyWorkSeparators + `])[ \t]*` + legacyWorkPolite +
+		`(?:(?:` + legacyWorkContinue + `|` + legacyWorkAddress + `)[ \t]*(?:` + workTaskLabel + `[ \t:：]*)?|` + workTaskLabel + `[ \t:：]*)` +
+		`(?:「([^」]+)」|『([^』]+)』|《([^》]+)》|“([^”]+)”|"([^"]+)"|\x60([^\x60]+)\x60)`)
+)
+
+// A direct reference can only require clarification. It never selects a
+// target. Even a named title must match a whole title in prior topic lineage.
 func chatLegacyWorkReferenceInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, body string) (bool, error) {
-	const separators = "，。！？、；,.!?;\r\n"
-	text := strings.ToLower(body)
 	var contextual bool
-	switch strings.Trim(text, separators+" \t") {
-	case "继续", "请继续", "继续吧", "请继续吧", "continue", "please continue", "resume":
-		contextual = true
-	}
-	var edits []string
-	for clause := range strings.FieldsFuncSeq(text, func(r rune) bool { return strings.ContainsRune(separators, r) }) {
-		continuing := containsWorkCue(clause, "继续", "接着", "continue ", "resume ", "keep working", "follow up", "follow-up")
-		if continuing || containsWorkCue(clause, "补充", "追加", "改成", "改为", "revise ", "append ") {
-			edits = append(edits, clause)
-			contextual = contextual || containsWorkCue(clause, "原任务", "原来的任务", "已有任务", "正在执行的任务", "上一版", "the same task", "existing task", "the current task") ||
-				continuing && containsWorkCue(clause, "刚才的", "前面的", "之前的", "这份", "那份", "that summary", "the previous ")
+	var titles []string
+	for clause := range strings.FieldsFuncSeq(body, func(r rune) bool { return strings.ContainsRune(legacyWorkSeparators, r) }) {
+		target := strings.TrimSpace(clause)
+		head := legacyWorkHead.FindStringSubmatch(target)
+		continuing := head != nil && head[1] != ""
+		if head != nil {
+			target = strings.TrimSpace(target[len(head[0]):])
+		}
+		if ref := legacyPriorTask.FindString(target); ref != "" && (head != nil || ref == target) {
+			contextual = true // The task-marked object is independent of the requested edit.
+			break
+		}
+		if continuing && (target == "" || target == "吧" || legacyPriorObject.MatchString(target)) {
+			contextual = true
+			break
+		}
+		if label := legacyWorkTitleLabel.FindString(target); label != "" {
+			titles = append(titles, strings.TrimSpace(target[len(label):]))
+		} else if continuing {
+			titles = append(titles, target)
 		}
 	}
-	if !contextual && len(edits) == 0 {
+	if !contextual {
+		// Read quotes from the original text so punctuation inside a title is
+		// not treated as a clause separator.
+		for _, match := range legacyQuotedTitle.FindAllStringSubmatch(body, -1) {
+			for _, title := range match[1:] {
+				if title != "" {
+					titles = append(titles, title)
+				}
+			}
+		}
+	}
+	if !contextual && len(titles) == 0 {
 		return false, nil
 	}
+	data, err := json.Marshal(titles)
+	if err != nil {
+		return false, err
+	}
 	var found bool
-	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1`+chatWorkThread+chatWorkThreadScope+
-		` AND (? OR (t.title<>'' AND instr(?,lower(t.title))>0)))`, c.GroupID, c.TopicID, c.Generation, contextual, strings.Join(edits, "\n")).Scan(&found)
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1`+chatWorkThread+chatWorkThreadScope+
+		` AND (? OR (t.title<>'' AND t.title IN (SELECT value FROM json_each(?)))))`, c.GroupID, c.TopicID, c.Generation, contextual, string(data)).Scan(&found)
 	return found, err
-}
-
-func containsWorkCue(clause string, cues ...string) bool {
-	return slices.ContainsFunc(cues, func(cue string) bool { return strings.Contains(clause, cue) })
 }
 
 func chatUnavailableWorkInputTarget() error {

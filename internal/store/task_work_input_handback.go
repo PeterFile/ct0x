@@ -32,9 +32,9 @@ type workInputReturnDecision struct {
 	policySourceID string
 }
 
-// Reuse the original admission/scope gate after proving the live assignment.
-// Nothing from the reason or proposed constraint history is authority evidence.
-func (s *Store) decideWorkInputReturnInTx(ctx context.Context, tx *sql.Tx, i domain.TaskWorkInput, v assignmentSnapshot) (workInputReturnDecision, error) {
+// Use only durable authority after proving the live assignment. Neither local
+// execution readiness nor the worker's reason is an authorizing fact.
+func decideWorkInputReturnInTx(ctx context.Context, tx *sql.Tx, i domain.TaskWorkInput, v assignmentSnapshot) (workInputReturnDecision, error) {
 	policy, err := chatPolicyInTx(ctx, tx, i.ThreadRef, 0)
 	if err != nil {
 		return workInputReturnDecision{}, err
@@ -42,10 +42,15 @@ func (s *Store) decideWorkInputReturnInTx(ctx context.Context, tx *sql.Tx, i dom
 	d := workInputReturnDecision{disposition: domain.TaskWorkInputReturnOriginalAuthorizationUnavailable,
 		policyRevision: policy.Revision, policySourceID: policy.ConfigurationSourceID}
 	if policy.Enabled && policy.Action == domain.ChatActionTextSubmission && policy.AuthorizedBy == "user" {
-		_, err := s.taskWorkOwnerChatActionInTx(ctx, tx, taskWorkFacts{v: v, d: taskWorkRecord(v, "", "")})
+		basis, err := taskWorkOwnerChatBasisInTx(ctx, tx, taskWorkFacts{v: v, d: taskWorkRecord(v, "", "")})
+		if err == nil && basis.action == domain.ChatActionReadOnlyInvestigation {
+			err = checkTaskInvestigationAuthorizationInTx(ctx, tx, basis.investigation, "", false)
+		}
 		switch {
 		case err == nil:
-			d.disposition = domain.TaskWorkInputReturnSeparateAuthorizationRequired
+			if basis.policyRevision == d.policyRevision && basis.policySourceID == d.policySourceID {
+				d.disposition = domain.TaskWorkInputReturnSeparateAuthorizationRequired
+			}
 		case errors.Is(err, errTaskWorkChatScope), errors.Is(err, ErrTaskInvestigationNotReady):
 		default:
 			return workInputReturnDecision{}, err

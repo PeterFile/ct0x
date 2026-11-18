@@ -128,6 +128,85 @@ func TestTaskWorkFollowupHandback(t *testing.T) {
 	}
 }
 
+func TestTaskWorkInvestigationHandbackWithoutRuntime(t *testing.T) {
+	f, policy, owner := investigationUserWorker(t)
+	f.s.EnableTaskWorkExecution()
+	p, scope := owner.Provenance, owner.Member
+	queueEvent(t, f.s, scope.Claim, provider.AcceptedEvent, "", "")
+	r, wake := taskWorkTestFollowup(t, f, "请同时将结论写入项目目录。")
+	original, err := f.s.GetWorkInputForMember(ctx, scope, r.WorkInputID)
+	if err != nil || original.ID != r.WorkInputID || original.Return != nil || original.Consumption != nil {
+		t.Fatalf("no durable unhandled input: %+v %v", original, err)
+	}
+	authorized, err := f.s.GetTaskInvestigationScope(ctx, p.GroupID, p.TaskID)
+	if err != nil || authorized.MandateID != original.MandateID || authorized.PolicyRevision != policy.Revision || authorized.ConfigurationSourceID != policy.ConfigurationSourceID {
+		t.Fatalf("fixture lacks the original investigation authority: %+v %v", authorized, err)
+	}
+	if err := f.s.CheckTaskInvestigationReady(ctx, p.GroupID, p.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	cold := queueHandle(t, f.path, false)
+	cold.EnableTaskWorkExecution() // Isolate the investigation startup flag.
+	if err := cold.CheckTaskInvestigationReady(ctx, p.GroupID, p.TaskID); !errors.Is(err, ErrTaskInvestigationNotReady) {
+		t.Fatalf("fixture unexpectedly ready on the second handle: %v", err)
+	}
+	before := messageSequenceSnapshot(t, cold)
+	if got, err := cold.ReadInvestigationChannel(ctx, owner, ListOptions{}); !errors.Is(err, ErrMemberToolDenied) || len(got.Items) != 0 {
+		t.Fatalf("read acquired investigation rights without the runtime: %+v %v", got, err)
+	}
+	if got, err := cold.GetWorkInputForMember(ctx, scope, original.ID); !errors.Is(err, ErrMemberToolDenied) || got.ID != "" {
+		t.Fatalf("input read bypassed readiness: %+v %v", got, err)
+	}
+	if got, err := cold.AcknowledgeWorkInputWithKey(ctx, scope, original.ID, "cold-ack"); !errors.Is(err, ErrMemberToolDenied) || got.ID != "" {
+		t.Fatalf("acknowledgement bypassed readiness: %+v %v", got, err)
+	}
+	if got, err := cold.ResolveInvestigationExecution(ctx, scope, p); !errors.Is(err, ErrMemberToolDenied) || got != (CoordinationRoleState{}) {
+		t.Fatalf("role resolved without investigation startup: %+v %v", got, err)
+	}
+	const reason, key = "原授权只允许读取和提交文本。", "investigation-return"
+	wrong := scope
+	wrong.Claim.Token += "-wrong"
+	if got, err := cold.HandBackWorkInputWithKey(ctx, wrong, original.ID, reason, key); !errors.Is(err, ErrMemberToolDenied) || got.ID != "" {
+		t.Fatalf("return accepted the wrong claim: %+v %v", got, err)
+	}
+	messageSequencePreserved(t, cold, before)
+
+	got, err := cold.HandBackWorkInputWithKey(ctx, scope, original.ID, reason, key)
+	h := got.Return
+	if err != nil || h == nil || h.Disposition != domain.TaskWorkInputReturnSeparateAuthorizationRequired ||
+		h.PolicyRevision != authorized.PolicyRevision || h.PolicySourceID != authorized.ConfigurationSourceID || h.TurnID != scope.Claim.TurnID ||
+		h.AttemptID != owner.AttemptID || h.MemberID != p.MemberID || !strings.Contains(h.Question, "单独授权") {
+		t.Fatalf("runtime readiness changed the durable return disposition: %+v %v", h, err)
+	}
+	projected := got
+	projected.Return = nil
+	if !reflect.DeepEqual(projected, original) {
+		t.Fatalf("return changed the projected original input: %+v", projected)
+	}
+	after := messageSequenceSnapshot(t, cold)
+	for _, table := range []string{"task_work_input_returns", "mutation_idempotency", "messages", "message_log"} {
+		if len(after[table]) != len(before[table])+1 {
+			t.Fatalf("return must add exactly one %s row", table)
+		}
+		delete(before, table)
+	}
+	messageSequencePreserved(t, cold, before)
+	taskWorkTestPeek(t, cold, wake, "followup_handled")
+	if sub, err := cold.SubmitAssignmentResult(ctx, owner, AssignmentResultInput{Summary: "按原范围交付调查结论。"}, "cold-submit"); !errors.Is(err, ErrMemberToolDenied) || sub.ID != "" {
+		t.Fatalf("return conferred submission rights without readiness: %+v %v", sub, err)
+	}
+	if again, err := f.s.HandBackWorkInputWithKey(ctx, scope, original.ID, reason, key); err != nil || !reflect.DeepEqual(again, got) {
+		t.Fatalf("enabled handle changed the stored disposition: %+v %v", again, err)
+	}
+	messageSequencePreserved(t, cold, after)
+	investigationDisablePolicy(t, f.s, policy)
+	after = messageSequenceSnapshot(t, cold)
+	if again, err := cold.HandBackWorkInputWithKey(ctx, scope, original.ID, reason, key); err != nil || !reflect.DeepEqual(again, got) {
+		t.Fatalf("policy drift changed the stored disposition: %+v %v", again, err)
+	}
+	messageSequencePreserved(t, cold, after)
+}
+
 func TestTaskWorkFollowupDormantAndAtomic(t *testing.T) {
 	f := chatSetup(t, "user", false)
 	old := chatAuthorityWorker(t, f)

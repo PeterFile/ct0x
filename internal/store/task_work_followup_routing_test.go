@@ -110,6 +110,45 @@ func TestTaskWorkFollowupImplicitAmbiguity(t *testing.T) {
 	}
 }
 
+func TestTaskWorkLegacyRequestDoesNotMatchTitleSubstring(t *testing.T) {
+	f := chatSetupSource(t, "user", false, "请汇总年度安全审计发现。")
+	f.input.Title, f.input.Description = "报告", "汇总年度安全审计发现。"
+	worker := chatAuthorityWorker(t, f)
+	p := worker.Provenance
+	sub, err := f.s.SubmitAssignmentResult(ctx, worker, AssignmentResultInput{Summary: "年度安全审计报告已交付。"}, "audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.ReviewTask(ctx, taskReviewInput(sub)); err != nil {
+		t.Fatal(err)
+	}
+	stopped := provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}
+	co := taskWorkTestCoordinator(t, f.s, p.GroupID, p.AssignmentID)
+	for _, scope := range []MemberToolScope{co, worker.Member} {
+		taskWorkTestReceipt(t, f.s, scope, stopped, domain.TurnStateNotStarted)
+	}
+
+	proposal := f.input // No Followup field; exercise the old request_work admission.
+	proposal.Title, proposal.Description, proposal.Acceptance = "下周预算报告", "起草下周预算报告", "列出费用明细"
+	t.Run("unrelated-budget-report", func(t *testing.T) {
+		scope, c := newWorkInputCandidate(t, f, "起草下周预算报告并追加费用明细")
+		defer taskWorkTestReceipt(t, f.s, scope, stopped, domain.TurnStateNotStarted)
+		r, err := f.s.ApplyChatAssessment(ctx, scope, c.ID, proposal, "登记独立预算任务。", "independent-budget")
+		if err != nil || r.Outcome != "admitted" || r.TaskID == p.TaskID || r.DispatchRequestID == "" ||
+			r.AuthorizationMessageID != c.MessageID || !r.AuthorityEvidenceVerified {
+			t.Fatalf("generic old title captured an unrelated new request: outcome=%q reason=%q err=%v", r.Outcome, r.ReasonCode, err)
+		}
+	})
+	t.Run("exact-quoted-title", func(t *testing.T) {
+		scope, c := newWorkInputCandidate(t, f, "请补充《报告》。")
+		r, err := f.s.ApplyChatAssessment(ctx, scope, c.ID, proposal, "核对原任务。", "quoted-audit")
+		chatAssertNotAdmitted(t, r, err, "existing_task_reference")
+		if r.ThreadRef != c.ThreadRef || r.MessageID != c.MessageID || r.WorkInputID != "" {
+			t.Fatalf("title clarification escaped the original source: %+v", r)
+		}
+	})
+}
+
 func TestTaskWorkLegacyRequestAfterClosedTask(t *testing.T) {
 	f := chatSetupSource(t, "user", false, "请整理日报。")
 	f.input.Title = "日报"

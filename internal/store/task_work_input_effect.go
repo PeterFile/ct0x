@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"time"
 
 	"agentworkspace/internal/domain"
@@ -12,22 +13,18 @@ const (
 	workInputReturnOperation = "hand_back_work_input"
 )
 
-func (s *Store) handleWorkInput(ctx context.Context, scope MemberToolScope, operation, inputID, reason, key string) (out domain.TaskWorkInput, err error) {
-	handBack := operation == workInputReturnOperation
+func (s *Store) handleWorkInput(ctx context.Context, scope MemberToolScope, operation, inputID, reason, key string) (domain.TaskWorkInput, error) {
 	action := "确认执行成员后续输入失败"
-	if handBack {
+	if operation == workInputReturnOperation {
 		action = "交回超出授权的后续输入失败"
 	}
-	defer func() {
-		if err != nil {
-			err = memberToolOperationError(action, err)
-		}
-	}()
-	tx, err := s.beginMemberToolTx(ctx, scope)
-	if err != nil {
-		return out, err
-	}
-	defer tx.Rollback()
+	return taskWorkMutationTx(ctx, s, scope, action, func(tx *sql.Tx) (domain.TaskWorkInput, error) {
+		return s.handleWorkInputInTx(ctx, tx, scope, operation, inputID, reason, key)
+	})
+}
+
+func (s *Store) handleWorkInputInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, operation, inputID, reason, key string) (out domain.TaskWorkInput, err error) {
+	handBack := operation == workInputReturnOperation
 	role, original, err := s.workInputHandlingOwnerInTx(ctx, tx, scope, handBack)
 	if err != nil {
 		return out, err
@@ -78,7 +75,7 @@ func (s *Store) handleWorkInput(ctx context.Context, scope MemberToolScope, oper
 			return out, ErrConflict // A key is not a substitute for a persisted fact.
 		}
 		if handBack {
-			decision, err = s.decideWorkInputReturnInTx(ctx, tx, i, original)
+			decision, err = decideWorkInputReturnInTx(ctx, tx, i, original)
 			if err != nil {
 				return out, err
 			}
@@ -112,7 +109,7 @@ func (s *Store) handleWorkInput(ctx context.Context, scope MemberToolScope, oper
 			return out, ErrMemberToolDenied
 		}
 		if handBack && fresh {
-			applied, err := s.decideWorkInputReturnInTx(ctx, tx, i, owner)
+			applied, err := decideWorkInputReturnInTx(ctx, tx, i, owner)
 			if err != nil {
 				return out, err
 			}
@@ -149,9 +146,6 @@ func (s *Store) handleWorkInput(ctx context.Context, scope MemberToolScope, oper
 		if !present || id != inputID {
 			return out, ErrConflict
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return out, err
 	}
 	return i, nil
 }
