@@ -15,8 +15,8 @@ import (
 // Keep the default and ceiling at the v24 context reservation bound.
 const maxChatDiscussionInviteHops = 2
 
-// The registry assigns this migration's version. Only an unapplied migration
-// is legacy; a SQL failure reading an installed policy must never default.
+// The registry assigns this migration's version. A missing marker is legacy
+// only if neither the policy table nor a later migration is present.
 var chatDiscussionPolicyVersion = slices.Index(migrations, chatDiscussionPolicySchema) + 1
 
 // ChatDiscussionPolicyAvailable reports whether the settings migration has been applied.
@@ -26,11 +26,23 @@ func (s *Store) ChatDiscussionPolicyAvailable(ctx context.Context) (bool, error)
 
 func chatDiscussionPolicyAvailable(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}) (available bool, err error) {
-	if chatDiscussionPolicyVersion != 0 {
-		err = q.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?)", chatDiscussionPolicyVersion).Scan(&available)
+}) (bool, error) {
+	if chatDiscussionPolicyVersion == 0 {
+		return false, nil
 	}
-	return
+	var state int
+	err := q.QueryRowContext(ctx, `SELECT CASE
+	 WHEN EXISTS(SELECT 1 FROM schema_migrations WHERE version=?1) THEN 1
+	 WHEN EXISTS(SELECT 1 FROM schema_migrations WHERE version>?1)
+	   OR EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='chat_discussion_policy_revisions') THEN -1
+	 ELSE 0 END`, chatDiscussionPolicyVersion).Scan(&state)
+	if err != nil {
+		return false, err
+	}
+	if state == -1 {
+		return false, errors.New("讨论策略迁移记录缺失")
+	}
+	return state == 1, nil
 }
 
 func (s *Store) GetChatDiscussionPolicy(ctx context.Context, thread domain.ThreadRef) (domain.ChatDiscussionPolicy, error) {

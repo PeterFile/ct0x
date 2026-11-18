@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
 )
@@ -110,6 +112,72 @@ func TestMemberOperationBoundDTOsAndPersistedEffects(t *testing.T) {
 	if err := f.raw.QueryRow("SELECT count(*) FROM turns").Scan(&turns); err != nil || turns != 1 {
 		t.Fatalf("tool operation executed a model: turns=%d, error=%v", turns, err)
 	}
+}
+
+func TestChatDiscussionPolicyGenericMemberSend(t *testing.T) {
+	// With roles/intake disabled, the runtime issues the same generic capability.
+	f, tools, token, claim := memberOperationsFixture(t, []string{"send_message"})
+	ctx := context.Background()
+	available, err := f.local.ChatDiscussionPolicyAvailable(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !available {
+		t.Skip("requires the discussion policy migration registration")
+	}
+	scope, err := f.db.BindMemberTool(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thread := domain.ThreadRef{GroupID: scope.Claim.GroupID, TopicID: scope.TopicID}
+	setPolicy := func(ref domain.ThreadRef, hops int, expected int64, key string) {
+		t.Helper()
+		if _, err := f.local.SetChatDiscussionPolicy(ctx, ref, hops, expected, key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setPolicy(domain.ThreadRef{GroupID: thread.GroupID, TopicID: "other-topic"}, 0, 0, "other-topic")
+	setPolicy(domain.ThreadRef{GroupID: f.otherID, TopicID: thread.TopicID}, 0, 0, "other-group")
+
+	peer := f.member(t, f.groupID)
+	directed := MemberMessageInput{Content: "review the conclusion", RecipientIDs: []string{peer.ID}}
+	send := func(key string) domain.Message {
+		t.Helper()
+		message, err := tools.SendMessage(ctx, token, directed, key)
+		if err != nil || message.ID == "" || message.GroupID != thread.GroupID || message.TopicID != thread.TopicID ||
+			message.SenderID != scope.MemberID || message.SourceKind != "member" || len(message.Deliveries) != 1 ||
+			message.Deliveries[0].RecipientID != peer.ID || message.Deliveries[0].State != domain.DeliveryStateQueued {
+			t.Fatalf("expected a bound generic delivery: %+v, %v", message, err)
+		}
+		return message
+	}
+	prior := send("prior") // Zeros in another topic or group do not apply.
+	setPolicy(thread, 0, 0, "disable")
+	_, err = tools.SendMessage(ctx, token, directed, "fresh")
+	requireCapabilityDenied(t, err)
+	if replay := send("prior"); !reflect.DeepEqual(replay, prior) {
+		t.Fatalf("zero policy changed the exact replay: %+v", replay)
+	}
+	changed := directed
+	changed.Content = "different request"
+	if _, err := tools.SendMessage(ctx, token, changed, "prior"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("zero policy masked an idempotency conflict: %v", err)
+	}
+	f.counts(t, 2, 2, 2, 4)
+
+	for _, recipients := range [][]string{nil, {}} {
+		public, err := tools.SendMessage(ctx, token, MemberMessageInput{Content: "public output", RecipientIDs: recipients}, fmt.Sprintf("public-%t", recipients == nil))
+		if err != nil || public.ID == "" || len(public.Deliveries) != 0 {
+			t.Fatalf("zero policy blocked or routed public output: %+v, %v", public, err)
+		}
+	}
+	user, err := f.local.CreateMessage(ctx, thread.GroupID, MessageInput{Content: "local user @ delivery", TopicID: thread.TopicID, RecipientIDs: []string{peer.ID}}, "user")
+	if err != nil || user.SenderID != "user" || len(user.Deliveries) != 1 || user.Deliveries[0].RecipientID != peer.ID {
+		t.Fatalf("zero policy changed explicit local-user routing: %+v, %v", user, err)
+	}
+	setPolicy(thread, 1, 1, "enable")
+	send("fresh") // The denied send reserved no key, and positive limits do not meter generic sends.
+	send("another")
 }
 
 func TestMemberOperationGrantsAndTokensFailClosed(t *testing.T) {

@@ -145,6 +145,15 @@ func (s *Store) sendMemberMessage(ctx context.Context, scope MemberToolScope, in
 		if err := chatDiscussionGateInTx(ctx, tx, scope, candidateID, input, replay); err != nil {
 			return domain.Message{}, memberToolOperationError(action, err)
 		}
+	} else if !replay && len(r.RecipientIDs) != 0 {
+		// Generic sends keep their existing routing, not structured chain accounting.
+		limits, err := currentChatDiscussionPolicyInTx(ctx, tx, domain.ThreadRef{GroupID: r.GroupID, TopicID: r.TopicID})
+		if err != nil {
+			return domain.Message{}, memberToolOperationError(action, err)
+		}
+		if limits.MaxInviteHops == 0 {
+			return domain.Message{}, ErrMemberToolDenied
+		}
 	}
 	message, err := createMessageInTx(ctx, tx, r, input.RecipientIDs)
 	if err != nil {

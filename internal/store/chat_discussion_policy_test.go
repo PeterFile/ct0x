@@ -208,6 +208,34 @@ func TestChatDiscussionPolicyEarlierSchema(t *testing.T) {
 	checkDiscussionCaps(t, s, origin.ID, 2)
 }
 
+func TestChatDiscussionPolicyMissingMigrationMarker(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		laterVersion bool
+	}{
+		{"surviving_table", false},
+		{"later_version", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s, _ := openTestStore(t) // No policy revisions are needed to detect damage.
+			requireDiscussionPolicyFixture(t, s)
+			// Isolate each sign of damage, even if other migrations follow this one.
+			coordinationDecideExec(t, s, "DELETE FROM schema_migrations WHERE version>=?", chatDiscussionPolicyVersion)
+			if test.laterVersion {
+				coordinationDecideExec(t, s, "DROP TABLE chat_discussion_policy_revisions")
+				coordinationDecideExec(t, s, "INSERT INTO schema_migrations(version) VALUES(?)", chatDiscussionPolicyVersion+1)
+			}
+			if available, err := s.ChatDiscussionPolicyAvailable(ctx); err == nil || available || errors.Is(err, ErrNotFound) {
+				t.Fatalf("missing migration marker must surface a storage error: %t %v", available, err)
+			}
+			thread := domain.ThreadRef{GroupID: group(t, s).ID}
+			if got, err := s.GetChatDiscussionPolicy(ctx, thread); err == nil || errors.Is(err, ErrNotFound) {
+				t.Fatalf("damaged policy read fell back or hid the storage error: %+v %v", got, err)
+			}
+		})
+	}
+}
+
 func TestChatDiscussionPolicyDamagedSchema(t *testing.T) {
 	f := setupMessages(t)
 	s := f.s
