@@ -13,9 +13,11 @@ func TestChatInvestigationExplicitFollowupFence(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		state domain.TurnState
+		body  string
 	}{
-		{"exact-task-id", domain.TurnStateCancelRequested},
-		{"original-task-cue", domain.TurnStateUnknown},
+		{"exact-task-id", domain.TurnStateCancelRequested, ""},
+		{"original-task-cue", domain.TurnStateUnknown, "请继续原任务，只核对源材料。"},
+		{"original-task-compact", domain.TurnStateUnknown, "请继续原任务并核对源材料。"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f, policy := investigationFollowupFixture(t, 2)
@@ -39,8 +41,8 @@ func TestChatInvestigationExplicitFollowupFence(t *testing.T) {
 				return chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: policy.TopicID,
 					ActorID: "user", Content: body, RecipientIDs: []string{assessor}}, []string{assessor})
 			}
-			body := "请继续原任务，只核对源材料。"
-			if tc.state == domain.TurnStateCancelRequested {
+			body := tc.body
+			if body == "" {
 				body = "请接着处理任务`" + taskID + "`，只核对源材料。"
 			}
 			source := local(body)
@@ -98,9 +100,9 @@ func TestChatInvestigationExplicitFollowupFence(t *testing.T) {
 			t.Fatal(err)
 		}
 		investigationAssertFollowupControl(t, f, msg, proposal, policy, "member")
-		fresh := chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: policy.TopicID, ActorID: "user",
-			Content: "请另开只读调查，核对「" + f.input.Title + "」的来源；“请继续原任务”是旧消息。"}, []string{f.a})
-		investigationAssertFollowupControl(t, f, fresh, proposal, policy, "local_user_chat")
+		quoted := chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: policy.TopicID, ActorID: "user",
+			Content: "“请继续原任务并核对源材料。”是旧消息。请另开只读调查，核对「" + f.input.Title + "」的来源。"}, []string{f.a})
+		investigationAssertFollowupControl(t, f, quoted, proposal, policy, "local_user_chat")
 
 		other := policy.ThreadRef
 		other.TopicID += "-other"

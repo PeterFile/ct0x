@@ -57,8 +57,9 @@ func (s *Store) chatInvestigationAdmissionInTx(ctx context.Context, tx *sql.Tx, 
 }
 
 // Only a direct request for the original task qualifies without an exact ID.
+// Chinese commands can be followed by another action without a separator.
 var chatInvestigationOriginalTaskCue = regexp.MustCompile(
-	`^(?:(?:请)?(?:继续|续办)原任务(?:吧)?|(?i:(?:please )?(?:continue|resume) the original task))(?:$|[\s\p{Z},.!?;:，。！？；：、])`)
+	`^(?:(?:请)?(?:继续|续办)原任务|(?i:(?:please )?(?:continue|resume) the original task)(?:$|[\s\p{Z},.!?;:，。！？；：、]))`)
 
 func chatInvestigationReferencesExistingWorkInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) (bool, error) {
 	if c.SourceKind != "local_user_chat" {
