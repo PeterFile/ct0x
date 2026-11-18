@@ -83,7 +83,7 @@ func runNativeSessionFixture(t *testing.T, f *rolePrepareFixture, prepared sched
 			t.Fatalf("actual native-session constructor failed: %v", err)
 		}
 		call.issued = config
-		_, call.token = memberToolRuntimeConfig(t, config.Path)
+		_, call.token = memberToolRuntimeConfigWithDiscussion(t, config.Path, run.intake)
 		prepareRoleOK(t, json.Unmarshal(binding, &call.binding))
 		call.resume = cloneMemberToolNativeReference(resume)
 		sortedNames := slices.Clone(names)

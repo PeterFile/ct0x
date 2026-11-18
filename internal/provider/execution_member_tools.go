@@ -28,7 +28,8 @@ type piMemberToolOptions struct {
 	extensionPath string
 	configPath    string
 	toolNames     []string
-	configSHA256  [sha256.Size]byte // Nonzero only for the runtime-bound profile.
+	configSHA256  [sha256.Size]byte // Nonzero only for a runtime-bound profile.
+	investigation bool
 }
 
 // NewPiMemberToolExecutor opts into four native member tools on verified Pi 1.4.0.
@@ -48,39 +49,52 @@ func NewPiMemberToolExecutor(selected Provider, extensionPath, configPath string
 // can include issued work-input operations. Names do not grant authority.
 // It preserves the legacy constructor's file/version gates and does not launch Pi.
 func NewPiMemberToolExecutorWithTools(selected Provider, extensionPath, configPath string, toolNames []string, timeout time.Duration) (Executor, error) {
+	native, err := newPiMemberToolExecutor(selected, extensionPath, configPath, toolNames, timeout, false)
+	if err != nil {
+		return nil, err
+	}
+	return native, nil
+}
+
+func newPiMemberToolExecutor(selected Provider, extensionPath, configPath string, toolNames []string, timeout time.Duration, investigation bool) (piExecutor, error) {
 	if selected.Name != Pi {
-		return nil, errExecutorConfiguration
+		return piExecutor{}, errExecutorConfiguration
 	}
 	baseline, err := NewExecutor(selected, timeout)
 	if err != nil {
-		return nil, err
+		return piExecutor{}, err
 	}
-	names, err := canonicalMemberToolProfile(toolNames, true)
+	var names []string
+	if investigation {
+		names, err = piInvestigationProfile(toolNames)
+	} else {
+		names, err = canonicalMemberToolProfile(toolNames, true)
+	}
 	if err != nil {
-		return nil, err
+		return piExecutor{}, err
 	}
 	if !filepath.IsAbs(extensionPath) || strings.ContainsRune(extensionPath, 0) ||
 		!filepath.IsAbs(configPath) || strings.ContainsRune(configPath, 0) {
-		return nil, errPiMemberToolConfiguration
+		return piExecutor{}, errPiMemberToolConfiguration
 	}
 	info, err := os.Stat(extensionPath)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0444 == 0 {
-		return nil, errPiMemberToolConfiguration
+		return piExecutor{}, errPiMemberToolConfiguration
 	}
 	extension, err := os.Open(extensionPath)
 	if err != nil {
-		return nil, errPiMemberToolConfiguration
+		return piExecutor{}, errPiMemberToolConfiguration
 	}
 	if extension.Close() != nil {
-		return nil, errPiMemberToolConfiguration
+		return piExecutor{}, errPiMemberToolConfiguration
 	}
 	// Clean first so a trailing separator cannot hide a final symlink from Lstat.
 	info, err = os.Lstat(filepath.Clean(configPath))
 	if err != nil || !info.Mode().IsRegular() || info.Mode() != 0600 {
-		return nil, errPiMemberToolConfiguration
+		return piExecutor{}, errPiMemberToolConfiguration
 	}
 	e := baseline.(piExecutor)
-	e.memberTools = &piMemberToolOptions{extensionPath: extensionPath, configPath: configPath, toolNames: names}
+	e.memberTools = &piMemberToolOptions{extensionPath: extensionPath, configPath: configPath, toolNames: names, investigation: investigation}
 	return e, nil
 }
 

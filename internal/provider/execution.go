@@ -171,7 +171,7 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		}
 		return r
 	}
-	if e.memberTools.boundConfig() && !memberToolConfigMatches(e.memberTools.configPath, e.memberTools.configSHA256) {
+	if e.memberTools.boundConfig() && !piMemberToolConfigMatches(e.memberTools.configPath, e.memberTools.configSHA256, e.memberTools.investigation) {
 		r.Reason = "成员工具配置无效或已变化，执行未启动"
 		return r
 	}
@@ -209,6 +209,12 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	}
 	if e.memberTools != nil {
 		args = append(args, "--tools", strings.Join(e.memberTools.toolNames, ","), "--extension", e.memberTools.extensionPath)
+		if e.memberTools.investigation {
+			// Explicit prompts prevent Pi from loading ambient SYSTEM.md and
+			// APPEND_SYSTEM.md independently of --no-context-files.
+			args = append(args, "--no-themes", "--exclude-tools", "read,bash,powershell,edit,write,grep,find,ls,codemode,tool_search,mcp__*",
+				"--system-prompt", "你只可使用本轮获准的只读调查工具。", "--append-system-prompt", "不得向宿主机请求文件、命令或网络工具。")
+		}
 	}
 	if codex {
 		args = []string{"--ask-for-approval", "never", "exec", "--json", "--sandbox", "read-only", "--ignore-user-config", "--ephemeral", "--cd", request.CWD, "--skip-git-repo-check", "--color", "never"}

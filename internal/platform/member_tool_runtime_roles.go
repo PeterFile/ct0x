@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"crypto/sha256"
+	"path/filepath"
 	"slices"
 
 	"agentworkspace/internal/domain"
@@ -24,7 +25,12 @@ func (r *MemberToolRuntime) WrapCoordinationRole(binding MemberToolRunBinding, e
 // never grants. The caller must sample adapters before entering this runtime.
 // The legacy wrapper supplies no facts and cannot create new assignments.
 func (r *MemberToolRuntime) WrapCoordinationRoleWithCapabilities(binding MemberToolRunBinding, expected store.CoordinationRoleProvenance, facts []store.DispatchWorkerCapabilityFact, factory MemberToolExecutorFactory) (provider.Executor, error) {
-	if r.roleFence == nil || (binding.ProviderName != provider.Pi && binding.ProviderName != provider.Codex) || !memberToolRuntimeText(binding.ProviderID) || factory == nil || len(binding.Model) > 256 || !memberToolRuntimeText(binding.Model) ||
+	return r.wrapCoordinationRole(binding, expected, facts, factory, nil)
+}
+
+func (r *MemberToolRuntime) wrapCoordinationRole(binding MemberToolRunBinding, expected store.CoordinationRoleProvenance, facts []store.DispatchWorkerCapabilityFact,
+	factory MemberToolExecutorFactory, investigation *investigationRolePreparation) (provider.Executor, error) {
+	if r.roleFence == nil || (binding.ProviderName != provider.Pi && binding.ProviderName != provider.Codex) || !memberToolRuntimeText(binding.ProviderID) || len(binding.Model) > 256 || !memberToolRuntimeText(binding.Model) ||
 		expected.GroupID != binding.GroupID || expected.MemberID != binding.MemberID || expected.ConversationID != binding.ConversationID || expected.DeliveryID != binding.DeliveryID ||
 		expected.TaskRevision < 1 || (expected.Kind != store.CoordinationRoleCoordinator && expected.Kind != store.CoordinationRoleWorker) ||
 		(expected.Kind == store.CoordinationRoleCoordinator && expected.AssignmentID != "") || (expected.Kind == store.CoordinationRoleWorker && !memberToolRuntimeText(expected.AssignmentID)) {
@@ -35,7 +41,18 @@ func (r *MemberToolRuntime) WrapCoordinationRoleWithCapabilities(binding MemberT
 			return nil, errMemberToolRuntimeBinding
 		}
 	}
-	return &memberToolRuntimeRun{runtime: r, binding: binding, factory: factory, role: &expected, dispatchCapabilities: slices.Clone(facts)}, nil
+	if investigation != nil {
+		if investigation.build == nil || factory != nil || binding.ProviderName != provider.Pi || investigation.providerID != binding.ProviderID || investigation.request.Model != binding.Model {
+			return nil, errMemberToolRuntimeBinding
+		}
+		frozen := *investigation
+		frozen.scope.ArtifactVersions = slices.Clone(frozen.scope.ArtifactVersions)
+		investigation = &frozen
+	} else if factory == nil {
+		return nil, errMemberToolRuntimeBinding
+	}
+	return &memberToolRuntimeRun{runtime: r, binding: binding, factory: factory, role: &expected, investigation: investigation,
+		dispatchCapabilities: slices.Clone(facts)}, nil
 }
 
 // CheckCoordinationRoleCapacity only performs bounded memory GC and Store reads;
@@ -70,7 +87,11 @@ func (e *memberToolRuntimeRun) roleStartup(ctx context.Context, claim store.Turn
 	if member.MemberID != e.binding.MemberID || member.ConversationID != e.binding.ConversationID || member.TopicID != e.role.TopicID {
 		return store.CoordinationToolScope{}, errMemberToolRuntimeBinding
 	}
-	state, err := db.ResolveCoordinationExecution(ctx, member, *e.role)
+	resolve := db.ResolveCoordinationExecution
+	if e.investigation != nil {
+		resolve = db.ResolveInvestigationExecution
+	}
+	state, err := resolve(ctx, member, *e.role)
 	if err != nil {
 		return store.CoordinationToolScope{}, err
 	}
@@ -97,16 +118,17 @@ func (e *memberToolRuntimeRun) rolePreflight(ctx context.Context, request provid
 	// successful Issue. Lock order stays registry -> Store, never fence -> registry.
 	r.tools.mu.RLock()
 	entry, found := r.tools.capabilities[sha256.Sum256([]byte(token))]
-	valid := found && entry.scope == scope.Member && entry.role == scope && slices.Equal(entry.grants.Operations, operations) &&
-		entry.grants.Skills == nil && entry.grants.Artifacts == nil && slices.Equal(entry.dispatchCapabilities, e.dispatchCapabilities)
+	valid := found && e.matchesRoleRegistration(entry, scope, operations)
 	r.tools.mu.RUnlock()
-	return valid && r.roleFence.rootValid(request.RuntimeDir) && r.rootValid() && e.configValid(config) && checkCtx.Err() == nil && ctx.Err() == nil
+	return valid && r.roleFence.rootValid(request.RuntimeDir) && r.rootValid() && e.configValid(config) &&
+		e.investigation.validateRequest(request) && checkCtx.Err() == nil && ctx.Err() == nil
 }
 
 func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, request provider.ExecuteRequest, onEvent func(provider.Event) error) provider.ExecutionReceipt {
 	unknown := e.startupUnknown("角色执行归属或历史结果未知，需对账后再处理")
 	r := e.runtime
-	if e.used.Swap(true) || !memberToolRuntimeRunID.MatchString(request.RunID) || request.Model != e.binding.Model || !r.roleFence.rootValid(request.RuntimeDir) {
+	if e.used.Swap(true) || !memberToolRuntimeRunID.MatchString(request.RunID) || request.Model != e.binding.Model ||
+		!r.roleFence.rootValid(request.RuntimeDir) || !e.investigation.validateRequest(request) {
 		return unknown
 	}
 	turn, err := r.tools.db.GetTurn(ctx, e.binding.GroupID, request.RunID)
@@ -141,7 +163,11 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 		}
 		scope.AttemptID = binding.AttemptID
 	}
-	token, err = r.tools.issueCoordinationRoleWithCapabilities(ctx, scope, e.dispatchCapabilities)
+	if e.investigation != nil {
+		token, err = r.tools.issueInvestigationRole(ctx, scope, e.investigation, e.dispatchCapabilities)
+	} else {
+		token, err = r.tools.issueCoordinationRoleWithCapabilities(ctx, scope, e.dispatchCapabilities)
+	}
 	if err != nil {
 		return unknown
 	}
@@ -163,13 +189,24 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 	if err != nil || !e.rolePreflight(ctx, request, scope, token, operations, config) {
 		return startupFailure()
 	}
-	native, session, err := e.constructExecutor(ctx, request, claim, token, config, slices.Clone(operations))
-	if err != nil || native == nil || e.nativeSession == nil && !e.rolePreflight(ctx, request, scope, token, operations, config) {
-		return startupFailure()
-	}
-	nativeRequest, err := e.executionRequest(request, config)
-	if err != nil || !e.commitNativeLaunch(ctx, token, session, owner) {
-		return startupFailure()
+	var native provider.Executor
+	var session *memberToolNativeTurn
+	nativeRequest := request
+	if e.investigation != nil {
+		issued := provider.NativeMemberToolConfig{Path: filepath.Join(r.configRoot, config.name), SHA256: config.digest}
+		native, err = e.investigation.build(issued, slices.Clone(operations))
+		if err != nil || native == nil || !e.commitInvestigationLaunch(ctx, request, scope, token, operations, config, owner) {
+			return startupFailure()
+		}
+	} else {
+		native, session, err = e.constructExecutor(ctx, request, claim, token, config, slices.Clone(operations))
+		if err != nil || native == nil || e.nativeSession == nil && !e.rolePreflight(ctx, request, scope, token, operations, config) {
+			return startupFailure()
+		}
+		nativeRequest, err = e.executionRequest(request, config)
+		if err != nil || !e.commitNativeLaunch(ctx, token, session, owner) {
+			return startupFailure()
+		}
 	}
 	// Freeze native evidence independently from the wrapper's metadata/aggregate.
 	raw := cloneMemberToolReceipt(native.Execute(ctx, nativeRequest, onEvent))
@@ -197,8 +234,8 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 			aggregate.Reason = "本轮文件操作结果未确认或无法核验，须保留资源并先对账；原生回执不代表目录操作已完成"
 		}
 	}
-	if workspace {
-		aggregate.NativeRef = nil // File profiles cannot acquire text-session metadata.
+	if workspace || e.investigation != nil {
+		aggregate.NativeRef = nil // File and investigation roles never get text-session metadata.
 	} else if session != nil {
 		aggregate = session.receipt(ctx, e, claim, aggregate)
 	} else {
@@ -206,6 +243,33 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 	}
 	r.captureRoleReceipt(e.binding, scope, token, raw, aggregate)
 	return aggregate
+}
+
+// A first-turn investigation never enters the v23 text-session selector. Use
+// the existing one-shot owner, then make the serialized B role/policy check
+// the final authority decision. Registry revocation cannot interleave with it.
+func (e *memberToolRuntimeRun) commitInvestigationLaunch(ctx context.Context, request provider.ExecuteRequest, scope store.CoordinationToolScope,
+	token string, operations []string, config *memberToolRuntimeConfigFile, owner *memberToolRoleFenceOwner) bool {
+	r := e.runtime
+	if ctx.Err() != nil || !r.roleFence.rootValid(request.RuntimeDir) || !r.clearRunDirectory(request) || !r.rootValid() || !e.configValid(config) ||
+		!e.investigation.validateRequest(request) || !owner.beginInvoke() {
+		return false
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, memberToolRuntimeVerificationTimeout)
+	defer cancel()
+	r.tools.mu.RLock()
+	defer r.tools.mu.RUnlock()
+	entry, found := r.tools.capabilities[sha256.Sum256([]byte(token))]
+	if !found || !e.matchesRoleRegistration(entry, scope, operations) {
+		return false
+	}
+	current, err := e.roleStartup(checkCtx, scope.Member.Claim)
+	return err == nil && current == scope && checkCtx.Err() == nil
+}
+
+func (e *memberToolRuntimeRun) matchesRoleRegistration(entry memberToolRegistration, scope store.CoordinationToolScope, operations []string) bool {
+	return entry.scope == scope.Member && entry.role == scope && slices.Equal(entry.grants.Operations, operations) &&
+		entry.grants.Skills == nil && e.investigation.matchesRegistration(entry) && slices.Equal(entry.dispatchCapabilities, e.dispatchCapabilities)
 }
 
 // Evidence acceptance deliberately does NOT call Bind/Resolve/Blocked or inspect
