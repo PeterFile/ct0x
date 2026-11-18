@@ -34,6 +34,7 @@ const (
 type Store struct {
 	db                     *sql.DB
 	investigationExecution atomic.Bool
+	taskWorkExecution      atomic.Bool
 }
 
 type CreateGroupInput struct {

@@ -101,9 +101,15 @@ func requestWorkPayload(groupID string, request domain.RequestWorkRequest, key s
 }
 
 func admitWorkInTx(ctx context.Context, tx *sql.Tx, trigger domain.Trigger, request domain.RequestWorkRequest, decisionID string) error {
-	var coordinated bool
-	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM routing_decisions WHERE trigger_id=?)", trigger.ID).Scan(&coordinated); err != nil {
+	var coordinated, hasInputs bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM routing_decisions WHERE trigger_id=?),"+workInputSchemaExists,
+		trigger.ID, taskWorkInputVersion).Scan(&coordinated, &hasInputs); err != nil {
 		return err
+	}
+	if !coordinated && hasInputs {
+		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM chat_followup_routes WHERE trigger_id=?)", trigger.ID).Scan(&coordinated); err != nil {
+			return err
+		}
 	}
 	if coordinated {
 		return fmt.Errorf("%w：来源已获授权", ErrConflict)

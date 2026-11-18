@@ -15,12 +15,35 @@ func (s *Store) investigationForRoleInTx(ctx context.Context, tx *sql.Tx, role C
 	if err := coordinationDecideLiveInTx(ctx, tx, role.Member); err != nil {
 		return domain.TaskInvestigationScope{}, err
 	}
+	f, err := lookupTaskWorkExecutionInTx(ctx, tx, role.Member)
+	if err == nil {
+		if taskWorkFollowupProvenance(f) != role.Provenance {
+			return domain.TaskInvestigationScope{}, ErrMemberToolDenied
+		}
+		evidence, err := s.investigationForFollowupInTx(ctx, tx, f, role.Member, role.AttemptID)
+		return evidence.TaskInvestigationScope, err
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return domain.TaskInvestigationScope{}, err
+	}
 	p, err := coordinationExecutionProvenanceInTx(ctx, tx, role.Member, role.Provenance)
 	if err != nil {
 		return domain.TaskInvestigationScope{}, err
 	}
 	evidence, err := s.investigationForProvenanceInTx(ctx, tx, role.Member, p, role.AttemptID)
 	return evidence.TaskInvestigationScope, err
+}
+
+func (s *Store) investigationForFollowupInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, member MemberToolScope, attemptID string) (taskInvestigationEvidence, error) {
+	state, err := s.taskWorkFollowupRoleInTx(ctx, tx, f, member.Claim.TurnID)
+	if err != nil {
+		return taskInvestigationEvidence{}, err
+	}
+	if state.Blocked != CoordinationReady || attemptID == "" || state.AttemptID != attemptID {
+		return taskInvestigationEvidence{}, ErrMemberToolDenied
+	}
+	evidence, err := s.taskWorkInvestigationInTx(ctx, tx, f)
+	return evidence, investigationToolError(err)
 }
 
 func (s *Store) investigationForProvenanceInTx(ctx context.Context, tx *sql.Tx, member MemberToolScope, p CoordinationRoleProvenance, attemptID string) (taskInvestigationEvidence, error) {

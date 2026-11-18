@@ -31,6 +31,11 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 	if err != nil {
 		return domain.ChatCandidate{}, memberToolOperationError("读取聊天来源失败", err)
 	}
+	// Check raw work provenance, not readiness or renderable message text.
+	// Typed work may not acquire ordinary intake even through a direct call.
+	if err := denyTaskWorkFallbackInTx(ctx, tx, scope.Claim.TurnID); err != nil {
+		return domain.ChatCandidate{}, memberToolOperationError("读取工作投递来源失败", err)
+	}
 	var id string
 	err = tx.QueryRowContext(ctx, "SELECT id FROM chat_candidates WHERE turn_id=?", scope.Claim.TurnID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -69,6 +74,15 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 	candidate, err := chatCandidateInTx(ctx, tx, scope, id)
 	if err != nil {
 		return domain.ChatCandidate{}, memberToolOperationError("读取聊天候选失败", err)
+	}
+	if candidate.SourceKind == "local_user_chat" && candidate.Policy.Enabled {
+		installed, err := workInputSchemaInTx(ctx, tx)
+		if err == nil && installed {
+			candidate.FollowupTaskIDs, err = chatFollowupTaskIDsInTx(ctx, tx, candidate, 5)
+		}
+		if err != nil {
+			return domain.ChatCandidate{}, memberToolOperationError("读取原任务提示失败", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.ChatCandidate{}, memberToolOperationError("保存聊天候选失败", err)

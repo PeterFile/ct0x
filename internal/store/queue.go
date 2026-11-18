@@ -48,6 +48,19 @@ func (s *Store) ListPendingDeliveries(ctx context.Context, options PendingOption
 	 JOIN messages msg ON msg.id=d.message_id AND msg.group_id=d.group_id
 	 WHERE d.state='queued' AND d.turn_id='' AND m.status='active'
 	 AND NOT EXISTS(SELECT 1 FROM turns WHERE (conversation_id=d.conversation_id OR member_id=d.recipient_id) AND ` + activeTurnPredicate + `)`
+	// A handled redundant wake stays in history but cannot consume a scheduler
+	// slot. ClaimTurn rechecks the same fact transactionally against races.
+	supported, err := taskWorkSchemaSupportedInTx(ctx, s.db)
+	if err != nil {
+		return Page[PendingDelivery]{}, queueError("扫描待投递失败", err)
+	}
+	if supported {
+		query += ` AND NOT EXISTS(SELECT 1 FROM task_work_deliveries w WHERE w.delivery_id=d.id AND w.source_kind='followup'`
+		if s.taskWorkExecution.Load() {
+			query += ` AND ` + taskWorkInputHandledSQL("w.source_id")
+		}
+		query += `)`
+	}
 	args := []any{}
 	switch options.Lane {
 	case "human":
@@ -129,7 +142,7 @@ func scanTurn(row scanner) (t domain.Turn, err error) {
 
 // Queue errors preserve stable categories and cancellation, never raw SQL or payloads.
 func queueError(action string, err error) error {
-	for _, known := range []error{ErrTurnBusy, ErrStaleClaim, ErrConflict, ErrInvalid, ErrNotFound, context.Canceled, context.DeadlineExceeded} {
+	for _, known := range []error{ErrTurnBusy, ErrStaleClaim, ErrConflict, ErrInvalid, ErrNotFound, ErrMemberToolDenied, context.Canceled, context.DeadlineExceeded} {
 		if errors.Is(err, known) {
 			return fmt.Errorf("%s：%w", action, known)
 		}

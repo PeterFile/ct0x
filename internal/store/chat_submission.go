@@ -13,9 +13,15 @@ import (
 // New writes honor the actual chat action. Historical same-key receipts bypass
 // this gate in the caller; legacy explicit tasks have no chat evidence.
 func (s *Store) chatTextSubmissionInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (evidence taskInvestigationEvidence, err error) {
-	var hasChat, hasScope bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_assessments'),EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_policy_scopes')`).Scan(&hasChat, &hasScope); err != nil {
+	var hasChat, hasScope, hasInputs bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_assessments'),EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_policy_scopes'),`+workInputSchemaExists,
+		taskWorkInputVersion).Scan(&hasChat, &hasScope, &hasInputs); err != nil {
 		return evidence, err
+	}
+	if hasInputs {
+		if err := requireHandledWorkConstraintsInTx(ctx, tx, input); err != nil {
+			return evidence, err
+		}
 	}
 	if !hasChat {
 		return evidence, nil

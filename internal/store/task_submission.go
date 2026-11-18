@@ -49,6 +49,11 @@ func (s *Store) submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTask
 	if err != nil {
 		return domain.Submission{}, err
 	}
+	if noticeTopic == nil && turnID != "" {
+		if err := denyTaskWorkFallbackInTx(ctx, tx, turnID); err != nil {
+			return domain.Submission{}, err
+		}
+	}
 	scope := mutationScope{operation: "submit_task", actorID: input.ActorID, groupID: input.GroupID, key: input.IdempotencyKey}
 	id, replay, err := reserveMutation(ctx, tx, scope, taskSubmissionPayload(input))
 	if err != nil {
