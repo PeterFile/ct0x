@@ -35,27 +35,18 @@ type memberToolConfig struct {
 
 // Trusted, stable ancestors are required. Descriptor and path checks detect
 // replacement/metadata drift, not hostile ancestor mutation or ABA writes.
-func readMemberToolConfig(path string) (memberToolConfig, error) {
-	return readMemberToolConfigMode(path, false, false)
-}
-
-func readPiMemberToolConfig(path string, strict bool) (memberToolConfig, error) {
-	return readMemberToolConfigMode(path, true, strict)
-}
-
-func readMemberToolConfigMode(path string, pi, strict bool) (memberToolConfig, error) {
-	var config memberToolConfig
+func readMemberToolConfigFile(path string) ([]byte, os.FileInfo, error) {
 	if !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
-		return config, errPiMemberToolConfiguration
+		return nil, nil, errPiMemberToolConfiguration
 	}
 	path = filepath.Clean(path)
 	before, err := os.Lstat(path)
 	if err != nil || before.Mode() != 0600 || before.Size() <= 0 || before.Size() > codexAppServerMemberConfigLimit {
-		return config, errPiMemberToolConfiguration
+		return nil, nil, errPiMemberToolConfiguration
 	}
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return config, errPiMemberToolConfiguration
+		return nil, nil, errPiMemberToolConfiguration
 	}
 	opened, statErr := file.Stat()
 	valid := func(info os.FileInfo) bool {
@@ -67,15 +58,32 @@ func readMemberToolConfigMode(path string, pi, strict bool) (memberToolConfig, e
 	}
 	if statErr != nil || !valid(opened) {
 		_ = file.Close()
-		return config, errPiMemberToolConfiguration
+		return nil, nil, errPiMemberToolConfiguration
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(file, codexAppServerMemberConfigLimit+1))
 	finished, finishErr := file.Stat()
 	closeErr := file.Close()
 	after, pathErr := os.Lstat(path)
 	if readErr != nil || finishErr != nil || closeErr != nil || pathErr != nil || !valid(finished) || !valid(after) || int64(len(raw)) != before.Size() || !utf8.Valid(raw) {
-		return config, errPiMemberToolConfiguration
+		return nil, nil, errPiMemberToolConfiguration
 	}
+	return raw, after, nil
+}
+
+func readMemberToolConfig(path string) (memberToolConfig, error) {
+	return readMemberToolConfigMode(path, false, false)
+}
+
+func readPiMemberToolConfig(path string, strict bool) (memberToolConfig, error) {
+	return readMemberToolConfigMode(path, true, strict)
+}
+
+func readMemberToolConfigMode(path string, pi, strict bool) (memberToolConfig, error) {
+	raw, file, err := readMemberToolConfigFile(path)
+	if err != nil {
+		return memberToolConfig{}, err
+	}
+	var config memberToolConfig
 	fields, err := codexAppServerMap(raw)
 	count := 2
 	if strict {
@@ -100,22 +108,30 @@ func readMemberToolConfigMode(path string, pi, strict bool) (memberToolConfig, e
 		json.Unmarshal(fields["endpoint"], &config.endpoint) != nil || json.Unmarshal(fields["token"], &config.token) != nil {
 		return memberToolConfig{}, errPiMemberToolConfiguration
 	}
-	parts := memberToolEndpoint.FindStringSubmatch(config.endpoint)
-	if len(parts) != 3 || len(config.token) > 256 || !memberToolBearer.MatchString(config.token) {
+	config.origin = memberToolConfigOrigin(config.endpoint, config.token)
+	if config.origin == "" {
 		return memberToolConfig{}, errPiMemberToolConfiguration
+	}
+	config.file, config.digest = file, sha256.Sum256(raw)
+	return config, nil
+}
+
+func memberToolConfigOrigin(endpoint, token string) string {
+	parts := memberToolEndpoint.FindStringSubmatch(endpoint)
+	if len(parts) != 3 || len(token) > 256 || !memberToolBearer.MatchString(token) {
+		return ""
 	}
 	port, err := strconv.Atoi(parts[2])
 	if err != nil || port < 1 || port > 65535 {
-		return memberToolConfig{}, errPiMemberToolConfiguration
+		return ""
 	}
 	// Native httpOrigin uses URL-origin serialization (canonical numeric port,
 	// with HTTP's default port omitted), not the literal configured URL bytes.
-	config.origin = "http://" + parts[1]
+	origin := "http://" + parts[1]
 	if port != 80 {
-		config.origin += ":" + strconv.Itoa(port)
+		origin += ":" + strconv.Itoa(port)
 	}
-	config.file, config.digest = after, sha256.Sum256(raw)
-	return config, nil
+	return origin
 }
 
 type codexAppServerMemberToolExecutor struct {

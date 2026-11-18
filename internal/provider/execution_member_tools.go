@@ -28,8 +28,11 @@ type piMemberToolOptions struct {
 	extensionPath string
 	configPath    string
 	toolNames     []string
-	configSHA256  [sha256.Size]byte // Nonzero only for a runtime-bound profile.
-	investigation bool
+	configSHA256  [sha256.Size]byte // Nonzero only for runtime-bound profiles.
+	investigation bool              // Strict first-investigation config and argv.
+
+	// Only typed investigation uses its own wire schema and in-memory session.
+	investigationConfigFile os.FileInfo
 }
 
 // NewPiMemberToolExecutor opts into four native member tools on verified Pi 1.4.0.
@@ -148,4 +151,16 @@ func (o *piMemberToolOptions) environment(inherited []string) []string {
 
 func (o *piMemberToolOptions) boundConfig() bool {
 	return o != nil && o.configSHA256 != ([sha256.Size]byte{})
+}
+
+func (o *piMemberToolOptions) launchConfigMatches() bool {
+	if !o.boundConfig() {
+		return true
+	}
+	if o.investigationConfigFile == nil {
+		return piMemberToolConfigMatches(o.configPath, o.configSHA256, o.investigation)
+	}
+	// The typed adapter already checked the schema of exactly these bytes.
+	raw, file, err := readMemberToolConfigFile(o.configPath)
+	return err == nil && os.SameFile(o.investigationConfigFile, file) && sha256.Sum256(raw) == o.configSHA256
 }

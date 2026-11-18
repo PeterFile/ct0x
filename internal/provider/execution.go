@@ -171,7 +171,7 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		}
 		return r
 	}
-	if e.memberTools.boundConfig() && !piMemberToolConfigMatches(e.memberTools.configPath, e.memberTools.configSHA256, e.memberTools.investigation) {
+	if !e.memberTools.launchConfigMatches() {
 		r.Reason = "成员工具配置无效或已变化，执行未启动"
 		return r
 	}
@@ -208,6 +208,9 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		args = append(args[:len(args)-4], "--session", session.file, "--session-dir", filepath.Dir(session.file))
 	}
 	if e.memberTools != nil {
+		if e.memberTools.investigationConfigFile != nil {
+			args = append(args, "--no-session") // Exact --session-id, but never load or append to a session file.
+		}
 		args = append(args, "--tools", strings.Join(e.memberTools.toolNames, ","), "--extension", e.memberTools.extensionPath)
 		if e.memberTools.investigation {
 			// Explicit prompts prevent Pi from loading ambient SYSTEM.md and
