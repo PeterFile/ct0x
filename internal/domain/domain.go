@@ -59,6 +59,8 @@ type Message struct {
 	Content    string     `json:"content"`
 	CreatedAt  time.Time  `json:"created_at"`
 	Deliveries []Delivery `json:"deliveries"`
+	// Read projection on the interrupted discussion head, not a publication receipt.
+	DiscussionClosureReason string `json:"discussion_closure_reason,omitempty"`
 }
 
 func (m Message) MarshalJSON() ([]byte, error) {
