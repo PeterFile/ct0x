@@ -120,7 +120,7 @@ function readConfig(path: string | undefined, digest: string | undefined) {
         wire !== JSON.stringify({ endpoint, token, run_id, action, source_kind, operations }) + "\n") throw new Error();
     const url = new URL(endpoint);
     if (url.port === "0") throw new Error();
-    return { endpoint: url, token, runID: run_id, role: source_kind, operations: Object.freeze(operations) };
+    return { endpoint: url, token, runID: run_id, role: source_kind, operations: Object.freeze(operations), configSHA256: digest };
   } catch {
     throw new Error(CONFIG_ERROR);
   } finally {
@@ -355,22 +355,44 @@ function investigationClient(endpoint: URL, token: string) {
 }
 
 export default function freshInvestigationWork(pi: ExtensionAPI) {
-  const { endpoint, token, runID, role, operations } = readConfig(process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG,
-    process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256);
-  const invoke = investigationClient(endpoint, token);
-  let started = false, active = false;
-  // Pi 1.4.0 reports session_start errors and still calls prompt() in print
-  // mode. Consume that one-shot JSON input before prompt's model/auth path.
-  // Never exit the process or intercept interactive input.
+  let config: ReturnType<typeof readConfig> | undefined;
+  let started = false, active = false, acknowledged = false;
+  const exactTools = (operations: readonly Operation[]) => {
+    const selected = pi.getActiveTools();
+    return selected.length === operations.length && selected.every((name, index) => name === operations[index]);
+  };
+  // Keep the guard even on config failure. Pi 1.4.0 reports session_start
+  // errors and still calls prompt(); handled input stops before model admission.
   pi.on("input", (_event, ctx) => {
-    if (ctx.mode === "json" && !active) return { action: "handled" };
+    if (ctx.mode !== "json") return;
+    if (!active || !config || acknowledged) return { action: "handled" };
+    try {
+      if (ctx.sessionManager.getSessionId() !== config.runID || ctx.sessionManager.getSessionFile() !== undefined ||
+          !exactTools(config.operations)) throw new Error(SESSION_ERROR);
+      // Print mode subscribes after session_start and before input. Use its
+      // native entry_appended serializer; a custom entry is not model context.
+      pi.appendEntry("agent_workspace_investigation_ready_v1", {
+        run_id: config.runID, source_kind: config.role, config_sha256: config.configSHA256,
+      });
+      acknowledged = true;
+    } catch {
+      // Don't admit input if readiness could not be recorded.
+      active = false;
+      return { action: "handled" };
+    }
   });
+  try {
+    config = readConfig(process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG, process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256);
+  } catch { /* Leave the input guard active; session_start reports the bounded error. */ }
   pi.on("session_start", (event, ctx) => {
     if (started) { active = false; throw new Error(SESSION_ERROR); }
     started = true;
+    if (!config) throw new Error(CONFIG_ERROR);
+    const { endpoint, token, runID, role, operations } = config;
     if (event.reason !== "startup" || ctx.mode !== "json" || ctx.sessionManager.getSessionId() !== runID ||
         ctx.sessionManager.getSessionFile() !== undefined ||
         ctx.sessionManager.getEntries().some(entry => entry.type !== "model_change" && entry.type !== "thinking_level_change")) throw new Error(SESSION_ERROR);
+    const invoke = investigationClient(endpoint, token);
     for (const op of operations) {
       const parameters = schemas[op];
       pi.registerTool<typeof parameters>({
@@ -384,8 +406,7 @@ export default function freshInvestigationWork(pi: ExtensionAPI) {
       });
     }
     pi.setActiveTools([...operations]);
-    const selected = pi.getActiveTools();
-    if (selected.length !== operations.length || selected.some((name, index) => name !== operations[index])) throw new Error(SESSION_ERROR);
+    if (!exactTools(operations)) throw new Error(SESSION_ERROR);
     active = true;
   });
   pi.on("session_shutdown", () => { active = false; });

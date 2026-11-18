@@ -15,7 +15,7 @@ import (
 
 // Only this entry (and its pinned pure bridge validators) implements the typed
 // investigation profile. It does not qualify either ordinary Pi entry point.
-const piFreshInvestigationEntrySHA = "2a879f9c3982aec91a0aa0a720081e6c2b18619fbfff347422b9580da32b2c59"
+const piFreshInvestigationEntrySHA = "94db410965bee6275fa193b0b83977ae6f1df3244294f36ff09a503e8ac2af57"
 
 const (
 	// PiInitialInvestigationOwnerRole is a C-only wire role, not a B wake.
