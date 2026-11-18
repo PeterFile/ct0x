@@ -43,7 +43,7 @@ func (s *Store) CreateMemberForTool(ctx context.Context, scope MemberToolScope, 
 		return MemberToolCreateResult{}, memberToolOperationError(action, err)
 	}
 	defer tx.Rollback()
-	if !memberToolKeyValid(key) || policy.MaxMembers < 1 || !memberToolIDsValid(policy.ProviderID, policy.Model) || !utf8.ValidString(policy.ProviderID) || !utf8.ValidString(policy.Model) {
+	if !memberToolKeyValid(key) || !policy.valid() {
 		return MemberToolCreateResult{}, ErrInvalid
 	}
 	mutation := mutationScope{operation: "member_tool_create_member", actorID: scope.MemberID, groupID: scope.Claim.GroupID, key: key}
@@ -57,7 +57,7 @@ func (s *Store) CreateMemberForTool(ctx context.Context, scope MemberToolScope, 
 	if replay {
 		result, err = memberToolCreateReceiptInTx(ctx, tx, scope.Claim.GroupID, id)
 	} else {
-		if !memberToolTextValid(input.Name, 160) || !memberToolTextValid(input.Role, 8192) || !memberToolTextValid(input.Reason, 16384) {
+		if !input.valid() {
 			return MemberToolCreateResult{}, ErrInvalid
 		}
 		result, err = automaticMemberInTx(ctx, tx, id, scope, input, policy)
@@ -83,38 +83,57 @@ func (s *Store) CreateMemberForTool(ctx context.Context, scope MemberToolScope, 
 }
 
 func automaticMemberInTx(ctx context.Context, tx *sql.Tx, id string, scope MemberToolScope, input MemberToolCreateInput, policy MemberToolCreatePolicy) (MemberToolCreateResult, error) {
-	member, err := scanMember(tx.QueryRowContext(ctx, `SELECT `+memberColumns+` FROM members
-	 WHERE group_id=? AND status='active' AND role=? AND provider_id=? AND model=? AND workspace=''
-	 ORDER BY created_at,id LIMIT 1`, scope.Claim.GroupID, input.Role, policy.ProviderID, policy.Model))
+	member, err := reusableAutomaticMemberInTx(ctx, tx, scope.Claim.GroupID, input.Role, policy, nil)
 	if err == nil {
 		return MemberToolCreateResult{Member: member, Reused: true}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return MemberToolCreateResult{}, err
 	}
-	var active int
-	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM members WHERE group_id=? AND status='active'", scope.Claim.GroupID).Scan(&active); err != nil {
-		return MemberToolCreateResult{}, err
-	}
-	if active >= policy.MaxMembers {
-		return MemberToolCreateResult{}, ErrMemberCapacity
-	}
-	member, err = insertMemberInTx(ctx, tx, id, CreateMemberInput{
-		GroupID: scope.Claim.GroupID, Name: input.Name, Role: input.Role, ProviderID: policy.ProviderID, Model: policy.Model,
-		CreatorID: scope.MemberID, OwnerID: "user",
-	})
+	member, err = insertAutomaticMemberInTx(ctx, tx, id, scope, input, policy)
 	if err != nil {
 		return MemberToolCreateResult{}, err
 	}
-	recipients := []string{member.ID}
-	join, err := createMessageInTx(ctx, tx, MessageRequest{
-		GroupID: scope.Claim.GroupID, TopicID: scope.TopicID, ActorID: scope.MemberID, RecipientIDs: recipients,
-		Content: fmt.Sprintf("新成员「%s」加入讨论。\n背景与问题：\n%s", member.Name, input.Reason),
-	}, recipients)
+	// Standalone create_member still wakes the new member via its join message.
+	join, err := publishAutomaticMemberJoinInTx(ctx, tx, scope, member.Name, input.Reason, []string{member.ID})
 	if err != nil {
 		return MemberToolCreateResult{}, err
 	}
 	return MemberToolCreateResult{Member: member, JoinMessage: &join}, nil
+}
+
+func reusableAutomaticMemberInTx(ctx context.Context, tx *sql.Tx, groupID, role string, policy MemberToolCreatePolicy, excluded []string) (domain.Member, error) {
+	query := `SELECT ` + memberColumns + ` FROM members
+	 WHERE group_id=? AND status='active' AND role=? AND provider_id=? AND model=? AND workspace=''`
+	args := []any{groupID, role, policy.ProviderID, policy.Model}
+	if len(excluded) != 0 {
+		query += " AND id NOT IN (?" + strings.Repeat(",?", len(excluded)-1) + ")"
+		for _, id := range excluded {
+			args = append(args, id)
+		}
+	}
+	return scanMember(tx.QueryRowContext(ctx, query+" ORDER BY created_at,id LIMIT 1", args...))
+}
+
+func insertAutomaticMemberInTx(ctx context.Context, tx *sql.Tx, id string, scope MemberToolScope, input MemberToolCreateInput, policy MemberToolCreatePolicy) (domain.Member, error) {
+	var active int
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM members WHERE group_id=? AND status='active'", scope.Claim.GroupID).Scan(&active); err != nil {
+		return domain.Member{}, err
+	}
+	if active >= policy.MaxMembers {
+		return domain.Member{}, ErrMemberCapacity
+	}
+	return insertMemberInTx(ctx, tx, id, CreateMemberInput{
+		GroupID: scope.Claim.GroupID, Name: input.Name, Role: input.Role, ProviderID: policy.ProviderID, Model: policy.Model,
+		CreatorID: scope.MemberID, OwnerID: "user",
+	})
+}
+
+func publishAutomaticMemberJoinInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, name, reason string, recipients []string) (domain.Message, error) {
+	return createMessageInTx(ctx, tx, MessageRequest{
+		GroupID: scope.Claim.GroupID, TopicID: scope.TopicID, ActorID: scope.MemberID, RecipientIDs: recipients,
+		Content: fmt.Sprintf("新成员「%s」加入讨论。\n背景与问题：\n%s", name, reason),
+	}, recipients)
 }
 
 // insertMemberInTx only inserts a validated, trusted member. The caller owns
@@ -146,6 +165,14 @@ func memberToolCreateReceiptInTx(ctx context.Context, tx *sql.Tx, groupID, recei
 		result.JoinMessage = &join
 	}
 	return result, nil
+}
+
+func (input MemberToolCreateInput) valid() bool {
+	return memberToolTextValid(input.Name, 160) && memberToolTextValid(input.Role, 8192) && memberToolTextValid(input.Reason, 16384)
+}
+
+func (policy MemberToolCreatePolicy) valid() bool {
+	return policy.MaxMembers > 0 && memberToolIDsValid(policy.ProviderID, policy.Model) && utf8.ValidString(policy.ProviderID) && utf8.ValidString(policy.Model)
 }
 
 func memberToolTextValid(text string, maximum int) bool {

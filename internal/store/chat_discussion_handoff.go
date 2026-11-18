@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 
 	"agentworkspace/internal/domain"
 )
@@ -15,15 +17,27 @@ const (
 )
 
 // ApplyChatDiscussion publishes an assessed handoff step using only the bound
-// intake and the current position in the path. It grants no work authority.
+// intake and the current position in the path. It never creates a member or
+// grants work authority.
 func (s *Store) ApplyChatDiscussion(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatDiscussionAction, key string) (domain.ChatDiscussionReceipt, error) {
+	return s.applyChatDiscussion(ctx, scope, candidateID, input, key, nil)
+}
+
+// ApplyChatDiscussionWithMember accepts only the create_member invitation form.
+// The caller must have checked the live intake's send_message and create_member
+// grants and supply the same trusted policy as standalone create_member.
+func (s *Store) ApplyChatDiscussionWithMember(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatDiscussionAction, key string, policy MemberToolCreatePolicy) (domain.ChatDiscussionReceipt, error) {
+	return s.applyChatDiscussion(ctx, scope, candidateID, input, key, &policy)
+}
+
+func (s *Store) applyChatDiscussion(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatDiscussionAction, key string, policy *MemberToolCreatePolicy) (domain.ChatDiscussionReceipt, error) {
 	const action = "保存聊天协作失败"
 	tx, err := s.beginMemberToolTx(ctx, scope)
 	if err != nil {
 		return domain.ChatDiscussionReceipt{}, memberToolOperationError(action, err)
 	}
 	defer tx.Rollback()
-	r, err := applyChatDiscussionInTx(ctx, tx, scope, candidateID, input, key)
+	r, err := applyChatDiscussionInTx(ctx, tx, scope, candidateID, input, key, policy)
 	if err == nil {
 		err = tx.Commit()
 	}
@@ -36,7 +50,7 @@ func (s *Store) ApplyChatDiscussion(ctx context.Context, scope MemberToolScope, 
 	return r, nil
 }
 
-func applyChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, candidateID string, input domain.ChatDiscussionAction, key string) (domain.ChatDiscussionReceipt, error) {
+func applyChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, candidateID string, input domain.ChatDiscussionAction, key string, policy *MemberToolCreatePolicy) (domain.ChatDiscussionReceipt, error) {
 	var r domain.ChatDiscussionReceipt
 	a, err := chatDiscussionArrivalInTx(ctx, tx, scope, candidateID)
 	if err != nil {
@@ -52,8 +66,17 @@ func applyChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSc
 	if !assessed {
 		return r, ErrMemberToolDenied
 	}
+	create := input.CreateMember
+	if (create == nil) != (policy == nil) || (policy != nil && !policy.valid()) {
+		return r, ErrInvalid
+	}
 	m := mutationScope{operation: "create_message", actorID: scope.MemberID, groupID: scope.Claim.GroupID, key: key}
-	payload := mutationPayload("chat_discussion/v1", candidateID, input.Kind, input.Content, input.RecipientID, input.ExpectedReply)
+	fields := []string{"chat_discussion/v1", candidateID, input.Kind, input.Content, input.RecipientID, input.ExpectedReply}
+	if create != nil {
+		// Bind the intended provider/model, not the mutable capacity or the selected member.
+		fields = append(fields, "create_member", create.Name, create.Role, create.Reason, policy.ProviderID, policy.Model)
+	}
+	payload := mutationPayload(fields...)
 	id, replay, err := lookupMutation(ctx, tx, m, payload)
 	if err != nil {
 		return r, err
@@ -85,12 +108,23 @@ func applyChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSc
 		}
 		chain = newChatDiscussionChain(thread, origin, scope.MemberID, defaultDiscussionInviteHops, defaultDiscussionTargetedWakes)
 	}
+	var newMember bool
+	if create != nil {
+		input.RecipientID, newMember, err = planChatDiscussionMemberInTx(ctx, tx, chain, create.Role, *policy)
+		if err != nil {
+			return r, err
+		}
+		input.CreateMember = nil // Plan the same bound route as an explicit invitation.
+	}
 	e, err := chain.plan(a.messageID, scope.MemberID, input)
 	if err != nil {
 		return r, err
 	}
 	targets := []string{}
-	if e.RecipientID != "" {
+	switch {
+	case newMember:
+		targets = append(targets, e.RecipientID)
+	case e.RecipientID != "":
 		var status domain.MemberStatus
 		err := tx.QueryRowContext(ctx, "SELECT status FROM members WHERE group_id=? AND id=?", thread.GroupID, e.RecipientID).Scan(&status)
 		if err == sql.ErrNoRows {
@@ -111,6 +145,16 @@ func applyChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSc
 	if err := chatDiscussionMessageSlotInTx(ctx, tx, scope.Claim.TurnID, e.RecipientID != ""); err != nil {
 		return r, err
 	}
+	if newMember {
+		member, err := insertAutomaticMemberInTx(ctx, tx, e.RecipientID, scope, MemberToolCreateInput(*create), *policy)
+		if err != nil {
+			return r, err
+		}
+		// The public join is visible without a wake; only the invitation is delivered.
+		if _, err := publishAutomaticMemberJoinInTx(ctx, tx, scope, member.Name, create.Reason, []string{}); err != nil {
+			return r, err
+		}
+	}
 	if len(chain.Events) == 0 {
 		if err := coordinationDispatchWrite(ctx, tx, `INSERT INTO chat_discussions(origin_message_id,group_id,topic_id,root_inviter_id,max_invite_hops,max_targeted_wakes)
 		 VALUES(?,?,?,?,?,?)`, origin, thread.GroupID, thread.TopicID, scope.MemberID, chain.maxInviteHops, chain.maxTargetedWakes); err != nil {
@@ -124,6 +168,22 @@ func applyChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSc
 		err = reserveChatDiscussionReturnContextInTx(ctx, tx, chain, r)
 	}
 	return r, err
+}
+
+// Pick a route without writing anything. The chain and publication slot are
+// checked against that route before an unmatched request can insert a member.
+func planChatDiscussionMemberInTx(ctx context.Context, tx *sql.Tx, chain *chatDiscussionChain, role string, policy MemberToolCreatePolicy) (id string, newMember bool, err error) {
+	visited := []string{chain.RootInviterID}
+	for _, receipt := range chain.Events {
+		if receipt.Event.Kind == domain.ChatDiscussionInvite {
+			visited = append(visited, receipt.Event.RecipientID)
+		}
+	}
+	member, err := reusableAutomaticMemberInTx(ctx, tx, chain.GroupID, role, policy, visited)
+	if errors.Is(err, sql.ErrNoRows) {
+		return rand.Text(), true, nil
+	}
+	return member.ID, false, err
 }
 
 func publishChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, candidateID, content string, mutation mutationScope,
@@ -172,11 +232,16 @@ func validChatDiscussionAction(input domain.ChatDiscussionAction) bool {
 	}
 	switch input.Kind {
 	case domain.ChatDiscussionInvite:
-		return validTriggerID(input.RecipientID) && (input.ExpectedReply == "" ||
-			memberToolTextValid(input.ExpectedReply, chatDiscussionExpectedReplyJSONBytes) &&
-				chatDiscussionJSONStringSize(input.ExpectedReply) <= chatDiscussionExpectedReplyJSONBytes)
+		if input.ExpectedReply != "" && (!memberToolTextValid(input.ExpectedReply, chatDiscussionExpectedReplyJSONBytes) ||
+			chatDiscussionJSONStringSize(input.ExpectedReply) > chatDiscussionExpectedReplyJSONBytes) {
+			return false
+		}
+		if input.CreateMember != nil {
+			return input.RecipientID == "" && MemberToolCreateInput(*input.CreateMember).valid()
+		}
+		return validTriggerID(input.RecipientID)
 	case domain.ChatDiscussionReply, domain.ChatDiscussionResolve:
-		return input.RecipientID == "" && input.ExpectedReply == ""
+		return input.RecipientID == "" && input.ExpectedReply == "" && input.CreateMember == nil
 	default:
 		return false
 	}
