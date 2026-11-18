@@ -88,11 +88,25 @@ func (f *boundWorkReportFixture) delegate(t *testing.T, parentRefs, childRefs []
 	ctx := t.Context()
 	child, err := f.local.CreateMember(ctx, f.group, platform.MemberInput{Name: "Child", Role: "Proofreader", ProviderID: f.worker.ProviderID, Model: f.worker.Model}, "")
 	roleOK(t, err)
-	_, err = f.db.SetDispatchPolicy(ctx, f.group, []string{f.worker.ID, child.ID}, 1, "report-workers")
+	owner := f.prepareInvestigationOwner(t, parentRefs, 1, child.ID)
+	owner = f.bindInvestigationOwner(t, owner)
+	f.acceptWork(t, owner.Member)
+	// Legacy transport fixtures construct the wake directly in B. The owner
+	// management fixture exercises its own real HTTP writer instead.
+	f.delegation, err = f.engine.DelegateWork(ctx, owner.Member, domain.DelegateWorkInput{MemberID: child.ID, Question: "核对第一条意见",
+		AllowTopicMessages: topicGrant, ArtifactVersions: childRefs}, "delegate")
+	roleOK(t, err)
+	f.settleWork(t, owner.Member, true)
+}
+
+func (f *boundWorkReportFixture) prepareInvestigationOwner(t *testing.T, parentRefs []domain.ArtifactVersionRef, maxDelegations int, workerIDs ...string) store.CoordinationToolScope {
+	t.Helper()
+	ctx := t.Context()
+	_, err := f.db.SetDispatchPolicy(ctx, f.group, append([]string{f.worker.ID}, workerIDs...), 1, "report-workers")
 	roleOK(t, err)
 	thread := domain.ThreadRef{GroupID: f.group, TopicID: "report-fixture"}
 	f.policy, err = f.engine.SetChatPolicy(ctx, thread, domain.ChatPolicyRequest{Enabled: true, Action: domain.ChatActionTextSubmission, MaxAdmissions: 1,
-		Investigation: &domain.ChatInvestigationPolicy{Objective: "Check the notes", AllowTopicMessages: true, MaxDelegations: 1, ArtifactVersions: parentRefs}}, 0, "report-policy")
+		Investigation: &domain.ChatInvestigationPolicy{Objective: "Check the notes", AllowTopicMessages: true, MaxDelegations: maxDelegations, ArtifactVersions: parentRefs}}, 0, "report-policy")
 	roleOK(t, err)
 	f.engine.EnableInvestigationExecution()
 	f.engine.EnableTaskWorkExecution() // Fixture only: no C executable is installed.
@@ -124,15 +138,16 @@ func (f *boundWorkReportFixture) delegate(t *testing.T, parentRefs, childRefs []
 	owner := f.claim(t, assignment.Delivery.DeliveryID)
 	ownerScope, err := f.db.BindMemberTool(ctx, owner.claim)
 	roleOK(t, err)
-	f.original, err = f.db.BindAssignmentAttempt(ctx, store.CoordinationToolScope{Member: ownerScope, Provenance: owner.provenance})
+	return store.CoordinationToolScope{Member: ownerScope, Provenance: owner.provenance}
+}
+
+func (f *boundWorkReportFixture) bindInvestigationOwner(t *testing.T, owner store.CoordinationToolScope) store.CoordinationToolScope {
+	t.Helper()
+	var err error
+	f.original, err = f.db.BindAssignmentAttempt(t.Context(), owner)
 	roleOK(t, err)
-	f.acceptWork(t, ownerScope)
-	// The writer is not a member operation in this slice. B derives the original
-	// scope, author Attempt and allowed subset from the live owner here.
-	f.delegation, err = f.engine.DelegateWork(ctx, ownerScope, domain.DelegateWorkInput{MemberID: child.ID, Question: "核对第一条意见",
-		AllowTopicMessages: topicGrant, ArtifactVersions: childRefs}, "delegate")
-	roleOK(t, err)
-	f.settleWork(t, ownerScope, true)
+	owner.AttemptID = f.original.AttemptID
+	return owner
 }
 
 func (f *boundWorkReportFixture) call(t *testing.T, token, id, op, args string, failed bool) string {
