@@ -33,13 +33,17 @@ export type MessageDiscussion = Readonly<{
   root_message_id: string; invitation_message_id: string; parent_invitation_message_id?: string;
   inviter_id: string; assignee_id: string; expected_reply: string;
 }>;
+export type MessageDiscussionWork = Readonly<{
+  task_id: string; mandate_id: string; dispatch_request_id: string;
+} & ({ assignment_id?: never; worker_member_id?: never } | { assignment_id: string; worker_member_id: string })>;
 export type Message = MessageSource & {
   id: string; group_id: string; topic_id: string; sender_id: string; content: string; created_at: string; deliveries: Delivery[];
   discussion?: MessageDiscussion | null;
   discussion_closure_reason?: string;
+  discussion_work?: MessageDiscussionWork;
 };
-export type WireMessage = Omit<Message, "discussion" | "discussion_closure_reason"> & {
-  discussion?: unknown; discussion_closure_reason?: unknown;
+export type WireMessage = Omit<Message, "discussion" | "discussion_closure_reason" | "discussion_work"> & {
+  discussion?: unknown; discussion_closure_reason?: unknown; discussion_work?: unknown;
 };
 export type MessageInput = Readonly<{ content: string; recipient_ids?: readonly string[]; topic_id?: string }>;
 type Page<T> = { items: T[]; next_cursor: string };
@@ -110,13 +114,31 @@ function discussionClosureFor(value: unknown, message: Omit<Message, "discussion
       && (value === discussionNotStarted || value === discussionDeparture)) return value;
   }
 }
-export function decodeMessage({ discussion, discussion_closure_reason, ...message }: WireMessage): Message {
+const discussionWorkId = (value: unknown): value is string => boundedDiscussionText(value, 128)
+  && value !== "" && !/[\p{White_Space}\p{Cc}\p{Cf}]/u.test(value);
+function discussionWorkFor(value: unknown, message: Omit<Message, "discussion">): MessageDiscussionWork | undefined {
+  const [delivery] = message.deliveries;
+  if (!isRecord(value) || Array.isArray(value) || message.source_kind !== "member" || !discussionWorkId(message.source_id)
+    || !delivery || !discussionWorkId(delivery.id) || !discussionWorkId(delivery.conversation_id) || !discussionWorkId(delivery.turn_id)) return;
+  // Admission can precede CLI acceptance and survive a failed delivery on the same Turn.
+  if (delivery.state === "failed") {
+    if (delivery.error.trim() === "") return;
+  } else if ((delivery.state !== "accepted" && delivery.state !== "queued") || delivery.error !== "") return;
+  const { task_id, mandate_id, dispatch_request_id, assignment_id, worker_member_id } = value;
+  if (!discussionWorkId(task_id) || !discussionWorkId(mandate_id) || !discussionWorkId(dispatch_request_id)) return;
+  if (assignment_id === undefined && worker_member_id === undefined) return { task_id, mandate_id, dispatch_request_id };
+  if (!discussionWorkId(assignment_id) || !discussionWorkId(worker_member_id) || worker_member_id === "user") return;
+  return { task_id, mandate_id, dispatch_request_id, assignment_id, worker_member_id };
+}
+export function decodeMessage({ discussion, discussion_closure_reason, discussion_work, ...message }: WireMessage): Message {
   // Invalid optional evidence must not conceal an otherwise valid public row or change its receipt.
   if (discussion === null) return { ...message, discussion };
   const relation = discussionFor(discussion, message);
   if (!relation) return message;
   const reason = discussionClosureFor(discussion_closure_reason, message);
-  return { ...message, discussion: relation, ...(reason === undefined ? {} : { discussion_closure_reason: reason }) };
+  const work = relation.kind === "invite" && reason === undefined ? discussionWorkFor(discussion_work, message) : undefined;
+  return { ...message, discussion: relation, ...(reason === undefined ? {} : { discussion_closure_reason: reason }),
+    ...(work === undefined ? {} : { discussion_work: work }) };
 }
 function validProviderAdapter(value: unknown, current: Record<string, unknown>): value is ProviderAdapter {
   if (!isRecord(value) || typeof value.id !== "string" || !value.id || value.id.trim() !== value.id || value.id.includes("\0")

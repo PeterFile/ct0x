@@ -3,14 +3,15 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"slices"
 	"strings"
 
 	"agentworkspace/internal/domain"
 )
 
-// projectMessageDiscussionsInTx uses the same read snapshot for the verified
-// relationship and the interruption reason. It never changes publication receipts.
+// projectMessageDiscussionsInTx verifies the scoped relationships before reading
+// admission or interruption in the same snapshot. Pending proof adds neither.
 func projectMessageDiscussionsInTx(ctx context.Context, tx *sql.Tx, groupID string, messages []domain.Message) error {
 	if err := messageDiscussionsInTx(ctx, tx, groupID, messages); err != nil {
 		return storeError("读取讨论关联失败", err)
@@ -26,14 +27,13 @@ func projectMessageDiscussionsInTx(ctx context.Context, tx *sql.Tx, groupID stri
 	if len(targets) == 0 {
 		return nil
 	}
-	closures, err := chatDiscussionClosuresInTx(ctx, tx, groupID, targets...)
+	heads, err := chatDiscussionHeadsInTx(ctx, tx, groupID, targets...)
 	if err != nil {
-		return storeError("读取讨论中断状态失败", err)
+		return fmt.Errorf("读取讨论状态失败：%w", err)
 	}
-	if len(closures) != 0 {
-		for i := range messages {
-			messages[i].DiscussionClosureReason = closures[messages[i].ID]
-		}
+	for i := range messages {
+		head := heads[messages[i].ID]
+		messages[i].DiscussionClosureReason, messages[i].DiscussionWork = head.closureReason, head.work
 	}
 	return nil
 }

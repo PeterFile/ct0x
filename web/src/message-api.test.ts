@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { decodeMessage, isDefinitiveRejection, listMessages, sendMessage } from "./api";
+import { decodeMessage, getMessage, isDefinitiveRejection, listMessages, sendMessage } from "./api";
 import type { Message } from "./api";
 import { group, json, other } from "./test/groups";
 
@@ -175,6 +175,44 @@ it("discards malformed closure text and closure without a verified targeted memb
   }
   for (const plain of [message, reply, summary, { ...row, discussion: null }, { ...row, source_kind: "unknown" as const, source_id: undefined }]) {
     expect(decodeMessage({ ...plain, discussion_closure_reason: interrupted })).toEqual(plain);
+  }
+});
+
+const work = { task_id: "task-actual", mandate_id: "mandate-actual", dispatch_request_id: "dispatch-actual" };
+const assignment = { assignment_id: "assignment-actual", worker_member_id: "actual-worker" };
+it.each([
+  ["claimed but queued", { ...accepted, state: "queued" }, work],
+  ["accepted with separate Assignment", accepted, { ...work, ...assignment }],
+  ["bound Turn that did not start", failed, work],
+] as const)("decodes the same read-only work references in list and detail: %s", async (_label, receipt, discussion_work) => {
+  const row = { ...invitation, deliveries: [receipt], discussion_work };
+  const wire = { ...row, discussion_work: { ...discussion_work, authority: "private authority", claim_token: "private claim" } };
+  transport.mockResolvedValueOnce(json({ items: [wire], next_cursor: "" })).mockResolvedValueOnce(json(wire));
+  expect((await listMessages(group.id)).items).toEqual([row]);
+  expect(await getMessage(group.id, row.id)).toEqual(row);
+});
+
+it("drops malformed work and unpaired Assignment fields without dropping the public invitation", () => {
+  const row = { ...invitation, deliveries: [accepted] };
+  for (const invalid of [null, [], {}, { ...work, task_id: " " }, { ...work, task_id: "task\u202e1" },
+    { ...work, mandate_id: "任".repeat(43) }, { ...work, dispatch_request_id: undefined },
+    { ...work, assignment_id: assignment.assignment_id }, { ...work, worker_member_id: assignment.worker_member_id },
+    { ...work, ...assignment, worker_member_id: "user" }, { ...work, ...assignment, assignment_id: null }]) {
+    expect(decodeMessage({ ...row, discussion_work: invalid })).toEqual(row);
+  }
+});
+
+it("requires a verified member invitation and its bound delivery; work cannot replace a valid closure", () => {
+  const row = { ...invitation, deliveries: [accepted] };
+  for (const unproved of [message, { ...reply, deliveries: [{ ...returnDelivery, state: "accepted", turn_id: accepted.turn_id }] }, summary,
+    { ...row, discussion: null }, { ...row, source_kind: "unknown" as const, source_id: undefined },
+    { ...row, deliveries: [{ ...accepted, recipient_id: "wrong-member" }] },
+    { ...row, deliveries: [{ ...accepted, conversation_id: "" }] },
+    { ...row, deliveries: [{ ...accepted, turn_id: "" }] }, { ...row, deliveries: [delivery] },
+    { ...row, deliveries: [unclaimed] }, { ...row, deliveries: [{ ...failed, turn_id: " " }] },
+    { ...row, deliveries: [{ ...failed, error: " " }] }, { ...row, deliveries: [{ ...accepted, error: "有投递错误" }] },
+    { ...row, deliveries: [{ ...accepted, state: "future" }] }, { ...row, discussion_closure_reason: interrupted }]) {
+    expect(decodeMessage({ ...unproved, discussion_work: work })).toEqual(decodeMessage(unproved));
   }
 });
 

@@ -1,7 +1,7 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection, sendMessage } from "./api";
-import type { Delivery, Member, Message, MessageInput } from "./api";
+import type { Delivery, Member, Message, MessageDiscussionWork, MessageInput } from "./api";
 import { messageAuthor, messageSourceLabel } from "./message-source";
 import { RequestWork } from "./RequestWork";
 import type { RequestWorkHandle } from "./RequestWork";
@@ -170,7 +170,8 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
             <span className="feed-note">{messageSourceLabel(message.source_kind)}</span></header>
           {message.topic_id ? <p className="eyebrow accent">话题消息</p> : null}
           <p className="message-content">{message.content}</p>
-          {discussion ? <DiscussionContext relation={discussion} closureReason={message.discussion_closure_reason} members={membersById} scopeId={formId}
+          {discussion ? <DiscussionContext relation={discussion} closureReason={message.discussion_closure_reason}
+            work={message.discussion_work} members={membersById} scopeId={formId}
             onNavigateReference={id => { scroll.onNavigateReference(id); feed.preserveReference(id); }} /> : null}
           <div className="message-actions">
             <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
@@ -302,8 +303,8 @@ function discussionContextFor(message: Message, loaded: ReadonlyMap<string, Mess
   return { facts, root, invitation, parent };
 }
 
-function DiscussionContext({ relation, closureReason, members, scopeId, onNavigateReference }: {
-  relation: NonNullable<ReturnType<typeof discussionContextFor>>; closureReason?: string;
+function DiscussionContext({ relation, closureReason, work, members, scopeId, onNavigateReference }: {
+  relation: NonNullable<ReturnType<typeof discussionContextFor>>; closureReason?: string; work?: MessageDiscussionWork;
   members: ReadonlyMap<string, Member>; scopeId: string; onNavigateReference: (id: string) => void;
 }) {
   const { facts, root, invitation, parent } = relation;
@@ -314,6 +315,7 @@ function DiscussionContext({ relation, closureReason, members, scopeId, onNaviga
   };
   const summary = kind === "invite" ? `${actor(inviter_id)} 邀请 ${actor(assignee_id)}`
     : kind === "reply" ? `${actor(assignee_id)} 回送给 ${actor(inviter_id)}` : `${actor(inviter_id)} 向群组总结`;
+  const workerName = work?.worker_member_id === undefined ? undefined : members.get(work.worker_member_id)?.name;
   return <>
     <details className="message-details message-discussion">
       <summary><strong>{discussionLabels[kind]}</strong> · {summary}</summary>
@@ -329,6 +331,10 @@ function DiscussionContext({ relation, closureReason, members, scopeId, onNaviga
       </dl>
     </details>
     {closureReason ? <p className="feed-note discussion-closure">{closureReason}</p> : null}
+    {kind === "invite" && work ? <p className="discussion-work">
+      <strong>已转为正式工作</strong> · 任务 ID：<code>{work.task_id}</code>
+      {work.assignment_id ? <> · 分配 ID：<code>{work.assignment_id}</code>{workerName ? `（${workerName}）` : null}</> : null}
+    </p> : null}
   </>;
 }
 

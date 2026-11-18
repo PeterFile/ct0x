@@ -8,6 +8,7 @@ type chatDiscussionChain struct {
 	domain.ChatDiscussionContext
 	maxInviteHops, maxTargetedWakes int
 	pending                         []domain.ChatDiscussionEvent
+	pendingProof                    bool
 }
 
 func newChatDiscussionChain(thread domain.ThreadRef, origin, root string, hops, wakes int) *chatDiscussionChain {
@@ -18,7 +19,7 @@ func newChatDiscussionChain(thread domain.ThreadRef, origin, root string, hops, 
 
 func (c *chatDiscussionChain) plan(source, actor string, input domain.ChatDiscussionAction) (domain.ChatDiscussionEvent, error) {
 	var e domain.ChatDiscussionEvent
-	if c.Closed || source != c.HeadMessageID || actor != c.ActiveOwnerID {
+	if c.Closed || c.pendingProof || source != c.HeadMessageID || actor != c.ActiveOwnerID {
 		return e, ErrMemberToolDenied
 	}
 	e = domain.ChatDiscussionEvent{Kind: input.Kind, OriginMessageID: c.OriginMessageID, SourceMessageID: source, ActorID: actor}
