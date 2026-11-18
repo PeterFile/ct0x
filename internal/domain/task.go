@@ -63,6 +63,16 @@ type ArtifactVersionRef struct {
 	VersionID  string `json:"version_id"`
 }
 
+// TaskArtifactDependency pins a plain Task dependency to one reviewed output.
+// ReadyWhen is currently restricted to "accepted" by persistence.
+type TaskArtifactDependency struct {
+	DependencyID string `json:"dependency_id"`
+	SubmissionID string `json:"submission_id"`
+	ArtifactID   string `json:"artifact_id"`
+	VersionID    string `json:"version_id"`
+	ReadyWhen    string `json:"ready_when"`
+}
+
 // Submission is immutable evidence to persist separately from Task.
 // SubmittedBy and ReviewedBy are platform-bound references, not domain auth rules.
 type Submission struct {

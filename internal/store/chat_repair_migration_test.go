@@ -15,7 +15,8 @@ func TestChatRepairV22RegistrationAndV21ReviewReplay(t *testing.T) {
 	t.Cleanup(func() { migrations = original })
 	migrations = original[:21]
 	f, worker, submission := chatReviewSubmittedV21(t)
-	migrations = original
+	// Reopen at exactly v22 so subsequent features cannot satisfy this test.
+	migrations = original[:22]
 	input := taskReviewInput(submission)
 	input.Outcome, input.Reason = domain.ReviewOutcomeRejected, "按原约定拒收；保留此历史命令。"
 	review, err := f.s.ReviewTask(ctx, input)
@@ -34,7 +35,8 @@ func TestChatRepairV22RegistrationAndV21ReviewReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	messageSequenceLedger(t, reopened, len(original))
+	chatRepairInstall(t, reopened)
+	messageSequenceLedger(t, reopened, 22)
 	got, err := reopened.ReviewTask(ctx, input)
 	if err != nil || !reflect.DeepEqual(got, review) {
 		t.Fatalf("upgrade rewrote historical Review receipt: %+v, %v", got, err)

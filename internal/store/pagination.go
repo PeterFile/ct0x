@@ -82,9 +82,11 @@ func (s *Store) ListMembers(ctx context.Context, groupID string, options ListOpt
 	return page, nil
 }
 
+const maxPageSize = 200
+
 func listLimit(options ListOptions) (int, error) {
-	if options.Limit < 0 || options.Limit > 200 {
-		return 0, fmt.Errorf("%w：列表数量须在 1 到 200 之间", ErrInvalid)
+	if options.Limit < 0 || options.Limit > maxPageSize {
+		return 0, fmt.Errorf("%w：列表数量须在 1 到 %d 之间", ErrInvalid, maxPageSize)
 	}
 	if c := options.Before; c != nil {
 		stamp := c.CreatedAt.UTC()
