@@ -9,6 +9,8 @@ import (
 	"slices"
 
 	"agentworkspace/internal/domain"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 const (
@@ -22,16 +24,39 @@ const (
 // A mismatch must not make a restricted task look like ordinary work.
 func chatInvestigationSupportedInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	version := slices.Index(migrations, chatInvestigationSchema) + 1
-	var applied, present bool
-	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),
-	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_investigation_policy_revisions')`, version).Scan(&applied, &present)
-	if err != nil {
+	var applied bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?)", version).Scan(&applied); err != nil {
 		return false, err
 	}
-	if applied != present {
-		return false, fmt.Errorf("%w：只读调查迁移标记与策略表不一致", ErrTaskInvestigationNotReady)
+	if applied {
+		// Require the real table and its primary key, not a same-named view.
+		// The probe only checks that the exact lookup works, not that a row exists.
+		var row bool
+		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT scope_json
+		 FROM main.chat_investigation_policy_revisions INDEXED BY sqlite_autoindex_chat_investigation_policy_revisions_1
+		 WHERE group_id='' AND topic_id='' AND revision=0)`).Scan(&row)
+		if err == nil {
+			return true, nil
+		}
+		// Missing tables, columns, or indexes fail resolution of this fixed SQL
+		// with SQLITE_ERROR. Keep other failures (e.g. busy or canceled) intact.
+		var cause *sqlite.Error
+		if !errors.As(err, &cause) || cause.Code() != sqlite3.SQLITE_ERROR {
+			return false, err
+		}
+	} else {
+		// Only a missing marker can take the legacy path. Prove absence of the
+		// specific table in this snapshot, rather than inferring it from a SQL error.
+		var present bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
+		 WHERE type='table' AND name='chat_investigation_policy_revisions')`).Scan(&present); err != nil {
+			return false, err
+		}
+		if !present {
+			return false, nil
+		}
 	}
-	return applied, nil
+	return false, fmt.Errorf("%w：只读调查迁移标记与策略表不一致", ErrTaskInvestigationNotReady)
 }
 
 func validateChatInvestigationPolicy(input domain.ChatInvestigationPolicy) error {

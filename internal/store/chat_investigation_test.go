@@ -99,17 +99,28 @@ func TestChatInvestigationPolicyOnV22(t *testing.T) {
 	original := migrations
 	defer func() { migrations = original }()
 	migrations = original[:22]
-	s, _ := openTestStore(t)
-	thread := domain.ThreadRef{GroupID: group(t, s).ID, TopicID: "investigation"}
-	s.EnableInvestigationExecution()
-	if policy, err := s.GetChatPolicy(ctx, thread); err != nil || policy.InvestigationSupported || policy.InvestigationExecutionEnabled || policy.Revision != 0 {
+	// Explicit work supplies a live worker without settling a chat Turn, which
+	// requires the v23 native binding schema in the current Store.
+	f, _, worker := assignmentBoundWorker(t)
+	migrations = original
+	messageSequenceLedger(t, f.s, 22)
+	thread := domain.ThreadRef{GroupID: f.groupID, TopicID: "investigation"}
+	f.s.EnableInvestigationExecution()
+	if policy, err := f.s.GetChatPolicy(ctx, thread); err != nil || policy.InvestigationSupported || policy.InvestigationExecutionEnabled || policy.Revision != 0 {
 		t.Fatalf("v22 claimed investigation support or readiness: %+v, %v", policy, err)
+	}
+	if got, err := f.s.ResolveCoordinationExecution(ctx, worker.Member, worker.Provenance); err != nil ||
+		got.Blocked != CoordinationReady || got.AttemptID != worker.AttemptID {
+		t.Fatalf("ordinary v22 worker requires investigation schema: %+v, %v", got, err)
+	}
+	if got, err := f.s.ResolveInvestigationExecution(ctx, worker.Member, worker.Provenance); !errors.Is(err, ErrMemberToolDenied) || got != (CoordinationRoleState{}) {
+		t.Fatalf("ordinary v22 worker resolved as an investigation: %+v, %v", got, err)
 	}
 }
 
 func TestChatInvestigationHistoricalSchemaAndOrdinaryWorker(t *testing.T) {
 	registered := migrations
-	for _, version := range []int{23, 24} {
+	for _, version := range []int{23, 24, 25} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			defer func() { migrations = registered }()
 			migrations = registered[:version]

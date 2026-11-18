@@ -191,22 +191,38 @@ func investigationTaskSubmitInput(role CoordinationToolScope, input AssignmentRe
 		ActorID: role.Member.MemberID, MemberScope: &role.Member, Summary: input.Summary, ArtifactVersions: input.ArtifactVersions, IdempotencyKey: key}
 }
 
-func TestChatInvestigationMissingMigrationMarkerFailsClosed(t *testing.T) {
-	f, _, role := investigationUserWorker(t)
-	messageSequenceLedger(t, f.s, 27)
-	id := role.Provenance.TaskID
-	if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); err != nil || scope.TaskID != id {
-		t.Fatalf("fixture does not have an investigation scope: %+v, %v", scope, err)
-	}
-	if ready, err := f.s.ResolveInvestigationExecution(ctx, role.Member, role.Provenance); err != nil || ready.Blocked != CoordinationReady || ready.AttemptID != role.AttemptID {
-		t.Fatalf("fixture does not have a live investigation worker: %+v, %v", ready, err)
-	}
-	coordinationDecideExec(t, f.s, "DELETE FROM schema_migrations WHERE version=27")
-	if state, err := f.s.ResolveCoordinationExecution(ctx, role.Member, role.Provenance); !errors.Is(err, ErrMemberToolDenied) || state != (CoordinationRoleState{}) {
-		t.Fatalf("a missing marker exposed a generic worker: %+v, %v", state, err)
-	}
-	if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); !errors.Is(err, ErrTaskInvestigationNotReady) || scope.TaskID != "" {
-		t.Fatalf("a missing marker was treated as legacy absence: %+v, %v", scope, err)
+func TestChatInvestigationSchemaMismatchFailsClosed(t *testing.T) {
+	const dropScope = "DROP TABLE chat_investigation_policy_revisions"
+	for _, tc := range []struct{ name, damage string }{
+		{"missing-marker", "DELETE FROM schema_migrations WHERE version=27"},
+		{"missing-table", dropScope},
+		{"view-for-table", dropScope + `; CREATE VIEW chat_investigation_policy_revisions AS
+		 SELECT group_id,topic_id,revision,'{}' AS scope_json FROM chat_policy_scopes WHERE 0`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, policy, role := investigationUserWorker(t)
+			messageSequenceLedger(t, f.s, 27)
+			id := role.Provenance.TaskID
+			if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); err != nil || scope.TaskID != id {
+				t.Fatalf("fixture does not have an investigation scope: %+v, %v", scope, err)
+			}
+			if ready, err := f.s.ResolveInvestigationExecution(ctx, role.Member, role.Provenance); err != nil || ready.Blocked != CoordinationReady || ready.AttemptID != role.AttemptID {
+				t.Fatalf("fixture does not have a live investigation worker: %+v, %v", ready, err)
+			}
+			coordinationDecideExec(t, f.s, tc.damage)
+			if state, err := f.s.ResolveCoordinationExecution(ctx, role.Member, role.Provenance); !errors.Is(err, ErrMemberToolDenied) || state != (CoordinationRoleState{}) {
+				t.Fatalf("schema mismatch exposed a generic worker: %+v, %v", state, err)
+			}
+			if state, err := f.s.ResolveInvestigationExecution(ctx, role.Member, role.Provenance); !errors.Is(err, ErrMemberToolDenied) || state != (CoordinationRoleState{}) {
+				t.Fatalf("schema mismatch exposed an investigation worker: %+v, %v", state, err)
+			}
+			if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); !errors.Is(err, ErrTaskInvestigationNotReady) || scope.TaskID != "" {
+				t.Fatalf("schema mismatch hid historical scope as legacy absence: %+v, %v", scope, err)
+			}
+			if got, err := f.s.GetChatPolicy(ctx, policy.ThreadRef); !errors.Is(err, ErrTaskInvestigationNotReady) || got.Revision != 0 {
+				t.Fatalf("schema mismatch returned a policy: %+v, %v", got, err)
+			}
+		})
 	}
 }
 
