@@ -200,6 +200,13 @@ func TestChatDiscussionWorkHandoffRead(t *testing.T) {
 	before = messageSequenceSnapshot(t, s)
 	checkDiscussionWorkMessage(t, s, f.groupID, invite.Message.ID, work, "")
 	messageSequencePreserved(t, s, before)
+
+	// Remove only the optional binding after verifying the assignment above.
+	coordinationDecideExec(t, s, `DROP TRIGGER coordination_assignment_dispatch_no_delete;
+	 DELETE FROM coordination_assignment_dispatch WHERE assignment_id=?`, decision.Assignment.ID)
+	delete(work, "assignment_id")
+	delete(work, "worker_member_id")
+	checkDiscussionWorkMessage(t, s, f.groupID, invite.Message.ID, work, "")
 }
 
 func admitDiscussionSummary(t *testing.T, s *Store, scope MemberToolScope, candidate string) domain.ChatAssessmentReceipt {

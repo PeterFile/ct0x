@@ -187,7 +187,7 @@ func chatDiscussionEvidenceInTx(ctx context.Context, tx *sql.Tx, groupID string,
 	}
 	for _, probe := range probes {
 		thread := domain.ThreadRef{GroupID: groupID, TopicID: probe.topicID}
-		admission, err := chatDiscussionWorkAdmissionInTx(ctx, tx, thread, probe.messageID, probe.candidateID, probe.turnID)
+		admission, err := chatDiscussionWorkAdmissionForDisplayInTx(ctx, tx, thread, probe.messageID, probe.candidateID, probe.turnID)
 		if err != nil && !errors.Is(err, ErrInvalid) && !errors.Is(err, ErrNotFound) && !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
 		}
