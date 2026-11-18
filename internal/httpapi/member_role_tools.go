@@ -32,6 +32,12 @@ func MemberRoleToolRoutes(tools *platform.MemberTools) []Route {
 			Route{http.MethodPost, "/api/v1/member-tools/hand_back_work_input", memberToolNative(a.handBackWorkInput)},
 		)
 	}
+	if tools.TaskWorkReportsEnabled() {
+		routes = append(routes,
+			Route{http.MethodPost, "/api/v1/member-tools/" + platform.ReportWorkOperation, memberToolNative(a.reportWork)},
+			Route{http.MethodPost, "/api/v1/member-tools/" + platform.ReadWorkReportOperation, memberToolNative(a.readWorkReport)},
+		)
+	}
 	return routes
 }
 
@@ -158,7 +164,7 @@ func memberRoleToolError(w http.ResponseWriter, operation string, err error) {
 	case err == store.ErrMemberToolDenied:
 		status, code, message = http.StatusForbidden, "forbidden", "无权访问成员工具"
 	case confirmed && (operation == "submit_result" || operation == "workspace_write" || operation == "publish_workspace_artifact" ||
-		operation == "ack_work_input" || operation == "hand_back_work_input" || operation == "continue_work"):
+		operation == "ack_work_input" || operation == "hand_back_work_input" || operation == "continue_work" || operation == platform.ReportWorkOperation):
 		switch {
 		case errors.Is(err, store.ErrMemberToolDenied):
 			status, code, message = http.StatusForbidden, "forbidden", "无权访问成员工具"
