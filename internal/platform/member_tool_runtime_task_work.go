@@ -66,12 +66,24 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	validRunFiles := func() bool {
 		return r.roleFence.rootValid(request.RuntimeDir) && r.clearRunDirectory(request) && r.rootValid() && workspace.pathMatches()
 	}
+	investigation := e.plan.investigation
 	verifyUnbound := func() bool {
 		checkCtx, cancel := context.WithTimeout(ctx, memberToolRuntimeVerificationTimeout)
 		defer cancel()
+		if investigation != nil {
+			// The text verifier must not stand in for B's typed launch gate.
+			return validRunFiles() && checkCtx.Err() == nil
+		}
 		return validRunFiles() && s.db.VerifyFreshTaskWorkStartup(checkCtx, launch) == nil
 	}
-	if !verifyUnbound() || !s.freshTaskWork.Supports(e.plan.selected) {
+	if !verifyUnbound() {
+		return unknown
+	}
+	if investigation == nil {
+		if !s.freshTaskWork.Supports(e.plan.selected) {
+			return unknown
+		}
+	} else if r.investigationTaskWork == nil || !r.investigationTaskWork.Supports(e.plan.selected, copyPiFreshInvestigationProfile(investigation.profile)) {
 		return unknown
 	}
 	owner, err := r.roleFence.reserve(ctx, claim, request.RuntimeDir)
@@ -86,11 +98,19 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	if err != nil || !reflect.DeepEqual(mandate, e.plan.mandate) {
 		return unknown
 	}
-	token, bound, err := s.issueFreshTaskWork(ctx, scope, e.plan.delivery)
+	var token string
+	var bound *taskWorkToolBinding
+	if investigation == nil {
+		token, bound, err = s.issueFreshTaskWork(ctx, scope, e.plan.delivery)
+		if err == nil {
+			launch.AttemptID = bound.attempt.ID
+		}
+	} else {
+		token, err = e.issueInvestigationTaskWork(ctx, &launch)
+	}
 	if err != nil {
 		return unknown
 	}
-	launch.AttemptID = bound.attempt.ID
 	var config *memberToolRuntimeConfigFile
 	defer func() {
 		if token != "" {
@@ -100,29 +120,46 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 			config.cleanup()
 		}
 	}()
-	config, err = r.createConfig(token)
-	if err != nil {
-		return unknown
+	validStartupFiles := func() bool { return validRunFiles() && workspace.valid(cwd) }
+	var native provider.Executor
+	if investigation == nil {
+		config, err = r.createConfig(token)
+		if err != nil {
+			return unknown
+		}
+		bootstrap := provider.FreshTaskWorkBinding{
+			ConfigPath: filepath.Join(r.configRoot, config.name), ConfigSHA256: provider.FreshTaskWorkConfigSHA256(r.endpoint, token),
+			RunID: claim.TurnID, Operations: provider.PiFreshTaskWorkToolNames(),
+		}
+		validTextFiles := func() bool {
+			return config.valid() && provider.FreshTaskWorkConfigMatches(bootstrap.ConfigPath, bootstrap.ConfigSHA256) &&
+				config.valid() && validStartupFiles()
+		}
+		if !e.preflight(ctx, launch, token, bound, validTextFiles, nil) {
+			return unknown
+		}
+		native, err = s.freshTaskWork.Construct(ctx, e.plan.selected, bootstrap)
+		if err != nil || nilTaskWorkExecutor(native) || !s.freshTaskWork.Supports(e.plan.selected) {
+			return unknown
+		}
+		if !e.preflight(ctx, launch, token, bound, validTextFiles, owner) {
+			native = nil
+		}
+	} else {
+		issued, err := e.createInvestigationTaskWorkConfig(ctx, launch, token)
+		config = issued.file
+		if err != nil {
+			return unknown
+		}
+		native = e.admitInvestigationTaskWork(ctx, launch, token, issued, owner, validStartupFiles)
 	}
-	bootstrap := provider.FreshTaskWorkBinding{
-		ConfigPath: filepath.Join(r.configRoot, config.name), ConfigSHA256: provider.FreshTaskWorkConfigSHA256(r.endpoint, token),
-		RunID: claim.TurnID, Operations: provider.PiFreshTaskWorkToolNames(),
-	}
-	validStartupFiles := func() bool {
-		return config.valid() && provider.FreshTaskWorkConfigMatches(bootstrap.ConfigPath, bootstrap.ConfigSHA256) &&
-			config.valid() && validRunFiles() && workspace.valid(cwd)
-	}
-	if !e.preflight(ctx, launch, token, bound, validStartupFiles, nil) {
-		return unknown
-	}
-	native, err := s.freshTaskWork.Construct(ctx, e.plan.selected, bootstrap)
-	if err != nil || nilTaskWorkExecutor(native) || !s.freshTaskWork.Supports(e.plan.selected) {
-		return unknown
-	}
-	if !e.preflight(ctx, launch, token, bound, validStartupFiles, owner) {
+	if native == nil {
 		if !workspace.valid(cwd) {
 			return cwdUnknown
 		}
+		return unknown
+	}
+	if investigation != nil && ctx.Err() != nil {
 		return unknown
 	}
 	raw := native.Execute(ctx, request, onEvent)
@@ -134,8 +171,12 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	if err != nil || checkCtx.Err() != nil || !memberToolRoleFenceMatches(turn, claim) ||
 		turn.DeliveryID != e.plan.delivery.DeliveryID || turn.ConversationID != scope.ConversationID || turn.MemberID != scope.MemberID ||
 		!r.roleFence.rootValid(request.RuntimeDir) ||
+		(investigation != nil && raw.NativeRef != nil) ||
 		(raw.Outcome == provider.OutcomeNotStarted && (ctx.Err() != nil || !base.fresh(turn))) {
 		raw.Outcome, raw.Reason = unknown.Outcome, unknown.Reason
+	}
+	if investigation != nil {
+		raw.NativeRef = nil // This profile must not record a #193 session binding.
 	}
 	return raw
 }

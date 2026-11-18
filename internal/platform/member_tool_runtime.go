@@ -47,6 +47,9 @@ type MemberToolRuntimeOptions struct {
 	// TaskWorkReports opts into the experimental postclaim report and typed
 	// investigation owner transport. It does not enable B or install a launcher.
 	TaskWorkReports *coordination.Engine
+	// InvestigationTaskWork is a separate trusted launcher. It requires the
+	// report transport and B's final commit, not the pure-text launch gate.
+	InvestigationTaskWork *InvestigationTaskWorkLaunch
 }
 
 type MemberToolRunBinding struct {
@@ -72,6 +75,7 @@ type MemberToolRuntime struct {
 	maxGroupMembers          int
 	roleFence                *memberToolRoleFence
 	executionRoot            *memberToolExecutionRoot
+	investigationTaskWork    *InvestigationTaskWorkLaunch
 }
 
 const memberToolRuntimeVerificationTimeout = 5 * time.Second
@@ -156,8 +160,13 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 			return nil, errMemberToolRuntimeConfig
 		}
 	}
+	investigation, err := freezeInvestigationTaskWorkLaunch(db, options)
+	if err != nil {
+		return nil, err
+	}
 	return &MemberToolRuntime{tools: tools, configRoot: root, resolvedRoot: resolved,
-		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence, executionRoot: executionRoot}, nil
+		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence,
+		executionRoot: executionRoot, investigationTaskWork: investigation}, nil
 }
 
 func memberToolRuntimeEndpoint(endpoint string) bool {
@@ -411,8 +420,12 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}
-	// Bind the bytes we are issuing, including the existing trailing newline.
-	data = append(data, '\n')
+	return r.writeConfig(append(data, '\n'))
+}
+
+// Both config codecs use the same exclusive, identity-pinned private mount.
+// Bind the bytes we issue (including their newline), never a path readback.
+func (r *MemberToolRuntime) writeConfig(data []byte) (*memberToolRuntimeConfigFile, error) {
 	root, err := os.OpenRoot(r.configRoot)
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
@@ -454,9 +467,10 @@ func (e *memberToolRuntimeRun) configValid(c *memberToolRuntimeConfigFile) bool 
 	if c == nil || !c.valid() {
 		return false
 	}
-	if e.nativeSession == nil {
-		return true
-	}
+	return e.nativeSession == nil || c.digestMatches()
+}
+
+func (c *memberToolRuntimeConfigFile) digestMatches() bool {
 	file, err := c.root.OpenFile(c.name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return false

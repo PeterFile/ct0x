@@ -322,6 +322,7 @@ type preparationInput struct {
 	conversation domain.Conversation
 	trigger      domain.Message
 	state        store.CoordinationRoleState
+	typedWork    *domain.TaskWorkDelivery // Validated report/delegation peek, never a claim.
 }
 
 // Keep the authority read order and checks shared by both trusted entry points.
@@ -379,7 +380,7 @@ func (p *Preparer) loadPreparationInput(ctx context.Context, pending store.Pendi
 	// The B owner-role resolver returns reports but denies delegates. Probe
 	// only those paths; a joined Store/rollback failure is not a plain denial.
 	if (err == nil && state.Provenance.SourceKind == domain.TaskWorkSourceReport) || errors.Unwrap(err) == store.ErrMemberToolDenied {
-		return p.resolveUnsupportedTaskWork(ctx, input, d.ID, err)
+		return p.resolveQueuedTaskWork(ctx, input, d.ID, err)
 	}
 	if err != nil {
 		return empty, preparationResolutionError(ctx, err)
