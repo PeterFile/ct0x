@@ -37,8 +37,12 @@ func typedWriteTestChild(t *testing.T, stream string) (Provider, ExecuteRequest,
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtimeDir := t.TempDir()
+	if err := os.Chmod(runtimeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	return Provider{ID: "fixture-pi", Name: Pi, Version: "1.4.0", Installation: Installed, Path: cli},
-		ExecuteRequest{RunID: "run1", RuntimeDir: t.TempDir(), CWD: root, Prompt: "synthetic"}, extensions
+		ExecuteRequest{RunID: "run1", RuntimeDir: runtimeDir, CWD: root, Prompt: "synthetic"}, extensions
 }
 
 func TestPiFreshTaskWorkWriteUncertainty(t *testing.T) {
