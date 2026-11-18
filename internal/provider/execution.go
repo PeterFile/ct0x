@@ -79,6 +79,8 @@ type ExecutionReceipt struct {
 	StderrPath        string  `json:"stderr_path"`
 	LogsTruncated     bool    `json:"logs_truncated"`
 	Reason            string  `json:"reason"`
+
+	NativeRef *NativeSessionReference `json:"-"`
 }
 
 // Callbacks run serially in record order, independently of native output parsing.

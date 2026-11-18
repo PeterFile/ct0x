@@ -158,9 +158,7 @@ func TestChatWorkspaceV19ToV20AtomicMigration(t *testing.T) {
 	}
 	migrations = original[:19]
 	f, turn, claim := queueClaimFixture(t)
-	if _, err := f.s.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, ExitCode: -1}); err != nil {
-		t.Fatal(err)
-	}
+	seedPreV23TurnReceipt(t, f.s, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, ExitCode: -1})
 	input := workspaceGrantInput(t, f.s)
 	input.Scope = "read_write"
 	grant, err := f.s.AuthorizeWorkspaceGrant(ctx, input, workspaceGrantValidation(input))

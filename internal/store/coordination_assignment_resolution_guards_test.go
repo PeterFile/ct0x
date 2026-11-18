@@ -181,9 +181,7 @@ func TestCoordinationAssignmentResolutionV14RoleRuntimeAndWorkerBinding(t *testi
 		t.Fatalf("role recovery did not preserve unknown/fence token: %+v, %v", turn, err)
 	}
 	claim.Token = turn.ClaimToken
-	if _, err := s.ApplyTurnReceipt(ctx, claim, queueReceipt(provider.OutcomeSucceeded)); err != nil {
-		t.Fatal(err)
-	}
+	seedPreV23TurnReceipt(t, s, claim, queueReceipt(provider.OutcomeSucceeded))
 	r.state = assignmentReceipt(t, s, r.assignmentSQLRows)
 	coordinatorMustCommit(t, s, assignmentStateUpdate(r.state))
 	binding := assignmentBinding(t, s, r.assignmentSQLRows)

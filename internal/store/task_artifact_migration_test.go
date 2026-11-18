@@ -44,9 +44,7 @@ func TestTaskArtifactV6UpgradePreservesTextHistoryAndClaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	claim := TurnClaim{GroupID: g.ID, TurnID: turn.ID, Token: turn.ClaimToken}
-	if _, err := old.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown}); err != nil {
-		t.Fatal(err)
-	}
+	seedPreV23TurnReceipt(t, old, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown})
 	beforeTurn := queueTurn(t, old, claim)
 	beforeMessage, err := old.GetMessage(ctx, g.ID, message.ID)
 	if err != nil {
