@@ -216,7 +216,7 @@ func (s *Store) recordTaskWorkReportInTx(ctx context.Context, tx *sql.Tx, scope 
 				return out, err
 			}
 		}
-		out, err = taskWorkReportInTx(ctx, tx, d.GroupID, id)
+		out, err = taskWorkReportInTx(ctx, tx, d.GroupID, id, &d.TaskWorkParent)
 	} else {
 		var saved taskWorkFacts
 		saved, err = taskWorkB3WakeInTx(ctx, tx, scope, f.v, domain.TaskWorkSourceReport, id, d.OwnerMemberID, replay, persist)

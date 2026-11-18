@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
 )
@@ -22,6 +23,17 @@ func taskWorkParentDest(p *domain.TaskWorkParent) []any {
 // Use the same immutable author/Attempt relation as the insert guard.
 var taskWorkSavedOwnerOrigin = strings.ReplaceAll(taskWorkOwnerOrigin, "NEW.", "p.")
 
+// A report author can lead back only to an earlier delegation of the same
+// Assignment. Check this by key before reloading the author's full source.
+const taskWorkBackwardAuthor = `(ad.id=origin.delivery_id OR EXISTS(
+ SELECT 1 FROM task_work_deliveries aw WHERE aw.delivery_id=ad.id
+ AND (aw.source_kind='followup' OR (aw.source_kind='report' AND EXISTS(
+ SELECT 1 FROM task_work_reports wr JOIN task_work_delegations earlier ON earlier.id=wr.delegation_id
+ WHERE (wr.id,wr.delivery_id)=(aw.source_id,aw.delivery_id)
+ AND (earlier.group_id,earlier.topic_id,earlier.task_id,earlier.task_revision,earlier.assignment_id,earlier.mandate_id,earlier.authority_generation,earlier.owner_member_id)=
+     (p.group_id,p.topic_id,p.task_id,p.task_revision,p.assignment_id,p.mandate_id,p.authority_generation,p.owner_member_id)
+ AND earlier.ordinal BETWEEN 1 AND p.ordinal-1)))))`
+
 func taskWorkDelegationInTx(ctx context.Context, tx *sql.Tx, groupID, id string) (d domain.TaskWorkDelegation, err error) {
 	var refs, stamp string
 	err = tx.QueryRowContext(ctx, `SELECT `+taskWorkParentColumns+`,p.id,p.member_id,p.question,p.allow_topic_messages,p.artifact_versions,
@@ -30,7 +42,7 @@ func taskWorkDelegationInTx(ctx context.Context, tx *sql.Tx, groupID, id string)
  JOIN turns author ON (author.id,author.group_id,author.member_id)=(p.author_turn_id,p.group_id,p.owner_member_id)
  JOIN deliveries ad ON (ad.id,ad.turn_id,ad.conversation_id)=(author.delivery_id,author.id,author.conversation_id)
  JOIN task_work_deliveries w ON (w.delivery_id,w.source_kind,w.source_id)=(p.delivery_id,'delegation',p.id)
- WHERE p.group_id=? AND p.id=? AND EXISTS(`+taskWorkSavedOwnerOrigin+`)`, groupID, id).Scan(append(taskWorkParentDest(&d.TaskWorkParent), &d.ID,
+ WHERE p.group_id=? AND p.id=? AND EXISTS(`+taskWorkSavedOwnerOrigin+`) AND `+taskWorkBackwardAuthor, groupID, id).Scan(append(taskWorkParentDest(&d.TaskWorkParent), &d.ID,
 		&d.MemberID, &d.Question, &d.AllowTopicMessages, &refs, &d.AuthorTurnID, &d.AuthorAttemptID, &d.AuthorDeliveryID, &d.AuthorMessageID,
 		&d.MaxDelegations, &d.Ordinal, &d.DeliveryID, &d.MessageID, &d.ConversationID, &stamp)...)
 	if err != nil {
@@ -39,42 +51,99 @@ func taskWorkDelegationInTx(ctx context.Context, tx *sql.Tx, groupID, id string)
 	if err := json.Unmarshal([]byte(refs), &d.ArtifactVersions); err != nil {
 		return d, err
 	}
-	if !taskWorkDelegateInputValid(d.DelegateWorkInput) {
+	if !taskWorkDelegateInputValid(d.DelegateWorkInput) || d.Ordinal < 1 || d.Ordinal > investigationMaxDelegations {
 		return d, ErrMemberToolDenied
 	}
 	d.CreatedAt, err = time.Parse(timestampLayout, stamp)
 	return
 }
 
-// Reports and wakes are separate. A native reply can be linked only through
-// the immutable report's exact source Turn, never through a model selector.
+// Native settlement publishes the exact nonblank candidate without a command
+// or a delivery. A reply pointer alone is not evidence of publication.
 const taskWorkReportSelect = `SELECT ` + taskWorkParentColumns + `,r.id,r.delegation_id,r.worker_member_id,
- r.source_turn_id,child.delivery_id,child.message_id,coalesce(reply.id,''),r.kind,r.summary,
+ r.source_turn_id,child.delivery_id,child.message_id,t.reply_message_id<>'',coalesce(reply.id,''),coalesce(reply.content,''),r.kind,r.summary,
  coalesce(r.delivery_id,''),coalesce(w.message_id,''),r.created_at` + taskWorkReportChildRelations + `
  JOIN task_work_reports r ON (r.delegation_id,r.group_id,r.task_id,r.worker_member_id,r.source_turn_id)=(p.id,p.group_id,p.task_id,p.member_id,t.id)
  JOIN coordination_assignment_dispatch origin ON origin.assignment_id=p.assignment_id
  LEFT JOIN messages reply ON (reply.id,reply.group_id,reply.topic_id,reply.sender_id)=(t.reply_message_id,p.group_id,p.topic_id,p.member_id)
+ AND t.accepted_at IS NOT NULL AND reply.content=t.candidate_text AND length(CAST(reply.content AS BLOB)) BETWEEN 1 AND 65536
+ AND EXISTS(SELECT 1 FROM turns h JOIN conversations c ON (c.id,c.group_id,c.topic_id,c.member_id)=(h.conversation_id,p.group_id,p.topic_id,p.member_id)
+ JOIN message_log incoming ON (incoming.message_id,incoming.group_id,incoming.topic_id)=(child.message_id,p.group_id,p.topic_id)
+ JOIN message_log published ON (published.message_id,published.group_id,published.topic_id)=(reply.id,p.group_id,p.topic_id)
+ WHERE h.id=t.id AND published.sequence>incoming.sequence AND ` + taskWorkTurnSettled + `)
+ AND NOT EXISTS(SELECT 1 FROM deliveries WHERE message_id=reply.id)
+ AND NOT EXISTS(SELECT 1 FROM task_work_deliveries WHERE message_id=reply.id)
+ AND NOT EXISTS(SELECT 1 FROM message_command_sources WHERE message_id=reply.id)
+ AND NOT EXISTS(SELECT 1 FROM turns other WHERE other.reply_message_id=reply.id AND other.reply_message_id<>'' AND other.id<>t.id)
  LEFT JOIN task_work_deliveries w ON (w.delivery_id,w.source_kind,w.source_id)=(r.delivery_id,'report',r.id)
  AND (w.group_id,w.topic_id,w.task_id,w.task_revision,w.assignment_id,w.mandate_id,w.authority_generation,w.owner_member_id,w.member_id,w.sender_member_id)=
  (p.group_id,p.topic_id,p.task_id,p.task_revision,p.assignment_id,p.mandate_id,p.authority_generation,p.owner_member_id,p.owner_member_id,p.member_id)`
 
-func scanTaskWorkReport(row scanner) (r domain.TaskWorkReport, err error) {
-	var stamp string
+func scanTaskWorkReport(row scanner) (r domain.TaskWorkReport, hasReply bool, err error) {
+	var stamp, replyText string
 	err = row.Scan(append(taskWorkParentDest(&r.TaskWorkParent), &r.ID, &r.DelegationID, &r.ActorID,
-		&r.SourceTurnID, &r.SourceDeliveryID, &r.SourceMessageID, &r.SourceReplyMessageID, &r.Kind, &r.Summary, &r.DeliveryID, &r.MessageID, &stamp)...)
+		&r.SourceTurnID, &r.SourceDeliveryID, &r.SourceMessageID, &hasReply, &r.SourceReplyMessageID, &replyText,
+		&r.Kind, &r.Summary, &r.DeliveryID, &r.MessageID, &stamp)...)
 	if err != nil {
 		return
 	}
 	wake := r.Kind != domain.TaskWorkReportProgress
 	if !taskWorkReportKindValid(r.Kind) || wake != (r.DeliveryID != "") || wake != (r.MessageID != "") {
-		return domain.TaskWorkReport{}, ErrConflict
+		return domain.TaskWorkReport{}, false, ErrConflict
+	}
+	if strings.TrimSpace(replyText) == "" || !utf8.ValidString(replyText) || !validTriggerID(r.SourceReplyMessageID) {
+		r.SourceReplyMessageID = ""
 	}
 	r.CreatedAt, err = time.Parse(timestampLayout, stamp)
 	return
 }
 
-func taskWorkReportInTx(ctx context.Context, tx *sql.Tx, groupID, id string) (domain.TaskWorkReport, error) {
-	return scanTaskWorkReport(tx.QueryRowContext(ctx, taskWorkReportSelect+` WHERE r.group_id=? AND r.id=?`, groupID, id))
+// Use message source precedence to exclude platform-only notices as well.
+// Classify each candidate once, even when several reports share one reply.
+func taskWorkProjectRepliesInTx(ctx context.Context, tx *sql.Tx, reports []domain.TaskWorkReport) error {
+	var messages []domain.Message
+	positions := make(map[string]int)
+	for _, r := range reports {
+		if id := r.SourceReplyMessageID; id != "" {
+			if _, seen := positions[id]; !seen {
+				positions[id] = len(messages)
+				messages = append(messages, domain.Message{ID: id})
+			}
+		}
+	}
+	if err := messageSourcesInTx(ctx, tx, messages); err != nil {
+		return err
+	}
+	for i, r := range reports {
+		if j, ok := positions[r.SourceReplyMessageID]; ok {
+			m := messages[j]
+			if m.SourceKind != "member" || m.SourceID != "turn:"+r.SourceTurnID {
+				reports[i].SourceReplyMessageID = ""
+			}
+		}
+	}
+	return nil
+}
+
+func taskWorkReportInTx(ctx context.Context, tx *sql.Tx, groupID, id string, parent *domain.TaskWorkParent) (domain.TaskWorkReport, error) {
+	r, hasReply, err := scanTaskWorkReport(tx.QueryRowContext(ctx, taskWorkReportSelect+` WHERE r.group_id=? AND r.id=?`, groupID, id))
+	if err != nil {
+		return domain.TaskWorkReport{}, err
+	}
+	if parent != nil && r.TaskWorkParent != *parent {
+		return domain.TaskWorkReport{}, ErrNotFound
+	}
+	if !hasReply {
+		return r, nil
+	}
+	item := []domain.TaskWorkReport{r}
+	if err := taskWorkProjectRepliesInTx(ctx, tx, item); err != nil {
+		return domain.TaskWorkReport{}, err
+	}
+	if item[0].SourceReplyMessageID == "" {
+		return domain.TaskWorkReport{}, ErrConflict
+	}
+	return item[0], nil
 }
 
 // These row proofs are used both by the producer's same-transaction callback
@@ -88,15 +157,31 @@ func taskWorkProveDelegationInTx(ctx context.Context, tx *sql.Tx, p domain.TaskW
 		d.DeliveryID != wake.DeliveryID || d.MessageID != wake.MessageID || d.ConversationID != wake.ConversationID {
 		return domain.TaskWorkDelegation{}, ErrMemberToolDenied
 	}
+	if d.AuthorDeliveryID == p.OriginalDeliveryID {
+		if d.AuthorMessageID != p.OriginalMessageID {
+			return domain.TaskWorkDelegation{}, ErrMemberToolDenied
+		}
+		return d, nil
+	}
+	// Reprove the exact continuation wake, not the current Attempt or claim.
+	// The ordinal check in the row query bounds every backward report hop.
+	author, err := taskWorkDeliveryInTx(ctx, tx, p.GroupID, d.AuthorDeliveryID)
+	if err != nil {
+		return domain.TaskWorkDelegation{}, coordinationRoleRelationError(err)
+	}
+	if !author.d.SourceKind.IsOwnerContinuation() || taskWorkParent(author) != p ||
+		author.turnID != d.AuthorTurnID || author.d.MessageID != d.AuthorMessageID {
+		return domain.TaskWorkDelegation{}, ErrMemberToolDenied
+	}
 	return d, nil
 }
 
 func taskWorkProveReportInTx(ctx context.Context, tx *sql.Tx, p domain.TaskWorkParent, wake domain.TaskWorkDelivery) (domain.TaskWorkReport, error) {
-	r, err := taskWorkReportInTx(ctx, tx, wake.GroupID, wake.SourceID)
+	r, err := taskWorkReportInTx(ctx, tx, wake.GroupID, wake.SourceID, &p)
 	if err != nil {
 		return domain.TaskWorkReport{}, coordinationRoleRelationError(err)
 	}
-	if r.TaskWorkParent != p || r.Kind == domain.TaskWorkReportProgress || r.ActorID != wake.SenderMemberID || wake.MemberID != p.OwnerMemberID ||
+	if r.Kind == domain.TaskWorkReportProgress || r.ActorID != wake.SenderMemberID || wake.MemberID != p.OwnerMemberID ||
 		r.DeliveryID != wake.DeliveryID || r.MessageID != wake.MessageID {
 		return domain.TaskWorkReport{}, ErrMemberToolDenied
 	}
@@ -169,7 +254,7 @@ func (s *Store) GetTaskWorkReport(ctx context.Context, groupID, reportID string)
 		if err := requireTaskWorkReportsInTx(ctx, tx); err != nil {
 			return domain.TaskWorkReport{}, err
 		}
-		return taskWorkReportInTx(ctx, tx, groupID, id)
+		return taskWorkReportInTx(ctx, tx, groupID, id, nil)
 	})
 }
 
@@ -182,14 +267,7 @@ func (s *Store) GetWorkReportForMember(ctx context.Context, scope MemberToolScop
 		if err != nil {
 			return out, err
 		}
-		r, err := taskWorkReportInTx(ctx, tx, p.GroupID, reportID)
-		if err != nil {
-			return out, err
-		}
-		if r.TaskWorkParent != p {
-			return out, ErrNotFound
-		}
-		return r, nil
+		return taskWorkReportInTx(ctx, tx, p.GroupID, reportID, &p)
 	})
 }
 
@@ -264,7 +342,7 @@ func taskWorkReportPageInTx(ctx context.Context, tx *sql.Tx, groupID, taskID str
 	defer rows.Close()
 	page.Items = []domain.TaskWorkReport{}
 	for rows.Next() {
-		r, err := scanTaskWorkReport(rows)
+		r, _, err := scanTaskWorkReport(rows)
 		if err != nil {
 			return Page[domain.TaskWorkReport]{}, err
 		}
@@ -277,6 +355,10 @@ func taskWorkReportPageInTx(ctx context.Context, tx *sql.Tx, groupID, taskID str
 		page.Items = page.Items[:limit]
 		last := page.Items[limit-1]
 		page.NextCursor = &Cursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	// Do not let a broken optional link hide valid report history.
+	if err := taskWorkProjectRepliesInTx(ctx, tx, page.Items); err != nil {
+		return Page[domain.TaskWorkReport]{}, err
 	}
 	return page, nil
 }
