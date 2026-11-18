@@ -28,14 +28,15 @@ type MemberToolGrants struct {
 }
 
 type memberToolRegistration struct {
-	scope     store.MemberToolScope
-	grants    MemberToolGrants
-	skills    *memberSkillState
-	role      store.CoordinationToolScope
-	candidate *domain.ChatCandidate
-	purpose   string
-	intake    memberToolIntakeSchema
-	taskWork  *taskWorkToolBinding
+	scope      store.MemberToolScope
+	grants     MemberToolGrants
+	skills     *memberSkillState
+	role       store.CoordinationToolScope
+	candidate  *domain.ChatCandidate
+	purpose    string
+	intake     memberToolIntakeSchema
+	taskWork   *taskWorkToolBinding
+	workReport *taskWorkReportBinding
 	// Frozen server capability facts are not grants or model-controlled input.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
@@ -43,14 +44,15 @@ type memberToolRegistration struct {
 // MemberTools owns process-local capabilities; durable claims authorize every use.
 // A runtime must revoke registrations when turns finish to reclaim capacity.
 type MemberTools struct {
-	db            *store.Store
-	mu            sync.RWMutex
-	capabilities  map[[sha256.Size]byte]memberToolRegistration
-	mcpRequests   map[[sha256.Size]byte]map[[sha256.Size]byte][sha256.Size]byte
-	chatEngine    *coordination.Engine
-	workInputs    MemberWorkInputService // Immutable after runtime construction.
-	freshTaskWork FreshTaskWorkLaunch    // Independent of the legacy work-input preview.
-	workspace     *memberWorkspaceRegistry
+	db               *store.Store
+	mu               sync.RWMutex
+	capabilities     map[[sha256.Size]byte]memberToolRegistration
+	mcpRequests      map[[sha256.Size]byte]*memberMCPRequests
+	chatEngine       *coordination.Engine
+	workInputs       MemberWorkInputService // Immutable after runtime construction.
+	freshTaskWork    FreshTaskWorkLaunch    // Independent of the legacy work-input preview.
+	workReportEngine *coordination.Engine   // Transport only; independent of either launch opt-in.
+	workspace        *memberWorkspaceRegistry
 }
 
 func NewMemberTools(db *store.Store) *MemberTools {

@@ -30,6 +30,12 @@ func (s *MemberTools) TransportProfile(ctx context.Context, token string) (Membe
 	if !found {
 		return MemberToolTransportProfile{}, store.ErrMemberToolDenied
 	}
+	if binding := entry.workReport; binding != nil {
+		if err := s.workReportCurrent(ctx, entry.scope, binding.delivery); err != nil {
+			return MemberToolTransportProfile{}, err
+		}
+		return MemberToolTransportProfile{Operations: slices.Clone(entry.grants.Operations)}, nil
+	}
 	if err := s.db.ValidateMemberTool(ctx, entry.scope); err != nil {
 		return MemberToolTransportProfile{}, memberRoleError(ctx, err)
 	}

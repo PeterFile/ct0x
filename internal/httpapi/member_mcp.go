@@ -24,6 +24,7 @@ const memberMCPMaxStringIDBytes = 128
 var memberMCPMaxEncodedID = strings.Repeat("\x00", memberMCPMaxStringIDBytes)
 
 var memberMCPComposedTools = slices.Concat(memberMCPTools, memberInvestigationMCPTools())
+var memberMCPWithReports = slices.Concat(memberMCPComposedTools, memberWorkReportMCPTools)
 
 // MemberMCPRoutes is opt-in; mount on the same NewServer and registry as native
 // routes. NewServer rejects GET with 405/Allow: POST: this endpoint has no SSE.
@@ -68,12 +69,21 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		memberMCPError(w, 400, id, -32600, "MCP-Protocol-Version 必须为 "+memberMCPVersion)
 		return
 	}
-	profile, err := a.tools.TransportProfile(r.Context(), token)
-	if err != nil && method != "tools/call" {
-		buffer = newMemberMCPBuffer()
-		memberToolError(buffer, err)
-		buffer.forward(w)
-		return
+	catalog := memberMCPComposedTools
+	reportTools := a.tools.TaskWorkReportsEnabled()
+	if reportTools {
+		catalog = memberMCPWithReports
+	}
+	var profile platform.MemberToolTransportProfile
+	var err error
+	if method != "tools/call" {
+		profile, err = a.tools.TransportProfile(r.Context(), token)
+		if err != nil {
+			buffer = newMemberMCPBuffer()
+			memberToolError(buffer, err)
+			buffer.forward(w)
+			return
+		}
 	}
 	switch method {
 	case "initialize":
@@ -101,7 +111,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			return
 		}
 		tools := make([]memberMCPTool, 0, len(profile.Operations))
-		for _, tool := range memberMCPComposedTools {
+		for _, tool := range catalog {
 			if slices.Contains(profile.Operations, tool.Name) {
 				if tool.Name == "send_message" && (profile.ContinueWork || profile.DiscussionOnlyExcerpt || profile.InvestigationIntake) {
 					tool.InputSchema = memberMCPSendMessageSchema(profile.ContinueWork, profile.DiscussionOnlyExcerpt, profile.InvestigationIntake)
@@ -138,7 +148,8 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		if name == "send_message" {
 			continuation, excerpt = memberToolSendAssessmentFields(arguments)
 		}
-		if name == "ack_work_input" || name == "hand_back_work_input" || continuation || excerpt {
+		reportWrite := reportTools && name == platform.ReportWorkOperation
+		if name == "ack_work_input" || name == "hand_back_work_input" || continuation || excerpt || reportWrite {
 			// Neither the derived key nor the fingerprint may alias replacement
 			// characters. Keep legacy send_message and opaque metadata unchanged.
 			if !validMemberToolJSONStrings(frame["id"]) {
@@ -150,7 +161,21 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				return
 			}
 		}
-		for _, tool := range memberMCPComposedTools {
+		if !reportWrite {
+			profile, err = a.tools.TransportProfile(r.Context(), token)
+		}
+		if reportTools && name == platform.ReadWorkReportOperation && (err != nil || !slices.Contains(profile.Operations, name)) {
+			// Withheld report reads don't reserve IDs. The handler will still
+			// recheck the exact report in B when discovery succeeds.
+			if err == nil {
+				err = store.ErrMemberToolDenied
+			}
+			buffer = newMemberMCPBuffer()
+			memberToolError(buffer, err)
+			memberMCPToolReply(w, id, false, buffer)
+			return
+		}
+		for _, tool := range catalog {
 			if tool.Name != name {
 				continue
 			}
@@ -164,9 +189,22 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				memberMCPError(w, 400, id, -32602, "工具 arguments 无效")
 				return
 			}
-			if bindErr = a.tools.BindMCPRequest(token, sha256.Sum256([]byte(key)), fingerprint); bindErr != nil {
+			requestID := sha256.Sum256([]byte(key))
+			var finish func(bool)
+			if reportWrite {
+				// No readiness preflight: the report handler lets B look up
+				// the original key before checking new-write eligibility.
+				finish, bindErr = a.tools.BeginMCPReportRequest(token, requestID, fingerprint)
+			} else {
+				bindErr = a.tools.BindMCPRequest(token, requestID, fingerprint)
+			}
+			if bindErr != nil {
 				memberMCPBindingError(w, id, bindErr)
 				return
+			}
+			rejected := false
+			if finish != nil {
+				defer func() { finish(rejected && r.Context().Err() == nil) }()
 			}
 			// Discovery preflight is not command outcome evidence: its generic
 			// validator sanitizes SQL errors that role writes must keep unknown.
@@ -185,7 +223,8 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				buffer.readLimitAdvice = memberInvestigationArtifactTooLarge
 			}
 			tool.invoke(a, buffer, native, token)
-			memberMCPToolReply(w, id, tool.write, buffer)
+			intact := memberMCPToolReply(w, id, tool.write, buffer)
+			rejected = finish != nil && intact && memberMCPReportRejected(buffer)
 			return
 		}
 		if err != nil {
@@ -370,13 +409,15 @@ func memberMCPEnvelopeFits(envelope map[string]any) bool {
 	return err == nil && len(encoded)+1 <= memberToolJSONBytes // WriteJSON adds a newline.
 }
 
-func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *memberMCPBuffer) {
+// Return whether the response writer accepted the complete, original envelope.
+func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *memberMCPBuffer) bool {
 	failed, text := buffer.status >= 400, string(buffer.body)
 	if failed {
 		text += memberMCPReconcile
 	}
 	envelope := memberMCPToolEnvelope(id, text, failed)
-	if buffer.overflow || !memberMCPEnvelopeFits(envelope) {
+	intact := !buffer.overflow && memberMCPEnvelopeFits(envelope)
+	if !intact {
 		switch {
 		case write && !failed:
 			// Success is durable even when its projection cannot fit the envelope.
@@ -393,5 +434,5 @@ func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *membe
 		}
 		envelope = memberMCPToolEnvelope(id, text, failed)
 	}
-	WriteJSON(w, http.StatusOK, envelope)
+	return writeJSON(w, http.StatusOK, envelope) && intact
 }

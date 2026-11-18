@@ -17,7 +17,7 @@ func (a memberToolAPI) mutateFreshTaskWorkInput(w http.ResponseWriter, r *http.R
 		err = a.tools.AckFreshTaskWorkInput(r.Context(), token, id, key)
 	}
 	if err != nil {
-		freshTaskWorkWriteError(w, op, err)
+		taskWorkWriteError(w, op, err)
 		return
 	}
 	// This confirms one operation on one input. B owns the return disposition
@@ -41,13 +41,13 @@ func (a memberToolAPI) submitFreshTaskWorkResult(w http.ResponseWriter, r *http.
 	}
 	submission, err := a.tools.SubmitFreshTaskWorkResult(r.Context(), token, in.Summary.value, key)
 	if err != nil {
-		freshTaskWorkWriteError(w, "submit_result", err)
+		taskWorkWriteError(w, "submit_result", err)
 		return
 	}
 	writeMemberRoleSubmissionReceipt(w, submission)
 }
 
-func freshTaskWorkWriteError(w http.ResponseWriter, op string, err error) {
+func taskWorkWriteError(w http.ResponseWriter, op string, err error) {
 	// B's negative outcome evidence outranks any joined business or timeout
 	// cause. No request-path retry, and no low-level error text on the wire.
 	_, uncertain := memberRoleToolRollbackEvidence(err)
