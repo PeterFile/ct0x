@@ -30,12 +30,17 @@ export type TaskReviewInput = Readonly<{
 type WorkRecord = {
   id: string; group_id: string; topic_id: string; task_id: string; task_revision: number; created_at: string;
 };
+type TaskWorkInputReturn = {
+  member_id: string; turn_id: string; attempt_id: string; reason: string;
+  question: string; notice_message_id: string; returned_at: string;
+};
 export type TaskWorkInput = WorkRecord & {
   content?: string; source_id?: string; reply_message_id?: string; notice_message_id?: string;
   trigger_id?: string; mandate_id?: string; assignment_id?: string; worker_member_id?: string;
   before_constraint_revision?: number; before_constraint?: string;
   after_constraint_revision?: number; after_constraint?: string;
   consumption?: { turn_id: string; consumed_at: string } | null;
+  return?: TaskWorkInputReturn | null;
 };
 export type TaskWorkReport = WorkRecord & {
   kind: string; summary: string; actor_id: string; owner_member_id: string;
@@ -159,6 +164,9 @@ const workRecordIn = (groupId: string, taskId: string) => {
 };
 const optionalConstraintRevision = (value: unknown) => value === undefined
   || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+const validWorkInputReturn = (value: unknown): value is TaskWorkInputReturn => isRecord(value)
+  && ["member_id", "turn_id", "attempt_id", "reason", "question", "notice_message_id"].every(key => nonblank(value[key]))
+  && validEvidenceTime(value.returned_at);
 
 async function listTaskWorkPage<T>(groupId: string, taskId: string, surface: "work-inputs" | "work-reports", before: string,
   signal: AbortSignal | undefined, valid: (value: unknown) => value is T) {
@@ -177,12 +185,14 @@ export function listTaskWorkInputs(groupId: string, taskId: string, before = "",
       "before_constraint", "after_constraint"].every(key => value[key] === undefined || typeof value[key] === "string")
     && optionalConstraintRevision(value.before_constraint_revision) && optionalConstraintRevision(value.after_constraint_revision)
     && (value.consumption === undefined || value.consumption === null || (isRecord(value.consumption)
-      && nonblank(value.consumption.turn_id) && validEvidenceTime(value.consumption.consumed_at))));
+      && nonblank(value.consumption.turn_id) && validEvidenceTime(value.consumption.consumed_at)))
+    && (value.return === undefined || value.return === null
+      || ((value.consumption === undefined || value.consumption === null) && validWorkInputReturn(value.return))));
 }
 export function listTaskWorkReports(groupId: string, taskId: string, before = "", signal?: AbortSignal) {
   const scoped = workRecordIn(groupId, taskId);
   return listTaskWorkPage(groupId, taskId, "work-reports", before, signal, (value): value is TaskWorkReport => scoped(value)
-    && ["kind", "summary", "actor_id", "owner_member_id"].every(key => typeof value[key] === "string"));
+    && ["kind", "summary", "actor_id", "owner_member_id"].every(key => nonblank(value[key])));
 }
 export function listTasks(groupId: string, before = "", signal?: AbortSignal) {
   const query = new URLSearchParams({ limit: "50" });

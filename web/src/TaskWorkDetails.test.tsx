@@ -67,10 +67,14 @@ it("lazily reads separate scoped work pages and distinguishes explicit handling 
   expect(screen.getByRole("button", { name: `${first.title}，待交付` })).toHaveAttribute("aria-pressed", "true");
   expect(screen.queryByRole("button", { name: "接纳交付" })).not.toBeInTheDocument();
 
+  const returnedInput = { ...rawInput, id: "input-returned", return: {
+    member_id: "bound-owner-1", turn_id: "return-turn-1", attempt_id: "return-attempt-1", notice_message_id: "return-notice-1",
+    reason: "该输入超出原授权范围。", question: "是否只复查已有内容？", returned_at: "2026-10-30T12:00:02.123456789Z",
+  } };
   await act(async () => initial.resolve(page([rawInput, { ...scope(first), id: "input-confirmed", content: "经执行成员确认的输入。",
     consumption: { turn_id: "worker-turn-1", consumed_at: "2026-10-30T12:00:01.123456789Z" } },
-  { ...scope(first), id: "legacy-input", consumption: null }], "older/+&")));
-  const [pending, confirmed, legacy] = inputs().getAllByRole("listitem");
+  { ...scope(first), id: "legacy-input", consumption: null, return: null }, returnedInput], "older/+&")));
+  const [pending, confirmed, legacy, returned] = inputs().getAllByRole("listitem");
   expect(within(pending).getByText(rawInput.content)).toBeVisible();
   expect(pending.querySelector("b")).toBeNull();
   expect(within(pending).getByText("输入前约束 · 版本 0")).toBeVisible();
@@ -83,6 +87,21 @@ it("lazily reads separate scoped work pages and distinguishes explicit handling 
   expect(turnId).not.toBeVisible();
   fireEvent.click(within(confirmed).getByText("标识详情", { selector: "summary" })); await tick();
   expect(turnId).toBeVisible();
+
+  const returnedDetails = within(returned);
+  const evidence = returnedInput.return;
+  expect(returnedDetails.getByText("已交回确认")).toBeVisible();
+  expect(returnedDetails.queryByText(/待确认处理|已明确确认处理/)).not.toBeInTheDocument();
+  expect(returnedDetails.getByText(evidence.returned_at, { selector: "time" })).toHaveAttribute("datetime", evidence.returned_at);
+  expect(returnedDetails.getByText(returnedInput.content)).toBeVisible();
+  expect(returnedDetails.getByText("输入后约束 · 版本 1")).toBeVisible();
+  expect(returnedDetails.getByText(returnedInput.after_constraint)).toBeVisible();
+  expect(returnedDetails.getByText("交回原因").nextElementSibling).toHaveTextContent(evidence.reason);
+  expect(returnedDetails.getByText("确认问题").nextElementSibling).toHaveTextContent(evidence.question);
+  fireEvent.click(returnedDetails.getByText("标识详情", { selector: "summary" })); await tick();
+  for (const id of [evidence.member_id, evidence.turn_id, evidence.attempt_id, evidence.notice_message_id, returnedInput.notice_message_id]) {
+    expect(returnedDetails.getByText(id)).toBeVisible();
+  }
 
   fireEvent.click(inputs().getByRole("button", { name: "加载更多工作输入" }));
   const [olderURL, olderInit] = readInputs.mock.calls[1];
@@ -118,4 +137,69 @@ it("lazily reads separate scoped work pages and distinguishes explicit handling 
   expect(screen.queryByText("另一群的报告。")).not.toBeInTheDocument();
   expect(readInputs).toHaveBeenCalledTimes(4); expect(readReports).toHaveBeenCalledTimes(4);
   expect(transport.mock.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+});
+
+it("refreshes both expanded work pages on demand without coupling their pagination to task polling", async () => {
+  vi.useFakeTimers();
+  const lateInputs = deferred<Response>(), lateReports = deferred<Response>();
+  const newInput = { ...rawInput, id: "input-new", content: "刷新后的输入。" };
+  const newReport = { ...delivered(first, "刷新后的报告。"), id: "report-new" };
+  const readInputs = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(page([rawInput], "older-inputs"))
+    .mockResolvedValueOnce(page([{ ...rawInput, id: "input-older", content: "已加载的旧输入。" }], "older-inputs-2"))
+    .mockReturnValueOnce(lateInputs.promise).mockResolvedValueOnce(page([newInput]));
+  const readReports = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(page([delivered(first, "初始报告。")], "older-reports"))
+    .mockResolvedValueOnce(page([{ ...delivered(first, "已加载的旧报告。"), id: "report-older" }], "older-reports-2"))
+    .mockReturnValueOnce(lateReports.promise).mockResolvedValueOnce(page([newReport]));
+  const readDetail = vi.fn<typeof fetch>(async () => json(first));
+  const transport: typeof fetch = (input, init) => {
+    const url = new URL(String(input), "http://fixture.invalid");
+    if (url.pathname === path(first)) return readDetail(input, init);
+    if (url.pathname === `${path(first)}/work-inputs`) return readInputs(input, init);
+    if (url.pathname === `${path(first)}/work-reports`) return readReports(input, init);
+    return Promise.resolve(url.pathname.endsWith("/tasks") ? page([first]) : json({}, 404));
+  };
+  vi.stubGlobal("fetch", transport);
+  const refreshDetails = () => fireEvent.click(screen.getByRole("button", { name: "刷新详情" }));
+  const loadMore = async () => {
+    fireEvent.click(inputs().getByRole("button", { name: "加载更多工作输入" }));
+    fireEvent.click(reports().getByRole("button", { name: "加载更多工作报告" }));
+    await flush();
+  };
+  render(<Tasks group={selectedGroup} />); await flush(); await select(first);
+  refreshDetails(); await flush();
+  expect(readDetail).toHaveBeenCalledTimes(2);
+  expect(readInputs).not.toHaveBeenCalled(); expect(readReports).not.toHaveBeenCalled();
+
+  await toggle(); await loadMore();
+  const openDisclosure = disclosure().closest("details");
+  await tick(5000);
+  expect(readDetail).toHaveBeenCalledTimes(3);
+  expect(readInputs).toHaveBeenCalledTimes(2); expect(readReports).toHaveBeenCalledTimes(2);
+  expect(inputs().getByText("已加载的旧输入。")).toBeVisible();
+  expect(reports().getByText("已加载的旧报告。")).toBeVisible();
+
+  await loadMore();
+  const [inputURL, inputInit] = readInputs.mock.calls[2];
+  const [reportURL, reportInit] = readReports.mock.calls[2];
+  expect(inputURL).toBe(`${path(first)}/work-inputs?limit=50&before=older-inputs-2`);
+  expect(reportURL).toBe(`${path(first)}/work-reports?limit=50&before=older-reports-2`);
+  refreshDetails(); await flush();
+  expect(readDetail).toHaveBeenCalledTimes(4);
+  expect(disclosure().closest("details")).toBe(openDisclosure);
+  expect(openDisclosure).toHaveAttribute("open");
+  expect(readInputs).toHaveBeenCalledTimes(4); expect(readReports).toHaveBeenCalledTimes(4);
+  expect(readInputs.mock.calls[3][0]).toBe(`${path(first)}/work-inputs?limit=50`);
+  expect(readReports.mock.calls[3][0]).toBe(`${path(first)}/work-reports?limit=50`);
+  expect(inputInit?.signal?.aborted).toBe(true); expect(reportInit?.signal?.aborted).toBe(true);
+
+  await act(async () => {
+    lateInputs.resolve(page([{ ...rawInput, content: "迟到的输入。" }]));
+    lateReports.resolve(page([delivered(first, "迟到的报告。")]));
+  });
+  expect(inputs().getByText(newInput.content)).toBeVisible();
+  expect(reports().getByText(newReport.summary)).toBeVisible();
+  expect(screen.queryByText("迟到的输入。")).not.toBeInTheDocument();
+  expect(screen.queryByText("迟到的报告。")).not.toBeInTheDocument();
 });

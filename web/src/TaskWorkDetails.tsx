@@ -5,16 +5,18 @@ import { listTaskWorkInputs, listTaskWorkReports } from "./task-api";
 import type { TaskWorkInput, TaskWorkReport } from "./task-api";
 
 type Scope = { groupId: string; taskId: string };
+type DisclosureProps = Scope & { refreshVersion: number };
 const reportKindText = new Map([["progress", "进度报告"], ["question", "提问报告"], ["blocked", "受阻报告"], ["delivered", "交付报告"]]);
 
-export function TaskWorkDetails({ groupId, taskId, active }: Scope & { active: boolean }) {
-  return active ? <WorkDisclosure key={JSON.stringify([groupId, taskId])} groupId={groupId} taskId={taskId} /> : null;
+export function TaskWorkDetails({ active, ...props }: DisclosureProps & { active: boolean }) {
+  return active ? <WorkDisclosure key={JSON.stringify([props.groupId, props.taskId])} {...props} /> : null;
 }
-function WorkDisclosure({ groupId, taskId }: Scope) {
+function WorkDisclosure({ groupId, taskId, refreshVersion }: DisclosureProps) {
   const [open, setOpen] = useState(false);
   return <details onToggle={event => { if (event.target === event.currentTarget) setOpen(event.currentTarget.open); }}>
     <summary>工作输入与报告</summary>
-    {open ? <div className="tasks-lifecycle">
+    {/* Restart both page readers without replacing the open disclosure. */}
+    {open ? <div key={refreshVersion} className="tasks-lifecycle">
       <WorkSurface groupId={groupId} taskId={taskId} title="工作输入" load={listTaskWorkInputs} renderItem={item => <WorkInput item={item} />} />
       <WorkSurface groupId={groupId} taskId={taskId} title="工作报告" load={listTaskWorkReports} renderItem={item => <WorkReport item={item} />}
         note="成员报告不等于正式提交或用户验收。" />
@@ -78,22 +80,29 @@ function Constraint({ label, revision, text }: { label: string; revision?: numbe
 }
 function WorkInput({ item }: { item: TaskWorkInput }) {
   const confirmation = item.consumption;
+  const returned = item.return;
+  const dispositionTime = confirmation?.consumed_at ?? returned?.returned_at;
   const hasConstraint = item.before_constraint_revision !== undefined || item.before_constraint !== undefined
     || item.after_constraint_revision !== undefined || item.after_constraint !== undefined;
   return <>
-    <p><strong>{confirmation ? "已明确确认处理" : "待确认处理"}</strong>{confirmation ? <>
-      {" · "}<time className="tasks-meta" dateTime={confirmation.consumed_at}>{confirmation.consumed_at}</time>
+    <p><strong>{confirmation ? "已明确确认处理" : returned ? "已交回确认" : "待确认处理"}</strong>{dispositionTime ? <>
+      {" · "}<time className="tasks-meta" dateTime={dispositionTime}>{dispositionTime}</time>
     </> : null}</p>
     <RecordMeta item={item} />
-    {item.content || hasConstraint ? <dl>
+    {item.content || hasConstraint || returned ? <dl>
       {item.content ? <><dt>用户原文</dt><dd className="tasks-copy">{item.content}</dd></> : null}
       <Constraint label="输入前约束" revision={item.before_constraint_revision} text={item.before_constraint} />
       <Constraint label="输入后约束" revision={item.after_constraint_revision} text={item.after_constraint} />
+      {returned ? <>
+        <dt>交回原因</dt><dd className="tasks-copy">{returned.reason}</dd>
+        <dt>确认问题</dt><dd className="tasks-copy">{returned.question}</dd>
+      </> : null}
     </dl> : null}
     <Identifiers entries={[["输入标识", item.id], ["话题标识", item.topic_id], ["来源标识", item.source_id],
       ["用户消息标识", item.reply_message_id], ["通知消息标识", item.notice_message_id], ["触发标识", item.trigger_id],
       ["授权标识", item.mandate_id], ["分配标识", item.assignment_id], ["执行成员标识", item.worker_member_id],
-      ["确认轮次标识", confirmation?.turn_id]]} />
+      ["确认轮次标识", confirmation?.turn_id], ["交回成员标识", returned?.member_id], ["交回轮次标识", returned?.turn_id],
+      ["交回尝试标识", returned?.attempt_id], ["交回通知消息标识", returned?.notice_message_id]]} />
   </>;
 }
 function WorkReport({ item }: { item: TaskWorkReport }) {
