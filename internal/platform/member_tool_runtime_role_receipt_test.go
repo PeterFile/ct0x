@@ -540,7 +540,7 @@ func TestRoleRuntimePreflightBoundsDatabasePoolWait(t *testing.T) {
 		t.Fatal("caller must have no deadline")
 	}
 	var run *memberToolRuntimeRun
-	executor, err := r.WrapCoordinationRole(binding, f.coordinatorScope.Provenance, func(path, _ string, _ []string) (provider.Executor, error) {
+	executor, err := r.WrapCoordinationRole(binding, f.coordinatorScope.Provenance, func(path, _ string, operations []string) (provider.Executor, error) {
 		_, token := memberToolRuntimeConfig(t, path)
 		root, err := os.OpenRoot(r.configRoot)
 		if err != nil {
@@ -564,7 +564,7 @@ func TestRoleRuntimePreflightBoundsDatabasePoolWait(t *testing.T) {
 			t.Fatal("real Store transaction never entered SQL hold")
 		}
 		finished := make(chan bool, 1)
-		go func() { finished <- run.rolePreflight(caller, req, f.coordinatorScope, token, config) }()
+		go func() { finished <- run.rolePreflight(caller, req, f.coordinatorScope, token, operations, config) }()
 		// Store deliberately has no public pool handle. Observe the pinned Go
 		// toolchain's actual rolePreflight -> DB.conn stack while its sole
 		// connection is held above. This is a SQL pool wait, NOT a fence gate wait.

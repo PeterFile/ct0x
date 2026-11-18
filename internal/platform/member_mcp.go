@@ -8,31 +8,40 @@ import (
 	"agentworkspace/internal/store"
 )
 
-// TransportOperations returns a private snapshot for transport discovery, not
-// authority for a later call. Native handlers still own their same-tx fences,
-// operation/purpose checks and receipt replay order. No identity is exported.
+type MemberToolTransportProfile struct {
+	Operations   []string
+	ContinueWork bool
+}
+
 func (s *MemberTools) TransportOperations(ctx context.Context, token string) ([]string, error) {
+	profile, err := s.TransportProfile(ctx, token)
+	return profile.Operations, err
+}
+
+// TransportProfile returns a private snapshot for discovery, not authority for
+// a later call. Native handlers retain their same-tx, purpose and replay checks.
+func (s *MemberTools) TransportProfile(ctx context.Context, token string) (MemberToolTransportProfile, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry, found := s.capabilities[sha256.Sum256([]byte(token))]
 	if !found {
-		return nil, store.ErrMemberToolDenied
+		return MemberToolTransportProfile{}, store.ErrMemberToolDenied
 	}
 	if err := s.db.ValidateMemberTool(ctx, entry.scope); err != nil {
-		return nil, memberRoleError(ctx, err)
+		return MemberToolTransportProfile{}, memberRoleError(ctx, err)
 	}
 	if entry.role.Provenance.Kind != "" {
 		if entry.role.Member != entry.scope {
-			return nil, store.ErrMemberToolDenied
+			return MemberToolTransportProfile{}, store.ErrMemberToolDenied
 		}
 		state, err := s.db.ResolveCoordinationExecution(ctx, entry.scope, entry.role.Provenance)
 		if err != nil {
-			return nil, err
+			return MemberToolTransportProfile{}, err
 		}
 		if state.AttemptID != entry.role.AttemptID {
-			return nil, store.ErrMemberToolDenied
+			return MemberToolTransportProfile{}, store.ErrMemberToolDenied
 		}
 		// Blocked is startup readiness, not historical replay authorization.
 	}
-	return slices.Clone(entry.grants.Operations), nil
+	return MemberToolTransportProfile{Operations: slices.Clone(entry.grants.Operations), ContinueWork: s.advertisesContinueWork(entry)}, nil
 }

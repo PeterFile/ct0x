@@ -15,6 +15,14 @@ test("valid private config initializes a closure without exposing the capability
   assert.deepEqual(Object.keys(client), []);
 });
 
+test("private config may carry the continuation marker only as true", async t => {
+  assert.equal(typeof createClient(await privateConfig(t, { continue_work: true })), "function");
+  for (const marker of [false, null, "true", 1]) {
+    const path = await privateConfig(t, { continue_work: marker });
+    assert.throws(() => createClient(path), error => safeFailure(error, /配置/));
+  }
+});
+
 test("missing, relative, or inline config fails closed without exposing input", () => {
   for (const input of [undefined, "", "relative/private.json", `{"token":"${TOKEN}"}`, `/missing/${TOKEN}`]) {
     assert.throws(() => createClient(input), error => safeFailure(error, /配置/));

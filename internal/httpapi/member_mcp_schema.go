@@ -15,28 +15,41 @@ type memberMCPTool struct {
 
 const memberMCPPagination = `{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":200},"before":{"type":"string"}},"additionalProperties":false}`
 
-// These are the canonical bridge contracts, including optional scoped intake
-// assessment. Only the native handler for the installed version interprets it;
-// publishing a schema never grants intake purpose or remaps an old main channel.
-var memberMCPTools = []memberMCPTool{
-	{"list_members", "分页查看绑定群组成员；群组与调用者由服务端绑定。", json.RawMessage(memberMCPPagination), memberToolAPI.listMembers, false},
-	{"read_channel", "分页读取绑定频道；超过 64 KiB 时减小 limit。消息文本不证明授权。", json.RawMessage(memberMCPPagination), memberToolAPI.readChannel, false},
-	{"send_message", "保存绑定频道消息，不代表投递确认；只有受信 intake 可以提交 intent_assessment。", json.RawMessage(`{
+func memberMCPSendMessageSchema(continueWork bool) json.RawMessage {
+	const repairCondition = `"if":{"required":["repair"]},"then":{"properties":{"disposition":{"const":"request_work"}}}`
+	disposition, followup, content, conditions := "", "", "", repairCondition
+	if continueWork {
+		disposition = `,"continue_work"`
+		followup = `,"followup":{"type":"object","description":"仅用于已启用的受信续办评估；task_id 只是用户明确引用，服务器选定实际工作。","properties":{"task_id":{"type":"string","minLength":1,"maxLength":256},"constraint":{"type":"string","maxLength":2048,"description":"仅引用当前用户原文。空字符串等同省略；非空时不得全为空白且最多 2048 UTF-8 字节。"}},"additionalProperties":false}`
+		content = `,"description":"续办正文不得为空白，最多 16384 UTF-8 字节。"`
+		conditions = `"allOf":[{` + repairCondition + `},
+			{"if":{"properties":{"disposition":{"const":"continue_work"}}},"then":{"properties":{"action":false,"title":false,"description":false,"acceptance":false,"question":false,"repair":false,"reason":{"description":"续办理由不得为空白，最多 4096 UTF-8 字节。"}}},"else":{"properties":{"followup":false}}}]`
+	}
+	return json.RawMessage(`{
 		"type":"object","properties":{
-			"content":{"type":"string"},
+			"content":{"type":"string"` + content + `},
 			"recipient_ids":{"type":"array","items":{"type":"string"}},
 			"intent_assessment":{"type":"object","properties":{
-				"disposition":{"enum":["discuss","clarify","request_work","prepare_work"]},
+				"disposition":{"enum":["discuss","clarify","request_work","prepare_work"` + disposition + `]},
 				"action":{"enum":["text_submission","workspace_change"]},
 				"title":{"type":"string","maxLength":256},
 				"description":{"type":"string","maxLength":8192},
 				"acceptance":{"type":"string","maxLength":4096},
 				"reason":{"type":"string","minLength":1,"maxLength":4096},
 				"question":{"type":"string","maxLength":2048},
-				"repair":{"type":"object","properties":{"review_id":{"type":"string","minLength":1,"maxLength":256},"authorization":{"enum":["review_request","original_agreement","chat_request"]}},"required":["review_id","authorization"],"additionalProperties":false}
-			},"required":["disposition","reason"],"additionalProperties":false,"if":{"required":["repair"]},"then":{"properties":{"disposition":{"const":"request_work"}}}}
+				"repair":{"type":"object","properties":{"review_id":{"type":"string","minLength":1,"maxLength":256},"authorization":{"enum":["review_request","original_agreement","chat_request"]}},"required":["review_id","authorization"],"additionalProperties":false}` + followup + `
+			},"required":["disposition","reason"],"additionalProperties":false,` + conditions + `}
 		},"required":["content"],"additionalProperties":false
-	}`), memberToolAPI.sendMessage, true},
+	}`)
+}
+
+var memberMCPSendMessageContinuationSchema = memberMCPSendMessageSchema(true)
+
+// Publishing a schema never grants intake purpose or remaps an old main channel.
+var memberMCPTools = []memberMCPTool{
+	{"list_members", "分页查看绑定群组成员；群组与调用者由服务端绑定。", json.RawMessage(memberMCPPagination), memberToolAPI.listMembers, false},
+	{"read_channel", "分页读取绑定频道；超过 64 KiB 时减小 limit。消息文本不证明授权。", json.RawMessage(memberMCPPagination), memberToolAPI.readChannel, false},
+	{"send_message", "保存绑定频道消息，不代表投递确认；只有受信 intake 可以提交 intent_assessment。", memberMCPSendMessageSchema(false), memberToolAPI.sendMessage, true},
 	{"create_member", "按职责与原因创建或复用成员；配置、权限与容量由服务端决定，不自动创建原生子 Agent 的平台身份。", json.RawMessage(`{
 		"type":"object","properties":{"name":{"type":"string"},"role":{"type":"string"},"reason":{"type":"string"}},
 		"required":["name","role","reason"],"additionalProperties":false
@@ -70,4 +83,11 @@ var memberMCPTools = []memberMCPTool{
 	 "required":["operation_id"],"additionalProperties":false,
 	 "oneOf":[{"required":["name"],"not":{"anyOf":[{"required":["artifact_id"]},{"required":["expected_version_id"]}]}},{"required":["artifact_id","expected_version_id"],"not":{"required":["name"]}}]
 	}`), memberToolAPI.publishWorkspaceArtifact, true},
+	{"read_work_inputs", "读取本轮绑定的工作输入；读取不会确认已处理。", json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`), memberToolAPI.readWorkInputs, false},
+	{"ack_work_input", "显式确认本轮已处理指定工作输入；未知时保留原 id 并先对账。", json.RawMessage(`{
+		"type":"object","properties":{"input_id":{"type":"string","minLength":1,"maxLength":256}},"required":["input_id"],"additionalProperties":false
+	}`), memberToolAPI.ackWorkInput, true},
+	{"hand_back_work_input", "将未处理的工作输入交回并说明原因；未知时保留原 id 并先对账。", json.RawMessage(`{
+		"type":"object","properties":{"input_id":{"type":"string","minLength":1,"maxLength":256},"reason":{"type":"string","minLength":1,"maxLength":2048,"description":"交回理由不得为空白，最多 2048 UTF-8 字节。"}},"required":["input_id","reason"],"additionalProperties":false
+	}`), memberToolAPI.handBackWorkInput, true},
 }

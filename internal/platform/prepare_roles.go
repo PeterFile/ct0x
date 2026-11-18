@@ -202,6 +202,9 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 		in.Permissions[1] = "本轮角色平台工具仅有 " + strings.Join(memberToolRoleOperations(state.Provenance.Kind), "、") + "；调用者、群组、会话、话题和任务关系由服务端绑定，模型不能改选身份或授权。"
 		in.Permissions = append(in.Permissions, codexNativeTextPermission)
 	}
+	if state.Provenance.Kind == store.CoordinationRoleWorker && r.tools.WorkInputsEnabled() {
+		in.Permissions[1] = "本轮基础角色工具为 " + strings.Join(names, "、") + "；仅在服务器实际提供工作输入工具时使用。读取不会确认已处理；处理后显式确认，无法处理则交回说明。调用者、群组、会话、话题和任务关系由服务端绑定。"
+	}
 	return rolePreparationPlan{state: state, selected: selected, selection: selection, dispatchCapabilities: facts, workspace: workspace, input: in}, nil
 }
 

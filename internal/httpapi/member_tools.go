@@ -206,6 +206,12 @@ func (a memberToolAPI) readChannel(w http.ResponseWriter, r *http.Request, token
 	writeMemberToolPage(w, page, scope, candidate)
 }
 
+type memberToolSendInput struct {
+	Content      memberToolField[string]                    `json:"content"`
+	RecipientIDs memberToolField[[]memberToolField[string]] `json:"recipient_ids"`
+	Assessment   memberToolField[json.RawMessage]           `json:"intent_assessment"`
+}
+
 func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token string) {
 	key, ok := requestKey(w, r)
 	if !ok {
@@ -215,25 +221,17 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 		operationError(w, store.ErrInvalid)
 		return
 	}
-	var input struct {
-		Content      memberToolField[string]                    `json:"content"`
-		RecipientIDs memberToolField[[]memberToolField[string]] `json:"recipient_ids"`
-		Assessment   memberToolField[json.RawMessage]           `json:"intent_assessment"`
-	}
-	if !decodeMemberToolJSON(w, r, &input) {
+	var input memberToolSendInput
+	if !decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: &input, required: isContinueWorkRequest}) {
 		return
 	}
 	if input.Assessment.present {
-		var assessment domain.ChatAssessment
-		decoder := json.NewDecoder(bytes.NewReader(input.Assessment.value))
-		decoder.DisallowUnknownFields()
-		if input.RecipientIDs.present || decoder.Decode(&assessment) != nil {
+		if input.RecipientIDs.present {
 			memberToolError(w, store.ErrInvalid)
 			return
 		}
-		receipt, err := a.tools.AssessChatIntent(r.Context(), token, assessment, input.Content.value, key)
-		if err != nil {
-			memberToolError(w, err)
+		receipt, ok := a.assessMemberChatIntent(w, r, token, input.Assessment.value, input.Content, key)
+		if !ok {
 			return
 		}
 		assessmentReceipt := chatIntentToolReceipt{ID: receipt.ID, Disposition: receipt.Disposition,

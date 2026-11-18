@@ -150,6 +150,12 @@ func TestMemberMCPProtocolOptInLifecycleAndProfile(t *testing.T) {
 			if json.Unmarshal(repair.Properties["authorization"], &authorization) != nil || !slices.Equal(authorization.Enum, []string{"review_request", "original_agreement", "chat_request"}) {
 				t.Fatal("repair authorization labels changed")
 			}
+			var disposition struct{ Enum []string }
+			raw := tool.InputSchema.Properties["intent_assessment"]
+			if json.Unmarshal(assessment.Properties["disposition"], &disposition) != nil || !slices.Equal(disposition.Enum, []string{"discuss", "clarify", "request_work", "prepare_work"}) ||
+				bytes.Contains(raw, []byte("continue_work")) || bytes.Contains(raw, []byte("followup")) {
+				t.Fatal("default member schema advertised opt-in continuation")
+			}
 		}
 	}
 	if !slices.Equal(names, []string{"list_members", "read_channel", "send_message", "create_member", "search_history", "read_history"}) || f.counts(t) != before {
@@ -214,6 +220,23 @@ func TestMemberMCPNativeHandlersIdentityReplayAndConflicts(t *testing.T) {
 	fresh := memberMCPText(t, memberMCPHTTP(t, f, body), false)
 	if fresh == text || f.counts(t)[1] != before[1]+1 {
 		t.Fatal("different run capability collided with the old RPC id")
+	}
+}
+
+func TestLegacySendMessageRetainsSurrogateDecode(t *testing.T) {
+	f := newMemberMCPHTTP(t, "send_message")
+	const body = `{"content":"before\ud800after"}`
+	native := decoded[memberToolHTTPSendResult](t, f.request(t, "send_message", body, "legacy-surrogate"), 201)
+	var mcp memberToolHTTPSendResult
+	text := memberMCPText(t, memberMCPHTTP(t, f, memberMCPCall(`"legacy-mcp"`, "send_message", body)), false)
+	if err := json.Unmarshal([]byte(text), &mcp); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{native.MessageID, mcp.MessageID} {
+		stored, err := f.db.GetMessage(context.Background(), f.groupID, id)
+		if err != nil || stored.Content != "before�after" {
+			t.Fatal("new work tool validation changed legacy send_message decoding")
+		}
 	}
 }
 

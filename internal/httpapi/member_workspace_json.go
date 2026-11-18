@@ -9,14 +9,18 @@ import (
 )
 
 func decodeMemberWorkspaceJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
-	return decodeMemberToolJSON(w, r, &memberWorkspaceJSON{dst: dst})
+	return decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: dst})
 }
 
-type memberWorkspaceJSON struct{ dst any }
+type memberToolScalarJSON struct {
+	dst any
+	// Nil requires Unicode scalar strings on every request using the wrapper.
+	required func([]byte) bool
+}
 
-func (input *memberWorkspaceJSON) UnmarshalJSON(body []byte) error {
+func (input *memberToolScalarJSON) UnmarshalJSON(body []byte) error {
 	// Validate before memberToolField or encoding/json can replace surrogates.
-	if !validMemberWorkspaceJSONStrings(body) {
+	if (input.required == nil || input.required(body)) && !validMemberToolJSONStrings(body) {
 		return store.ErrInvalid
 	}
 	decoder := json.NewDecoder(bytes.NewReader(body))
@@ -26,7 +30,7 @@ func (input *memberWorkspaceJSON) UnmarshalJSON(body []byte) error {
 
 // Check only raw string escapes; the existing decoder owns JSON syntax, UTF-8,
 // duplicate fields and body limits. Never apply this to opaque MCP metadata.
-func validMemberWorkspaceJSONStrings(body []byte) bool {
+func validMemberToolJSONStrings(body []byte) bool {
 	if len(body) > memberToolJSONBytes {
 		return false
 	}
@@ -46,7 +50,7 @@ func validMemberWorkspaceJSONStrings(body []byte) bool {
 			if body[i] != 'u' {
 				continue
 			}
-			unit, ok := memberWorkspaceJSONCodeUnit(body[i+1:])
+			unit, ok := memberToolJSONCodeUnit(body[i+1:])
 			if !ok {
 				return false
 			}
@@ -56,7 +60,7 @@ func validMemberWorkspaceJSONStrings(body []byte) bool {
 				if i+6 >= len(body) || body[i+1] != '\\' || body[i+2] != 'u' {
 					return false
 				}
-				low, ok := memberWorkspaceJSONCodeUnit(body[i+3:])
+				low, ok := memberToolJSONCodeUnit(body[i+3:])
 				if !ok || low < 0xdc00 || low > 0xdfff {
 					return false
 				}
@@ -69,7 +73,7 @@ func validMemberWorkspaceJSONStrings(body []byte) bool {
 	return !inString
 }
 
-func memberWorkspaceJSONCodeUnit(body []byte) (uint16, bool) {
+func memberToolJSONCodeUnit(body []byte) (uint16, bool) {
 	if len(body) < 4 {
 		return 0, false
 	}
