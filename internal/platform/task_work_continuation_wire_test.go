@@ -1,0 +1,319 @@
+package platform_test
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"agentworkspace/internal/coordination"
+	"agentworkspace/internal/domain"
+	"agentworkspace/internal/httpapi"
+	"agentworkspace/internal/platform"
+	"agentworkspace/internal/provider"
+	"agentworkspace/internal/scheduler"
+	"agentworkspace/internal/store"
+)
+
+// All authority is established through v29 APIs. The only substitutions are a
+// metadata-only Pi executable and an in-process executor/HTTP recorder.
+func TestFreshTaskWorkB29NativeWire(t *testing.T) {
+	for _, mode := range []string{"confirmed", "commit-unknown", "wrong-resource", "extra-resource", "late-resource", "late-config", "late-policy"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := context.Background()
+			f := newRoleRuntime(t)
+			engine := coordination.New(f.db)
+			f.options.ChatIntake = engine
+			root := t.TempDir()
+			private, cli, ordinary := filepath.Join(root, "workspaces"), filepath.Join(root, "metadata-only"), filepath.Join(root, "index.ts")
+			roleOK(t, os.Mkdir(private, 0700))
+			roleOK(t, os.WriteFile(cli, nil, 0700))
+			roleOK(t, os.WriteFile(ordinary, nil, 0600))
+			selected := provider.Provider{ID: f.worker.ProviderID, Name: provider.Pi, Path: cli, Installation: provider.Installed, Version: "1.4.0"}
+			opts := platform.PrepareOptions{Providers: []provider.Provider{selected}, PrivateWorkspaceRoot: private,
+				MemberTools: f.runtime, PiMemberToolsExtension: ordinary}
+			off, err := platform.NewPreparer(f.db, opts)
+			roleOK(t, err)
+			thread := domain.ThreadRef{GroupID: f.group, TopicID: "fresh-text"}
+			policy := domain.ChatPolicyRequest{Enabled: true, Action: domain.ChatActionTextSubmission, MaxAdmissions: 1}
+			policySnap, err := engine.SetChatPolicy(ctx, thread, policy, 0, "chat-policy")
+			roleOK(t, err)
+			settle := func(claim store.TurnClaim, outcome provider.Outcome) domain.Turn {
+				t.Helper()
+				turn, err := f.db.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{Outcome: outcome})
+				roleOK(t, err)
+				return turn
+			}
+			claim := func(delivery string, keys []string) store.MemberToolScope {
+				t.Helper()
+				turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group, DeliveryID: delivery, MaxActive: 1, ResourceKeys: keys})
+				roleOK(t, err)
+				scope, err := f.db.BindMemberTool(ctx, store.TurnClaim{GroupID: f.group, TurnID: turn.ID, Token: turn.ClaimToken})
+				roleOK(t, err)
+				return scope
+			}
+			capture := func(text, key string) (store.MemberToolScope, domain.ChatCandidate) {
+				t.Helper()
+				msg, err := f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: thread.TopicID, Content: text, RecipientIDs: []string{f.lead.ID}}, key)
+				roleOK(t, err)
+				scope := claim(msg.Deliveries[0].ID, nil)
+				c, err := engine.CaptureChatCandidate(ctx, scope)
+				roleOK(t, err)
+				return scope, c
+			}
+			pending := func(id string) store.PendingDelivery {
+				t.Helper()
+				msg, err := f.db.GetMessage(ctx, f.group, id)
+				roleOK(t, err)
+				return store.PendingDelivery{GroupID: f.group, SenderID: msg.SenderID, Delivery: msg.Deliveries[0]}
+			}
+
+			intake, c := capture("请完成纯文本摘要。", "source")
+			admission, err := engine.AssessChatIntent(ctx, intake, c.ID, domain.ChatAssessment{Disposition: "request_work", Action: domain.ChatActionTextSubmission,
+				Title: "原任务摘要", Description: "只交付文本", Acceptance: "列出结论", Reason: "明确文本请求"}, "确认请求。", "admit")
+			roleOK(t, err)
+			settle(intake.Claim, provider.OutcomeNotStarted)
+			dispatch, err := f.db.MaterializeDispatchRequest(ctx, admission.DispatchRequestID, 1, time.Now().UTC())
+			roleOK(t, err)
+			coord := f.claim(t, dispatch.Delivery.DeliveryID)
+			decider, err := f.db.BindMemberTool(ctx, coord.claim)
+			roleOK(t, err)
+			decision, err := f.db.DecideDispatch(ctx, store.CoordinationToolScope{Member: decider, Provenance: coord.provenance},
+				store.CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: f.worker.ID, Reason: "原文本工作"}, "assign")
+			roleOK(t, err)
+			settle(coord.claim, provider.OutcomeNotStarted)
+			assignment, err := f.db.MaterializeAssignment(ctx, decision.Assignment.ID, 1, time.Now().UTC())
+			roleOK(t, err)
+			original := pending(assignment.Delivery.MessageID)
+			originalPrep, err := off.Prepare(ctx, original)
+			roleOK(t, err)
+			state, err := f.db.ResolveCoordinationDelivery(ctx, f.group, original.Delivery.ID)
+			roleOK(t, err)
+			oldScope := claim(original.Delivery.ID, originalPrep.ResourceKeys)
+			prior, err := f.db.BindAssignmentAttempt(ctx, store.CoordinationToolScope{Member: oldScope, Provenance: state.Provenance})
+			roleOK(t, err)
+			settle(oldScope.Claim, provider.OutcomeNotStarted)
+
+			followup := func(constraint string) domain.ChatAssessment {
+				return domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork, Reason: "续办原文本任务",
+					Followup: &domain.ChatFollowupAssessment{TaskID: admission.TaskID, Constraint: constraint}}
+			}
+			intake, c = capture("请继续 "+admission.TaskID+"。另写项目文件。", "older-source")
+			older, err := f.db.ApplyChatAssessmentDormant(ctx, intake, c.ID, followup("另写项目文件"), "记录补充。", "dormant")
+			roleOK(t, err)
+			settle(intake.Claim, provider.OutcomeNotStarted)
+			const detail = "请保留原格式🧪"
+			intake, c = capture("请继续 "+admission.TaskID+"。"+detail, "latest-source")
+			assess := func() (domain.ChatAssessmentReceipt, error) {
+				return engine.AssessChatIntent(ctx, intake, c.ID, followup(detail), "记录续办。", "continue")
+			}
+			if _, err := assess(); !errors.Is(err, store.ErrTaskWorkExecutionNotReady) {
+				t.Fatalf("default readiness was not closed: %v", err)
+			}
+			engine.EnableTaskWorkExecution()
+			wake, err := assess()
+			roleOK(t, err)
+			settle(intake.Claim, provider.OutcomeNotStarted)
+			if wake.WorkInputID == "" || wake.WorkDeliveryID == "" || wake.MandateID != admission.MandateID {
+				t.Fatal("v29 did not bind the input and typed wake to the original Mandate")
+			}
+			queued := pending(wake.WorkWakeMessageID)
+			if got, err := off.Prepare(ctx, queued); got.Executor != nil || !errors.Is(err, scheduler.ErrNotReady) {
+				t.Fatalf("ordinary role profile could prepare a typed delivery: %v", err)
+			}
+			if got, err := off.InspectRoleReadiness(ctx, queued); err != nil || got.Blocked == nil || got.HistoryLimit != 0 {
+				t.Fatalf("typed delivery inspected as legacy: %+v %v", got, err)
+			}
+
+			var token, configPath string
+			var live store.MemberToolScope
+			calls := 0
+			call := func(op, body, key string, status int) string {
+				t.Helper()
+				w := f.http(t, token, op, body, key)
+				if w.Code != status {
+					t.Fatalf("%s: status %d, expected %d: %s", op, w.Code, status, w.Body)
+				}
+				return w.Body.String()
+			}
+			f.options.FreshTaskWork = &platform.FreshTaskWorkLaunch{
+				Supports: func(p provider.Provider) bool { return p.ID == selected.ID },
+				Construct: func(_ context.Context, p provider.Provider, b provider.FreshTaskWorkBinding) (provider.Executor, error) {
+					configPath = b.ConfigPath
+					bytes, err := os.ReadFile(configPath)
+					roleOK(t, err)
+					var config struct{ Token, Endpoint string }
+					roleOK(t, json.Unmarshal(bytes, &config))
+					token = config.Token
+					if token == "" || token == live.Claim.Token || config.Endpoint != f.options.Endpoint || b.ConfigSHA256 != sha256.Sum256(bytes) ||
+						b.RunID != live.Claim.TurnID || p.ID != selected.ID || !slices.Equal(b.Operations, provider.PiFreshTaskWorkToolNames()) {
+						t.Fatal("wrong fresh bootstrap binding")
+					}
+					switch mode {
+					case "late-resource":
+						_, err := f.raw.Exec(`INSERT INTO resource_claims(resource_key,turn_id) VALUES('late-foreign-key',?)`, b.RunID)
+						roleOK(t, err)
+					case "late-config":
+						roleOK(t, os.WriteFile(configPath, append(bytes, ' '), 0600))
+					case "late-policy":
+						policy.Enabled = false
+						_, err := engine.SetChatPolicy(ctx, thread, policy, policySnap.Revision, "revoke-before-launch")
+						roleOK(t, err)
+					}
+					return roleNative(func(_ context.Context, req provider.ExecuteRequest, _ func(provider.Event) error) provider.ExecutionReceipt {
+						calls++
+						if mode != "confirmed" && mode != "commit-unknown" {
+							t.Fatal("denied preflight invoked the executor")
+						}
+						if !strings.Contains(req.Prompt, admission.MandateID) || !strings.Contains(req.Prompt, wake.WorkInputID) ||
+							strings.Contains(req.Prompt, detail) || strings.Contains(req.Prompt, token) {
+							t.Fatal("prompt was not confined to the Mandate and input handle")
+						}
+						id := fmt.Sprintf(`{"input_id":%q}`, wake.WorkInputID)
+						call("list_members", `{}`, "", 403)
+						call("report_work", `{}`, "no-report", 404)
+						call("hand_back_work", `{}`, "no-task-handback", 404)
+						call("mcp", `{}`, "", 403)
+						call("read_work_inputs", id[:len(id)-1]+`,"limit":1}`, "", 400)
+						call("submit_result", `{"summary":"text","artifact_versions":[]}`, "refs", 400)
+						call("submit_result", `{"summary":"too early"}`, "premature", 409)
+						if mode == "commit-unknown" {
+							_, err := f.raw.Exec(`CREATE TABLE commit_guard(id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED);
+								CREATE TRIGGER ack_commit_fault AFTER INSERT ON mutation_idempotency
+								BEGIN INSERT INTO commit_guard VALUES('nonexistent-group'); END`)
+							roleOK(t, err)
+							text := call("ack_work_input", id, "unknown-key", 500)
+							if !strings.Contains(text, "未确认") || strings.Contains(text, "commit_guard") {
+								t.Fatal("B commit uncertainty leaked details or lost reconciliation guidance")
+							}
+							var n int
+							roleOK(t, f.raw.QueryRow(`SELECT count(*) FROM task_work_input_consumptions`).Scan(&n))
+							if n != 0 {
+								t.Fatal("failed COMMIT left a durable confirmation")
+							}
+							return provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown}
+						}
+						var page struct {
+							Items []struct {
+								InputID string `json:"input_id"`
+							}
+							NextCursor string `json:"next_cursor"`
+						}
+						roleOK(t, json.Unmarshal([]byte(call("read_work_inputs", `{"limit":1}`, "", 200)), &page))
+						if len(page.Items) != 1 || page.Items[0].InputID != wake.WorkInputID || page.NextCursor == "" {
+							t.Fatal("directory lost the exact B order or cursor")
+						}
+						if next := call("read_work_inputs", fmt.Sprintf(`{"before":%q}`, page.NextCursor), "", 200); !strings.Contains(next, older.WorkInputID) {
+							t.Fatal("cursor lost the older input")
+						}
+						call("read_work_inputs", fmt.Sprintf(`{"before":%q}`, page.NextCursor+"A"), "", 400)
+						var contents strings.Builder
+						for offset := 0; ; {
+							var segment struct {
+								Text     string
+								Complete bool
+								Next     int `json:"next_offset"`
+							}
+							roleOK(t, json.Unmarshal([]byte(call("read_work_inputs", fmt.Sprintf(`{"input_id":%q,"offset":%d,"max_bytes":13}`, wake.WorkInputID, offset), "", 200)), &segment))
+							if segment.Next <= offset || len(segment.Text) != segment.Next-offset || segment.Next > 1000 {
+								t.Fatal("segment did not advance in UTF-8 bytes")
+							}
+							contents.WriteString(segment.Text)
+							if segment.Complete {
+								break
+							}
+							offset = segment.Next
+						}
+						if !strings.Contains(contents.String(), detail) {
+							t.Fatal("segment reconstruction lost the input")
+						}
+						call("submit_result", `{"summary":"read is not acknowledgement"}`, "still-premature", 409)
+						returned := fmt.Sprintf(`{"input_id":%q,"reason":"超出原文本范围"}`, older.WorkInputID)
+						if got := call("hand_back_work_input", returned, "one-input", 200); !strings.Contains(got, `"disposition":"returned"`) || got != call("hand_back_work_input", returned, "one-input", 200) {
+							t.Fatal("single-input handback receipt was not stable")
+						}
+						if got := call("ack_work_input", id, "ack", 200); !strings.Contains(got, `"disposition":"confirmed"`) || got != call("ack_work_input", id, "ack", 200) {
+							t.Fatal("confirmation receipt was not stable")
+						}
+						const body = `{"summary":"完成原文本摘要。"}`
+						if got := call("submit_result", body, "submit", 201); !strings.Contains(got, `"artifact_version_count":0`) || got != call("submit_result", body, "submit", 201) {
+							t.Fatal("submission receipt was not stable")
+						}
+						task, err := f.db.GetTask(ctx, f.group, admission.TaskID)
+						roleOK(t, err)
+						sub, err := f.db.GetTaskSubmission(ctx, f.group, task.ID, task.CurrentSubmissionID)
+						roleOK(t, err)
+						if task.Status != domain.TaskStatusSubmitted || sub.AttemptID == prior.AttemptID || sub.SubmittedBy != f.worker.ID || len(sub.ArtifactVersions) != 0 {
+							t.Fatal("wrong typed Attempt or submission scope")
+						}
+						return provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted} // No model ran.
+					}), nil
+				},
+			}
+			f.runtime, err = platform.NewMemberToolRuntime(f.db, f.options)
+			roleOK(t, err)
+			defer f.runtime.Close()
+			tools := f.runtime.Tools()
+			if tools.WorkInputsEnabled() {
+				t.Fatal("fresh profile enabled the legacy intake seam")
+			}
+			routes := append(httpapi.MemberToolRoutes(tools), httpapi.MemberRoleToolRoutes(tools)...)
+			routes = append(routes, httpapi.MemberMCPRoutes(tools)...)
+			server, err := httpapi.NewServer(httpapi.DefaultAddress, routes...)
+			roleOK(t, err)
+			f.handler = server.Handler
+			opts.MemberTools = f.runtime
+			prep, err := platform.NewPreparer(f.db, opts)
+			roleOK(t, err)
+			prepared, err := prep.Prepare(ctx, queued)
+			roleOK(t, err)
+			if token != "" || !slices.Equal(prepared.ResourceKeys, originalPrep.ResourceKeys) || prepared.Request.CWD != originalPrep.Request.CWD {
+				t.Fatal("preparation acquired authority or changed the private resource")
+			}
+			keys := slices.Clone(prepared.ResourceKeys)
+			if mode == "wrong-resource" {
+				keys = []string{"wrong-key"}
+			}
+			if mode == "extra-resource" {
+				keys = append(keys, "extra-key")
+			}
+			live = claim(queued.Delivery.ID, keys)
+			prepared.Request.RunID, prepared.Request.RuntimeDir = live.Claim.TurnID, f.root
+			out := prepared.Executor.Execute(ctx, prepared.Request, nil)
+			want := provider.OutcomeUnknown
+			if mode == "confirmed" {
+				want = provider.OutcomeNotStarted
+			}
+			if out.Outcome != want || (calls == 1) != (mode == "confirmed" || mode == "commit-unknown") {
+				t.Fatalf("wrong guarded result: %v calls=%d", out.Outcome, calls)
+			}
+			if again := prepared.Executor.Execute(ctx, prepared.Request, nil); again.Outcome != provider.OutcomeUnknown {
+				t.Fatal("fresh executor was reusable")
+			}
+			if token != "" {
+				call("ack_work_input", fmt.Sprintf(`{"input_id":%q}`, wake.WorkInputID), "retired", 403)
+				if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+					t.Fatal("config survived revocation")
+				}
+			}
+			turn := settle(live.Claim, out.Outcome)
+			if want == provider.OutcomeUnknown && turn.State != domain.TurnStateUnknown {
+				t.Fatal("unknown turned terminal")
+			}
+			for _, key := range keys {
+				held, err := f.db.HasResourceClaim(ctx, key)
+				roleOK(t, err)
+				if held != (want == provider.OutcomeUnknown) {
+					t.Fatal("resource settlement did not match B outcome")
+				}
+			}
+		})
+	}
+}

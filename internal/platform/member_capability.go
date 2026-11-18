@@ -34,6 +34,7 @@ type memberToolRegistration struct {
 	role      store.CoordinationToolScope
 	candidate *domain.ChatCandidate
 	purpose   string
+	taskWork  *taskWorkToolBinding
 	// Frozen server capability facts are not grants or model-controlled input.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
@@ -41,13 +42,14 @@ type memberToolRegistration struct {
 // MemberTools owns process-local capabilities; durable claims authorize every use.
 // A runtime must revoke registrations when turns finish to reclaim capacity.
 type MemberTools struct {
-	db           *store.Store
-	mu           sync.RWMutex
-	capabilities map[[sha256.Size]byte]memberToolRegistration
-	mcpRequests  map[[sha256.Size]byte]map[[sha256.Size]byte][sha256.Size]byte
-	chatEngine   *coordination.Engine
-	workInputs   MemberWorkInputService // Immutable after runtime construction.
-	workspace    *memberWorkspaceRegistry
+	db            *store.Store
+	mu            sync.RWMutex
+	capabilities  map[[sha256.Size]byte]memberToolRegistration
+	mcpRequests   map[[sha256.Size]byte]map[[sha256.Size]byte][sha256.Size]byte
+	chatEngine    *coordination.Engine
+	workInputs    MemberWorkInputService // Immutable after runtime construction.
+	freshTaskWork FreshTaskWorkLaunch    // Independent of the legacy work-input preview.
+	workspace     *memberWorkspaceRegistry
 }
 
 func NewMemberTools(db *store.Store) *MemberTools {

@@ -21,6 +21,10 @@ const (
 )
 
 func (a memberToolAPI) readWorkInputs(w http.ResponseWriter, r *http.Request, token string) {
+	if a.tools.IsFreshTaskWorkCapability(token) {
+		a.readFreshTaskWorkInputs(w, r, token)
+		return
+	}
 	if !decodeMemberToolJSON(w, r, &struct{}{}) {
 		return
 	}
@@ -71,6 +75,10 @@ func (a memberToolAPI) mutateWorkInput(w http.ResponseWriter, r *http.Request, t
 	}
 	if !validWorkInputID(input.InputID.value) || handBack != input.Reason.present || handBack && !validWorkInputText(input.Reason.value, maxHandBackReasonBytes) {
 		operationError(w, store.ErrInvalid)
+		return
+	}
+	if a.tools.IsFreshTaskWorkCapability(token) {
+		a.mutateFreshTaskWorkInput(w, r, token, handBack, input.InputID.value, input.Reason.value, key)
 		return
 	}
 	operation := "ack_work_input"

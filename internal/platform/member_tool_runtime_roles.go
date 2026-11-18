@@ -26,7 +26,7 @@ func (r *MemberToolRuntime) WrapCoordinationRole(binding MemberToolRunBinding, e
 func (r *MemberToolRuntime) WrapCoordinationRoleWithCapabilities(binding MemberToolRunBinding, expected store.CoordinationRoleProvenance, facts []store.DispatchWorkerCapabilityFact, factory MemberToolExecutorFactory) (provider.Executor, error) {
 	if r.roleFence == nil || (binding.ProviderName != provider.Pi && binding.ProviderName != provider.Codex) || !memberToolRuntimeText(binding.ProviderID) || factory == nil || len(binding.Model) > 256 || !memberToolRuntimeText(binding.Model) ||
 		expected.GroupID != binding.GroupID || expected.MemberID != binding.MemberID || expected.ConversationID != binding.ConversationID || expected.DeliveryID != binding.DeliveryID ||
-		expected.TaskRevision < 1 || (expected.Kind != store.CoordinationRoleCoordinator && expected.Kind != store.CoordinationRoleWorker) ||
+		expected.SourceKind != "" || expected.SourceID != "" || expected.TaskRevision < 1 || (expected.Kind != store.CoordinationRoleCoordinator && expected.Kind != store.CoordinationRoleWorker) ||
 		(expected.Kind == store.CoordinationRoleCoordinator && expected.AssignmentID != "") || (expected.Kind == store.CoordinationRoleWorker && !memberToolRuntimeText(expected.AssignmentID)) {
 		return nil, errMemberToolRuntimeBinding
 	}

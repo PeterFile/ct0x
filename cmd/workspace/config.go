@@ -24,6 +24,7 @@ type config struct {
 	enableCodexAppServer                                        bool
 	piMemberToolsExtension, roleThinking                        string
 	executionMaxActive, memberToolsMaxMembers                   int
+	piFreshTaskWorkExtension                                    string
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -40,6 +41,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags.IntVar(&config.executionMaxActive, "execution-max-active", defaultExecutionMaxActive, "执行最大并发（1..8）")
 	flags.BoolVar(&config.enableMemberTools, "enable-member-tools", false, "启用 Pi 基础成员工具（默认禁用）")
 	flags.StringVar(&config.piMemberToolsExtension, "pi-member-tools-extension", "", "可信 Pi 扩展的绝对文件路径")
+	config.registerPiFreshTaskWorkFlag(flags, output)
 	flags.IntVar(&config.memberToolsMaxMembers, "member-tools-max-members", 4, "成员工具增员容量（1..200）")
 	flags.BoolVar(&config.enableCoordinationRoles, "enable-coordination-roles", false, "显式启用受信协调角色（默认禁用）")
 	flags.BoolVar(&config.enableCodexAppServer, "enable-codex-app-server", false, "显式选择实验性 Codex AppServer 与会话级平台 MCP（默认禁用）")
@@ -92,6 +94,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	}
 	if config.enableCoordinationRoles && (!config.enableExecution || !config.enableMemberTools) {
 		return config, errors.New("启用协调角色必须同时启用执行、成员工具并显式指定可信 Pi 扩展")
+	}
+	if err := config.validatePiFreshTaskWork(); err != nil {
+		return config, err
 	}
 	if !config.enableCoordinationRoles && set["role-thinking"] {
 		return config, errors.New("协调角色禁用时不能指定角色 thinking 级别，包括空值")

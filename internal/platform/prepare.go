@@ -198,6 +198,9 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	}
 	group, member, conversation, trigger, state := input.group, input.member, input.conversation, input.trigger, input.state
 	d := pending.Delivery
+	if state.Provenance.SourceKind != "" {
+		return p.prepareFreshTaskWork(ctx, input)
+	}
 	if state.Provenance.Kind != store.CoordinationRoleOrdinary {
 		return p.prepareCoordinationRole(ctx, state, group, member, conversation, trigger)
 	}

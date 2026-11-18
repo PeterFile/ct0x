@@ -41,6 +41,9 @@ type MemberToolRuntimeOptions struct {
 	// WorkInputs is trusted startup composition. Nil keeps work inputs closed;
 	// a typed nil is a configuration error. ContinueWork also requires ChatIntake.
 	WorkInputs MemberWorkInputService
+	// FreshTaskWork uses the same role fence and Engine as ChatIntake.
+	// Nil (default) does not compose typed continuation or change #181 grants.
+	FreshTaskWork *FreshTaskWorkLaunch
 }
 
 type MemberToolRunBinding struct {
@@ -130,6 +133,12 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 	}
 	tools := NewMemberTools(db)
 	tools.workInputs = options.WorkInputs
+	if launch := options.FreshTaskWork; launch != nil {
+		if roleFence == nil || !options.ChatIntake.UsesStore(db) || launch.Supports == nil || launch.Construct == nil {
+			return nil, errMemberToolRuntimeConfig
+		}
+		tools.freshTaskWork = *launch
+	}
 	if options.ChatIntake != nil {
 		if roleFence == nil {
 			return nil, errMemberToolRuntimeConfig
