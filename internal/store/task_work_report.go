@@ -169,7 +169,10 @@ func (s *Store) ReportWork(ctx context.Context, scope MemberToolScope, input dom
 	if !memberToolKeyValid(key) || !taskWorkReportKindValid(input.Kind) || !memberToolTextValid(input.Summary, domain.MaxWorkReportBytes) || len(input.AnswerTo) > 4096 {
 		return domain.TaskWorkReport{}, ErrInvalid
 	}
-	return workMemberTx(ctx, s, scope, "记录协作报告失败", func(tx *sql.Tx) (out domain.TaskWorkReport, err error) {
+	return taskWorkMutationTx(ctx, s, scope, "记录协作报告失败", func(tx *sql.Tx) (out domain.TaskWorkReport, err error) {
+		if err := requireTaskWorkReportsInTx(ctx, tx); err != nil {
+			return out, coordinationRoleRelationError(err)
+		}
 		f, err := taskWorkExecutionInTx(ctx, tx, scope)
 		if err != nil {
 			return out, err
@@ -184,7 +187,10 @@ func (s *Store) ReportWork(ctx context.Context, scope MemberToolScope, input dom
 			out, err = s.recordTaskWorkReportInTx(ctx, tx, scope, f, input, id, replay)
 			return err
 		})
-		return out, err
+		if err != nil {
+			return out, err
+		}
+		return out, coordinationDecideLiveInTx(ctx, tx, scope)
 	})
 }
 

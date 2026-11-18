@@ -577,6 +577,72 @@ func TestB3WorkDelegationReplayAndAuthority(t *testing.T) {
 	}
 }
 
+func TestB3ReportWorkMutationUncertainty(t *testing.T) {
+	f, owner, child, _ := workReportOwner(t, 1)
+	d, err := f.s.DelegateWork(ctx, owner.Member, domain.DelegateWorkInput{MemberID: child.ID, Question: "核对摘要。"}, "delegate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wake, err := f.s.ResolveTaskWorkDelivery(ctx, d.GroupID, d.DeliveryID)
+	if err != nil || wake.Blocked != "" {
+		t.Fatalf("delegation wake: %+v %v", wake, err)
+	}
+	worker := taskWorkTestClaim(t, f.s, wake, "report-transaction-resource")
+	queueEvent(t, f.s, worker.Claim, provider.AcceptedEvent, "", "")
+	before := messageSequenceSnapshot(t, f.s)
+	cause := fmt.Errorf("commit acknowledgement lost: %w", ErrConflict)
+	fault, _ := coordinationDecideWrapped(t, f.path, "ack-error", cause)
+	fault.EnableTaskWorkExecution()
+	fault.EnableInvestigationExecution()
+	in := domain.ReportWorkInput{Kind: domain.TaskWorkReportDelivered, Summary: "摘要已核对。"}
+	const key = "report-exact-key"
+	out, callErr := fault.ReportWork(ctx, worker, in, key)
+	requestDispatchZero(t, out, callErr, ErrTaskWorkMutationUnknown)
+	var evidence interface {
+		Phase() string
+		CommitOutcomeUnknown() bool
+		RollbackConfirmed() bool
+	}
+	if !errors.As(callErr, &evidence) || evidence.Phase() != "commit" || !evidence.CommitOutcomeUnknown() || evidence.RollbackConfirmed() ||
+		!errors.Is(callErr, cause) || callErr.Error() != ErrTaskWorkMutationUnknown.Error() {
+		t.Fatalf("wrong commit evidence: %v", callErr)
+	}
+	for _, s := range []*Store{fault, f.s} {
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	s := queueHandle(t, f.path, false)
+	s.EnableTaskWorkExecution()
+	s.EnableInvestigationExecution()
+	page, err := s.ListTaskWorkReports(ctx, d.GroupID, d.TaskID, ListOptions{})
+	if err != nil || len(page.Items) != 1 {
+		t.Fatalf("expected one durable report: %+v %v", page, err)
+	}
+	want := page.Items[0]
+	if want.TaskWorkParent != d.TaskWorkParent || want.ReportWorkInput != in || want.DelegationID != d.ID || want.SourceTurnID != worker.Claim.TurnID {
+		t.Fatalf("wrong durable report: %+v", want)
+	}
+	wake, err = s.ResolveTaskWorkDelivery(ctx, d.GroupID, want.DeliveryID)
+	if err != nil || wake.SourceKind != domain.TaskWorkSourceReport || wake.SourceID != want.ID || wake.MessageID != want.MessageID ||
+		wake.MemberID != d.OwnerMemberID || wake.Blocked != "prior_turn_unsettled" {
+		t.Fatalf("wrong durable report wake: %+v %v", wake, err)
+	}
+	after := messageSequenceSnapshot(t, s)
+	for _, table := range []string{"task_work_reports", "task_work_deliveries", "messages", "message_log", "deliveries", "mutation_idempotency"} {
+		if len(after[table]) != len(before[table])+1 {
+			t.Fatalf("expected exactly one new %s row", table)
+		}
+		delete(before, table)
+	}
+	messageSequencePreserved(t, s, before)
+	if replay, err := s.ReportWork(ctx, worker, in, key); err != nil || replay != want {
+		t.Fatalf("same-key reconciliation changed the report: %+v %v", replay, err)
+	}
+	messageSequencePreserved(t, s, after)
+}
+
 func TestB3WorkReportAtomicWritesAndHandback(t *testing.T) {
 	f, owner, child, _ := workReportOwner(t, 1)
 	s := f.s
