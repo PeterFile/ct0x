@@ -28,7 +28,8 @@ const (
 	TerminalEvent     EventKind = "terminal"
 )
 
-// ExecuteRequest starts a fresh run, never resumes one. RuntimeDir must be an
+// ExecuteRequest starts a fresh run by default; only explicit session adapters
+// can resume a qualified native reference. RuntimeDir must be an
 // existing private platform-owned directory with trusted ancestors; RunID reserves
 // a new child directory exclusively. CWD is explicit and grants no sandbox.
 // Model is optional and uses the CLI's model selector. Prompt travels over stdin;
@@ -97,6 +98,7 @@ type executionCommand struct {
 	path        string
 	timeout     time.Duration
 	memberTools *piMemberToolOptions
+	piSession   *piSessionOptions
 }
 
 type piExecutor struct{ executionCommand }
@@ -130,6 +132,9 @@ func (e piExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent
 
 func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error, codex bool) ExecutionReceipt {
 	r := ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "执行参数无效"}
+	if e.piSession != nil {
+		r.NativeRef = e.piSession.bindingReference()
+	}
 	if codex && request.Thinking != "" {
 		r.Reason = "Codex 暂不支持 thinking 参数"
 		return r
@@ -162,6 +167,15 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		}
 		return r
 	}
+	var session *piSessionRun
+	if e.piSession != nil {
+		var err error
+		session, err = e.preparePiSession(request, dir)
+		if err != nil {
+			r.Reason = errPiSession.Error()
+			return r
+		}
+	}
 	r.StdoutPath, r.StderrPath = filepath.Join(dir, "stdout.jsonl"), filepath.Join(dir, "stderr.log")
 	stdout, err := os.OpenFile(r.StdoutPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
@@ -181,6 +195,10 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	}
 	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex, frameLimit: frameLimit}
 	args := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", toolFlag, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--session-dir", dir, "--session-id", request.RunID}
+	if session != nil {
+		out.piSession = session.tracker
+		args = append(args[:len(args)-4], "--session", session.file, "--session-dir", filepath.Dir(session.file))
+	}
 	if e.memberTools != nil {
 		args = append(args, "--tools", strings.Join(e.memberTools.toolNames, ","), "--extension", e.memberTools.extensionPath)
 	}
@@ -237,7 +255,21 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	}
 	r.OutputComplete = normalExit && outDrain.complete && errDrain.complete && !out.damaged && len(out.line) == 0 && !out.dropping && !outLog.failed && !errLog.failed && outClose == nil && errClose == nil
 	r.Reason = "执行结果未知，需对账后再重试"
-	if r.OutputComplete && ctx.Err() == nil && !r.DeliveryFailed && r.Terminal != "" {
+	canSettle := r.OutputComplete && ctx.Err() == nil && !r.DeliveryFailed && r.Terminal != "" &&
+		(session == nil || r.Accepted && r.DirectChildReaped && !session.tracker.hasUncertainExecution())
+	if canSettle && session != nil {
+		// Only success has a supported persistence proof. Withhold publication
+		// and claim release for other terminals pending reconciliation, without
+		// discarding the observed lifecycle evidence.
+		canSettle = false
+		if r.Terminal == OutcomeSucceeded {
+			if ref := session.capture(r.NativeSessionID, e.path); ref != nil && ctx.Err() == nil {
+				r.NativeRef = ref
+				canSettle = true
+			}
+		}
+	}
+	if canSettle {
 		r.Outcome = r.Terminal
 		r.Reason = map[Outcome]string{OutcomeSucceeded: "执行完成", OutcomeFailed: "模型执行失败", OutcomeAborted: "模型执行已中止", OutcomeTruncated: "模型输出被截断"}[r.Outcome]
 	}
