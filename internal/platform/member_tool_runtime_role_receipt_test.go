@@ -445,6 +445,42 @@ func TestRoleReceiptCancelledCallerAndUnsupportedCapture(t *testing.T) {
 	})
 }
 
+func TestRoleReceiptRejectsNativeRefCapture(t *testing.T) {
+	f, r, req, binding := roleReceiptRuntime(t)
+	scope := f.coordinatorScope
+	plain := provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, Started: true, ExitCode: -1}
+	record := memberToolRoleReceiptRecord{Version: 1, Source: memberToolRoleReceiptSourceFor(binding, scope), Raw: plain, Aggregate: plain}
+	if _, ok := memberToolRoleEncodeReceipt(record); !ok {
+		t.Fatal("receipt without a native reference must be capturable")
+	}
+	for _, side := range []string{"raw", "aggregate"} {
+		t.Run(side, func(t *testing.T) {
+			withRef := record
+			ref := &provider.NativeSessionReference{}
+			if side == "raw" {
+				withRef.Raw.NativeRef = ref
+			} else {
+				withRef.Aggregate.NativeRef = ref
+			}
+			if _, ok := memberToolRoleEncodeReceipt(withRef); ok {
+				t.Fatal("diagnostic accepted a receipt with a private native reference")
+			}
+		})
+	}
+	t.Run("runtime", func(t *testing.T) {
+		raw := plain
+		raw.NativeRef = &provider.NativeSessionReference{Version: provider.NativeSessionReferenceVersion, Binding: json.RawMessage(`{"fixture":"private-reference"}`)}
+		got := roleReceiptInvoke(t, r, req, binding, scope.Provenance, func() provider.ExecutionReceipt { return raw })
+		if got != raw {
+			t.Fatal("diagnostic refusal changed execution evidence")
+		}
+		diagnostic, err := r.InspectCoordinationRoleReceipt(context.Background(), f.groupID, req.RunID)
+		if err != nil || diagnostic.Capture != nil || diagnostic.CaptureStatus != "missing" {
+			t.Fatalf("unsupported receipt did not leave capture missing: status=%q err=%v", diagnostic.CaptureStatus, err)
+		}
+	})
+}
+
 func TestRoleRuntimePostclaimAndFinalStartupRechecks(t *testing.T) {
 	for _, phase := range []string{"post-reserve fresh", "startup blocked", "final selection", "revoked grants", "factory failure", "wrong root"} {
 		t.Run(phase, func(t *testing.T) {
