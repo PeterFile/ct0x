@@ -72,7 +72,7 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 	if n != 1 {
 		return domain.Turn{}, queueError(action, ErrConflict)
 	}
-	if err := s.taskWorkFollowupClaimInTx(ctx, tx, t); err != nil {
+	if err := s.taskWorkClaimInTx(ctx, tx, t); err != nil {
 		return domain.Turn{}, queueError(action, err)
 	}
 	for _, key := range keys {

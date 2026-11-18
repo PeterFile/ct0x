@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"agentworkspace/internal/domain"
@@ -67,26 +68,8 @@ func taskWorkFollowupWakeInTx(ctx context.Context, tx *sql.Tx, sender MemberTool
 	if assessment != assessmentID || actor != sender.Claim.TurnID {
 		return domain.TaskWorkDelivery{}, ErrMemberToolDenied
 	}
-	body := taskWorkWakeBody(want)
-	if len(body) > 16<<10 || !validTriggerID(want.TaskID) || !validTriggerID(want.MandateID) {
-		return domain.TaskWorkDelivery{}, ErrInvalid
-	}
-	target := []string{want.MemberID}
-	m, err := createMessageInTx(ctx, tx, MessageRequest{GroupID: want.GroupID, TopicID: want.TopicID, ActorID: sender.MemberID, Content: body, RecipientIDs: target}, target)
+	want, err = taskWorkCreateWakeInTx(ctx, tx, want, nil)
 	if err != nil {
-		return domain.TaskWorkDelivery{}, err
-	}
-	if m.GroupID != want.GroupID || m.TopicID != want.TopicID || m.SenderID != sender.MemberID || m.Content != body || len(m.Deliveries) != 1 {
-		return domain.TaskWorkDelivery{}, ErrConflict
-	}
-	d := m.Deliveries[0]
-	if d.RecipientID != want.MemberID || d.MessageID != m.ID || d.State != domain.DeliveryStateQueued || d.TurnID != "" {
-		return domain.TaskWorkDelivery{}, ErrConflict
-	}
-	want.DeliveryID, want.MessageID, want.ConversationID = d.ID, m.ID, d.ConversationID
-	if err := coordinationDispatchWrite(ctx, tx, "INSERT INTO task_work_deliveries("+taskWorkDeliveryColumns+") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-		want.DeliveryID, want.SourceKind, want.SourceID, want.AssignmentID, want.TaskID, want.TaskRevision, want.MandateID, want.AuthorityGeneration,
-		want.OwnerMemberID, want.MemberID, want.SenderMemberID, want.GroupID, want.TopicID, want.ConversationID, want.MessageID); err != nil {
 		return domain.TaskWorkDelivery{}, err
 	}
 	saved, err := taskWorkDeliveryInTx(ctx, tx, want.GroupID, want.DeliveryID)
@@ -102,6 +85,80 @@ func taskWorkFollowupWakeInTx(ctx context.Context, tx *sql.Tx, sender MemberTool
 	return saved.d, nil
 }
 
+// Only fenced producers may allocate a wake. B3 inserts its logical source
+// after allocating the physical delivery but before inserting the marker.
+func taskWorkCreateWakeInTx(ctx context.Context, tx *sql.Tx, want domain.TaskWorkDelivery, persistSource func(domain.TaskWorkDelivery) error) (domain.TaskWorkDelivery, error) {
+	body := taskWorkWakeBody(want)
+	if len(body) > 16<<10 || !validTriggerID(want.TaskID) || !validTriggerID(want.MandateID) {
+		return domain.TaskWorkDelivery{}, ErrInvalid
+	}
+	target := []string{want.MemberID}
+	m, err := createMessageInTx(ctx, tx, MessageRequest{GroupID: want.GroupID, TopicID: want.TopicID, ActorID: want.SenderMemberID, Content: body, RecipientIDs: target}, target)
+	if err != nil {
+		return domain.TaskWorkDelivery{}, err
+	}
+	if m.GroupID != want.GroupID || m.TopicID != want.TopicID || m.SenderID != want.SenderMemberID || m.Content != body || len(m.Deliveries) != 1 {
+		return domain.TaskWorkDelivery{}, ErrConflict
+	}
+	d := m.Deliveries[0]
+	if d.RecipientID != want.MemberID || d.MessageID != m.ID || d.State != domain.DeliveryStateQueued || d.TurnID != "" {
+		return domain.TaskWorkDelivery{}, ErrConflict
+	}
+	want.DeliveryID, want.MessageID, want.ConversationID = d.ID, m.ID, d.ConversationID
+	if persistSource != nil {
+		if err := persistSource(want); err != nil {
+			return domain.TaskWorkDelivery{}, err
+		}
+	}
+	if err := coordinationDispatchWrite(ctx, tx, "INSERT INTO task_work_deliveries("+taskWorkDeliveryColumns+") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		want.DeliveryID, want.SourceKind, want.SourceID, want.AssignmentID, want.TaskID, want.TaskRevision, want.MandateID, want.AuthorityGeneration,
+		want.OwnerMemberID, want.MemberID, want.SenderMemberID, want.GroupID, want.TopicID, want.ConversationID, want.MessageID); err != nil {
+		return domain.TaskWorkDelivery{}, err
+	}
+	return want, nil
+}
+
+// Resolve the original wake on replay; a missing marker never allocates again.
+func taskWorkB3WakeInTx(ctx context.Context, tx *sql.Tx, sender MemberToolScope, v assignmentSnapshot, kind domain.TaskWorkSourceKind,
+	sourceID, memberID string, replay bool, persistSource func(domain.TaskWorkDelivery) error) (taskWorkFacts, error) {
+	want := taskWorkRecord(v, sender.MemberID, sourceID)
+	want.SourceKind, want.MemberID = kind, memberID
+	if (kind != domain.TaskWorkSourceDelegation && kind != domain.TaskWorkSourceReport) ||
+		want.GroupID != sender.Claim.GroupID || want.TopicID != sender.TopicID ||
+		!taskWorkTargetValid(want, v.r.CoordinatorMemberID) {
+		return taskWorkFacts{}, ErrMemberToolDenied
+	}
+	var err error
+	if replay {
+		err = tx.QueryRowContext(ctx, `SELECT delivery_id,message_id,conversation_id FROM task_work_deliveries
+		 WHERE source_kind=? AND source_id=?`, kind, sourceID).Scan(&want.DeliveryID, &want.MessageID, &want.ConversationID)
+	} else {
+		want, err = taskWorkCreateWakeInTx(ctx, tx, want, persistSource)
+	}
+	if err != nil {
+		return taskWorkFacts{}, coordinationRoleRelationError(err)
+	}
+	saved, err := taskWorkDeliveryInTx(ctx, tx, want.GroupID, want.DeliveryID)
+	if err != nil {
+		return taskWorkFacts{}, coordinationRoleRelationError(err)
+	}
+	if saved.d != want || saved.sourceTurnID != sender.Claim.TurnID || (!replay && saved.turnID != "") {
+		return taskWorkFacts{}, ErrConflict
+	}
+	return saved, nil
+}
+
+func taskWorkTargetValid(d domain.TaskWorkDelivery, coordinator string) bool {
+	switch d.SourceKind {
+	case domain.TaskWorkSourceFollowup, domain.TaskWorkSourceReport:
+		return d.MemberID == d.OwnerMemberID
+	case domain.TaskWorkSourceDelegation:
+		return d.MemberID != d.OwnerMemberID && d.MemberID != coordinator
+	default:
+		return false // Handbacks record notices, never native wakes.
+	}
+}
+
 const taskWorkClaimDeliveryState = `CASE WHEN t.accepted_at IS NOT NULL THEN 'accepted'
  WHEN t.state IN ('starting','running','cancel_requested','unknown') THEN 'queued' ELSE 'failed' END`
 
@@ -110,6 +167,8 @@ type taskWorkFacts struct {
 	v                                  assignmentSnapshot
 	dispatch                           domain.AssignmentDispatchState
 	turnID, assessmentID, sourceTurnID string
+	delegation                         *domain.TaskWorkDelegation
+	report                             *domain.TaskWorkReport
 }
 
 // Probe every identity by its unique key before joining any proof. An orphan
@@ -143,7 +202,7 @@ func taskWorkDeliveryInTx(ctx context.Context, tx *sql.Tx, groupID, deliveryID s
 	if err != nil {
 		return f, coordinationRoleRelationError(err)
 	}
-	if d.GroupID != groupID || d.SourceKind != domain.TaskWorkSourceFollowup || d.MemberID != d.OwnerMemberID {
+	if d.GroupID != groupID {
 		return f, ErrMemberToolDenied
 	}
 	for _, id := range []string{d.DeliveryID, d.SourceID, d.AssignmentID, d.TaskID, d.MandateID, d.OwnerMemberID, d.MemberID, d.SenderMemberID, d.ConversationID, d.MessageID} {
@@ -157,7 +216,8 @@ func taskWorkDeliveryInTx(ctx context.Context, tx *sql.Tx, groupID, deliveryID s
 	}
 	r := f.v.r
 	if f.v.a.GroupID != d.GroupID || f.v.a.TaskID != d.TaskID || f.v.a.WorkerMemberID != d.OwnerMemberID ||
-		r.TopicID != d.TopicID || r.TaskRevision != d.TaskRevision || r.MandateID != d.MandateID || r.AuthorityGeneration != d.AuthorityGeneration {
+		f.dispatch.Delivery == nil || r.TopicID != d.TopicID || r.TaskRevision != d.TaskRevision ||
+		r.MandateID != d.MandateID || r.AuthorityGeneration != d.AuthorityGeneration || !taskWorkTargetValid(*d, r.CoordinatorMemberID) {
 		return f, ErrMemberToolDenied
 	}
 	var valid bool
@@ -184,7 +244,11 @@ func taskWorkDeliveryInTx(ctx context.Context, tx *sql.Tx, groupID, deliveryID s
 	if !valid {
 		return f, ErrMemberToolDenied
 	}
-	f.assessmentID, f.sourceTurnID, err = taskWorkFollowupSourceInTx(ctx, tx, *d)
+	if d.SourceKind == domain.TaskWorkSourceFollowup {
+		f.assessmentID, f.sourceTurnID, err = taskWorkFollowupSourceInTx(ctx, tx, *d)
+	} else {
+		err = taskWorkReportSourceInTx(ctx, tx, &f)
+	}
 	return f, err
 }
 
@@ -197,6 +261,35 @@ func lookupTaskWorkDeliveryInTx(ctx context.Context, tx *sql.Tx, groupID, delive
 		return taskWorkFacts{}, ErrNotFound
 	}
 	return taskWorkDeliveryInTx(ctx, tx, groupID, deliveryID)
+}
+
+// ClaimTurn has reserved the delivery and inserted its Turn in this transaction.
+// Busy rolls back the claim; it is not a handling or settlement receipt.
+func (s *Store) taskWorkClaimInTx(ctx context.Context, tx *sql.Tx, turn domain.Turn) error {
+	f, err := lookupTaskWorkDeliveryInTx(ctx, tx, turn.GroupID, turn.DeliveryID)
+	if errors.Is(err, ErrNotFound) {
+		return nil // Verified absence of a typed marker.
+	}
+	if err != nil {
+		return err
+	}
+	if f.turnID != turn.ID || f.d.MemberID != turn.MemberID || f.d.ConversationID != turn.ConversationID {
+		return ErrMemberToolDenied
+	}
+	if f.d.SourceKind == domain.TaskWorkSourceFollowup {
+		handled, err := taskWorkInputHandledInTx(ctx, tx, f.d.SourceID)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return ErrTurnBusy
+		}
+	}
+	blocked, _, err := s.taskWorkReadinessInTx(ctx, tx, f, turn.ID)
+	if err == nil && blocked != "" {
+		err = ErrTurnBusy
+	}
+	return err
 }
 
 // Legacy write paths must not treat even a damaged typed marker as chat or a

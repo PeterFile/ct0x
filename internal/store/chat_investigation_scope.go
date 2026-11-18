@@ -146,7 +146,10 @@ func investigationSubmissionProvenanceInTx(ctx context.Context, tx *sql.Tx, inpu
 	}
 	work, err = lookupTaskWorkExecutionInTx(ctx, tx, member)
 	if err == nil {
-		p = taskWorkFollowupProvenance(work)
+		if !work.d.SourceKind.IsOwnerContinuation() {
+			return p, work, ErrMemberToolDenied
+		}
+		p = taskWorkOwnerProvenance(work)
 	} else if errors.Is(err, ErrNotFound) {
 		p, err = coordinationClaimProvenanceInTx(ctx, tx, member)
 	}

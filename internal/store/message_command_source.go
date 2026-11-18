@@ -75,12 +75,13 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 	if len(messages) == 0 {
 		return nil
 	}
-	var available, hasReviewNotices, hasWorkspaceNotices, hasTaskWork, hasWorkInputs bool
+	var available, hasReviewNotices, hasWorkspaceNotices, hasTaskWork, hasWorkInputs, hasWorkReports bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=17),
 	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=18),
 	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=21),
-	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='task_work_deliveries'),`+workInputSchemaExists, taskWorkInputVersion).
-		Scan(&available, &hasReviewNotices, &hasWorkspaceNotices, &hasTaskWork, &hasWorkInputs); err != nil {
+	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='task_work_deliveries'),
+	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),`+workInputSchemaExists, taskWorkReportVersion, taskWorkInputVersion).
+		Scan(&available, &hasReviewNotices, &hasWorkspaceNotices, &hasTaskWork, &hasWorkReports, &hasWorkInputs); err != nil {
 		return err
 	}
 	if !available && !hasWorkspaceNotices {
@@ -112,6 +113,12 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 		workSource = "CASE WHEN tw.delivery_id IS NOT NULL THEN 'work:'||tw.source_kind||':'||tw.source_id END,"
 		workJoin = ` LEFT JOIN task_work_deliveries tw ON tw.message_id=m.id AND tw.group_id=m.group_id
 		 AND tw.topic_id=m.topic_id AND tw.sender_member_id=m.sender_id`
+	}
+	if hasWorkReports {
+		workKind += "CASE WHEN hb.id IS NOT NULL THEN 'platform' END,"
+		workSource += "CASE WHEN hb.id IS NOT NULL THEN 'work:handback:'||hb.id END,"
+		workJoin += ` LEFT JOIN task_work_handbacks hb ON hb.notice_message_id=m.id AND hb.group_id=m.group_id
+		 AND hb.topic_id=m.topic_id AND hb.owner_member_id=m.sender_id`
 	}
 	returnKind, returnSource, returnJoin := "", "", ""
 	if hasWorkInputs {

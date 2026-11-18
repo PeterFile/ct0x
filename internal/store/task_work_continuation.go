@@ -18,7 +18,7 @@ type taskWorkActivationAuthority struct {
 
 func (a *taskWorkActivationAuthority) authorizeTaskAttemptInTx(_ context.Context, _ *sql.Tx, in ActivateTaskAttemptInput) error {
 	d := a.delivery
-	if d.SourceKind != domain.TaskWorkSourceFollowup || d.OwnerMemberID != d.MemberID || in.MemberScope == nil || *in.MemberScope != a.scope ||
+	if !d.SourceKind.IsOwnerContinuation() || d.OwnerMemberID != d.MemberID || in.MemberScope == nil || *in.MemberScope != a.scope ||
 		in.ActorID != d.OwnerMemberID || in.GroupID != d.GroupID || in.TaskID != d.TaskID || in.ExpectedRevision != d.TaskRevision ||
 		in.ExpectedActiveAttemptID != a.previous || a.previous == "" || in.IdempotencyKey != "" {
 		return ErrMemberToolDenied
@@ -46,6 +46,9 @@ func (s *Store) BindTaskWorkContinuation(ctx context.Context, scope MemberToolSc
 		return out, err
 	}
 	d := f.d
+	if !d.SourceKind.IsOwnerContinuation() {
+		return out, ErrMemberToolDenied
+	}
 	blocked, previous, err := s.taskWorkReadinessInTx(ctx, tx, f, scope.Claim.TurnID)
 	if err != nil {
 		return out, err
@@ -119,6 +122,9 @@ func (s *Store) SubmitTaskWorkResult(ctx context.Context, scope MemberToolScope,
 		return out, err
 	}
 	d := f.d
+	if !d.SourceKind.IsOwnerContinuation() {
+		return out, ErrMemberToolDenied
+	}
 	attempt, err := taskWorkBoundAttemptInTx(ctx, tx, d, "")
 	if err != nil {
 		return out, err

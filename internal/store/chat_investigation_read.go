@@ -17,7 +17,7 @@ func (s *Store) investigationForRoleInTx(ctx context.Context, tx *sql.Tx, role C
 	}
 	f, err := lookupTaskWorkExecutionInTx(ctx, tx, role.Member)
 	if err == nil {
-		if taskWorkFollowupProvenance(f) != role.Provenance {
+		if !f.d.SourceKind.IsOwnerContinuation() || taskWorkOwnerProvenance(f) != role.Provenance {
 			return domain.TaskInvestigationScope{}, ErrMemberToolDenied
 		}
 		evidence, err := s.investigationForFollowupInTx(ctx, tx, f, role.Member, role.AttemptID)
@@ -35,7 +35,7 @@ func (s *Store) investigationForRoleInTx(ctx context.Context, tx *sql.Tx, role C
 }
 
 func (s *Store) investigationForFollowupInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, member MemberToolScope, attemptID string) (taskInvestigationEvidence, error) {
-	state, err := s.taskWorkFollowupRoleInTx(ctx, tx, f, member.Claim.TurnID)
+	state, err := s.taskWorkOwnerRoleInTx(ctx, tx, f, member.Claim.TurnID)
 	if err != nil {
 		return taskInvestigationEvidence{}, err
 	}
