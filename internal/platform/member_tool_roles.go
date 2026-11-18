@@ -20,21 +20,19 @@ func (s *MemberTools) issueCoordinationRole(ctx context.Context, scope store.Coo
 
 func (s *MemberTools) issueCoordinationRoleWithCapabilities(ctx context.Context, scope store.CoordinationToolScope, facts []store.DispatchWorkerCapabilityFact) (string, error) {
 	facts = slices.Clone(facts)
-	var operations []string
 	switch scope.Provenance.Kind {
 	case store.CoordinationRoleCoordinator:
 		if scope.Provenance.AssignmentID != "" || scope.AttemptID != "" {
 			return "", store.ErrMemberToolDenied
 		}
-		operations = []string{"list_members", "read_channel", "search_history", "read_history", "decide_dispatch"}
 	case store.CoordinationRoleWorker:
 		if scope.Provenance.AssignmentID == "" || scope.AttemptID == "" {
 			return "", store.ErrMemberToolDenied
 		}
-		operations = []string{"read_channel", "search_history", "read_history", "submit_result"}
 	default:
 		return "", store.ErrMemberToolDenied
 	}
+	operations := memberToolRoleOperations(scope.Provenance.Kind)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.capabilities) >= maxMemberToolRegistrations {
@@ -58,6 +56,13 @@ func (s *MemberTools) issueCoordinationRoleWithCapabilities(ctx context.Context,
 		return "", store.ErrMemberToolDenied
 	}
 	if scope.Provenance.Kind == store.CoordinationRoleWorker {
+		var work MemberWorkInputGrants
+		if s.WorkInputsEnabled() {
+			work, err = s.workInputs.WorkInputGrants(ctx, scope)
+			if err != nil {
+				return "", err
+			}
+		}
 		_, err := s.db.GetTaskWorkspaceScope(ctx, scope.Provenance.GroupID, scope.Provenance.TaskID)
 		if err != nil && !errors.Is(err, store.ErrNotFound) {
 			return "", err
@@ -72,6 +77,15 @@ func (s *MemberTools) issueCoordinationRoleWithCapabilities(ctx context.Context,
 			}
 			s.workspace.grants[key] = grant
 			operations = provider.WorkspaceWorkerToolNames()
+		}
+		if work.Read {
+			operations = append(operations, "read_work_inputs")
+		}
+		if work.Ack {
+			operations = append(operations, "ack_work_input")
+		}
+		if work.HandBack {
+			operations = append(operations, "hand_back_work_input")
 		}
 	}
 	s.capabilities[key] = memberToolRegistration{scope: scope.Member, role: scope,

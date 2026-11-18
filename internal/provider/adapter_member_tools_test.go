@@ -175,6 +175,26 @@ func TestMemberToolConfigRejectsUnsafeTransportAndFiles(t *testing.T) {
 	}
 }
 
+func TestMemberToolConfigAcceptsOnlyIssuedContinuationMarker(t *testing.T) {
+	_, _, path := memberToolFiles(t, `exit 99`)
+	base := strings.TrimSuffix(strings.TrimSpace(memberToolTestConfig), "}")
+	for _, tc := range []struct {
+		field string
+		valid bool
+	}{
+		{"", true}, {`,"continue_work":true`, true}, {`,"continue_work":false`, false},
+		{`,"continue_work":null`, false}, {`,"continue_work":"true"`, false},
+		{`,"continue_work":true,"continue_work":true`, false}, {`,"CONTINUE_WORK":true`, false},
+	} {
+		if err := os.WriteFile(path, []byte(base+tc.field+"}"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readMemberToolConfig(path); (err == nil) != tc.valid {
+			t.Errorf("continuation field %q valid=%v: %v", tc.field, tc.valid, err)
+		}
+	}
+}
+
 func TestCodexAppServerMemberConfigDriftDoesNotStartProcess(t *testing.T) {
 	for _, change := range []string{"contents", "replacement", "mode"} {
 		t.Run(change, func(t *testing.T) {

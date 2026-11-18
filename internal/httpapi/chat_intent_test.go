@@ -66,6 +66,26 @@ func chatHTTPBody(extra string) string {
 	return `{"content":"将按讨论结论交付文本。","intent_assessment":{"disposition":"request_work","action":"text_submission","title":"三条摘要","description":"只生成文本","acceptance":"有三条可核对结论","reason":"当前用户结合上下文明确要求交付"` + extra + `}}`
 }
 
+func TestChatContinuationDisabledDoesNotConsumeLegacyIntake(t *testing.T) {
+	f := chatHTTPSetup(t)
+	f.handler = mustServer(t, DefaultAddress, append(f.routes, MemberMCPRoutes(f.tools)...)...).Handler
+	list := memberMCPHTTP(t, f, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if list.Code != 200 || !strings.Contains(list.Body.String(), `"name":"send_message"`) || strings.Contains(list.Body.String(), `"continue_work"`) || strings.Contains(list.Body.String(), `"followup"`) {
+		t.Fatalf("disabled service changed the intake schema: %s", list.Body)
+	}
+	before := f.counts(t)
+	body := `{"content":"继续。","intent_assessment":{"disposition":"continue_work","reason":"用户明确要求续办","followup":{"task_id":"hint"}}}`
+	w := f.request(t, "send_message", body, "disabled-continuation")
+	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 403, "forbidden")
+	if f.counts(t) != before {
+		t.Fatal("disabled continuation changed durable state")
+	}
+	w = f.request(t, "send_message", chatHTTPBody(""), "legacy-after-denial")
+	if w.Code != 201 {
+		t.Fatalf("disabled branch consumed the old intake: %d %s", w.Code, w.Body)
+	}
+}
+
 func TestChatAuthorityReadOnlyMessageSources(t *testing.T) {
 	f := chatHTTPSetup(t)
 	routes := append(f.routes, MessageRoutes(platform.NewLocalUser(f.db))...)

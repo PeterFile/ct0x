@@ -46,6 +46,7 @@ type MemberTools struct {
 	capabilities map[[sha256.Size]byte]memberToolRegistration
 	mcpRequests  map[[sha256.Size]byte]map[[sha256.Size]byte][sha256.Size]byte
 	chatEngine   *coordination.Engine
+	workInputs   MemberWorkInputService // Immutable after runtime construction.
 	workspace    *memberWorkspaceRegistry
 }
 

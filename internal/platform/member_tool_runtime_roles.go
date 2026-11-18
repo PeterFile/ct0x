@@ -55,13 +55,6 @@ func memberToolRoleOperations(kind store.CoordinationRoleKind) []string {
 	return []string{"read_channel", "search_history", "read_history", "submit_result"}
 }
 
-func (e *memberToolRuntimeRun) roleOperations() []string {
-	if e.workspace {
-		return provider.WorkspaceWorkerToolNames()
-	}
-	return memberToolRoleOperations(e.role.Kind)
-}
-
 func (e *memberToolRuntimeRun) roleStartup(ctx context.Context, claim store.TurnClaim) (store.CoordinationToolScope, error) {
 	db := e.runtime.tools.db
 	turn, err := db.GetTurn(ctx, claim.GroupID, claim.TurnID)
@@ -88,7 +81,7 @@ func (e *memberToolRuntimeRun) roleStartup(ctx context.Context, claim store.Turn
 	return store.CoordinationToolScope{Member: member, Provenance: state.Provenance, AttemptID: state.AttemptID}, nil
 }
 
-func (e *memberToolRuntimeRun) rolePreflight(ctx context.Context, request provider.ExecuteRequest, scope store.CoordinationToolScope, token string, config *memberToolRuntimeConfigFile) bool {
+func (e *memberToolRuntimeRun) rolePreflight(ctx context.Context, request provider.ExecuteRequest, scope store.CoordinationToolScope, token string, operations []string, config *memberToolRuntimeConfigFile) bool {
 	r := e.runtime
 	if ctx.Err() != nil || !r.roleFence.rootValid(request.RuntimeDir) || !r.clearRunDirectory(request) || !r.rootValid() || config == nil || !config.valid() {
 		return false
@@ -105,7 +98,7 @@ func (e *memberToolRuntimeRun) rolePreflight(ctx context.Context, request provid
 	// successful Issue. Lock order stays registry -> Store, never fence -> registry.
 	r.tools.mu.RLock()
 	entry, found := r.tools.capabilities[sha256.Sum256([]byte(token))]
-	valid := found && entry.scope == scope.Member && entry.role == scope && slices.Equal(entry.grants.Operations, e.roleOperations()) &&
+	valid := found && entry.scope == scope.Member && entry.role == scope && slices.Equal(entry.grants.Operations, operations) &&
 		entry.grants.Skills == nil && entry.grants.Artifacts == nil && slices.Equal(entry.dispatchCapabilities, e.dispatchCapabilities)
 	r.tools.mu.RUnlock()
 	return valid && r.roleFence.rootValid(request.RuntimeDir) && r.rootValid() && config.valid() && checkCtx.Err() == nil && ctx.Err() == nil
@@ -154,18 +147,19 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 		return unknown
 	}
 	r.tools.mu.RLock()
-	entry := r.tools.capabilities[sha256.Sum256([]byte(token))]
-	e.workspace = slices.Equal(entry.grants.Operations, provider.WorkspaceWorkerToolNames())
+	entry, found := r.tools.capabilities[sha256.Sum256([]byte(token))]
+	operations := slices.Clone(entry.grants.Operations)
 	r.tools.mu.RUnlock()
-	if e.workspace && e.binding.ProviderName == provider.Codex {
+	workspace := slices.Contains(operations, "workspace_write")
+	if !found || workspace && e.binding.ProviderName == provider.Codex {
 		return unknown
 	}
 	config, err = r.createConfig(token)
-	if err != nil || !e.rolePreflight(ctx, request, scope, token, config) {
+	if err != nil || !e.rolePreflight(ctx, request, scope, token, operations, config) {
 		return unknown
 	}
-	native, err := e.factory(filepath.Join(r.configRoot, config.name), claim.TurnID, e.roleOperations())
-	if err != nil || native == nil || !e.rolePreflight(ctx, request, scope, token, config) || !owner.beginInvoke() {
+	native, err := e.factory(filepath.Join(r.configRoot, config.name), claim.TurnID, slices.Clone(operations))
+	if err != nil || native == nil || !e.rolePreflight(ctx, request, scope, token, operations, config) || !owner.beginInvoke() {
 		return unknown
 	}
 	// Keep the native receipt before deriving the wrapper aggregate. Receipt
@@ -188,7 +182,7 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 			aggregate.Reason = "本次调用未启动，但整轮未执行证据不足，需对账后再处理"
 		}
 	}
-	if e.workspace {
+	if workspace {
 		unresolved, err := r.tools.db.HasUnresolvedWorkspaceOperations(checkCtx, claim.GroupID, claim.TurnID)
 		if err != nil || unresolved {
 			aggregate.Outcome = provider.OutcomeUnknown

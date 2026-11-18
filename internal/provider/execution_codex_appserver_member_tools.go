@@ -68,7 +68,10 @@ func readMemberToolConfig(path string) (memberToolConfig, error) {
 		return config, errPiMemberToolConfiguration
 	}
 	fields, err := codexAppServerMap(raw)
-	if err != nil || len(fields) != 2 || json.Unmarshal(fields["endpoint"], &config.endpoint) != nil || json.Unmarshal(fields["token"], &config.token) != nil {
+	// The optional Pi schema hint is not authority; Codex discovers its schema
+	// from MCP under the same bound token rather than reading the hint.
+	if err != nil || len(fields) != 2 && !(len(fields) == 3 && string(fields["continue_work"]) == "true") ||
+		json.Unmarshal(fields["endpoint"], &config.endpoint) != nil || json.Unmarshal(fields["token"], &config.token) != nil {
 		return memberToolConfig{}, errPiMemberToolConfiguration
 	}
 	parts := memberToolEndpoint.FindStringSubmatch(config.endpoint)
@@ -87,34 +90,6 @@ func readMemberToolConfig(path string) (memberToolConfig, error) {
 	}
 	config.file, config.digest = after, sha256.Sum256(raw)
 	return config, nil
-}
-
-// Match the existing Pi selector: an ordinary subset, or one complete role.
-// The Pi adapter still delegates construction to its original version/path gate.
-func memberToolProfile(names []string) ([]string, error) {
-	canonical := strings.Split(piMemberToolNames+",search_history,read_history", ",")
-	all := false
-	switch {
-	case slices.Contains(names, "decide_dispatch"):
-		canonical, all = []string{"list_members", "read_channel", "search_history", "read_history", "decide_dispatch"}, true
-	case slices.Contains(names, "submit_result"):
-		canonical, all = []string{"read_channel", "search_history", "read_history", "submit_result"}, true
-	}
-	if len(names) == 0 || all && len(names) != len(canonical) {
-		return nil, errPiMemberToolConfiguration
-	}
-	for i, name := range names {
-		if !slices.Contains(canonical, name) || slices.Contains(names[:i], name) {
-			return nil, errPiMemberToolConfiguration
-		}
-	}
-	selected := make([]string, 0, len(names))
-	for _, name := range canonical {
-		if slices.Contains(names, name) {
-			selected = append(selected, name)
-		}
-	}
-	return selected, nil
 }
 
 type codexAppServerMemberToolExecutor struct {

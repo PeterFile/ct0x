@@ -165,10 +165,12 @@ for (const [index, name] of history.entries()) {
   });
 }
 
-for (const profile of [four, six]) {
+const workInputs = ["read_work_inputs", "ack_work_input", "hand_back_work_input"];
+const workerWithInputs = ["read_channel", ...history, "submit_result", ...workInputs];
+for (const profile of [four, six, workerWithInputs]) {
   test(`real Pi 1.4.0 SDK activates exactly ${profile.length} granted tools and cannot widen them without a prompt`, async t => {
     const extensions = await load(t);
-    assert.deepEqual([...definitions(extensions).keys()], [...six, "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact"], "the actual loader must register all twelve schemas");
+    assert.deepEqual([...definitions(extensions).keys()], [...six, "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", ...workInputs]);
     const { createAgentSession, SessionManager, SettingsManager } = await loadSessionSDK();
     const directory = await mkdtemp(join(tmpdir(), "pi-history-session-"));
     t.after(() => rm(directory, { recursive: true, force: true }));
@@ -210,8 +212,8 @@ for (const profile of [four, six]) {
       assert.equal(session.model, model);
       assert.deepEqual(session.getActiveToolNames(), profile);
       assert.deepEqual(session.getCallableToolNames(), profile);
-      const inactive = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls", "codemode", "tool_search", "ungranted", "create_task", "decide_dispatch", "submit_result"];
-      session.setActiveToolsByName([...profile, ...history, ...inactive]);
+      const inactive = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls", "codemode", "tool_search", "ungranted", "create_task", ...six, "decide_dispatch", "submit_result", "workspace_read", "workspace_write", "publish_workspace_artifact", ...workInputs];
+      session.setActiveToolsByName([...new Set([...profile, ...inactive])]);
       assert.deepEqual(session.getActiveToolNames(), profile, "session API must not widen the allowlist");
       assert.deepEqual(session.getCallableToolNames(), profile);
       assert.deepEqual(session.messages, []);

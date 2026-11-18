@@ -6,7 +6,7 @@ import { request } from "node:http";
 const CONFIG_LIMIT = 4096;
 const BYTE_LIMIT = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 25_000;
-export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact"]);
+export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", "read_work_inputs", "ack_work_input", "hand_back_work_input"]);
 
 /** @typedef {{ text: string, json: unknown }} Reply */
 /** @typedef {(toolName: string, params: unknown, toolCallId: string, signal?: AbortSignal) => Promise<Reply>} Client */
@@ -30,6 +30,12 @@ function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/** @param {string} value */
+export function validUnicode(value) {
+  // The Unicode-mode pattern sees valid pairs as a single non-surrogate scalar.
+  return !/[\ud800-\udfff]/u.test(value);
+}
+
 /** @param {unknown} value */
 function endpointURL(value) {
   if (typeof value !== "string" ||
@@ -45,9 +51,9 @@ function endpointURL(value) {
 /**
  * Read once; the launcher owns the config file's lifetime.
  * @param {string | undefined} path
- * @returns {Client}
+ * @returns {{ invoke: Client, continueWork: boolean }}
  */
-export function createClient(path) {
+export function openBridge(path) {
   let fd;
   try {
     if (!path || !isAbsolute(path)) throw new Error(CONFIG_ERROR);
@@ -66,7 +72,10 @@ export function createClient(path) {
     }
     if (size > CONFIG_LIMIT) throw new Error(CONFIG_ERROR);
     const config = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, size)));
-    if (!isRecord(config) || Object.keys(config).sort().join(",") !== "endpoint,token" ||
+    if (!isRecord(config)) throw new Error(CONFIG_ERROR);
+    const fields = Object.keys(config).sort().join(",");
+    const continueWork = fields === "continue_work,endpoint,token" && config.continue_work === true;
+    if ((fields !== "endpoint,token" && !continueWork) ||
         typeof config.token !== "string" || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token)) {
       throw new Error(CONFIG_ERROR);
     }
@@ -74,7 +83,10 @@ export function createClient(path) {
     const token = config.token;
     /** @type {WriteState} */
     const writes = {};
-    return (toolName, params, toolCallId, signal) => requestTool(endpoint, token, writes, toolName, params, toolCallId, signal);
+    return {
+      invoke: (toolName, params, toolCallId, signal) => requestTool(endpoint, token, writes, toolName, params, toolCallId, signal),
+      continueWork,
+    };
   } catch {
     throw new Error(CONFIG_ERROR);
   } finally {
@@ -82,6 +94,11 @@ export function createClient(path) {
       try { closeSync(fd); } catch { throw new Error(CONFIG_ERROR); }
     }
   }
+}
+
+/** @param {string | undefined} path @returns {Client} */
+export function createClient(path) {
+  return openBridge(path).invoke;
 }
 
 /** @param {Buffer} buffer @returns {{ text: string, json: unknown }} */
@@ -114,14 +131,16 @@ function validRoleReceiptWire(text, count = 4) {
   return field.lastIndex === wire.length;
 }
 
-/** @param {unknown} value @param {string} token @param {boolean} roleWrite */
-function serverError(value, token, roleWrite) {
+/** @param {unknown} value @param {string} token @param {boolean} roleWrite @param {string} toolName */
+function serverError(value, token, roleWrite, toolName) {
   if (!isRecord(value) || !isRecord(value.error) || typeof value.error.code !== "string") return undefined;
   const raw = value.error.code;
   let code = /^[a-z][a-z0-9_]{0,63}$/.test(raw) && !raw.includes(token) ? raw : "request_failed";
   if (code.includes(token)) code = "";
-  const message = (!roleWrite || raw === "request_canceled" || raw === "deadline_exceeded" ?
-    SERVER_ERROR_MESSAGES.get(raw) : undefined) || "成员工具请求失败";
+  const message = toolName === "read_work_inputs" && raw === "tool_result_too_large" ?
+    "完整工作输入超过响应上限，未返回部分内容；当前工具不支持分段读取" :
+    ((!roleWrite || raw === "request_canceled" || raw === "deadline_exceeded" ?
+      SERVER_ERROR_MESSAGES.get(raw) : undefined) || "成员工具请求失败");
   return code ? `${message}（${code}）。` : `${message}。`;
 }
 
@@ -136,14 +155,23 @@ function validReceiptTime(value) {
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 19) === wall;
 }
 
-/** @param {string} toolName @param {number} status @param {unknown} value @param {unknown} requestKind */
-function validWriteReceipt(toolName, status, value, requestKind) {
+/** @param {string} toolName */
+function isWorkInputWrite(toolName) {
+  return toolName === "ack_work_input" || toolName === "hand_back_work_input";
+}
+
+/** @param {string} toolName @param {number} status @param {unknown} value @param {unknown} requestValue */
+function validWriteReceipt(toolName, status, value, requestValue) {
   // Role receipts are fixed projections; ordinary receipts remain additive.
+  if (isWorkInputWrite(toolName)) {
+    return status === 201 && isRecord(value) && Object.keys(value).join(",") === "input_id" &&
+      typeof value.input_id === "string" && value.input_id !== "" && value.input_id === requestValue;
+  }
   if (toolName === "decide_dispatch" || toolName === "submit_result") {
     if (status !== 201 || !isRecord(value) || !validReceiptTime(value.created_at)) return false;
     if (toolName === "decide_dispatch") {
       return Object.keys(value).sort().join(",") === "assignment_id,created_at,decision_id,kind" &&
-        typeof value.decision_id === "string" && value.decision_id.length > 0 && value.kind === requestKind &&
+        typeof value.decision_id === "string" && value.decision_id.length > 0 && value.kind === requestValue &&
         (value.kind === "assign" ? typeof value.assignment_id === "string" && value.assignment_id.length > 0 :
           value.kind === "decline" && value.assignment_id === "");
     }
@@ -195,25 +223,29 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
   /** @param {string} message */
   const safeError = message => new Error(message.replaceAll(token, "〔已隐藏〕"));
   if (!TOOL_NAMES.some(name => name === toolName)) throw safeError("成员工具名称无效，未发送请求。");
-  if (typeof toolCallId !== "string" || !toolCallId.trim()) throw safeError("工具调用标识无效，未发送请求。");
+  const workInputWrite = isWorkInputWrite(toolName);
+  const roleWrite = toolName === "decide_dispatch" || toolName === "submit_result" || workInputWrite;
+  const workspaceWrite = toolName === "workspace_write" || toolName === "publish_workspace_artifact";
+  const write = roleWrite || workspaceWrite || toolName === "send_message" || toolName === "create_member";
+  // Hashing malformed UTF-16 as UTF-8 would alias valid replacement characters.
+  if (typeof toolCallId !== "string" || !toolCallId.trim() || (write && !validUnicode(toolCallId))) {
+    throw safeError("工具调用标识无效，未发送请求。");
+  }
   let body;
   /** @type {unknown} */
-  let requestKind;
+  let requestValue;
   try {
     const text = JSON.stringify(params);
     if (typeof text !== "string" || text.includes(token)) throw new Error();
     body = Buffer.from(text, "utf8");
-    if (toolName === "decide_dispatch") {
+    if (toolName === "decide_dispatch" || workInputWrite) {
       const snapshot = JSON.parse(text);
-      if (isRecord(snapshot)) requestKind = snapshot.kind;
+      if (isRecord(snapshot)) requestValue = workInputWrite ? snapshot.input_id : snapshot.kind;
     }
   } catch {
     throw safeError("成员工具参数无效，未发送请求。");
   }
   if (body.length > BYTE_LIMIT) throw safeError("工具请求超过 64 KiB 限制，未发送请求。");
-  const roleWrite = toolName === "decide_dispatch" || toolName === "submit_result";
-  const workspaceWrite = toolName === "workspace_write" || toolName === "publish_workspace_artifact";
-  const write = roleWrite || workspaceWrite || toolName === "send_message" || toolName === "create_member";
   const fingerprint = write ? createHash("sha256").update(body).digest("hex") : "";
   if (write && writes.unknown) {
     const previous = writes.unknown;
@@ -291,20 +323,21 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
             toolName === "create_member" ? status === 200 || status === 201 : status === 200;
           const sensitive = result.text.includes(token) || JSON.stringify(result.json)?.includes(token);
           if (!success) {
-            const message = status >= 400 && status <= 599 ? serverError(result.json, token, roleWrite) : undefined;
+            const message = status >= 400 && status <= 599 ? serverError(result.json, token, roleWrite, toolName) : undefined;
             const error = isRecord(result.json) && isRecord(result.json.error) ? result.json.error : undefined;
             const code = error?.code;
             const rejected = !sensitive && typeof code === "string" && typeof error?.message === "string" &&
               (REJECTION_CODES.get(status)?.includes(code) ||
+                (toolName === "read_work_inputs" && status === 413 && code === "tool_result_too_large") ||
                 (toolName !== "decide_dispatch" && ((status === 404 && code === "not_found") || (status === 409 && code === "conflict"))) ||
                 (!roleWrite && status === 409 && code === "member_capacity"));
             const suffix = rejected || code === "request_canceled" || code === "deadline_exceeded" ? "" : ` ${unknown}`;
             return fail(message ? message + suffix : invalidResponse, rejected ? "rejected" : "unknown");
           }
           if (sensitive) return fail(`成员工具返回了敏感数据，已拒绝显示；${unknown}`);
-          if (!validWriteReceipt(toolName, status, result.json, requestKind)) return fail(invalidResponse);
+          if (!validWriteReceipt(toolName, status, result.json, requestValue)) return fail(invalidResponse);
           if (roleWrite || workspaceWrite) {
-            if (!validRoleReceiptWire(result.text, workspaceWrite ? 5 : 4)) return fail(invalidResponse);
+            if (!validRoleReceiptWire(result.text, workInputWrite ? 1 : workspaceWrite ? 5 : 4)) return fail(invalidResponse);
             result = { text: JSON.stringify(result.json), json: result.json };
           }
           settled = true;

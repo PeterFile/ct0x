@@ -1,15 +1,16 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { createClient } from "./bridge.mjs";
+import { openBridge, validUnicode } from "./bridge.mjs";
+
+const workInputBytes = { reason: 4096, content: 16384, constraint: 2048, handBackReason: 2048 } as const;
 
 const pagination = Type.Object({
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: "每页条数，范围 1 至 200。" })),
   before: Type.Optional(Type.String({ description: "上一页返回的不透明游标。" })),
 }, { additionalProperties: false });
 
-const chatAssessment = Type.Object({
-  disposition: Type.Union([Type.Literal("discuss"), Type.Literal("clarify"), Type.Literal("request_work"), Type.Literal("prepare_work")], { description: "仅受信chat_intake/v1解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。prepare_work仅限受支持的topic_summary。" }),
+const chatAssessmentFields = {
   action: Type.Optional(Type.Union([Type.Literal("text_submission"), Type.Literal("workspace_change")], { description: "结合可信来源和上下文提出文本交付或目录文件修改；只是一项语义建议，当前 Policy、目录授权和 Task 范围由服务器核定，模型不能授予 IO 权限。" })),
   title: Type.Optional(Type.String({ maxLength: 256, description: "仅request_work填写目标；prepare_work须省略。" })),
   description: Type.Optional(Type.String({ maxLength: 8192, description: "仅request_work填写边界；prepare_work须省略。" })),
@@ -20,7 +21,31 @@ const chatAssessment = Type.Object({
     review_id: Type.String({ minLength: 1, maxLength: 256, description: "仅引用服务器 repair_source 中的真实本机用户评审；不能选择调用者、目录或授权。" }),
     authorization: Type.Union([Type.Literal("review_request"), Type.Literal("original_agreement"), Type.Literal("chat_request")], { description: "解释实际评审修复请求、原冻结同范围约定或当前真人聊天修复请求；chat_request还须服务器核对当前真实聊天命令和正式Review引用。拒收本身、Agent共识、平台消息标签均不自动授权。服务器重验许可和版本范围。" }),
   }, { additionalProperties: false })),
-}, { additionalProperties: false });
+};
+
+function sendMessageParameters(continueWork: boolean) {
+  const disposition = Type.Union([
+    Type.Literal("discuss"), Type.Literal("clarify"), Type.Literal("request_work"), Type.Literal("prepare_work"),
+    ...(continueWork ? [Type.Literal("continue_work")] : []),
+  ], { description: "仅受信chat_intake/v1解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。prepare_work仅限受支持的topic_summary。" +
+    (continueWork ? `continue_work仅用于当前本机用户的明确续办请求；续办理由不得为空白，最多 ${workInputBytes.reason} UTF-8 字节。` : "") });
+  const assessment = Type.Object({
+    disposition,
+    ...chatAssessmentFields,
+    ...(continueWork ? { followup: Type.Optional(Type.Object({
+      task_id: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "仅填写用户明确引用的任务；实际工作和权限由服务器核定。" })),
+      constraint: Type.Optional(Type.String({ maxLength: workInputBytes.constraint,
+        description: `仅引用当前用户原文，不授予权限。空字符串等同省略；非空时不得全为空白且最多 ${workInputBytes.constraint} UTF-8 字节。` })),
+    }, { additionalProperties: false, description: "仅用于受信 continue_work 评估。" })) } : {}),
+  }, { additionalProperties: false });
+  return Type.Object({
+    content: Type.String({ description: "消息正文。" + (continueWork ? `续办正文不得为空白，最多 ${workInputBytes.content} UTF-8 字节。` : "") }),
+    recipient_ids: Type.Optional(Type.Array(Type.String(), { description: "接收成员标识；省略或空数组表示公开消息，不创建投递、不唤醒成员；仅显式列出的成员会进入投递队列。" })),
+    intent_assessment: Type.Optional(assessment),
+  }, { additionalProperties: false });
+}
+
+const workInputId = Type.String({ minLength: 1, maxLength: 256, description: "服务器返回的本轮工作输入标识。" });
 
 const tools = [
   {
@@ -39,11 +64,7 @@ const tools = [
     name: "send_message",
     label: "发送群组消息",
     description: "在绑定频道保存消息，不代表投递确认。只有受信intake可intent_assessment；not_admitted是持久未准入，不是执行成功。intake须先评估，随后可公开讨论；真人触发轮最多邀请一个同群固定ID一次，成员轮不能递归邀请。",
-    parameters: Type.Object({
-      content: Type.String({ description: "消息正文。" }),
-      recipient_ids: Type.Optional(Type.Array(Type.String(), { description: "接收成员标识；省略或空数组表示公开消息，不创建投递、不唤醒成员；仅显式列出的成员会进入投递队列。" })),
-      intent_assessment: Type.Optional(chatAssessment),
-    }, { additionalProperties: false }),
+    parameters: sendMessageParameters(false),
   },
   {
     name: "create_member",
@@ -131,6 +152,28 @@ const tools = [
       expected_version_id: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "更新时必须提供实际基于的精确版本。" })),
     }, { additionalProperties: false }),
   },
+  {
+    name: "read_work_inputs",
+    label: "读取工作输入",
+    description: "只读取本轮绑定的工作输入；读取不会确认已处理。",
+    defaultActive: false,
+    parameters: Type.Object({}, { additionalProperties: false }),
+  },
+  {
+    name: "ack_work_input",
+    label: "确认工作输入",
+    description: "显式确认本轮已处理指定工作输入；结果未知时保留原调用标识并先对账，不自动重试。",
+    defaultActive: false,
+    parameters: Type.Object({ input_id: workInputId }, { additionalProperties: false }),
+  },
+  {
+    name: "hand_back_work_input",
+    label: "交回工作输入",
+    description: "将未处理的工作输入交回并说明原因；结果未知时保留原调用标识并先对账，不自动重试。",
+    defaultActive: false,
+    parameters: Type.Object({ input_id: workInputId, reason: Type.String({ minLength: 1, maxLength: workInputBytes.handBackReason,
+      description: `交回理由不得为空白，最多 ${workInputBytes.handBackReason} UTF-8 字节。` }) }, { additionalProperties: false }),
+  },
 ] as const;
 
 function workspacePath(value: string, directory: boolean): boolean {
@@ -138,36 +181,69 @@ function workspacePath(value: string, directory: boolean): boolean {
     (directory && value === "." || value.split("/").every(part => part !== "" && part !== "." && part !== ".."));
 }
 
-function workspaceText(value: string, limit: number): boolean {
-  return !/[\ud800-\udfff]/u.test(value) && Buffer.byteLength(value, "utf8") <= limit;
+function utf8TextWithinBytes(value: string, limit: number): boolean {
+  return validUnicode(value) && Buffer.byteLength(value, "utf8") <= limit;
+}
+
+function validWorkInputText(value: string, limit: number): boolean {
+  // Go's TrimSpace uses Unicode White_Space, not JavaScript's trim (NEL/BOM).
+  return utf8TextWithinBytes(value, limit) && /\P{White_Space}/u.test(value) && !value.includes("\u0000");
+}
+
+function validOpaqueIDShape(value: string): boolean {
+  return value !== "" && utf8TextWithinBytes(value, 256) && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+
+function validWorkInputID(value: string): boolean {
+  // Match Go's TrimSpace at the boundaries without rewriting the ID.
+  return validOpaqueIDShape(value) && !/^\p{White_Space}|\p{White_Space}$/u.test(value);
 }
 
 export default function piBridge(pi: ExtensionAPI) {
-  const invoke = createClient(process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG);
+  const { invoke, continueWork } = openBridge(process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG);
   for (const tool of tools) {
-    pi.registerTool<typeof tool.parameters>({
+    const parameters = tool.name === "send_message" && continueWork ? sendMessageParameters(true) : tool.parameters;
+    pi.registerTool<typeof parameters>({
       ...tool,
+      parameters,
       async execute(toolCallId, params, signal, _onUpdate, _ctx) {
         let valid = false;
         let payload: unknown;
         try {
-          if (Value.Check(tool.parameters, params)) {
+          if (Value.Check(parameters, params)) {
             const encoded = JSON.stringify(params, (_key, value: unknown) => {
               if (value === undefined) throw new Error();
               return value;
             });
             payload = JSON.parse(encoded);
-            valid = Value.Check(tool.parameters, payload);
+            valid = Value.Check(parameters, payload);
             if (valid && tool.name === "send_message") {
-              const message = payload as { recipient_ids?: string[]; intent_assessment?: { disposition: string; repair?: { review_id: string } } };
+              const message = payload as { content: string; recipient_ids?: string[]; intent_assessment?: {
+                disposition: string; reason: string; repair?: { review_id: string }; followup?: { task_id?: string; constraint?: string };
+              } };
               if (Object.hasOwn(message, "intent_assessment")) {
                 valid = !Object.hasOwn(message, "recipient_ids");
                 const assessment = message.intent_assessment!;
                 if (Object.hasOwn(assessment, "repair")) {
                   const id = assessment.repair!.review_id;
-                  valid = valid && assessment.disposition === "request_work" && workspaceText(id, 256) && id.trim() === id && id !== "" && !/[\u0000-\u001f\u007f-\u009f]/u.test(id);
+                  valid = valid && assessment.disposition === "request_work" && id.trim() === id && validOpaqueIDShape(id);
+                }
+                if (assessment.disposition === "continue_work") {
+                  const { task_id: reference, constraint = "" } = assessment.followup ?? {};
+                  valid = valid && validWorkInputText(assessment.reason, workInputBytes.reason) &&
+                    validWorkInputText(message.content, workInputBytes.content) &&
+                    (constraint === "" || validWorkInputText(constraint, workInputBytes.constraint)) &&
+                    (reference === undefined || validWorkInputID(reference)) &&
+                    Object.keys(assessment).every(key => ["disposition", "reason", "followup"].includes(key));
+                } else {
+                  valid = valid && !Object.hasOwn(assessment, "followup");
                 }
               }
+            }
+            if (valid && (tool.name === "ack_work_input" || tool.name === "hand_back_work_input")) {
+              const input = payload as { input_id: string; reason?: string };
+              valid = validWorkInputID(input.input_id) &&
+                (tool.name !== "hand_back_work_input" || validWorkInputText(input.reason!, workInputBytes.handBackReason));
             }
             if (valid && tool.name === "decide_dispatch") {
               // Keep an object schema for Pi; check the conditional field on the safe snapshot.
@@ -178,13 +254,13 @@ export default function piBridge(pi: ExtensionAPI) {
               const file = payload as { path: string; create?: boolean; text?: string; expected_sha256?: string };
               valid = workspacePath(file.path, tool.name === "workspace_list");
               if (tool.name === "workspace_write") valid = valid &&
-                Object.hasOwn(file, "expected_sha256") === !file.create && workspaceText(file.text!, 8192);
+                Object.hasOwn(file, "expected_sha256") === !file.create && utf8TextWithinBytes(file.text!, 8192);
             }
             if (valid && tool.name === "publish_workspace_artifact") {
               const artifact = payload as { operation_id: string; artifact_id?: string; name?: string; expected_version_id?: string };
               const update = Object.hasOwn(artifact, "artifact_id");
               valid = Object.hasOwn(artifact, "expected_version_id") === update && Object.hasOwn(artifact, "name") === !update &&
-                Object.values(artifact).every(value => workspaceText(value, 256) && value.trim() !== "" && !/[\u0000-\u001f\u007f-\u009f]/u.test(value));
+                Object.values(artifact).every(value => utf8TextWithinBytes(value, 256) && value.trim() !== "" && !/[\u0000-\u001f\u007f-\u009f]/u.test(value));
             }
           }
         } catch { /* Reject unsafe runtime values without exposing their errors. */ }

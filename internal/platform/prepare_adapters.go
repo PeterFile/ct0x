@@ -34,10 +34,11 @@ func (p *Preparer) memberToolAdapterRegistry(selection provider.AdapterSelection
 	switch selection.ID {
 	case provider.PiMemberToolAdapterID:
 		if slices.Contains(names, "workspace_write") {
-			if !slices.Equal(names, provider.WorkspaceWorkerToolNames()) {
+			base := provider.WorkspaceWorkerToolNames()
+			if len(names) < len(base) || !slices.Equal(names[:len(base)], base) {
 				return nil, errMemberToolAdapterUnsupported
 			}
-			adapter = provider.NewPiWorkspaceMemberToolAdapter(p.piMemberToolsExtension, configPath)
+			adapter = provider.NewPiWorkspaceMemberToolAdapter(p.piMemberToolsExtension, configPath, names[len(base):]...)
 		} else {
 			adapter = provider.NewPiMemberToolAdapter(p.piMemberToolsExtension, configPath, names)
 		}
