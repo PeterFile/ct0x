@@ -224,6 +224,47 @@ func TestMemberToolOperationCreateJoinReceiptAndOwnership(t *testing.T) {
 	}
 }
 
+func TestMemberToolOperationCreateDiscussionPolicy(t *testing.T) {
+	f, scope := memberOperationFixture(t)
+	tool := queueHandle(t, f.path, false)
+	thread := domain.ThreadRef{GroupID: f.groupID, TopicID: scope.TopicID}
+	input, policy := memberOperationInput(), memberOperationPolicy()
+	policy.MaxMembers = 5 // Keep room for a different role, including after a local-user create.
+	setDiscussionPolicy(t, f.s, thread, 1, 0, "positive")
+	first, err := tool.CreateMemberForTool(ctx, scope, input, policy, "first")
+	if err != nil || first.Reused || first.JoinMessage == nil || len(first.JoinMessage.Deliveries) != 1 {
+		t.Fatalf("positive policy did not create and wake a member: %+v, %v", first, err)
+	}
+	setDiscussionPolicy(t, f.s, thread, 0, 1, "disable")
+
+	before := memberOperationCounts(t, f.s)
+	fresh := input
+	fresh.Role += " independently"
+	const deniedKey = "new-at-zero"
+	if got, err := tool.CreateMemberForTool(ctx, scope, fresh, policy, deniedKey); !errors.Is(err, ErrMemberToolDenied) || got != (MemberToolCreateResult{}) {
+		t.Fatalf("zero policy must deny a fresh create: member=%+v, join=%+v, error=%v", got.Member, got.JoinMessage, err)
+	}
+	if counts := memberOperationCounts(t, f.s); counts != before {
+		t.Fatalf("denial committed a member, join notice, delivery, or mutation key: got %v, want %v", counts, before)
+	}
+	if replay, err := tool.CreateMemberForTool(ctx, scope, input, policy, "first"); err != nil || !reflect.DeepEqual(replay, first) || memberOperationCounts(t, f.s) != before {
+		t.Fatalf("zero policy changed the prior receipt or re-woke the member: %+v, %v", replay, err)
+	}
+	input.Name = "Another analyst"
+	before[4]++ // Only the fresh reuse receipt may be added.
+	if reused, err := tool.CreateMemberForTool(ctx, scope, input, policy, "reuse"); err != nil || !reused.Reused || reused.Member.ID != first.Member.ID || reused.JoinMessage != nil || memberOperationCounts(t, f.s) != before {
+		t.Fatalf("zero policy blocked no-wake reuse or added side effects: %+v, %v", reused, err)
+	}
+	if _, err := f.s.CreateMember(ctx, CreateMemberInput{GroupID: f.groupID, Name: "Manual", Role: "Local-user member", ActorID: "user", CreatorID: "user", OwnerID: "user"}); err != nil {
+		t.Fatalf("zero policy blocked local-user creation: %v", err)
+	}
+
+	setDiscussionPolicy(t, f.s, thread, 1, 2, "enable")
+	if got, err := tool.CreateMemberForTool(ctx, scope, fresh, policy, deniedKey); err != nil || got.Reused || got.JoinMessage == nil || len(got.JoinMessage.Deliveries) != 1 {
+		t.Fatalf("denied key could not create after re-enabling: %+v, %v", got, err)
+	}
+}
+
 func TestMemberToolOperationExactReuseBeforeCapacity(t *testing.T) {
 	f, scope := memberOperationFixture(t)
 	input, policy := memberOperationInput(), memberOperationPolicy()

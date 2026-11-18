@@ -96,15 +96,16 @@ function DiscussionPolicyEditor({ groupId, active }: Scope) {
 
   const policy = !state.reading && !state.readError ? state.policy : null;
   return <>
-    <p className="tasks-note">仅本群主话题；不会邀请其他群的成员，不扩大消息可见范围，也不授予工作权限。</p>
-    <p className="tasks-note">每次邀请预留一次返回唤醒。0 次关闭新讨论的成员互邀，不影响公开消息、本机用户 @ 投递或已开始的讨论。</p>
+    <p className="tasks-note">设置范围为本群主话题。</p>
+    <p className="tasks-note">启用结构化讨论工具后，新接力使用所选额度。每次邀请预留一次回程唤醒。</p>
+    <p className="tasks-note">设为 0 时，普通成员工具也会拦截新的定向发送和会唤醒新成员的自动增员。</p>
     <section aria-label="当前讨论策略">
-      {policy ? <p>版本 {policy.revision}{policy.revision === 0 ? "（默认）" : ""}：最多 {policy.max_invite_hops} 次邀请、{policy.max_targeted_wakes} 次定向唤醒。</p>
+      {policy ? <p>版本 {policy.revision}{policy.revision === 0 ? "（默认）" : ""}：新结构化讨论链最多 {policy.max_invite_hops} 次邀请、{policy.max_targeted_wakes} 次定向唤醒。</p>
         : <p role="status">{state.readError || "正在读取讨论策略…"}</p>}
     </section>
     <button type="button" disabled={state.saving} onClick={refresh}>重新读取讨论策略</button>
     <form aria-label="保存讨论策略" onSubmit={event => { event.preventDefault(); void submit(); }}>
-      <label>每条新讨论的邀请上限
+      <label>新结构化讨论链的邀请上限
         <select value={state.draft ?? policy?.max_invite_hops ?? ""} disabled={!policy || !!state.attempt} onChange={event => {
           const hops = Number(event.target.value);
           if (active && !current.current.attempt && isDiscussionInviteHops(hops)) update(value => ({ ...value, draft: hops, error: "" }));

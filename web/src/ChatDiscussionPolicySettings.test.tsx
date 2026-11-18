@@ -11,7 +11,7 @@ const reads = vi.fn<typeof fetch>(), writes = vi.fn<typeof fetch>(), messages = 
 const flush = () => act(async () => {});
 const current = () => screen.getByRole("region", { name: "当前讨论策略" });
 const form = () => screen.getByRole("form", { name: "保存讨论策略" });
-const limit = () => within(form()).getByRole("combobox", { name: "每条新讨论的邀请上限" });
+const limit = () => within(form()).getByRole("combobox", { name: "新结构化讨论链的邀请上限" });
 const choose = (hops: number) => fireEvent.change(limit(), { target: { value: String(hops) } });
 const submit = () => fireEvent.submit(form());
 const attempt = (index: number) => {
@@ -43,8 +43,10 @@ it("lazily edits the main-topic discussion budget without touching work policy o
   const view = render(<Tasks group={group} />);
   await expandWork(); expect(reads).not.toHaveBeenCalled();
   await expandDiscussion(); expect(reads).toHaveBeenCalledTimes(1); expect(reads.mock.calls[0][0]).toBe(url());
-  expect(current()).toHaveTextContent(/版本 0.*2 次邀请.*4 次定向唤醒/);
-  expect(screen.getByText(/仅本群主话题.*其他群/)).toBeVisible();
+  expect(current()).toHaveTextContent(/版本 0（默认）.*新结构化讨论链最多 2 次邀请.*4 次定向唤醒/);
+  expect(screen.getByText("设置范围为本群主话题。")).toBeVisible();
+  expect(screen.getByText("启用结构化讨论工具后，新接力使用所选额度。每次邀请预留一次回程唤醒。")).toBeVisible();
+  expect(screen.getByText("设为 0 时，普通成员工具也会拦截新的定向发送和会唤醒新成员的自动增员。")).toBeVisible();
   choose(0);
   writes.mockResolvedValueOnce(json(policy(1, 0))); reads.mockResolvedValueOnce(json(policy(1, 0)));
   submit(); await flush();
