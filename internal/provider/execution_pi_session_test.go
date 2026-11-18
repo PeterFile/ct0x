@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -494,6 +495,45 @@ func TestPiSessionConstructorRejectsUnqualifiedReference(t *testing.T) {
 	}
 	if e, err := NewPiSessionExecutor(selected, extension, config, []string{"read_channel"}, PiSessionOptions{}, 0); e != nil || err != errPiSession {
 		t.Fatal("opt-in accepted a CLI path that cannot produce a canonical reference")
+	}
+}
+
+func TestPiSessionConstructorFileIdentityRange(t *testing.T) {
+	selected, extension, config := memberToolFiles(t, `: > "$0.invoked"; exit 99`)
+	cwd := filepath.Dir(selected.Path)
+	tools := []string{"read_channel"}
+	for _, tc := range []struct {
+		name          string
+		device, inode uint64
+		valid         bool
+	}{
+		{"minimum", 1, 1, true},
+		{"maximum", math.MaxInt64, math.MaxInt64, true},
+		{"device-over-max", math.MaxInt64 + 1, 1, false},
+		{"inode-over-max", 1, math.MaxInt64 + 1, false},
+		{"zero-device", 0, 1, false},
+		{"zero-inode", 1, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := &NativeSessionReference{Version: NativeSessionReferenceVersion, Pi: &PiNativeSessionReference{
+				Adapter: piSessionAdapter, Protocol: piSessionProtocol, CLIPath: selected.Path, CLIVersion: selected.Version,
+				Model: "synthetic/model", Thinking: "max", CWD: cwd, ToolsProfileSHA256: piSessionDigest(tools),
+				NativeSessionID: "00000000-0000-7000-8000-000000000001", SessionFile: filepath.Join(cwd, "session.jsonl"),
+				Device: tc.device, Inode: tc.inode, Size: 1, MTimeNS: 1, FileSHA256: piSessionBytesDigest([]byte("x")),
+				LeafID: "leaf", LastCompletedAssistantID: "assistant",
+			}}
+			e, err := NewPiSessionExecutor(selected, extension, config, tools, PiSessionOptions{Resume: ref}, 0)
+			if tc.valid {
+				if e == nil || err != nil {
+					t.Fatalf("representable identity rejected: %T, %v", e, err)
+				}
+			} else if e != nil || err != errPiSession {
+				t.Fatalf("out-of-range identity not rejected: %T, %v", e, err)
+			}
+		})
+	}
+	if _, err := os.Stat(selected.Path + ".invoked"); !os.IsNotExist(err) {
+		t.Fatal("constructor probed child")
 	}
 }
 

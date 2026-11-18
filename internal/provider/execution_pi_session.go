@@ -3,6 +3,7 @@ package provider
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -72,11 +73,13 @@ func validPiNativeReference(ref *NativeSessionReference) bool {
 		return false
 	}
 	p := ref.Pi
+	// Store v23 encodes device and inode as signed int64 in the canonical reference.
 	return p.Adapter == piSessionAdapter && p.Protocol == piSessionProtocol && p.CLIVersion == "1.4.0" &&
 		nativeSessionPath(p.CLIPath) && nativeSessionPath(p.CWD) && nativeSessionPath(p.SessionFile) &&
 		len(p.Model) <= 256 && piSessionModel.MatchString(p.Model) && validPiThinking(p.Thinking) &&
 		nativeSessionSHA256(p.ToolsProfileSHA256) && piSessionUUID.MatchString(p.NativeSessionID) &&
-		p.Device != 0 && p.Inode != 0 && p.Size > 0 && p.Size <= piSessionFileLimit && p.MTimeNS > 0 &&
+		p.Device > 0 && p.Device <= math.MaxInt64 && p.Inode > 0 && p.Inode <= math.MaxInt64 &&
+		p.Size > 0 && p.Size <= piSessionFileLimit && p.MTimeNS > 0 &&
 		nativeSessionSHA256(p.FileSHA256) && piSessionEntryID.MatchString(p.LeafID) && piSessionEntryID.MatchString(p.LastCompletedAssistantID)
 }
 
