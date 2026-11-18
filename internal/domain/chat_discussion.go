@@ -54,9 +54,10 @@ type ChatDiscussionReceipt struct {
 	Event   ChatDiscussionEvent `json:"event"`
 }
 
-// ChatDiscussionWork is the admitted work bound to the receiving Turn of the
-// current invitation. Assignment and worker are omitted until proved. These
-// references do not indicate execution, submission, or acceptance.
+// ChatDiscussionWork is the admitted work bound to the exact invitation's
+// receiving Turn, even after the discussion advances. Assignment and worker
+// are omitted until proved. These references do not indicate execution,
+// submission, or acceptance.
 type ChatDiscussionWork struct {
 	TaskID            string `json:"task_id"`
 	MandateID         string `json:"mandate_id"`
@@ -68,8 +69,9 @@ type ChatDiscussionWork struct {
 // ChatDiscussionContext is scoped to an arriving turn. A new action needs the
 // current head and owner; an older arrival can still read its associated path.
 // After a root answer, the owner can resolve but no invitation is active.
-// Closed ends the ordinary path, including when WorkAdmitted transfers it to
-// admitted work. Only a proven interruption at the current head has ClosureReason.
+// Closed ends the ordinary path. WorkAdmitted means only the active invitation
+// transferred to formal work, not that the work succeeded or historical work
+// controls this path. Only a proven interruption at the current head has ClosureReason.
 // When ContentOmitted is true, read full bodies via read_history using
 // OriginMessageID and each event's MessageID. Independent reply requirements
 // remain inline even when the bodies are omitted.

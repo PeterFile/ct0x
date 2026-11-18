@@ -59,9 +59,9 @@ func checkDiscussionPendingProof(t *testing.T, s *Store, admitted domain.Message
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	heads, err := chatDiscussionHeadsInTx(ctx, tx, want.GroupID, want.ID)
-	if err != nil || heads[want.ID] != (chatDiscussionHeadState{pendingProof: true}) {
-		t.Fatalf("invitation head is not pending proof: %+v, %v", heads[want.ID], err)
+	states, err := chatDiscussionEvidenceInTx(ctx, tx, want.GroupID, want.ID)
+	if err != nil || states[want.ID] != (chatDiscussionEvidence{pendingProof: true}) {
+		t.Fatalf("invitation head is not pending proof: %+v, %v", states[want.ID], err)
 	}
 }
 
@@ -94,6 +94,9 @@ func TestChatDiscussionWorkHandoffRead(t *testing.T) {
 	if err != nil || dispatch.State.Status != domain.DispatchStatusPending {
 		t.Fatalf("fixture must not have dispatched work yet: %+v, %v", dispatch, err)
 	}
+	if task, err := s.GetTask(ctx, f.groupID, r.TaskID); err != nil || task.Status != domain.TaskStatusOpen || task.ActiveAttemptID != "" {
+		t.Fatalf("admission is not execution or success: %+v, %v", task, err)
+	}
 	checkContext := func(scope MemberToolScope, candidate, incoming string) {
 		t.Helper()
 		got, err := s.ReadChatDiscussionContext(ctx, scope, candidate)
@@ -102,7 +105,7 @@ func TestChatDiscussionWorkHandoffRead(t *testing.T) {
 		}
 		wantEvent := invite
 		wantEvent.Message.Content = ""
-		if !got.Closed || got.ClosureReason != "" || got.ActiveOwnerID != "" || got.ActiveInvitationMessageID != "" ||
+		if !got.WorkAdmitted || !got.Closed || got.ClosureReason != "" || got.ActiveOwnerID != "" || got.ActiveInvitationMessageID != "" ||
 			got.HeadMessageID != invite.Message.ID || got.IncomingMessageID != incoming || !got.ContentOmitted ||
 			!reflect.DeepEqual(got.Events, []domain.ChatDiscussionReceipt{wantEvent}) {
 			t.Fatalf("work handoff did not close only the ordinary path or preserve event metadata: closed=%t, closure=%q, owner=%q", got.Closed, got.ClosureReason, got.ActiveOwnerID)
@@ -210,10 +213,10 @@ func admitDiscussionSummary(t *testing.T, s *Store, scope MemberToolScope, candi
 	return r
 }
 
-func TestChatDiscussionWorkHandoffDoesNotFollowEarlierInvite(t *testing.T) {
+func TestChatDiscussionWorkHandoffStaysOnEarlierInvite(t *testing.T) {
 	f, invite, b, cb := chatWorkInvitation(t)
 	s := f.s
-	admitDiscussionSummary(t, s, b, cb)
+	admitted := admitDiscussionSummary(t, s, b, cb)
 	// Reproduce an already-persisted reply from before the A handoff guard.
 	// Use the ordinary publication transaction and schema, bypassing only plan.
 	tx, err := s.beginMemberToolTx(ctx, b)
@@ -236,13 +239,40 @@ func TestChatDiscussionWorkHandoffDoesNotFollowEarlierInvite(t *testing.T) {
 	if proof := readDiscussionWork(t, s, f.policy.ThreadRef, invite.Message.ID, cb, b.Claim.TurnID); proof == nil {
 		t.Fatal("the superseded invitation must still have genuine B evidence")
 	}
-	checkDiscussionWorkMessage(t, s, f.groupID, invite.Message.ID, nil, "")
-	checkDiscussionWorkMessage(t, s, f.groupID, r.Message.ID, nil, "")
+	work := map[string]string{"task_id": admitted.TaskID, "mandate_id": admitted.MandateID, "dispatch_request_id": admitted.DispatchRequestID}
+	checkDiscussionWorkMessage(t, s, f.groupID, invite.Message.ID, work, "")
+	if reply := checkDiscussionWorkMessage(t, s, f.groupID, r.Message.ID, nil, ""); reply.Discussion == nil ||
+		reply.Discussion.Kind != domain.ChatDiscussionReply || reply.Discussion.InvitationMessageID != invite.Message.ID {
+		t.Fatalf("the reply lost its original discussion relation: %+v", reply.Discussion)
+	}
 	origin, err := s.GetMessage(ctx, f.groupID, f.candidate.MessageID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	discussionCheckContext(t, s, b, cb, origin, f.a, f.a, "", invite.Message.ID, r.Message.ID, false, invite, r)
+	discussionEnd(t, s, b)
+
+	dispatch, err := s.GetDispatchRequest(ctx, f.groupID, admitted.DispatchRequestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinator := coordinationDecideBindRequest(t, s, dispatch.Request)
+	decision, err := s.DecideDispatch(ctx, coordinator, CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: f.b, Reason: "按策略分配。"}, "assign-summary")
+	if err != nil || decision.Assignment == nil {
+		t.Fatalf("fixture assignment: %+v, %v", decision, err)
+	}
+	work["assignment_id"], work["worker_member_id"] = decision.Assignment.ID, f.b
+	checkDiscussionWorkMessage(t, s, f.groupID, invite.Message.ID, work, "")
+	checkDiscussionWorkMessage(t, s, f.groupID, r.Message.ID, nil, "")
+	discussionEnd(t, s, coordinator.Member)
+
+	// The reply's real receiving Turn can still act on the later head.
+	a, ca := discussionArrive(t, s, f.groupID, r.Event.DeliveryID)
+	discussionCheckContext(t, s, a, ca, origin, f.a, f.a, "", r.Message.ID, r.Message.ID, false, invite, r)
+	discussionAssess(t, s, a, ca)
+	resolved := discussionApply(t, s, a, ca, "resolve", domain.ChatDiscussionAction{Kind: domain.ChatDiscussionResolve, Content: "结论已确认。"})
+	discussionCheckContext(t, s, a, ca, origin, f.a, "", "", r.Message.ID, resolved.Message.ID, true, invite, r, resolved)
+	checkDiscussionWorkMessage(t, s, f.groupID, invite.Message.ID, work, "")
 }
 
 func TestChatDiscussionWorkHandoffDistinguishesMissingAndInvalidProof(t *testing.T) {
@@ -263,8 +293,6 @@ func TestChatDiscussionWorkHandoffDistinguishesMissingAndInvalidProof(t *testing
 	coordinationDecideExec(t, s, "UPDATE deliveries SET turn_id=? WHERE id=?", b.Claim.TurnID, invite.Event.DeliveryID)
 
 	coordinationDecideExec(t, s, "DROP TRIGGER chat_assessments_no_update")
-	// B returns nil when the named notice cannot be bound to this recipient.
-	coordinationDecideExec(t, s, "UPDATE chat_assessments SET notice_message_id=? WHERE id=?", f.candidate.MessageID, r.ID)
 	origin, err := s.GetMessage(ctx, f.groupID, f.candidate.MessageID)
 	if err != nil {
 		t.Fatal(err)
@@ -283,6 +311,18 @@ func TestChatDiscussionWorkHandoffDistinguishesMissingAndInvalidProof(t *testing
 		}
 		messageSequencePreserved(t, s, before)
 	}
+
+	// Damage only the paired references. The exact receipt still claims admission.
+	var decisionID string
+	if err := s.db.QueryRowContext(ctx, `SELECT decision_id FROM chat_assessments WHERE id=? AND candidate_id=?`, r.ID, cb).Scan(&decisionID); err != nil {
+		t.Fatal(err)
+	}
+	coordinationDecideExec(t, s, `UPDATE chat_assessments SET decision_id=NULL,dispatch_request_id=NULL WHERE id=? AND candidate_id=?`, r.ID, cb)
+	checkPending()
+	coordinationDecideExec(t, s, `UPDATE chat_assessments SET decision_id=?,dispatch_request_id=? WHERE id=? AND candidate_id=?`, decisionID, r.DispatchRequestID, r.ID, cb)
+
+	// B returns nil when the named notice cannot be bound to this recipient.
+	coordinationDecideExec(t, s, "UPDATE chat_assessments SET notice_message_id=? WHERE id=?", f.candidate.MessageID, r.ID)
 	checkPending()
 
 	foreign := createTestTask(t, s, f.otherID)
@@ -433,7 +473,7 @@ func TestChatDiscussionWorkHandoffMissingProofIsNotInterruption(t *testing.T) {
 		t.Fatalf("admission changed the failed delivery: %+v", d)
 	}
 	coordinationDecideExec(t, s, "DROP TRIGGER chat_assessments_no_update")
-	coordinationDecideExec(t, s, "UPDATE chat_assessments SET notice_message_id=? WHERE id=?", f.candidate.MessageID, r.ID)
+	coordinationDecideExec(t, s, `UPDATE chat_assessments SET decision_id=NULL,dispatch_request_id=NULL WHERE id=? AND candidate_id=?`, r.ID, cb)
 	checkDiscussionPendingProof(t, s, admitted)
 }
 
@@ -536,6 +576,12 @@ func TestChatDiscussionWorkHandoffDoesNotUseGenericAdmission(t *testing.T) {
 	t.Run("independent route on the invitation", func(t *testing.T) {
 		f, invite, b, cb := chatWorkInvitation(t)
 		discussionAssess(t, f.s, b, cb)
+		// A normal discuss receipt has neither formal reference, but is not pending proof.
+		origin, err := f.s.GetMessage(ctx, f.groupID, f.candidate.MessageID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		discussionCheckContext(t, f.s, b, cb, origin, f.a, f.b, invite.Message.ID, invite.Message.ID, invite.Message.ID, false, invite)
 		r, err := f.s.RequestWork(ctx, f.groupID, domain.RequestWorkRequest{TopicID: f.policy.TopicID, MessageID: invite.Message.ID,
 			Mode: domain.RoutingDecisionCreateNew, Reason: "用户独立建单。", NewTask: &domain.NewTaskRequest{Title: "独立任务", Acceptance: "文本交付"}}, "route")
 		if err != nil || r.Task.ID == "" {

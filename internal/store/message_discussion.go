@@ -27,13 +27,13 @@ func projectMessageDiscussionsInTx(ctx context.Context, tx *sql.Tx, groupID stri
 	if len(targets) == 0 {
 		return nil
 	}
-	heads, err := chatDiscussionHeadsInTx(ctx, tx, groupID, targets...)
+	states, err := chatDiscussionEvidenceInTx(ctx, tx, groupID, targets...)
 	if err != nil {
 		return fmt.Errorf("读取讨论状态失败：%w", err)
 	}
 	for i := range messages {
-		head := heads[messages[i].ID]
-		messages[i].DiscussionClosureReason, messages[i].DiscussionWork = head.closureReason, head.work
+		state := states[messages[i].ID]
+		messages[i].DiscussionClosureReason, messages[i].DiscussionWork = state.closureReason, state.work
 	}
 	return nil
 }

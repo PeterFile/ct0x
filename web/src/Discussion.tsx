@@ -333,7 +333,9 @@ function DiscussionContext({ relation, closureReason, work, members, scopeId, on
     {closureReason ? <p className="feed-note discussion-closure">{closureReason}</p> : null}
     {kind === "invite" && work ? <p className="discussion-work">
       <strong>已转为正式工作</strong> · 任务 ID：<code>{work.task_id}</code>
-      {work.assignment_id ? <> · 分配 ID：<code>{work.assignment_id}</code>{workerName ? `（${workerName}）` : null}</> : null}
+      {work.assignment_id ? <> · 分配 ID：<code>{work.assignment_id}</code>
+        {workerName?.trim() ? `（${workerName}）` : <> · 执行成员 ID：<code>{work.worker_member_id}</code></>}
+      </> : null}
     </p> : null}
   </>;
 }

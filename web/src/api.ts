@@ -126,9 +126,10 @@ function discussionWorkFor(value: unknown, message: Omit<Message, "discussion">)
   } else if ((delivery.state !== "accepted" && delivery.state !== "queued") || delivery.error !== "") return;
   const { task_id, mandate_id, dispatch_request_id, assignment_id, worker_member_id } = value;
   if (!discussionWorkId(task_id) || !discussionWorkId(mandate_id) || !discussionWorkId(dispatch_request_id)) return;
-  if (assignment_id === undefined && worker_member_id === undefined) return { task_id, mandate_id, dispatch_request_id };
-  if (!discussionWorkId(assignment_id) || !discussionWorkId(worker_member_id) || worker_member_id === "user") return;
-  return { task_id, mandate_id, dispatch_request_id, assignment_id, worker_member_id };
+  const core = { task_id, mandate_id, dispatch_request_id };
+  // The optional Assignment is usable only as a pair; it cannot invalidate the proved Task references.
+  return discussionWorkId(assignment_id) && discussionWorkId(worker_member_id) && worker_member_id !== "user"
+    ? { ...core, assignment_id, worker_member_id } : core;
 }
 export function decodeMessage({ discussion, discussion_closure_reason, discussion_work, ...message }: WireMessage): Message {
   // Invalid optional evidence must not conceal an otherwise valid public row or change its receipt.

@@ -164,7 +164,7 @@ it("shows the interrupted reply on its row when the existing newest-page poll su
 
 it("shows proved work alongside failed delivery and adds only a separately proved Assignment after exact refresh", async () => {
   const label = "已转为正式工作";
-  const worker = { ...member, id: "actual-worker", name: "执行成员" };
+  const worker = { ...member, id: "actual-worker", name: "开发执行员" };
   const foreign = { ...worker, group_id: other.id, name: "外群执行成员" };
   const legacy = { ...message, id: "legacy", deliveries: [], content: "可以开始，但没有关联证据。", discussion_work: discussionWork };
   const queued = { ...invitation.deliveries[0], state: "queued" };
@@ -196,16 +196,21 @@ it("shows proved work alongside failed delivery and adds only a separately prove
     fireEvent.click(card.getByRole("button", { name: `刷新消息 ${invitation.id} 讨论状态` }));
     await flush();
     const status = card.getByText(label).closest("p")!;
-    expect(status).toHaveTextContent("任务 ID：task-actual · 分配 ID：assignment-actual（执行成员）");
+    expect(status).toHaveTextContent(`任务 ID：task-actual · 分配 ID：assignment-actual（${worker.name}）`);
     expect(status.querySelector("button, a")).toBeNull();
     expect(status).not.toHaveTextContent(/已启动|已提交|已验收|报告/);
     expect(article(invitation.id)).not.toHaveTextContent(/CLI已接收|已中断|mandate-hidden|dispatch-hidden|private-claim-digest|外群执行成员/);
     expect(card.getByText(/投递详情.*投递失败 1/)).toBeVisible();
     expect(content()).toHaveValue("保留这份讨论草稿");
     expect(card.getByRole("button", { name: `转为任务，消息 ${invitation.id}` })).toBeVisible();
-    rerender(view([member, helper, foreign]));
-    expect(status).toHaveTextContent("分配 ID：assignment-actual");
-    expect(status).not.toHaveTextContent(worker.name);
+    for (const roster of [[member, helper, foreign], [member, helper, { ...worker, name: " " }]]) {
+      rerender(view(roster));
+      expect(status).toHaveTextContent(`分配 ID：assignment-actual · 执行成员 ID：${worker.id}`);
+      expect(within(status).getByText(worker.id, { selector: "code", exact: true })).toBeVisible();
+      expect(status).not.toHaveTextContent(worker.name);
+      expect(status).not.toHaveTextContent(helper.id);
+      expect(card.getByText("邀请协作").closest("summary")).toHaveTextContent(helper.name);
+    }
     const url = `/api/v1/groups/${group.id}/messages`;
     expect(vi.mocked(fetch).mock.calls.map(([path]) => path)).toEqual([`${url}?limit=50`, `${url}?limit=50`, `${url}/${invitation.id}`]);
     expect(writes).not.toHaveBeenCalled();

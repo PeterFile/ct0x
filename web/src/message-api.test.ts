@@ -192,14 +192,26 @@ it.each([
   expect(await getMessage(group.id, row.id)).toEqual(row);
 });
 
-it("drops malformed work and unpaired Assignment fields without dropping the public invitation", () => {
+it("drops malformed essential work evidence without dropping the public invitation", () => {
   const row = { ...invitation, deliveries: [accepted] };
   for (const invalid of [null, [], {}, { ...work, task_id: " " }, { ...work, task_id: "task\u202e1" },
-    { ...work, mandate_id: "任".repeat(43) }, { ...work, dispatch_request_id: undefined },
-    { ...work, assignment_id: assignment.assignment_id }, { ...work, worker_member_id: assignment.worker_member_id },
-    { ...work, ...assignment, worker_member_id: "user" }, { ...work, ...assignment, assignment_id: null }]) {
+    { ...work, mandate_id: "任".repeat(43) }, { ...work, dispatch_request_id: undefined }]) {
     expect(decodeMessage({ ...row, discussion_work: invalid })).toEqual(row);
   }
+});
+
+it.each([
+  ["missing worker", { assignment_id: assignment.assignment_id }],
+  ["missing Assignment", { worker_member_id: assignment.worker_member_id }],
+  ["non-string Assignment", { ...assignment, assignment_id: null }],
+  ["invalid worker", { ...assignment, worker_member_id: "user" }],
+  ["malformed worker ID", { ...assignment, worker_member_id: "worker\u202e1" }],
+] as const)("keeps only the Task core in list and detail with %s", async (_label, optional) => {
+  const row = { ...invitation, deliveries: [accepted], discussion_work: work };
+  const wire = { ...row, discussion_work: { ...work, ...optional } };
+  transport.mockResolvedValueOnce(json({ items: [wire], next_cursor: "" })).mockResolvedValueOnce(json(wire));
+  expect((await listMessages(group.id)).items).toStrictEqual([row]);
+  expect(await getMessage(group.id, row.id)).toStrictEqual(row);
 });
 
 it("requires a verified member invitation and its bound delivery; work cannot replace a valid closure", () => {
