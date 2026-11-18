@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"path/filepath"
 )
@@ -15,6 +16,44 @@ type piInvestigationStartup struct {
 	role, configSHA256     string
 	header, ready, invalid bool
 	response               Event // Only the latest snapshot, bounded by the native frame limit.
+
+	unverifiedWrites piTypedWorkOutput // Never consulted for settlement or delivery.
+	bearer           piInvestigationBearerFingerprint
+}
+
+// A plausible native call ID (or digest) can contain the issued bearer. Keep
+// only its fingerprint and compare against windows of the bounded fields.
+type piInvestigationBearerFingerprint struct {
+	size   int
+	digest [sha256.Size]byte
+}
+
+func (b piInvestigationBearerFingerprint) inEvidence(e *piTypedWriteEvidence) bool {
+	for _, field := range [...]string{e.Role, e.RunID, e.Operation, e.ToolCallID, e.IdempotencyKey, e.RequestSHA256} {
+		for i := 0; i+b.size <= len(field); i++ {
+			if sha256.Sum256([]byte(field[i:i+b.size])) == b.digest {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Reuse the bounded native pair checks on frames rejected before acceptance.
+// Matching here makes the identity plausible, not attributable to startup.
+func (s *piInvestigationStartup) observeUnverifiedWrite(kind string, line []byte, runID string) {
+	w := &s.unverifiedWrites
+	if w.unknown != nil || s.bearer.size == 0 {
+		return
+	}
+	switch kind {
+	case "tool_execution_start":
+		w.observeStart(line, true)
+	case "tool_execution_end":
+		if len(w.writes) != 0 && w.observeEnd(line, runID, true) && w.unknown != nil && s.bearer.inEvidence(w.unknown) {
+			w.unknown = nil
+		}
+	}
 }
 
 // allow consumes the startup prefix and later entry frames. Do not expose the

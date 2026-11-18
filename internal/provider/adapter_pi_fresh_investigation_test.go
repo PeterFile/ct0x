@@ -1,10 +1,13 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -330,6 +333,98 @@ func TestPiFreshInvestigationWriteUncertainty(t *testing.T) {
 						executionStart, c.frames, executionAssistant("stop"), executionSettled, ""}, "\n")
 					checkInvestigationWriteReceipt(t, profile, runID, stream, c.want, c.complete, c.marked)
 				})
+			}
+		})
+	}
+}
+
+func TestPiFreshInvestigationWriteEvidenceAtStdoutCap(t *testing.T) {
+	const runID, op = "turn-investigation", "report_work"
+	const unverified = "agent_workspace_write_unknown_unverified_v1"
+	profile := PiFreshInvestigationProfile{Action: domain.ChatActionReadOnlyInvestigation,
+		SourceKind: domain.TaskWorkSourceDelegation, Operations: []string{op}}
+	_, digest := investigationTestConfig(t, runID, profile)
+	ready := investigationTestReady(runID, profile.SourceKind, digest) + "\n"
+	wrongReady := investigationTestReady(runID, profile.SourceKind, [sha256.Size]byte{}) + "\n"
+	identity := typedWriteTestDetails(string(profile.SourceKind), runID, op)
+	end := func(m map[string]string) string {
+		return fmt.Sprintf(`{"type":"tool_execution_end","toolName":%q,"toolCallId":%q,"result":{"content":[{"type":"text","text":%q}],"details":{%q:%s},"isError":true},"isError":true,"durationMs":1}`,
+			m["operation"], m["tool_call_id"], "synthetic response with "+investigationTestToken, typedWriteTestField, memberToolJSON(t, m))
+	}
+	pair := func(m map[string]string) string {
+		start := typedWriteTestStart(m["operation"], m["tool_call_id"], `{"summary":"raw args"}`)
+		return start + "\n" + end(m)
+	}
+	valid := pair(identity)
+	withCallID := func(id string) map[string]string {
+		m := maps.Clone(identity)
+		m["tool_call_id"] = id
+		m["idempotency_key"] = fmt.Sprintf("%x", sha256.Sum256([]byte(op+id)))
+		return m
+	}
+	readOnly := typedWriteTestDetails(string(profile.SourceKind), runID, "read_work_inputs")
+	unissued := typedWriteTestDetails(string(profile.SourceKind), runID, "submit_result")
+	// Cross the log cap with only a few individually valid frames so the marker
+	// falls outside the retained prefix without overflowing the parser queue.
+	large := `{"type":"message_update","delta":"` + strings.Repeat("x", executionLogLimit/2) + `"}` + "\n"
+	for _, c := range []struct {
+		name, proof, write, late, wantType string
+	}{
+		{name: "missing ready", write: valid, wantType: unverified},
+		{name: "wrong ready digest", proof: wrongReady, write: valid, wantType: unverified},
+		{name: "duplicate before start", proof: ready + ready, write: valid, wantType: unverified},
+		{name: "foreign marker run", write: strings.Replace(valid, runID, "other-run", 1)},
+		{name: "foreign marker role", write: strings.Replace(valid, `"role":"delegation"`, `"role":"report"`, 1)},
+		{name: "unissued operation", write: pair(unissued)},
+		{name: "nonwrite operation", write: pair(readOnly)},
+		{name: "missing write start", write: end(identity)},
+		{name: "wrong idempotency key", write: strings.Replace(valid, identity["idempotency_key"], strings.Repeat("0", 64), 1)},
+		{name: "malformed request digest", write: strings.Replace(valid, identity["request_sha256"], strings.Repeat("z", 64), 1)},
+		{name: "overlong call ID", write: pair(withCallID(strings.Repeat("x", 257)))},
+		{name: "duplicate decoded marker field", write: strings.Replace(valid, `"role":`, `"\u0072ole":"delegation","role":`, 1)},
+		{name: "marker in message", write: `{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":` + memberToolJSON(t, valid) + `}]}}`},
+		{name: "bearer in call ID", write: pair(withCallID("call_" + investigationTestToken))},
+		{name: "late duplicate keeps verified format", proof: ready, write: valid, late: ready, wantType: typedWriteTestField},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			stream := investigationTestHeader(runID) + "\n" + c.proof + executionStart + "\n" + large + large + c.write + "\n" +
+				executionAssistant("stop") + "\n" + executionSettled + "\n" + c.late
+			e, req := investigationTestExecutor(t, profile, runID, stream)
+			var events []Event
+			got := e.Execute(t.Context(), req, func(event Event) error { events = append(events, event); return nil })
+			accepted := c.late != ""
+			var wantID string
+			var wantEvents []Event
+			if accepted {
+				wantID = runID
+				wantEvents = []Event{{Kind: SessionEvent, NativeSessionID: runID}, {Kind: AcceptedEvent, NativeSessionID: runID}}
+			}
+			if got.Outcome != OutcomeUnknown || !got.Started || !got.DirectChildReaped || got.ExitCode != 0 || got.Accepted != accepted ||
+				got.OutputComplete || got.Terminal != "" || got.NativeSessionID != wantID || got.NativeRef != nil || got.DeliveryFailed ||
+				!got.LogsTruncated || !slices.Equal(events, wantEvents) || strings.Contains(got.Reason, "写入") != accepted {
+				t.Fatalf("diagnostic evidence changed the startup or execution receipt: %+v, %v", got, events)
+			}
+
+			log, err := os.ReadFile(got.StdoutPath)
+			prefix := []byte(stream[:executionLogLimit-piTypedWriteLogReserve])
+			if err != nil || !bytes.HasPrefix(log, prefix) || len(log) > executionLogLimit {
+				t.Fatal("private stdout prefix or bounds changed", err)
+			}
+			if st, err := os.Stat(got.StdoutPath); err != nil || st.Mode().Perm() != 0600 {
+				t.Fatal("diagnostic evidence lost private file permissions", err)
+			}
+			tail := log[len(prefix):]
+			if c.wantType == "" {
+				if len(tail) != 0 {
+					t.Fatal("retained malformed or foreign evidence")
+				}
+				return
+			}
+			want := maps.Clone(identity)
+			want["type"] = c.wantType
+			var record map[string]string
+			if len(tail) == 0 || tail[0] != '\n' || tail[len(tail)-1] != '\n' || json.Unmarshal(tail, &record) != nil || !maps.Equal(record, want) {
+				t.Fatal("stdout tail did not preserve the exact bounded identity with the expected trust label")
 			}
 		})
 	}
