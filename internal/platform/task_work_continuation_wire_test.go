@@ -23,14 +23,32 @@ import (
 	"agentworkspace/internal/store"
 )
 
+// Platform CI shards by top-level test name. Spread these independent SQLite
+// scenarios across test entries so one shard does not run all of them.
+func TestFreshTaskWorkB29NativeWire(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "confirmed", "context-after-handback")
+}
+
+func TestFreshTaskWorkB29NativeWireUncertaintyAndCancellation(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "commit-unknown", "cancel-before-gate")
+}
+
+func TestFreshTaskWorkB29NativeWireResourceClaims(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "wrong-resource", "extra-resource", "late-resource")
+}
+
+func TestFreshTaskWorkB29NativeWireWorkspaceAndConfig(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "replaced-original-cwd", "workspace-before-gate", "late-config")
+}
+
+func TestFreshTaskWorkB29NativeWireLaunchGate(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "late-policy", "policy-before-gate", "failed-launch-commit", "policy-after-gate")
+}
+
 // All authority is established through v29 APIs. The only substitutions are a
 // metadata-only Pi executable and an in-process executor/HTTP recorder.
-func TestFreshTaskWorkB29NativeWire(t *testing.T) {
-	for _, mode := range []string{
-		"confirmed", "commit-unknown", "wrong-resource", "extra-resource", "late-resource", "late-config", "late-policy",
-		"context-after-handback", "replaced-original-cwd", "workspace-before-gate", "policy-before-gate", "cancel-before-gate",
-		"failed-launch-commit", "policy-after-gate",
-	} {
+func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
+	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			f := newRoleRuntime(t)
