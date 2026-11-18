@@ -168,8 +168,8 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 	if err != nil || native == nil || !e.rolePreflight(ctx, request, scope, token, config) || !owner.beginInvoke() {
 		return unknown
 	}
-	// ExecutionReceipt currently contains only values/strings: this assignment
-	// copies ALL native evidence before constructing any wrapper aggregate.
+	// Keep the native receipt before deriving the wrapper aggregate. Receipt
+	// copies share NativeRef, which must be treated as immutable.
 	raw := native.Execute(ctx, request, onEvent)
 	// Drain every authorized callback before auditing unresolved filesystem IO.
 	// Native success/cancellation is not evidence that file operations settled.

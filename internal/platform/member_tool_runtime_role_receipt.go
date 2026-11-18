@@ -91,6 +91,10 @@ func memberToolRoleReceiptOutcome(outcome provider.Outcome, terminal bool) bool 
 	}
 }
 func memberToolRoleEncodeReceipt(record memberToolRoleReceiptRecord) ([]byte, bool) {
+	// JSON omits the private reference. Refuse rather than claim full capture.
+	if record.Raw.NativeRef != nil || record.Aggregate.NativeRef != nil {
+		return nil, false
+	}
 	s := record.Source
 	if record.Version != 1 || s.TaskRevision < 1 || s.Model == "" || len(s.ClaimFingerprint) != 64 {
 		return nil, false
