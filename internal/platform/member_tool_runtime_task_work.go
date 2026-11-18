@@ -8,7 +8,6 @@ import (
 	"reflect"
 	"time"
 
-	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
 )
@@ -60,8 +59,19 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 		return unknown
 	}
 	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
-	scope, ok := e.live(ctx, request, claim)
-	if !ok || scope.AttemptID != "" || !s.freshTaskWork.Supports(e.plan.selected) {
+	// The Store check fences and verifies this proposed scope before use.
+	scope := store.MemberToolScope{Claim: claim, MemberID: turn.MemberID, ConversationID: turn.ConversationID, TopicID: e.plan.delivery.TopicID}
+	launch := store.FreshTaskWorkLaunch{Scope: scope, Delivery: e.plan.delivery, RequestID: e.plan.provenance.RequestID,
+		ProviderID: base.binding.ProviderID, Model: base.binding.Model, ResourceKey: workspace.key}
+	validRunFiles := func() bool {
+		return r.roleFence.rootValid(request.RuntimeDir) && r.clearRunDirectory(request) && r.rootValid() && workspace.pathMatches()
+	}
+	verifyUnbound := func() bool {
+		checkCtx, cancel := context.WithTimeout(ctx, memberToolRuntimeVerificationTimeout)
+		defer cancel()
+		return validRunFiles() && s.db.VerifyFreshTaskWorkStartup(checkCtx, launch) == nil
+	}
+	if !verifyUnbound() || !s.freshTaskWork.Supports(e.plan.selected) {
 		return unknown
 	}
 	owner, err := r.roleFence.reserve(ctx, claim, request.RuntimeDir)
@@ -69,17 +79,18 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 		return unknown
 	}
 	defer owner.markLocalDone()
-	if current, ok := e.live(ctx, request, claim); !ok || current != scope {
+	if !verifyUnbound() {
 		return unknown
 	}
 	mandate, err := currentTaskWorkMandate(ctx, s.db, e.plan.delivery)
 	if err != nil || !reflect.DeepEqual(mandate, e.plan.mandate) {
 		return unknown
 	}
-	token, bound, err := s.issueFreshTaskWork(ctx, scope.Member, e.plan.delivery)
+	token, bound, err := s.issueFreshTaskWork(ctx, scope, e.plan.delivery)
 	if err != nil {
 		return unknown
 	}
+	launch.AttemptID = bound.attempt.ID
 	var config *memberToolRuntimeConfigFile
 	defer func() {
 		if token != "" {
@@ -99,16 +110,16 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	}
 	validStartupFiles := func() bool {
 		return config.valid() && provider.FreshTaskWorkConfigMatches(bootstrap.ConfigPath, bootstrap.ConfigSHA256) &&
-			config.valid() && r.rootValid() && workspace.valid(cwd)
+			config.valid() && validRunFiles() && workspace.valid(cwd)
 	}
-	if !e.preflight(ctx, request, scope.Member, token, bound, validStartupFiles, nil) {
+	if !e.preflight(ctx, launch, token, bound, validStartupFiles, nil) {
 		return unknown
 	}
 	native, err := s.freshTaskWork.Construct(ctx, e.plan.selected, bootstrap)
 	if err != nil || nilTaskWorkExecutor(native) || !s.freshTaskWork.Supports(e.plan.selected) {
 		return unknown
 	}
-	if !e.preflight(ctx, request, scope.Member, token, bound, validStartupFiles, owner.beginInvoke) {
+	if !e.preflight(ctx, launch, token, bound, validStartupFiles, owner) {
 		if !workspace.valid(cwd) {
 			return cwdUnknown
 		}
@@ -121,7 +132,7 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	defer cancel()
 	turn, err = s.db.GetTurn(checkCtx, claim.GroupID, claim.TurnID)
 	if err != nil || checkCtx.Err() != nil || !memberToolRoleFenceMatches(turn, claim) ||
-		turn.DeliveryID != e.plan.delivery.DeliveryID || turn.ConversationID != scope.Member.ConversationID || turn.MemberID != scope.Member.MemberID ||
+		turn.DeliveryID != e.plan.delivery.DeliveryID || turn.ConversationID != scope.ConversationID || turn.MemberID != scope.MemberID ||
 		!r.roleFence.rootValid(request.RuntimeDir) ||
 		(raw.Outcome == provider.OutcomeNotStarted && (ctx.Err() != nil || !base.fresh(turn))) {
 		raw.Outcome, raw.Reason = unknown.Outcome, unknown.Reason
@@ -140,51 +151,39 @@ func nilTaskWorkExecutor(executor provider.Executor) bool {
 	return false
 }
 
-func (e *taskWorkRun) live(ctx context.Context, request provider.ExecuteRequest, claim store.TurnClaim) (store.CoordinationToolScope, bool) {
-	var empty store.CoordinationToolScope
-	ctx, cancel := context.WithTimeout(ctx, memberToolRuntimeVerificationTimeout)
-	defer cancel()
-	r, plan := e.base.runtime, e.plan
-	scope, err := e.base.roleStartup(ctx, claim)
-	if err != nil || !taskWorkMatchesScope(scope.Member, plan.delivery) {
-		return empty, false
-	}
-	current, err := r.tools.chatEngine.GetTaskWorkExecution(ctx, scope.Member)
-	if err != nil || current != plan.delivery {
-		return empty, false
-	}
-	db := r.tools.db
-	member, err := db.GetMember(ctx, plan.delivery.GroupID, plan.delivery.MemberID)
-	if err != nil || member.Workspace != "" || member.Status != domain.MemberStatusActive ||
-		member.ProviderID != e.base.binding.ProviderID || member.Model != e.base.binding.Model {
-		return empty, false
-	}
-	if request.CWD != plan.workspace.path || !r.roleFence.rootValid(request.RuntimeDir) ||
-		!r.clearRunDirectory(request) || !r.rootValid() || db.VerifyFreshTaskWorkResource(ctx, scope.Member, plan.workspace.key) != nil ||
-		!plan.workspace.pathMatches() {
-		return empty, false
-	}
-	return scope, ctx.Err() == nil
-}
-
-func (e *taskWorkRun) preflight(ctx context.Context, request provider.ExecuteRequest, scope store.MemberToolScope, token string, binding *taskWorkToolBinding, validStartupFiles, invoke func() bool) bool {
+func (e *taskWorkRun) preflight(ctx context.Context, launch store.FreshTaskWorkLaunch, token string, binding *taskWorkToolBinding, validStartupFiles func() bool, owner *memberToolRoleFenceOwner) bool {
 	s, plan := e.base.runtime.tools, e.plan
 	checkCtx, cancel := context.WithTimeout(ctx, memberToolRuntimeVerificationTimeout)
 	defer cancel()
-	mandate, err := s.chatEngine.ReadTaskWorkMandate(checkCtx, scope)
-	if err != nil || !reflect.DeepEqual(mandate, plan.mandate) {
+	if owner == nil {
+		// Verify immutable admission/input payloads before construction. The
+		// final gate pins their exact B identities and rechecks mutable authority
+		// in one transaction instead of rereading through these tool paths.
+		mandate, err := s.chatEngine.ReadTaskWorkMandate(checkCtx, launch.Scope)
+		if err != nil || !reflect.DeepEqual(mandate, plan.mandate) {
+			return false
+		}
+		input, err := s.chatEngine.GetWorkInputForMember(checkCtx, launch.Scope, plan.delivery.SourceID)
+		if err != nil || !pendingExactTaskWorkInput(plan.delivery, input) || s.db.VerifyFreshTaskWorkStartup(checkCtx, launch) != nil {
+			return false
+		}
+	}
+	if !validStartupFiles() {
 		return false
 	}
-	input, err := s.chatEngine.GetWorkInputForMember(checkCtx, scope, plan.delivery.SourceID)
-	if err != nil || !pendingExactTaskWorkInput(plan.delivery, input) {
-		return false
-	}
-	if current, ok := e.live(checkCtx, request, scope.Claim); !ok || current.Member != scope || current.AttemptID != binding.attempt.ID || !validStartupFiles() {
-		return false
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	entry := s.capabilities[sha256.Sum256([]byte(token))]
-	return entry.scope == scope && entry.taskWork == binding && entry.taskWorkProfileValid() &&
-		checkCtx.Err() == nil && (invoke == nil || invoke())
+	checked := func() bool {
+		// Same registry -> Store lock order as issue and tool calls. Neither
+		// lock survives into file checks or native execution.
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		entry := s.capabilities[sha256.Sum256([]byte(token))]
+		if entry.scope != launch.Scope || entry.taskWork != binding || !entry.taskWorkProfileValid() || checkCtx.Err() != nil {
+			return false
+		}
+		return owner == nil || s.db.CommitFreshTaskWorkLaunch(checkCtx, launch, owner.beginInvoke) == nil
+	}()
+	// Recheck filesystem identity outside the locks after the launch commit,
+	// including the dedicated CWD. Authority can change after commit; live
+	// tool checks and cancellation remain independent of launch authorization.
+	return checked && (owner == nil || validStartupFiles()) && checkCtx.Err() == nil
 }

@@ -22,6 +22,13 @@ scheduler resource and the new bound Attempt. This does not bypass an unknown
 or cancel-requested predecessor. Trust the directory namespace through launch;
 the CWD is not a host filesystem sandbox.
 
+The final Store commit is the launch authorization point. It checks current
+member configuration, B authority, and the resource claim while consuming the
+runtime's one-shot invocation right. Provider invocation happens outside the
+transaction. Changes committed before this point can block launch. Later
+changes are enforced by live tool checks and cancellation; the gate doesn't
+prevent every change between commit and process start.
+
 Only four pinned native HTTP tools are installed: `read_work_inputs` (directory
 or bounded UTF-8 byte segment), `ack_work_input`, `hand_back_work_input` (one
 input, not the Task) and `submit_result` (text only). A segment reads compact

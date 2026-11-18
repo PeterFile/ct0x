@@ -44,7 +44,7 @@ func (p *Preparer) prepareFreshTaskWork(ctx context.Context, input preparationIn
 		return scheduler.PreparedExecution{}, err
 	}
 	d := plan.delivery
-	base := memberToolRuntimeRun{runtime: p.memberTools, role: &plan.provenance, binding: MemberToolRunBinding{
+	base := memberToolRuntimeRun{runtime: p.memberTools, binding: MemberToolRunBinding{
 		GroupID: d.GroupID, MemberID: d.MemberID, ConversationID: d.ConversationID, DeliveryID: d.DeliveryID,
 		ProviderID: plan.selected.ID, Model: plan.request.Model,
 	}}

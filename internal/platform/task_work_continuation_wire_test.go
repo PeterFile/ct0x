@@ -25,7 +25,11 @@ import (
 // All authority is established through v29 APIs. The only substitutions are a
 // metadata-only Pi executable and an in-process executor/HTTP recorder.
 func TestFreshTaskWorkB29NativeWire(t *testing.T) {
-	for _, mode := range []string{"confirmed", "commit-unknown", "wrong-resource", "extra-resource", "late-resource", "late-config", "late-policy", "context-after-handback", "replaced-original-cwd"} {
+	for _, mode := range []string{
+		"confirmed", "commit-unknown", "wrong-resource", "extra-resource", "late-resource", "late-config", "late-policy",
+		"context-after-handback", "replaced-original-cwd", "workspace-before-gate", "policy-before-gate", "cancel-before-gate",
+		"failed-launch-commit", "policy-after-gate",
+	} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			f := newRoleRuntime(t)
@@ -157,6 +161,57 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 			var token, configPath, typedCWD string
 			var live store.MemberToolScope
 			calls := 0
+			beforeGateChanged := false
+			var peer *store.Store
+			switch mode {
+			case "workspace-before-gate", "policy-before-gate", "cancel-before-gate", "policy-after-gate":
+				peer, err = store.Open(f.path)
+				roleOK(t, err)
+				t.Cleanup(func() { roleOK(t, peer.Close()) })
+			}
+			revokePolicy := func() domain.ChatPolicy {
+				t.Helper()
+				disabled := policy
+				disabled.Enabled = false
+				saved, err := coordination.New(peer).SetChatPolicy(ctx, thread, disabled, policySnap.Revision, "gate-policy")
+				roleOK(t, err)
+				if saved.Enabled || saved.Revision <= policySnap.Revision {
+					t.Fatal("fixture did not commit a new disabled Chat Policy")
+				}
+				return saved
+			}
+			cancelClaim := func() {
+				t.Helper()
+				turn, err := peer.RequestTurnCancel(ctx, f.group, live.Claim.TurnID)
+				roleOK(t, err)
+				if turn.State != domain.TurnStateCancelRequested || turn.CancelRequestedAt == nil || turn.ClaimToken != live.Claim.Token {
+					t.Fatal("fixture did not commit cancellation on the same claim")
+				}
+			}
+			beforeGate := func() {
+				t.Helper()
+				switch mode {
+				case "workspace-before-gate":
+					grantPreparer, err := platform.NewPreparer(peer, platform.PrepareOptions{PrivateWorkspaceRoot: private})
+					roleOK(t, err)
+					external := filepath.Join(root, "external")
+					roleOK(t, os.Mkdir(external, 0700))
+					_, err = grantPreparer.AuthorizeWorkspaceGrant(ctx, f.group, f.worker.ID, platform.WorkspaceGrantInput{Root: external, Scope: "read_write"}, "gate-grant")
+					roleOK(t, err)
+					member, err := f.db.GetMember(ctx, f.group, f.worker.ID)
+					roleOK(t, err)
+					if member.Workspace != external {
+						t.Fatal("grant did not update the configured member workspace")
+					}
+				case "policy-before-gate":
+					revokePolicy()
+				case "cancel-before-gate":
+					cancelClaim()
+				default:
+					return
+				}
+				beforeGateChanged = true
+			}
 			call := func(op, body, key string, status int) string {
 				t.Helper()
 				w := f.http(t, token, op, body, key)
@@ -188,21 +243,60 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 						policy.Enabled = false
 						_, err := engine.SetChatPolicy(ctx, thread, policy, policySnap.Revision, "revoke-before-launch")
 						roleOK(t, err)
+					case "failed-launch-commit":
+						// Only the private fixture's launch transaction uses this scope
+						// write. All checks can pass but COMMIT hits a deferred FK.
+						_, err := f.raw.Exec(`CREATE TABLE launch_fault(id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED);
+							CREATE TRIGGER fail_launch_commit AFTER UPDATE OF claim_token ON turns
+							BEGIN INSERT INTO launch_fault VALUES('missing-group'); END`)
+						roleOK(t, err)
 					case "replaced-original-cwd":
 						// Even after the exact new key was claimed, swapping the typed CWD must stop launch.
 						roleOK(t, os.Rename(typedCWD, typedCWD+"-moved"))
 						roleOK(t, os.Mkdir(typedCWD, 0700))
 					}
+					beforeGate()
 					return roleNative(func(_ context.Context, req provider.ExecuteRequest, _ func(provider.Event) error) provider.ExecutionReceipt {
 						calls++
-						if mode != "confirmed" && mode != "commit-unknown" && mode != "context-after-handback" {
-							t.Fatal("denied preflight invoked the executor")
+						switch mode {
+						case "confirmed", "commit-unknown", "context-after-handback", "policy-after-gate":
+						default:
+							t.Fatal("synthetic executor entered despite a committed pre-launch change or invalid binding")
 						}
 						if !strings.Contains(req.Prompt, admission.MandateID) || !strings.Contains(req.Prompt, wake.WorkInputID) ||
 							strings.Contains(req.Prompt, detail) || strings.Contains(req.Prompt, token) || strings.Contains(req.Prompt, returnedQuote) {
 							t.Fatal("prompt was not confined to the Mandate and input handle")
 						}
 						id := fmt.Sprintf(`{"input_id":%q}`, wake.WorkInputID)
+						if mode == "policy-after-gate" {
+							// This runs at entry to a synthetic executor, after the launch
+							// gate. Live tools use B's authority now, not the launch permit.
+							call("read_work_inputs", id, "", 200)
+							revoked := revokePolicy()
+							for _, denied := range []string{
+								call("read_work_inputs", `{}`, "", 403), call("read_work_inputs", id, "", 403),
+								call("ack_work_input", id, "denied-ack", 403), call("submit_result", `{"summary":"denied"}`, "denied-submit", 409),
+							} {
+								if strings.Contains(denied, detail) || strings.Contains(denied, wake.WorkInputID) {
+									t.Fatal("revoked tool disclosed input")
+								}
+							}
+							// B still allows the canonical owner to hand back one input under
+							// disabled chat authority, without returning text or granting work.
+							returned := call("hand_back_work_input", fmt.Sprintf(`{"input_id":%q,"reason":"当前授权已撤销"}`, older.WorkInputID), "live-return", 200)
+							if strings.Contains(returned, returnedQuote) || !strings.Contains(returned, `"disposition":"returned"`) {
+								t.Fatal("live handback was not receipt-only")
+							}
+							var disposition string
+							var revision int64
+							roleOK(t, f.raw.QueryRow(`SELECT disposition,policy_revision FROM task_work_input_returns WHERE input_id=?`, older.WorkInputID).Scan(&disposition, &revision))
+							if disposition != string(domain.TaskWorkInputReturnOriginalAuthorizationUnavailable) || revision != revoked.Revision {
+								t.Fatal("handback did not use the latest B authority")
+							}
+							cancelClaim()
+							call("hand_back_work_input", fmt.Sprintf(`{"input_id":%q,"reason":"取消后不得处理"}`, wake.WorkInputID), "cancelled-return", 403)
+							return provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown}
+						}
 						if mode == "context-after-handback" {
 							contextOnly, err := f.db.GetWorkInputForMember(ctx, live, wake.WorkInputID)
 							roleOK(t, err)
@@ -423,9 +517,35 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 			if mode == "confirmed" || mode == "context-after-handback" {
 				want = provider.OutcomeNotStarted
 			}
-			if out.Outcome != want || (calls == 1) != (mode == "confirmed" || mode == "context-after-handback" || mode == "commit-unknown") ||
+			wantCalls := 0
+			if mode == "confirmed" || mode == "context-after-handback" || mode == "commit-unknown" || mode == "policy-after-gate" {
+				wantCalls = 1
+			}
+			if strings.HasSuffix(mode, "-before-gate") && !beforeGateChanged {
+				t.Fatal("controller did not reach the pre-launch mutation")
+			}
+			if out.Outcome != want || calls != wantCalls || out.NativeRef != nil ||
 				mode == "replaced-original-cwd" && (token == "" || !strings.Contains(out.Reason, "专用目录身份")) {
 				t.Fatalf("wrong guarded result: %v calls=%d", out.Outcome, calls)
+			}
+			var boundAttempts, nativeRecords int
+			roleOK(t, f.raw.QueryRow(`SELECT (SELECT count(*) FROM task_attempts WHERE turn_id=?),
+				(SELECT count(*) FROM native_run_bindings WHERE turn_id=?)`, live.Claim.TurnID, live.Claim.TurnID).Scan(&boundAttempts, &nativeRecords))
+			wantAttempts := 1 // B's original continuation binder ran once, before construction.
+			if mode == "wrong-resource" || mode == "extra-resource" {
+				wantAttempts = 0
+			}
+			if boundAttempts != wantAttempts || nativeRecords != 0 {
+				t.Fatalf("startup changed B binding or wrote a native record: attempts=%d native=%d", boundAttempts, nativeRecords)
+			}
+			if mode == "failed-launch-commit" {
+				var faultRows int
+				roleOK(t, f.raw.QueryRow(`SELECT count(*) FROM launch_fault`).Scan(&faultRows))
+				if faultRows != 0 {
+					t.Fatal("failed launch commit left durable effects")
+				}
+				_, err := f.raw.Exec(`DROP TRIGGER fail_launch_commit`)
+				roleOK(t, err)
 			}
 			if again := prepared.Executor.Execute(ctx, prepared.Request, nil); again.Outcome != provider.OutcomeUnknown {
 				t.Fatal("fresh executor was reusable")
@@ -437,8 +557,15 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 				}
 			}
 			turn := settle(live.Claim, out.Outcome)
-			if want == provider.OutcomeUnknown && turn.State != domain.TurnStateUnknown {
-				t.Fatal("unknown turned terminal")
+			if want == provider.OutcomeUnknown {
+				if turn.State != domain.TurnStateUnknown || turn.ClaimToken != live.Claim.Token ||
+					((mode == "cancel-before-gate" || mode == "policy-after-gate") && turn.CancelRequestedAt == nil) {
+					t.Fatal("unknown settled, changed claim ownership or lost cancellation")
+				}
+				if _, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group, DeliveryID: queued.Delivery.ID,
+					MaxActive: f.options.RoleMaxActive, ResourceKeys: []string{"different-resource"}}); !errors.Is(err, store.ErrTurnBusy) {
+					t.Fatalf("unknown followup was claimable again: %v", err)
+				}
 			}
 			for _, key := range keys {
 				held, err := f.db.HasResourceClaim(ctx, key)

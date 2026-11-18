@@ -2,36 +2,85 @@ package store
 
 import (
 	"context"
+	"database/sql"
 
 	"agentworkspace/internal/domain"
 )
 
-// VerifyFreshTaskWorkResource is the runtime's last Store check for a fresh
-// text followup. It checks B's current authority and the exact sole resource
-// of the same live Turn under SQLite write serialization. It neither binds an
-// Attempt nor authorizes native resume. No transaction escapes to the caller;
-// filesystem, transport and native I/O must stay outside this check.
-func (s *Store) VerifyFreshTaskWorkResource(ctx context.Context, scope MemberToolScope, resourceKey string) error {
-	const action = "核验任务续办轮次资源失败"
-	if !memberToolIDsValid(resourceKey) {
+// FreshTaskWorkLaunch is the runtime's frozen plan and issued scope, not a
+// launch permit. AttemptID is empty only for verification before B binds it.
+type FreshTaskWorkLaunch struct {
+	Scope       MemberToolScope
+	Delivery    domain.TaskWorkDelivery
+	RequestID   string
+	AttemptID   string
+	ProviderID  string
+	Model       string
+	ResourceKey string
+}
+
+// VerifyFreshTaskWorkStartup is a snapshot check before constructing the
+// executor. It does not bind an Attempt or authorize invocation.
+func (s *Store) VerifyFreshTaskWorkStartup(ctx context.Context, launch FreshTaskWorkLaunch) error {
+	return s.checkFreshTaskWorkLaunch(ctx, launch, nil)
+}
+
+// CommitFreshTaskWorkLaunch is the final authorization point for fresh Pi text
+// work. Hold the issuing registry's revoke lock across the exact capability
+// check and this call. admit spends the existing memory-only owner once; it
+// must not do Store, filesystem, transport or provider I/O. Only a successful
+// commit with a live context permits invocation. On failure the spent owner
+// is not restored. No execution or acceptance evidence is persisted here.
+// Later writes affect live tools and cancellation, not the committed launch.
+func (s *Store) CommitFreshTaskWorkLaunch(ctx context.Context, launch FreshTaskWorkLaunch, admit func() bool) error {
+	if !memberToolIDsValid(launch.AttemptID) || admit == nil {
 		return ErrInvalid
 	}
-	// The first conditional write fences other handles even on a deferred
-	// connection. B's loaders also recheck the exact scope after that write.
-	tx, err := s.beginMemberToolTx(ctx, scope)
+	return s.checkFreshTaskWorkLaunch(ctx, launch, admit)
+}
+
+func (s *Store) checkFreshTaskWorkLaunch(ctx context.Context, launch FreshTaskWorkLaunch, admit func() bool) error {
+	const action = "核验任务续办启动失败"
+	if !memberToolIDsValid(launch.ResourceKey, launch.Delivery.DeliveryID, launch.RequestID, launch.ProviderID, launch.Model) {
+		return ErrInvalid
+	}
+	// The first statement is the existing conditional scope write, even on a
+	// deferred connection. It fences member, policy, claim and receipt writers
+	// on other handles before any reads; a read-only snapshot would not.
+	tx, err := s.beginMemberToolTx(ctx, launch.Scope)
 	if err != nil {
 		return memberToolOperationError(action, err)
 	}
 	defer tx.Rollback()
-	f, err := taskWorkExecutionInTx(ctx, tx, scope)
+	var exact bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM resource_claims r
+	 JOIN turns t ON t.id=r.turn_id
+	 JOIN members m ON (m.id,m.group_id)=(t.member_id,t.group_id)
+	 LEFT JOIN task_work_continuations b ON b.delivery_id=t.delivery_id
+	 WHERE r.resource_key=:resource AND t.id=:turn AND t.delivery_id=:delivery
+	 AND m.id=:member AND m.status='active' AND m.provider_id=:provider AND m.model=:model AND m.workspace=''
+	 AND t.state='starting' AND t.accepted_at IS NULL AND t.native_session_id='' AND t.cancel_requested_at IS NULL
+	 AND t.candidate_text='' AND t.candidate_terminal='' AND t.receipt_json=''
+	 AND ((:attempt='' AND b.delivery_id IS NULL) OR (:attempt<>'' AND b.turn_id=t.id AND b.attempt_id=:attempt))
+	 AND NOT EXISTS(SELECT 1 FROM resource_claims other WHERE other.turn_id=t.id AND other.resource_key<>r.resource_key))`,
+		sql.Named("resource", launch.ResourceKey), sql.Named("turn", launch.Scope.Claim.TurnID), sql.Named("delivery", launch.Delivery.DeliveryID),
+		sql.Named("member", launch.Scope.MemberID), sql.Named("provider", launch.ProviderID), sql.Named("model", launch.Model),
+		sql.Named("attempt", launch.AttemptID)).Scan(&exact)
 	if err != nil {
 		return memberToolOperationError(action, err)
 	}
-	if f.d.SourceKind != domain.TaskWorkSourceFollowup {
+	if !exact {
 		return ErrMemberToolDenied
 	}
-	// Reuse the same pending-input predicate as B's claim gate. Readiness
-	// alone allows an already-bound Turn to finish handling its input.
+	f, err := taskWorkExecutionInTx(ctx, tx, launch.Scope)
+	if err != nil {
+		return memberToolOperationError(action, err)
+	}
+	if f.d != launch.Delivery || f.v.r.ID != launch.RequestID {
+		return ErrMemberToolDenied
+	}
+	// B permits an already-bound Turn to finish handling its input. Startup
+	// still requires the exact source to be pending, as at B's claim gate.
 	handled, err := taskWorkInputHandledInTx(ctx, tx, f.d.SourceID)
 	if err != nil {
 		return memberToolOperationError(action, err)
@@ -39,38 +88,43 @@ func (s *Store) VerifyFreshTaskWorkResource(ctx context.Context, scope MemberToo
 	if handled {
 		return ErrMemberToolDenied
 	}
-	blocked, _, err := s.taskWorkReadinessInTx(ctx, tx, f, f.turnID)
+	basis, err := taskWorkOwnerChatBasisInTx(ctx, tx, f)
 	if err != nil {
 		return memberToolOperationError(action, err)
 	}
-	if blocked != "" {
+	if basis.action != domain.ChatActionTextSubmission {
 		return ErrMemberToolDenied
 	}
-	chatAction, err := s.taskWorkOwnerChatActionInTx(ctx, tx, f)
+	// Preserve the former role resolver's exclusion of retained or damaged
+	// investigation evidence, even though this admission is text-only.
+	if _, err := s.investigationProfileInTx(ctx, tx, taskWorkFollowupProvenance(f), false); err != nil {
+		return memberToolOperationError(action, err)
+	}
+	// Check the remaining B readiness predicates (including the current
+	// Mandate and active Attempt) without repeating the chat authority query.
+	blocked, active, err := s.taskWorkReadinessForOwnerInTx(ctx, tx, f, f.turnID, true)
 	if err != nil {
 		return memberToolOperationError(action, err)
 	}
-	if chatAction != domain.ChatActionTextSubmission {
-		return ErrMemberToolDenied // This runtime does not launch investigations.
-	}
-	var held bool
-	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM resource_claims r
-	 JOIN turns t ON t.id=r.turn_id
-	 WHERE r.resource_key=? AND r.turn_id=? AND t.state='starting'
-	 AND t.accepted_at IS NULL AND t.native_session_id='' AND t.cancel_requested_at IS NULL
-	 AND t.candidate_text='' AND t.candidate_terminal='' AND t.receipt_json=''
-	 AND NOT EXISTS(SELECT 1 FROM resource_claims other WHERE other.turn_id=t.id AND other.resource_key<>r.resource_key))`,
-		resourceKey, f.turnID).Scan(&held)
-	if err != nil {
-		return memberToolOperationError(action, err)
-	}
-	if !held {
+	if blocked != "" || (launch.AttemptID != "" && active != launch.AttemptID) {
 		return ErrMemberToolDenied
 	}
-	// The no-op scope write was only a lock. Release it without publishing
-	// anything, and do not report success if the release was not confirmed.
-	if err := tx.Rollback(); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if admit == nil {
+		err = tx.Rollback() // The scope write was only a lock.
+	} else {
+		if !admit() {
+			return ErrMemberToolDenied
+		}
+		err = tx.Commit()
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err != nil {
 		return memberToolOperationError(action, err)
 	}
-	return ctx.Err()
+	return nil
 }
