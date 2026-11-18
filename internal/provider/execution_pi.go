@@ -143,10 +143,13 @@ func (o *executionOutput) recordPi(line []byte) {
 		o.emit(Event{Kind: SessionEvent})
 	case "agent_start":
 		o.last = ""
+	case "tool_execution_start":
+		if o.piTypedWork != nil && !o.piTypedWork.observeStart(line, r.Accepted && !o.settled) {
+			o.damaged = true
+		}
 	case "tool_execution_end":
-		if o.piTypedWork != nil && !o.piTypedWork.observe(line, o.runID, r.Accepted && !o.settled) {
-			// An invalid control frame cannot settle the invocation. It does not
-			// change what the native assistant or the child lifecycle showed.
+		if o.piTypedWork != nil && !o.piTypedWork.observeEnd(line, o.runID, r.Accepted && !o.settled) {
+			// A bad pair denies settlement but does not erase native terminal evidence.
 			o.damaged = true
 		}
 	case "message_start", "message_end":

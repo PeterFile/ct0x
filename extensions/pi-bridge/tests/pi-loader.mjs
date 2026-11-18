@@ -31,7 +31,8 @@ export async function runJSONPrint(t, session, initialMessage) {
   try {
     const exit = await runPrintMode({ session, setRebindSession() {}, async dispose() { session.dispose(); } },
       { mode: "json", initialMessage });
-    return { exit, errors, frames: chunks.join("").trimEnd().split("\n").map(line => JSON.parse(line)) };
+    const jsonl = chunks.join("");
+    return { exit, errors, jsonl, frames: jsonl.trimEnd().split("\n").map(line => JSON.parse(line)) };
   } finally {
     out.mock.restore();
     err.mock.restore();

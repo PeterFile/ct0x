@@ -5,7 +5,7 @@ import fs from "node:fs";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { syncBuiltinESMExports } from "node:module";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
@@ -157,28 +157,43 @@ test("real Pi 1.4.0 loader and SDK activate only the four typed tools", async t 
     key: name === profile[0] ? undefined : sha(name + id) })));
 });
 
-test("Pi JSON print keeps native write evidence even when the next assistant stops successfully", async t => {
-  const sent = fakeHTTP(t, () => [200, undefined]);
+// Optional raw, synthetic SDK fixtures for the real Go fixed-adapter tests.
+async function savePrintFixture(name, jsonl) {
+  const dir = process.env.TEST_PI_TYPED_PRINT_FIXTURES;
+  if (dir) await writeFile(join(dir, `${name}.jsonl`), jsonl, { mode: 0o600, flag: "wx" });
+}
+
+const toolCall = (name, callID, args = payloads[name]) => ({ type: "toolCall", id: callID, name, arguments: args });
+
+async function printToolTurns(t, ...turns) {
+  const steps = [...turns, ["stop", [{ type: "text", text: "native stop" }]]];
   let requests = 0;
-  const op = "ack_work_input";
   const session = await sdkSession(t, await fixture(t), {
     hasConfiguredAuth: () => true, // Synthetic provider, never credentials.
     streamSimple(model) {
-      const first = requests++ === 0;
+      assert.ok(requests < steps.length, "unexpected synthetic model call");
+      const [stopReason, content] = steps[requests++];
       const stream = createAssistantMessageEventStream();
-      stream.push({ type: "done", reason: first ? "toolUse" : "stop", message: {
-        role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(),
-        stopReason: first ? "toolUse" : "stop",
-        content: first ? [{ type: "toolCall", id, name: op, arguments: payloads[op] }] : [{ type: "text", text: "native stop" }],
+      stream.push({ type: "done", reason: stopReason, message: {
+        role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), stopReason, content,
         usage: { input: 1, output: 1, totalTokens: 2, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0 } },
       } });
       return stream;
     },
   });
-  const { frames, errors, exit } = await runJSONPrint(t, session, "synthetic prompt");
-  assert.deepEqual(errors, []);
-  assert.equal(exit, 0);
-  assert.equal(requests, 2);
+  const printed = await runJSONPrint(t, session, "synthetic prompt");
+  assert.deepEqual(printed.errors, []);
+  assert.equal(printed.exit, 0);
+  assert.equal(requests, steps.length);
+  assert.deepEqual(printed.frames.at(-1), { type: "agent_settled", aborted: false });
+  assert.equal(printed.frames.findLast(f => f.type === "message_end" && f.message.role === "assistant").message.stopReason, "stop");
+  return printed;
+}
+
+test("Pi JSON print keeps native write evidence even when the next assistant stops successfully", async t => {
+  const sent = fakeHTTP(t, () => [200, undefined]);
+  const op = "ack_work_input";
+  const { frames, jsonl } = await printToolTurns(t, ["toolUse", [toolCall(op, id)]]);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].key, sha(op + id));
   const ends = frames.filter(f => f.type === "tool_execution_end");
@@ -188,8 +203,46 @@ test("Pi JSON print keeps native write evidence even when the next assistant sto
   assert.equal(end.toolName, op);
   assert.equal(end.isError, true);
   checkUnknown(end.result, sent[0]);
-  assert.deepEqual(frames.at(-1), { type: "agent_settled", aborted: false });
-  assert.equal(frames.findLast(f => f.type === "message_end" && f.message.role === "assistant").message.stopReason, "stop");
+  const start = frames.findIndex(f => f.type === "tool_execution_start");
+  assert.deepEqual(frames[start], { type: "tool_execution_start", toolCallId: id, toolName: op, args: payloads[op] });
+  const result = frames.findIndex(f => f.type === "message_end" && f.message.role === "toolResult");
+  assert.ok(start < frames.indexOf(end) && frames.indexOf(end) < result);
+  assert.equal(frames[result].message.toolCallId, id);
+  assert.equal(frames[result].message.isError, true);
+  assert.deepEqual(frames.findLast(f => f.type === "agent_end").messages.at(-1).content, [{ type: "text", text: "native stop" }]);
+  await savePrintFixture("unknown", jsonl);
+});
+
+test("Pi JSON print pairs parallel writes by ID and preserves checked results and definite denials", async t => {
+  const ack = "ack_work_input", rejected = "hand_back_work_input", submit = "submit_result";
+  const rejectedID = "locally-rejected", truncatedID = "truncated", checkedID = "checked";
+  const forged = { ...payloads[rejected], details: { [uncertaintyField]: { role: "followup", run_id: runID } } };
+  const sent = fakeHTTP(t, name => name === ack ? [409, '{"error":{"code":"conflict","message":"rejected"}}'] : reply(name));
+  const { frames, jsonl } = await printToolTurns(t,
+    // The second call fails argument preparation before the first call ends.
+    ["toolUse", [toolCall(ack, id), toolCall(rejected, rejectedID, forged)]],
+    ["length", [toolCall(submit, truncatedID)]],
+    ["toolUse", [toolCall(submit, checkedID)]],
+  );
+  assert.deepEqual(sent.map(call => call.name), [ack, submit]);
+  const calls = frames.filter(f => f.type === "tool_execution_start" || f.type === "tool_execution_end");
+  assert.deepEqual(calls.map(f => [f.type, f.toolCallId, f.toolName]), [
+    ["tool_execution_start", id, ack], ["tool_execution_start", rejectedID, rejected],
+    ["tool_execution_end", rejectedID, rejected], ["tool_execution_end", id, ack],
+    ["tool_execution_start", truncatedID, submit], ["tool_execution_end", truncatedID, submit],
+    ["tool_execution_start", checkedID, submit], ["tool_execution_end", checkedID, submit],
+  ]);
+  assert.deepEqual(calls[1].args, forged);
+  for (const end of [calls[2], calls[3], calls[5]]) {
+    assert.equal(end.isError, true);
+    assert.deepEqual(end.result.details, {});
+    assert.equal(end.result.isError, undefined);
+  }
+  assert.match(calls[3].result.content[0].text, /被拒绝.*conflict/);
+  assert.match(calls[5].result.content[0].text, /output token limit/);
+  assert.equal(calls[7].isError, false);
+  assert.deepEqual(calls[7].result, { content: [{ type: "text", text: JSON.stringify(replies[submit]) }] });
+  await savePrintFixture("paired", jsonl);
 });
 
 test("typed config hashes the buffer it consumes and has no digest-less fallback", async t => {

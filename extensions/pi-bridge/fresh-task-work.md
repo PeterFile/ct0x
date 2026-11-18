@@ -58,11 +58,19 @@ operation, original native call ID (at most 256 visible ASCII bytes), the key
 It holds no request body or capability. Checked successes and definite denials
 don't set this marker.
 
-The pinned typed adapter retains the record in the private `stdout.jsonl` and
-returns `OutcomeUnknown`, even if Pi reports a successful terminal and exits
-normally. It preserves the observed Terminal and child wait facts, not a native
-resume reference. Assistant text and tool arguments can't set or clear the
-marker. A damaged stream or clipped typed stdout log can't authorize settlement.
+The pinned typed adapter requires a native `tool_execution_start` and matching
+`tool_execution_end` (same call ID and bound write name), even for a declined
+write. Ends may arrive in a different order from starts. Missing, mismatched,
+or duplicate write frames and exceeding the 256-ID limit per invocation
+(including closed writes) prevent settlement. This check can't see a write if
+both native lifecycle frames are omitted; assistant messages and tool results
+aren't substitute lifecycle proof.
+
+The adapter retains a matched marker in the private `stdout.jsonl` and returns
+`OutcomeUnknown`, even if Pi reports a successful terminal and exits normally.
+It preserves the observed Terminal and child wait facts, not a native resume
+reference. Assistant text and tool arguments can't set or clear the marker.
+A damaged stream or clipped typed stdout log can't authorize settlement.
 If a valid marker was observed despite clipping, a reserved tail in the same
 1 MiB log holds a parent-written copy of just the identity, with type
 `agent_workspace_write_unknown_v1`. A lost frame or failed log can still leave
@@ -71,3 +79,16 @@ supply the original request, reconcile the write, or authorize replay.
 
 Remove the fresh flag on restart to disable new launches. That does not settle
 previous claims, release unknown resources or authorize retry of in-flight work.
+
+For the offline SDK-to-Go regression, export `TEST_PI_TYPED_PRINT_FIXTURES`
+pointing to an empty private directory and run these from the repository root
+with the pinned SDK dependencies installed:
+
+```sh
+node --test --test-name-pattern='Pi JSON print' extensions/pi-bridge/tests/fresh-task-work.test.mjs
+go test -race -run '^TestPiFreshTaskWorkSDKPrintLifecycle$' ./internal/provider
+```
+
+Node uses an in-memory SDK session, synthetic assistant turns and mocked HTTP.
+Go drives the fixed adapter with that raw JSONL and also tests single-frame
+omissions without changing the tool results or final terminal.
