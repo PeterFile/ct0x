@@ -96,9 +96,9 @@ function DiscussionPolicyEditor({ groupId, active }: Scope) {
 
   const policy = !state.reading && !state.readError ? state.policy : null;
   return <>
-    <p className="tasks-note">仅本群主话题，不影响独立话题。</p>
-    <p className="tasks-note">执行入口提供结构化讨论交接工具时，每条新链采用所选的 0、1 或 2 次邀请上限，每次邀请预留一次返回唤醒。</p>
-    <p className="tasks-note">普通成员工具仍按现有规则运行；设为 0 时，也禁止新的定向发送和会唤醒新成员的自动增员。</p>
+    <p className="tasks-note">设置范围为本群主话题。</p>
+    <p className="tasks-note">启用结构化讨论工具后，新接力使用所选额度。每次邀请预留一次回程唤醒。</p>
+    <p className="tasks-note">设为 0 时，普通成员工具也会拦截新的定向发送和会唤醒新成员的自动增员。</p>
     <section aria-label="当前讨论策略">
       {policy ? <p>版本 {policy.revision}{policy.revision === 0 ? "（默认）" : ""}：新结构化讨论链最多 {policy.max_invite_hops} 次邀请、{policy.max_targeted_wakes} 次定向唤醒。</p>
         : <p role="status">{state.readError || "正在读取讨论策略…"}</p>}

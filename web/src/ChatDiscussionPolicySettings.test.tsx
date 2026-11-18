@@ -44,9 +44,9 @@ it("lazily edits the main-topic discussion budget without touching work policy o
   await expandWork(); expect(reads).not.toHaveBeenCalled();
   await expandDiscussion(); expect(reads).toHaveBeenCalledTimes(1); expect(reads.mock.calls[0][0]).toBe(url());
   expect(current()).toHaveTextContent(/版本 0（默认）.*新结构化讨论链最多 2 次邀请.*4 次定向唤醒/);
-  expect(screen.getByText(/仅本群主话题，不影响独立话题/)).toBeVisible();
-  expect(screen.getByText(/执行入口提供结构化讨论交接工具时.*0、1 或 2 次邀请上限.*每次邀请预留一次返回唤醒/)).toBeVisible();
-  expect(screen.getByText(/普通成员工具仍按现有规则运行.*设为 0 时.*新的定向发送.*会唤醒新成员的自动增员/)).toBeVisible();
+  expect(screen.getByText("设置范围为本群主话题。")).toBeVisible();
+  expect(screen.getByText("启用结构化讨论工具后，新接力使用所选额度。每次邀请预留一次回程唤醒。")).toBeVisible();
+  expect(screen.getByText("设为 0 时，普通成员工具也会拦截新的定向发送和会唤醒新成员的自动增员。")).toBeVisible();
   choose(0);
   writes.mockResolvedValueOnce(json(policy(1, 0))); reads.mockResolvedValueOnce(json(policy(1, 0)));
   submit(); await flush();
