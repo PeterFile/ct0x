@@ -39,6 +39,9 @@ func (s *Store) ApplyTurnReceipt(ctx context.Context, claim TurnClaim, receipt p
 		if previous != string(data) {
 			return domain.Turn{}, queueError(action, ErrConflict)
 		}
+		if err := applyNativeBindingInTx(ctx, tx, turn, receipt, true); err != nil {
+			return domain.Turn{}, queueError(action, err)
+		}
 		if err := tx.Commit(); err != nil {
 			return domain.Turn{}, queueError(action, err)
 		}
@@ -62,6 +65,9 @@ func (s *Store) ApplyTurnReceipt(ctx context.Context, claim TurnClaim, receipt p
 		return domain.Turn{}, queueError(action, err)
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE turns SET receipt_json=? WHERE group_id=? AND id=? AND claim_token=?", string(data), claim.GroupID, claim.TurnID, claim.Token); err != nil {
+		return domain.Turn{}, queueError(action, err)
+	}
+	if err := applyNativeBindingInTx(ctx, tx, turn, receipt, false); err != nil {
 		return domain.Turn{}, queueError(action, err)
 	}
 	if !activeTurn(turn.State) {
