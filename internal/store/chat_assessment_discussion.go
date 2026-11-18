@@ -147,9 +147,13 @@ func chatDiscussionLegacyWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.
 	if !errors.As(limitErr, &limit) {
 		return limitErr // No limit, or evidence that could not be verified.
 	}
+	// A newer command can make the verified root stale, but cannot authorize its relay.
 	stale, err := chatSourceSupersededInTx(ctx, tx, c.ThreadRef, root.sequence)
-	if err != nil || stale {
-		return err // A newer user command supersedes a verified legacy restriction.
+	if err != nil {
+		return err
+	}
+	if stale {
+		return chatStaleSource()
 	}
 	return limitErr
 }

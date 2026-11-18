@@ -171,44 +171,94 @@ func TestChatDiscussionOnlyBlocksTopicSummaryWithBothScopes(t *testing.T) {
 }
 
 func TestChatDiscussionOnlyInvestigationSourceDistinctions(t *testing.T) {
-	for _, legacy := range []bool{false, true} {
-		name := "newer-user-before-handoff"
-		if legacy {
-			name = "legacy-member-without-lineage"
-		}
+	for _, name := range []string{"structured", "legacy-discussion-only", "legacy-unassessed", "legacy-explicit-request", "legacy-other-topic"} {
 		t.Run(name, func(t *testing.T) {
 			f := chatSetup(t, "user", false)
 			policy := investigationPolicy(t, f, domain.ChatInvestigationPolicy{Objective: investigationObjective, AllowTopicMessages: true}, 1)
 			f.s.EnableInvestigationExecution()
 			discussionEnd(t, f.s, f.scope)
-			origin := chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: policy.TopicID,
-				ActorID: "user", Content: discussionOnlyQuote, RecipientIDs: []string{f.a}}, []string{f.a})
-			a, ca := discussionArrive(t, f.s, f.groupID, origin.Deliveries[0].ID)
-			assessment := domain.ChatAssessment{Disposition: "discuss", Reason: "讨论问题。", DiscussionOnlyExcerpt: new(discussionOnlyQuote)}
-			if _, err := f.s.ApplyChatAssessment(ctx, a, ca, assessment, "先讨论。", "assess"); err != nil {
-				t.Fatal(err)
+			postUser := func(thread domain.ThreadRef, content string, targets ...string) domain.Message {
+				t.Helper()
+				return chatLocalMessage(t, f.s, MessageRequest{GroupID: thread.GroupID, TopicID: thread.TopicID,
+					ActorID: "user", Content: content, RecipientIDs: targets}, targets)
 			}
-			chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: policy.TopicID, ActorID: "user",
-				Content: "最新要求：现在可以按本话题策略准备只读调查。"}, nil)
-
-			var deliveryID string
-			if legacy {
-				msg, err := f.s.SendMessageForChatIntake(ctx, a, ca, MemberToolMessageInput{Content: "请提出意见。", RecipientIDs: []string{f.b}}, "invite")
-				if err != nil || len(msg.Deliveries) != 1 || msg.SourceKind != "member" || msg.SourceID == "" {
-					t.Fatalf("legacy member command: %+v, %v", msg, err)
+			restrict := func(message domain.Message, quote string) (MemberToolScope, string) {
+				t.Helper()
+				scope, id := discussionArrive(t, f.s, f.groupID, message.Deliveries[0].ID)
+				input := domain.ChatAssessment{Disposition: "discuss", Reason: "讨论问题。", DiscussionOnlyExcerpt: new(quote)}
+				r, err := f.s.ApplyChatAssessment(ctx, scope, id, input, "先讨论。", "limit-"+id)
+				if err != nil || !r.DiscussionOnly || r.DiscussionOnlyExcerpt != quote || r.MessageID != message.ID ||
+					r.SourceKind != "local_user_chat" || r.SourceID != message.SourceID || r.TurnID != scope.Claim.TurnID || r.ThreadRef != policy.ThreadRef {
+					t.Fatalf("restriction was not persisted for the exact user command: %+v, %v", r, err)
 				}
-				deliveryID = msg.Deliveries[0].ID
-			} else {
-				invite := discussionApply(t, f.s, a, ca, "invite", domain.ChatDiscussionAction{
-					Kind: domain.ChatDiscussionInvite, Content: "请提出意见。", RecipientID: f.b})
-				deliveryID = invite.Event.DeliveryID
+				return scope, id
 			}
-			b, cb := discussionArrive(t, f.s, f.groupID, deliveryID)
+			origin := postUser(policy.ThreadRef, discussionOnlyQuote+"，有哪些问题要核对？", f.a)
+			a, ca := restrict(origin, discussionOnlyQuote)
+
+			want := "stale_source"
+			var request domain.Message
+			requestPolicy := policy
+			switch name {
+			case "legacy-discussion-only":
+				const quote = "仍只讨论"
+				later := postUser(policy.ThreadRef, quote+"，不要创建任务。", f.b)
+				peer, _ := restrict(later, quote)
+				discussionEnd(t, f.s, peer)
+			case "legacy-explicit-request", "legacy-other-topic":
+				if name == "legacy-other-topic" {
+					want = "discussion_only"
+					thread := domain.ThreadRef{GroupID: f.groupID, TopicID: "independent-topic"}
+					var err error
+					requestPolicy, err = f.s.SetChatPolicy(ctx, thread, domain.ChatPolicyRequest{
+						Enabled: true, Action: domain.ChatActionTextSubmission, MaxAdmissions: 1}, 0, "independent-policy")
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				request = postUser(requestPolicy.ThreadRef, "请现在形成文本摘要，交付三条可核对的结论。", f.a)
+			default:
+				postUser(policy.ThreadRef, "先交换一下意见，你怎么看？")
+			}
+
+			// The handoff is published after the new message but still comes from the original Turn.
+			var msg domain.Message
+			if name == "structured" {
+				msg = discussionApply(t, f.s, a, ca, "invite", domain.ChatDiscussionAction{
+					Kind: domain.ChatDiscussionInvite, RecipientID: f.b, Content: "请提出意见。"}).Message
+			} else {
+				var err error
+				msg, err = f.s.SendMessageForChatIntake(ctx, a, ca, MemberToolMessageInput{Content: "请提出意见。", RecipientIDs: []string{f.b}}, "invite")
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if len(msg.Deliveries) != 1 || msg.SourceKind != "member" || msg.SourceID == "" || msg.SenderID != a.MemberID {
+				t.Fatalf("wrong handoff source or delivery: %+v", msg)
+			}
+			discussionEnd(t, f.s, a)
+			b, cb := discussionArrive(t, f.s, f.groupID, msg.Deliveries[0].ID)
 			got, err := f.s.ApplyChatAssessment(ctx, b, cb, investigationProposal(), "建议调查。", "investigation")
-			if !legacy {
-				chatAssertNotAdmitted(t, got, err, "stale_source")
-			} else if err != nil || got.TaskID == "" || got.Authority != "written_preauthorization" || got.SourceKind != "member" {
-				t.Fatalf("legacy proposal did not retain baseline policy-only admission: %+v, %v", got, err)
+			chatAssertNotAdmitted(t, got, err, want)
+			if got.SourceID != msg.SourceID || got.MessageID != msg.ID || got.TurnID != b.Claim.TurnID || got.ThreadRef != policy.ThreadRef {
+				t.Fatalf("denial lost the receiving source: %+v", got)
+			}
+			counts := messageSequenceRows(t, f.s.db, `SELECT (SELECT count(*) FROM tasks), (SELECT count(*) FROM mandates),
+			 (SELECT count(*) FROM coordination_dispatch_requests)`)
+			if !reflect.DeepEqual(counts, [][]any{{int64(0), int64(0), int64(0)}}) {
+				t.Fatalf("stale or restricted handoff created work: %v", counts)
+			}
+
+			if request.ID != "" {
+				// Only the new command's own delivery can carry its explicit authority.
+				scope, id := discussionArrive(t, f.s, f.groupID, request.Deliveries[0].ID)
+				admitted, err := f.s.ApplyChatAssessment(ctx, scope, id, f.input, "按新指令准备摘要。", "explicit-request")
+				if err != nil || admitted.Outcome != "admitted" || admitted.TaskID == "" || admitted.Authority != "explicit_request" ||
+					!admitted.AuthorityEvidenceVerified || admitted.AuthorizationMessageID != request.ID || admitted.MessageID != request.ID ||
+					admitted.SourceKind != "local_user_chat" || admitted.SourceID != request.SourceID || admitted.TurnID != scope.Claim.TurnID ||
+					admitted.ThreadRef != requestPolicy.ThreadRef || admitted.PolicyRevision != requestPolicy.Revision {
+					t.Fatalf("new request was not admitted on its own source and thread: %+v, %v", admitted, err)
+				}
 			}
 		})
 	}
