@@ -90,11 +90,18 @@ func automaticMemberInTx(ctx context.Context, tx *sql.Tx, id string, scope Membe
 	if !errors.Is(err, sql.ErrNoRows) {
 		return MemberToolCreateResult{}, err
 	}
+	// Standalone create_member wakes a new member via its join message.
+	limits, err := currentChatDiscussionPolicyInTx(ctx, tx, domain.ThreadRef{GroupID: scope.Claim.GroupID, TopicID: scope.TopicID})
+	if err != nil {
+		return MemberToolCreateResult{}, err
+	}
+	if limits.MaxInviteHops == 0 {
+		return MemberToolCreateResult{}, ErrMemberToolDenied
+	}
 	member, err = insertAutomaticMemberInTx(ctx, tx, id, scope, input, policy)
 	if err != nil {
 		return MemberToolCreateResult{}, err
 	}
-	// Standalone create_member still wakes the new member via its join message.
 	join, err := publishAutomaticMemberJoinInTx(ctx, tx, scope, member.Name, input.Reason, []string{member.ID})
 	if err != nil {
 		return MemberToolCreateResult{}, err
