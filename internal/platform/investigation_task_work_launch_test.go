@@ -21,10 +21,9 @@ import (
 	"agentworkspace/internal/store"
 )
 
-// Real v30 queue/claim, Attempt and issued HTTP configuration. Only the final
-// B commit contract and native invocation are fixtures; this does not exercise
-// the missing B authorization transaction or launch the actual Pi executable.
-func TestInvestigationTaskWorkLaunchFixture(t *testing.T) {
+// Real v30 queue/claim, Attempt, issued HTTP configuration and final B commit.
+// Native invocation is in-process; no Pi executable or model is started.
+func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 	for _, tc := range []struct {
 		kind domain.TaskWorkSourceKind
 		mode string
@@ -111,33 +110,54 @@ func TestInvestigationTaskWorkLaunchFixture(t *testing.T) {
 					} else if n != 0 || plan.AttemptID != "" {
 						t.Fatal("delegate launch acquired an owner Attempt")
 					}
-					// Read the exact physical claim for this fixture, not a simulated
-					// business policy or transaction. The real B gate will own this.
 					var held string
 					roleOK(t, f.raw.QueryRowContext(check, `SELECT resource_key FROM resource_claims WHERE turn_id=?`, plan.Scope.Claim.TurnID).Scan(&held))
+					wantHeld := plan.ResourceKey
 					if tc.mode == "wrong-resource" {
-						if held == plan.ResourceKey {
-							t.Fatal("fixture did not give scheduler the wrong resource")
-						}
-						return store.ErrMemberToolDenied
+						wantHeld = "wrong-resource"
 					}
-					if held != plan.ResourceKey {
-						t.Fatal("scheduler did not claim the exact private CWD")
+					if held != wantHeld {
+						t.Fatal("scheduler did not claim the intended physical resource")
 					}
 					if tc.mode == "no-callback" {
-						return nil // An incomplete or untrusted contract result.
+						return nil // Deliberate fixture violation of the trusted contract.
 					}
-					admitted = admit()
+					err := f.db.CommitInvestigationTaskWorkLaunch(check, store.InvestigationTaskWorkLaunch(plan), func() bool {
+						admitted = admit()
+						return admitted
+					})
+					switch tc.mode {
+					case "wrong-resource":
+						if admitted || !errors.Is(err, store.ErrMemberToolDenied) {
+							t.Fatal("B spent the callback despite a wrong resource or did not definitively deny it")
+						}
+						return err
+					case "commit-error":
+						if err == nil || !admitted {
+							t.Fatal("fixture did not fail B COMMIT after the callback")
+						}
+						var faultRows int
+						roleOK(t, f.raw.QueryRowContext(check, `SELECT count(*) FROM launch_fault`).Scan(&faultRows))
+						if faultRows != 0 {
+							t.Fatal("failed B launch left fixture writes")
+						}
+						// Do not inject a second failure into scheduler receipt IO.
+						_, dropErr := f.raw.ExecContext(check, `DROP TRIGGER fail_typed_launch_commit`)
+						roleOK(t, dropErr)
+						return err
+					}
+					roleOK(t, err)
 					if !admitted || nativeCalls != 0 {
-						t.Fatal("callback did not only spend the memory owner")
+						t.Fatal("B committed without exhausting the callback, or native ran inside it")
 					}
 					switch tc.mode {
-					case "commit-error":
-						return errors.New("fixture: commit outcome not confirmed")
 					case "cancel-after-callback":
 						stop()
 					case "config-after-commit":
-						roleOK(t, os.WriteFile(path, []byte("changed in place"), 0600))
+						bytes, err := os.ReadFile(path)
+						roleOK(t, err)
+						bytes[0] = '[' // Same inode and size; the digest must still refuse it.
+						roleOK(t, os.WriteFile(path, bytes, 0600))
 					}
 					commitReturned = true
 					return nil
@@ -163,8 +183,16 @@ func TestInvestigationTaskWorkLaunchFixture(t *testing.T) {
 					cfg.SourceKind != tc.kind || !slices.Equal(cfg.Operations, wantOps) || !slices.Equal(b.Profile.Operations, wantOps) {
 					t.Fatal("construction did not receive the exact closed typed bootstrap")
 				}
-				if tc.mode == "revoked-token" {
+				switch tc.mode {
+				case "revoked-token":
 					f.runtime.Tools().Revoke(token)
+				case "commit-error":
+					// Fixture-only fault on B's scope write. All checks and the
+					// callback can pass, but the real COMMIT must fail.
+					_, err := f.raw.ExecContext(check, `CREATE TABLE launch_fault(id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED);
+						CREATE TRIGGER fail_typed_launch_commit AFTER UPDATE OF claim_token ON turns
+						BEGIN INSERT INTO launch_fault VALUES('missing-group'); END`)
+					roleOK(t, err)
 				}
 				return roleNative(func(check context.Context, req provider.ExecuteRequest, emit func(provider.Event) error) provider.ExecutionReceipt {
 					nativeCalls++

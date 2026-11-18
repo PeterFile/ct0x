@@ -138,7 +138,11 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		routes = append(routes, httpapi.MemberHistoryToolRoutes(memberTools.Tools())...)
 		if config.enableInvestigationExecution {
 			routes = append(routes, httpapi.MemberInvestigationToolRoutes(memberTools.Tools())...)
-			toolStatus += "；只读调查仅支持选定 Pi 1.4.0、单收件人的真实本机用户原始消息与首次正式分派的角色；仅按策略读取指定资料，不授予续接或文件工具"
+			if config.piFreshInvestigationWorkExtension != "" {
+				toolStatus += "；只读调查首轮仍限单收件人的真实本机用户原始消息与首次正式分派；已配置选定 Pi 1.4.0 的补充、委派与报告全新轮，须逐轮确认启动，不新增工作授权、不恢复会话或授予文件写入"
+			} else {
+				toolStatus += "；只读调查仅支持选定 Pi 1.4.0、单收件人的真实本机用户原始消息与首次正式分派的角色；仅按策略读取指定资料，不授予续接或文件工具"
+			}
 		}
 		if config.enableCodexAppServer {
 			routes = append(routes, httpapi.MemberMCPRoutes(memberTools.Tools())...)

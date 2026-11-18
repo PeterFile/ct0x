@@ -319,7 +319,11 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 							return provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}
 						}
 						call("list_members", `{}`, "", 403)
-						call("report_work", `{}`, "no-report", 404)
+						if mode == "confirmed" {
+							call("report_work", `{"kind":"progress","summary":"not a delegate"}`, "no-report", 403)
+						} else {
+							call("report_work", `{}`, "no-report", 404)
+						}
 						call("hand_back_work", `{}`, "no-task-handback", 404)
 						call("mcp", `{}`, "", 403)
 						call("read_work_inputs", id[:len(id)-1]+`,"limit":1}`, "", 400)
@@ -397,6 +401,18 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 						return provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted} // No model ran.
 					}), nil
 				},
+			}
+			if mode == "confirmed" {
+				// Both profiles in one registry: this persisted text admission
+				// must still use the real text gate and bootstrap.
+				entry, err := filepath.Abs("../../extensions/pi-bridge/fresh-investigation-work.ts")
+				roleOK(t, err)
+				f.options.TaskWorkReports = engine
+				f.options.InvestigationTaskWork = platform.NewPiInvestigationTaskWorkLaunch(entry, 0,
+					func(context.Context, store.FreshTaskWorkLaunch, func() bool) error {
+						t.Error("text followup reached the investigation commit")
+						return store.ErrMemberToolDenied
+					})
 			}
 			f.runtime, err = platform.NewMemberToolRuntime(f.db, f.options)
 			roleOK(t, err)
