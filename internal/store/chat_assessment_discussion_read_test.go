@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"agentworkspace/internal/domain"
@@ -32,6 +33,9 @@ func readDiscussionWork(t *testing.T, s *Store, thread domain.ThreadRef, message
 	if err != nil {
 		t.Fatalf("read discussion admission: %v", err)
 	}
+	if display, err := chatDiscussionWorkAdmissionForDisplayInTx(ctx, tx, thread, messageID, candidateID, turnID); err != nil || !reflect.DeepEqual(display, got) {
+		t.Fatalf("display admission = %+v, %v; want strict admission %+v", display, err, got)
+	}
 	return got
 }
 
@@ -52,13 +56,13 @@ func TestChatDiscussionWorkAdmissionPendingAndBoundAssignment(t *testing.T) {
 	if turn, err := f.s.ApplyTurnReceipt(ctx, b.Claim, queueReceipt(provider.OutcomeFailed)); err != nil || turn.State != domain.TurnStateFailed {
 		t.Fatalf("settle recipient turn: %+v, %v", turn, err)
 	}
-	want := chatDiscussionWorkAdmission{TaskID: r.TaskID, MandateID: r.MandateID, DispatchRequestID: r.DispatchRequestID}
+	core := chatDiscussionWorkAdmission{TaskID: r.TaskID, MandateID: r.MandateID, DispatchRequestID: r.DispatchRequestID}
 	s := queueHandle(t, f.path, false)
 	view, err := s.GetDispatchRequest(ctx, thread.GroupID, r.DispatchRequestID)
 	if err != nil || view.State.Status != domain.DispatchStatusPending {
 		t.Fatalf("fixture dispatch was not pending: %+v, %v", view, err)
 	}
-	if got := readDiscussionWork(t, s, thread, messageID, cb, turnID); !reflect.DeepEqual(got, &want) {
+	if got := readDiscussionWork(t, s, thread, messageID, cb, turnID); !reflect.DeepEqual(got, &core) {
 		t.Fatalf("pending dispatch proved wrong work or fabricated an assignment: %+v", got)
 	}
 
@@ -67,6 +71,7 @@ func TestChatDiscussionWorkAdmissionPendingAndBoundAssignment(t *testing.T) {
 	if err != nil || decision.Assignment == nil {
 		t.Fatalf("stored assignment: %+v, %v", decision, err)
 	}
+	want := core
 	want.Assignment = decision.Assignment
 	if got := readDiscussionWork(t, s, thread, messageID, cb, turnID); !reflect.DeepEqual(got, &want) {
 		t.Fatalf("wrong assignment proof: %+v, want %+v", got, want)
@@ -90,32 +95,66 @@ func TestChatDiscussionWorkAdmissionPendingAndBoundAssignment(t *testing.T) {
 		})
 	}
 
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
+	// Exercise each counterfactual independently on the private fixture DB.
+	faultTx := func(t *testing.T, query string, args ...any) *sql.Tx {
+		t.Helper()
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { tx.Rollback() })
+		if _, err := tx.Exec(query, args...); err != nil {
+			t.Fatal(err)
+		}
+		return tx
 	}
-	defer tx.Rollback()
-	if _, err := tx.Exec(`DROP TRIGGER chat_assessments_no_update`); err != nil {
-		t.Fatal(err)
+	for _, fault := range []struct {
+		name, query string
+		args        []any
+		strictErr   error
+		displayCore bool
+	}{
+		{"missing-assignment-binding", `DROP TRIGGER coordination_assignment_dispatch_no_delete;
+		 DELETE FROM coordination_assignment_dispatch WHERE assignment_id=?`, []any{decision.Assignment.ID}, sql.ErrNoRows, true},
+		{"invalid-assignment-time", `DROP TRIGGER coordination_decisions_no_update; PRAGMA ignore_check_constraints=ON;
+		 UPDATE coordination_decisions SET created_at='2026-02-30T00:00:00.000000000Z' WHERE id=?;
+		 PRAGMA ignore_check_constraints=OFF`, []any{decision.Decision.ID}, ErrInvalid, true},
+		{"invalid-core-source", `DROP TRIGGER chat_assessments_no_update;
+		 UPDATE chat_assessments SET receipt_json=json_set(receipt_json,'$.source_id',?) WHERE id=?`,
+			[]any{f.candidate.SourceID, r.ID}, ErrInvalid, false},
+		{"missing-core-policy-proof", `DROP TRIGGER chat_assessments_no_update;
+		 UPDATE chat_assessments SET receipt_json=json_set(receipt_json,'$.authorization_message_id',?) WHERE id=?`,
+			[]any{invite.Message.ID, r.ID}, sql.ErrNoRows, false},
+		{"ambiguous-recipient-turn", `INSERT INTO turns(id,group_id,delivery_id,conversation_id,member_id,claim_token,state,created_at,updated_at)
+		 SELECT 'duplicate-turn',group_id,delivery_id,conversation_id,member_id,'duplicate-claim','unknown',created_at,updated_at
+		 FROM turns WHERE id=?`, []any{turnID}, nil, false},
+	} {
+		t.Run(fault.name, func(t *testing.T) {
+			tx := faultTx(t, fault.query, fault.args...)
+			if got, err := chatDiscussionWorkAdmissionInTx(ctx, tx, thread, messageID, cb, turnID); got != nil || !errors.Is(err, fault.strictErr) {
+				t.Fatalf("strict admission = %+v, %v; want nil, %v", got, err, fault.strictErr)
+			}
+			var wantDisplay *chatDiscussionWorkAdmission
+			displayErr := fault.strictErr
+			if fault.displayCore {
+				wantDisplay, displayErr = &core, nil
+			}
+			if got, err := chatDiscussionWorkAdmissionForDisplayInTx(ctx, tx, thread, messageID, cb, turnID); !reflect.DeepEqual(got, wantDisplay) || !errors.Is(err, displayErr) {
+				t.Fatalf("display admission = %+v, %v; want %+v, %v", got, err, wantDisplay, displayErr)
+			}
+		})
 	}
-	if _, err := tx.Exec(`UPDATE chat_assessments SET receipt_json=json_set(receipt_json,'$.source_id',?) WHERE id=?`, f.candidate.SourceID, r.ID); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := chatDiscussionWorkAdmissionInTx(ctx, tx, thread, messageID, cb, turnID); got != nil || err == nil {
-		t.Fatalf("receipt mismatching the captured command source was accepted: %+v, %v", got, err)
-	}
-	if _, err := tx.Exec(`UPDATE chat_assessments SET receipt_json=json_set(receipt_json,'$.source_id',?) WHERE id=?`, invite.Message.SourceID, r.ID); err != nil {
-		t.Fatal(err)
-	}
-	// Even a recorded terminal Turn cannot hide an ambiguous second claimant.
-	if _, err := tx.Exec(`INSERT INTO turns(id,group_id,delivery_id,conversation_id,member_id,claim_token,state,created_at,updated_at)
-	 SELECT 'duplicate-turn',group_id,delivery_id,conversation_id,member_id,'duplicate-claim','unknown',created_at,updated_at
-	 FROM turns WHERE id=?`, turnID); err != nil {
-		t.Fatal(err)
-	}
-	if got, err := chatDiscussionWorkAdmissionInTx(ctx, tx, thread, messageID, cb, turnID); got != nil || err != nil {
-		t.Fatalf("ambiguous recipient Turn should not prove work: %+v, %v", got, err)
-	}
+	t.Run("assignment-query-error", func(t *testing.T) {
+		// Only the optional assignment proof queries coordination_decisions.
+		tx := faultTx(t, `ALTER TABLE coordination_decisions RENAME TO damaged_coordination_decisions`)
+		const detail = "no such table: coordination_decisions"
+		if got, err := chatDiscussionWorkAdmissionInTx(ctx, tx, thread, messageID, cb, turnID); got != nil || err == nil || !strings.Contains(err.Error(), detail) {
+			t.Fatalf("strict admission did not propagate query failure: %+v, %v", got, err)
+		}
+		if got, err := chatDiscussionWorkAdmissionForDisplayInTx(ctx, tx, thread, messageID, cb, turnID); got != nil || err == nil || !strings.Contains(err.Error(), detail) {
+			t.Fatalf("display admission did not propagate query failure: %+v, %v", got, err)
+		}
+	})
 }
 
 func TestChatDiscussionWorkAdmissionSurvivesClaimRecovery(t *testing.T) {
