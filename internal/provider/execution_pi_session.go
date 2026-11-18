@@ -145,25 +145,27 @@ func piSessionMatchesReference(snapshot piSessionSnapshot, p *PiNativeSessionRef
 		piSessionBytesDigest(snapshot.data) == p.FileSHA256 && snapshot.content.nativeID == p.NativeSessionID && snapshot.content.leafID == p.LeafID && snapshot.content.assistantID == p.LastCompletedAssistantID
 }
 
-// Called only after Cmd.Wait, stream/parser drain, callback join and outcome
-// consolidation. A capture failure does not rewrite native or business evidence.
-func (run *piSessionRun) capture(receipt *ExecutionReceipt, cliPath string) {
-	if receipt.Outcome != OutcomeSucceeded || receipt.Terminal != OutcomeSucceeded || !receipt.Started || !receipt.Accepted || !receipt.DirectChildReaped || !receipt.OutputComplete || receipt.DeliveryFailed || !run.tracker.complete() || !piSessionAncestorsStable(run.ancestors) {
-		return
+// Called for a native success only after Cmd.Wait, parser drain and callback
+// join, before settling the outcome. A missing proof leaves it unknown.
+func (run *piSessionRun) capture(nativeID, cliPath string) *NativeSessionReference {
+	if !run.tracker.complete() || !piSessionAncestorsStable(run.ancestors) {
+		return nil
 	}
 	snapshot, err := inspectPiSession(run.file, run.profile, true)
-	if err != nil || !os.SameFile(run.seed, snapshot.info) || snapshot.content.nativeID != receipt.NativeSessionID || snapshot.content.nativeID != run.tracker.nativeID || snapshot.content.headerSHA != run.tracker.headerSHA {
-		return
+	if err != nil || !os.SameFile(run.seed, snapshot.info) || snapshot.content.nativeID != nativeID || snapshot.content.nativeID != run.tracker.nativeID || snapshot.content.headerSHA != run.tracker.headerSHA {
+		return nil
 	}
 	oldMessages, oldUsers := 0, 0
 	if before := run.before; before != nil {
 		if !bytes.HasPrefix(snapshot.data, before.data) || len(snapshot.data) <= len(before.data) || !piSessionAncestorsStable(before.ancestors) {
-			return
+			return nil
 		}
 		oldMessages, oldUsers = len(before.content.messages), before.content.users
 	}
+	// The parsed linear history must append the tracked user and final
+	// assistant (including its content), not merely resemble the stdout turn.
 	if snapshot.content.users != oldUsers+1 || len(snapshot.content.messages) != oldMessages+len(run.tracker.history.messages) || !slices.Equal(snapshot.content.messages[oldMessages:], run.tracker.history.messages) {
-		return
+		return nil
 	}
 	stat := snapshot.info.Sys().(*syscall.Stat_t)
 	ref := &NativeSessionReference{Version: NativeSessionReferenceVersion, Binding: bytes.Clone(run.options.binding), Pi: &PiNativeSessionReference{
@@ -172,7 +174,8 @@ func (run *piSessionRun) capture(receipt *ExecutionReceipt, cliPath string) {
 		NativeSessionID: snapshot.content.nativeID, SessionFile: run.file, Device: uint64(stat.Dev), Inode: uint64(stat.Ino), Size: snapshot.info.Size(), MTimeNS: snapshot.info.ModTime().UnixNano(),
 		FileSHA256: piSessionBytesDigest(snapshot.data), LeafID: snapshot.content.leafID, LastCompletedAssistantID: snapshot.content.assistantID,
 	}}
-	if validPiNativeReference(ref) {
-		receipt.NativeRef = ref
+	if !validPiNativeReference(ref) {
+		return nil
 	}
+	return ref
 }

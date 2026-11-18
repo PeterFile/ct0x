@@ -28,7 +28,9 @@ executor, err := provider.NewPiSessionExecutor(
 
 本轮同时观察 assistant 的实际 toolCall、toolResult 与 `tool_execution_start/end`，核对 ID、名称、参数和结果。所有调用都必须来自本轮名单并完整匹配；任何缺结束、`isError`、未知或不一致均永久取消本轮 capture。尤其不能以最终 assistant 正常 stop 清掉 send_message/create_member/decide_dispatch/submit_result 的未知写风险。首版对只读工具错误也保守不给引用。
 
-仅在原执行真实 succeeded、native terminal/`agent_settled`、输出排空、真实 `Cmd.Wait`、parser 与 callback 全部 join 后捕获：再次严格读取同一 inode，核旧完整字节前缀、新单轮消息与 stdout 完成消息一致、末叶和末次完成 assistant，然后同步自有文件及直到 RuntimeDir 的受控父目录。任何失败均只取消引用，不伪造或修改真实 outcome、OutputComplete、DirectChildReaped 或业务接纳。
+仅在观察到 `agent_start` 且完整用户事件对与本轮提示词匹配后记录接纳。原有工具按当前 claim 授权，`starting` 和 `running` 均可使用，不依赖接纳事件先落库。
+
+收到成功的原生 `agent_settled` 后，须等 `Cmd.Wait`、输出排空、解析与回调全部结束，再严格验证同一 inode、旧完整字节前缀，以及新追加的本轮用户和 assistant 消息与 stdout 一致。验证末叶并同步会话文件及直到 RuntimeDir 的受控父目录后，才返回成功和原生引用。缺少这份证明时仍为 `unknown`，候选回复不可发布，已观察到的原生终态和直接子进程证据不变。
 
 引用是不可变的 server-only `ExecutionReceipt.NativeRef json:"-"`，不会进入旧 canonical receipt JSON。Binding 仅有界严格 canonical 验证和深拷贝，provider 不解释业务身份。失败时可只返回当前 Binding 屏障；复制 receipt 后不得原地修改共享指针。
 

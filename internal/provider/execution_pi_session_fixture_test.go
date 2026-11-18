@@ -97,7 +97,6 @@ func main() {
  emit(outputHeader)
  emit(map[string]any{"type":"agent_start"})
  emit(map[string]any{"type":"turn_start"})
- if mode=="fixture:cancel" { time.Sleep(30*time.Second); return }
  appendEntry:=func(entry map[string]any) {
   entry["id"]=id(); entry["parentId"]=parent; entry["timestamp"]=time.Now().UTC().Format(time.RFC3339Nano); parent=entry["id"]
   file,err:=os.OpenFile(path,os.O_WRONLY|os.O_APPEND,0600); must(err)
@@ -130,7 +129,7 @@ func main() {
  // Pi 1.4 agent-session.js constructs one text block for a plain stdin prompt.
  text:=mode; if mode=="fixture:wrong-user" { text="different prompt" }
  user:=map[string]any{"role":"user","content":[]any{map[string]any{"type":"text","text":text}}}
- if !fresh && (mode=="fixture:prior-response" || mode=="fixture:prior-response-after-user") {
+ if !fresh && strings.HasPrefix(mode,"fixture:prior-response") {
   lines:=bytes.Split(bytes.TrimSpace(raw),[]byte{'\n'})
   for i:=len(lines)-1;i>0;i-- {
    var entry struct{ Message map[string]any }; must(json.Unmarshal(lines[i],&entry))
@@ -139,6 +138,14 @@ func main() {
     // A timestamp tie alone cannot disambiguate a known historical answer.
     user["timestamp"]=entry.Message["timestamp"]
     message(user)
+   }
+   if mode=="fixture:prior-response-reformatted" {
+    // Neither frame is persisted. The current prompt and a changed old
+    // message digest must not substitute for an actual appended turn.
+    stamp:=entry.Message["timestamp"].(float64)+1
+    user["timestamp"],entry.Message["timestamp"]=stamp,stamp
+    entry.Message["fixtureMetadata"]=true
+    emitMessage(user)
    }
    emitMessage(entry.Message)
    emit(map[string]any{"type":"turn_end","message":entry.Message,"toolResults":[]any{}})
@@ -149,6 +156,7 @@ func main() {
   panic("missing synthetic prior assistant")
  }
  if mode!="fixture:missing-user" { message(user) }
+ if mode=="fixture:cancel" { time.Sleep(30*time.Second); return }
  if mode=="fixture:eof" { return }
  assistant:=func(content []any,stop string) map[string]any {
   return map[string]any{"role":"assistant","content":content,"provider":model[0],"model":model[1],"thinkingLevel":args["--thinking"],"stopReason":stop}

@@ -49,12 +49,8 @@ func TestPiSessionReceiptRequiresExactFields(t *testing.T) {
 				t.Fatal(err)
 			}
 			e, _ := piSessionFixtureExecutor(t, selected, extension, piSessionTokenOne, PiSessionOptions{})
-			canonical := tc.name == "canonical"
-			want := OutcomeUnknown
-			if canonical {
-				want = OutcomeSucceeded
-			}
-			piSessionCheckReceiptEvents(t, e, request, want, tc.terminal, canonical, tc.answers, "")
+			// Even canonical native frames do not prove success without the file.
+			piSessionCheckReceiptEvents(t, e, request, OutcomeUnknown, tc.terminal, true, tc.name == "canonical", tc.answers, "")
 		})
 	}
 }
@@ -78,7 +74,7 @@ func TestPiSessionReceiptRequiresCurrentAnswer(t *testing.T) {
 		}
 	})
 	for _, mode := range []string{"missing-user", "wrong-user", "missing-user-end", "missing-assistant-start",
-		"stale-assistant", "invalid-assistant-timestamp", "prior-response", "prior-response-after-user"} {
+		"stale-assistant", "invalid-assistant-timestamp", "prior-response", "prior-response-after-user", "prior-response-reformatted"} {
 		t.Run(mode, func(t *testing.T) {
 			selected, extension, request := piSessionFixtureSetup(t, binary)
 			options := PiSessionOptions{Binding: json.RawMessage(`{"turn":2}`)}
@@ -91,22 +87,32 @@ func TestPiSessionReceiptRequiresCurrentAnswer(t *testing.T) {
 			}
 			request.Prompt = "fixture:" + mode
 			e, _ := piSessionFixtureExecutor(t, selected, extension, piSessionTokenTwo, options)
-			piSessionCheckReceiptEvents(t, e, request, OutcomeUnknown, OutcomeSucceeded, true, nil, string(options.Binding))
+			accepted := !slices.Contains([]string{"missing-user", "wrong-user", "missing-user-end", "prior-response"}, mode)
+			var candidates []string
+			if mode == "prior-response-reformatted" {
+				// The candidate looks current on stdout alone. A callback is not
+				// publication; only the settled outcome can make it publishable.
+				candidates = []string{"offline complete"}
+			}
+			piSessionCheckReceiptEvents(t, e, request, OutcomeUnknown, OutcomeSucceeded, accepted, true, candidates, string(options.Binding))
 		})
 	}
 }
 
-func piSessionCheckReceiptEvents(t *testing.T, e Executor, request ExecuteRequest, want, terminal Outcome, outputComplete bool, answers []string, binding string) {
+func piSessionCheckReceiptEvents(t *testing.T, e Executor, request ExecuteRequest, want, terminal Outcome, accepted, outputComplete bool, answers []string, binding string) {
 	t.Helper()
 	var events []Event
 	r := e.Execute(context.Background(), request, func(ev Event) error { events = append(events, ev); return nil })
-	if r.Outcome != want || r.Terminal != terminal || !r.Started || !r.Accepted || !r.DirectChildReaped || r.OutputComplete != outputComplete || r.DeliveryFailed || r.ExitCode != 0 || !piSessionUUID.MatchString(r.NativeSessionID) {
+	if r.Outcome != want || r.Terminal != terminal || !r.Started || r.Accepted != accepted || !r.DirectChildReaped || r.OutputComplete != outputComplete || r.DeliveryFailed || r.ExitCode != 0 || !piSessionUUID.MatchString(r.NativeSessionID) {
 		t.Errorf("receipt or independently observed lifecycle differs: %+v", r)
 	}
 	if binding == "" && r.NativeRef != nil || binding != "" && (r.NativeRef == nil || r.NativeRef.Pi != nil || string(r.NativeRef.Binding) != binding) {
 		t.Error("an unverified stream must not qualify a reference or lose its binding-only barrier")
 	}
-	wantKinds := []EventKind{SessionEvent, AcceptedEvent}
+	wantKinds := []EventKind{SessionEvent}
+	if accepted {
+		wantKinds = append(wantKinds, AcceptedEvent)
+	}
 	var gotKinds []EventKind
 	var gotAnswers []string
 	for _, ev := range events {
@@ -124,7 +130,7 @@ func piSessionCheckReceiptEvents(t *testing.T, e Executor, request ExecuteReques
 	for range answers {
 		wantKinds = append(wantKinds, ResponseEvent)
 	}
-	if terminal != "" {
+	if accepted && terminal != "" {
 		wantKinds = append(wantKinds, TerminalEvent)
 	}
 	if !slices.Equal(gotKinds, wantKinds) || !slices.Equal(gotAnswers, answers) {

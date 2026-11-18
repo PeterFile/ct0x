@@ -207,12 +207,12 @@ func TestPiSessionExecutorOfflineChild(t *testing.T) {
 			request.Prompt = "fixture:" + mode
 			e, _ := piSessionFixtureExecutor(t, selected, extension, piSessionTokenOne, PiSessionOptions{Binding: json.RawMessage(`{"purpose":"fixture"}`)})
 			got := e.Execute(context.Background(), request, nil)
-			if slices.Contains([]string{"unknown-write", "missing-tool-end", "mismatched-tool-id", "pending-tool", "write-error-file-clean", "mismatched-result", "foreign-tool"}, mode) {
+			if mode != "tool-ok" {
 				if got.Outcome != OutcomeUnknown || got.Terminal != OutcomeSucceeded || !got.Started || !got.Accepted || !got.DirectChildReaped || !got.OutputComplete || got.DeliveryFailed || got.ExitCode != 0 || got.NativeRef == nil || got.NativeRef.Pi != nil {
-					t.Fatalf("unknown external execution must preserve native evidence without qualifying success: %+v", got)
+					t.Fatalf("unverified completion must preserve native evidence without qualifying success: %+v", got)
 				}
 			} else {
-				piSessionAssertSucceeded(t, got, mode == "tool-ok")
+				piSessionAssertSucceeded(t, got, true)
 			}
 			if got.NativeRef == nil || string(got.NativeRef.Binding) != `{"purpose":"fixture"}` {
 				t.Fatal("capture failure lost current binding-only barrier")
@@ -235,6 +235,9 @@ func TestPiSessionExecutorOfflineChild(t *testing.T) {
 			})
 			if got.Outcome != OutcomeUnknown || !got.Started || !got.DirectChildReaped || got.NativeRef != nil {
 				t.Fatalf("unsafe native lifecycle qualified: %+v", got)
+			}
+			if mode == "cancel" && (!got.Accepted || ctx.Err() == nil) {
+				t.Fatal("trusted prompt acceptance did not reach the cancellation callback")
 			}
 			if mode == "inherited-pipe" {
 				piSessionWaitFile(t, filepath.Join(request.CWD, "pipe-descendant-exited"))
@@ -290,7 +293,9 @@ func TestPiSessionExecutorOfflineChild(t *testing.T) {
 		close(release)
 		select {
 		case got := <-done:
-			piSessionAssertSucceeded(t, got, false)
+			if got.Outcome != OutcomeUnknown || got.Terminal != OutcomeSucceeded || !got.Accepted || !got.DirectChildReaped || !got.OutputComplete || got.DeliveryFailed || got.NativeRef != nil {
+				t.Fatalf("session damaged before callback join still qualified: %+v", got)
+			}
 		case <-time.After(5 * time.Second):
 			t.Fatal("callback join did not finish")
 		}
@@ -316,7 +321,9 @@ func TestPiSessionExecutorOfflineChild(t *testing.T) {
 		e, _ = piSessionFixtureExecutor(t, selected, extension, piSessionTokenTwo, PiSessionOptions{Resume: first.NativeRef})
 		request.RunID, request.Prompt = "run2", "fixture:prefix-drift"
 		got := e.Execute(context.Background(), request, nil)
-		piSessionAssertSucceeded(t, got, false)
+		if got.Outcome != OutcomeUnknown || got.Terminal != OutcomeSucceeded || !got.Accepted || !got.DirectChildReaped || !got.OutputComplete || got.DeliveryFailed || got.NativeRef != nil {
+			t.Fatalf("rewritten prefix qualified as current native success: %+v", got)
+		}
 	})
 	t.Run("resume-id-not-platform-run-id", func(t *testing.T) {
 		selected, extension, request := piSessionFixtureSetup(t, binary)

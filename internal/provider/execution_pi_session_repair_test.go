@@ -25,12 +25,8 @@ func TestPiSessionRepairReceiptSafety(t *testing.T) {
 			e, _ := piSessionFixtureExecutor(t, selected, extension, piSessionTokenOne, PiSessionOptions{})
 			var events []Event
 			r := e.Execute(context.Background(), request, func(ev Event) error { events = append(events, ev); return nil })
-			want := OutcomeUnknown
-			if mode == "bad-lf" || mode == "replace-file" {
-				want = OutcomeSucceeded
-			}
 			t.Logf("synthetic mode=%s outcome=%s terminal=%s started=%t accepted=%t reaped=%t output_complete=%t ref=%t callbacks=%d", mode, r.Outcome, r.Terminal, r.Started, r.Accepted, r.DirectChildReaped, r.OutputComplete, r.NativeRef != nil, len(events))
-			piSessionRepairAssertEvidence(t, r, events, want)
+			piSessionRepairAssertEvidence(t, r, events, OutcomeUnknown)
 		})
 	}
 	t.Run("mismatched-native-id-evidence", func(t *testing.T) {
@@ -182,17 +178,28 @@ func TestPiSessionRepairObservesToolsAfterAnchorLoss(t *testing.T) {
 			request.Prompt = "hello"
 			events := piSessionRepairEvents(t, mode)
 			events[0]["cwd"] = request.CWD
-			if err := os.WriteFile(filepath.Join(request.CWD, "events.jsonl"), piSessionTestBytes(events), 0600); err != nil {
+			data := piSessionTestBytes(events)
+			if err := os.WriteFile(filepath.Join(request.CWD, "events.jsonl"), data, 0600); err != nil {
 				t.Fatal(err)
 			}
 			e, _ := piSessionFixtureExecutor(t, selected, extension, piSessionTokenOne, PiSessionOptions{})
 			var callbacks []Event
 			r := e.Execute(context.Background(), request, func(ev Event) error { callbacks = append(callbacks, ev); return nil })
-			want := OutcomeUnknown
-			if mode == "valid" || mode == "anchor-only" || mode == "model-anchor-only" {
-				want = OutcomeSucceeded
+			piSessionRepairAssertEvidence(t, r, callbacks, OutcomeUnknown)
+			// Without a session file the receipt is unknown in every case; check
+			// that the tool uncertainty latch still distinguishes the reasons.
+			_, profile := piSessionToolHistory("send_message")
+			profile.cwd = request.CWD
+			tracker := newPiSessionTracker(profile, "", request.Prompt)
+			for line := range bytes.SplitSeq(bytes.TrimSuffix(data, []byte{'\n'}), []byte{'\n'}) {
+				if !tracker.observe(line) {
+					t.Fatal("invalid tool observer fixture frame")
+				}
 			}
-			piSessionRepairAssertEvidence(t, r, callbacks, want)
+			wantUncertain := mode != "valid" && mode != "anchor-only" && mode != "model-anchor-only"
+			if tracker.hasUncertainExecution() != wantUncertain {
+				t.Fatal("unexpected tool execution certainty after anchor loss")
+			}
 			if _, err := os.Stat(filepath.Join(request.CWD, "child-finished")); err != nil {
 				t.Fatal("execution returned before the synthetic child finished")
 			}
@@ -275,7 +282,7 @@ func TestPiSessionRepairAdditionalHeaderStaysUnknown(t *testing.T) {
 			}
 			e, _ := piSessionFixtureExecutor(t, selected, extension, piSessionTokenOne, PiSessionOptions{})
 			r := e.Execute(context.Background(), request, nil)
-			if r.Outcome != OutcomeUnknown || r.NativeSessionID != piSessionTestUUID || !r.Accepted || r.Terminal != OutcomeSucceeded || !r.Started || !r.DirectChildReaped || r.ExitCode != 0 || r.OutputComplete || r.NativeRef != nil {
+			if r.Outcome != OutcomeUnknown || r.NativeSessionID != piSessionTestUUID || r.Accepted || r.Terminal != OutcomeSucceeded || !r.Started || !r.DirectChildReaped || r.ExitCode != 0 || r.OutputComplete || r.NativeRef != nil {
 				t.Fatalf("later stop cleared uncertain identity or lost valid evidence: %+v", r)
 			}
 		})

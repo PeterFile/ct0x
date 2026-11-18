@@ -255,7 +255,18 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	}
 	r.OutputComplete = normalExit && outDrain.complete && errDrain.complete && !out.damaged && len(out.line) == 0 && !out.dropping && !outLog.failed && !errLog.failed && outClose == nil && errClose == nil
 	r.Reason = "执行结果未知，需对账后再重试"
-	if r.OutputComplete && ctx.Err() == nil && !r.DeliveryFailed && r.Terminal != "" && (session == nil || !session.tracker.hasUncertainExecution()) {
+	canSettle := r.OutputComplete && ctx.Err() == nil && !r.DeliveryFailed && r.Terminal != "" &&
+		(session == nil || r.Accepted && r.DirectChildReaped && !session.tracker.hasUncertainExecution())
+	if canSettle && session != nil && r.Terminal == OutcomeSucceeded {
+		// Response callbacks supply private candidates, not permission to publish.
+		// Only the verified persisted turn can make native-session success final.
+		ref := session.capture(r.NativeSessionID, e.path)
+		canSettle = ref != nil && ctx.Err() == nil
+		if canSettle {
+			r.NativeRef = ref
+		}
+	}
+	if canSettle {
 		r.Outcome = r.Terminal
 		r.Reason = map[Outcome]string{OutcomeSucceeded: "执行完成", OutcomeFailed: "模型执行失败", OutcomeAborted: "模型执行已中止", OutcomeTruncated: "模型输出被截断"}[r.Outcome]
 	}
@@ -264,9 +275,6 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	}
 	if r.DeliveryFailed {
 		r.Reason = "执行事件保存失败，交付与执行结果未知"
-	}
-	if session != nil {
-		session.capture(&r, e.path)
 	}
 	return r
 }

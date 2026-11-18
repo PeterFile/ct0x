@@ -86,9 +86,9 @@ func (o *executionOutput) emit(event Event) {
 	o.delivery.enqueue(event)
 }
 
-// Pi 1.4.0 print-mode.js emits the header before prompt(). agent_start is
-// therefore the adapter's acceptance rule, not a native acknowledgement.
-// agent-session.js settles only after retries/recovery/queued work finish.
+// Pi 1.4.0 print-mode.js emits the header before prompt(). The ordinary
+// adapter treats agent_start as acceptance. Native-session mode also needs the
+// current prompt's user pair. Settlement follows retries/recovery/queued work.
 func (o *executionOutput) recordPi(line []byte) {
 	t := o.piSession
 	if t != nil {
@@ -125,6 +125,13 @@ func (o *executionOutput) recordPi(line []byte) {
 	if o.settled {
 		o.damaged = true
 	}
+	if !r.Accepted && (t == nil && event.Type == "agent_start" || t != nil && !o.damaged && t.hasCurrentPrompt()) {
+		r.Accepted = true
+		o.emit(Event{Kind: AcceptedEvent})
+	}
+	// Decode genuine native evidence even if the opt-in stream never proved
+	// that this invocation's prompt was accepted.
+	agentStarted := r.Accepted || t != nil && t.starts > 0
 	switch event.Type {
 	case "session":
 		if o.piSession != nil || event.Version != 3 || event.ID != o.runID || !filepath.IsAbs(event.CWD) || r.NativeSessionID != "" {
@@ -135,10 +142,6 @@ func (o *executionOutput) recordPi(line []byte) {
 		o.emit(Event{Kind: SessionEvent})
 	case "agent_start":
 		o.last = ""
-		if !r.Accepted {
-			r.Accepted = true
-			o.emit(Event{Kind: AcceptedEvent})
-		}
 	case "message_start", "message_end":
 		if event.Message.Role == "" {
 			o.damaged, o.last = true, ""
@@ -148,7 +151,7 @@ func (o *executionOutput) recordPi(line []byte) {
 			return
 		}
 		o.last = ""
-		if !r.Accepted {
+		if !agentStarted {
 			o.damaged = true
 			return
 		}
@@ -176,14 +179,13 @@ func (o *executionOutput) recordPi(line []byte) {
 		// Only a complete assistant's stop reason decides the final result.
 		// Earlier error messages must not poison a later successful retry.
 		o.last = map[string]Outcome{"stop": OutcomeSucceeded, "error": OutcomeFailed, "aborted": OutcomeAborted, "length": OutcomeTruncated}[event.Message.StopReason]
-		// A strictly decoded stop reason is native evidence even if the answer
-		// cannot be attributed to this prompt. Only forward attributed snapshots.
-		// An empty snapshot still replaces earlier text.
-		if t == nil || !t.answerUncertain {
+		// An empty candidate still replaces earlier text. Native-session success
+		// later requires the shutdown-verified file to confirm the candidate.
+		if r.Accepted && (t == nil || !t.answerUncertain) {
 			o.emit(Event{Kind: ResponseEvent, Text: text.String()})
 		}
 	case "agent_settled":
-		if event.Aborted == nil || !r.Accepted || r.NativeSessionID == "" || o.settled {
+		if event.Aborted == nil || !agentStarted || r.NativeSessionID == "" || o.settled {
 			o.damaged = true
 			return
 		}
@@ -194,7 +196,10 @@ func (o *executionOutput) recordPi(line []byte) {
 		}
 		if terminal != "" {
 			r.Terminal = terminal
-			o.emit(Event{Kind: TerminalEvent, Terminal: terminal})
+			// The turn event sink requires acceptance before terminal callbacks.
+			if r.Accepted {
+				o.emit(Event{Kind: TerminalEvent, Terminal: terminal})
+			}
 		}
 	}
 }

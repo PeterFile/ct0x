@@ -196,6 +196,10 @@ func piSessionMessageMillis(message map[string]any) int64 {
 	return ms
 }
 
+func (t *piSessionTracker) hasCurrentPrompt() bool {
+	return t.starts == 1 && t.userMS > 0 && !t.answerUncertain
+}
+
 func (t *piSessionTracker) isPriorMessage(message map[string]any) bool {
 	return len(t.priorMessages) != 0 && slices.Contains(t.priorMessages, piSessionDigest(message))
 }
