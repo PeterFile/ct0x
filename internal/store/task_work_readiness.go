@@ -19,8 +19,10 @@ const taskWorkCurrent = `SELECT coalesce(t.active_attempt_id,''),CASE
  WHERE cb.group_id=t.group_id AND cb.revision=:binding AND h.member_id=:coordinator) THEN 'binding_stale'
  WHEN NOT EXISTS(SELECT 1 FROM group_dispatch_policies cp JOIN group_dispatch_policy_revisions h USING(group_id,revision)
  WHERE cp.group_id=t.group_id AND cp.revision=:policy
- AND EXISTS(SELECT 1 FROM json_each(h.allowed_worker_ids) WHERE type='text' AND value=:owner)) THEN 'policy_stale'
+ AND EXISTS(SELECT 1 FROM json_each(h.allowed_worker_ids) WHERE type='text' AND value=:owner)
+ AND (:kind<>'delegation' OR EXISTS(SELECT 1 FROM json_each(h.allowed_worker_ids) WHERE type='text' AND value=:member))) THEN 'policy_stale'
  WHEN NOT EXISTS(SELECT 1 FROM members WHERE group_id=t.group_id AND id=:owner AND status='active')
+ OR (:kind='delegation' AND NOT EXISTS(SELECT 1 FROM members WHERE group_id=t.group_id AND id=:member AND status='active'))
  OR NOT EXISTS(SELECT 1 FROM members WHERE group_id=t.group_id AND id=:coordinator AND status='active') THEN 'member_inactive'
  WHEN EXISTS(SELECT 1 FROM task_dependencies d LEFT JOIN tasks parent ON parent.id=d.dependency_id AND parent.group_id=d.group_id
  WHERE d.group_id=t.group_id AND d.task_id=t.id AND parent.status IS NOT 'accepted') THEN 'dependency_not_accepted'
@@ -31,7 +33,7 @@ func taskWorkCurrentInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts) (bloc
 	err = tx.QueryRowContext(ctx, taskWorkCurrent,
 		sql.Named("grp", d.GroupID), sql.Named("task", d.TaskID), sql.Named("topic", d.TopicID), sql.Named("revision", d.TaskRevision),
 		sql.Named("mandate", d.MandateID), sql.Named("authority", d.AuthorityGeneration), sql.Named("owner", d.OwnerMemberID),
-		sql.Named("binding", r.BindingRevision),
+		sql.Named("binding", r.BindingRevision), sql.Named("kind", string(d.SourceKind)), sql.Named("member", d.MemberID),
 		sql.Named("coordinator", r.CoordinatorMemberID), sql.Named("policy", r.PolicyRevision)).Scan(&active, &blocked)
 	if err == nil && blocked == "" {
 		var pinned bool
@@ -43,16 +45,18 @@ func taskWorkCurrentInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts) (bloc
 	return blocked, active, coordinationRoleRelationError(err)
 }
 
+// Peek, claim and postclaim must agree. Only an exact delegated child may
+// overlap its own known-running owner; no typed wake replaces uncertain work.
 func (s *Store) taskWorkReadinessInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, turnID string) (blocked, active string, err error) {
 	return s.taskWorkReadinessForOwnerInTx(ctx, tx, f, turnID, false)
 }
 
 func (s *Store) taskWorkReadinessForOwnerInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, turnID string, returnOnly bool) (blocked, active string, err error) {
 	d := f.d
-	if d.SourceKind != domain.TaskWorkSourceFollowup {
+	if !d.SourceKind.IsOwnerContinuation() && (d.SourceKind != domain.TaskWorkSourceDelegation || f.delegation == nil) {
 		return "", "", ErrMemberToolDenied
 	}
-	if turnID == "" {
+	if d.SourceKind == domain.TaskWorkSourceFollowup && turnID == "" {
 		handled, err := taskWorkInputHandledInTx(ctx, tx, d.SourceID)
 		if err != nil {
 			return "", "", err
@@ -68,8 +72,10 @@ func (s *Store) taskWorkReadinessForOwnerInTx(ctx context.Context, tx *sql.Tx, f
 	if err != nil || blocked != "" {
 		return blocked, active, err
 	}
-	if !returnOnly || turnID == "" {
-		_, err = s.taskWorkOwnerChatActionInTx(ctx, tx, f)
+	// Keep the B1 return-only exception for an already claimed followup.
+	// A report wake still needs the exact investigation execution fence.
+	if d.SourceKind.IsOwnerContinuation() && (!returnOnly || turnID == "" || d.SourceKind == domain.TaskWorkSourceReport) {
+		action, err := s.taskWorkOwnerChatActionInTx(ctx, tx, f)
 		switch {
 		case errors.Is(err, errTaskWorkChatScope):
 			return "chat_scope_unavailable", active, nil
@@ -77,6 +83,8 @@ func (s *Store) taskWorkReadinessForOwnerInTx(ctx context.Context, tx *sql.Tx, f
 			return "investigation_scope_stale", active, nil
 		case err != nil:
 			return "", "", err
+		case d.SourceKind == domain.TaskWorkSourceReport && action != domain.ChatActionReadOnlyInvestigation:
+			return "chat_scope_unavailable", active, nil
 		}
 	}
 	var initialAttempt, initialTurn string
@@ -108,7 +116,10 @@ func (s *Store) taskWorkReadinessForOwnerInTx(ctx context.Context, tx *sql.Tx, f
 	if own.ID != "" && (own.ID != active || own.TurnID != turnID) {
 		return "attempt_conflict", active, nil
 	}
-	if own.ID == "" && active != initialAttempt {
+	activeTurn := initialTurn
+	if own.ID != "" {
+		activeTurn = own.TurnID
+	} else if active != initialAttempt {
 		if active == "" {
 			return "attempt_conflict", active, nil
 		}
@@ -119,16 +130,29 @@ func (s *Store) taskWorkReadinessForOwnerInTx(ctx context.Context, tx *sql.Tx, f
 		if prior.ID == "" {
 			return "attempt_conflict", active, nil
 		}
+		activeTurn = prior.TurnID
+	}
+	allowRunning := ""
+	if f.delegation != nil && f.delegation.AuthorTurnID == activeTurn {
+		allowRunning = activeTurn
 	}
 	var unsettled bool
 	err = tx.QueryRowContext(ctx, taskWorkUnsettledTurns,
 		sql.Named("grp", d.GroupID), sql.Named("task", d.TaskID), sql.Named("turn", turnID),
-		sql.Named("coordinator", f.v.coordinatorTurn), sql.Named("original", initialTurn)).Scan(&unsettled)
+		sql.Named("coordinator", f.v.coordinatorTurn), sql.Named("original", initialTurn), sql.Named("owner_running", allowRunning)).Scan(&unsettled)
 	if err != nil {
 		return "", "", err
 	}
 	if unsettled {
 		return "prior_turn_unsettled", active, nil
+	}
+	if f.delegation != nil {
+		if _, err := s.taskWorkDelegationMaterialsInTx(ctx, tx, f); err != nil {
+			if errors.Is(err, ErrTaskInvestigationNotReady) || errors.Is(err, ErrMemberToolDenied) {
+				return "investigation_scope_unavailable", active, nil
+			}
+			return "", "", err
+		}
 	}
 	return "", active, nil
 }
@@ -232,7 +256,7 @@ func taskWorkInvestigationEvidenceInTx(ctx context.Context, tx *sql.Tx, f taskWo
 const taskWorkUnsettledTurns = `WITH related(id,valid) AS (
  SELECT :coordinator,1 UNION ALL SELECT :original,1
  UNION ALL SELECT a.turn_id,1 FROM task_attempts a WHERE a.group_id=:grp AND a.task_id=:task AND a.turn_id IS NOT NULL
- UNION ALL SELECT t.id,coalesce(w.source_kind='followup'
+ UNION ALL SELECT t.id,coalesce(w.source_kind IN ('followup','report','delegation')
  AND (d.message_id,d.group_id,d.topic_id,d.conversation_id,d.recipient_id)=(w.message_id,w.group_id,w.topic_id,w.conversation_id,w.member_id)
  AND CASE WHEN d.turn_id='' THEN d.state='queued' AND t.id IS NULL
  ELSE t.id=d.turn_id AND (t.group_id,t.conversation_id,t.member_id)=(w.group_id,w.conversation_id,w.member_id)
@@ -245,9 +269,15 @@ const taskWorkUnsettledTurns = `WITH related(id,valid) AS (
  WHERE CASE
  WHEN NOT r.valid THEN 1
  WHEN r.id IS NULL OR r.id=:turn THEN 0
- WHEN h.state IN ('not_started','succeeded','failed','aborted','truncated')
+ WHEN h.id=:owner_running AND h.state='running' AND h.cancel_requested_at IS NULL
+ AND h.candidate_terminal='' AND h.accepted_at IS NOT NULL AND h.native_session_id<>'' THEN 0
+ ELSE NOT ` + taskWorkTurnSettled + ` END)`
+
+// Both a replacement start and a fresh Submission require durable terminal
+// evidence and no remaining resource claim; a terminal-looking state is not enough.
+const taskWorkTurnSettled = `(CASE WHEN h.state IN ('not_started','succeeded','failed','aborted','truncated')
  AND length(CAST(h.receipt_json AS BLOB))<=1048576 AND json_valid(h.receipt_json)
- AND NOT EXISTS(SELECT 1 FROM resource_claims WHERE turn_id=h.id) THEN NOT (
+ AND NOT EXISTS(SELECT 1 FROM resource_claims WHERE turn_id=h.id) THEN (
  json_extract(h.receipt_json,'$.outcome') IS h.state AND json_type(h.receipt_json,'$.delivery_failed') IS 'false'
  AND json_extract(h.receipt_json,'$.reason') IS h.reason AND h.reason<>''
  AND json_extract(h.receipt_json,'$.native_session_id') IS h.native_session_id
@@ -259,7 +289,7 @@ const taskWorkUnsettledTurns = `WITH related(id,valid) AS (
  AND json_extract(h.receipt_json,'$.terminal') IS h.state AND json_type(h.receipt_json,'$.started') IS 'true'
  AND json_type(h.receipt_json,'$.accepted') IS 'true' AND json_type(h.receipt_json,'$.direct_child_reaped') IS 'true'
  AND json_type(h.receipt_json,'$.output_complete') IS 'true' END)
- ELSE 1 END)`
+ ELSE 0 END)`
 
 // Empty attemptID reads this delivery's binding; a nonempty ID reads a
 // predecessor of the same Assignment/Task/scope. Raw absence isn't a binding.

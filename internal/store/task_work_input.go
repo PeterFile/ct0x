@@ -166,7 +166,7 @@ func (s *Store) workInputWorkerInTx(ctx context.Context, tx *sql.Tx, scope Membe
 func (s *Store) workInputHandlingOwnerInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, returnOnly bool) (CoordinationToolScope, assignmentSnapshot, error) {
 	f, err := lookupTaskWorkExecutionInTx(ctx, tx, scope)
 	if err == nil {
-		state, err := s.taskWorkFollowupOwnerRoleInTx(ctx, tx, f, scope.Claim.TurnID, returnOnly)
+		state, err := s.taskWorkOwnerContinuationRoleInTx(ctx, tx, f, scope.Claim.TurnID, returnOnly)
 		if err != nil {
 			return CoordinationToolScope{}, assignmentSnapshot{}, err
 		}

@@ -67,31 +67,3 @@ func taskWorkInputHandledInTx(ctx context.Context, tx *sql.Tx, inputID string) (
 	err := tx.QueryRowContext(ctx, `SELECT `+taskWorkInputHandledSQL("i.id")+` FROM task_work_inputs i WHERE i.id=?`, inputID).Scan(&handled)
 	return handled, coordinationRoleRelationError(err)
 }
-
-// ClaimTurn has reserved the delivery and inserted its Turn in this transaction.
-// Recheck mutable followup readiness before committing that claim. Busy is a
-// refusal to claim, never a synthetic terminal receipt or an ack of the input.
-func (s *Store) taskWorkFollowupClaimInTx(ctx context.Context, tx *sql.Tx, turn domain.Turn) error {
-	f, err := lookupTaskWorkDeliveryInTx(ctx, tx, turn.GroupID, turn.DeliveryID)
-	if errors.Is(err, ErrNotFound) {
-		return nil // Verified absence of a typed marker.
-	}
-	if err != nil {
-		return err
-	}
-	if f.turnID != turn.ID || f.d.MemberID != turn.MemberID || f.d.ConversationID != turn.ConversationID {
-		return ErrMemberToolDenied
-	}
-	handled, err := taskWorkInputHandledInTx(ctx, tx, f.d.SourceID)
-	if err != nil {
-		return err
-	}
-	if handled {
-		return ErrTurnBusy
-	}
-	blocked, _, err := s.taskWorkReadinessInTx(ctx, tx, f, turn.ID)
-	if err == nil && blocked != "" {
-		err = ErrTurnBusy
-	}
-	return err
-}

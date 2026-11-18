@@ -83,6 +83,10 @@ func (s *Store) submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTask
 	if err != nil {
 		return domain.Submission{}, err
 	}
+	parent, err := taskWorkSubmissionParentInTx(ctx, tx, input, investigation)
+	if err != nil {
+		return domain.Submission{}, err
+	}
 	next, submission, err := task.Submit(domain.Submission{
 		ID: id, TaskID: task.ID, GroupID: task.GroupID, TaskRevision: task.Revision,
 		AttemptID: attempt.ID, Summary: input.Summary, SubmittedBy: actorID,
@@ -120,6 +124,9 @@ func (s *Store) submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTask
 	}
 	if investigation.TaskID != "" {
 		if err := s.checkInvestigationSubmissionWriteInTx(ctx, tx, investigation, input, submission.ID); err != nil {
+			return domain.Submission{}, err
+		}
+		if err := taskWorkChildrenSettledInTx(ctx, tx, parent); err != nil {
 			return domain.Submission{}, err
 		}
 	}
