@@ -58,18 +58,31 @@ func (s *Store) chatInvestigationAdmissionInTx(ctx context.Context, tx *sql.Tx, 
 	return authorization, nil
 }
 
+const (
+	chatInvestigationSentenceBreaks   = ".!?;。！？；\r\n\u0085\u2028\u2029"
+	chatInvestigationClauseSeparators = ",:，：、"
+	chatInvestigationMetaLabelPrefix  = `(?:这句(?:话)?|这条消息)[\s\p{Z}]*(?:只|仅)?是[\s\p{Z}]*`
+)
+
 var (
 	chatInvestigationEnglishCue = regexp.MustCompile(
 		`^(?i:(?:please )?(?:continue|resume) the original task)(?:$|[\s\p{Z},.!?;:，。！？；：、])`)
-	chatInvestigationMetaCue = regexp.MustCompile(
-		`(?:(?:这句(?:话)?|这条消息)[\s\p{Z}]*(?:只|仅)?是[\s\p{Z}]*(?:旧消息(?:示例)?|(?:一个)?(?:示例|例子))|` +
-			`(?:^|[,:，：、])[\s\p{Z}]*并?(?:非|不是)本次指令)[\s\p{Z}]*(?:$|[,，])`)
-	chatInvestigationNegatedActivity = regexp.MustCompile(`^(?:非|不是|不要|不必|不用|无需|没有|未曾)`)
+	chatInvestigationDirectMeta = regexp.MustCompile(
+		`^(?:` + chatInvestigationMetaLabelPrefix + `(?:旧消息(?:示例)?|(?:一个)?(?:示例|例子))|并?(?:非|不是)本次指令)$`)
+	chatInvestigationCompactMeta = regexp.MustCompile(
+		"^[^\"'`“”‘’「」『』《》]*" + chatInvestigationMetaLabelPrefix + `旧消息(?:示例)?$`)
+	chatInvestigationContinuationAssertion = regexp.MustCompile(`^(?:不能|无法|非|不是|没有|未曾)`)
 )
 
-// This high-precision cue only considers the opening sentence. It neither
-// interprets arbitrary phrasing (the model IntentPass handles meaning) nor
-// supplies authority. Keep quoted openings and explicit mentions distinct.
+func chatInvestigationFirstClause(text string) string {
+	if end := strings.IndexAny(text, chatInvestigationSentenceBreaks+chatInvestigationClauseSeparators); end >= 0 {
+		text = text[:end]
+	}
+	return strings.TrimSpace(text)
+}
+
+// This opening cue neither interprets arbitrary phrasing nor supplies authority.
+// A delimited command takes precedence over any later constraints or examples.
 func chatInvestigationHasOriginalTaskCue(content string) bool {
 	content = strings.TrimSpace(content)
 	text := strings.TrimSpace(strings.TrimPrefix(content, "请"))
@@ -81,24 +94,34 @@ func chatInvestigationHasOriginalTaskCue(content string) bool {
 		return chatInvestigationEnglishCue.MatchString(content)
 	}
 	rest = strings.TrimPrefix(rest, "吧")
-	if end := strings.IndexAny(rest, ".!?;。！？；"); end >= 0 {
-		rest = rest[:end]
+	first, _ := utf8.DecodeRuneInString(rest)
+	switch {
+	case rest == "" || strings.ContainsRune(chatInvestigationSentenceBreaks, first):
+		return true
+	case unicode.IsSpace(first) || strings.ContainsRune(chatInvestigationClauseSeparators, first):
+		// A soft separator can also introduce a label of the opening itself.
+		next := strings.TrimLeftFunc(rest, func(r rune) bool {
+			return !strings.ContainsRune(chatInvestigationSentenceBreaks, r) &&
+				(unicode.IsSpace(r) || strings.ContainsRune(chatInvestigationClauseSeparators, r))
+		})
+		return !chatInvestigationDirectMeta.MatchString(chatInvestigationFirstClause(next))
 	}
-	if chatInvestigationMetaCue.MatchString(rest) {
-		return false
-	}
-	tail := strings.TrimLeftFunc(rest, func(r rune) bool {
-		return unicode.IsSpace(r) || strings.ContainsRune(",:，：、", r)
-	})
+
+	clause := chatInvestigationFirstClause(rest)
 	for _, connective := range [...]string{"并且", "并", "然后", "同时", "再"} {
-		if activity, ok := strings.CutPrefix(tail, connective); ok {
+		if activity, ok := strings.CutPrefix(clause, connective); ok {
 			activity = strings.TrimSpace(activity)
 			first, _ := utf8.DecodeRuneInString(activity)
-			// Require activity text, not a bare connective or an explicit negation.
-			return unicode.IsLetter(first) && !chatInvestigationNegatedActivity.MatchString(activity)
+			// A subordinate prohibition is an activity modifier, not an assertion about continuing.
+			if !unicode.IsLetter(first) || chatInvestigationContinuationAssertion.MatchString(activity) {
+				return false
+			}
+			// After compact activity, require an unquoted old-message label;
+			// a generic example label may refer to the material being examined.
+			return !chatInvestigationDirectMeta.MatchString(activity) && !chatInvestigationCompactMeta.MatchString(activity)
 		}
 	}
-	return rest == "" || tail != rest // End of sentence or an ordinary separator.
+	return false
 }
 
 func chatInvestigationReferencesExistingWorkInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) (bool, error) {
