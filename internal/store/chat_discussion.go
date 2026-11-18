@@ -5,8 +5,8 @@ import (
 	"database/sql"
 )
 
-// Intake is not a renamed all-purpose capability. It can only publish bounded
-// discussion after assessment; member-triggered turns cannot invite recursively.
+// Legacy intake messages keep their original visibility and sender semantics.
+// Member-triggered turns use the structured handoff for any further wakes.
 func chatDiscussionGateInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, candidateID string, input MemberToolMessageInput, replay bool) error {
 	if err := chatIntakePurposeInTx(ctx, tx, scope, candidateID); err != nil {
 		return err
@@ -39,13 +39,20 @@ func chatDiscussionGateInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSco
 			return ErrMemberToolDenied
 		}
 	}
-	var used int
-	err = tx.QueryRowContext(ctx, `SELECT count(*) FROM message_command_sources s WHERE s.turn_id=? AND
-  EXISTS(SELECT 1 FROM deliveries d WHERE d.message_id=s.message_id)=?`, scope.Claim.TurnID, directed).Scan(&used)
-	if err != nil {
+	return chatDiscussionMessageSlotInTx(ctx, tx, scope.Claim.TurnID, directed)
+}
+
+// Both command paths share the slots. A structured return still spends the
+// directed slot when the intended recipient has left and no wake is sent.
+func chatDiscussionMessageSlotInTx(ctx context.Context, tx *sql.Tx, turnID string, directed bool) error {
+	var used bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM message_command_sources s WHERE s.turn_id=? AND (
+  EXISTS(SELECT 1 FROM deliveries d WHERE d.message_id=s.message_id)
+  OR EXISTS(SELECT 1 FROM chat_discussion_events e WHERE e.message_id=s.message_id AND e.recipient_id IS NOT NULL))=?)`,
+		turnID, directed).Scan(&used); err != nil {
 		return err
 	}
-	if used >= 1 {
+	if used {
 		return ErrMemberToolDenied
 	}
 	return nil
