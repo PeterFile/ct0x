@@ -177,7 +177,15 @@ func startRunWithSearch(t *testing.T, search provider.Search, args ...string) (s
 		if parsed.enableExecution {
 			executionStatus = fmt.Sprintf("全新单轮执行已启用，最大并发 %d；", parsed.executionMaxActive)
 		}
-		for _, want := range []string{"消息持久化", "历史与详情", "排队投递记录", executionStatus, "不支持恢复", "平台工具", "不是主机读取沙箱", "祖先必须可信"} {
+		sessionStatus := "不支持恢复"
+		if parsed.enableNativeSessionResume {
+			executionStatus = strings.TrimPrefix(executionStatus, "全新")
+			sessionStatus = "最新持久引用合格时续接"
+			if parsed.enableCodexAppServer && !strings.Contains(line, "仅普通 chat_intake/v1 可续接") {
+				t.Fatal("startup did not scope the Codex resume opt-in")
+			}
+		}
+		for _, want := range []string{"消息持久化", "历史与详情", "排队投递记录", executionStatus, sessionStatus, "平台工具", "不是主机读取沙箱", "祖先必须可信"} {
 			if !strings.Contains(line, want) {
 				t.Fatalf("startup must state execution boundaries: missing %q: %s", want, line)
 			}

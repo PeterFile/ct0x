@@ -54,7 +54,7 @@ func TestNativeSessionPrepareDefaultOffAndKnownSelectionOnly(t *testing.T) {
 	}
 }
 
-func TestNativeSessionPrepareMixedAdaptersKeepCodexFresh(t *testing.T) {
+func TestNativeSessionPrepareMixedAdaptersKeepUnscopedCodexFresh(t *testing.T) {
 	f := newRolePrepareFixture(t)
 	f.enableRuntime(t)
 	useReleasePiBridge(t, f)
@@ -78,7 +78,7 @@ func TestNativeSessionPrepareMixedAdaptersKeepCodexFresh(t *testing.T) {
 			t.Fatal("mixed selection lost qualified Pi resume capability")
 		}
 		if codex.ID != provider.CodexAppServerAdapterID || !codex.Enabled || codex.Capabilities == nil || !memberToolCapabilitiesSupported(*codex.Capabilities) || codex.Capabilities.NativeResume != provider.SupportUnsupported {
-			t.Fatalf("mixed selection must report fresh-only Codex AppServer with its platform tools and terminal evidence: %+v", codex.Capabilities)
+			t.Fatalf("Codex without chat intake must report fresh AppServer with platform tools and terminal evidence: %+v", codex.Capabilities)
 		}
 	})
 
@@ -100,7 +100,7 @@ func TestNativeSessionPrepareMixedAdaptersKeepCodexFresh(t *testing.T) {
 			prepared, err := p.Prepare(ctx, tc.pending)
 			prepareRoleOK(t, err)
 			if prepared.Executor.(*memberToolRuntimeRun).nativeSession != nil || prepared.Request != legacy.Request || !slices.Equal(prepared.ResourceKeys, legacy.ResourceKeys) {
-				t.Fatal("Pi opt-in selected Codex resume or changed its fresh prompt, model, thinking or claim keys")
+				t.Fatal("native opt-in changed the unqualified Codex prompt, model, thinking or claim keys")
 			}
 			_, receipt := executePreparedAdapterFixture(t, f, prepared, false, func(token string) {
 				names, err := f.opts.MemberTools.Tools().TransportOperations(ctx, token)
@@ -110,7 +110,7 @@ func TestNativeSessionPrepareMixedAdaptersKeepCodexFresh(t *testing.T) {
 					want = memberToolRoleOperations(store.CoordinationRoleCoordinator)
 				}
 				if !slices.Equal(names, want) {
-					t.Fatal("Pi opt-in changed fresh Codex grants")
+					t.Fatal("native opt-in changed fresh Codex grants")
 				}
 			})
 			if receipt.NativeRef != nil {
