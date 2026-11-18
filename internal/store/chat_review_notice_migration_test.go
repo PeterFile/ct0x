@@ -16,10 +16,10 @@ func chatReviewV17(t *testing.T, outcome domain.ReviewOutcome) (chatFixture, dom
 	original := migrations
 	defer func() { migrations = original }()
 	migrations = original[:17]
-	f, worker, submission := chatReviewSubmitted(t)
-	if _, err := f.s.ApplyTurnReceipt(ctx, worker.Member.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, ExitCode: -1}); err != nil {
-		t.Fatal(err)
-	}
+	// The v21 migration fixture's text Submission flow also runs on v17;
+	// it seeds the intake receipt without depending on the v23 association.
+	f, worker, submission := chatReviewSubmittedV21(t)
+	seedPreV23TurnReceipt(t, f.s, worker.Member.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, ExitCode: -1})
 	input := taskReviewInput(submission)
 	input.Outcome, input.Reason = outcome, "旧版本中本机用户的真实决定，迁移不得补发或改写。"
 	decision, err := f.s.ReviewTask(ctx, input)

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
 )
 
@@ -16,16 +17,41 @@ func TestWorkspaceOperationV20ToV21AtomicMigration(t *testing.T) {
 		t.Fatal("missing appended v21")
 	}
 	migrations = original[:20]
-	f, receipt := chatWorkspaceAdmitted(t)
+	f := chatSetup(t, "user", false)
+	if _, err := f.api.SetChatPolicy(ctx, f.candidate.ThreadRef, chatWorkspacePolicyInput(t, f.policy.ChatPolicyRequest), 1, "workspace-policy"); err != nil {
+		t.Fatal(err)
+	}
+	// Close the original intake before capturing a new local-user command
+	// under the workspace policy. Admission itself still uses the live gates.
+	seedPreV23TurnReceipt(t, f.s, f.scope.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted, ExitCode: -1})
+	message := chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID, ActorID: "user", Content: "请按刚才约定在本群已授权目录落实文件变更，交付可核验的文件版本。", RecipientIDs: []string{f.a}}, []string{f.a})
+	intake, err := f.s.ClaimTurn(ctx, ClaimTurnInput{GroupID: f.groupID, DeliveryID: message.Deliveries[0].ID, MaxActive: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scope, err := f.s.BindMemberTool(ctx, TurnClaim{GroupID: f.groupID, TurnID: intake.ID, Token: intake.ClaimToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate, err := f.api.CaptureChatCandidate(ctx, scope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assessment := f.input
+	assessment.Action = domain.ChatActionWorkspaceChange
+	assessment.Title, assessment.Description, assessment.Acceptance = "更新已授权目录", "按讨论落实变更", "提交可核验的冻结文件版本"
+	chatWorkspaceAuthorize(t, f, f.groupID, f.b, t.TempDir(), "workspace:1:2", "read_write")
+	receipt, err := f.api.ApplyChatAssessment(ctx, scope, candidate.ID, assessment, "按授权范围落实。", "workspace-admit")
+	if err != nil || receipt.TaskID == "" || receipt.WorkspaceScope == nil {
+		t.Fatalf("workspace admission: %+v, %v", receipt, err)
+	}
 	delivery := queueDelivery(t, f.s, f.groupID, f.b, "migration-unknown")
 	turn, err := f.s.ClaimTurn(ctx, ClaimTurnInput{GroupID: f.groupID, DeliveryID: delivery.ID, MaxActive: 8, ResourceKeys: []string{receipt.WorkspaceScope.ResourceKey}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	claim := TurnClaim{GroupID: f.groupID, TurnID: turn.ID, Token: turn.ClaimToken}
-	if _, err := f.s.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown}); err != nil {
-		t.Fatal(err)
-	}
+	seedPreV23TurnReceipt(t, f.s, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown})
 	before := messageSequenceSnapshot(t, f.s)
 	objects := messageSequenceRows(t, f.s.db, assignmentSchemaQuery)
 	migrations = slices.Clone(original[:21])

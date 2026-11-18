@@ -233,9 +233,10 @@ func TestWorkspaceGrantV15UpgradePreservesUnknownClaims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	turn, err = s.ApplyTurnReceipt(ctx, TurnClaim{GroupID: input.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown})
-	if err != nil || turn.State != domain.TurnStateUnknown {
-		t.Fatal(err)
+	claim := TurnClaim{GroupID: input.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	seedPreV23TurnReceipt(t, s, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown})
+	if got := queueTurn(t, s, claim); got.State != domain.TurnStateUnknown {
+		t.Fatalf("historical turn did not retain uncertainty: %s", got.State)
 	}
 	before := messageSequenceSnapshot(t, s)
 	objects := messageSequenceRows(t, s.db, assignmentSchemaQuery)

@@ -98,9 +98,7 @@ func TestCoordinationAssignmentResolutionV14ReceiptHistoryUpgrade(t *testing.T) 
 				if mode == "unknown" {
 					receipt := queueReceipt(provider.OutcomeSucceeded)
 					receipt.Outcome, receipt.OutputComplete = provider.OutcomeUnknown, false
-					if _, err := old.ApplyTurnReceipt(ctx, TurnClaim{GroupID: g, TurnID: turn.ID, Token: turn.ClaimToken}, receipt); err != nil {
-						t.Fatal(err)
-					}
+					seedPreV23TurnReceipt(t, old, TurnClaim{GroupID: g, TurnID: turn.ID, Token: turn.ClaimToken}, receipt)
 				}
 			}
 			coordinatorMustCommit(t, old,

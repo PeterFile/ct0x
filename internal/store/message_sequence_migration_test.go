@@ -44,9 +44,7 @@ func messageSequenceV7Fixture(t *testing.T) (*Store, string, func(*Store)) {
 	}
 	receipt := queueReceipt(provider.OutcomeSucceeded)
 	receipt.Outcome, receipt.OutputComplete = provider.OutcomeUnknown, false
-	if _, err := s.ApplyTurnReceipt(ctx, claim, receipt); err != nil {
-		t.Fatal(err)
-	}
+	seedPreV23TurnReceipt(t, s, claim, receipt)
 	beforeTurn := queueTurn(t, s, claim)
 	beforeReceipt := queueReceiptJSON(t, s, claim)
 	beforeMessage, err := s.GetMessage(ctx, g.ID, message.ID)

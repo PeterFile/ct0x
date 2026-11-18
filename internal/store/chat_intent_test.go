@@ -493,9 +493,7 @@ func TestChatIntentV16MigrationAtomicAndRetainsUnknownClaims(t *testing.T) {
 	defer func() { migrations = original }()
 	migrations = original[:15]
 	f, turn, claim := queueClaimFixture(t)
-	if _, err := f.s.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, ExitCode: -1}); err != nil {
-		t.Fatal(err)
-	}
+	seedPreV23TurnReceipt(t, f.s, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown, ExitCode: -1})
 	before := messageSequenceSnapshot(t, f.s)
 	migrations = slices.Clone(original)
 	migrations[15] += "\nINSERT INTO synthetic_missing_chat_migration VALUES(1);"
