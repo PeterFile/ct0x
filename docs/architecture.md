@@ -59,7 +59,8 @@ Initial endpoints:
 | `/api/v1/groups` | GET list, POST `{name, description?}` |
 | `/api/v1/groups/{group}/members` | GET list, POST `{name, role, provider_id?, model?, workspace?}` |
 | `/api/v1/groups/{group}/messages` | GET bounded history, POST `{content, recipient_ids?, topic_id?}` |
-| `/api/v1/groups/{group}/tasks` | GET, POST `{title, description, acceptance, assignee_id?, dependency_ids?}` |
+| `/api/v1/groups/{group}/tasks` | GET, POST `{title, description, acceptance, assignee_id?, dependency_ids?, artifact_dependencies?}` |
+| `/api/v1/groups/{group}/tasks/{task}/artifact-dependencies` | GET immutable `{artifact_dependencies: [...]}` |
 | `/api/v1/groups/{group}/artifacts` | GET versioned outputs, POST publish |
 | `/api/v1/groups/{group}/context` | GET knowledge and summaries |
 | `/api/v1/groups/{group}/history?q=...` | GET scoped search |
@@ -68,6 +69,10 @@ Initial endpoints:
 | `/api/v1/events` | GET SSE notifications; reconnect always re-reads durable state |
 
 Initial Group fields: `id, name, description, created_at`. Member fields: `id, group_id, name, role, provider_id, model, creator_id, owner_id, status, workspace, created_at`. Message fields: `id, group_id, topic_id, sender_id, content, created_at, deliveries`. Local-user and some platform messages use `sender_id=user`; that label alone is not human permission. Member messages use the member ID. An empty topic denotes the main channel. Delivery fields: `id, message_id, conversation_id, recipient_id, state, turn_id, error, created_at`. Provider fields: `id, name, path, version, installation, account, connectivity, capabilities, evidence`.
+
+For an independent Task, the local user can explicitly pin one ArtifactVersion per prerequisite in `artifact_dependencies`: `{dependency_id, submission_id, artifact_id, version_id, ready_when: "accepted"}`. `dependency_id` must also appear in `dependency_ids`; the same-group Task edge is required, not derived. The exact Submission must belong to that Task and contain the exact published version, whose `source_task_id` must be that Task. The pin does not follow the Artifact head. Registration is allowed while the Submission is current and awaiting Review, or when it already has an exact local-user acceptance. A rejected Submission cannot be used for a new pin.
+
+Starting a new attempt still requires every plain prerequisite to be accepted. A pin additionally requires a local-user Review accepting its exact Submission and task revision. Chat, head changes, and Review of a different Submission do not satisfy it, even if that Submission cites the same version. Pins cannot be edited or removed; the read endpoint returns them ordered by `dependency_id` (or `[]` in the envelope). Task list and detail payloads are unchanged. Pins do not grant Artifact access or execution authority and are not inferred from intra-Task cooperation.
 
 The first provider implementation targets installed Pi and Codex. Capability tiers remain truthful: richer native protocols are separate slices, and PTY-only integrations do not claim machine collaboration. Live provider checks are recorded separately from fixture tests.
 

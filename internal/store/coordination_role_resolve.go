@@ -195,7 +195,7 @@ func coordinationRoleStateInTx(ctx context.Context, tx *sql.Tx, scope MemberTool
 		}
 		state.AttemptID = attempt
 	}
-	var valid bool
+	var valid, checkArtifactDeps bool
 	var status string
 	err := tx.QueryRowContext(ctx, `SELECT coalesce(
  r.group_id=:grp AND r.task_id=:task AND r.task_revision=:revision AND r.topic_id=:topic AND r.requested_by='user'
@@ -226,7 +226,9 @@ func coordinationRoleStateInTx(ctx context.Context, tx *sql.Tx, scope MemberTool
  WHEN co.status<>'active' OR w.status<>'active' THEN 'member_inactive'
  WHEN :kind='worker' AND EXISTS(SELECT 1 FROM task_dependencies dep JOIN tasks parent ON parent.id=dep.dependency_id AND parent.group_id=dep.group_id
  WHERE dep.task_id=r.task_id AND dep.group_id=r.group_id AND parent.status<>'accepted') THEN 'dependency_not_accepted'
- ELSE '' END
+ ELSE '' END,
+ CASE WHEN :kind='worker' AND :attempt='' THEN EXISTS(SELECT 1 FROM task_dependencies dep
+ WHERE dep.group_id=r.group_id AND dep.task_id=r.task_id) ELSE 0 END
  FROM coordination_dispatch_requests r LEFT JOIN coordination_dispatch_state s ON s.request_id=r.id
  LEFT JOIN tasks t ON t.id=r.task_id LEFT JOIN mandates m ON m.id=r.mandate_id LEFT JOIN routing_decisions rd ON rd.id=m.decision_id
  LEFT JOIN group_coordinator_binding_revisions h ON h.group_id=r.group_id AND h.revision=r.binding_revision
@@ -236,7 +238,7 @@ func coordinationRoleStateInTx(ctx context.Context, tx *sql.Tx, scope MemberTool
  LEFT JOIN group_dispatch_policies cp ON cp.group_id=r.group_id WHERE r.id=:request`,
 		sql.Named("grp", p.GroupID), sql.Named("task", p.TaskID), sql.Named("revision", p.TaskRevision), sql.Named("topic", p.TopicID),
 		sql.Named("kind", string(p.Kind)), sql.Named("member", p.MemberID), sql.Named("attempt", state.AttemptID), sql.Named("request", p.RequestID)).Scan(
-		&valid, &status, &state.ProviderID, &state.Model, &state.Blocked)
+		&valid, &status, &state.ProviderID, &state.Model, &state.Blocked, &checkArtifactDeps)
 	if err != nil {
 		return CoordinationRoleState{}, coordinationRoleRelationError(err)
 	}
@@ -263,6 +265,15 @@ func coordinationRoleStateInTx(ctx context.Context, tx *sql.Tx, scope MemberTool
 			}
 		} else if receipt.Decision.CoordinatorTurnID != scope.Claim.TurnID {
 			return CoordinationRoleState{}, ErrMemberToolDenied
+		}
+	}
+	if checkArtifactDeps && state.Blocked == CoordinationReady {
+		blocked, err := taskArtifactDependenciesBlockedInTx(ctx, tx, p.GroupID, p.TaskID)
+		if err != nil {
+			return CoordinationRoleState{}, err
+		}
+		if blocked {
+			state.Blocked = CoordinationDependencyNotAccepted
 		}
 	}
 	return state, nil
