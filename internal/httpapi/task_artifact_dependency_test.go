@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -60,11 +62,9 @@ func TestTaskArtifactDependencyHTTPExactReview(t *testing.T) {
 	child := decoded[domain.Task](t, created, 201)
 	childPath := collection + "/" + child.ID
 	read := a.request("GET", childPath+"/artifact-dependencies", "")
-	got := decoded[struct {
-		Pins []artifactDependencyWire `json:"artifact_dependencies"`
-	}](t, read, 200)
-	if len(got.Pins) != 1 || got.Pins[0] != pin {
-		t.Fatalf("expected immutable historical version %v, got %v", pin, got.Pins)
+	got := decoded[listResult[artifactDependencyWire]](t, read, 200)
+	if !slices.Equal(got.Items, []artifactDependencyWire{pin}) || got.NextCursor != "" {
+		t.Fatalf("expected immutable historical version %v, got %+v", pin, got)
 	}
 	changed := pin
 	changed.VersionID = later.ID // Both versions belong to this Submission.
@@ -146,8 +146,9 @@ func TestTaskArtifactDependencyHTTPSemanticValidationFollowsIdempotency(t *testi
 	ids := []string{parent.ID}
 	pin := artifactDependencyWire{parent.ID, sub.ID, version.ArtifactID, version.ID, "accepted"}
 	pinned := artifactDependencyBody(t, ids, pin)
-	pin.ReadyWhen = "submitted"
-	invalid := artifactDependencyBody(t, ids, pin)
+	invalidPin := pin
+	invalidPin.ReadyWhen = "submitted"
+	invalid := artifactDependencyBody(t, ids, invalidPin)
 	invalidJSON := strings.Replace(invalid, `"ready_when":"submitted"`, `"ready_when":true`, 1)
 
 	t.Run("fresh-key", func(t *testing.T) {
@@ -168,6 +169,21 @@ func TestTaskArtifactDependencyHTTPSemanticValidationFollowsIdempotency(t *testi
 			}
 		})
 	}
+	t.Run("fresh-pin-limit", func(t *testing.T) {
+		// Use distinct, syntactically valid pairs so ordinary pin validation
+		// would proceed to the missing-Task lookup without the count bound.
+		ids, pins := make([]string, 201), make([]artifactDependencyWire, 201)
+		for i := range pins {
+			ids[i] = "missing-" + strconv.Itoa(i)
+			pins[i] = pin
+			pins[i].DependencyID = ids[i]
+		}
+		oversized := artifactDependencyBody(t, ids, pins...)
+		taskLifecycleError(t, a.request("POST", collection, oversized, "limit"), 400, "invalid_input")
+		decoded[domain.Task](t, a.request("POST", collection, pinned, "limit"), 201)
+		w := a.request("POST", collection, oversized, "limit")
+		assertError(t, w.Code, w.Header(), w.Body.Bytes(), 409, "conflict")
+	})
 }
 
 func TestTaskArtifactDependencyHTTPRejectsInvalidPinsAtomically(t *testing.T) {
@@ -218,14 +234,52 @@ func TestTaskArtifactDependencyHTTPRejectsInvalidPinsAtomically(t *testing.T) {
 	otherPin := artifactDependencyWire{sibling.ID, siblingSub.ID, wrongSource.ArtifactID, wrongSource.ID, "accepted"}
 	first := a.request("POST", collection, artifactDependencyBody(t, []string{parent.ID, sibling.ID}, valid, otherPin), "retry")
 	child := decoded[domain.Task](t, first, 201)
+	childPath := collection + "/" + child.ID
+	target := childPath + "/artifact-dependencies"
+	want := []artifactDependencyWire{valid, otherPin}
+	if want[0].DependencyID < want[1].DependencyID {
+		slices.Reverse(want)
+	}
+	firstURL := target + "?limit=1"
+	head := a.request("GET", firstURL, "")
+	firstPage := decoded[listResult[artifactDependencyWire]](t, head, 200)
+	var cursor pageCursor
+	if !slices.Equal(firstPage.Items, want[:1]) || parseCursor(firstPage.NextCursor, &cursor) != nil ||
+		cursor.Scope != "task_artifact_dependencies:"+child.ID || cursor.GroupID != g.ID ||
+		cursor.ID != want[0].DependencyID || !cursor.CreatedAt.Equal(child.CreatedAt) {
+		t.Fatalf("first pin page or cursor: %+v %+v", firstPage, cursor)
+	}
+	tailURL := firstURL + "&before=" + firstPage.NextCursor
+	tail := a.request("GET", tailURL, "")
+	lastPage := decoded[listResult[artifactDependencyWire]](t, tail, 200)
+	if !slices.Equal(lastPage.Items, want[1:]) || lastPage.NextCursor != "" {
+		t.Fatalf("exactly full last pin page: %+v", lastPage)
+	}
+
 	w := a.request("POST", collection, artifactDependencyBody(t, []string{sibling.ID, parent.ID, parent.ID}, otherPin, valid), "retry")
 	if w.Code != 201 || !bytes.Equal(w.Body.Bytes(), first.Body.Bytes()) {
 		t.Fatalf("pin ordering changed keyed create: %d %s", w.Code, w.Body)
 	}
-	w = a.request("GET", "/api/v1/groups/"+foreign.ID+"/tasks/"+child.ID+"/artifact-dependencies", "")
-	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 404, "not_found")
-	if w := a.request("GET", parentPath+"/artifact-dependencies", ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"artifact_dependencies":[]`) {
-		t.Fatalf("unbound Task must return an empty pin array: %d %s", w.Code, w.Body)
+	if err := a.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a = openTaskLifecycleAPI(t, a.path)
+	for url, body := range map[string][]byte{firstURL: head.Body.Bytes(), tailURL: tail.Body.Bytes()} {
+		if w := a.request("GET", url, ""); w.Code != 200 || !bytes.Equal(w.Body.Bytes(), body) {
+			t.Fatalf("pin page changed after create replay and reopen: %d %s", w.Code, w.Body)
+		}
+	}
+	foreignTarget := "/api/v1/groups/" + foreign.ID + "/tasks/" + child.ID + "/artifact-dependencies"
+	taskLifecycleError(t, a.request("GET", foreignTarget, ""), 404, "not_found")
+	for _, wrong := range []string{foreignTarget, parentPath + "/artifact-dependencies", childPath + "/attempts"} {
+		taskLifecycleError(t, a.request("GET", wrong+"?before="+firstPage.NextCursor, ""), 400, "invalid_input")
+	}
+	for _, query := range []string{"limit=201", "before=invalid"} {
+		taskLifecycleError(t, a.request("GET", target+"?"+query, ""), 400, "invalid_input")
+	}
+	empty := decoded[listResult[artifactDependencyWire]](t, a.request("GET", parentPath+"/artifact-dependencies", ""), 200)
+	if empty.Items == nil || len(empty.Items) != 0 || empty.NextCursor != "" {
+		t.Fatalf("unbound Task must return an empty pin array: %+v", empty)
 	}
 	if w := a.request("GET", collection, ""); w.Code != 200 || strings.Contains(w.Body.String(), `"artifact_dependencies"`) {
 		t.Fatalf("Task list changed shape: %d %s", w.Code, w.Body)

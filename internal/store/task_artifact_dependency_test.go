@@ -75,8 +75,8 @@ func TestTaskArtifactDependencyV22UpgradePreservesPlainPayload(t *testing.T) {
 	}
 	checkPlain := func(s *Store) {
 		t.Helper()
-		got, err := s.GetTaskArtifactDependencies(ctx, child.GroupID, child.ID)
-		if err != nil || got == nil || len(got) != 0 {
+		got, err := s.ListTaskArtifactDependencies(ctx, child.GroupID, child.ID, ListOptions{})
+		if err != nil || got.Items == nil || len(got.Items) != 0 || got.NextCursor != nil {
 			t.Fatalf("plain edge has pins: %+v %v", got, err)
 		}
 		var payload []byte
@@ -120,8 +120,8 @@ func TestTaskArtifactDependencyV22UpgradePreservesPlainPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if pins, err := s.GetTaskArtifactDependencies(ctx, newChild.GroupID, newChild.ID); err != nil || !slices.Equal(pins, pinned.ArtifactDependencies) {
-		t.Fatalf("new pinned edge after upgrade: %+v %v", pins, err)
+	if page, err := s.ListTaskArtifactDependencies(ctx, newChild.GroupID, newChild.ID, ListOptions{}); err != nil || !slices.Equal(page.Items, pinned.ArtifactDependencies) || page.NextCursor != nil {
+		t.Fatalf("new pinned edge after upgrade: %+v %v", page, err)
 	}
 	dispatchAssertFK(t, s)
 }
@@ -165,10 +165,67 @@ func TestTaskArtifactDependencyStoreAuthorityAndImmutability(t *testing.T) {
 	if got, err := s.CreateTask(ctx, input); got.ID != "" || !errors.Is(err, ErrInvalid) {
 		t.Fatalf("an untrusted Review registered a new pin: %+v %v", got, err)
 	}
-	if pins, err := s.GetTaskArtifactDependencies(ctx, groupID, child.ID); err != nil || !slices.Equal(pins, input.ArtifactDependencies) {
-		t.Fatalf("pin changed: %+v %v", pins, err)
+	if page, err := s.ListTaskArtifactDependencies(ctx, groupID, child.ID, ListOptions{}); err != nil || !slices.Equal(page.Items, input.ArtifactDependencies) || page.NextCursor != nil {
+		t.Fatalf("pin changed: %+v %v", page, err)
 	}
 	assertTaskCounts(t, s, 2, 1, 1)
+}
+
+func TestTaskArtifactDependencyListUsesScopedLimitAndBefore(t *testing.T) {
+	s, path := openTestStore(t)
+	groupID := group(t, s).ID
+	_, _, first := artifactDependencySource(t, s, groupID)
+	_, _, second := artifactDependencySource(t, s, groupID)
+	input, other := artifactDependencyCreateInput(first), artifactDependencyCreateInput(second)
+	input.ArtifactDependencies = append(input.ArtifactDependencies, other.ArtifactDependencies...)
+	input.DependencyIDs = append(input.DependencyIDs, other.DependencyIDs...)
+	child, err := s.CreateTask(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := input.ArtifactDependencies
+	if want[0].DependencyID < want[1].DependencyID {
+		slices.Reverse(want)
+	}
+	cursor := &Cursor{CreatedAt: child.CreatedAt, ID: want[0].DependencyID}
+	recorder := assignmentQueryStore(t, path)
+	for _, tc := range []struct {
+		name    string
+		options ListOptions
+		want    Page[domain.TaskArtifactDependency]
+		limit   int64
+	}{
+		{"default", ListOptions{}, Page[domain.TaskArtifactDependency]{Items: want}, 51},
+		{"first", ListOptions{Limit: 1}, Page[domain.TaskArtifactDependency]{Items: want[:1], NextCursor: cursor}, 2},
+		{"before", ListOptions{Limit: 1, Before: cursor}, Page[domain.TaskArtifactDependency]{Items: want[1:]}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder.queries = nil
+			page, err := recorder.s.ListTaskArtifactDependencies(ctx, groupID, child.ID, tc.options)
+			if err != nil || !reflect.DeepEqual(page, tc.want) {
+				t.Fatalf("page = %+v, %v; want %+v", page, err, tc.want)
+			}
+			args, keys := []any{groupID, child.ID}, "group_id=? AND task_id=?"
+			if tc.options.Before != nil {
+				args = append(args, cursor.ID)
+				keys += " AND dependency_id<?"
+			}
+			for _, q := range recorder.queries {
+				if !strings.Contains(q.query, "FROM task_artifact_dependencies") {
+					continue
+				}
+				if !strings.HasSuffix(q.query, " LIMIT ?") || !reflect.DeepEqual(q.args, append(args, tc.limit)) {
+					t.Fatalf("pin query did not bind scope, before, and limit+1: %+v", q)
+				}
+				plan := resolutionPlan(t, s, q.query, q.args...)
+				if !strings.Contains(plan, "USING PRIMARY KEY ("+keys+")") || strings.Contains(plan, "TEMP B-TREE") {
+					t.Fatalf("pin page did not seek the scoped primary key: %s", plan)
+				}
+				return
+			}
+			t.Fatal("pin page did not query the dependency table")
+		})
+	}
 }
 
 func TestTaskArtifactDependencyWorkerReadinessRequiresPinnedReview(t *testing.T) {

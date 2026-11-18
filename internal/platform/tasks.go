@@ -28,8 +28,8 @@ func (s *LocalUser) GetTask(ctx context.Context, groupID, taskID string) (domain
 	return s.db.GetTask(ctx, groupID, taskID)
 }
 
-func (s *LocalUser) GetTaskArtifactDependencies(ctx context.Context, groupID, taskID string) ([]domain.TaskArtifactDependency, error) {
-	return s.db.GetTaskArtifactDependencies(ctx, groupID, taskID)
+func (s *LocalUser) ListTaskArtifactDependencies(ctx context.Context, groupID, taskID string, options store.ListOptions) (store.Page[domain.TaskArtifactDependency], error) {
+	return s.db.ListTaskArtifactDependencies(ctx, groupID, taskID, options)
 }
 
 func (s *LocalUser) ListTasks(ctx context.Context, groupID string, options store.ListOptions) (store.Page[domain.Task], error) {

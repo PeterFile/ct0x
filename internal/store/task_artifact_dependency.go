@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"agentworkspace/internal/domain"
 )
@@ -16,8 +17,11 @@ func canonicalTaskArtifactDependencies(input []domain.TaskArtifactDependency) []
 	return pins
 }
 
-// Both inputs are sorted by dependency ID.
+// Both inputs are sorted by dependency ID. Validate only fresh writes, after replay lookup.
 func validateTaskArtifactDependencies(deps []string, pins []domain.TaskArtifactDependency) error {
+	if len(pins) > maxPageSize {
+		return fmt.Errorf("%w：成果依赖数量不能超过 %d", ErrInvalid, maxPageSize)
+	}
 	for i, pin := range pins {
 		if strings.TrimSpace(pin.DependencyID) == "" || strings.TrimSpace(pin.SubmissionID) == "" ||
 			strings.TrimSpace(pin.ArtifactID) == "" || strings.TrimSpace(pin.VersionID) == "" || pin.ReadyWhen != "accepted" {
@@ -89,48 +93,79 @@ func insertTaskArtifactDependenciesInTx(ctx context.Context, tx *sql.Tx, task do
 	return nil
 }
 
-// GetTaskArtifactDependencies is a trusted read of explicit immutable pins,
+// ListTaskArtifactDependencies is a trusted read of explicit immutable pins,
 // not a grant to access Artifact contents or execute the Task.
-func (s *Store) GetTaskArtifactDependencies(ctx context.Context, groupID, taskID string) ([]domain.TaskArtifactDependency, error) {
+func (s *Store) ListTaskArtifactDependencies(ctx context.Context, groupID, taskID string, options ListOptions) (Page[domain.TaskArtifactDependency], error) {
+	const action = "列出任务成果依赖失败"
+	limit, err := listLimit(options)
+	if err != nil {
+		return Page[domain.TaskArtifactDependency]{}, taskError(action, err)
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, taskError("读取任务成果依赖失败", err)
+		return Page[domain.TaskArtifactDependency]{}, taskError(action, err)
 	}
 	defer tx.Rollback()
-	var exists int
-	if err := tx.QueryRowContext(ctx, "SELECT 1 FROM tasks WHERE group_id=? AND id=?", groupID, taskID).Scan(&exists); err != nil {
-		return nil, taskError("读取任务成果依赖失败", err)
+	var stamp string
+	if err := tx.QueryRowContext(ctx, "SELECT created_at FROM tasks WHERE group_id=? AND id=?", groupID, taskID).Scan(&stamp); err != nil {
+		return Page[domain.TaskArtifactDependency]{}, taskError(action, err)
 	}
-	pins, err := taskArtifactDependenciesInTx(ctx, tx, groupID, taskID)
+	page, err := listTaskArtifactDependenciesInTx(ctx, tx, groupID, taskID, stamp, limit, options.Before)
 	if err != nil {
-		return nil, taskError("读取任务成果依赖失败", err)
+		return Page[domain.TaskArtifactDependency]{}, taskError(action, err)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, taskError("读取任务成果依赖失败", err)
+		return Page[domain.TaskArtifactDependency]{}, taskError(action, err)
 	}
-	return pins, nil
+	return page, nil
 }
 
-func taskArtifactDependenciesInTx(ctx context.Context, tx *sql.Tx, groupID, taskID string) ([]domain.TaskArtifactDependency, error) {
-	pins := []domain.TaskArtifactDependency{}
+func listTaskArtifactDependenciesInTx(ctx context.Context, tx *sql.Tx, groupID, taskID, stamp string, limit int, before *Cursor) (Page[domain.TaskArtifactDependency], error) {
+	page := Page[domain.TaskArtifactDependency]{Items: []domain.TaskArtifactDependency{}}
 	installed, err := taskArtifactDependencySchemaInTx(ctx, tx)
 	if err != nil || !installed {
-		return pins, err
+		return page, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT dependency_id,submission_id,artifact_id,version_id,ready_when
-	 FROM task_artifact_dependencies WHERE group_id=? AND task_id=? ORDER BY dependency_id`, groupID, taskID)
+	query := `SELECT dependency_id,submission_id,artifact_id,version_id,ready_when
+	 FROM task_artifact_dependencies WHERE group_id=? AND task_id=?`
+	args := []any{groupID, taskID}
+	// Pins share the child Task's timestamp. At that timestamp, seek directly
+	// within the (group_id, task_id, dependency_id) primary key.
+	if before != nil {
+		boundary := before.CreatedAt.UTC().Format(timestampLayout)
+		if stamp > boundary {
+			return page, nil
+		}
+		if stamp == boundary {
+			query += " AND dependency_id<?"
+			args = append(args, before.ID)
+		}
+	}
+	query += " ORDER BY dependency_id DESC LIMIT ?"
+	rows, err := tx.QueryContext(ctx, query, append(args, limit+1)...)
 	if err != nil {
-		return nil, err
+		return Page[domain.TaskArtifactDependency]{}, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var pin domain.TaskArtifactDependency
 		if err := rows.Scan(&pin.DependencyID, &pin.SubmissionID, &pin.ArtifactID, &pin.VersionID, &pin.ReadyWhen); err != nil {
-			return nil, err
+			return Page[domain.TaskArtifactDependency]{}, err
 		}
-		pins = append(pins, pin)
+		page.Items = append(page.Items, pin)
 	}
-	return pins, rows.Err()
+	if err := rows.Err(); err != nil {
+		return Page[domain.TaskArtifactDependency]{}, err
+	}
+	if len(page.Items) > limit {
+		createdAt, err := time.Parse(timestampLayout, stamp)
+		if err != nil {
+			return Page[domain.TaskArtifactDependency]{}, err
+		}
+		page.Items = page.Items[:limit]
+		page.NextCursor = &Cursor{CreatedAt: createdAt, ID: page.Items[limit-1].DependencyID}
+	}
+	return page, nil
 }
 
 // Check only new starts that passed the existing plain dependency gate. The

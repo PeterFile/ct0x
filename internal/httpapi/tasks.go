@@ -3,7 +3,6 @@ package httpapi
 import (
 	"net/http"
 
-	"agentworkspace/internal/domain"
 	"agentworkspace/internal/platform"
 )
 
@@ -13,7 +12,7 @@ func TaskRoutes(local *platform.LocalUser) []Route {
 		{http.MethodGet, "/api/v1/groups/{group}/tasks", a.listTasks},
 		{http.MethodPost, "/api/v1/groups/{group}/tasks", noQuery(a.createTask)},
 		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}", noQuery(a.getTask)},
-		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/artifact-dependencies", noQuery(a.getTaskArtifactDependencies)},
+		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/artifact-dependencies", a.listTaskArtifactDependencies},
 	}
 }
 
@@ -32,11 +31,16 @@ func (a localAPI) getTask(w http.ResponseWriter, r *http.Request) {
 	operationResult(w, http.StatusOK, task, err)
 }
 
-func (a localAPI) getTaskArtifactDependencies(w http.ResponseWriter, r *http.Request) {
-	pins, err := a.local.GetTaskArtifactDependencies(r.Context(), r.PathValue("group"), r.PathValue("task"))
-	operationResult(w, http.StatusOK, struct {
-		ArtifactDependencies []domain.TaskArtifactDependency `json:"artifact_dependencies"`
-	}{pins}, err)
+func (a localAPI) listTaskArtifactDependencies(w http.ResponseWriter, r *http.Request) {
+	groupID, taskID := r.PathValue("group"), r.PathValue("task")
+	scope := "task_artifact_dependencies:" + taskID
+	options, err := listOptions(r, scope, groupID)
+	if err != nil {
+		operationError(w, err)
+		return
+	}
+	page, err := a.local.ListTaskArtifactDependencies(r.Context(), groupID, taskID, options)
+	writePage(w, page, scope, groupID, err)
 }
 
 func (a localAPI) listTasks(w http.ResponseWriter, r *http.Request) {
