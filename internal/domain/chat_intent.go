@@ -3,23 +3,44 @@ package domain
 import "time"
 
 const (
-	ChatActionTextSubmission    = "text_submission"
-	ChatActionWorkspaceChange   = "workspace_change"
-	ChatPreparationTopicSummary = "topic_summary"
-	ChatIntakePurpose           = "chat_intake/v1"
+	ChatActionTextSubmission        = "text_submission"
+	ChatActionWorkspaceChange       = "workspace_change"
+	ChatActionReadOnlyInvestigation = "read_only_investigation"
+	ChatPreparationTopicSummary     = "topic_summary"
+	ChatIntakePurpose               = "chat_intake/v1"
 )
 
 // ChatPolicyRequest is local-user configuration, not a member tool grant.
 // Scope is exactly one group/topic. Workspace changes require a separate opt-in
 // and server-bound grants. The budget covers the entire policy revision.
 type ChatPolicyRequest struct {
-	Enabled                   bool   `json:"enabled"`
-	AllowPreparation          bool   `json:"allow_preparation"`
-	PreauthorizationMessageID string `json:"preauthorization_message_id"`
-	Action                    string `json:"action"`
-	MaxAdmissions             int    `json:"max_admissions"`
-	PreparationScopeKind      string `json:"preparation_scope_kind,omitempty"`
-	AllowWorkspaceChanges     bool   `json:"allow_workspace_changes,omitempty"`
+	Enabled                   bool                     `json:"enabled"`
+	AllowPreparation          bool                     `json:"allow_preparation"`
+	PreauthorizationMessageID string                   `json:"preauthorization_message_id"`
+	Action                    string                   `json:"action"`
+	MaxAdmissions             int                      `json:"max_admissions"`
+	PreparationScopeKind      string                   `json:"preparation_scope_kind,omitempty"`
+	AllowWorkspaceChanges     bool                     `json:"allow_workspace_changes,omitempty"`
+	Investigation             *ChatInvestigationPolicy `json:"investigation,omitempty"`
+}
+
+// ChatInvestigationPolicy is a local-user allowlist, not a tool or delegation grant.
+type ChatInvestigationPolicy struct {
+	Objective          string               `json:"objective"`
+	AllowTopicMessages bool                 `json:"allow_topic_messages"`
+	ArtifactVersions   []ArtifactVersionRef `json:"artifact_versions"`
+	MaxDelegations     int                  `json:"max_delegations"`
+}
+
+// TaskInvestigationScope is immutable admission evidence, not live permission.
+type TaskInvestigationScope struct {
+	ThreadRef
+	TaskID                string `json:"task_id"`
+	TaskRevision          int64  `json:"task_revision"`
+	MandateID             string `json:"mandate_id"`
+	PolicyRevision        int64  `json:"policy_revision"`
+	ConfigurationSourceID string `json:"configuration_source_id"`
+	ChatInvestigationPolicy
 }
 
 type ChatPolicy struct {
@@ -34,6 +55,10 @@ type ChatPolicy struct {
 	// WorkspaceChangesSupported describes Store admission support, not user
 	// permission, provider file capabilities, or connected execution tools.
 	WorkspaceChangesSupported bool `json:"workspace_changes_supported"`
+
+	// Schema support and trusted process readiness are not policy grants.
+	InvestigationSupported        bool `json:"investigation_supported"`
+	InvestigationExecutionEnabled bool `json:"investigation_execution_enabled"`
 }
 
 // ChatCandidate is captured by the runtime before semantic assessment. Its
@@ -94,6 +119,9 @@ type ChatAssessment struct {
 	Reason      string                `json:"reason"`
 	Question    string                `json:"question,omitempty"`
 	Repair      *ChatRepairAssessment `json:"repair,omitempty"`
+
+	// Only for discuss: a verbatim restriction from the bound local-user message.
+	DiscussionOnlyExcerpt *string `json:"discussion_only_excerpt,omitempty"`
 }
 
 // ChatAssessmentReceipt preserves the real assessor and source separately from
@@ -124,6 +152,10 @@ type ChatAssessmentReceipt struct {
 	ReasonCode                string    `json:"reason_code,omitempty"`
 	Question                  string    `json:"question,omitempty"`
 	AuthorityEvidenceVerified bool      `json:"authority_evidence_verified"`
+
+	// Source limitation, not authorization or a policy change.
+	DiscussionOnly        bool   `json:"discussion_only,omitempty"`
+	DiscussionOnlyExcerpt string `json:"discussion_only_excerpt,omitempty"`
 
 	WorkspaceScope *TaskWorkspaceScope `json:"workspace_scope,omitempty"`
 	RepairLink     *ChatRepairLink     `json:"repair_link,omitempty"`

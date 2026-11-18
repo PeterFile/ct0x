@@ -18,6 +18,18 @@ func (e *Engine) GetChatPolicy(ctx context.Context, thread domain.ThreadRef) (do
 	return e.store.GetChatPolicy(ctx, thread)
 }
 
+// EnableInvestigationExecution is trusted startup wiring, after the read-only
+// profile and its scoped tools are installed. Policy writes cannot enable it.
+func (e *Engine) EnableInvestigationExecution() { e.store.EnableInvestigationExecution() }
+
+func (e *Engine) GetTaskInvestigationScope(ctx context.Context, groupID, taskID string) (domain.TaskInvestigationScope, error) {
+	return e.store.GetTaskInvestigationScope(ctx, groupID, taskID)
+}
+
+func (e *Engine) CheckTaskInvestigationReady(ctx context.Context, groupID, taskID string) error {
+	return e.store.CheckTaskInvestigationReady(ctx, groupID, taskID)
+}
+
 func (e *Engine) GetChatAdmission(ctx context.Context, groupID, taskID string) (domain.ChatAssessmentReceipt, error) {
 	return e.store.GetChatAdmission(ctx, groupID, taskID)
 }

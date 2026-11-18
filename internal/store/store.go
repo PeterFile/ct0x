@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"agentworkspace/internal/domain"
@@ -30,7 +31,10 @@ const (
 	conversationColumns = "id, group_id, member_id, topic_id, created_at"
 )
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db                     *sql.DB
+	investigationExecution atomic.Bool
+}
 
 type CreateGroupInput struct {
 	Name, Description string

@@ -134,7 +134,8 @@ func (s *Store) BindAssignmentAttempt(ctx context.Context, scope CoordinationToo
 		return out, err
 	}
 	var binding domain.AssignmentAttemptBinding
-	if view.Binding != nil {
+	fresh := view.Binding == nil
+	if !fresh {
 		if !coordinationAssignmentBound(scope, view.Binding) {
 			return out, ErrMemberToolDenied
 		}
@@ -144,6 +145,9 @@ func (s *Store) BindAssignmentAttempt(ctx context.Context, scope CoordinationToo
 			return out, ErrMemberToolDenied
 		}
 		phase = "activate"
+		if _, err := s.investigationDispatchInTx(ctx, tx, v.r, false); err != nil {
+			return out, err
+		}
 		p := scope.Provenance
 		attempt, err := activateTaskAttemptInTx(ctx, tx, ActivateTaskAttemptInput{
 			GroupID: p.GroupID, TaskID: p.TaskID, ExpectedRevision: p.TaskRevision,
@@ -188,6 +192,13 @@ func (s *Store) BindAssignmentAttempt(ctx context.Context, scope CoordinationToo
 	}
 	if err := coordinationAssignmentStartInTx(ctx, tx, v, scope, binding.AttemptID); err != nil {
 		return out, err
+	}
+	// An existing binding retains its original replay fences. This extra
+	// readiness check governs new writes, not reads of that historical receipt.
+	if fresh {
+		if _, err := s.investigationDispatchInTx(ctx, tx, v.r, false); err != nil {
+			return out, err
+		}
 	}
 	phase = "commit"
 	if err := tx.Commit(); err != nil {
