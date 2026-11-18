@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -55,9 +56,13 @@ func verifyChatDiscussionOnlyInTx(ctx context.Context, tx *sql.Tx, scope MemberT
 	return nil
 }
 
-// A local user source may have multiple recipient Turns. A structured handoff
-// inherits the same source limit, but never the origin's work authority.
 func chatDiscussionWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) error {
+	return chatDiscussionSourceGateInTx(ctx, tx, c, true)
+}
+
+// Relays inherit the same source limit, not the origin's work authority.
+// Recency constrains new admissions, not execution of already admitted work.
+func chatDiscussionSourceGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, checkRecency bool) error {
 	var available, structured bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version>=24)
 	 OR EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN ('chat_discussions','chat_discussion_events'))`).Scan(&available); err != nil {
@@ -71,7 +76,7 @@ func chatDiscussionWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCa
 	}
 	if !structured {
 		if c.SourceKind == "member" {
-			return chatDiscussionLegacyWorkGateInTx(ctx, tx, c)
+			return chatDiscussionLegacyWorkGateInTx(ctx, tx, c, checkRecency)
 		}
 		if c.SourceKind != "local_user_chat" {
 			return nil
@@ -109,13 +114,15 @@ func chatDiscussionWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCa
 	if err != nil {
 		return err
 	}
-	// A newer handoff cannot make the root current again after a user command.
-	stale, err := chatSourceSupersededInTx(ctx, tx, c.ThreadRef, source.sequence)
-	if err != nil {
-		return err
-	}
-	if stale {
-		return chatStaleSource()
+	if checkRecency {
+		// A newer handoff cannot make the root current again after a user command.
+		stale, err := chatSourceSupersededInTx(ctx, tx, c.ThreadRef, source.sequence)
+		if err != nil {
+			return err
+		}
+		if stale {
+			return chatStaleSource()
+		}
 	}
 	return chatDiscussionRootLimitInTx(ctx, tx, c.ThreadRef, origin, source)
 }
@@ -123,7 +130,7 @@ func chatDiscussionWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCa
 // Generic sends can relay an arrival without capturing an intake on every hop.
 // Each message has at most one publishing Turn, and its input must be older.
 // Bound the indexed walk; an unproved prefix must not count as unrelated chat.
-func chatDiscussionLegacyWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) error {
+func chatDiscussionLegacyWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, checkRecency bool) error {
 	const maxSourceHops = 16
 	for hops := 0; c.SourceKind == "member"; hops++ {
 		if hops == maxSourceHops {
@@ -144,8 +151,8 @@ func chatDiscussionLegacyWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.
 	}
 	limitErr := chatDiscussionRootLimitInTx(ctx, tx, c.ThreadRef, c.MessageID, root)
 	var limit *chatNonAdmission
-	if !errors.As(limitErr, &limit) {
-		return limitErr // No limit, or evidence that could not be verified.
+	if !checkRecency || !errors.As(limitErr, &limit) {
+		return limitErr
 	}
 	// A newer command can make the verified root stale, but cannot authorize its relay.
 	stale, err := chatSourceSupersededInTx(ctx, tx, c.ThreadRef, root.sequence)
@@ -209,7 +216,7 @@ func chatDiscussionRootLimitInTx(ctx context.Context, tx *sql.Tx, thread domain.
 	// Start at the root's deliveries, not the topic's assessment history. Read
 	// at most two claims: multiple rows fail closed without choosing a quote.
 	// Historical proof does not depend on the assessor's live claim or status.
-	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.notice_message_id,c.id,c.member_id,c.turn_id,coalesce(c.policy_revision,0),
+	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.notice_message_id,c.id,c.member_id,c.turn_id,coalesce(c.policy_revision,0),a.receipt_json,
 	 coalesce((c.group_id,c.topic_id,c.message_id,c.member_id,c.generation)=(d.group_id,d.topic_id,d.message_id,d.recipient_id,?)
 	 AND (i.turn_id,i.purpose,i.source_id,i.source_kind)=(c.turn_id,?,?,'local_user_chat')
 	 AND a.decision_id IS NULL AND a.dispatch_request_id IS NULL,0)
@@ -219,7 +226,9 @@ func chatDiscussionRootLimitInTx(ctx context.Context, tx *sql.Tx, thread domain.
 	 JOIN chat_assessments a ON a.candidate_id=c.id
 	 LEFT JOIN chat_intake_executions i ON i.candidate_id=c.id
 	 WHERE d.message_id=? AND d.group_id=? AND d.topic_id=?
-	 AND (json_type(a.receipt_json,'$.discussion_only') IS NOT NULL OR json_type(a.receipt_json,'$.discussion_only_excerpt') IS NOT NULL)
+	 AND CASE WHEN json_valid(a.receipt_json) THEN
+	  json_type(a.receipt_json,'$.discussion_only') IS NOT NULL OR json_type(a.receipt_json,'$.discussion_only_excerpt') IS NOT NULL
+	 ELSE 1 END
 	 LIMIT 2`, source.sequence, domain.ChatIntakePurpose, source.id, origin, thread.GroupID, thread.TopicID)
 	if err != nil {
 		return err
@@ -228,11 +237,11 @@ func chatDiscussionRootLimitInTx(ctx context.Context, tx *sql.Tx, thread domain.
 	if !rows.Next() {
 		return rows.Err()
 	}
-	var receiptID, candidateID, memberID, turnID string
+	var receiptID, candidateID, memberID, turnID, data string
 	var noticeID sql.NullString
 	var revision int64
 	var bound bool
-	if err := rows.Scan(&receiptID, &noticeID, &candidateID, &memberID, &turnID, &revision, &bound); err != nil {
+	if err := rows.Scan(&receiptID, &noticeID, &candidateID, &memberID, &turnID, &revision, &data, &bound); err != nil {
 		return err
 	}
 	if !bound || rows.Next() {
@@ -241,15 +250,16 @@ func chatDiscussionRootLimitInTx(ctx context.Context, tx *sql.Tx, thread domain.
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	r, err := chatAssessmentReceiptInTx(ctx, tx, receiptID, candidateID)
-	if err != nil {
-		return err
+	// Decode the immutable proof without projecting live follow-up relations.
+	var r domain.ChatAssessmentReceipt
+	if err := json.Unmarshal([]byte(data), &r); err != nil {
+		return ErrMemberToolDenied
 	}
 	if !r.DiscussionOnly || r.ID != receiptID || r.CandidateID != candidateID || r.ThreadRef != thread || r.MessageID != origin ||
 		r.SourceKind != "local_user_chat" || r.SourceID != source.id || r.SourceSenderID != "user" || r.CandidateGeneration != source.sequence ||
 		r.AssessedBy != memberID || r.TurnID != turnID || r.Purpose != domain.ChatIntakePurpose || r.PolicyRevision != revision ||
 		r.NoticeMessageID == "" || r.NoticeMessageID != noticeID.String || r.Disposition != "discuss" || r.Outcome != "discuss" ||
-		r.Authority != "" || r.AuthorityEvidenceVerified || r.TaskID != "" || r.MandateID != "" || r.DispatchRequestID != "" ||
+		r.Authority != "" || r.AuthorityEvidenceVerified || r.TaskID != "" || r.MandateID != "" || r.DispatchRequestID != "" || r.WorkInputID != "" ||
 		!memberToolTextValid(r.DiscussionOnlyExcerpt, chatDiscussionOnlyExcerptBytes) || !strings.Contains(source.content, r.DiscussionOnlyExcerpt) {
 		return ErrMemberToolDenied
 	}
