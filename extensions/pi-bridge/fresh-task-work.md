@@ -11,14 +11,26 @@ also configured, uses its own published bytes and pins.
 
 This profile consumes an existing B v29 typed followup for a plain-text Task.
 It does not turn on any new intake schema or provide a second authorization
-path. Preparation uses the original Mandate and private conversation workspace.
-After claim, it checks the original Assignment, the new bound Attempt and the
-same Turn's sole resource. Only the four pinned native HTTP tools are installed:
-`read_work_inputs` (directory or bounded UTF-8 byte segment), `ack_work_input`,
-`hand_back_work_input` (one input, not the Task) and `submit_result` (text only).
+path. Preparation keeps the original Task, Mandate and Assignment, not the
+original conversation directory or its contents. A separate 0700 directory
+under the trusted private workspace root is selected by typed delivery. It
+contains only a private delivery/inode seal, never task data or a capability.
+Inspection does not create it. An unsealed, replaced or non-dedicated entry
+blocks with `typed_private_cwd_unavailable`; a held key is not reused. Startup
+pins the directory and verifies the new Turn's exact sole
+scheduler resource and the new bound Attempt. This does not bypass an unknown
+or cancel-requested predecessor. Trust the directory namespace through launch;
+the CWD is not a host filesystem sandbox.
+
+Only four pinned native HTTP tools are installed: `read_work_inputs` (directory
+or bounded UTF-8 byte segment), `ack_work_input`, `hand_back_work_input` (one
+input, not the Task) and `submit_result` (text only). A segment reads compact
+JSON `{content,constraint,disposition}`. `constraint` is empty unless this input
+advanced B's proposal revision with a contiguous verbatim quote from `content`.
+`pending` and `confirmed` do not extend the Mandate; `returned` includes neither
+content nor quote. After handling changes, start reading from offset zero.
 Reads do not acknowledge input, and submission is not acceptance. There is no
-report, delegation, investigation, file authority, MCP or generic fallback
-for a typed run. The private directory is not a host filesystem sandbox.
+report, delegation, investigation, file tool, MCP or generic fallback.
 
 Keep the original call ID, derived key and request if a write outcome is
 unknown. The bridge does not resend it and blocks subsequent writes for that

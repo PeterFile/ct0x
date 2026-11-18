@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"slices"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
@@ -91,8 +93,8 @@ func (s *MemberTools) withFreshTaskWork(token, op string, use func(store.MemberT
 
 // MemberWorkInputRecord contains only what this wire profile can disclose.
 type MemberWorkInputRecord struct {
-	InputID, Content, Constraint string
-	CreatedAt                    time.Time
+	InputID, Content, Constraint, Disposition string
+	CreatedAt                                 time.Time
 }
 
 func (s *MemberTools) ListFreshTaskWorkInputs(ctx context.Context, token string, opts store.ListOptions) (page store.Page[MemberWorkInputRecord], err error) {
@@ -129,7 +131,24 @@ func (s *MemberTools) GetFreshTaskWorkInput(ctx context.Context, token, id strin
 		if i.ID != id {
 			return store.ErrMemberToolDenied
 		}
-		out = MemberWorkInputRecord{InputID: i.ID, Content: i.Content, Constraint: i.AfterConstraint, CreatedAt: i.CreatedAt}
+		out = MemberWorkInputRecord{InputID: i.ID, CreatedAt: i.CreatedAt, Disposition: "pending"}
+		if i.Return != nil {
+			// Keep the history handle and effect, not declined instructions or
+			// their explanation, in the new model's context.
+			out.Disposition = "returned"
+			return nil
+		}
+		if i.Consumption != nil {
+			out.Disposition = "confirmed"
+		}
+		out.Content = i.Content
+		// B's snapshots include returned proposals. Only a revision advance
+		// with a contiguous quote in this very source is this input's proposal.
+		before, after, quote := i.BeforeConstraintRevision, i.AfterConstraintRevision, i.AfterConstraint
+		if before >= 0 && after > before && after-before == 1 && strings.TrimSpace(quote) != "" &&
+			utf8.ValidString(quote) && strings.Contains(i.Content, quote) {
+			out.Constraint = quote
+		}
 		return nil
 	})
 	return out, memberRoleError(ctx, err)

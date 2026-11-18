@@ -20,7 +20,7 @@ const piFreshTaskWorkTools = "read_work_inputs,ack_work_input,hand_back_work_inp
 // Independent from the ordinary index.ts/bridge.mjs pair used by native resume.
 // Update both digests together after offline Pi 1.4.0 loader/config checks.
 const (
-	piFreshTaskWorkEntrySHA = "d33a000d4d70f287e7fc105c6396e4901ed0ccc43e9567609d7f93140e078195"
+	piFreshTaskWorkEntrySHA = "0f42260dfd4ce255da065315a929cbc715128de0f82211f3762b8eadb41f2f81"
 	piFreshTaskWorkImplSHA  = "228eeb89a4bb39ea1715e74625a88b3131763ae1566975d8efce4009a5bccb5f"
 )
 

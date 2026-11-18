@@ -19,7 +19,7 @@ const tools = [
   {
     name: "read_work_inputs",
     label: "读取工作输入",
-    description: "仅列出服务端绑定的工作输入目录（limit/before），或按 input_id 读取 {content,constraint} 的规范 JSON 字节片段（offset/max_bytes）。complete 表示到达末尾，不表示当前片段是全文；读取不是确认，也不扩大原授权。",
+    description: "仅列出服务端绑定的工作输入目录（limit/before），或按 input_id 分段读取 {content,constraint,disposition}。constraint 只可能是本条原文的补充；returned 不返回正文或约束。complete 只表示末尾；处理状态变化后从 offset 0 重读。读取不是确认，不扩大原授权。",
     // Pi expects top-level object properties; B accepts exactly one of these two shapes.
     parameters: Type.Object({ ...pageFields, input_id: Type.Optional(inputID), ...segmentFields }, { ...closed, oneOf: [page, segment] }),
   },

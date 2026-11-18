@@ -132,13 +132,14 @@ func (a memberToolAPI) readWorkInputSegment(w http.ResponseWriter, r *http.Reque
 		memberToolError(w, errWorkInputReadProjection)
 		return
 	}
-	// Canonical v1 value: one compact JSON object with these two fields in
-	// order. Marshal the single exact source, never a transcript or a batch.
-	// Offsets apply to these bytes, not to either raw field or the wire escaping.
+	// One compact JSON object for this input and its current handling state,
+	// never a transcript or a batch. Offsets apply to these bytes, not to the
+	// source or the wire escaping. Reread from zero after a handling change.
 	value, err := json.Marshal(struct {
-		Content    string `json:"content"`
-		Constraint string `json:"constraint"`
-	}{item.Content, item.Constraint})
+		Content     string `json:"content"`
+		Constraint  string `json:"constraint"`
+		Disposition string `json:"disposition"`
+	}{item.Content, item.Constraint, item.Disposition})
 	if err != nil {
 		memberToolError(w, err)
 		return

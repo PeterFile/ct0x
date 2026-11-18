@@ -43,7 +43,7 @@ func (p *Preparer) InspectRoleReadiness(ctx context.Context, pending store.Pendi
 	}
 	if provenance.SourceKind != "" {
 		result.MaxContextBytes = p.roleMaxContextBytes
-		_, err := p.planFreshTaskWork(ctx, input)
+		_, err := p.planFreshTaskWork(ctx, input, false)
 		return roleInspectionResult(ctx, result, err)
 	}
 	result.HistoryLimit, result.MaxContextBytes = p.roleHistoryLimit, p.roleMaxContextBytes

@@ -3,13 +3,13 @@ package platform
 import (
 	"context"
 	"crypto/sha256"
+	"os"
 	"path/filepath"
 	"reflect"
 	"time"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
-	"agentworkspace/internal/scheduler"
 	"agentworkspace/internal/store"
 )
 
@@ -38,6 +38,21 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	want.RunID, want.RuntimeDir = request.RunID, request.RuntimeDir
 	if base.used.Swap(true) || !memberToolRuntimeRunID.MatchString(request.RunID) || request != want || !r.roleFence.rootValid(request.RuntimeDir) {
 		return unknown
+	}
+	// Hold the actual directory through invocation so its inode cannot be
+	// recycled. The native adapter still needs a stable trusted pathname.
+	workspace := e.plan.workspace
+	cwdUnknown := memberToolRuntimeReceipt(provider.OutcomeUnknown, "任务续办专用目录身份无法确认，未启动原生执行，需对账")
+	if !workspace.pathMatches() {
+		return cwdUnknown
+	}
+	cwd, err := os.OpenRoot(workspace.path)
+	if err != nil {
+		return cwdUnknown
+	}
+	defer cwd.Close()
+	if !workspace.valid(cwd) {
+		return cwdUnknown
 	}
 	s := r.tools
 	turn, err := s.db.GetTurn(ctx, base.binding.GroupID, request.RunID)
@@ -82,15 +97,21 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 		ConfigPath: filepath.Join(r.configRoot, config.name), ConfigSHA256: provider.FreshTaskWorkConfigSHA256(r.endpoint, token),
 		RunID: claim.TurnID, Operations: provider.PiFreshTaskWorkToolNames(),
 	}
-	validConfig := func() bool {
-		return config.valid() && provider.FreshTaskWorkConfigMatches(bootstrap.ConfigPath, bootstrap.ConfigSHA256) && config.valid() && r.rootValid()
+	validStartupFiles := func() bool {
+		return config.valid() && provider.FreshTaskWorkConfigMatches(bootstrap.ConfigPath, bootstrap.ConfigSHA256) &&
+			config.valid() && r.rootValid() && workspace.valid(cwd)
 	}
-	if !e.preflight(ctx, request, scope.Member, token, bound, validConfig, nil) {
+	if !e.preflight(ctx, request, scope.Member, token, bound, validStartupFiles, nil) {
 		return unknown
 	}
 	native, err := s.freshTaskWork.Construct(ctx, e.plan.selected, bootstrap)
-	if err != nil || nilTaskWorkExecutor(native) || !s.freshTaskWork.Supports(e.plan.selected) ||
-		!e.preflight(ctx, request, scope.Member, token, bound, validConfig, owner.beginInvoke) {
+	if err != nil || nilTaskWorkExecutor(native) || !s.freshTaskWork.Supports(e.plan.selected) {
+		return unknown
+	}
+	if !e.preflight(ctx, request, scope.Member, token, bound, validStartupFiles, owner.beginInvoke) {
+		if !workspace.valid(cwd) {
+			return cwdUnknown
+		}
 		return unknown
 	}
 	raw := native.Execute(ctx, request, onEvent)
@@ -138,18 +159,15 @@ func (e *taskWorkRun) live(ctx context.Context, request provider.ExecuteRequest,
 		member.ProviderID != e.base.binding.ProviderID || member.Model != e.base.binding.Model {
 		return empty, false
 	}
-	if request.CWD != plan.request.CWD || !privatePreparationDirectory(request.CWD) || !r.roleFence.rootValid(request.RuntimeDir) ||
-		!r.clearRunDirectory(request) || !r.rootValid() {
-		return empty, false
-	}
-	keys, err := scheduler.WorkspaceResourceKeys([]string{request.CWD})
-	if err != nil || keys[0] != plan.key || db.VerifyFreshTaskWorkResource(ctx, scope.Member, plan.key) != nil {
+	if request.CWD != plan.workspace.path || !r.roleFence.rootValid(request.RuntimeDir) ||
+		!r.clearRunDirectory(request) || !r.rootValid() || db.VerifyFreshTaskWorkResource(ctx, scope.Member, plan.workspace.key) != nil ||
+		!plan.workspace.pathMatches() {
 		return empty, false
 	}
 	return scope, ctx.Err() == nil
 }
 
-func (e *taskWorkRun) preflight(ctx context.Context, request provider.ExecuteRequest, scope store.MemberToolScope, token string, binding *taskWorkToolBinding, validConfig, invoke func() bool) bool {
+func (e *taskWorkRun) preflight(ctx context.Context, request provider.ExecuteRequest, scope store.MemberToolScope, token string, binding *taskWorkToolBinding, validStartupFiles, invoke func() bool) bool {
 	s, plan := e.base.runtime.tools, e.plan
 	checkCtx, cancel := context.WithTimeout(ctx, memberToolRuntimeVerificationTimeout)
 	defer cancel()
@@ -161,7 +179,7 @@ func (e *taskWorkRun) preflight(ctx context.Context, request provider.ExecuteReq
 	if err != nil || !pendingExactTaskWorkInput(plan.delivery, input) {
 		return false
 	}
-	if current, ok := e.live(checkCtx, request, scope.Claim); !ok || current.Member != scope || current.AttemptID != binding.attempt.ID || !validConfig() {
+	if current, ok := e.live(checkCtx, request, scope.Claim); !ok || current.Member != scope || current.AttemptID != binding.attempt.ID || !validStartupFiles() {
 		return false
 	}
 	s.mu.RLock()

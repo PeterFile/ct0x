@@ -25,10 +25,11 @@ import (
 // All authority is established through v29 APIs. The only substitutions are a
 // metadata-only Pi executable and an in-process executor/HTTP recorder.
 func TestFreshTaskWorkB29NativeWire(t *testing.T) {
-	for _, mode := range []string{"confirmed", "commit-unknown", "wrong-resource", "extra-resource", "late-resource", "late-config", "late-policy"} {
+	for _, mode := range []string{"confirmed", "commit-unknown", "wrong-resource", "extra-resource", "late-resource", "late-config", "late-policy", "context-after-handback", "replaced-original-cwd"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			f := newRoleRuntime(t)
+			f.options.RoleMaxActive = 2 // The assessor can record input while the prior worker is unsettled.
 			engine := coordination.New(f.db)
 			f.options.ChatIntake = engine
 			root := t.TempDir()
@@ -53,7 +54,7 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 			}
 			claim := func(delivery string, keys []string) store.MemberToolScope {
 				t.Helper()
-				turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group, DeliveryID: delivery, MaxActive: 1, ResourceKeys: keys})
+				turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group, DeliveryID: delivery, MaxActive: f.options.RoleMaxActive, ResourceKeys: keys})
 				roleOK(t, err)
 				scope, err := f.db.BindMemberTool(ctx, store.TurnClaim{GroupID: f.group, TurnID: turn.ID, Token: turn.ClaimToken})
 				roleOK(t, err)
@@ -99,20 +100,41 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 			oldScope := claim(original.Delivery.ID, originalPrep.ResourceKeys)
 			prior, err := f.db.BindAssignmentAttempt(ctx, store.CoordinationToolScope{Member: oldScope, Provenance: state.Provenance})
 			roleOK(t, err)
-			settle(oldScope.Claim, provider.OutcomeNotStarted)
 
 			followup := func(constraint string) domain.ChatAssessment {
 				return domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork, Reason: "续办原文本任务",
 					Followup: &domain.ChatFollowupAssessment{TaskID: admission.TaskID, Constraint: constraint}}
 			}
-			intake, c = capture("请继续 "+admission.TaskID+"。另写项目文件。", "older-source")
-			older, err := f.db.ApplyChatAssessmentDormant(ctx, intake, c.ID, followup("另写项目文件"), "记录补充。", "dormant")
+			var confirmedID string
+			const confirmedQuote = "注明摘要依据"
+			if mode == "context-after-handback" {
+				intake, c = capture("请继续 "+admission.TaskID+"。"+confirmedQuote, "earlier-source")
+				ack, err := f.db.ApplyChatAssessmentDormant(ctx, intake, c.ID, followup(confirmedQuote), "记录补充。", "prior-dormant")
+				roleOK(t, err)
+				settle(intake.Claim, provider.OutcomeNotStarted)
+				confirmedID = ack.WorkInputID
+				_, err = f.db.AcknowledgeWorkInputWithKey(ctx, oldScope, confirmedID, "prior-ack")
+				roleOK(t, err)
+			}
+			const returnedQuote = "另写项目文件"
+			intake, c = capture("请继续 "+admission.TaskID+"。"+returnedQuote+"。", "older-source")
+			older, err := f.db.ApplyChatAssessmentDormant(ctx, intake, c.ID, followup(returnedQuote), "记录补充。", "dormant")
 			roleOK(t, err)
 			settle(intake.Claim, provider.OutcomeNotStarted)
 			const detail = "请保留原格式🧪"
-			intake, c = capture("请继续 "+admission.TaskID+"。"+detail, "latest-source")
+			constraint := detail
+			if mode == "context-after-handback" {
+				_, err := f.db.HandBackWorkInputWithKey(ctx, oldScope, older.WorkInputID, "不在原授权内", "prior-return")
+				roleOK(t, err)
+				constraint = ""
+			}
+			if mode != "replaced-original-cwd" {
+				settle(oldScope.Claim, provider.OutcomeNotStarted)
+			}
+			body := "请继续 " + admission.TaskID + "。" + detail
+			intake, c = capture(body, "latest-source")
 			assess := func() (domain.ChatAssessmentReceipt, error) {
-				return engine.AssessChatIntent(ctx, intake, c.ID, followup(detail), "记录续办。", "continue")
+				return engine.AssessChatIntent(ctx, intake, c.ID, followup(constraint), "记录续办。", "continue")
 			}
 			if _, err := assess(); !errors.Is(err, store.ErrTaskWorkExecutionNotReady) {
 				t.Fatalf("default readiness was not closed: %v", err)
@@ -132,7 +154,7 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 				t.Fatalf("typed delivery inspected as legacy: %+v %v", got, err)
 			}
 
-			var token, configPath string
+			var token, configPath, typedCWD string
 			var live store.MemberToolScope
 			calls := 0
 			call := func(op, body, key string, status int) string {
@@ -166,17 +188,48 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 						policy.Enabled = false
 						_, err := engine.SetChatPolicy(ctx, thread, policy, policySnap.Revision, "revoke-before-launch")
 						roleOK(t, err)
+					case "replaced-original-cwd":
+						// Even after the exact new key was claimed, swapping the typed CWD must stop launch.
+						roleOK(t, os.Rename(typedCWD, typedCWD+"-moved"))
+						roleOK(t, os.Mkdir(typedCWD, 0700))
 					}
 					return roleNative(func(_ context.Context, req provider.ExecuteRequest, _ func(provider.Event) error) provider.ExecutionReceipt {
 						calls++
-						if mode != "confirmed" && mode != "commit-unknown" {
+						if mode != "confirmed" && mode != "commit-unknown" && mode != "context-after-handback" {
 							t.Fatal("denied preflight invoked the executor")
 						}
 						if !strings.Contains(req.Prompt, admission.MandateID) || !strings.Contains(req.Prompt, wake.WorkInputID) ||
-							strings.Contains(req.Prompt, detail) || strings.Contains(req.Prompt, token) {
+							strings.Contains(req.Prompt, detail) || strings.Contains(req.Prompt, token) || strings.Contains(req.Prompt, returnedQuote) {
 							t.Fatal("prompt was not confined to the Mandate and input handle")
 						}
 						id := fmt.Sprintf(`{"input_id":%q}`, wake.WorkInputID)
+						if mode == "context-after-handback" {
+							contextOnly, err := f.db.GetWorkInputForMember(ctx, live, wake.WorkInputID)
+							roleOK(t, err)
+							if contextOnly.BeforeConstraintRevision != 2 || contextOnly.AfterConstraintRevision != contextOnly.BeforeConstraintRevision ||
+								contextOnly.BeforeConstraint != returnedQuote || contextOnly.AfterConstraint != returnedQuote || contextOnly.Content != body {
+								t.Fatal("fixture did not inherit the returned B proposal's historical snapshot")
+							}
+							read := func(input, content, quote, disposition string) {
+								t.Helper()
+								var segment struct {
+									Complete bool
+									Text     string
+								}
+								roleOK(t, json.Unmarshal([]byte(call("read_work_inputs", fmt.Sprintf(`{"input_id":%q}`, input), "", 200)), &segment))
+								var value struct{ Content, Constraint, Disposition string }
+								roleOK(t, json.Unmarshal([]byte(segment.Text), &value))
+								if !segment.Complete || value.Content != content || value.Constraint != quote || value.Disposition != disposition {
+									t.Fatalf("wrong projected %s input: %+v", disposition, value)
+								}
+							}
+							read(wake.WorkInputID, body, "", "pending")
+							read(older.WorkInputID, "", "", "returned")
+							read(confirmedID, "请继续 "+admission.TaskID+"。"+confirmedQuote, confirmedQuote, "confirmed")
+							call("ack_work_input", id, "context-ack", 200)
+							read(wake.WorkInputID, body, "", "confirmed")
+							return provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}
+						}
 						call("list_members", `{}`, "", 403)
 						call("report_work", `{}`, "no-report", 404)
 						call("hand_back_work", `{}`, "no-task-handback", 404)
@@ -272,10 +325,89 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 			opts.MemberTools = f.runtime
 			prep, err := platform.NewPreparer(f.db, opts)
 			roleOK(t, err)
+			assertBlocked := func(code string) {
+				t.Helper()
+				if got, err := prep.InspectRoleReadiness(ctx, queued); err != nil || got.Blocked == nil || got.Blocked.Code != code {
+					t.Fatalf("inspection did not report %s: %+v %v", code, got, err)
+				}
+				var blocked *platform.RolePreparationBlocked
+				if got, err := prep.Prepare(ctx, queued); got.Executor != nil || !errors.As(err, &blocked) || blocked.Code != code {
+					t.Fatalf("preparation did not report %s: %v", code, err)
+				}
+			}
+			var replacedKey string
+			if mode == "replaced-original-cwd" {
+				assertPriorFence := func(want domain.TurnState) {
+					t.Helper()
+					assertBlocked("prior_turn_unsettled")
+					if _, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group, DeliveryID: queued.Delivery.ID,
+						MaxActive: f.options.RoleMaxActive, ResourceKeys: []string{"different-resource"}}); !errors.Is(err, store.ErrTurnBusy) {
+						t.Fatalf("a different key bypassed the prior claim: %v", err)
+					}
+					turn, err := f.db.GetTurn(ctx, f.group, oldScope.Claim.TurnID)
+					roleOK(t, err)
+					held, err := f.db.HasResourceClaim(ctx, originalPrep.ResourceKeys[0])
+					roleOK(t, err)
+					if !held || turn.State != want || turn.ClaimToken != oldScope.Claim.Token {
+						t.Fatal("the prior claim was released or replaced")
+					}
+				}
+				_, err := f.db.RequestTurnCancel(ctx, f.group, oldScope.Claim.TurnID)
+				roleOK(t, err)
+				assertPriorFence(domain.TurnStateCancelRequested)
+				settle(oldScope.Claim, provider.OutcomeUnknown)
+				assertPriorFence(domain.TurnStateUnknown)
+				// Only authoritative terminal evidence may release the original resource.
+				terminal, err := f.db.ApplyTurnReceipt(ctx, oldScope.Claim, provider.ExecutionReceipt{
+					Outcome: provider.OutcomeAborted, Terminal: provider.OutcomeAborted, NativeSessionID: "synthetic",
+					Started: true, Accepted: true, DirectChildReaped: true, OutputComplete: true,
+				})
+				roleOK(t, err)
+				held, err := f.db.HasResourceClaim(ctx, originalPrep.ResourceKeys[0])
+				roleOK(t, err)
+				if held || terminal.State != domain.TurnStateAborted {
+					t.Fatal("terminal settlement did not remove the original claim")
+				}
+				roleOK(t, os.Rename(originalPrep.Request.CWD, originalPrep.Request.CWD+"-moved"))
+				roleOK(t, os.Mkdir(originalPrep.Request.CWD, 0700))
+				roleOK(t, os.WriteFile(filepath.Join(originalPrep.Request.CWD, "not-task-work"), []byte("old path replacement"), 0600))
+				keys, err := scheduler.WorkspaceResourceKeys([]string{originalPrep.Request.CWD})
+				roleOK(t, err)
+				replacedKey = keys[0]
+				rootInfo, err := os.Stat(private)
+				roleOK(t, err)
+				if got, err := prep.InspectRoleReadiness(ctx, queued); err != nil || got.Blocked != nil || got.HistoryLimit != 0 {
+					t.Fatalf("settled pure-text work was not ready: %+v %v", got, err)
+				}
+				after, err := os.Stat(private)
+				roleOK(t, err)
+				if !rootInfo.ModTime().Equal(after.ModTime()) {
+					t.Fatal("inspection provisioned a directory")
+				}
+			}
 			prepared, err := prep.Prepare(ctx, queued)
 			roleOK(t, err)
-			if token != "" || !slices.Equal(prepared.ResourceKeys, originalPrep.ResourceKeys) || prepared.Request.CWD != originalPrep.Request.CWD {
-				t.Fatal("preparation acquired authority or changed the private resource")
+			typedCWD = prepared.Request.CWD
+			if mode == "replaced-original-cwd" {
+				if typedCWD == originalPrep.Request.CWD || slices.Contains(prepared.ResourceKeys, replacedKey) || slices.Equal(prepared.ResourceKeys, originalPrep.ResourceKeys) {
+					t.Fatal("typed work adopted the replaced original directory instead of a dedicated CWD")
+				}
+				keys, err := scheduler.WorkspaceResourceKeys([]string{typedCWD})
+				roleOK(t, err)
+				again, err := prep.Prepare(ctx, queued)
+				roleOK(t, err)
+				if filepath.Dir(typedCWD) != private || typedCWD != again.Request.CWD || !slices.Equal(keys, prepared.ResourceKeys) || !slices.Equal(keys, again.ResourceKeys) {
+					t.Fatal("typed CWD was not stable under the private root with its own exact key")
+				}
+				// Even a real 0700 legacy directory moved to the typed name is not a C binding.
+				roleOK(t, os.Rename(typedCWD, typedCWD+"-saved"))
+				roleOK(t, os.Rename(originalPrep.Request.CWD, typedCWD))
+				assertBlocked("typed_private_cwd_unavailable")
+				roleOK(t, os.Rename(typedCWD, originalPrep.Request.CWD))
+				roleOK(t, os.Rename(typedCWD+"-saved", typedCWD))
+			}
+			if token != "" {
+				t.Fatal("preparation acquired tool authority")
 			}
 			keys := slices.Clone(prepared.ResourceKeys)
 			if mode == "wrong-resource" {
@@ -288,10 +420,11 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 			prepared.Request.RunID, prepared.Request.RuntimeDir = live.Claim.TurnID, f.root
 			out := prepared.Executor.Execute(ctx, prepared.Request, nil)
 			want := provider.OutcomeUnknown
-			if mode == "confirmed" {
+			if mode == "confirmed" || mode == "context-after-handback" {
 				want = provider.OutcomeNotStarted
 			}
-			if out.Outcome != want || (calls == 1) != (mode == "confirmed" || mode == "commit-unknown") {
+			if out.Outcome != want || (calls == 1) != (mode == "confirmed" || mode == "context-after-handback" || mode == "commit-unknown") ||
+				mode == "replaced-original-cwd" && (token == "" || !strings.Contains(out.Reason, "专用目录身份")) {
 				t.Fatalf("wrong guarded result: %v calls=%d", out.Outcome, calls)
 			}
 			if again := prepared.Executor.Execute(ctx, prepared.Request, nil); again.Outcome != provider.OutcomeUnknown {
