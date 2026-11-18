@@ -165,10 +165,8 @@ func executePreparedAdapterFixture(t *testing.T, f *rolePrepareFixture, prepared
 	t.Helper()
 	ctx := context.Background()
 	run := prepared.Executor.(*memberToolRuntimeRun)
-	factory := run.factory
 	var issued string
-	run.factory = func(path, id string, names []string) (provider.Executor, error) {
-		actual, err := factory(path, id, names)
+	replaceExecute := func(path string, actual provider.Executor, err error) (provider.Executor, error) {
 		if err != nil || actual == nil {
 			t.Fatalf("actual claimed adapter factory failed: %v", err)
 		}
@@ -192,6 +190,18 @@ func executePreparedAdapterFixture(t *testing.T, f *rolePrepareFixture, prepared
 			prepareRoleOK(t, onEvent(provider.Event{Kind: provider.TerminalEvent, NativeSessionID: session, Terminal: provider.OutcomeSucceeded}))
 			return provider.ExecutionReceipt{Started: true, Accepted: true, NativeSessionID: session, Outcome: provider.OutcomeSucceeded, Terminal: provider.OutcomeSucceeded, OutputComplete: true, DirectChildReaped: true, ExitCode: 0}
 		}), nil
+	}
+	if build := run.intakeBuilder; build != nil {
+		run.intakeBuilder = func(config provider.NativeMemberToolConfig) (provider.Executor, error) {
+			actual, err := build(config)
+			return replaceExecute(config.Path, actual, err)
+		}
+	} else {
+		factory := run.factory
+		run.factory = func(path, id string, names []string) (provider.Executor, error) {
+			actual, err := factory(path, id, names)
+			return replaceExecute(path, actual, err)
+		}
 	}
 	turn, err := f.s.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group.ID, DeliveryID: run.binding.DeliveryID, MaxActive: 1, ResourceKeys: prepared.ResourceKeys})
 	prepareRoleOK(t, err)

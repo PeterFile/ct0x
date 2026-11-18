@@ -189,6 +189,12 @@ func memberToolRuntimeText(value string) bool {
 	return value != "" && utf8.ValidString(value) && strings.TrimSpace(value) == value && !strings.ContainsAny(value, "\x00\r\n")
 }
 
+// These qualified Pi schema hints require the issued-config builder even if
+// issuance rechecks the policy and removes the investigation action.
+func (schema memberToolIntakeSchema) requiresIssuedPiConfig() bool {
+	return schema.piDiscussionExcerpt || schema.investigation
+}
+
 type memberToolRuntimeRun struct {
 	runtime       *MemberToolRuntime
 	binding       MemberToolRunBinding
@@ -197,7 +203,7 @@ type memberToolRuntimeRun struct {
 	role          *store.CoordinationRoleProvenance
 	intake        bool
 	intakeSchema  memberToolIntakeSchema
-	intakeBuilder func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh investigation intake only.
+	intakeBuilder func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
 	investigation *investigationRolePreparation
 	nativeSession *memberToolNativeSessionPlan
 	// Cloned at trusted wrapping and again when the claimed token is registered.

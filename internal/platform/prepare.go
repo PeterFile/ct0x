@@ -256,8 +256,8 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	}
 	// Native text bindings record tool names, not dynamic intake schemas.
 	// Keep intake on the fresh path when it changes the #193 send_message contract.
-	if useMemberTools && p.piNativeSessionConfigured(selected) && !intakeSchema.investigation &&
-		!intakeSchema.piDiscussionExcerpt && !(intake && p.memberTools.tools.WorkInputsEnabled()) {
+	if useMemberTools && p.piNativeSessionConfigured(selected) && !intakeSchema.requiresIssuedPiConfig() &&
+		!(intake && p.memberTools.tools.WorkInputsEnabled()) {
 		names, maxMembers = p.memberTools.operations, p.memberTools.maxGroupMembers
 		if intake {
 			names, maxMembers = chatIntakeOperations(), 0
@@ -298,7 +298,7 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 		if intake {
 			run := executor.(*memberToolRuntimeRun)
 			run.intakeSchema = intakeSchema
-			if intakeSchema.investigation {
+			if intakeSchema.requiresIssuedPiConfig() {
 				run.intakeBuilder = func(config provider.NativeMemberToolConfig) (provider.Executor, error) {
 					return provider.NewPiInvestigationIntakeExecutor(selected, p.piMemberToolsExtension, config, p.executionTimeout)
 				}
