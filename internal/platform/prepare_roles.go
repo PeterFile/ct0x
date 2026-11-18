@@ -128,6 +128,7 @@ type rolePreparationPlan struct {
 	selection            provider.AdapterSelection
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 	workspace            *domain.TaskWorkspaceScope
+	nativeText           bool
 	input                contextpack.Input
 }
 
@@ -202,10 +203,26 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 		in.Permissions[1] = "本轮角色平台工具仅有 " + strings.Join(memberToolRoleOperations(state.Provenance.Kind), "、") + "；调用者、群组、会话、话题和任务关系由服务端绑定，模型不能改选身份或授权。"
 		in.Permissions = append(in.Permissions, codexNativeTextPermission)
 	}
-	if state.Provenance.Kind == store.CoordinationRoleWorker && r.tools.WorkInputsEnabled() {
+	workInputs := state.Provenance.Kind == store.CoordinationRoleWorker && r.tools.WorkInputsEnabled()
+	if workInputs {
 		in.Permissions[1] = "本轮基础角色工具为 " + strings.Join(names, "、") + "；仅在服务器实际提供工作输入工具时使用。读取不会确认已处理；处理后显式确认，无法处理则交回说明。调用者、群组、会话、话题和任务关系由服务端绑定。"
 	}
-	return rolePreparationPlan{state: state, selected: selected, selection: selection, dispatchCapabilities: facts, workspace: workspace, input: in}, nil
+	var nativeText bool
+	// Work-input grants and workspace tasks are outside the frozen text profile.
+	if workspace == nil && !workInputs {
+		thinking := ""
+		if selected.Name == provider.Pi {
+			thinking = p.roleThinking
+		}
+		nativeText, err = p.previewNativeSession(ctx, selected, member, conversation, thinking, names, 0)
+		if err != nil {
+			return empty, roleWorkspacePreparationError(state, err)
+		}
+		if nativeText {
+			in.Permissions[0] = nativeSessionTextPermission
+		}
+	}
+	return rolePreparationPlan{state: state, selected: selected, selection: selection, dispatchCapabilities: facts, workspace: workspace, nativeText: nativeText, input: in}, nil
 }
 
 func (plan rolePreparationPlan) format() ([]byte, error) {
@@ -237,12 +254,12 @@ func (p *Preparer) prepareCoordinationRole(ctx context.Context, state store.Coor
 	if err != nil {
 		return empty, err
 	}
-	var cwd, key string
+	var workspace preparationWorkspace
 	if plan.workspace != nil && state.Provenance.Kind == store.CoordinationRoleWorker {
-		_, cwd, _, err = p.workspacePreparationGrant(ctx, *plan.workspace, member.ID)
-		key = plan.workspace.ResourceKey
+		_, workspace.cwd, _, err = p.workspacePreparationGrant(ctx, *plan.workspace, member.ID)
+		workspace.key = plan.workspace.ResourceKey
 	} else {
-		cwd, key, err = p.workspace(ctx, member, conversation)
+		workspace, err = p.resolvePreparationWorkspaceSnapshot(ctx, member, conversation, true)
 	}
 	if err != nil {
 		return empty, roleWorkspacePreparationError(state, err)
@@ -262,6 +279,11 @@ func (p *Preparer) prepareCoordinationRole(ctx context.Context, state store.Coor
 	if plan.selection.Protocol == provider.PiExtensionProtocol {
 		thinking = p.roleThinking
 	}
-	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{key},
-		Request: provider.ExecuteRequest{CWD: cwd, Prompt: string(packet), Model: member.Model, Thinking: thinking}}, nil
+	request := provider.ExecuteRequest{CWD: workspace.cwd, Prompt: string(packet), Model: member.Model, Thinking: thinking}
+	if plan.nativeText {
+		if err := p.bindNativeSessionPreparation(executor, selected, plan.selection, member, workspace, thinking, memberToolRoleOperations(state.Provenance.Kind), 0, &request); err != nil {
+			return empty, roleWorkspacePreparationError(state, err)
+		}
+	}
+	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{workspace.key}, Request: request}, nil
 }

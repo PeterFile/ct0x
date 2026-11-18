@@ -82,6 +82,10 @@ type ExecutionReceipt struct {
 	Reason            string  `json:"reason"`
 
 	NativeRef *NativeSessionReference `json:"-"`
+	// NativePreflightFailure is set only by the trusted native launch wrapper
+	// before invocation. Apply may preserve a prior receipt instead of treating
+	// this result as new execution or reconciliation evidence.
+	NativePreflightFailure bool `json:"-"`
 }
 
 // Callbacks run serially in record order, independently of native output parsing.
@@ -167,6 +171,10 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		}
 		return r
 	}
+	if e.memberTools.boundConfig() && !memberToolConfigMatches(e.memberTools.configPath, e.memberTools.configSHA256) {
+		r.Reason = "成员工具配置无效或已变化，执行未启动"
+		return r
+	}
 	var session *piSessionRun
 	if e.piSession != nil {
 		var err error
@@ -224,7 +232,7 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	cmd := exec.CommandContext(ctx, e.path, args...)
 	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = request.CWD, strings.NewReader(request.Prompt), outDrain, errDrain
 	if e.memberTools != nil {
-		cmd.Env = piMemberToolEnvironment(os.Environ(), e.memberTools.configPath)
+		cmd.Env = e.memberTools.environment(os.Environ())
 	}
 	// WaitDelay bounds inherited pipes, not descendants' lifetimes or callbacks.
 	// Tools mode keeps JSON parsing off the copier; plain adapters stay synchronous.

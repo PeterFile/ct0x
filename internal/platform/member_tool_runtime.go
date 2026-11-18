@@ -3,8 +3,10 @@ package platform
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -30,6 +33,9 @@ type MemberToolRuntimeOptions struct {
 	// use the scheduler's same MaxActive and actual private RuntimeDir.
 	RoleMaxActive     int
 	RoleExecutionRoot string
+	// NativeExecutionRoot is the trusted scheduler RuntimeDir for native text
+	// sessions. When roles are configured, the same pinned root is reused.
+	NativeExecutionRoot string
 	// ChatIntake reuses the same Engine and requires the role execution path.
 	ChatIntake *coordination.Engine
 	// WorkInputs is trusted startup composition. Nil keeps work inputs closed;
@@ -59,6 +65,7 @@ type MemberToolRuntime struct {
 	operations               []string
 	maxGroupMembers          int
 	roleFence                *memberToolRoleFence
+	executionRoot            *memberToolExecutionRoot
 }
 
 const memberToolRuntimeVerificationTimeout = 5 * time.Second
@@ -95,12 +102,25 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 		capacity = 4
 	}
 	var roleFence *memberToolRoleFence
+	var executionRoot *memberToolExecutionRoot
 	if options.RoleMaxActive != 0 || options.RoleExecutionRoot != "" {
 		roleFence, err = newMemberToolRoleFence(db, options.RoleMaxActive, options.RoleExecutionRoot)
 		if err != nil {
 			return nil, err
 		}
-		keys, keyErr := scheduler.WorkspaceResourceKeys([]string{root, options.RoleExecutionRoot})
+		executionRoot = &roleFence.memberToolExecutionRoot
+		if options.NativeExecutionRoot != "" && !executionRoot.rootValid(options.NativeExecutionRoot) {
+			return nil, errMemberToolRuntimeConfig
+		}
+	} else if options.NativeExecutionRoot != "" {
+		pinned, err := pinMemberToolExecutionRoot(options.NativeExecutionRoot)
+		if err != nil {
+			return nil, err
+		}
+		executionRoot = &pinned
+	}
+	if executionRoot != nil {
+		keys, keyErr := scheduler.WorkspaceResourceKeys([]string{root, executionRoot.executionRoot})
 		if keyErr != nil || keys[0] == keys[1] {
 			return nil, errMemberToolRuntimeConfig
 		}
@@ -119,7 +139,7 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 		}
 	}
 	return &MemberToolRuntime{tools: tools, configRoot: root, resolvedRoot: resolved,
-		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence}, nil
+		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence, executionRoot: executionRoot}, nil
 }
 
 func memberToolRuntimeEndpoint(endpoint string) bool {
@@ -170,12 +190,13 @@ func memberToolRuntimeText(value string) bool {
 }
 
 type memberToolRuntimeRun struct {
-	runtime *MemberToolRuntime
-	binding MemberToolRunBinding
-	factory MemberToolExecutorFactory
-	used    atomic.Bool
-	role    *store.CoordinationRoleProvenance
-	intake  bool
+	runtime       *MemberToolRuntime
+	binding       MemberToolRunBinding
+	factory       MemberToolExecutorFactory
+	used          atomic.Bool
+	role          *store.CoordinationRoleProvenance
+	intake        bool
+	nativeSession *memberToolNativeSessionPlan
 	// Cloned at trusted wrapping and again when the claimed token is registered.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
@@ -184,10 +205,13 @@ func memberToolRuntimeReceipt(outcome provider.Outcome, reason string) provider.
 	return provider.ExecutionReceipt{Outcome: outcome, ExitCode: -1, Reason: reason}
 }
 
-func (e *memberToolRuntimeRun) fresh(turn domain.Turn) bool {
+func (e *memberToolRuntimeRun) matchesTurn(turn domain.Turn) bool {
 	b := e.binding
-	return turn.GroupID == b.GroupID && turn.MemberID == b.MemberID && turn.ConversationID == b.ConversationID &&
-		turn.DeliveryID == b.DeliveryID && turn.ClaimToken != "" && turn.State == domain.TurnStateStarting &&
+	return turn.GroupID == b.GroupID && turn.MemberID == b.MemberID && turn.ConversationID == b.ConversationID && turn.DeliveryID == b.DeliveryID
+}
+
+func (e *memberToolRuntimeRun) fresh(turn domain.Turn) bool {
+	return e.matchesTurn(turn) && turn.ClaimToken != "" && turn.State == domain.TurnStateStarting &&
 		turn.NativeSessionID == "" && turn.AcceptedAt == nil && turn.CancelRequestedAt == nil &&
 		turn.CandidateText == "" && turn.CandidateTerminal == ""
 }
@@ -196,13 +220,13 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	if e.role != nil {
 		return e.executeCoordinationRole(ctx, request, onEvent)
 	}
-	unknown := memberToolRuntimeReceipt(provider.OutcomeUnknown, "成员工具执行归属或历史结果未知，需对账后再处理")
+	unknown := e.startupUnknown("成员工具执行归属或历史结果未知，需对账后再处理")
 	if e.used.Swap(true) || !memberToolRuntimeRunID.MatchString(request.RunID) || request.Model != e.binding.Model {
 		return unknown
 	}
 	r := e.runtime
 	turn, err := r.tools.db.GetTurn(ctx, e.binding.GroupID, request.RunID)
-	if err != nil || turn.ID != request.RunID || !e.fresh(turn) || !r.clearRunDirectory(request) {
+	if err != nil || turn.ID != request.RunID || !e.fresh(turn) || !e.clearRunDirectory(request) {
 		return unknown
 	}
 	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
@@ -219,7 +243,9 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	}
 	var config *memberToolRuntimeConfigFile
 	defer func() {
-		r.tools.Revoke(token) // Unconditional, uncancelled in-flight drain comes first.
+		if token != "" {
+			r.tools.Revoke(token) // Uncancelled in-flight drain comes first.
+		}
 		if config != nil {
 			config.cleanup()
 		}
@@ -229,18 +255,32 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 		return *receipt
 	}
 	if err != nil {
-		return memberToolRuntimeReceipt(provider.OutcomeNotStarted, "无法安全准备成员工具凭证，执行未启动")
+		return e.startupFailure(ctx, request, claim, token, "无法安全准备成员工具凭证，执行未启动")
 	}
-	native, err := e.factory(filepath.Join(r.configRoot, config.name), claim.TurnID, e.toolOperations())
-	// Recheck uncertainty before classifying even a failed factory as not_started.
-	if receipt := e.preflight(ctx, request, claim, token, config); receipt != nil {
-		return *receipt
+	native, session, err := e.constructExecutor(ctx, request, claim, token, config, e.toolOperations())
+	if e.nativeSession == nil {
+		if receipt := e.preflight(ctx, request, claim, token, config); receipt != nil {
+			return *receipt
+		}
 	}
 	if err != nil || native == nil {
-		return memberToolRuntimeReceipt(provider.OutcomeNotStarted, "无法构造成员工具执行器，执行未启动")
+		return e.startupFailure(ctx, request, claim, token, "无法构造成员工具执行器，执行未启动")
+	}
+	nativeRequest, err := e.executionRequest(request, config)
+	if err != nil {
+		return e.startupFailure(ctx, request, claim, token, "原生会话运行目录或配置已变更，执行未启动")
+	}
+	if !e.commitNativeLaunch(ctx, token, session, nil) {
+		return e.startupFailure(ctx, request, claim, token, "原生会话启动绑定无法确认，执行未启动")
 	}
 	// Once invoked, only the adapter owns execution classification and evidence.
-	return native.Execute(ctx, request, onEvent)
+	raw := native.Execute(ctx, nativeRequest, onEvent)
+	if session == nil {
+		return raw
+	}
+	r.tools.Revoke(token)
+	token = ""
+	return session.receipt(ctx, e, claim, raw)
 }
 
 func (e *memberToolRuntimeRun) toolOperations() []string {
@@ -252,13 +292,22 @@ func (e *memberToolRuntimeRun) toolOperations() []string {
 
 func (e *memberToolRuntimeRun) preflight(ctx context.Context, request provider.ExecuteRequest, claim store.TurnClaim, token string, config *memberToolRuntimeConfigFile) *provider.ExecutionReceipt {
 	r := e.runtime
+	if e.nativeSession != nil {
+		// Native selection checks live Store evidence and authority. Here check
+		// the local prerequisites without holding the registry across that IO.
+		if ctx.Err() == nil && e.clearRunDirectory(request) && r.rootValid() && e.configValid(config) {
+			return nil
+		}
+		receipt := e.startupFailure(ctx, request, claim, token, "成员工具凭证目录或文件已变更，执行未启动")
+		return &receipt
+	}
 	outcome, reason := provider.OutcomeUnknown, "成员工具执行归属或历史结果未知，需对账后再处理"
 	// Bound reconciliation independently of caller cancellation, including SQL pool
 	// waits. This never settles a turn; failure or expiry must remain unknown.
 	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), memberToolRuntimeVerificationTimeout)
 	defer cancel()
 	turn, err := r.tools.db.GetTurn(checkCtx, claim.GroupID, claim.TurnID)
-	if err == nil && e.fresh(turn) && turn.ClaimToken == claim.Token && r.clearRunDirectory(request) &&
+	if err == nil && e.fresh(turn) && turn.ClaimToken == claim.Token && e.clearRunDirectory(request) &&
 		r.tools.withAuthorized(checkCtx, token, e.toolOperations()[0], func(scope store.MemberToolScope, _ MemberToolGrants) error {
 			if scope.Claim != claim || scope.MemberID != e.binding.MemberID || scope.ConversationID != e.binding.ConversationID {
 				return store.ErrMemberToolDenied
@@ -268,12 +317,17 @@ func (e *memberToolRuntimeRun) preflight(ctx context.Context, request provider.E
 		outcome, reason = provider.OutcomeNotStarted, "成员工具凭证目录或文件已变更，执行未启动"
 		if ctx.Err() != nil {
 			reason = "执行在启动前已取消或超时"
-		} else if r.rootValid() && config != nil && config.valid() {
+		} else if r.rootValid() && e.configValid(config) {
 			return nil
 		}
 	}
 	receipt := memberToolRuntimeReceipt(outcome, reason)
 	return &receipt
+}
+
+func (e *memberToolRuntimeRun) clearRunDirectory(request provider.ExecuteRequest) bool {
+	r := e.runtime
+	return (e.nativeSession == nil || r.executionRoot.rootValid(request.RuntimeDir)) && r.clearRunDirectory(request)
 }
 
 // Only inspect: the adapter still reserves RuntimeDir/RunID exclusively itself.
@@ -302,20 +356,32 @@ func (r *MemberToolRuntime) rootValid() bool {
 }
 
 type memberToolRuntimeConfigFile struct {
-	root *os.Root
-	name string
-	info os.FileInfo
+	root   *os.Root
+	name   string
+	info   os.FileInfo
+	size   int64
+	digest [sha256.Size]byte
 }
 
 func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfigFile, error) {
 	if !r.rootValid() {
 		return nil, errMemberToolRuntimeConfig
 	}
+	data, err := json.Marshal(struct {
+		Endpoint     string `json:"endpoint"`
+		Token        string `json:"token"`
+		ContinueWork bool   `json:"continue_work,omitempty"`
+	}{r.endpoint, token, r.tools.issuedContinueWork(token)})
+	if err != nil {
+		return nil, errMemberToolRuntimeConfig
+	}
+	// Bind the bytes we are issuing, including the existing trailing newline.
+	data = append(data, '\n')
 	root, err := os.OpenRoot(r.configRoot)
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}
-	config := &memberToolRuntimeConfigFile{root: root, name: "member-tools-" + rand.Text() + ".json"}
+	config := &memberToolRuntimeConfigFile{root: root, name: "member-tools-" + rand.Text() + ".json", size: int64(len(data)), digest: sha256.Sum256(data)}
 	info, err := root.Stat(".")
 	if err != nil || !os.SameFile(r.rootInfo, info) || info.Mode() != os.ModeDir|0700 {
 		return config, errMemberToolRuntimeConfig
@@ -326,11 +392,7 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 	}
 	config.info, err = file.Stat()
 	if err == nil {
-		err = json.NewEncoder(file).Encode(struct {
-			Endpoint     string `json:"endpoint"`
-			Token        string `json:"token"`
-			ContinueWork bool   `json:"continue_work,omitempty"`
-		}{r.endpoint, token, r.tools.issuedContinueWork(token)})
+		_, err = file.Write(data)
 	}
 	closeErr := file.Close()
 	if err != nil || closeErr != nil || !config.valid() {
@@ -350,6 +412,26 @@ func (c *memberToolRuntimeConfigFile) ownedInfo() os.FileInfo {
 func (c *memberToolRuntimeConfigFile) valid() bool {
 	info := c.ownedInfo()
 	return info != nil && info.Mode() == 0600
+}
+
+func (e *memberToolRuntimeRun) configValid(c *memberToolRuntimeConfigFile) bool {
+	if c == nil || !c.valid() {
+		return false
+	}
+	if e.nativeSession == nil {
+		return true
+	}
+	file, err := c.root.OpenFile(c.name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || info.Mode() != 0600 || !os.SameFile(c.info, info) || info.Size() != c.size {
+		return false
+	}
+	data, err := io.ReadAll(io.LimitReader(file, c.size+1))
+	return err == nil && int64(len(data)) == c.size && sha256.Sum256(data) == c.digest && c.valid()
 }
 
 func (c *memberToolRuntimeConfigFile) cleanup() {

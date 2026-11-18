@@ -471,7 +471,8 @@ func TestRoleReceiptRejectsNativeRefCapture(t *testing.T) {
 		raw := plain
 		raw.NativeRef = &provider.NativeSessionReference{Version: provider.NativeSessionReferenceVersion, Binding: json.RawMessage(`{"fixture":"private-reference"}`)}
 		got := roleReceiptInvoke(t, r, req, binding, scope.Provenance, func() provider.ExecutionReceipt { return raw })
-		if got != raw {
+		// A detached sidecar is the same evidence, not the same pointer.
+		if !reflect.DeepEqual(got, raw) {
 			t.Fatal("diagnostic refusal changed execution evidence")
 		}
 		diagnostic, err := r.InspectCoordinationRoleReceipt(context.Background(), f.groupID, req.RunID)

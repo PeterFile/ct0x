@@ -412,11 +412,11 @@ func TestPiMemberToolsRoleProfilesCanonicalArgvAndFrozenSelection(t *testing.T) 
 }
 
 func TestPiMemberToolsEnvironmentReplacesDuplicatesWithoutMutation(t *testing.T) {
-	inherited := []string{"KEEP=literal=value", memberToolConfigEnv + "=first", "AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_EXTRA=keep", memberToolConfigEnv + "=second"}
+	inherited := []string{"KEEP=literal=value", memberToolConfigEnv + "=first", "AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_EXTRA=keep", memberToolConfigEnv + "=second", piMemberToolConfigSHAEnv + "=inherited"}
 	before := append([]string(nil), inherited...)
-	got := piMemberToolEnvironment(inherited, "/trusted/private.json")
+	opts := piMemberToolOptions{configPath: "/trusted/private.json"}
 	want := []string{"KEEP=literal=value", "AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_EXTRA=keep", memberToolConfigEnv + "=/trusted/private.json"}
-	if !reflect.DeepEqual(got, want) || !reflect.DeepEqual(inherited, before) {
-		t.Fatalf("environment did not replace only the exact key in a fresh child snapshot: %v", got)
+	if !reflect.DeepEqual(opts.environment(inherited), want) || !reflect.DeepEqual(inherited, before) {
+		t.Fatal("legacy environment inherited a bootstrap override or changed unrelated entries")
 	}
 }

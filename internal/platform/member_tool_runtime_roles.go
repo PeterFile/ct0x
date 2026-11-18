@@ -3,7 +3,6 @@ package platform
 import (
 	"context"
 	"crypto/sha256"
-	"path/filepath"
 	"slices"
 
 	"agentworkspace/internal/domain"
@@ -83,7 +82,7 @@ func (e *memberToolRuntimeRun) roleStartup(ctx context.Context, claim store.Turn
 
 func (e *memberToolRuntimeRun) rolePreflight(ctx context.Context, request provider.ExecuteRequest, scope store.CoordinationToolScope, token string, operations []string, config *memberToolRuntimeConfigFile) bool {
 	r := e.runtime
-	if ctx.Err() != nil || !r.roleFence.rootValid(request.RuntimeDir) || !r.clearRunDirectory(request) || !r.rootValid() || config == nil || !config.valid() {
+	if ctx.Err() != nil || !r.roleFence.rootValid(request.RuntimeDir) || !r.clearRunDirectory(request) || !r.rootValid() || !e.configValid(config) {
 		return false
 	}
 	// Bound database verification independently of caller cancellation, including
@@ -101,11 +100,11 @@ func (e *memberToolRuntimeRun) rolePreflight(ctx context.Context, request provid
 	valid := found && entry.scope == scope.Member && entry.role == scope && slices.Equal(entry.grants.Operations, operations) &&
 		entry.grants.Skills == nil && entry.grants.Artifacts == nil && slices.Equal(entry.dispatchCapabilities, e.dispatchCapabilities)
 	r.tools.mu.RUnlock()
-	return valid && r.roleFence.rootValid(request.RuntimeDir) && r.rootValid() && config.valid() && checkCtx.Err() == nil && ctx.Err() == nil
+	return valid && r.roleFence.rootValid(request.RuntimeDir) && r.rootValid() && e.configValid(config) && checkCtx.Err() == nil && ctx.Err() == nil
 }
 
 func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, request provider.ExecuteRequest, onEvent func(provider.Event) error) provider.ExecutionReceipt {
-	unknown := memberToolRuntimeReceipt(provider.OutcomeUnknown, "角色执行归属或历史结果未知，需对账后再处理")
+	unknown := e.startupUnknown("角色执行归属或历史结果未知，需对账后再处理")
 	r := e.runtime
 	if e.used.Swap(true) || !memberToolRuntimeRunID.MatchString(request.RunID) || request.Model != e.binding.Model || !r.roleFence.rootValid(request.RuntimeDir) {
 		return unknown
@@ -154,17 +153,26 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 	if !found || workspace && e.binding.ProviderName == provider.Codex {
 		return unknown
 	}
+	startupFailure := func() provider.ExecutionReceipt {
+		if e.nativeSession != nil {
+			return e.startupFailure(ctx, request, claim, token, "")
+		}
+		return unknown
+	}
 	config, err = r.createConfig(token)
 	if err != nil || !e.rolePreflight(ctx, request, scope, token, operations, config) {
-		return unknown
+		return startupFailure()
 	}
-	native, err := e.factory(filepath.Join(r.configRoot, config.name), claim.TurnID, slices.Clone(operations))
-	if err != nil || native == nil || !e.rolePreflight(ctx, request, scope, token, operations, config) || !owner.beginInvoke() {
-		return unknown
+	native, session, err := e.constructExecutor(ctx, request, claim, token, config, slices.Clone(operations))
+	if err != nil || native == nil || e.nativeSession == nil && !e.rolePreflight(ctx, request, scope, token, operations, config) {
+		return startupFailure()
 	}
-	// Keep the native receipt before deriving the wrapper aggregate. Receipt
-	// copies share NativeRef, which must be treated as immutable.
-	raw := native.Execute(ctx, request, onEvent)
+	nativeRequest, err := e.executionRequest(request, config)
+	if err != nil || !e.commitNativeLaunch(ctx, token, session, owner) {
+		return startupFailure()
+	}
+	// Freeze native evidence independently from the wrapper's metadata/aggregate.
+	raw := cloneMemberToolReceipt(native.Execute(ctx, nativeRequest, onEvent))
 	// Drain every authorized callback before auditing unresolved filesystem IO.
 	// Native success/cancellation is not evidence that file operations settled.
 	r.tools.Revoke(token)
@@ -188,6 +196,13 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 			aggregate.Outcome = provider.OutcomeUnknown
 			aggregate.Reason = "本轮文件操作结果未确认或无法核验，须保留资源并先对账；原生回执不代表目录操作已完成"
 		}
+	}
+	if workspace {
+		aggregate.NativeRef = nil // File profiles cannot acquire text-session metadata.
+	} else if session != nil {
+		aggregate = session.receipt(ctx, e, claim, aggregate)
+	} else {
+		aggregate = cloneMemberToolReceipt(aggregate)
 	}
 	r.captureRoleReceipt(e.binding, scope, token, raw, aggregate)
 	return aggregate
