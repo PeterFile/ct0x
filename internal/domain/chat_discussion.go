@@ -54,11 +54,24 @@ type ChatDiscussionReceipt struct {
 	Event   ChatDiscussionEvent `json:"event"`
 }
 
+// ChatDiscussionWork is the admitted work bound to the exact invitation's
+// receiving Turn, even after the discussion advances. Assignment and worker
+// are omitted until proved. These references do not indicate execution,
+// submission, or acceptance.
+type ChatDiscussionWork struct {
+	TaskID            string `json:"task_id"`
+	MandateID         string `json:"mandate_id"`
+	DispatchRequestID string `json:"dispatch_request_id"`
+	AssignmentID      string `json:"assignment_id,omitempty"`
+	WorkerMemberID    string `json:"worker_member_id,omitempty"`
+}
+
 // ChatDiscussionContext is scoped to an arriving turn. A new action needs the
 // current head and owner; an older arrival can still read its associated path.
 // After a root answer, the owner can resolve but no invitation is active.
-// Closed covers a structured resolution, a public-only return, or a proven
-// interruption at the current head. Only an interruption has ClosureReason.
+// Closed ends the ordinary path. WorkAdmitted means only the active invitation
+// transferred to formal work, not that the work succeeded or historical work
+// controls this path. Only a proven interruption at the current head has ClosureReason.
 // When ContentOmitted is true, read full bodies via read_history using
 // OriginMessageID and each event's MessageID. Independent reply requirements
 // remain inline even when the bodies are omitted.
@@ -74,6 +87,7 @@ type ChatDiscussionContext struct {
 	ActiveOwnerID             string                  `json:"active_owner_id,omitempty"`
 	Closed                    bool                    `json:"closed"`
 	ClosureReason             string                  `json:"closure_reason,omitempty"`
+	WorkAdmitted              bool                    `json:"work_admitted,omitempty"`
 	ContentOmitted            bool                    `json:"content_omitted,omitempty"`
 	Events                    []ChatDiscussionReceipt `json:"events"`
 }

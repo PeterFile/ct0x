@@ -80,7 +80,7 @@ func (s *Store) DelegateWork(ctx context.Context, scope MemberToolScope, input d
 	if err != nil {
 		return domain.TaskWorkDelegation{}, ErrInvalid
 	}
-	return workMemberTx(ctx, s, scope, "委派任务内问题失败", func(tx *sql.Tx) (out domain.TaskWorkDelegation, err error) {
+	return taskWorkB3MutationTx(ctx, s, scope, "委派任务内问题失败", func(tx *sql.Tx) (out domain.TaskWorkDelegation, err error) {
 		f, attempt, err := taskWorkOwnerInTx(ctx, tx, scope)
 		if err != nil {
 			return out, err
@@ -169,10 +169,7 @@ func (s *Store) ReportWork(ctx context.Context, scope MemberToolScope, input dom
 	if !memberToolKeyValid(key) || !taskWorkReportKindValid(input.Kind) || !memberToolTextValid(input.Summary, domain.MaxWorkReportBytes) || len(input.AnswerTo) > 4096 {
 		return domain.TaskWorkReport{}, ErrInvalid
 	}
-	return taskWorkMutationTx(ctx, s, scope, "记录协作报告失败", func(tx *sql.Tx) (out domain.TaskWorkReport, err error) {
-		if err := requireTaskWorkReportsInTx(ctx, tx); err != nil {
-			return out, coordinationRoleRelationError(err)
-		}
+	return taskWorkB3MutationTx(ctx, s, scope, "记录协作报告失败", func(tx *sql.Tx) (out domain.TaskWorkReport, err error) {
 		f, err := taskWorkExecutionInTx(ctx, tx, scope)
 		if err != nil {
 			return out, err
@@ -187,10 +184,7 @@ func (s *Store) ReportWork(ctx context.Context, scope MemberToolScope, input dom
 			out, err = s.recordTaskWorkReportInTx(ctx, tx, scope, f, input, id, replay)
 			return err
 		})
-		if err != nil {
-			return out, err
-		}
-		return out, coordinationDecideLiveInTx(ctx, tx, scope)
+		return out, err
 	})
 }
 
