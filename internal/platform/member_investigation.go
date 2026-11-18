@@ -259,8 +259,18 @@ func (s *MemberTools) withInvestigationRead(ctx context.Context, token, operatio
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry, found := s.capabilities[sha256.Sum256([]byte(token))]
-	if !found || entry.purpose != memberInvestigationRolePurpose || entry.role.Member != entry.scope ||
-		!validInvestigationRoleScope(entry.role) || !isInvestigationReadOperation(operation) || !slices.Contains(entry.grants.Operations, operation) {
+	if !found || !isInvestigationReadOperation(operation) || !slices.Contains(entry.grants.Operations, operation) {
+		return store.ErrMemberToolDenied
+	}
+	if entry.investigationOwner != nil {
+		if !entry.investigationWorkOwnerValid() || entry.investigationOwner.delivery.SourceKind != domain.TaskWorkSourceFollowup {
+			return store.ErrMemberToolDenied
+		}
+	} else if entry.workReport != nil {
+		if entry.workReport.delivery.SourceKind != domain.TaskWorkSourceDelegation {
+			return store.ErrMemberToolDenied
+		}
+	} else if entry.purpose != memberInvestigationRolePurpose || entry.role.Member != entry.scope || !validInvestigationRoleScope(entry.role) {
 		return store.ErrMemberToolDenied
 	}
 	return investigationReadError(ctx, use(entry))
@@ -281,7 +291,13 @@ func investigationReadError(ctx context.Context, err error) error {
 func (s *MemberTools) ReadInvestigationChannel(ctx context.Context, token string, options store.ListOptions) (store.Page[domain.Message], error) {
 	var result store.Page[domain.Message]
 	err := s.withInvestigationRead(ctx, token, ReadInvestigationChannelOperation, func(entry memberToolRegistration) error {
-		page, err := s.db.ReadInvestigationChannel(ctx, entry.role, options)
+		var page store.Page[domain.Message]
+		var err error
+		if entry.workReport != nil {
+			page, err = s.workReportEngine.ReadTaskWorkChannel(ctx, entry.scope, options)
+		} else {
+			page, err = s.db.ReadInvestigationChannel(ctx, entry.investigationReadRole(), options)
+		}
 		if err != nil {
 			return err
 		}
@@ -329,19 +345,31 @@ func (s *MemberTools) ReadInvestigationArtifact(ctx context.Context, token strin
 		if input.Offset < 0 || input.Offset > investigationMaxBlobBytes || input.MaxBytes < 1 || input.MaxBytes > investigationMaxFragmentBytes {
 			return store.ErrInvalid
 		}
-		role := entry.role
-		_, version, err := s.db.ReadInvestigationArtifact(ctx, role, input.ArtifactID, input.VersionID)
+		ref := domain.ArtifactVersionRef{ArtifactID: input.ArtifactID, VersionID: input.VersionID}
+		if (entry.workReport != nil && !slices.Contains(entry.workReport.versions, ref)) ||
+			(entry.investigationOwner != nil && !slices.Contains(entry.investigationOwner.versions, ref)) {
+			return store.ErrMemberToolDenied
+		}
+		readVersion := func() (domain.ArtifactVersion, error) {
+			if entry.workReport != nil {
+				_, version, err := s.workReportEngine.ReadTaskWorkArtifact(ctx, entry.scope, ref.ArtifactID, ref.VersionID)
+				return version, err
+			}
+			_, version, err := s.db.ReadInvestigationArtifact(ctx, entry.investigationReadRole(), ref.ArtifactID, ref.VersionID)
+			return version, err
+		}
+		version, err := readVersion()
 		if err != nil {
 			return err
 		}
-		if version.GroupID != role.Provenance.GroupID || version.ArtifactID != input.ArtifactID || version.ID != input.VersionID {
+		if version.GroupID != entry.scope.Claim.GroupID || version.ArtifactID != ref.ArtifactID || version.ID != ref.VersionID {
 			return store.ErrMemberToolDenied
 		}
 		fragment, readErr := readInvestigationFragment(grant, version, input)
 		// Even open, seek/read, Close and output-budget failures reveal information.
 		// Re-resolve the exact tuple in B's live fence AFTER all I/O, before any
 		// result (success or failure) leaves the registry callback.
-		_, current, err := s.db.ReadInvestigationArtifact(ctx, role, input.ArtifactID, input.VersionID)
+		current, err := readVersion()
 		if err != nil {
 			return err
 		}

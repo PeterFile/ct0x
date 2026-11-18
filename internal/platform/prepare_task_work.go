@@ -17,8 +17,7 @@ import (
 const taskWorkProfileUnavailable = "typed_profile_unavailable"
 
 // A successful typed peek is evidence of a wake, not permission to start it.
-// v30 delegation and report have no launch profile in this Preparer.
-func (p *Preparer) resolveUnsupportedTaskWork(ctx context.Context, input preparationInput, deliveryID string, coordinationErr error) (preparationInput, error) {
+func (p *Preparer) resolveQueuedTaskWork(ctx context.Context, input preparationInput, deliveryID string, coordinationErr error) (preparationInput, error) {
 	var empty preparationInput
 	work, err := p.store.ResolveTaskWorkDelivery(ctx, input.group.ID, deliveryID)
 	if err != nil {
@@ -34,11 +33,7 @@ func (p *Preparer) resolveUnsupportedTaskWork(ctx context.Context, input prepara
 	matches := work.GroupID == input.group.ID && work.DeliveryID == deliveryID && work.MemberID == input.member.ID &&
 		work.ConversationID == input.conversation.ID && work.MessageID == input.trigger.ID && work.TopicID == input.trigger.TopicID &&
 		work.SenderMemberID == input.trigger.SenderID && work.Blocked != "already_claimed"
-	prov := store.CoordinationRoleProvenance{
-		GroupID: work.GroupID, MemberID: work.MemberID, ConversationID: work.ConversationID, MessageID: work.MessageID,
-		DeliveryID: work.DeliveryID, TopicID: work.TopicID, SourceKind: work.SourceKind, SourceID: work.SourceID,
-		AssignmentID: work.AssignmentID, TaskID: work.TaskID, TaskRevision: work.TaskRevision,
-	}
+	prov := taskWorkWakeProvenance(work)
 	if coordinationErr != nil {
 		if !matches || work.SourceKind != domain.TaskWorkSourceDelegation {
 			return empty, preparationResolutionError(ctx, coordinationErr)
@@ -59,17 +54,34 @@ func (p *Preparer) resolveUnsupportedTaskWork(ctx context.Context, input prepara
 			return empty, errPrepareBinding
 		}
 	}
-	input.state.Provenance, input.state.Blocked = prov, taskWorkProfileUnavailable
+	input.state.Provenance = prov
+	if p.memberTools == nil || p.memberTools.investigationTaskWork == nil {
+		input.state.Blocked = taskWorkProfileUnavailable
+	} else {
+		input.typedWork = &work
+		if input.state.Blocked == store.CoordinationReady {
+			input.state.Blocked = store.CoordinationReadinessCode(work.Blocked)
+		}
+	}
 	return input, nil
 }
 
+func taskWorkWakeProvenance(work domain.TaskWorkDelivery) store.CoordinationRoleProvenance {
+	return store.CoordinationRoleProvenance{
+		GroupID: work.GroupID, MemberID: work.MemberID, ConversationID: work.ConversationID, MessageID: work.MessageID,
+		DeliveryID: work.DeliveryID, TopicID: work.TopicID, SourceKind: work.SourceKind, SourceID: work.SourceID,
+		AssignmentID: work.AssignmentID, TaskID: work.TaskID, TaskRevision: work.TaskRevision,
+	}
+}
+
 type taskWorkPreparation struct {
-	delivery   domain.TaskWorkDelivery
-	mandate    domain.Mandate
-	provenance store.CoordinationRoleProvenance
-	selected   provider.Provider
-	request    provider.ExecuteRequest
-	workspace  taskWorkWorkspace
+	delivery      domain.TaskWorkDelivery
+	mandate       domain.Mandate
+	provenance    store.CoordinationRoleProvenance
+	selected      provider.Provider
+	request       provider.ExecuteRequest
+	workspace     taskWorkWorkspace
+	investigation *investigationTaskWorkPreparation // Nil means the existing pure-text profile.
 }
 
 func currentTaskWorkMandate(ctx context.Context, db *store.Store, work domain.TaskWorkDelivery) (domain.Mandate, error) {
@@ -110,6 +122,21 @@ func (p *Preparer) planFreshTaskWork(ctx context.Context, input preparationInput
 	prov := state.Provenance
 	if state.Blocked != store.CoordinationReady {
 		return empty, rolePreparationBlocked(state, string(state.Blocked), nil)
+	}
+	if r != nil && r.investigationTaskWork != nil {
+		// Classify the original persisted admission, not the wake text or the
+		// current Policy's action. Only B's verified absence permits text planning.
+		scope, err := p.store.GetTaskInvestigationScope(ctx, prov.GroupID, prov.TaskID)
+		switch {
+		case err == nil:
+			return p.planInvestigationTaskWork(ctx, input, scope, createWorkspace)
+		case ctx.Err() == nil && errors.Is(err, store.ErrNotFound):
+			// The existing text plan still requires an admitted text followup.
+		case ctx.Err() == nil && errors.Is(err, store.ErrTaskInvestigationNotReady):
+			return empty, rolePreparationBlocked(state, "investigation_not_ready", nil)
+		default:
+			return empty, preparationResolutionError(ctx, err)
+		}
 	}
 	if r == nil || r.roleFence == nil || !r.tools.FreshTaskWorkEnabled() || input.member.Workspace != "" ||
 		prov.SourceKind != domain.TaskWorkSourceFollowup {
@@ -178,7 +205,13 @@ func (p *Preparer) planFreshTaskWork(ctx context.Context, input preparationInput
 	if err != nil {
 		return empty, err
 	}
-	plan.workspace, err = p.freshTaskWorkWorkspace(ctx, work, createWorkspace)
+	return p.finishTaskWorkPlan(ctx, state, plan, prompt, input.member.Model, createWorkspace)
+}
+
+func (p *Preparer) finishTaskWorkPlan(ctx context.Context, state store.CoordinationRoleState, plan taskWorkPreparation, prompt, model string, createWorkspace bool) (taskWorkPreparation, error) {
+	var empty taskWorkPreparation
+	var err error
+	plan.workspace, err = p.freshTaskWorkWorkspace(ctx, plan.delivery, createWorkspace)
 	if ctx.Err() == nil && (errors.Is(err, errPrepareWorkspace) || errors.Is(err, scheduler.ErrNotReady)) {
 		return empty, rolePreparationBlocked(state, "typed_private_cwd_unavailable", nil)
 	}
@@ -194,7 +227,7 @@ func (p *Preparer) planFreshTaskWork(ctx context.Context, input preparationInput
 			return empty, rolePreparationBlocked(state, "workspace_resource_held", nil)
 		}
 	}
-	plan.request = provider.ExecuteRequest{CWD: plan.workspace.path, Prompt: prompt, Model: input.member.Model, Thinking: p.roleThinking}
+	plan.request = provider.ExecuteRequest{CWD: plan.workspace.path, Prompt: prompt, Model: model, Thinking: p.roleThinking}
 	return plan, ctx.Err()
 }
 

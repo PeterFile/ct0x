@@ -17,11 +17,23 @@ import (
 	"agentworkspace/internal/store"
 )
 
-// B produces both kinds of wake through real admission, assignment and live
-// claim APIs. The fixture installs no C Task Work profile and runs no provider.
+// B produces the wakes through real admission, assignment and live claim
+// APIs. The fixture installs no C launch profile and runs no provider.
 func queueUnsupportedTaskWork(t *testing.T, kind domain.TaskWorkSourceKind) (*roleRuntimeFixture, domain.TaskWorkDelivery) {
 	t.Helper()
 	ctx := t.Context()
+	if kind == domain.TaskWorkSourceFollowup {
+		f := newBoundWorkReportFixture(t)
+		f.delegate(t, nil, nil, false)
+		f.settleWork(t, f.claimWork(t, f.delegation.DeliveryID), false)
+		receipt, _ := queueInvestigationWorkInput(t, f, "保持引用原材料。", false)
+		work, err := f.engine.ResolveTaskWorkDelivery(ctx, f.group, receipt.WorkDeliveryID)
+		roleOK(t, err)
+		if work.SourceKind != kind || work.SourceID != receipt.WorkInputID || work.Blocked != "" {
+			t.Fatal("fixture did not produce a ready v30 investigation followup")
+		}
+		return f.roleRuntimeFixture, work
+	}
 	f := newRoleRuntime(t)
 	f.options.RoleMaxActive = 2 // B permits the delegate to overlap its running owner.
 	child, err := f.local.CreateMember(ctx, f.group, platform.MemberInput{Name: "delegate", Role: "research", ProviderID: f.worker.ProviderID, Model: f.worker.Model}, "")
@@ -119,7 +131,7 @@ func queuePreparer(t *testing.T, f *roleRuntimeFixture) (*platform.Preparer, str
 }
 
 func TestUnsupportedV30TaskWorkDoesNotStopScheduler(t *testing.T) {
-	for _, kind := range []domain.TaskWorkSourceKind{domain.TaskWorkSourceDelegation, domain.TaskWorkSourceReport} {
+	for _, kind := range []domain.TaskWorkSourceKind{domain.TaskWorkSourceDelegation, domain.TaskWorkSourceReport, domain.TaskWorkSourceFollowup} {
 		t.Run(string(kind), func(t *testing.T) {
 			ctx := t.Context()
 			f, work := queueUnsupportedTaskWork(t, kind)

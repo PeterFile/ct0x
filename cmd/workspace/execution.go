@@ -47,6 +47,10 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	investigationTaskWork, err := config.piFreshInvestigationWorkLaunch(db, engine, providers)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	maxActive := config.executionMaxActive
 	if maxActive == 0 { // Direct config literals may leave the CLI default unset.
 		maxActive = defaultExecutionMaxActive
@@ -72,6 +76,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			return nil, nil, nil, err
 		}
 		options.Investigation = &platform.InvestigationPreparationOptions{PiPath: config.piPath, Artifacts: grant}
+		if investigationTaskWork != nil {
+			investigationTaskWork.Artifacts = grant
+		}
 	}
 	var tools *platform.MemberToolRuntime
 	if config.enableMemberTools {
@@ -92,7 +99,13 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			options.RoleThinking = config.roleThinking
 		}
 		toolOptions.FreshTaskWork = freshTaskWork
-		tools, err = platform.NewMemberToolRuntime(db, toolOptions)
+		if investigationTaskWork != nil {
+			// The existing role and investigation HTTP mounts consume this
+			// same registry. No delegate-authoring tool is added here.
+			tools, err = platform.NewMemberToolRuntimeWithTaskWorkReports(db, toolOptions, engine, investigationTaskWork)
+		} else {
+			tools, err = platform.NewMemberToolRuntime(db, toolOptions)
+		}
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -125,7 +138,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			return nil, nil, nil, err
 		}
 	}
-	if freshTaskWork != nil {
+	if freshTaskWork != nil || investigationTaskWork != nil {
 		// B's process-local readiness assertion, not Policy or authority. Set
 		// it only after successful composition and before accepting requests.
 		engine.EnableTaskWorkExecution()
