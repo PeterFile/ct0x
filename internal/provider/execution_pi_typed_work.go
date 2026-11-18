@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"agentworkspace/internal/domain"
 )
 
 const piTypedWriteUnknown = "agent_workspace_write_unknown_v1"
@@ -63,9 +65,16 @@ func piTypedWorkHasExactType(line []byte) bool {
 }
 
 func (p *piTypedWorkOutput) boundWrite(name string) bool {
+	if !slices.Contains(p.tools, name) {
+		return false
+	}
 	switch name {
 	case "ack_work_input", "hand_back_work_input", "submit_result", "report_work":
-		return slices.Contains(p.tools, name)
+		return true
+	case DelegateWorkTool:
+		return domain.TaskWorkSourceKind(p.role) == PiInitialInvestigationOwnerRole || domain.TaskWorkSourceKind(p.role).IsOwnerContinuation()
+	case HandbackWorkTool:
+		return domain.TaskWorkSourceKind(p.role).IsOwnerContinuation()
 	default:
 		return false
 	}

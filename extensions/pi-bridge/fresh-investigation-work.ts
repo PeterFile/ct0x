@@ -14,10 +14,12 @@ const UNKNOWN = "执行结果未知；请保留原调用标识、幂等键和内
 const wireLimit = 64 * 1024;
 const artifactLimit = 64 * 1024 * 1024;
 const summaryLimit = 8192;
+const questionLimit = 4096, versionLimit = 16;
 const reportKinds = ["progress", "question", "blocked", "delivered"] as const;
 const channel = "read_investigation_channel", artifact = "read_investigation_artifact";
 const owner = ["read_work_inputs", "ack_work_input", "hand_back_work_input", "submit_result"] as const;
-const roles = { followup: owner, delegation: ["report_work"], report: ["read_work_report", ...owner] } as const;
+const delegate = "delegate_work", handback = "handback_work";
+const roles = { initial_owner: ["submit_result"], followup: owner, delegation: ["report_work"], report: ["read_work_report", ...owner] } as const;
 const closed = { additionalProperties: false } as const;
 const id = Type.String({ minLength: 1, maxLength: 256 });
 const text = (maxLength: number) => Type.String({ minLength: 1, maxLength, description: `非空文本，最多 ${maxLength} UTF-8 字节。` });
@@ -27,16 +29,19 @@ const inputPage = { limit: count(1, 20), before: cursor(512) };
 const inputSegment = { offset: count(0, Number.MAX_SAFE_INTEGER), max_bytes: count(4, 8192) };
 const pageShape = Type.Object(inputPage, closed);
 const segmentShape = Type.Object({ input_id: id, ...inputSegment }, closed);
+const versionShape = Type.Object({ artifact_id: Type.String({ minLength: 1, maxLength: 128 }), version_id: Type.String({ minLength: 1, maxLength: 128 }) }, closed);
 const schemas = {
   [channel]: Type.Object({ limit: count(1, 200), before: cursor(2048) }, closed),
-  [artifact]: Type.Object({ artifact_id: Type.String({ minLength: 1, maxLength: 128 }), version_id: Type.String({ minLength: 1, maxLength: 128 }),
-    offset: count(0, artifactLimit), max_bytes: count(1, 16384) }, closed),
+  [artifact]: Type.Object({ ...versionShape.properties, offset: count(0, artifactLimit), max_bytes: count(1, 16384) }, closed),
   read_work_inputs: Type.Object({ ...inputPage, input_id: Type.Optional(id), ...inputSegment }, { ...closed, oneOf: [pageShape, segmentShape] }),
   ack_work_input: Type.Object({ input_id: id }, closed),
   hand_back_work_input: Type.Object({ input_id: id, reason: text(2048) }, closed),
   submit_result: Type.Object({ summary: text(summaryLimit) }, closed),
   report_work: Type.Object({ kind: Type.String({ enum: [...reportKinds] }), summary: text(summaryLimit) }, closed),
   read_work_report: Type.Object({}, closed),
+  [delegate]: Type.Object({ member_id: id, question: text(questionLimit), allow_topic_messages: Type.Optional(Type.Boolean()),
+    artifact_versions: Type.Optional(Type.Array(versionShape, { maxItems: versionLimit })) }, closed),
+  [handback]: Type.Object({ summary: text(summaryLimit) }, closed),
 };
 type Operation = keyof typeof schemas;
 const descriptions: Record<Operation, string> = {
@@ -48,12 +53,14 @@ const descriptions: Record<Operation, string> = {
   submit_result: "提交绑定尝试的纯文本成果，不接受成果版本；提交不等于验收。",
   report_work: "报告本轮委派，不提交成果。progress 不唤醒责任方；其他种类由服务端绑定回送。",
   read_work_report: "只读取唤醒本轮的绑定正式报告。必须传空对象，不接受任何选择器。",
+  [delegate]: "请本轮列出的同伴核对一个问题。可请求确切获准材料的子集；省略材料字段则不共享。平台检查当前权限与余额。",
+  [handback]: "将整项调查的待决问题和原因正式交回绑定协调员查阅。不交回单条输入，不改派或触发执行。",
 };
 const status: Record<Operation, number> = {
   [channel]: 200, [artifact]: 200, read_work_report: 200, read_work_inputs: 200,
-  ack_work_input: 200, hand_back_work_input: 200, submit_result: 201, report_work: 201,
+  ack_work_input: 200, hand_back_work_input: 200, submit_result: 201, report_work: 201, [delegate]: 201, [handback]: 201,
 };
-const writes = new Set<Operation>(["ack_work_input", "hand_back_work_input", "submit_result", "report_work"]);
+const writes = new Set<Operation>(["ack_work_input", "hand_back_work_input", "submit_result", "report_work", delegate, handback]);
 const rejections = new Map([
   [400, ["invalid_input", "invalid_json"]], [403, ["forbidden", "invalid_host", "invalid_origin"]], [404, ["not_found"]],
   [405, ["method_not_allowed"]], [409, ["conflict"]], [413, ["body_too_large"]], [415, ["unsupported_media_type"]],
@@ -76,8 +83,14 @@ function validProfile(kind: string, operations: unknown): operations is Operatio
   if (!Object.hasOwn(roles, kind) || !Array.isArray(operations)) return false;
   let start = 0;
   for (const op of [channel, artifact]) if (operations[start] === op) start++;
-  const suffix = roles[kind as keyof typeof roles];
-  return operations.length === start + suffix.length && suffix.every((name, index) => operations[start + index] === name);
+  if (kind === "initial_owner" && start === 0) return false;
+  const base = roles[kind as keyof typeof roles];
+  if (!base.every((name, index) => operations[start + index] === name)) return false;
+  const suffix = operations.slice(start + base.length);
+  if (suffix.length === 0) return true;
+  if (kind === "initial_owner") return suffix.length === 1 && suffix[0] === delegate;
+  if (kind !== "followup" && (kind !== "report" || start !== 0)) return false;
+  return (suffix.length === 1 && suffix[0] === handback) || (suffix.length === 2 && suffix[0] === delegate && suffix[1] === handback);
 }
 
 function readConfig(path: string | undefined, digest: string | undefined) {
@@ -117,19 +130,40 @@ function readConfig(path: string | undefined, digest: string | undefined) {
   }
 }
 
-type Args = Record<string, string | number>;
+function ownFields(raw: unknown, properties: object) {
+  if (!record(raw) || (Object.getPrototypeOf(raw) !== Object.prototype && Object.getPrototypeOf(raw) !== null)) throw new Error();
+  return Reflect.ownKeys(raw).map(key => {
+    const field = Object.getOwnPropertyDescriptor(raw, key);
+    if (typeof key !== "string" || !Object.hasOwn(properties, key) || !field?.enumerable || !Object.hasOwn(field, "value")) throw new Error();
+    return [key, field.value as unknown] as const;
+  });
+}
+
+function checkedVersions(raw: unknown) {
+  if (!Array.isArray(raw) || Object.getPrototypeOf(raw) !== Array.prototype || raw.length > versionLimit ||
+      Reflect.ownKeys(raw).length !== raw.length + 1) throw new Error();
+  const refs: Record<string, string>[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const field = Object.getOwnPropertyDescriptor(raw, String(i));
+    if (!field?.enumerable || !Object.hasOwn(field, "value")) throw new Error();
+    const ref = Object.fromEntries(ownFields(field.value, versionShape.properties));
+    if (!Value.Check(versionShape, ref) || !versionHandle(ref.artifact_id) || !versionHandle(ref.version_id)) throw new Error();
+    refs.push(ref);
+  }
+  return refs;
+}
+
+type Args = Record<string, string | number | boolean | Record<string, string>[]>;
 function checkedArgs(op: Operation, raw: unknown): Args {
   try {
-    if (!record(raw) || (Object.getPrototypeOf(raw) !== Object.prototype && Object.getPrototypeOf(raw) !== null)) throw new Error();
-    const fields = Reflect.ownKeys(raw).map(key => {
-      const field = Object.getOwnPropertyDescriptor(raw, key);
-      if (typeof key !== "string" || !Object.hasOwn(schemas[op].properties, key) || !field?.enumerable || !Object.hasOwn(field, "value") ||
-          (typeof field.value !== "string" && typeof field.value !== "number")) throw new Error();
-      return [key, field.value] as const;
-    });
-    // Only own scalar JSON fields survive; getters, toJSON, undefined, null and
-    // coercions cannot change what was checked. A new snapshot is used at send.
-    const args = Object.fromEntries(fields);
+    // Snapshot only checked own data fields, including the exact nested version
+    // tuples. Getters, toJSON, undefined, null and coercions cannot change the wire.
+    const args: Args = Object.fromEntries(ownFields(raw, schemas[op].properties).map(([key, value]) => {
+      if (op === delegate && key === "artifact_versions") return [key, checkedVersions(value)];
+      if (op === delegate && key === "allow_topic_messages" && typeof value === "boolean") return [key, value];
+      if (typeof value === "string" || typeof value === "number") return [key, value];
+      throw new Error();
+    }));
     if (!Value.Check(schemas[op], args as unknown)) throw new Error();
     const valid = (() => {
       switch (op) {
@@ -142,6 +176,8 @@ function checkedArgs(op: Operation, raw: unknown): Args {
         case "submit_result": return validText(args.summary, summaryLimit);
         case "report_work": return reportKind(args.kind) && validText(args.summary, summaryLimit);
         case "read_work_report": return true;
+        case delegate: return validWorkInputID(args.member_id) && validText(args.question, questionLimit);
+        case handback: return validText(args.summary, summaryLimit);
       }
     })();
     if (valid) return args;
@@ -196,6 +232,12 @@ function validReply(op: Operation, value: unknown, sent: Args, wire: string): bo
     case "submit_result":
       return keys(value, "submission_id", "created_at", "artifact_version_count", "summary_omitted") && flatWire(wire, 4) &&
         validWorkInputID(value.submission_id) && timestamp(value.created_at) && value.artifact_version_count === 0 && value.summary_omitted === true;
+    case delegate:
+      return keys(value, "delegation_id", "created_at", "wake_queued") && flatWire(wire, 3) && validWorkInputID(value.delegation_id) &&
+        timestamp(value.created_at) && value.wake_queued === true;
+    case handback:
+      return keys(value, "handback_id", "notice_message_id", "created_at") && flatWire(wire, 3) && validWorkInputID(value.handback_id) &&
+        validWorkInputID(value.notice_message_id) && timestamp(value.created_at);
     case "ack_work_input":
     case "hand_back_work_input":
       return keys(value, "input_id", "disposition") && flatWire(wire, 2) && value.input_id === sent.input_id &&
@@ -257,6 +299,9 @@ function exchange(endpoint: URL, op: Operation, body: Buffer, headers: Record<st
 function investigationClient(endpoint: URL, token: string) {
   let uncertain: { key: string; fingerprint: string; error: Error } | undefined;
   let writing = false;
+  // A native owner management call is sent at most once, even if its receipt
+  // was definitive. A new call ID is a new operation, still subject to B.
+  const sentOwnerCalls = new Set<string>();
   const safe = (message: string) => new Error(message.replaceAll(token, "〔已隐藏〕"));
   return async (op: Operation, args: Args, id: string, signal?: AbortSignal) => {
     const write = writes.has(op);
@@ -272,6 +317,10 @@ function investigationClient(endpoint: URL, token: string) {
     }
     if (write && writing) throw safe("前一写入尚未完成，未发送请求。");
     if (signal?.aborted) throw safe("工具调用已取消，未发送请求。");
+    if (op === delegate || op === handback) {
+      if (sentOwnerCalls.has(id) || sentOwnerCalls.size >= 256) throw safe("工具调用标识已使用或已达本轮上限，未发送请求。");
+      sentOwnerCalls.add(id);
+    }
     const headers: Record<string, string | number> = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Content-Length": body.length };
     if (write) { headers["Idempotency-Key"] = key; writing = true; }
     let failure = UNKNOWN;

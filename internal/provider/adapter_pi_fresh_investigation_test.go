@@ -155,8 +155,11 @@ func TestPiFreshInvestigationWriteUncertainty(t *testing.T) {
 		{domain.TaskWorkSourceFollowup, PiFreshTaskWorkToolNames(), "ack_work_input"},
 		{domain.TaskWorkSourceDelegation, []string{"report_work"}, "report_work"},
 		{domain.TaskWorkSourceReport, append([]string{"read_work_report"}, PiFreshTaskWorkToolNames()...), "submit_result"},
+		{PiInitialInvestigationOwnerRole, []string{ReadInvestigationChannelTool, "submit_result", DelegateWorkTool}, DelegateWorkTool},
+		{domain.TaskWorkSourceFollowup, append(PiFreshTaskWorkToolNames(), DelegateWorkTool, HandbackWorkTool), DelegateWorkTool},
+		{domain.TaskWorkSourceReport, slices.Concat([]string{"read_work_report"}, PiFreshTaskWorkToolNames(), []string{HandbackWorkTool}), HandbackWorkTool},
 	} {
-		t.Run(string(tc.kind), func(t *testing.T) {
+		t.Run(string(tc.kind)+"/"+tc.op, func(t *testing.T) {
 			const runID = "run1"
 			profile := PiFreshInvestigationProfile{Action: domain.ChatActionReadOnlyInvestigation, SourceKind: tc.kind, Operations: tc.tools}
 			start := typedWriteTestStart(tc.op, typedWriteTestCall, `{}`)
@@ -166,14 +169,18 @@ func TestPiFreshInvestigationWriteUncertainty(t *testing.T) {
 			}
 			pair := func(end string) string { return start + "\n" + end }
 			checked := fmt.Sprintf(`{"type":"tool_execution_end","toolCallId":%q,"toolName":%q,"result":{"content":[],"isError":false},"isError":false}`, typedWriteTestCall, tc.op)
+			denied := fmt.Sprintf(`{"type":"tool_execution_end","toolCallId":%q,"toolName":%q,"result":{"content":[]},"isError":true}`, typedWriteTestCall, tc.op)
 			for _, c := range []struct {
 				name, frames     string
 				want             Outcome
 				complete, marked bool
 			}{
 				{"checked", pair(checked), OutcomeSucceeded, true, false},
+				{"denied", pair(denied), OutcomeSucceeded, true, false}, // Native stop does not mean the tool write succeeded.
 				{"unknown", pair(marker(string(tc.kind))), OutcomeUnknown, true, true},
 				{"foreign source", pair(marker("foreign")), OutcomeUnknown, false, false},
+				{"wrong run", pair(strings.Replace(marker(string(tc.kind)), `"run_id":"run1"`, `"run_id":"run2"`, 1)), OutcomeUnknown, false, false},
+				{"wrong operation", pair(strings.Replace(marker(string(tc.kind)), `"operation":"`+tc.op+`"`, `"operation":"other"`, 1)), OutcomeUnknown, false, false},
 				{"no start", checked, OutcomeUnknown, false, false},
 				{"no end", start, OutcomeUnknown, false, false},
 				{"aliased envelope", pair(strings.Replace(checked, `"toolCallId"`, `"ToolCallId"`, 1)), OutcomeUnknown, false, false},
@@ -217,25 +224,36 @@ func checkInvestigationWriteReceipt(t *testing.T, profile PiFreshInvestigationPr
 	}
 }
 
-// Replay real SDK print output through the exact delegation adapter; edit only
-// the native lifecycle frame, leaving the tool result and terminal intact.
+// Replay real SDK print output through the typed adapter; edit only the
+// native lifecycle frame, leaving the other results and terminal intact.
 func TestPiFreshInvestigationSDKPrintLifecycle(t *testing.T) {
 	dir := os.Getenv("TEST_PI_TYPED_PRINT_FIXTURES")
 	if dir == "" {
 		t.Skip("set TEST_PI_TYPED_PRINT_FIXTURES to the captured Pi JSON print fixtures")
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "delegation-unknown.jsonl"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	const op, runID = "report_work", "turn-investigation"
-	profile := PiFreshInvestigationProfile{Action: domain.ChatActionReadOnlyInvestigation,
-		SourceKind: domain.TaskWorkSourceDelegation, Operations: []string{op}}
-	stream := string(raw)
-	checkInvestigationWriteReceipt(t, profile, runID, stream, OutcomeUnknown, true, true)
-	for _, kind := range []string{"tool_execution_start", "tool_execution_end"} {
-		t.Run("missing "+kind, func(t *testing.T) {
-			checkInvestigationWriteReceipt(t, profile, runID, dropTypedPrintFrame(t, stream, kind, op), OutcomeUnknown, false, false)
+	const runID = "turn-investigation"
+	for _, tc := range []struct {
+		kind  domain.TaskWorkSourceKind
+		op    string
+		tools []string
+	}{
+		{domain.TaskWorkSourceDelegation, "report_work", []string{"report_work"}},
+		{PiInitialInvestigationOwnerRole, DelegateWorkTool, []string{ReadInvestigationChannelTool, ReadInvestigationArtifactTool, "submit_result", DelegateWorkTool}},
+		{domain.TaskWorkSourceReport, HandbackWorkTool, slices.Concat([]string{"read_work_report"}, PiFreshTaskWorkToolNames(), []string{DelegateWorkTool, HandbackWorkTool})},
+	} {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			raw, err := os.ReadFile(filepath.Join(dir, string(tc.kind)+"-unknown.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			profile := PiFreshInvestigationProfile{Action: domain.ChatActionReadOnlyInvestigation, SourceKind: tc.kind, Operations: tc.tools}
+			stream := string(raw)
+			checkInvestigationWriteReceipt(t, profile, runID, stream, OutcomeUnknown, true, true)
+			for _, kind := range []string{"tool_execution_start", "tool_execution_end"} {
+				t.Run("missing "+kind, func(t *testing.T) {
+					checkInvestigationWriteReceipt(t, profile, runID, dropTypedPrintFrame(t, stream, kind, tc.op), OutcomeUnknown, false, false)
+				})
+			}
 		})
 	}
 }
@@ -256,6 +274,18 @@ func TestPiFreshInvestigationProfiles(t *testing.T) {
 		{domain.TaskWorkSourceReport, []string{"read_work_report"}, false},
 		{domain.TaskWorkSourceReport, append([]string{"read_work_report", "read_work_report"}, owner...), false},
 		{domain.TaskWorkSourceHandback, owner, false},
+		{PiInitialInvestigationOwnerRole, []string{ReadInvestigationChannelTool, "submit_result", DelegateWorkTool}, true},
+		{PiInitialInvestigationOwnerRole, []string{ReadInvestigationArtifactTool, "submit_result"}, true},
+		{PiInitialInvestigationOwnerRole, []string{"submit_result", DelegateWorkTool}, false},
+		{PiInitialInvestigationOwnerRole, []string{ReadInvestigationChannelTool, "submit_result", HandbackWorkTool}, false},
+		{domain.TaskWorkSourceDelegation, []string{"report_work", DelegateWorkTool}, false},
+		{domain.TaskWorkSourceFollowup, slices.Concat(owner, []string{DelegateWorkTool, HandbackWorkTool}), true},
+		{domain.TaskWorkSourceFollowup, slices.Concat(owner, []string{HandbackWorkTool}), true},
+		{domain.TaskWorkSourceFollowup, slices.Concat(owner, []string{HandbackWorkTool, DelegateWorkTool}), false},
+		{domain.TaskWorkSourceFollowup, slices.Concat(owner, []string{"hand_back_work"}), false},
+		{domain.TaskWorkSourceReport, slices.Concat([]string{"read_work_report"}, owner, []string{HandbackWorkTool}), true},
+		{domain.TaskWorkSourceReport, slices.Concat([]string{"read_work_report"}, owner, []string{DelegateWorkTool}), false},
+		{domain.TaskWorkSourceReport, slices.Concat([]string{ReadInvestigationChannelTool, "read_work_report"}, owner, []string{HandbackWorkTool}), false},
 	} {
 		p := PiFreshInvestigationProfile{Action: domain.ChatActionReadOnlyInvestigation, SourceKind: c.kind, Operations: c.names}
 		_, _, err := PiFreshInvestigationConfig("http://[::1]:7310/api/v1/member-tools", "fixture", "turn-fixture", p)
