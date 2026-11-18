@@ -92,11 +92,12 @@ const question = { ...message, id: "root /+%", topic_id: "discussion-topic", con
 const helper = { ...member, id: "discussion-helper", name: "复核员", status: "left" };
 const invitation = { ...question, id: "invite-1", sender_id: member.id, source_kind: "member" as const, source_id: "invite-command",
   content: "请独立核对这份数据", discussion: { kind: "invite" as const, root_message_id: question.id, invitation_message_id: "invite-1",
-    inviter_id: member.id, assignee_id: helper.id, expected_reply: "列出待复核的数据项" } };
+    inviter_id: member.id, assignee_id: helper.id, expected_reply: "列出待复核的数据项" },
+  deliveries: [{ ...delivery, message_id: "invite-1", recipient_id: helper.id, state: "accepted", turn_id: "receiving-turn" }] };
 const reply = { ...invitation, id: "reply-1", sender_id: helper.id, source_id: "reply-command", content: "这里是核对意见",
-  discussion: { ...invitation.discussion, kind: "reply" as const } };
+  discussion: { ...invitation.discussion, kind: "reply" as const }, deliveries: [] };
 const resolution = { ...invitation, id: "resolve-1", source_id: "resolve-command", content: "综合以上意见，这是本次讨论的结论",
-  discussion: { ...invitation.discussion, kind: "resolve" as const } };
+  discussion: { ...invitation.discussion, kind: "resolve" as const }, deliveries: [] };
 
 it("links persisted invitation, return and resolution in the existing timeline without annotating legacy prose", async () => {
   const legacy = { ...message, deliveries: [], content: `@${member.name} 请邀请并答复这个问题。`, discussion: null };
@@ -129,7 +130,7 @@ it("links persisted invitation, return and resolution in the existing timeline w
       expect(evidence.getByText(value, { exact: true })).toBeVisible();
     }
     expect(within(record).getByText("成员消息", { exact: true })).toBeVisible();
-    expect(within(record).getByText(/投递详情.*暂无投递记录/)).toBeVisible();
+    expect(within(record).getByText(row === invitation ? /投递详情.*CLI已接收 1/ : /投递详情.*暂无投递记录/)).toBeVisible();
     expect(within(record).getByRole("button", { name: `转为任务，消息 ${row.id}` })).toBeEnabled();
   }
   for (const row of [question, legacy]) expect(article(row.id).querySelectorAll("summary")).toHaveLength(1);
@@ -160,6 +161,49 @@ it("shows the interrupted reply on its row when the existing newest-page poll su
   }
 });
 
+it("refreshes an older accepted handoff in place without starting another polling path", async () => {
+  const latest = Array.from({ length: 50 }, (_, index) => ({ ...message, id: `newest-${index}`, deliveries: [],
+    created_at: "2026-10-30T12:01:00Z" }));
+  const reason = "讨论已中断：接收成员的轮次异常结束，未提交结构化讨论动作";
+  const flush = (ms = 0) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+  vi.useFakeTimers();
+  try {
+    reads.mockResolvedValueOnce(page(latest, "older+/"));
+    render(<main aria-label="讨论"><Discussion groupId={group.id} members={{ [group.id]: [member, helper] }} /></main>);
+    await flush();
+    expect(panel().queryByRole("article", { name: `消息 ${invitation.id}` })).not.toBeInTheDocument();
+    reads.mockResolvedValueOnce(page([invitation, question]));
+    fireEvent.click(panel().getByRole("button", { name: "加载更早消息" }));
+    await flush();
+    const older = within(article(invitation.id));
+    expect(older.getByText(/投递详情.*CLI已接收 1/)).toBeVisible();
+
+    reads.mockResolvedValueOnce(page(latest, "older+/"));
+    await flush(5000);
+    expect(details).not.toHaveBeenCalled();
+    expect(older.queryByText(reason)).not.toBeInTheDocument();
+    expect(panel().getByText("最新页自动更新")).toBeVisible();
+
+    const pending = deferred<Response>();
+    details.mockReturnValueOnce(pending.promise);
+    const button = older.getByRole("button", { name: `刷新消息 ${invitation.id} 讨论状态` });
+    expect(button).toBeVisible();
+    fireEvent.click(button);
+    expect(button).toBeDisabled();
+    await act(async () => pending.resolve(json({ ...invitation, discussion_closure_reason: reason })));
+    expect(older.getByText(reason)).toBeVisible();
+    expect(older.getByText(/投递详情.*CLI已接收 1/)).toBeVisible();
+    expect(button).toBeEnabled();
+    expect(panel().getAllByRole("article")).toHaveLength(latest.length + 2);
+    const listURL = `/api/v1/groups/${group.id}/messages?limit=50`;
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual([
+      listURL, `${listURL}&before=older%2B%2F`, listURL, `/api/v1/groups/${group.id}/messages/${invitation.id}`,
+    ]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("keeps unloaded relation IDs, but does not assert provenance from contradictory records", async () => {
   const unloaded = { ...reply, id: "unloaded-reply", sender_id: "missing-assignee",
     discussion: { ...reply.discussion, root_message_id: "earlier-question", invitation_message_id: "earlier-invitation",
@@ -169,7 +213,8 @@ it("keeps unloaded relation IDs, but does not assert provenance from contradicto
     root_message_id: otherTopic.id, invitation_message_id: "not-loaded" } };
   const policy = { ...question, id: "policy-row", source_kind: "local_user_policy", content: "不是用户问题" };
   const fromPolicy = { ...invitation, id: "from-policy", discussion: { ...invitation.discussion,
-    invitation_message_id: "from-policy", root_message_id: policy.id } };
+    invitation_message_id: "from-policy", root_message_id: policy.id },
+    deliveries: [{ ...invitation.deliveries[0], message_id: "from-policy" }] };
   const wrongRecipient = { ...reply, id: "wrong-recipient", discussion: { ...reply.discussion, inviter_id: "other-inviter" } };
   const wrongSender = { ...reply, id: "wrong-sender", sender_id: member.id };
   const wrongSource = { ...reply, id: "wrong-source", source_kind: "platform" };
@@ -189,6 +234,7 @@ it("keeps unloaded relation IDs, but does not assert provenance from contradicto
   expect(evidence.queryByRole("link")).not.toBeInTheDocument();
   for (const row of mismatches) {
     expect(article(row.id).querySelectorAll("summary")).toHaveLength(1);
+    expect(within(article(row.id)).queryByRole("button", { name: /讨论状态/ })).not.toBeInTheDocument();
     expect(within(article(row.id)).getByText(row.content)).toBeVisible();
   }
   expect(fetch).toHaveBeenCalledTimes(1);
@@ -212,7 +258,7 @@ it("renders exact inert raw text with a truthful topic and folded technical reco
   const technical = expandDetails(record);
   for (const value of [message.id, message.sender_id, "topic-A", message.created_at]) expect(technical.getByText(value, { exact: true })).toBeVisible();
   expect(technical.getByText(/状态未知.*future/)).toBeVisible();
-  expect(panel().getByText("自动更新")).toBeVisible();
+  expect(panel().getByText("最新页自动更新")).toBeVisible();
   expect(panel().getByText("已载入 1 条（含话题，片段可能有间隔）。")).toBeVisible();
 });
 it.each([

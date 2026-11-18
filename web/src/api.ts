@@ -85,23 +85,32 @@ function discussionFor(value: unknown, message: Omit<Message, "discussion">): Me
     || (parent_invitation_message_id !== undefined && (!discussionId(parent_invitation_message_id)
       || parent_invitation_message_id === root_message_id || parent_invitation_message_id === invitation_message_id
       || parent_invitation_message_id === message.id))) return;
+  const { deliveries } = message;
+  const [delivery] = deliveries;
+  if (deliveries.length > 1 || (kind === "invite" && deliveries.length !== 1) || (kind === "resolve" && deliveries.length !== 0)
+    || (delivery && (delivery.message_id !== message.id || delivery.recipient_id !== (kind === "invite" ? assignee_id : inviter_id)))) return;
   return { kind, root_message_id, invitation_message_id, inviter_id, assignee_id, expected_reply,
     ...(parent_invitation_message_id === undefined ? {} : { parent_invitation_message_id }) };
 }
-function discussionClosureFor(value: unknown, message: Omit<Message, "discussion">, relation: MessageDiscussion): string | undefined {
-  if (relation.kind === "resolve" || message.source_kind !== "member" || !discussionId(message.source_id) || message.deliveries.length !== 1
-    || !boundedDiscussionText(value, 256) || value === "" || value.trim() !== value || /[\p{Cc}\p{Cf}\u2028\u2029]/u.test(value)) return;
+const unclaimedDiscussionDeparture = "接收成员已离开，讨论交接未启动";
+function discussionClosureFor(value: unknown, message: Omit<Message, "discussion">): string | undefined {
+  // Called only after discussionFor has verified the visible delivery set.
   const [delivery] = message.deliveries;
-  const recipient = relation.kind === "invite" ? relation.assignee_id : relation.inviter_id;
-  if (delivery.message_id === message.id && delivery.recipient_id === recipient
-    && (delivery.state === "accepted" || delivery.state === "failed")) return value;
+  if (!delivery || message.source_kind !== "member" || !discussionId(message.source_id)
+    || !boundedDiscussionText(value, 256) || value === "" || value.trim() !== value || /[\p{Cc}\p{Cf}\u2028\u2029]/u.test(value)) return;
+  if (delivery.state === "accepted" && discussionId(delivery.turn_id) && delivery.error === "") return value;
+  if (delivery.state === "failed") {
+    if (delivery.turn_id === "") {
+      if (value === unclaimedDiscussionDeparture && delivery.error === value) return value;
+    } else if (discussionId(delivery.turn_id) && delivery.error.trim() !== "") return value;
+  }
 }
 export function decodeMessage({ discussion, discussion_closure_reason, ...message }: WireMessage): Message {
   // Invalid optional evidence must not conceal an otherwise valid public row or change its receipt.
   if (discussion === null) return { ...message, discussion };
   const relation = discussionFor(discussion, message);
   if (!relation) return message;
-  const reason = discussionClosureFor(discussion_closure_reason, message, relation);
+  const reason = discussionClosureFor(discussion_closure_reason, message);
   return { ...message, discussion: relation, ...(reason === undefined ? {} : { discussion_closure_reason: reason }) };
 }
 function validProviderAdapter(value: unknown, current: Record<string, unknown>): value is ProviderAdapter {

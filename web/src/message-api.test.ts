@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { decodeMessage, isDefinitiveRejection, sendMessage } from "./api";
+import { decodeMessage, isDefinitiveRejection, listMessages, sendMessage } from "./api";
 import type { Message } from "./api";
 import { group, json, other } from "./test/groups";
 
@@ -92,21 +92,70 @@ it("drops incompatible discussion metadata without losing a matching message rec
   expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toEqual({ content });
 });
 
-it("keeps closure text only on a verified member handoff with its single intended delivery", () => {
-  const invite: Message = { ...message, sender_id: "inviter", source_kind: "member", source_id: "invite-command",
-    deliveries: [{ ...delivery, state: "failed" }], discussion: { kind: "invite", root_message_id: "question",
-      invitation_message_id: message.id, inviter_id: "inviter", assignee_id: delivery.recipient_id, expected_reply: "核对结论" } };
-  const reason = "接收成员的讨论轮未启动";
-  const closed = { ...invite, discussion_closure_reason: reason };
+const invitation = { ...message, sender_id: "inviter", source_kind: "member", source_id: "invite-command",
+  discussion: { kind: "invite", root_message_id: "question", invitation_message_id: message.id,
+    inviter_id: "inviter", assignee_id: delivery.recipient_id, expected_reply: "核对结论" } } satisfies Message;
+const reply = { ...invitation, id: "reply", sender_id: delivery.recipient_id, source_id: "reply-command", deliveries: [],
+  discussion: { ...invitation.discussion, kind: "reply" } } satisfies Message;
+const summary = { ...invitation, id: "summary", source_id: "summary-command", deliveries: [],
+  discussion: { ...invitation.discussion, kind: "resolve" } } satisfies Message;
+const returnDelivery = { ...delivery, message_id: reply.id, recipient_id: invitation.sender_id };
+
+it("preserves both public and targeted replies, invitations, summaries and legacy source-optional wire", async () => {
+  const { source_kind: _kind, source_id: _id, ...legacyInvitation } = invitation;
+  const items = [legacyInvitation, reply, { ...reply, id: "targeted", deliveries: [{ ...returnDelivery, message_id: "targeted" }] }, summary];
+  transport.mockResolvedValueOnce(json({ items, next_cursor: "" }));
+  expect((await listMessages(group.id)).items).toEqual(items);
+});
+it.each([
+  ["invitation without a delivery", invitation, []],
+  ["invitation delivered to the wrong member", invitation, [{ ...delivery, recipient_id: invitation.sender_id }]],
+  ["invitation with an extra delivery", invitation, [delivery, { ...delivery, id: "extra" }]],
+  ["reply delivered to the wrong member", reply, [{ ...returnDelivery, recipient_id: reply.sender_id }]],
+  ["reply with an extra delivery", reply, [returnDelivery, { ...returnDelivery, id: "extra" }]],
+  ["summary with a delivery", summary, [{ ...delivery, message_id: summary.id }]],
+] as const)("keeps a message row but not the relation: %s", async (_label, { discussion, ...row }, deliveries) => {
+  const plain = { ...row, deliveries };
+  transport.mockResolvedValueOnce(json({ items: [{ ...plain, discussion }], next_cursor: "next" }));
+  expect(await listMessages(group.id)).toEqual({ items: [plain], next_cursor: "next" });
+});
+
+const notStarted = "接收成员的讨论轮未启动";
+const departed = "接收成员已离开，讨论交接未启动";
+const interrupted = "讨论已中断：接收成员的轮次异常结束，未提交结构化讨论动作";
+const accepted = { ...delivery, state: "accepted", turn_id: "receiving-turn" };
+const failed = { ...accepted, state: "failed", error: "执行未启动" };
+const unclaimed = { ...delivery, state: "failed", error: departed };
+it.each([
+  ["accepted terminal Turn", accepted, interrupted],
+  ["bound Turn that did not start", failed, notStarted],
+  ["departure after binding a Turn", failed, departed],
+  ["unclaimed departure", unclaimed, departed],
+] as const)("preserves closure for consistent delivery: %s", (_label, receipt, reason) => {
+  const closed = { ...invitation, deliveries: [receipt], discussion_closure_reason: reason };
   expect(decodeMessage(closed)).toEqual(closed);
-  for (const invalid of [null, 1, {}, "", "   ", ` ${reason}`, `${reason}\n附注`, "答".repeat(150)]) {
-    expect(decodeMessage({ ...invite, discussion_closure_reason: invalid })).toEqual(invite);
+});
+it.each([
+  ["acceptance without a Turn", { ...accepted, turn_id: "" }, interrupted],
+  ["acceptance with an error", { ...accepted, error: "投递失败" }, interrupted],
+  ["bound failure without an error", { ...failed, error: "" }, notStarted],
+  ["bound failure with a blank error", { ...failed, error: " " }, notStarted],
+  ["unclaimed failure without the marker", { ...failed, turn_id: "" }, notStarted],
+  ["departure text without the matching delivery marker", { ...unclaimed, error: `${departed} ` }, departed],
+  ["departure marker with unrelated closure text", unclaimed, notStarted],
+  ["departure with a malformed Turn ID", { ...unclaimed, turn_id: " " }, departed],
+  ["pending delivery", delivery, interrupted],
+] as const)("discards closure but keeps the relation for %s", (_label, receipt, reason) => {
+  const row = { ...invitation, deliveries: [receipt] };
+  expect(decodeMessage({ ...row, discussion_closure_reason: reason })).toEqual(row);
+});
+it("discards malformed closure text and closure without a verified targeted member handoff", () => {
+  const row = { ...invitation, deliveries: [accepted] };
+  for (const invalid of [null, 1, {}, "", "   ", ` ${interrupted}`, `${interrupted}\n附注`, "答".repeat(150)]) {
+    expect(decodeMessage({ ...row, discussion_closure_reason: invalid })).toEqual(row);
   }
-  for (const row of [message, { ...invite, discussion: null }, { ...invite, source_kind: "unknown" as const, source_id: undefined },
-    { ...invite, deliveries: [] }, { ...invite, deliveries: [...invite.deliveries, delivery] },
-    { ...invite, deliveries: [{ ...invite.deliveries[0], recipient_id: "another-member" }] },
-    { ...invite, deliveries: [delivery] }]) {
-    expect(decodeMessage({ ...row, discussion_closure_reason: reason })).toEqual(row);
+  for (const plain of [message, reply, summary, { ...row, discussion: null }, { ...row, source_kind: "unknown" as const, source_id: undefined }]) {
+    expect(decodeMessage({ ...plain, discussion_closure_reason: interrupted })).toEqual(plain);
   }
 });
 
