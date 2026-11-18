@@ -32,8 +32,8 @@ type MemberToolRuntimeOptions struct {
 	RoleExecutionRoot string
 	// ChatIntake reuses the same Engine and requires the role execution path.
 	ChatIntake *coordination.Engine
-	// WorkInputs is trusted startup composition. Nil keeps work inputs closed.
-	// ContinueWork additionally requires ChatIntake on the issuing registry.
+	// WorkInputs is trusted startup composition. Nil keeps work inputs closed;
+	// a typed nil is a configuration error. ContinueWork also requires ChatIntake.
 	WorkInputs MemberWorkInputService
 }
 
@@ -105,7 +105,7 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 			return nil, errMemberToolRuntimeConfig
 		}
 	}
-	if options.WorkInputs != nil && roleFence == nil {
+	if options.WorkInputs != nil && (roleFence == nil || nilWorkInputService(options.WorkInputs)) {
 		return nil, errMemberToolRuntimeConfig
 	}
 	tools := NewMemberTools(db)

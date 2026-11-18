@@ -17,16 +17,17 @@ const memberMCPPagination = `{"type":"object","properties":{"limit":{"type":"int
 
 func memberMCPSendMessageSchema(continueWork bool) json.RawMessage {
 	const repairCondition = `"if":{"required":["repair"]},"then":{"properties":{"disposition":{"const":"request_work"}}}`
-	disposition, followup, conditions := "", "", repairCondition
+	disposition, followup, content, conditions := "", "", "", repairCondition
 	if continueWork {
 		disposition = `,"continue_work"`
-		followup = `,"followup":{"type":"object","description":"仅用于已启用的受信续办评估；task_id 只是用户明确引用，服务器选定实际工作。","properties":{"task_id":{"type":"string","minLength":1,"maxLength":256},"constraint":{"type":"string"}},"additionalProperties":false}`
+		followup = `,"followup":{"type":"object","description":"仅用于已启用的受信续办评估；task_id 只是用户明确引用，服务器选定实际工作。","properties":{"task_id":{"type":"string","minLength":1,"maxLength":256},"constraint":{"type":"string","maxLength":2048,"description":"仅引用当前用户原文。空字符串等同省略；非空时不得全为空白且最多 2048 UTF-8 字节。"}},"additionalProperties":false}`
+		content = `,"description":"续办正文不得为空白，最多 16384 UTF-8 字节。"`
 		conditions = `"allOf":[{` + repairCondition + `},
-			{"if":{"properties":{"disposition":{"const":"continue_work"}}},"then":{"properties":{"action":false,"title":false,"description":false,"acceptance":false,"question":false,"repair":false}},"else":{"properties":{"followup":false}}}]`
+			{"if":{"properties":{"disposition":{"const":"continue_work"}}},"then":{"properties":{"action":false,"title":false,"description":false,"acceptance":false,"question":false,"repair":false,"reason":{"description":"续办理由不得为空白，最多 4096 UTF-8 字节。"}}},"else":{"properties":{"followup":false}}}]`
 	}
 	return json.RawMessage(`{
 		"type":"object","properties":{
-			"content":{"type":"string"},
+			"content":{"type":"string"` + content + `},
 			"recipient_ids":{"type":"array","items":{"type":"string"}},
 			"intent_assessment":{"type":"object","properties":{
 				"disposition":{"enum":["discuss","clarify","request_work","prepare_work"` + disposition + `]},
@@ -87,6 +88,6 @@ var memberMCPTools = []memberMCPTool{
 		"type":"object","properties":{"input_id":{"type":"string","minLength":1,"maxLength":256}},"required":["input_id"],"additionalProperties":false
 	}`), memberToolAPI.ackWorkInput, true},
 	{"hand_back_work_input", "将未处理的工作输入交回并说明原因；未知时保留原 id 并先对账。", json.RawMessage(`{
-		"type":"object","properties":{"input_id":{"type":"string","minLength":1,"maxLength":256},"reason":{"type":"string","minLength":1}},"required":["input_id","reason"],"additionalProperties":false
+		"type":"object","properties":{"input_id":{"type":"string","minLength":1,"maxLength":256},"reason":{"type":"string","minLength":1,"maxLength":2048,"description":"交回理由不得为空白，最多 2048 UTF-8 字节。"}},"required":["input_id","reason"],"additionalProperties":false
 	}`), memberToolAPI.handBackWorkInput, true},
 }

@@ -206,6 +206,12 @@ func (a memberToolAPI) readChannel(w http.ResponseWriter, r *http.Request, token
 	writeMemberToolPage(w, page, scope, candidate)
 }
 
+type memberToolSendInput struct {
+	Content      memberToolField[string]                    `json:"content"`
+	RecipientIDs memberToolField[[]memberToolField[string]] `json:"recipient_ids"`
+	Assessment   memberToolField[json.RawMessage]           `json:"intent_assessment"`
+}
+
 func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token string) {
 	key, ok := requestKey(w, r)
 	if !ok {
@@ -215,11 +221,7 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 		operationError(w, store.ErrInvalid)
 		return
 	}
-	var input struct {
-		Content      memberToolField[string]                    `json:"content"`
-		RecipientIDs memberToolField[[]memberToolField[string]] `json:"recipient_ids"`
-		Assessment   memberToolField[json.RawMessage]           `json:"intent_assessment"`
-	}
+	var input memberToolSendInput
 	if !decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: &input, required: isContinueWorkRequest}) {
 		return
 	}

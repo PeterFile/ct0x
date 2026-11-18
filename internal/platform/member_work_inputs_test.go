@@ -234,6 +234,26 @@ func TestWorkInputsRealWorkerBindingNativeAndMCP(t *testing.T) {
 						}
 					})
 					if withAck {
+						t.Run("hand-back text", func(t *testing.T) {
+							p.mutationErr = nil
+							const op = "hand_back_work_input"
+							maxReason := strings.Repeat("🙂", 512)
+							for i, reason := range []string{"", "\u0085", "a\x00b", maxReason + "x", maxReason, "\ufeff"} {
+								before, valid := len(p.calls), i >= 4
+								raw, err := json.Marshal(map[string]string{"input_id": "input-1", "reason": reason})
+								roleOK(t, err)
+								w := f.http(t, token, op, string(raw), "hand-back-text")
+								params := fmt.Sprintf(`{"name":%q,"arguments":%s}`, op, raw)
+								mcp := memberMCPRoleText(t, memberMCPRoleHTTP(t, f, token, fmt.Sprintf(`"hand-back-text-%d"`, i), "tools/call", params), !valid)
+								if valid {
+									if w.Code != 201 || len(p.calls) != before+2 || p.calls[before].reason != reason || p.calls[before+1].reason != reason {
+										t.Fatalf("valid hand-back text changed or was rejected: %d, %s", w.Code, mcp)
+									}
+								} else if w.Code != 400 || !strings.Contains(mcp, `"code":"invalid_input"`) || len(p.calls) != before {
+									t.Fatalf("invalid hand-back text reached B: %d, %s", w.Code, mcp)
+								}
+							}
+						})
 						t.Run("unicode", func(t *testing.T) {
 							p.mutationErr = nil
 							before := len(p.calls)
@@ -281,6 +301,16 @@ func TestWorkInputsRealWorkerBindingNativeAndMCP(t *testing.T) {
 				t.Fatal("revoked capability reached B")
 			}
 		})
+	}
+}
+
+func TestWorkInputsRejectTypedNilAtRuntimeConstruction(t *testing.T) {
+	f := newRoleRuntime(t)
+	var service *workInputProbe
+	f.options.WorkInputs = service
+	f.options.ChatIntake = coordination.New(f.db)
+	if runtime, err := platform.NewMemberToolRuntime(f.db, f.options); err == nil || runtime != nil {
+		t.Fatal("typed-nil WorkInputs must not produce a runtime or issue capabilities")
 	}
 }
 
@@ -381,19 +411,43 @@ func TestWorkContinuationUsesCapturedIntakeCandidate(t *testing.T) {
 		}
 	}
 	params := func(args string) string { return fmt.Sprintf(`{"name":"send_message","arguments":%s}`, args) }
-	t.Run("shape", func(t *testing.T) {
-		for i, invalid := range []string{
-			strings.Replace(body, `"content":"记录续办。",`, "", 1),
-			strings.Replace(body, "用户续办", strings.Repeat("🙂", 4097), 1),
+	t.Run("text", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, value string
+			limit       int
+			emptyOK     bool
+		}{
+			{"reason", "用户续办", 4096, false},
+			{"content", "记录续办。", 16384, false},
+			{"constraint", ` 仅校对\n`, 2048, true},
 		} {
-			before := len(p.calls)
-			if w := f.http(t, token, "send_message", invalid, "invalid-shape"); w.Code != 400 || len(p.calls) != before {
-				t.Fatalf("invalid continuation shape reached B: %d %s", w.Code, w.Body)
-			}
-			w := memberMCPRoleHTTP(t, f, token, fmt.Sprintf("%d", i), "tools/call", params(invalid))
-			if text := memberMCPRoleText(t, w, true); !strings.Contains(text, `"code":"invalid_input"`) || len(p.calls) != before {
-				t.Fatal("MCP forwarded an invalid continuation shape")
-			}
+			t.Run(tc.name, func(t *testing.T) {
+				invalid := []string{`"\u0085"`, `"a\u0000b"`, "null", "1", fmt.Sprintf("%q", strings.Repeat("🙂", tc.limit/4)+"x")}
+				if !tc.emptyOK {
+					invalid = append(invalid, `""`)
+				}
+				field := fmt.Sprintf(`"%s":"%s"`, tc.name, tc.value)
+				for i, bad := range append(invalid, "missing") {
+					var request string
+					if bad == "missing" {
+						if tc.emptyOK {
+							continue
+						}
+						request = strings.Replace(body, field+",", "", 1)
+					} else {
+						request = strings.Replace(body, field, fmt.Sprintf(`"%s":%s`, tc.name, bad), 1)
+					}
+					before := len(p.calls)
+					if w := f.http(t, token, "send_message", request, "invalid-text"); w.Code != 400 || len(p.calls) != before {
+						t.Fatalf("invalid continuation %s case %d reached B: %d %s", tc.name, i, w.Code, w.Body)
+					}
+					id := fmt.Sprintf(`"invalid-%s-%d"`, tc.name, i)
+					w := memberMCPRoleHTTP(t, f, token, id, "tools/call", params(request))
+					if text := memberMCPRoleText(t, w, true); (!strings.Contains(text, `"code":"invalid_input"`) && !strings.Contains(text, `"code":"invalid_json"`)) || len(p.calls) != before {
+						t.Fatalf("MCP did not reject invalid continuation %s case %d: %s", tc.name, i, text)
+					}
+				}
+			})
 		}
 	})
 	t.Run("unicode", func(t *testing.T) {
@@ -422,8 +476,58 @@ func TestWorkContinuationUsesCapturedIntakeCandidate(t *testing.T) {
 		got.proposal != (platform.MemberContinueWorkInput{Reason: "用户续办", TaskID: "reference-only", Constraint: " 仅校对\n"}) || !strings.HasPrefix(got.key, "mcp-") {
 		t.Fatal("intake changed the authorized candidate, proposal or key")
 	}
-	boundary := strings.Replace(body, "用户续办", strings.Repeat("🙂", 4096), 1)
-	if w := f.http(t, token, "send_message", boundary, "max-reason"); w.Code != 201 || len(p.calls) != 2 || p.calls[1].proposal.Reason != strings.Repeat("🙂", 4096) {
-		t.Fatal("maxLength counts Unicode code points, not UTF-8 bytes")
-	}
+	t.Run("exact limits", func(t *testing.T) {
+		reason, content, constraint := strings.Repeat("🙂", 1024), strings.Repeat("🙂", 4096), strings.Repeat("🙂", 512)
+		boundary := fmt.Sprintf(`{"content":%q,"intent_assessment":{"disposition":"continue_work","reason":%q,"followup":{"constraint":%q}}}`, content, reason, constraint)
+		before := len(p.calls)
+		if w := f.http(t, token, "send_message", boundary, "exact-text"); w.Code != 201 {
+			t.Fatalf("exact text limits rejected: %d %s", w.Code, w.Body)
+		}
+		memberMCPRoleText(t, memberMCPRoleHTTP(t, f, token, `"exact-text"`, "tools/call", params(boundary)), false)
+		if calls := p.calls[before:]; len(calls) != 2 || calls[0].content != content || calls[1].content != content ||
+			calls[0].proposal != (platform.MemberContinueWorkInput{Reason: reason, Constraint: constraint}) || calls[0].proposal != calls[1].proposal {
+			t.Fatal("transports did not forward exact byte-limit text to B")
+		}
+	})
+	t.Run("empty followup replay", func(t *testing.T) {
+		const base = `{"content":" 记录续办\n","intent_assessment":{"disposition":"continue_work","reason":" 依原要求\n"%s}}`
+		for _, taskID := range []string{"", "reference-only"} {
+			var omitEmpty string
+			emptyForms := []string{``, `,"followup":{}`, `,"Followup":{"CONSTRAINT":""}`}
+			if taskID != "" {
+				omitEmpty = `,"followup":{"task_id":"reference-only"}`
+				emptyForms = []string{omitEmpty, `,"followup":{"constraint":"","task_id":"reference-only"}`}
+			}
+			id := fmt.Sprintf("%q", "empty-followup-"+taskID)
+			before := len(p.calls)
+			for _, form := range emptyForms {
+				memberMCPRoleText(t, memberMCPRoleHTTP(t, f, token, id, "tools/call", params(fmt.Sprintf(base, form))), false)
+			}
+			first := p.calls[before]
+			if w := f.http(t, token, "send_message", fmt.Sprintf(base, emptyForms[len(emptyForms)-1]), first.key); w.Code != 201 {
+				t.Fatalf("native handoff of the MCP key failed: %d %s", w.Code, w.Body)
+			}
+			if first.proposal != (platform.MemberContinueWorkInput{Reason: " 依原要求\n", TaskID: taskID}) || first.content != " 记录续办\n" || len(p.calls) != before+len(emptyForms)+1 {
+				t.Fatal("optional-equivalent requests did not preserve the actual proposal and content")
+			}
+			for _, got := range p.calls[before:] {
+				if got != first {
+					t.Fatal("empty followup changed the key, scope or proposal reaching B")
+				}
+			}
+			for _, changed := range []string{
+				fmt.Sprintf(base, `,"followup":{"task_id":"other"}`),
+				fmt.Sprintf(base, `,"followup":{"constraint":"另一条原文"}`),
+				fmt.Sprintf(base, `,"followup":{"constraint":null}`),
+				fmt.Sprintf(base, `,"followup":{"constraint":"","group_id":"foreign"}`),
+				fmt.Sprintf(strings.Replace(base, " 依原要求", "依原要求", 1), omitEmpty),
+				fmt.Sprintf(strings.Replace(base, " 记录续办", "记录续办", 1), omitEmpty),
+			} {
+				text := memberMCPRoleText(t, memberMCPRoleHTTP(t, f, token, id, "tools/call", params(changed)), true)
+				if !strings.Contains(text, `"code":"conflict"`) || len(p.calls) != before+len(emptyForms)+1 {
+					t.Fatal("different or invalid arguments reused the bound MCP identity")
+				}
+			}
+		}
+	})
 }

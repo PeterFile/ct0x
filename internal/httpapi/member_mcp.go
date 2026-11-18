@@ -121,7 +121,8 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			memberMCPError(w, 400, id, -32602, "工具名称和 arguments 对象无效")
 			return
 		}
-		if name == "ack_work_input" || name == "hand_back_work_input" || name == "send_message" && isContinueWorkRequest(arguments) {
+		continuation := name == "send_message" && isContinueWorkRequest(arguments)
+		if name == "ack_work_input" || name == "hand_back_work_input" || continuation {
 			// Neither the derived key nor the fingerprint may alias replacement
 			// characters. Keep legacy send_message and opaque metadata unchanged.
 			if !validMemberToolJSONStrings(frame["id"]) {
@@ -137,8 +138,12 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			if tool.Name != name {
 				continue
 			}
+			fingerprintArgs := arguments
+			if continuation {
+				fingerprintArgs = memberMCPContinueWorkArguments(arguments)
+			}
 			key := memberMCPKey(token, id)
-			fingerprint, bindErr := memberMCPFingerprint(name, arguments)
+			fingerprint, bindErr := memberMCPFingerprint(name, fingerprintArgs)
 			if bindErr != nil {
 				memberMCPError(w, 400, id, -32602, "工具 arguments 无效")
 				return

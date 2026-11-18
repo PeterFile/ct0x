@@ -13,6 +13,13 @@ import (
 	"agentworkspace/internal/store"
 )
 
+const (
+	maxContinueReasonBytes  = 4096
+	maxContinueContentBytes = 16384
+	maxWorkConstraintBytes  = 2048
+	maxHandBackReasonBytes  = 2048
+)
+
 func (a memberToolAPI) readWorkInputs(w http.ResponseWriter, r *http.Request, token string) {
 	if !decodeMemberToolJSON(w, r, &struct{}{}) {
 		return
@@ -62,7 +69,7 @@ func (a memberToolAPI) mutateWorkInput(w http.ResponseWriter, r *http.Request, t
 	if !decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: &input}) {
 		return
 	}
-	if !validWorkInputID(input.InputID.value) || handBack != input.Reason.present || handBack && strings.TrimSpace(input.Reason.value) == "" {
+	if !validWorkInputID(input.InputID.value) || handBack != input.Reason.present || handBack && !validWorkInputText(input.Reason.value, maxHandBackReasonBytes) {
 		operationError(w, store.ErrInvalid)
 		return
 	}
@@ -83,6 +90,11 @@ func (a memberToolAPI) mutateWorkInput(w http.ResponseWriter, r *http.Request, t
 	WriteJSON(w, http.StatusCreated, struct {
 		InputID string `json:"input_id"`
 	}{input.InputID.value})
+}
+
+// Match B's text gate on decoded bytes, without trimming or rewriting the payload.
+func validWorkInputText(text string, maxBytes int) bool {
+	return len(text) <= maxBytes && strings.TrimSpace(text) != "" && utf8.ValidString(text) && !strings.ContainsRune(text, '\x00')
 }
 
 func validWorkInputID(id string) bool {
@@ -112,8 +124,8 @@ func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Req
 		return domain.ChatAssessmentReceipt{}, false
 	}
 	if assessment.Disposition == "continue_work" {
-		input, ok := decodeContinueWork(raw)
-		if !ok || !content.present {
+		input, ok := decodeContinueWork(raw, content)
+		if !ok {
 			memberToolError(w, store.ErrInvalid)
 			return domain.ChatAssessmentReceipt{}, false
 		}
@@ -134,9 +146,11 @@ func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Req
 	return receipt, err == nil
 }
 
-// The enclosing native decoder has already bounded the entire body and caught
-// duplicate keys, including inside followup. This branch only adds shape checks.
-func decodeContinueWork(raw json.RawMessage) (platform.MemberContinueWorkInput, bool) {
+// The enclosing transport checks the body limit, unique keys and Unicode escapes.
+func decodeContinueWork(raw json.RawMessage, content memberToolField[string]) (platform.MemberContinueWorkInput, bool) {
+	if !validWorkInputText(content.value, maxContinueContentBytes) {
+		return platform.MemberContinueWorkInput{}, false
+	}
 	var input struct {
 		Disposition string                           `json:"disposition"`
 		Reason      memberToolField[string]          `json:"reason"`
@@ -144,7 +158,7 @@ func decodeContinueWork(raw json.RawMessage) (platform.MemberContinueWorkInput, 
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&input) != nil || input.Disposition != "continue_work" || strings.TrimSpace(input.Reason.value) == "" || utf8.RuneCountInString(input.Reason.value) > 4096 {
+	if decoder.Decode(&input) != nil || input.Disposition != "continue_work" || !validWorkInputText(input.Reason.value, maxContinueReasonBytes) {
 		return platform.MemberContinueWorkInput{}, false
 	}
 	var followup struct {
@@ -154,9 +168,43 @@ func decodeContinueWork(raw json.RawMessage) (platform.MemberContinueWorkInput, 
 	if input.Followup.present {
 		decoder = json.NewDecoder(bytes.NewReader(input.Followup.value))
 		decoder.DisallowUnknownFields()
-		if decoder.Decode(&followup) != nil || followup.TaskID.present && !validWorkInputID(followup.TaskID.value) {
+		if decoder.Decode(&followup) != nil || followup.TaskID.present && !validWorkInputID(followup.TaskID.value) ||
+			followup.Constraint.value != "" && !validWorkInputText(followup.Constraint.value, maxWorkConstraintBytes) {
 			return platform.MemberContinueWorkInput{}, false
 		}
 	}
 	return platform.MemberContinueWorkInput{Reason: input.Reason.value, TaskID: followup.TaskID.value, Constraint: followup.Constraint.value}, true
+}
+
+// Use the native proposal's omission semantics for valid continuations only.
+// This projection is for MCP identity; the native handler still receives the
+// original arguments. In particular, never drop unknown or null fields to
+// manufacture a valid replay out of an invalid request.
+func memberMCPContinueWorkArguments(arguments json.RawMessage) json.RawMessage {
+	var input memberToolSendInput
+	decoder := json.NewDecoder(bytes.NewReader(arguments))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&input) != nil || !input.Assessment.present || input.RecipientIDs.present {
+		return arguments
+	}
+	proposal, ok := decodeContinueWork(input.Assessment.value, input.Content)
+	if !ok {
+		return arguments
+	}
+	assessment := map[string]any{"disposition": "continue_work", "reason": proposal.Reason}
+	followup := map[string]string{}
+	if proposal.TaskID != "" {
+		followup["task_id"] = proposal.TaskID
+	}
+	if proposal.Constraint != "" {
+		followup["constraint"] = proposal.Constraint
+	}
+	if len(followup) != 0 {
+		assessment["followup"] = followup
+	}
+	canonical, err := json.Marshal(map[string]any{"content": input.Content.value, "intent_assessment": assessment})
+	if err != nil {
+		return arguments
+	}
+	return canonical
 }

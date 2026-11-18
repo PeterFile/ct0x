@@ -30,6 +30,12 @@ function isRecord(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/** @param {string} value */
+export function validUnicode(value) {
+  // The Unicode-mode pattern sees valid pairs as a single non-surrogate scalar.
+  return !/[\ud800-\udfff]/u.test(value);
+}
+
 /** @param {unknown} value */
 function endpointURL(value) {
   if (typeof value !== "string" ||
@@ -217,9 +223,15 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
   /** @param {string} message */
   const safeError = message => new Error(message.replaceAll(token, "〔已隐藏〕"));
   if (!TOOL_NAMES.some(name => name === toolName)) throw safeError("成员工具名称无效，未发送请求。");
-  if (typeof toolCallId !== "string" || !toolCallId.trim()) throw safeError("工具调用标识无效，未发送请求。");
-  let body;
   const workInputWrite = isWorkInputWrite(toolName);
+  const roleWrite = toolName === "decide_dispatch" || toolName === "submit_result" || workInputWrite;
+  const workspaceWrite = toolName === "workspace_write" || toolName === "publish_workspace_artifact";
+  const write = roleWrite || workspaceWrite || toolName === "send_message" || toolName === "create_member";
+  // Hashing malformed UTF-16 as UTF-8 would alias valid replacement characters.
+  if (typeof toolCallId !== "string" || !toolCallId.trim() || (write && !validUnicode(toolCallId))) {
+    throw safeError("工具调用标识无效，未发送请求。");
+  }
+  let body;
   /** @type {unknown} */
   let requestValue;
   try {
@@ -234,9 +246,6 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
     throw safeError("成员工具参数无效，未发送请求。");
   }
   if (body.length > BYTE_LIMIT) throw safeError("工具请求超过 64 KiB 限制，未发送请求。");
-  const roleWrite = toolName === "decide_dispatch" || toolName === "submit_result" || workInputWrite;
-  const workspaceWrite = toolName === "workspace_write" || toolName === "publish_workspace_artifact";
-  const write = roleWrite || workspaceWrite || toolName === "send_message" || toolName === "create_member";
   const fingerprint = write ? createHash("sha256").update(body).digest("hex") : "";
   if (write && writes.unknown) {
     const previous = writes.unknown;

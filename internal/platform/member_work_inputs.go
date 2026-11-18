@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"crypto/sha256"
+	"reflect"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/store"
@@ -34,7 +35,18 @@ type MemberWorkInput struct {
 
 // TaskID is an optional reference in the proposal, never the execution scope.
 // An empty TaskID or Constraint means omission; only B can resolve the task.
+// The adapter omits the followup object when both fields are empty.
 type MemberContinueWorkInput struct{ Reason, TaskID, Constraint string }
+
+func nilWorkInputService(service MemberWorkInputService) bool {
+	value := reflect.ValueOf(service)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return service == nil
+	}
+}
 
 // WorkInputsEnabled controls startup route composition, not per-turn authority.
 func (s *MemberTools) WorkInputsEnabled() bool { return s != nil && s.workInputs != nil }
