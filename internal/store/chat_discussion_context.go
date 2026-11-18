@@ -105,7 +105,10 @@ func reserveChatDiscussionReturnContextInTx(ctx context.Context, tx *sql.Tx, cha
 	msg.CreatedAt = time.Unix(0, 1).UTC() // Nine fractional digits.
 	delivery := msg.Deliveries[0]
 	delivery.CreatedAt = msg.CreatedAt
-	probe.ActiveOwnerID, probe.ClosureReason = probe.RootInviterID, chatDiscussionRecipientLeftReason
+	probe.ActiveOwnerID = probe.RootInviterID
+	for _, reason := range []string{chatDiscussionRecipientLeftReason, chatDiscussionNotStartedReason, chatDiscussionNoActionReason, chatDiscussionAbnormalExitReason} {
+		probe.ClosureReason = widerChatDiscussionRef(probe.ClosureReason, reason)
+	}
 	probe.HeadMessageID = msg.ID
 	base := domain.ChatDiscussionEvent{OriginMessageID: probe.OriginMessageID, SourceMessageID: msg.ID, MessageID: msg.ID}
 	for i := len(probe.Events) - 1; i >= 0; i-- {
@@ -255,28 +258,11 @@ func chatDiscussionChainInTx(ctx context.Context, tx *sql.Tx, thread domain.Thre
 		return nil, ErrMemberToolDenied
 	}
 	if !c.Closed {
-		// The departure trigger records the unclaimed case. After a claim,
-		// a trusted not_started receipt proves closure regardless of member
-		// status. Project closure without settling or releasing anything here.
-		head := c.Events[len(c.Events)-1].Event
-		const notStartedReason = "接收成员的讨论轮未启动"
-		var reason string
-		if err := tx.QueryRowContext(ctx, `SELECT CASE
-		 WHEN d.turn_id='' AND d.error=? THEN d.error
-		 ELSE coalesce((
-		   SELECT CASE WHEN m.status='left' THEN ? ELSE ? END
-		   FROM turns t JOIN members m ON m.group_id=t.group_id AND m.id=t.member_id
-		   WHERE t.id=d.turn_id AND t.delivery_id=d.id AND t.group_id=d.group_id
-		     AND t.conversation_id=d.conversation_id AND t.member_id=d.recipient_id
-		     AND t.state='not_started' AND t.accepted_at IS NULL AND t.native_session_id=''
-		     AND CASE WHEN json_valid(t.receipt_json) THEN
-		       json_extract(t.receipt_json,'$.outcome')='not_started'
-		       AND json_type(t.receipt_json,'$.started')='false' AND json_type(t.receipt_json,'$.accepted')='false' END
-		 ),'') END FROM deliveries d WHERE d.id=? AND d.state='failed'`,
-			chatDiscussionRecipientLeftReason, chatDiscussionRecipientLeftReason, notStartedReason, head.DeliveryID).Scan(&reason); err != nil && err != sql.ErrNoRows {
+		closures, err := chatDiscussionClosuresInTx(ctx, tx, c.GroupID, c.HeadMessageID)
+		if err != nil {
 			return nil, err
 		}
-		if reason != "" {
+		if reason := closures[c.HeadMessageID]; reason != "" {
 			c.Closed, c.ClosureReason = true, reason
 			c.ActiveInvitationMessageID, c.ActiveOwnerID = "", ""
 		}

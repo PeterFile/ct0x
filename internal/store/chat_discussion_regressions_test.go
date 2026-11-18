@@ -72,6 +72,7 @@ func TestChatDiscussionRecipientLeaves(t *testing.T) {
 			if phase == "" {
 				stored.Deliveries[0].State = domain.DeliveryStateFailed
 				stored.Deliveries[0].Error = "接收成员已离开，讨论交接未启动"
+				stored.DiscussionClosureReason = stored.Deliveries[0].Error
 				if err := s.Close(); err != nil {
 					t.Fatal(err)
 				}
@@ -106,8 +107,9 @@ func TestChatDiscussionRecipientLeaves(t *testing.T) {
 				if err := s.db.QueryRow("SELECT receipt_json FROM turns WHERE id=?", turn.ID).Scan(&receipt); err != nil {
 					t.Fatal(err)
 				}
-				for _, unproven := range []string{"", `{"outcome":"not_started","started":true,"accepted":false}`} {
+				for _, unproven := range []string{"", `{"outcome":"not_started","started":true,"accepted":false}`, `{"outcome":"not_started","started":false,"accepted":false}`} {
 					coordinationDecideExec(t, s, "UPDATE turns SET receipt_json=? WHERE id=?", unproven, turn.ID)
+					discussionCheckMessageClosure(t, s, f.groupID, invite.Message.ID, "")
 					discussionCheckContext(t, s, a, ca, origin, f.a, f.b, invite.Message.ID, origin.ID, invite.Message.ID, false, invite)
 				}
 				coordinationDecideExec(t, s, "UPDATE turns SET receipt_json=? WHERE id=?", receipt, turn.ID)

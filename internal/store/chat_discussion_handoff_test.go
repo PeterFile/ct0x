@@ -23,7 +23,12 @@ func discussionArrive(t *testing.T, s *Store, groupID, deliveryID string) (Membe
 	if err != nil {
 		t.Fatal(err)
 	}
-	scope, err := s.BindMemberTool(ctx, TurnClaim{GroupID: groupID, TurnID: turn.ID, Token: turn.ClaimToken})
+	return discussionCapture(t, s, TurnClaim{GroupID: groupID, TurnID: turn.ID, Token: turn.ClaimToken})
+}
+
+func discussionCapture(t *testing.T, s *Store, claim TurnClaim) (MemberToolScope, string) {
+	t.Helper()
+	scope, err := s.BindMemberTool(ctx, claim)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -377,6 +382,9 @@ func TestChatDiscussionV22LegacyDirectedMessage(t *testing.T) {
 	plain, err := f.s.SendMessageForTool(ctx, a, legacy, "old-directed")
 	if err != nil || plain.SenderID != f.a || plain.SourceKind != "member" || len(plain.Deliveries) != 1 {
 		t.Fatalf("legacy directed send: %+v %v", plain, err)
+	}
+	if stored := discussionCheckMessageClosure(t, f.s, f.groupID, plain.ID, ""); !reflect.DeepEqual(stored, plain) {
+		t.Fatalf("pre-v24 read changed the message: %+v", stored)
 	}
 	if err := f.s.Close(); err != nil {
 		t.Fatal(err)

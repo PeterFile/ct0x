@@ -47,8 +47,8 @@ type ChatDiscussionReceipt struct {
 // ChatDiscussionContext is scoped to an arriving turn. A new action needs the
 // current head and owner; an older arrival can still read its associated path.
 // After a root answer, the owner can resolve but no invitation is active.
-// Closed also covers a public-only return or a departed recipient's delivery
-// known not to have started; only the latter has ClosureReason.
+// Closed covers a structured resolution, a public-only return, or a proven
+// interruption at the current head. Only an interruption has ClosureReason.
 // When ContentOmitted is true, read full bodies via read_history using
 // OriginMessageID and each event's MessageID. Independent reply requirements
 // remain inline even when the bodies are omitted.
