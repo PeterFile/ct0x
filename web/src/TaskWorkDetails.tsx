@@ -11,41 +11,45 @@ const reportKindText = new Map([["progress", "进度报告"], ["question", "提�
 export function TaskWorkDetails({ active, ...props }: DisclosureProps & { active: boolean }) {
   return active ? <WorkDisclosure key={JSON.stringify([props.groupId, props.taskId])} {...props} /> : null;
 }
-function WorkDisclosure({ groupId, taskId, refreshVersion }: DisclosureProps) {
+function WorkDisclosure(props: DisclosureProps) {
   const [open, setOpen] = useState(false);
   return <details onToggle={event => { if (event.target === event.currentTarget) setOpen(event.currentTarget.open); }}>
     <summary>工作输入与报告</summary>
-    {/* Restart both page readers without replacing the open disclosure. */}
-    {open ? <div key={refreshVersion} className="tasks-lifecycle">
-      <WorkSurface groupId={groupId} taskId={taskId} title="工作输入" load={listTaskWorkInputs} renderItem={item => <WorkInput item={item} />} />
-      <WorkSurface groupId={groupId} taskId={taskId} title="工作报告" load={listTaskWorkReports} renderItem={item => <WorkReport item={item} />}
+    {open ? <div className="tasks-lifecycle">
+      <WorkSurface {...props} title="工作输入" load={listTaskWorkInputs} renderItem={item => <WorkInput item={item} />} />
+      <WorkSurface {...props} title="工作报告" load={listTaskWorkReports} renderItem={item => <WorkReport item={item} />}
         note="成员报告不等于正式提交或用户验收。" />
     </div> : null}
   </details>;
 }
 
-function WorkSurface<T extends { id: string }>({ groupId, taskId, title, load, renderItem, note }: Scope & {
+function WorkSurface<T extends { id: string }>({ groupId, taskId, refreshVersion, title, load, renderItem, note }: DisclosureProps & {
   title: string; load: (groupId: string, taskId: string, before: string, signal: AbortSignal) => Promise<{ items: T[]; next_cursor: string }>;
   renderItem: (item: T) => ReactNode; note?: string;
 }) {
-  const [request, setRequest] = useState({ before: "" });
-  const [page, setPage] = useState<{ request: typeof request | null; items: T[]; next: string; error: string }>(
-    { request: null, items: [], next: "", error: "" });
-  const pending = page.request !== request;
+  const [paging, setPaging] = useState<{ refreshVersion: number; before: string } | null>(null);
+  // A new refresh epoch starts at the first page, regardless of the previous cursor.
+  const request = paging?.refreshVersion === refreshVersion ? paging : null;
+  const before = request?.before ?? "";
+  const readPage = (before: string) => setPaging({ refreshVersion, before });
+  const [page, setPage] = useState<{ refreshVersion: number | null; request: typeof request; items: T[]; next: string; error: string }>(
+    { refreshVersion: null, request: null, items: [], next: "", error: "" });
+  const currentEpoch = page.refreshVersion === refreshVersion;
+  const pending = !currentEpoch || page.request !== request;
   useEffect(() => {
     const controller = new AbortController();
-    // A closed or replaced panel cannot publish even when the transport ignores abort.
-    void load(groupId, taskId, request.before, controller.signal).then(result => {
+    // Ignore closed or superseded reads even when the transport ignores abort.
+    void load(groupId, taskId, before, controller.signal).then(result => {
       if (controller.signal.aborted) return;
-      setPage(previous => ({ request, next: result.next_cursor, error: "",
-        items: [...new Map([...(request.before ? previous.items : []), ...result.items].map(item => [item.id, item])).values()] }));
+      setPage(previous => ({ refreshVersion, request, next: result.next_cursor, error: "",
+        items: [...new Map([...(before ? previous.items : []), ...result.items].map(item => [item.id, item])).values()] }));
     }, error => {
       if (controller.signal.aborted) return;
-      setPage(previous => ({ request, items: previous.items, next: "",
+      setPage(previous => ({ refreshVersion, request, items: previous.items, next: "",
         error: error instanceof ApiError ? error.message : "请求未完成，请重试。" }));
     });
     return () => controller.abort();
-  }, [groupId, taskId, request, load]);
+  }, [groupId, taskId, refreshVersion, request, before, load]);
   return <section className="tasks-delivery" aria-label={title} aria-busy={pending}>
     <h3>{title}</h3>
     {pending ? <p role="status">正在读取{title}…</p>
@@ -54,12 +58,12 @@ function WorkSurface<T extends { id: string }>({ groupId, taskId, title, load, r
       {note ? <p className="tasks-note">{note}</p> : null}
       <ul className="tasks-list">{page.items.map(item => <li key={item.id} className="tasks-delivery">{renderItem(item)}</li>)}</ul>
     </> : null}
-    {page.error ? <div className="tasks-lifecycle">
+    {currentEpoch && page.error ? <div className="tasks-lifecycle">
       {!pending ? <p role="alert">{title}读取未确认。{page.error}</p> : null}
-      <div className="tasks-actions"><button type="button" disabled={pending} onClick={() => setRequest({ before: request.before })}>重试读取{title}</button></div>
+      <div className="tasks-actions"><button type="button" disabled={pending} onClick={() => readPage(before)}>重试读取{title}</button></div>
     </div> : null}
-    {page.next ? <div className="tasks-actions">
-      <button type="button" disabled={pending} onClick={() => setRequest({ before: page.next })}>加载更多{title}</button>
+    {currentEpoch && page.next ? <div className="tasks-actions">
+      <button type="button" disabled={pending} onClick={() => readPage(page.next)}>加载更多{title}</button>
     </div> : null}
   </section>;
 }

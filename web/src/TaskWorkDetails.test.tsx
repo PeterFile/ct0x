@@ -14,6 +14,8 @@ const scope = (value: Task) => ({ group_id: value.group_id, task_id: value.id, t
 const rawInput = { ...scope(first), id: "input-1", source_id: "source-1", reply_message_id: "user-message-1", notice_message_id: "notice-1",
   content: "补充原文：<b>逐项复查</b>", before_constraint_revision: 0, before_constraint: "",
   after_constraint_revision: 1, after_constraint: "必须记录复查结果。" };
+const confirmedInput = { ...scope(first), id: "input-confirmed", content: "经执行成员确认的输入。",
+  consumption: { turn_id: "worker-turn-1", attempt_id: "worker-attempt-1", consumed_at: "2026-10-30T12:00:01.123456789Z" } };
 const delivered = (value: Task, summary: string) => ({ ...scope(value), id: "report-1", kind: "delivered", summary,
   actor_id: "worker-1", owner_member_id: "owner-1" });
 const flush = () => act(async () => {});
@@ -21,6 +23,19 @@ const tick = (ms = 1) => act(() => vi.advanceTimersByTimeAsync(ms));
 const disclosure = () => within(screen.getByRole("region", { name: "任务详情" })).getByText("工作输入与报告", { selector: "summary" });
 const inputs = () => within(screen.getByRole("region", { name: "工作输入" }));
 const reports = () => within(screen.getByRole("region", { name: "工作报告" }));
+const refreshDetails = () => fireEvent.click(screen.getByRole("button", { name: "刷新详情" }));
+function stubFirstTask(readInputs: typeof fetch, readReports: typeof fetch) {
+  const readDetail = vi.fn<typeof fetch>(async () => json(first));
+  const transport: typeof fetch = (input, init) => {
+    const url = new URL(String(input), "http://fixture.invalid");
+    if (url.pathname === path(first)) return readDetail(input, init);
+    if (url.pathname === `${path(first)}/work-inputs`) return readInputs(input, init);
+    if (url.pathname === `${path(first)}/work-reports`) return readReports(input, init);
+    return Promise.resolve(url.pathname.endsWith("/tasks") ? page([first]) : json({}, 404));
+  };
+  vi.stubGlobal("fetch", transport);
+  return readDetail;
+}
 async function select(value: Task) {
   fireEvent.click(screen.getByRole("button", { name: `${value.title}，待交付` }));
   await flush();
@@ -74,9 +89,8 @@ it("lazily reads separate scoped work pages and distinguishes explicit handling 
     member_id: "bound-owner-1", turn_id: "return-turn-1", attempt_id: "return-attempt-1", notice_message_id: "return-notice-1",
     reason: "该输入超出原授权范围。", question: "是否只复查已有内容？", returned_at: "2026-10-30T12:00:02.123456789Z",
   } };
-  await act(async () => initial.resolve(page([rawInput, { ...scope(first), id: "input-confirmed", content: "经执行成员确认的输入。",
-    consumption: { turn_id: "worker-turn-1", attempt_id: "worker-attempt-1", consumed_at: "2026-10-30T12:00:01.123456789Z" } },
-  { ...scope(first), id: "legacy-input", consumption: null, return: null }, returnedInput], "older/+&")));
+  await act(async () => initial.resolve(page([rawInput, confirmedInput,
+    { ...scope(first), id: "legacy-input", consumption: null, return: null }, returnedInput], "older/+&")));
   const [pending, confirmed, legacy, returned] = inputs().getAllByRole("listitem");
   expect(within(pending).getByText(rawInput.content)).toBeVisible();
   expect(pending.querySelector("b")).toBeNull();
@@ -165,16 +179,7 @@ it("refreshes both expanded work pages on demand without coupling their paginati
     .mockResolvedValueOnce(json({ error: { code: "not_found", message: "任务不存在" } }, 404))
     .mockResolvedValueOnce(page([{ ...delivered(first, "已加载的旧报告。"), id: "report-older" }], "older-reports-2"))
     .mockReturnValueOnce(lateReports.promise).mockResolvedValueOnce(page([newReport]));
-  const readDetail = vi.fn<typeof fetch>(async () => json(first));
-  const transport: typeof fetch = (input, init) => {
-    const url = new URL(String(input), "http://fixture.invalid");
-    if (url.pathname === path(first)) return readDetail(input, init);
-    if (url.pathname === `${path(first)}/work-inputs`) return readInputs(input, init);
-    if (url.pathname === `${path(first)}/work-reports`) return readReports(input, init);
-    return Promise.resolve(url.pathname.endsWith("/tasks") ? page([first]) : json({}, 404));
-  };
-  vi.stubGlobal("fetch", transport);
-  const refreshDetails = () => fireEvent.click(screen.getByRole("button", { name: "刷新详情" }));
+  const readDetail = stubFirstTask(readInputs, readReports);
   const loadMore = async () => {
     fireEvent.click(inputs().getByRole("button", { name: "加载更多工作输入" }));
     fireEvent.click(reports().getByRole("button", { name: "加载更多工作报告" }));
@@ -223,4 +228,50 @@ it("refreshes both expanded work pages on demand without coupling their paginati
   expect(reports().getByText(newReport.summary)).toBeVisible();
   expect(screen.queryByText("迟到的输入。")).not.toBeInTheDocument();
   expect(screen.queryByText("迟到的报告。")).not.toBeInTheDocument();
+});
+
+it("keeps earlier same-task work evidence through a failed manual refresh and replaces it on retry", async () => {
+  vi.useFakeTimers();
+  const failRefresh = deferred<void>();
+  const originalReport = delivered(first, "刷新前的报告。");
+  const olderReport = { ...delivered(first, "刷新前已加载的旧报告。"), id: "report-older" };
+  const newInput = { ...confirmedInput, id: "input-retried", content: "重试后的输入。" };
+  const newReport = { ...delivered(first, "重试后的报告。"), id: "report-retried" };
+  const readInputs = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(page([confirmedInput]))
+    .mockImplementationOnce(async () => { await failRefresh.promise; return json({}, 404); })
+    .mockResolvedValueOnce(page([newInput]));
+  const readReports = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(page([originalReport], "older-reports"))
+    .mockResolvedValueOnce(page([olderReport]))
+    .mockImplementationOnce(async () => { await failRefresh.promise; throw new TypeError("connection lost"); })
+    .mockResolvedValueOnce(page([newReport]));
+  stubFirstTask(readInputs, readReports);
+  render(<Tasks group={selectedGroup} />); await flush(); await select(first); await toggle();
+  fireEvent.click(reports().getByRole("button", { name: "加载更多工作报告" })); await flush();
+  const priorInput = inputs().getByText(confirmedInput.content);
+  const priorReports = [reports().getByText(originalReport.summary), reports().getByText(olderReport.summary)];
+
+  refreshDetails(); await flush();
+  expect(inputs().getByRole("status")).toHaveTextContent("正在读取工作输入");
+  expect(reports().getByRole("status")).toHaveTextContent("正在读取工作报告");
+  for (const row of [priorInput, ...priorReports]) expect(row).toBeVisible();
+  await act(async () => failRefresh.resolve(undefined));
+  expect(inputs().getByRole("alert")).toHaveTextContent("工作输入读取未确认。未找到请求的服务或记录（HTTP 404）。");
+  expect(reports().getByRole("alert")).toHaveTextContent("工作报告读取未确认。");
+  for (const row of [priorInput, ...priorReports]) expect(row).toBeVisible();
+
+  fireEvent.click(inputs().getByRole("button", { name: "重试读取工作输入" })); await flush();
+  const inputURL = `${path(first)}/work-inputs?limit=50`;
+  expect(readInputs.mock.calls.map(([url]) => url)).toEqual([inputURL, inputURL, inputURL]);
+  expect(inputs().getByText(newInput.content)).toBeVisible();
+  expect(priorInput).not.toBeInTheDocument();
+  expect(reports().getByRole("alert")).toBeVisible();
+  for (const row of priorReports) expect(row).toBeVisible();
+
+  fireEvent.click(reports().getByRole("button", { name: "重试读取工作报告" })); await flush();
+  const reportURL = `${path(first)}/work-reports?limit=50`;
+  expect(readReports.mock.calls.map(([url]) => url)).toEqual([reportURL, `${reportURL}&before=older-reports`, reportURL, reportURL]);
+  expect(reports().getByText(newReport.summary)).toBeVisible();
+  for (const row of priorReports) expect(row).not.toBeInTheDocument();
 });
