@@ -7,14 +7,24 @@ const (
 )
 
 // ChatDiscussionAction never selects the source, caller, or return route.
-// Invite requires a recipient; ExpectedReply optionally refines its question
-// and is limited to 1024 bytes as a JSON string, including quotes and escapes.
-// When omitted, the invitation's exact saved Content is the reply requirement.
+// Invite requires exactly one of RecipientID or CreateMember. ExpectedReply
+// optionally refines its question and is limited to 1024 bytes as a JSON string,
+// including quotes and escapes. When omitted, the invitation's exact saved
+// Content is the reply requirement. Reply and resolve accept only Kind and Content.
 type ChatDiscussionAction struct {
-	Kind          string `json:"kind"`
-	Content       string `json:"content"`
-	RecipientID   string `json:"recipient_id,omitempty"`
-	ExpectedReply string `json:"expected_reply,omitempty"`
+	Kind          string                      `json:"kind"`
+	Content       string                      `json:"content"`
+	RecipientID   string                      `json:"recipient_id,omitempty"`
+	ExpectedReply string                      `json:"expected_reply,omitempty"`
+	CreateMember  *ChatDiscussionCreateMember `json:"create_member,omitempty"`
+}
+
+// ChatDiscussionCreateMember describes a fallback participant, not its runtime
+// configuration, ownership, workspace or grants.
+type ChatDiscussionCreateMember struct {
+	Name   string `json:"name"`
+	Role   string `json:"role"`
+	Reason string `json:"reason"`
 }
 
 // ChatDiscussionEvent records one step. SourceMessageID is the arriving message
