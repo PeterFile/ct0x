@@ -1,6 +1,18 @@
-# Typed Pi investigation transport (unwired)
+# Opt-in typed Pi investigation transport
 
-Keep this adapter off. It consumes C's offline profile and native HTTP contract at `8ca27b25eba318bcc7ceb00b1bd37efeeadc2318`. The public B v30 authority source is `c38b5f216eca46e05628321ab598b11d37d34653`, not the C trial's Store snapshot. There is no CLI flag, default extension, provider route, or readiness claim.
+This C candidate is disabled by default. Its three typed wakes use B's exact v30 launch transaction at `2b942bf8b3f2f19b7e3e3c71700360ba45f8aa6c`, in the same scheduler and registry as the first investigation. The CLI opt-in is not task or policy authority.
+
+For a coordinator's isolated trial, start from the repository root with a separate non-symlink `0700` data directory and a qualified Pi 1.4.0 executable. Use these `workspace` arguments (`BRIDGE` is the absolute physical path to this checkout's `extensions/pi-bridge`):
+
+```sh
+--listen 127.0.0.1:0 --data-dir "$DATA_DIR" --pi-path "$PI_140" \
+  --enable-execution --execution-max-active 1 --enable-member-tools \
+  --enable-coordination-roles --enable-investigation-execution \
+  --pi-member-tools-extension "$BRIDGE/index.ts" \
+  --pi-fresh-investigation-work-extension "$BRIDGE/fresh-investigation-work.ts"
+```
+
+Use the printed loopback port. Keep `index.ts` with its matched `bridge.mjs`, and `fresh-investigation-work.ts` with `fresh-task-work.mjs`. Use this checkout's new pair for combined intake, and also pass `--pi-fresh-task-work-extension "$BRIDGE/fresh-task-work.ts"` to exercise the existing `continue_work` intake. The legacy qualification tests do not certify the new config with an old pair. The scheduler selects and claims the private per-delivery CWD; do not substitute an external workspace. This trial adds neither an owner delegation tool nor a task handback tool.
 
 ## Pass the profile and digest from the claimed launch
 
@@ -37,4 +49,11 @@ Pi 1.4.0 catches a `session_start` handler error, and its print mode still calls
 
 ## Offline proof and remaining acceptance
 
-The source locations, commands, test exits, and pinned checksums are in `.local/pi/autonomy-c-20261118/task-work-investigation-fresh/typed-write-unknown`. The installed Pi 1.4.0 loader and in-memory SDK fixtures check the three profiles, intercepted HTTP, and the real JSON print path for a loaded extension with a mismatched, nonempty, or persistent session. Malformed config has loader-error evidence and a source-level CLI diagnostics check, not a raw malformed-boot test of the deployed executable. The fixtures don't launch the product CLI, call a model service, bind sockets, or prove a real claim-to-write round trip. C still has to compose private issuance and cleanup with `FreshInvestigationWorkLaunch`, mount and verify the matching HTTP routes with B's public v30 runtime, and retain the final preflight on the fresh Turn, Attempt, and claimed resource. That includes revoking and draining the capability on every exit, even if native invocation never starts. B owns live source/role/policy/version authority, mutation replay, and durable settlement. Before any enablement, independently review the integrated code and qualify real Pi CLI/loader and all three profiles end to end, including material denials, claim/revocation races, and unknown reconciliation. Nothing in this slice enables or certifies those paths.
+The SQLite fixtures run the real claim/resource/Attempt and B commit path with an in-process executor. The Pi 1.4.0 loader and in-memory SDK fixtures check the three profiles, intercepted HTTP, and JSON print startup refusal with a mismatched, nonempty, or persistent session. With cached SDK dependencies installed, point `TEST_PI_TYPED_PRINT_FIXTURES` at a new private directory and run from the repository root:
+
+```sh
+node --test --test-name-pattern='Pi JSON print' extensions/pi-bridge/tests/fresh-{task,investigation}-work.test.mjs
+go test -run '^TestPiFresh(TaskWork|Investigation)SDKPrintLifecycle$' ./internal/provider
+```
+
+This replays synthetic Pi JSONL through the pinned Go adapters, including `report_work` without either native lifecycle frame. It does not exercise malformed bootstrap on the deployed CLI, real Pi/account/model startup, or a deployed report-to-owner round trip. Unknown executions still require reconciliation; the opt-in does not release their claims.
