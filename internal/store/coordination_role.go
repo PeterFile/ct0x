@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+
+	"agentworkspace/internal/domain"
 )
 
 type CoordinationRoleKind string
@@ -15,10 +17,12 @@ const (
 )
 
 type CoordinationRoleProvenance struct {
-	Kind                                                              CoordinationRoleKind `json:"-"`
-	GroupID, DeliveryID, MessageID, ConversationID, MemberID, TopicID string               `json:"-"`
-	RequestID, TaskID, AssignmentID                                   string               `json:"-"`
-	TaskRevision                                                      int64                `json:"-"`
+	Kind                                                              CoordinationRoleKind      `json:"-"`
+	GroupID, DeliveryID, MessageID, ConversationID, MemberID, TopicID string                    `json:"-"`
+	RequestID, TaskID, AssignmentID                                   string                    `json:"-"`
+	TaskRevision                                                      int64                     `json:"-"`
+	SourceKind                                                        domain.TaskWorkSourceKind `json:"-"`
+	SourceID                                                          string                    `json:"-"`
 }
 
 type CoordinationToolScope struct {
@@ -52,6 +56,9 @@ func coordinationExecutionProvenanceInTx(ctx context.Context, tx *sql.Tx, member
 // Raw receipt candidates are selected before validating relations: a broken second role cannot disappear.
 // Each receipt delivery key is UNIQUE, so this observes at most two candidates. No current eligibility is read.
 func coordinationClaimProvenanceInTx(ctx context.Context, tx *sql.Tx, member MemberToolScope) (CoordinationRoleProvenance, error) {
+	if err := denyTaskWorkFallbackInTx(ctx, tx, member.Claim.TurnID); err != nil {
+		return CoordinationRoleProvenance{}, err
+	}
 	rows, err := tx.QueryContext(ctx, `WITH source AS (
 	 SELECT 'coordinator' kind,s.request_id,s.task_id,s.group_id,s.delivery_id,s.message_id,s.conversation_id,
 	 s.delivered_member_id,'' assignment_id,1 linked FROM coordination_dispatch_state s WHERE s.delivery_id=(SELECT delivery_id FROM turns WHERE id=?)

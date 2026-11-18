@@ -191,6 +191,16 @@ func investigationTaskSubmitInput(role CoordinationToolScope, input AssignmentRe
 		ActorID: role.Member.MemberID, MemberScope: &role.Member, Summary: input.Summary, ArtifactVersions: input.ArtifactVersions, IdempotencyKey: key}
 }
 
+func investigationWorkerAtV27(t *testing.T, prepare func(*testing.T, chatFixture) CoordinationToolScope) (chatFixture, domain.ChatPolicy, CoordinationToolScope) {
+	t.Helper()
+	// Materialize only v1–27 so later schema objects cannot mask the cold-path cases.
+	prior := migrations
+	defer func() { migrations = prior }()
+	migrations = prior[:27]
+	f, policy := investigationUserCandidate(t)
+	return f, policy, prepare(t, f)
+}
+
 func TestChatInvestigationSchemaMismatchFailsClosed(t *testing.T) {
 	const (
 		dropMarker = "DELETE FROM schema_migrations WHERE version=27"
@@ -210,7 +220,7 @@ func TestChatInvestigationSchemaMismatchFailsClosed(t *testing.T) {
 		{"missing-marker-with-later-version", dropMarker + "; " + dropScope + "; " + dropGuards + "; INSERT INTO schema_migrations(version) VALUES(28)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f, policy, role := investigationUserWorker(t)
+			f, policy, role := investigationWorkerAtV27(t, investigationBindWorker)
 			messageSequenceLedger(t, f.s, 27)
 			id := role.Provenance.TaskID
 			if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); err != nil || scope.TaskID != id {
@@ -265,8 +275,7 @@ func TestChatInvestigationRetainedAdmissionWithoutSchema(t *testing.T) {
 		}
 	}
 	t.Run("fresh-binding", func(t *testing.T) {
-		f, _ := investigationUserCandidate(t)
-		role := investigationClaimWorker(t, f)
+		f, _, role := investigationWorkerAtV27(t, investigationClaimWorker)
 		removeMetadata(t, f, role)
 		before := coordinationDecideSnapshot(t, f.s)
 		if binding, err := f.s.BindAssignmentAttempt(ctx, role); !errors.Is(err, ErrMemberToolDenied) || binding != (domain.AssignmentAttemptBinding{}) {
@@ -275,7 +284,7 @@ func TestChatInvestigationRetainedAdmissionWithoutSchema(t *testing.T) {
 		coordinationDecidePreserved(t, f.s, before)
 	})
 	t.Run("bound-worker", func(t *testing.T) {
-		f, _, role := investigationUserWorker(t)
+		f, _, role := investigationWorkerAtV27(t, investigationBindWorker)
 		removeMetadata(t, f, role)
 		before := coordinationDecideSnapshot(t, f.s)
 		p := role.Provenance

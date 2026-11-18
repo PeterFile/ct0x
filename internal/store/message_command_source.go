@@ -75,10 +75,12 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 	if len(messages) == 0 {
 		return nil
 	}
-	var available, hasReviewNotices, hasWorkspaceNotices bool
+	var available, hasReviewNotices, hasWorkspaceNotices, hasTaskWork, hasWorkInputs bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=17),
 	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=18),
-	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=21)`).Scan(&available, &hasReviewNotices, &hasWorkspaceNotices); err != nil {
+	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=21),
+	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='task_work_deliveries'),`+workInputSchemaExists, taskWorkInputVersion).
+		Scan(&available, &hasReviewNotices, &hasWorkspaceNotices, &hasTaskWork, &hasWorkInputs); err != nil {
 		return err
 	}
 	if !available && !hasWorkspaceNotices {
@@ -104,14 +106,27 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 	 LEFT JOIN workspace_operation_receipts wf ON wf.notice_message_id=m.id
 	 LEFT JOIN workspace_operations wo ON wo.id=wf.operation_id AND wo.group_id=m.group_id`
 	}
+	workKind, workSource, workJoin := "", "", ""
+	if hasTaskWork {
+		workKind = "CASE WHEN tw.delivery_id IS NOT NULL THEN 'platform' END,"
+		workSource = "CASE WHEN tw.delivery_id IS NOT NULL THEN 'work:'||tw.source_kind||':'||tw.source_id END,"
+		workJoin = ` LEFT JOIN task_work_deliveries tw ON tw.message_id=m.id AND tw.group_id=m.group_id
+		 AND tw.topic_id=m.topic_id AND tw.sender_member_id=m.sender_id`
+	}
+	returnKind, returnSource, returnJoin := "", "", ""
+	if hasWorkInputs {
+		returnKind = "CASE WHEN handback.input_id IS NOT NULL THEN 'platform' END,"
+		returnSource = "CASE WHEN handback.input_id IS NOT NULL THEN 'work_input_return:'||handback.input_id END,"
+		returnJoin = " LEFT JOIN task_work_input_returns handback ON handback.notice_message_id=m.id AND handback.member_id=m.sender_id"
+	}
 	query := `SELECT m.id,
-	 coalesce(` + reviewKind + workspaceKind + `s.kind,CASE WHEN d.request_id IS NOT NULL OR a.assignment_id IS NOT NULL OR n.id IS NOT NULL OR sn.submission_id IS NOT NULL THEN 'platform' WHEN t.id IS NOT NULL THEN 'member' ELSE 'unknown' END),
-	 coalesce(` + reviewSource + workspaceSource + `s.id,CASE WHEN d.request_id IS NOT NULL THEN 'dispatch:'||d.request_id WHEN a.assignment_id IS NOT NULL THEN 'assignment:'||a.assignment_id WHEN n.id IS NOT NULL THEN 'assessment:'||n.id WHEN sn.submission_id IS NOT NULL THEN 'submission:'||sn.submission_id WHEN t.id IS NOT NULL THEN 'turn:'||t.id ELSE '' END)
+	 coalesce(` + workKind + returnKind + reviewKind + workspaceKind + `s.kind,CASE WHEN d.request_id IS NOT NULL OR a.assignment_id IS NOT NULL OR n.id IS NOT NULL OR sn.submission_id IS NOT NULL THEN 'platform' WHEN t.id IS NOT NULL THEN 'member' ELSE 'unknown' END),
+	 coalesce(` + workSource + returnSource + reviewSource + workspaceSource + `s.id,CASE WHEN d.request_id IS NOT NULL THEN 'dispatch:'||d.request_id WHEN a.assignment_id IS NOT NULL THEN 'assignment:'||a.assignment_id WHEN n.id IS NOT NULL THEN 'assessment:'||n.id WHEN sn.submission_id IS NOT NULL THEN 'submission:'||sn.submission_id WHEN t.id IS NOT NULL THEN 'turn:'||t.id ELSE '' END)
 	 FROM messages m LEFT JOIN message_command_sources s ON s.message_id=m.id
 	 LEFT JOIN coordination_dispatch_state d ON d.message_id=m.id
 	 LEFT JOIN coordination_assignment_dispatch a ON a.message_id=m.id
 	 LEFT JOIN chat_assessments n ON n.notice_message_id=m.id
-	 LEFT JOIN chat_submission_notices sn ON sn.message_id=m.id` + reviewJoin + workspaceJoin + `
+	 LEFT JOIN chat_submission_notices sn ON sn.message_id=m.id` + reviewJoin + workspaceJoin + workJoin + returnJoin + `
 	 LEFT JOIN turns t ON t.reply_message_id=m.id AND t.reply_message_id<>''
 	 WHERE m.id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(messages)), ",") + ")"
 	rows, err := tx.QueryContext(ctx, query, args...)

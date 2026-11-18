@@ -126,37 +126,62 @@ func (s *Store) chatInvestigationSubmissionInTx(ctx context.Context, tx *sql.Tx,
 	if len(input.ArtifactVersions) != 0 || !memberToolTextValid(input.Summary, investigationSubmissionMaxBytes) {
 		return taskInvestigationEvidence{}, fmt.Errorf("%w：只读调查仅允许非空且最多%d字节的有效UTF-8文本，不允许附带成果版本", ErrInvalid, investigationSubmissionMaxBytes)
 	}
-	p, err := investigationSubmissionProvenanceInTx(ctx, tx, input)
+	p, work, err := investigationSubmissionProvenanceInTx(ctx, tx, input)
 	if err != nil {
 		return taskInvestigationEvidence{}, err
+	}
+	if work.d.DeliveryID != "" {
+		return s.investigationForFollowupInTx(ctx, tx, work, *input.MemberScope, input.AttemptID)
 	}
 	return s.investigationForProvenanceInTx(ctx, tx, *input.MemberScope, p, input.AttemptID)
 }
 
-func investigationSubmissionProvenanceInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (CoordinationRoleProvenance, error) {
+func investigationSubmissionProvenanceInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (p CoordinationRoleProvenance, work taskWorkFacts, err error) {
 	if input.MemberScope == nil {
-		return CoordinationRoleProvenance{}, ErrMemberToolDenied
+		return p, work, ErrMemberToolDenied
 	}
 	member := *input.MemberScope
 	if err := coordinationDecideLiveInTx(ctx, tx, member); err != nil {
-		return CoordinationRoleProvenance{}, err
+		return p, work, err
 	}
-	p, err := coordinationClaimProvenanceInTx(ctx, tx, member)
+	work, err = lookupTaskWorkExecutionInTx(ctx, tx, member)
+	if err == nil {
+		p = taskWorkFollowupProvenance(work)
+	} else if errors.Is(err, ErrNotFound) {
+		p, err = coordinationClaimProvenanceInTx(ctx, tx, member)
+	}
 	if err != nil {
-		return CoordinationRoleProvenance{}, err
+		return p, work, err
 	}
 	if p.Kind != CoordinationRoleWorker || p.GroupID != input.GroupID || p.TaskID != input.TaskID || p.TaskRevision != input.ExpectedRevision || p.MemberID != input.ActorID {
-		return CoordinationRoleProvenance{}, ErrMemberToolDenied
+		return p, work, ErrMemberToolDenied
 	}
-	return p, nil
+	return p, work, nil
 }
 
 // Both submission entries recheck after the Task and any notice were written.
 // The bound worker must still own the exact resulting Task pointer.
 func (s *Store) checkInvestigationSubmissionWriteInTx(ctx context.Context, tx *sql.Tx, evidence taskInvestigationEvidence, input SubmitTaskInput, submissionID string) error {
-	p, err := investigationSubmissionProvenanceInTx(ctx, tx, input)
+	p, work, err := investigationSubmissionProvenanceInTx(ctx, tx, input)
 	if err != nil {
 		return err
+	}
+	if work.d.DeliveryID != "" {
+		attempt, err := taskWorkBoundAttemptInTx(ctx, tx, work.d, "")
+		if err != nil {
+			return err
+		}
+		if !s.taskWorkExecution.Load() || !evidence.matchesDispatch(work.v.r) || attempt.ID == "" || attempt.ID != input.AttemptID || attempt.TurnID != input.MemberScope.Claim.TurnID {
+			return ErrMemberToolDenied
+		}
+		task, err := taskInTx(ctx, tx, p.GroupID, p.TaskID)
+		if err != nil {
+			return err
+		}
+		if task.ActiveAttemptID != attempt.ID || (task.AssigneeID != "" && task.AssigneeID != p.MemberID) {
+			return ErrMemberToolDenied
+		}
+		return investigationToolError(s.checkTaskInvestigationReadyInTx(ctx, tx, evidence, submissionID, false))
 	}
 	role := CoordinationToolScope{Member: *input.MemberScope, Provenance: p, AttemptID: input.AttemptID}
 	v, view, err := coordinationAssignmentWorkerInTx(ctx, tx, role)
@@ -198,6 +223,12 @@ func (s *Store) checkTaskInvestigationReadyInTx(ctx context.Context, tx *sql.Tx,
 	if !s.investigationExecution.Load() {
 		return ErrTaskInvestigationNotReady
 	}
+	return checkTaskInvestigationAuthorizationInTx(ctx, tx, scope, submissionID, allowNoEligibleWorker)
+}
+
+// This is the durable half of the execution fence. It can explain a handback,
+// but by itself never authorizes investigation execution or tools.
+func checkTaskInvestigationAuthorizationInTx(ctx context.Context, tx *sql.Tx, scope taskInvestigationEvidence, submissionID string, allowNoEligibleWorker bool) error {
 	status := domain.TaskStatusOpen
 	if submissionID != "" {
 		status = domain.TaskStatusSubmitted

@@ -72,7 +72,11 @@ const coordinationAssignmentStart = ` AND t.status='open' AND t.revision=r.task_
  WHERE dep.task_id=a.task_id AND dep.group_id=a.group_id AND parent.status<>'accepted')`
 
 func coordinationAssignmentStartInTx(ctx context.Context, tx *sql.Tx, v assignmentSnapshot, scope CoordinationToolScope, own string) error {
-	args := append(v.args(), sql.Named("own", own), sql.Named("turn", scope.Member.Claim.TurnID))
+	return coordinationAssignmentCurrentInTx(ctx, tx, v, own, scope.Member.Claim.TurnID)
+}
+
+func coordinationAssignmentCurrentInTx(ctx context.Context, tx *sql.Tx, v assignmentSnapshot, own, turnID string) error {
+	args := append(v.args(), sql.Named("own", own), sql.Named("turn", turnID))
 	var allowed bool
 	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1"+coordinationAssignmentRelations+coordinationAssignmentStart+")", args...).Scan(&allowed); err != nil {
 		return err
