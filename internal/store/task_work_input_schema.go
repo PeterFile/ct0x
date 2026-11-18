@@ -57,7 +57,10 @@ CREATE TABLE task_work_input_returns (
     reason TEXT NOT NULL CHECK(length(CAST(reason AS BLOB)) BETWEEN 1 AND 2048 AND instr(reason,char(0))=0),
     question TEXT NOT NULL CHECK(length(CAST(question AS BLOB)) BETWEEN 1 AND 2048),
     notice_message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
-    returned_at TEXT NOT NULL
+    returned_at TEXT NOT NULL,
+    disposition TEXT NOT NULL CHECK(disposition IN ('separate_authorization_required','original_authorization_unavailable')),
+    policy_revision INTEGER NOT NULL CHECK(typeof(policy_revision)='integer' AND policy_revision>=0),
+    policy_source_id TEXT REFERENCES message_command_sources(id)
 );
 CREATE TRIGGER chat_followup_routes_insert BEFORE INSERT ON chat_followup_routes BEGIN
     SELECT RAISE(ABORT,'跟进路由不可替换') WHERE EXISTS(SELECT 1 FROM chat_followup_routes WHERE
@@ -116,6 +119,10 @@ CREATE TRIGGER task_work_input_returns_insert BEFORE INSERT ON task_work_input_r
         AND (n.group_id,n.topic_id,n.sender_id)=(i.group_id,i.topic_id,NEW.member_id)
         AND NOT EXISTS(SELECT 1 FROM message_command_sources WHERE message_id=n.id)
         AND NOT EXISTS(SELECT 1 FROM deliveries WHERE message_id=n.id)));
+    SELECT RAISE(ABORT,'工作输入交回策略依据不匹配') WHERE NOT EXISTS(
+        SELECT 1 FROM task_work_inputs i LEFT JOIN chat_policies p ON (p.group_id,p.topic_id)=(i.group_id,i.topic_id)
+        LEFT JOIN chat_policy_scopes s ON (s.group_id,s.topic_id,s.revision)=(p.group_id,p.topic_id,p.revision)
+        WHERE i.id=NEW.input_id AND NEW.policy_revision=coalesce(p.revision,0) AND NEW.policy_source_id IS s.command_source_id);
 END;
 CREATE TRIGGER task_work_input_returns_no_update BEFORE UPDATE ON task_work_input_returns
 BEGIN SELECT RAISE(ABORT,'工作输入交回不可修改'); END;

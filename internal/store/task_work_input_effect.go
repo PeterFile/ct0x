@@ -28,7 +28,7 @@ func (s *Store) handleWorkInput(ctx context.Context, scope MemberToolScope, oper
 		return out, err
 	}
 	defer tx.Rollback()
-	role, err := s.workInputWorkerInTx(ctx, tx, scope)
+	role, original, err := s.workInputHandlingOwnerInTx(ctx, tx, scope, handBack)
 	if err != nil {
 		return out, err
 	}
@@ -59,10 +59,7 @@ func (s *Store) handleWorkInput(ctx context.Context, scope MemberToolScope, oper
 	if replay && id != inputID {
 		return out, ErrConflict
 	}
-	r, err := coordinationDispatchRequestInTx(ctx, tx, p.GroupID, p.RequestID)
-	if err != nil {
-		return out, coordinationRoleRelationError(err)
-	}
+	r := original.r
 	i, err := workerWorkInputInTx(ctx, tx, p, inputID, r.MandateID)
 	if err != nil {
 		return out, err
@@ -75,12 +72,17 @@ func (s *Store) handleWorkInput(ctx context.Context, scope MemberToolScope, oper
 		return out, ErrConflict
 	}
 	fresh := i.Consumption == nil && i.Return == nil
+	var decision workInputReturnDecision
 	if fresh {
 		if replay {
 			return out, ErrConflict // A key is not a substitute for a persisted fact.
 		}
 		if handBack {
-			i.Return, err = insertWorkInputReturnInTx(ctx, tx, role, i, reason)
+			decision, err = s.decideWorkInputReturnInTx(ctx, tx, i, original)
+			if err != nil {
+				return out, err
+			}
+			i.Return, err = insertWorkInputReturnInTx(ctx, tx, role, i, reason, decision)
 		} else {
 			c := &domain.TaskWorkInputConsumption{TurnID: scope.Claim.TurnID, AttemptID: role.AttemptID, ConsumedAt: time.Now().UTC()}
 			err = coordinationDispatchWrite(ctx, tx, `INSERT INTO task_work_input_consumptions(input_id,turn_id,attempt_id,consumed_at) VALUES(?,?,?,?)`,
@@ -102,12 +104,21 @@ func (s *Store) handleWorkInput(ctx context.Context, scope MemberToolScope, oper
 	if fresh || newKey {
 		// Verify the actual effect and current authority after the last write,
 		// including any changes made by triggers in this transaction.
-		current, err := s.workInputWorkerInTx(ctx, tx, scope)
+		current, owner, err := s.workInputHandlingOwnerInTx(ctx, tx, scope, handBack)
 		if err != nil {
 			return out, err
 		}
-		if current != role {
+		if current != role || owner.r != r {
 			return out, ErrMemberToolDenied
+		}
+		if handBack && fresh {
+			applied, err := s.decideWorkInputReturnInTx(ctx, tx, i, owner)
+			if err != nil {
+				return out, err
+			}
+			if applied != decision {
+				return out, ErrConflict
+			}
 		}
 		saved, err := workerWorkInputInTx(ctx, tx, p, inputID, r.MandateID)
 		if err != nil {

@@ -6,7 +6,9 @@ import "time"
 // revision, a delivery, or permission to execute. ReplyMessageID identifies the
 // original user message in ThreadRef, not the platform's notice. SourceSequence
 // is source commit order; CreatedAt and constraint revisions record routing
-// order. Each changed quote supplements, rather than replaces, prior quotes.
+// order of proposals, including pending and returned inputs. An acknowledgement
+// pertains only to this input's own quote (if its revision changed), not to its
+// historical before value or to any other proposal. Neither quote is a grant.
 type TaskWorkInput struct {
 	ID string `json:"id"`
 	ThreadRef
@@ -39,14 +41,25 @@ type TaskWorkInputConsumption struct {
 	ConsumedAt time.Time `json:"consumed_at"`
 }
 
-// TaskWorkInputReturn preserves an out-of-scope disposition separately from
-// confirmed processing. It does not change any Mandate, Attempt or Turn.
+type TaskWorkInputReturnDisposition string
+
+const (
+	TaskWorkInputReturnSeparateAuthorizationRequired    TaskWorkInputReturnDisposition = "separate_authorization_required"
+	TaskWorkInputReturnOriginalAuthorizationUnavailable TaskWorkInputReturnDisposition = "original_authorization_unavailable"
+)
+
+// TaskWorkInputReturn preserves a non-granting decision separately from
+// confirmed processing. PolicyRevision and PolicySourceID refer to the topic
+// policy applied at return, not the policy at replay or Mandate admission.
 type TaskWorkInputReturn struct {
-	MemberID        string    `json:"member_id"`
-	TurnID          string    `json:"turn_id"`
-	AttemptID       string    `json:"attempt_id"`
-	Reason          string    `json:"reason"`
-	Question        string    `json:"question"`
-	NoticeMessageID string    `json:"notice_message_id"`
-	ReturnedAt      time.Time `json:"returned_at"`
+	MemberID        string                         `json:"member_id"`
+	TurnID          string                         `json:"turn_id"`
+	AttemptID       string                         `json:"attempt_id"`
+	Reason          string                         `json:"reason"` // Worker's explanation, not the authority basis.
+	Question        string                         `json:"question"`
+	NoticeMessageID string                         `json:"notice_message_id"`
+	ReturnedAt      time.Time                      `json:"returned_at"`
+	Disposition     TaskWorkInputReturnDisposition `json:"disposition"`
+	PolicyRevision  int64                          `json:"policy_revision"`
+	PolicySourceID  string                         `json:"policy_source_id,omitempty"`
 }

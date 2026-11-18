@@ -13,22 +13,24 @@ import (
 const workInputSelect = `SELECT i.id,i.group_id,i.topic_id,i.task_id,i.task_revision,i.mandate_id,i.assignment_id,i.worker_member_id,
  r.trigger_id,i.source_id,t.message_sequence,a.candidate_id,r.reply_message_id,r.notice_message_id,i.content,
  i.before_revision,i.before_constraint,i.after_revision,i.after_constraint,i.created_at,c.turn_id,c.attempt_id,c.consumed_at,
- h.member_id,h.turn_id,h.attempt_id,h.reason,h.question,h.notice_message_id,h.returned_at
+ h.member_id,h.turn_id,h.attempt_id,h.reason,h.question,h.notice_message_id,h.returned_at,h.disposition,h.policy_revision,h.policy_source_id
  FROM task_work_inputs i JOIN chat_followup_routes r ON r.source_id=i.source_id
  JOIN coordination_triggers t ON t.id=r.trigger_id JOIN chat_assessments a ON a.id=r.assessment_id
  LEFT JOIN task_work_input_consumptions c ON c.input_id=i.id LEFT JOIN task_work_input_returns h ON h.input_id=i.id`
 
-const latestWorkConstraint = ` FROM task_work_inputs WHERE group_id=? AND task_id=? AND task_revision=?
+// The proposal sequence includes returns; it is not an effective constraint view.
+const latestWorkConstraintProposal = ` FROM task_work_inputs WHERE group_id=? AND task_id=? AND task_revision=?
  AND after_revision>before_revision ORDER BY after_revision DESC`
 
 func scanWorkInput(row scanner) (i domain.TaskWorkInput, err error) {
 	var stamp string
 	var turn, attempt, consumed sql.NullString
-	var who, returnTurn, returnAttempt, reason, question, notice, returned sql.NullString
+	var who, returnTurn, returnAttempt, reason, question, notice, returned, disposition, policySource sql.NullString
+	var policyRevision sql.NullInt64
 	if err = row.Scan(&i.ID, &i.GroupID, &i.TopicID, &i.TaskID, &i.TaskRevision, &i.MandateID, &i.AssignmentID, &i.WorkerMemberID,
 		&i.TriggerID, &i.SourceID, &i.SourceSequence, &i.CandidateID, &i.ReplyMessageID, &i.NoticeMessageID, &i.Content,
 		&i.BeforeConstraintRevision, &i.BeforeConstraint, &i.AfterConstraintRevision, &i.AfterConstraint, &stamp, &turn, &attempt, &consumed,
-		&who, &returnTurn, &returnAttempt, &reason, &question, &notice, &returned); err != nil {
+		&who, &returnTurn, &returnAttempt, &reason, &question, &notice, &returned, &disposition, &policyRevision, &policySource); err != nil {
 		return
 	}
 	i.CreatedAt, err = time.Parse(timestampLayout, stamp)
@@ -38,7 +40,8 @@ func scanWorkInput(row scanner) (i domain.TaskWorkInput, err error) {
 	}
 	if err == nil && returned.Valid {
 		i.Return = &domain.TaskWorkInputReturn{MemberID: who.String, TurnID: returnTurn.String, AttemptID: returnAttempt.String,
-			Reason: reason.String, Question: question.String, NoticeMessageID: notice.String}
+			Reason: reason.String, Question: question.String, NoticeMessageID: notice.String, Disposition: domain.TaskWorkInputReturnDisposition(disposition.String),
+			PolicyRevision: policyRevision.Int64, PolicySourceID: policySource.String}
 		i.Return.ReturnedAt, err = time.Parse(timestampLayout, returned.String)
 	}
 	return
@@ -154,26 +157,32 @@ func (s *Store) ListWorkInputHistoryForMember(ctx context.Context, scope MemberT
 // Derive the role and canonical Attempt, never from tool arguments. A later
 // ordinary Turn of the same member or conversation has no inbox rights.
 func (s *Store) workInputWorkerInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope) (CoordinationToolScope, error) {
-	f, err := lookupTaskWorkExecutionInTx(ctx, tx, scope)
-	if err == nil {
-		state, err := s.taskWorkFollowupRoleInTx(ctx, tx, f, scope.Claim.TurnID)
-		if err != nil {
-			return CoordinationToolScope{}, err
-		}
-		if state.AttemptID == "" || state.Blocked != CoordinationReady {
-			return CoordinationToolScope{}, ErrMemberToolDenied
-		}
-		return CoordinationToolScope{Member: scope, Provenance: state.Provenance, AttemptID: state.AttemptID}, nil
-	}
-	if !errors.Is(err, ErrNotFound) {
-		return CoordinationToolScope{}, err
-	}
-	role, _, err := s.boundTaskWorkOriginalInTx(ctx, tx, scope)
+	role, _, err := s.workInputHandlingOwnerInTx(ctx, tx, scope, false)
 	return role, err
 }
 
+// Only handback can proceed without current chat execution authority. It still
+// requires the live, canonical owner and never bypasses Task/Assignment fences.
+func (s *Store) workInputHandlingOwnerInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, returnOnly bool) (CoordinationToolScope, assignmentSnapshot, error) {
+	f, err := lookupTaskWorkExecutionInTx(ctx, tx, scope)
+	if err == nil {
+		state, err := s.taskWorkFollowupOwnerRoleInTx(ctx, tx, f, scope.Claim.TurnID, returnOnly)
+		if err != nil {
+			return CoordinationToolScope{}, assignmentSnapshot{}, err
+		}
+		if state.AttemptID == "" || state.Blocked != CoordinationReady {
+			return CoordinationToolScope{}, assignmentSnapshot{}, ErrMemberToolDenied
+		}
+		return CoordinationToolScope{Member: scope, Provenance: state.Provenance, AttemptID: state.AttemptID}, f.v, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return CoordinationToolScope{}, assignmentSnapshot{}, err
+	}
+	return s.boundTaskWorkOriginalInTx(ctx, tx, scope, returnOnly)
+}
+
 // Only use this path after fencing the claim and ruling out a typed delivery.
-func (s *Store) boundTaskWorkOriginalInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope) (CoordinationToolScope, assignmentSnapshot, error) {
+func (s *Store) boundTaskWorkOriginalInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, returnOnly bool) (CoordinationToolScope, assignmentSnapshot, error) {
 	var zero assignmentSnapshot
 	p := CoordinationRoleProvenance{Kind: CoordinationRoleWorker, GroupID: scope.Claim.GroupID, MemberID: scope.MemberID,
 		ConversationID: scope.ConversationID, TopicID: scope.TopicID}
@@ -200,12 +209,14 @@ func (s *Store) boundTaskWorkOriginalInTx(ctx context.Context, tx *sql.Tx, scope
 		}
 		return CoordinationToolScope{}, zero, err
 	}
-	f := taskWorkFacts{v: v, d: taskWorkRecord(v, "", "")}
-	if _, err := s.taskWorkOwnerChatActionInTx(ctx, tx, f); err != nil {
-		if errors.Is(err, errTaskWorkChatScope) || errors.Is(err, ErrTaskInvestigationNotReady) {
-			err = ErrMemberToolDenied
+	if !returnOnly {
+		f := taskWorkFacts{v: v, d: taskWorkRecord(v, "", "")}
+		if _, err := s.taskWorkOwnerChatActionInTx(ctx, tx, f); err != nil {
+			if errors.Is(err, errTaskWorkChatScope) || errors.Is(err, ErrTaskInvestigationNotReady) {
+				err = ErrMemberToolDenied
+			}
+			return CoordinationToolScope{}, zero, err
 		}
-		return CoordinationToolScope{}, zero, err
 	}
 	return role, v, nil
 }
@@ -241,8 +252,8 @@ func (s *Store) ListWorkInputsForMember(ctx context.Context, scope MemberToolSco
 	if err == nil && installed {
 		const inboxLimit = 50
 		args := workerWorkInputArgs(role.Provenance)
-		// Reserve one slot for the most recent confirmed constraint even if
-		// the inbox is full; older confirmed state is in scoped history.
+		// Reserve one slot for the most recent acknowledged delta, not the
+		// before/after snapshot of an acknowledged context-only input.
 		var confirmed []domain.TaskWorkInput
 		confirmed, err = workInputsInTx(ctx, tx, workerWorkInputWhere+` AND c.input_id IS NOT NULL AND i.after_revision>i.before_revision
 		 ORDER BY i.after_revision DESC LIMIT 1`, args...)

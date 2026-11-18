@@ -17,6 +17,10 @@ func taskWorkFollowupProvenance(f taskWorkFacts) CoordinationRoleProvenance {
 }
 
 func (s *Store) taskWorkFollowupRoleInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, turnID string) (CoordinationRoleState, error) {
+	return s.taskWorkFollowupOwnerRoleInTx(ctx, tx, f, turnID, false)
+}
+
+func (s *Store) taskWorkFollowupOwnerRoleInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, turnID string, returnOnly bool) (CoordinationRoleState, error) {
 	// Other typed sources do not fall through as chat. Their role policy is
 	// deliberately not defined by the followup path.
 	if f.d.SourceKind != domain.TaskWorkSourceFollowup || f.turnID != turnID {
@@ -28,7 +32,7 @@ func (s *Store) taskWorkFollowupRoleInTx(ctx context.Context, tx *sql.Tx, f task
 		Scan(&state.ProviderID, &state.Model); err != nil {
 		return CoordinationRoleState{}, coordinationRoleRelationError(err)
 	}
-	blocked, _, err := s.taskWorkReadinessInTx(ctx, tx, f, turnID)
+	blocked, _, err := s.taskWorkReadinessForOwnerInTx(ctx, tx, f, turnID, returnOnly)
 	if err != nil {
 		return CoordinationRoleState{}, err
 	}

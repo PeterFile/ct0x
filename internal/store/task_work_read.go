@@ -138,7 +138,7 @@ func (s *Store) ReadTaskWorkMandate(ctx context.Context, scope MemberToolScope) 
 func (s *Store) taskWorkMandateRequestInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope) (domain.DispatchRequest, error) {
 	f, err := lookupTaskWorkExecutionInTx(ctx, tx, scope)
 	if errors.Is(err, ErrNotFound) {
-		_, v, err := s.boundTaskWorkOriginalInTx(ctx, tx, scope)
+		_, v, err := s.boundTaskWorkOriginalInTx(ctx, tx, scope, false)
 		return v.r, err
 	}
 	if err != nil {

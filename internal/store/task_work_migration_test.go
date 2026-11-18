@@ -29,6 +29,9 @@ func TestTaskWorkFrozenPrefixAndRegistration(t *testing.T) {
 			t.Fatalf("staged migration v%d changed: %s", 23+i, got)
 		}
 	}
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(migrations[28]))); got != "a3d41f35bbf678377e79fd36b5ec2d088fe98f376f51323b82ad4877af5676bb" {
+		t.Fatalf("typed delivery migration v29 changed: %s", got)
+	}
 }
 
 func TestTaskWorkLegacyV27UpgradePreservesLiveHistory(t *testing.T) {

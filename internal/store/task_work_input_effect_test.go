@@ -18,10 +18,13 @@ func TestTaskWorkInputEffectKeys(t *testing.T) {
 	taskWorkTestReceipt(t, f.s, coordinator, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}, domain.TurnStateNotStarted)
 	var ids []string
 	var assessor MemberToolScope
-	for _, text := range []string{"注明摘要来源", "同时写入项目目录", "也请参考原文附注"} {
+	for idx, text := range []string{"注明摘要来源", "同时写入项目目录", "也请参考原文附注"} {
 		s, c := newWorkInputCandidate(t, f, text)
-		r, err := f.s.ApplyChatAssessmentDormant(ctx, s, c.ID, domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork,
-			Reason: "补充原任务"}, "已记录后续要求。", "effect-fixture")
+		cmd := domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork, Reason: "补充原任务"}
+		if idx < 2 {
+			cmd.Followup = &domain.ChatFollowupAssessment{Constraint: text}
+		}
+		r, err := f.s.ApplyChatAssessmentDormant(ctx, s, c.ID, cmd, "已记录后续要求。", "effect-fixture")
 		if err != nil || r.WorkInputID == "" {
 			t.Fatalf("record input: %+v %v", r, err)
 		}
@@ -110,8 +113,14 @@ func TestTaskWorkInputEffectKeys(t *testing.T) {
 	if got, err := f.s.SubmitAssignmentResult(ctx, worker, result, "original-scope"); !errors.Is(err, ErrConflict) || got.ID != "" {
 		t.Fatalf("handback bypassed a different unresolved input: %+v %v", got, err)
 	}
-	if _, err := f.s.AcknowledgeWorkInput(ctx, scope, pendingID); err != nil {
-		t.Fatal(err)
+	contextOnly, err := f.s.AcknowledgeWorkInput(ctx, scope, pendingID)
+	if err != nil || contextOnly.Consumption == nil || contextOnly.BeforeConstraintRevision != contextOnly.AfterConstraintRevision ||
+		contextOnly.AfterConstraint != returned.AfterConstraint {
+		t.Fatalf("context-only acknowledgement rewrote its captured proposal history: %+v %v", contextOnly, err)
+	}
+	items, err := f.s.ListWorkInputsForMember(ctx, scope)
+	if err != nil || len(items) != 3 || !reflect.DeepEqual(items[0], ack) {
+		t.Fatalf("returned quote displaced the acknowledged delta: %+v %v", items, err)
 	}
 	sub, err := f.s.SubmitAssignmentResult(ctx, worker, result, "original-scope")
 	if err != nil || sub.ID == "" || sub.TaskID != p.TaskID || sub.TaskRevision != p.TaskRevision || sub.AttemptID != worker.AttemptID {

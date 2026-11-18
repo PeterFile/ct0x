@@ -78,7 +78,7 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 	if candidate.SourceKind == "local_user_chat" && candidate.Policy.Enabled {
 		installed, err := workInputSchemaInTx(ctx, tx)
 		if err == nil && installed {
-			candidate.FollowupTaskIDs, err = chatFollowupTaskIDsInTx(ctx, tx, candidate, 5)
+			candidate.FollowupTaskIDs, err = s.chatFollowupTaskIDsInTx(ctx, tx, candidate, 5)
 		}
 		if err != nil {
 			return domain.ChatCandidate{}, memberToolOperationError("读取原任务提示失败", err)

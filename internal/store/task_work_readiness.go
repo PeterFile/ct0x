@@ -44,6 +44,10 @@ func taskWorkCurrentInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts) (bloc
 }
 
 func (s *Store) taskWorkReadinessInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, turnID string) (blocked, active string, err error) {
+	return s.taskWorkReadinessForOwnerInTx(ctx, tx, f, turnID, false)
+}
+
+func (s *Store) taskWorkReadinessForOwnerInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, turnID string, returnOnly bool) (blocked, active string, err error) {
 	d := f.d
 	if d.SourceKind != domain.TaskWorkSourceFollowup {
 		return "", "", ErrMemberToolDenied
@@ -64,14 +68,16 @@ func (s *Store) taskWorkReadinessInTx(ctx context.Context, tx *sql.Tx, f taskWor
 	if err != nil || blocked != "" {
 		return blocked, active, err
 	}
-	_, err = s.taskWorkOwnerChatActionInTx(ctx, tx, f)
-	switch {
-	case errors.Is(err, errTaskWorkChatScope):
-		return "chat_scope_unavailable", active, nil
-	case errors.Is(err, ErrTaskInvestigationNotReady):
-		return "investigation_scope_stale", active, nil
-	case err != nil:
-		return "", "", err
+	if !returnOnly || turnID == "" {
+		_, err = s.taskWorkOwnerChatActionInTx(ctx, tx, f)
+		switch {
+		case errors.Is(err, errTaskWorkChatScope):
+			return "chat_scope_unavailable", active, nil
+		case errors.Is(err, ErrTaskInvestigationNotReady):
+			return "investigation_scope_stale", active, nil
+		case err != nil:
+			return "", "", err
+		}
 	}
 	var initialAttempt, initialTurn string
 	err = tx.QueryRowContext(ctx, `SELECT attempt_id,turn_id FROM coordination_assignment_attempts WHERE assignment_id=?`, d.AssignmentID).Scan(&initialAttempt, &initialTurn)

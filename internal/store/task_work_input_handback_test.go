@@ -11,21 +11,30 @@ import (
 )
 
 func TestTaskWorkFollowupHandback(t *testing.T) {
-	for _, name := range []string{"original", "continuation"} {
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		continuation bool
+		stale        bool
+	}{
+		{name: "original"},
+		{name: "continuation", continuation: true},
+		{name: "policy-changed-before-return", continuation: true, stale: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			f := chatSetup(t, "user", false)
 			f.s.EnableTaskWorkExecution()
 			old := chatAuthorityWorker(t, f)
 			p := old.Provenance
 			const text = "还需要将摘要写入项目目录"
 			s, c := newWorkInputCandidate(t, f, text)
-			cmd := domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork, Reason: "由执行成员核对是否属于原授权"}
+			cmd := domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork, Reason: "由执行成员核对是否属于原授权",
+				Followup: &domain.ChatFollowupAssessment{Constraint: text}}
 			r, err := f.s.ApplyChatAssessment(ctx, s, c.ID, cmd, "记录要求。", "handback-fixture")
 			if err != nil || r.WorkDeliveryID == "" {
 				t.Fatalf("work input: %+v %v", r, err)
 			}
 			scope, attemptID := old.Member, old.AttemptID
-			if name == "continuation" {
+			if tc.continuation {
 				co := taskWorkTestCoordinator(t, f.s, p.GroupID, p.AssignmentID)
 				for _, prior := range []MemberToolScope{co, old.Member} {
 					taskWorkTestReceipt(t, f.s, prior, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}, domain.TurnStateNotStarted)
@@ -41,7 +50,22 @@ func TestTaskWorkFollowupHandback(t *testing.T) {
 				}
 				attemptID = a.ID
 			}
-			const reason = "原任务只授权在群内交付文本，未授权目录写入"
+			changePolicy := func(enabled bool, expected int64) domain.ChatPolicy {
+				t.Helper()
+				policy, err := f.s.SetChatPolicy(ctx, c.ThreadRef, domain.ChatPolicyRequest{Enabled: enabled,
+					Action: domain.ChatActionTextSubmission, MaxAdmissions: 2}, expected, "return-policy")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return policy
+			}
+			policy := f.policy
+			if tc.stale {
+				// Enabled is not enough: the original authorization was bound to its earlier policy.
+				policy = changePolicy(true, policy.Revision)
+			}
+			// A worker's reason does not decide which authority is available.
+			const reason = "我认为可以直接按现有授权写入目录"
 			for _, denied := range []MemberToolScope{s, {Claim: scope.Claim, MemberID: f.foreign, ConversationID: scope.ConversationID, TopicID: scope.TopicID}} {
 				if _, err := f.s.HandBackWorkInput(ctx, denied, r.WorkInputID, reason); !errors.Is(err, ErrMemberToolDenied) {
 					t.Fatalf("another scope could return the owner's input: %v", err)
@@ -49,9 +73,18 @@ func TestTaskWorkFollowupHandback(t *testing.T) {
 			}
 			protected := []string{"tasks", "task_attempts", "turns", "resource_claims", "coordination_assignments", "mandates", "message_command_sources"}
 			before := messageSequenceSnapshot(t, f.s)
-			got, err := f.s.HandBackWorkInput(ctx, scope, r.WorkInputID, reason)
-			if err != nil || got.Return == nil || got.Return.MemberID != p.MemberID || got.Return.AttemptID != attemptID || got.Return.TurnID != scope.Claim.TurnID || got.Return.Reason != reason || got.Content != text || got.ReplyMessageID != c.MessageID || got.Consumption != nil {
+			const key = "return-with-policy"
+			got, err := f.s.HandBackWorkInputWithKey(ctx, scope, r.WorkInputID, reason, key)
+			if err != nil || got.Return == nil || got.Return.MemberID != p.MemberID || got.Return.AttemptID != attemptID || got.Return.TurnID != scope.Claim.TurnID || got.Return.Reason != reason || got.Content != text || got.ReplyMessageID != c.MessageID || got.Consumption != nil || got.AfterConstraint != text {
 				t.Fatalf("handback merged authority or lost the human source: %+v %v", got, err)
+			}
+			phrase, disposition := "单独授权", domain.TaskWorkInputReturnSeparateAuthorizationRequired
+			if tc.stale {
+				phrase, disposition = "当前授权不可用", domain.TaskWorkInputReturnOriginalAuthorizationUnavailable
+			}
+			if !strings.Contains(got.Return.Question, phrase) || got.Return.Disposition != disposition ||
+				got.Return.PolicyRevision != policy.Revision || got.Return.PolicySourceID != policy.ConfigurationSourceID {
+				t.Fatalf("handback ignored active policy revision %d: %+v", policy.Revision, got.Return)
 			}
 			after := messageSequenceSnapshot(t, f.s)
 			for _, table := range protected {
@@ -70,10 +103,22 @@ func TestTaskWorkFollowupHandback(t *testing.T) {
 			if _, err := f.s.HandBackWorkInput(ctx, scope, r.WorkInputID, "不同原因"); !errors.Is(err, ErrConflict) {
 				t.Fatalf("return history was replaceable: %v", err)
 			}
-			if _, err := f.s.AcknowledgeWorkInput(ctx, scope, r.WorkInputID); !errors.Is(err, ErrConflict) {
-				t.Fatalf("handback was converted into confirmation: %v", err)
+			if !tc.continuation {
+				if wake, err := f.s.ResolveTaskWorkDelivery(ctx, p.GroupID, r.WorkDeliveryID); err != nil || wake.Blocked != "followup_handled" {
+					t.Fatalf("returned input remained executable: %+v %v", wake, err)
+				}
 			}
-			page, err := f.s.ListWorkInputHistoryForMember(ctx, scope, ListOptions{Limit: 1})
+			if !tc.stale {
+				if _, err := f.s.AcknowledgeWorkInput(ctx, scope, r.WorkInputID); !errors.Is(err, ErrConflict) {
+					t.Fatalf("handback was converted into confirmation: %v", err)
+				}
+				changePolicy(false, policy.Revision)
+			}
+			after = messageSequenceSnapshot(t, f.s)
+			if again, err := f.s.HandBackWorkInputWithKey(ctx, scope, r.WorkInputID, reason, key); err != nil || !reflect.DeepEqual(again, got) {
+				t.Fatalf("policy drift changed the exact keyed handback: %+v %v", again, err)
+			}
+			page, err := f.s.ListTaskWorkInputs(ctx, p.GroupID, p.TaskID, ListOptions{Limit: 1})
 			if err != nil || len(page.Items) != 1 || !reflect.DeepEqual(page.Items[0], got) || page.NextCursor != nil {
 				t.Fatalf("work history lost returned input: %+v %v", page, err)
 			}
