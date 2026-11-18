@@ -64,12 +64,19 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 				return domain.ChatPolicy{}, fmt.Errorf("%w：当前数据库版本不支持目录工作准入", ErrInvalid)
 			}
 		}
+		investigation, err := prepareChatInvestigationPolicyInTx(ctx, tx, thread, input.Investigation)
+		if err != nil {
+			return domain.ChatPolicy{}, admissionError("验证只读调查策略失败", err)
+		}
 		rule := fmt.Sprintf("本机用户已配置本群、本话题聊天准入策略：启用=%t；仅允许纯文本交付；本版总准入额度=%d。", input.Enabled, input.MaxAdmissions)
 		if input.AllowWorkspaceChanges {
 			rule = fmt.Sprintf("本机用户已配置本群、本话题聊天准入策略：启用=%t；允许纯文本交付，以及真实用户明确请求且已有读写目录授权的目录工作；本版总准入额度=%d。", input.Enabled, input.MaxAdmissions)
 		}
 		if input.AllowPreparation {
 			rule += "\n预授权范围 topic_summary：仅依据本群本话题已有消息准备纯文本摘要；目标与验收由服务端固定。不得改为其他目标、引用Artifact版本、读写文件或执行外部动作。"
+		}
+		if investigation != "" {
+			rule += "\n预授权范围 read_only_investigation：只读调查并交付纯文本；只允许以下明确配置的资料，不授予文件、进程或网络权限。\n" + investigation
 		}
 		command, err := createMessageInTx(ctx, tx, MessageRequest{GroupID: thread.GroupID, TopicID: thread.TopicID, ActorID: "user", Content: rule, RecipientIDs: []string{}}, nil)
 		if err != nil {
@@ -96,6 +103,11 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 				return domain.ChatPolicy{}, admissionError("保存目录工作策略失败", err)
 			}
 		}
+		if investigation != "" {
+			if err := coordinatorWrite(ctx, tx, `INSERT INTO chat_investigation_policy_revisions(group_id,topic_id,revision,scope_json) VALUES(?,?,?,?)`, thread.GroupID, thread.TopicID, revision, investigation); err != nil {
+				return domain.ChatPolicy{}, admissionError("保存只读调查策略失败", err)
+			}
+		}
 		if expected == 0 {
 			err = coordinatorWrite(ctx, tx, "INSERT INTO chat_policies(group_id,topic_id,revision) VALUES(?,?,?)", thread.GroupID, thread.TopicID, revision)
 		} else {
@@ -115,6 +127,7 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 	if err := tx.Commit(); err != nil {
 		return domain.ChatPolicy{}, admissionError("保存聊天策略失败", err)
 	}
+	policy.InvestigationExecutionEnabled = policy.InvestigationSupported && s.investigationExecution.Load()
 	return policy, nil
 }
 
@@ -134,16 +147,25 @@ func (s *Store) GetChatPolicy(ctx context.Context, thread domain.ThreadRef) (dom
 	if err := tx.Commit(); err != nil {
 		return domain.ChatPolicy{}, admissionError("读取聊天策略失败", err)
 	}
+	policy.InvestigationExecutionEnabled = policy.InvestigationSupported && s.investigationExecution.Load()
 	return policy, nil
+}
+
+func chatPolicyCapabilitiesInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef) (domain.ChatPolicy, error) {
+	workspace, err := chatWorkspaceSupportedInTx(ctx, tx)
+	if err != nil {
+		return domain.ChatPolicy{}, err
+	}
+	investigation, err := chatInvestigationSupportedInTx(ctx, tx)
+	return domain.ChatPolicy{ThreadRef: thread, WorkspaceChangesSupported: workspace, InvestigationSupported: investigation}, err
 }
 
 // revision=0 selects current; absence is explicitly disabled, not inferred authorization.
 func chatPolicyInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, revision int64) (domain.ChatPolicy, error) {
-	supported, err := chatWorkspaceSupportedInTx(ctx, tx)
+	policy, err := chatPolicyCapabilitiesInTx(ctx, tx, thread)
 	if err != nil {
 		return domain.ChatPolicy{}, err
 	}
-	policy := domain.ChatPolicy{ThreadRef: thread, WorkspaceChangesSupported: supported}
 	query := `SELECT r.revision,r.enabled,r.allow_preparation,coalesce(r.preauthorization_message_id,''),r.action,r.max_admissions,r.authorized_by,coalesce(m.content,'')
 	 FROM chat_policy_revisions r LEFT JOIN messages m ON m.id=r.preauthorization_message_id
 	 WHERE r.group_id=? AND r.topic_id=? AND r.revision=?`
@@ -173,10 +195,13 @@ func chatPolicyInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, re
 			}
 		}
 		policy.PreparationSupported = policy.AllowPreparation && policy.PreparationScopeKind == domain.ChatPreparationTopicSummary && policy.ConfigurationSourceID != ""
-		if supported {
+		if policy.WorkspaceChangesSupported {
 			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM chat_workspace_policy_revisions WHERE group_id=? AND topic_id=? AND revision=? AND allow_workspace_changes=1)`, thread.GroupID, thread.TopicID, policy.Revision).Scan(&policy.AllowWorkspaceChanges); err != nil {
 				return domain.ChatPolicy{}, err
 			}
+		}
+		if policy.InvestigationSupported {
+			policy.Investigation, err = chatInvestigationPolicyInTx(ctx, tx, thread, policy.Revision)
 		}
 	}
 	return policy, err

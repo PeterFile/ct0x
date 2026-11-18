@@ -29,7 +29,7 @@ func (s *Store) SubmitTask(ctx context.Context, input SubmitTaskInput) (domain.S
 		return domain.Submission{}, taskError("提交任务失败", err)
 	}
 	defer tx.Rollback()
-	submission, err := submitTaskInTx(ctx, tx, input)
+	submission, err := s.submitTaskInTx(ctx, tx, input, nil)
 	if err != nil {
 		if errors.Is(err, ErrMemberToolDenied) {
 			return domain.Submission{}, ErrMemberToolDenied
@@ -42,7 +42,8 @@ func (s *Store) SubmitTask(ctx context.Context, input SubmitTaskInput) (domain.S
 	return submission, nil
 }
 
-func submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (domain.Submission, error) {
+// Only the formal assignment result supplies a topic for a new chat notice.
+func (s *Store) submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput, noticeTopic *string) (domain.Submission, error) {
 	// Current authority precedes receipts and all task/attempt reads.
 	turnID, err := taskActorInTx(ctx, tx, input.GroupID, input.ActorID, input.MemberScope)
 	if err != nil {
@@ -73,7 +74,8 @@ func submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (dom
 	if actorID != input.ActorID || (input.ActorID != "user" && attempt.TurnID != turnID) {
 		return domain.Submission{}, ErrMemberToolDenied
 	}
-	if err := chatTextSubmissionInTx(ctx, tx, input); err != nil {
+	investigation, err := s.chatTextSubmissionInTx(ctx, tx, input)
+	if err != nil {
 		return domain.Submission{}, err
 	}
 	next, submission, err := task.Submit(domain.Submission{
@@ -105,6 +107,16 @@ func submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (dom
 	}
 	if changed != 1 {
 		return domain.Submission{}, fmt.Errorf("%w：任务当前状态已改变", ErrConflict)
+	}
+	if noticeTopic != nil {
+		if err := chatSubmissionNoticeInTx(ctx, tx, submission, *noticeTopic); err != nil {
+			return domain.Submission{}, err
+		}
+	}
+	if investigation.TaskID != "" {
+		if err := s.checkInvestigationSubmissionWriteInTx(ctx, tx, investigation, input, submission.ID); err != nil {
+			return domain.Submission{}, err
+		}
 	}
 	return submission, nil
 }

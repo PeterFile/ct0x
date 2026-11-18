@@ -66,12 +66,27 @@ func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		MessageID: candidate.MessageID, SourceSenderID: candidate.SourceSenderID, AssessedBy: scope.MemberID, TurnID: scope.Claim.TurnID,
 		PolicyRevision: candidate.Policy.Revision, CandidateGeneration: candidate.Generation, Disposition: input.Disposition,
 		Action: input.Action, CreatedAt: time.Now().UTC(), Purpose: candidate.Purpose, SourceID: candidate.SourceID, SourceKind: candidate.SourceKind, Outcome: input.Disposition}
+	if input.DiscussionOnlyExcerpt != nil {
+		excerpt := *input.DiscussionOnlyExcerpt
+		if err := verifyChatDiscussionOnlyInTx(ctx, tx, scope, candidate, excerpt); err != nil {
+			return domain.ChatAssessmentReceipt{}, memberToolOperationError("验证仅讨论限制失败", err)
+		}
+		receipt.DiscussionOnly, receipt.DiscussionOnlyExcerpt = true, excerpt
+	}
 	decisionID := ""
 	var workspace *domain.TaskWorkspaceScope
 	var repair *domain.ChatRepairSource
+	var investigationAuthorization string
 	wantsWork := input.Disposition == "request_work" || input.Disposition == "prepare_work"
 	if wantsWork {
 		err := chatAdmissionGateInTx(ctx, tx, candidate, input)
+		if err == nil && input.Action == domain.ChatActionReadOnlyInvestigation {
+			investigationAuthorization, err = s.chatInvestigationAdmissionInTx(ctx, tx, candidate, input)
+			if err == nil {
+				// Keep the live delivery/source fence for unstructured investigations too.
+				_, err = chatDiscussionArrivalInTx(ctx, tx, scope, candidate.ID)
+			}
+		}
 		if err == nil && input.Repair != nil {
 			repair, err = chatRepairAdmissionInTx(ctx, tx, candidate, input)
 		}
@@ -94,11 +109,13 @@ func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, 
 	}
 	if wantsWork {
 		receipt.Outcome = "admitted"
-		if input.Disposition == "prepare_work" {
-			input.Title, input.Description, input.Acceptance = chatSummaryTask(candidate)
-		}
 		receipt.Authority, receipt.AuthorizationMessageID = "explicit_request", candidate.MessageID
-		if input.Disposition == "prepare_work" {
+		if input.Action == domain.ChatActionReadOnlyInvestigation {
+			input.Title, input.Description, input.Acceptance = chatInvestigationTask(candidate)
+			input.Reason = "按本机用户的当前只读调查策略准备文本交付。"
+			receipt.Authority, receipt.AuthorizationMessageID = "written_preauthorization", investigationAuthorization
+		} else if input.Disposition == "prepare_work" {
+			input.Title, input.Description, input.Acceptance = chatSummaryTask(candidate)
 			receipt.Authority, receipt.AuthorizationMessageID = "written_preauthorization", candidate.Policy.PreauthorizationMessageID
 		}
 		if repair != nil {
@@ -184,6 +201,9 @@ func validateChatAssessment(input domain.ChatAssessment, content string) error {
 	if !memberToolTextValid(input.Reason, 4096) || !memberToolTextValid(content, 16384) {
 		return ErrInvalid
 	}
+	if input.DiscussionOnlyExcerpt != nil && (input.Disposition != "discuss" || !memberToolTextValid(*input.DiscussionOnlyExcerpt, chatDiscussionOnlyExcerptBytes)) {
+		return ErrInvalid
+	}
 	if input.Repair != nil {
 		if input.Disposition != "request_work" || !validTriggerID(input.Repair.ReviewID) {
 			return ErrInvalid
@@ -232,7 +252,7 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 	if current.Revision != c.Policy.Revision || current.Revision < 1 {
 		return chatDeny("stale_policy", "评估绑定的策略版本已经变化。", "是否以当前策略重新评估最新请求？")
 	}
-	if current.Action != domain.ChatActionTextSubmission || (input.Action != domain.ChatActionTextSubmission && input.Action != domain.ChatActionWorkspaceChange) {
+	if current.Action != domain.ChatActionTextSubmission || (input.Action != domain.ChatActionTextSubmission && input.Action != domain.ChatActionWorkspaceChange && input.Action != domain.ChatActionReadOnlyInvestigation) {
 		return chatDeny("unsupported_action", "本版策略不支持所提动作。", "是否只需要在群聊交付纯文本？")
 	}
 	if input.Action == domain.ChatActionWorkspaceChange && !current.AllowWorkspaceChanges {
@@ -241,11 +261,8 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 	// Generation is the actual source's committed position, not the chat head.
 	// Later user messages supersede it even before capture; member replies do not
 	// change user authority. Keep the range anchored to the immutable source.
-	var superseded bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-	 SELECT 1 FROM message_log l JOIN message_command_sources s ON s.message_id=l.message_id AND s.kind='local_user_chat'
-	 WHERE l.group_id=? AND l.topic_id=? AND l.sequence>?)`,
-		c.GroupID, c.TopicID, c.Generation).Scan(&superseded); err != nil {
+	superseded, err := chatSourceSupersededInTx(ctx, tx, c.ThreadRef, c.Generation)
+	if err != nil {
 		return err
 	}
 	binding, policy, err := chatDispatchRevisionsInTx(ctx, tx, c.GroupID)
@@ -253,7 +270,7 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 		return err
 	}
 	if superseded {
-		return chatDeny("stale_source", "已有更新的真实用户聊天命令，本次旧评估未产生新工作。", "是否以最新用户要求为准？")
+		return chatStaleSource()
 	}
 	if binding != c.BindingRevision || policy != c.DispatchPolicyRevision {
 		return chatDeny("stale_dispatch_configuration", "协调员绑定或分派策略已变化。", "是否按当前协调配置重新评估？")
@@ -286,7 +303,7 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 		}
 		return chatDeny("user_request_required", "成员建议或共识不能替代用户的工作请求。", question)
 	}
-	if input.Disposition == "prepare_work" {
+	if input.Disposition == "prepare_work" && input.Action != domain.ChatActionReadOnlyInvestigation {
 		if !current.PreparationSupported || current.PreauthorizationMessageID == "" || current.AuthorizedBy != "user" {
 			return chatDeny("preparation_not_authorized", "未启用受支持的结构化准备范围；旧自由文本规则不被升级为权限。", "是否显式启用本话题纯文本摘要准备范围？")
 		}
@@ -300,6 +317,9 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 	}
 	if routed {
 		return chatDeny("source_already_routed", "此来源已有持久工作路由，本次没有重复准入。", "是否先查看该来源已有的任务？")
+	}
+	if err := chatDiscussionWorkGateInTx(ctx, tx, c); err != nil {
+		return err
 	}
 	var used int
 	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM chat_candidates c JOIN chat_assessments a ON a.candidate_id=c.id

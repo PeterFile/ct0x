@@ -15,7 +15,7 @@ type AssignmentResultInput struct {
 }
 
 // SubmitAssignmentResult preserves submitTaskInTx's operation, payload, replay
-// order and same-Turn fence. Starting readiness is deliberately not consulted.
+// order and same-Turn fence. Only fresh investigation writes recheck live readiness.
 func (s *Store) SubmitAssignmentResult(ctx context.Context, scope CoordinationToolScope, input AssignmentResultInput, key string) (out domain.Submission, err error) {
 	phase := "begin"
 	var tx *sql.Tx
@@ -49,7 +49,7 @@ func (s *Store) SubmitAssignmentResult(ctx context.Context, scope CoordinationTo
 	if err != nil {
 		return out, err
 	}
-	result, err := submitTaskInTx(ctx, tx, derived)
+	result, err := s.submitTaskInTx(ctx, tx, derived, &scope.Member.TopicID)
 	if err != nil {
 		return out, err
 	}
@@ -80,9 +80,6 @@ func (s *Store) SubmitAssignmentResult(ctx context.Context, scope CoordinationTo
 		if task.Status != domain.TaskStatusSubmitted || task.Revision != binding.TaskRevision ||
 			task.ActiveAttemptID != binding.AttemptID || task.CurrentSubmissionID != result.ID {
 			return out, ErrConflict
-		}
-		if err := chatSubmissionNoticeInTx(ctx, tx, result, scope.Member.TopicID); err != nil {
-			return out, err
 		}
 	}
 	if key != "" {

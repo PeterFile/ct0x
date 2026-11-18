@@ -38,9 +38,20 @@ func coordinationDecideLiveInTx(ctx context.Context, tx *sql.Tx, m MemberToolSco
 	return err
 }
 
+func coordinationExecutionProvenanceInTx(ctx context.Context, tx *sql.Tx, member MemberToolScope, expected CoordinationRoleProvenance) (CoordinationRoleProvenance, error) {
+	actual, err := coordinationClaimProvenanceInTx(ctx, tx, member)
+	if err == nil && actual != expected {
+		err = ErrMemberToolDenied
+	}
+	if err != nil {
+		return CoordinationRoleProvenance{}, err
+	}
+	return actual, nil
+}
+
 // Raw receipt candidates are selected before validating relations: a broken second role cannot disappear.
 // Each receipt delivery key is UNIQUE, so this observes at most two candidates. No current eligibility is read.
-func coordinationExecutionProvenanceInTx(ctx context.Context, tx *sql.Tx, member MemberToolScope, expected CoordinationRoleProvenance) (CoordinationRoleProvenance, error) {
+func coordinationClaimProvenanceInTx(ctx context.Context, tx *sql.Tx, member MemberToolScope) (CoordinationRoleProvenance, error) {
 	rows, err := tx.QueryContext(ctx, `WITH source AS (
 	 SELECT 'coordinator' kind,s.request_id,s.task_id,s.group_id,s.delivery_id,s.message_id,s.conversation_id,
 	 s.delivered_member_id,'' assignment_id,1 linked FROM coordination_dispatch_state s WHERE s.delivery_id=(SELECT delivery_id FROM turns WHERE id=?)
@@ -79,7 +90,7 @@ func coordinationExecutionProvenanceInTx(ctx context.Context, tx *sql.Tx, member
 	if err := rows.Err(); err != nil {
 		return CoordinationRoleProvenance{}, err
 	}
-	if count != 1 || !valid || actual != expected {
+	if count != 1 || !valid {
 		return CoordinationRoleProvenance{}, ErrMemberToolDenied
 	}
 	return actual, nil

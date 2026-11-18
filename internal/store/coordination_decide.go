@@ -25,7 +25,7 @@ type DispatchWorkerCapabilityFact struct {
 	MemberID   string `json:"-"`
 	ProviderID string `json:"-"`
 	Model      string `json:"-"`
-	// File facts bind an exact verified profile to this immutable Task scope.
+	// Restricted facts bind a verified profile to an exact Task scope.
 	RequiredProfile string `json:"-"`
 	TaskID          string `json:"-"`
 	TaskRevision    int64  `json:"-"`
@@ -35,6 +35,9 @@ type DispatchWorkerCapabilityFact struct {
 }
 
 const DispatchWorkspaceWorkerProfile = "workspace_worker/v1"
+
+// DispatchInvestigationWorkerProfile identifies a sampled read-only worker.
+const DispatchInvestigationWorkerProfile = "investigation_worker/v1"
 
 // DecideDispatchWithCapabilities additionally binds a new assignment to frozen
 // server capability facts. Historical receipts retain the original replay order.
@@ -90,13 +93,8 @@ func (s *Store) decideDispatch(ctx context.Context, scope CoordinationToolScope,
 		if state.Generation == math.MaxInt64 {
 			return out, ErrInvalid
 		}
-		if err := coordinationDecideEligibleInTx(ctx, tx, r, input.WorkerMemberID, ""); err != nil {
+		if err := s.coordinationDecideNewInTx(ctx, tx, r, input.WorkerMemberID, "", facts, requireCapabilities); err != nil {
 			return out, err
-		}
-		if input.Kind == "assign" {
-			if err := coordinationDecideCapabilityInTx(ctx, tx, r, input.WorkerMemberID, facts, requireCapabilities); err != nil {
-				return out, err
-			}
 		}
 		at := time.Now().UTC()
 		stamp := at.Format(timestampLayout)
@@ -184,13 +182,8 @@ func (s *Store) decideDispatch(ctx context.Context, scope CoordinationToolScope,
 		if _, err := coordinationExecutionProvenanceInTx(ctx, tx, scope.Member, p); err != nil {
 			return out, err
 		}
-		if err := coordinationDecideEligibleInTx(ctx, tx, r, input.WorkerMemberID, want.Decision.AssignmentID); err != nil {
+		if err := s.coordinationDecideNewInTx(ctx, tx, r, input.WorkerMemberID, want.Decision.AssignmentID, facts, requireCapabilities); err != nil {
 			return out, err
-		}
-		if input.Kind == "assign" {
-			if err := coordinationDecideCapabilityInTx(ctx, tx, r, input.WorkerMemberID, facts, requireCapabilities); err != nil {
-				return out, err
-			}
 		}
 	}
 	result, err := coordinationDecideReceiptInTx(ctx, tx, r.GroupID, r.ID)
@@ -208,9 +201,21 @@ func (s *Store) decideDispatch(ctx context.Context, scope CoordinationToolScope,
 	return result, nil
 }
 
+func (s *Store) coordinationDecideNewInTx(ctx context.Context, tx *sql.Tx, r domain.DispatchRequest, workerID, ownAssignment string, facts []DispatchWorkerCapabilityFact, required bool) error {
+	if err := coordinationDecideEligibleInTx(ctx, tx, r, workerID, ownAssignment); err != nil {
+		return err
+	}
+	decline := workerID == "" // Only a validated decline has no worker ID.
+	investigation, err := s.investigationDispatchInTx(ctx, tx, r, decline)
+	if err != nil || decline { // Decline still requires current authority, not a worker fact.
+		return err
+	}
+	return coordinationDecideCapabilityInTx(ctx, tx, r, workerID, facts, required, investigation)
+}
+
 // Only compare immutable server facts with current rows here. Capability
 // sampling, filesystem validation and adapter code must stay outside SQL txs.
-func coordinationDecideCapabilityInTx(ctx context.Context, tx *sql.Tx, r domain.DispatchRequest, workerID string, facts []DispatchWorkerCapabilityFact, required bool) error {
+func coordinationDecideCapabilityInTx(ctx context.Context, tx *sql.Tx, r domain.DispatchRequest, workerID string, facts []DispatchWorkerCapabilityFact, required, investigation bool) error {
 	scope, err := taskWorkspaceScopeInTx(ctx, tx, r.GroupID, r.TaskID)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return err
@@ -222,14 +227,18 @@ func coordinationDecideCapabilityInTx(ctx context.Context, tx *sql.Tx, r domain.
 		if err != nil {
 			return err
 		}
-		if scope.TaskRevision != r.TaskRevision || scope.DispatchRequestID != r.ID || scope.MandateID != r.MandateID {
+		if investigation || scope.TaskRevision != r.TaskRevision || scope.DispatchRequestID != r.ID || scope.MandateID != r.MandateID {
 			return ErrConflict
 		}
-	} else if !required {
+	} else if !required && !investigation {
 		return nil
 	}
 	for _, fact := range facts {
 		if fact.GroupID != r.GroupID || fact.MemberID != workerID || fact.ProviderID == "" || fact.Model == "" {
+			continue
+		}
+		if investigation != (fact.RequiredProfile == DispatchInvestigationWorkerProfile) ||
+			investigation && (fact.TaskID != r.TaskID || fact.TaskRevision != r.TaskRevision) {
 			continue
 		}
 		if fileTask && (fact.RequiredProfile != DispatchWorkspaceWorkerProfile || fact.TaskID != scope.TaskID || fact.TaskRevision != scope.TaskRevision || fact.ResourceKey != scope.ResourceKey || fact.NodeID != scope.NodeID || fact.GrantID != grant.GrantID) {

@@ -138,9 +138,19 @@ func coordinationQueuedProvenanceInTx(ctx context.Context, tx *sql.Tx, base Coor
 	return actual, nil
 }
 
-// ResolveCoordinationExecution keeps identity separate from startup readiness.
-// The same transaction fences the live claim, then re-derives all provenance.
-func (s *Store) ResolveCoordinationExecution(ctx context.Context, scope MemberToolScope, expected CoordinationRoleProvenance) (out CoordinationRoleState, err error) {
+// ResolveCoordinationExecution fences the live claim for a generic role. An
+// investigation Task must never fall back to the generic execution profile.
+func (s *Store) ResolveCoordinationExecution(ctx context.Context, scope MemberToolScope, expected CoordinationRoleProvenance) (CoordinationRoleState, error) {
+	return s.resolveCoordinationExecution(ctx, scope, expected, false)
+}
+
+// ResolveInvestigationExecution is for trusted wiring of the read-only profile.
+// It rechecks live authority in the role transaction; it issues no tools.
+func (s *Store) ResolveInvestigationExecution(ctx context.Context, scope MemberToolScope, expected CoordinationRoleProvenance) (CoordinationRoleState, error) {
+	return s.resolveCoordinationExecution(ctx, scope, expected, true)
+}
+
+func (s *Store) resolveCoordinationExecution(ctx context.Context, scope MemberToolScope, expected CoordinationRoleProvenance, investigation bool) (out CoordinationRoleState, err error) {
 	phase := "begin"
 	var tx *sql.Tx
 	defer func() { err = coordinationAssignmentFinish(tx, phase, err) }()
@@ -164,6 +174,9 @@ func (s *Store) ResolveCoordinationExecution(ctx context.Context, scope MemberTo
 	}
 	p, err := coordinationExecutionProvenanceInTx(ctx, tx, scope, expected)
 	if err != nil {
+		return out, err
+	}
+	if _, err := s.investigationProfileInTx(ctx, tx, p, investigation); err != nil {
 		return out, err
 	}
 	state, err := coordinationRoleStateInTx(ctx, tx, scope, p)

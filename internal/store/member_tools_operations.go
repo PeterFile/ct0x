@@ -66,6 +66,18 @@ func (s *Store) ReadChannelForTool(ctx context.Context, scope MemberToolScope, o
 		return Page[domain.Message]{}, memberToolOperationError(action, err)
 	}
 	defer tx.Rollback()
+	page, err := readCurrentChannelInTx(ctx, tx, scope, options)
+	if err != nil {
+		return Page[domain.Message]{}, memberToolOperationError(action, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Page[domain.Message]{}, memberToolOperationError(action, err)
+	}
+	return page, nil
+}
+
+// The caller must fence the live scope in the same transaction before reading.
+func readCurrentChannelInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, options ListOptions) (Page[domain.Message], error) {
 	limit, err := listLimit(options)
 	if err != nil {
 		return Page[domain.Message]{}, err
@@ -77,22 +89,22 @@ func (s *Store) ReadChannelForTool(ctx context.Context, scope MemberToolScope, o
 	}
 	rows, err := tx.QueryContext(ctx, query+" ORDER BY created_at DESC,id DESC LIMIT ?", append(args, limit+1)...)
 	if err != nil {
-		return Page[domain.Message]{}, memberToolOperationError(action, err)
+		return Page[domain.Message]{}, err
 	}
 	defer rows.Close()
 	page := Page[domain.Message]{Items: make([]domain.Message, 0, limit+1)}
 	for rows.Next() {
 		message, err := scanMessage(rows)
 		if err != nil {
-			return Page[domain.Message]{}, memberToolOperationError(action, err)
+			return Page[domain.Message]{}, err
 		}
 		page.Items = append(page.Items, message)
 	}
 	if err := rows.Err(); err != nil {
-		return Page[domain.Message]{}, memberToolOperationError(action, err)
+		return Page[domain.Message]{}, err
 	}
 	if err := rows.Close(); err != nil {
-		return Page[domain.Message]{}, memberToolOperationError(action, err)
+		return Page[domain.Message]{}, err
 	}
 	if len(page.Items) > limit {
 		page.Items = page.Items[:limit]
@@ -101,14 +113,11 @@ func (s *Store) ReadChannelForTool(ctx context.Context, scope MemberToolScope, o
 	}
 	for i := range page.Items {
 		if err := messageDeliveries(ctx, tx, &page.Items[i]); err != nil {
-			return Page[domain.Message]{}, memberToolOperationError(action, err)
+			return Page[domain.Message]{}, err
 		}
 	}
 	if err := messageSourcesInTx(ctx, tx, page.Items); err != nil {
-		return Page[domain.Message]{}, memberToolOperationError(action, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return Page[domain.Message]{}, memberToolOperationError(action, err)
+		return Page[domain.Message]{}, err
 	}
 	return page, nil
 }

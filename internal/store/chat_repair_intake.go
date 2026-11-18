@@ -26,6 +26,7 @@ func chatRepairSupportedInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 
 // Only a NEW actual Review command reaches this hook. Missing routing leaves a
 // valid Review untouched; it is not permission to reinterpret notice text.
+// Investigation Policy authorizes preparation only, not repair intake.
 func chatRepairReviewIntakeInTx(ctx context.Context, tx *sql.Tx, decision domain.ReviewDecision) error {
 	if decision.Outcome != domain.ReviewOutcomeRejected || decision.ReviewedBy != "user" {
 		return nil
@@ -49,7 +50,8 @@ func chatRepairReviewIntakeInTx(ctx context.Context, tx *sql.Tx, decision domain
 	 JOIN members member ON member.id=b.member_id AND member.group_id=b.group_id AND member.status='active'
 	 JOIN chat_policies cp ON cp.group_id=c.group_id AND cp.topic_id=c.topic_id
 	 JOIN chat_policy_revisions p ON p.group_id=cp.group_id AND p.topic_id=cp.topic_id AND p.revision=cp.revision AND p.enabled=1
-	 WHERE rn.review_id=?`, decision.GroupID, decision.TaskID, decision.ID).Scan(&messageID, &topicID, &memberID, &binding, &policy)
+	 WHERE rn.review_id=? AND json_extract(a.receipt_json,'$.action') IS NOT ?`,
+		decision.GroupID, decision.TaskID, decision.ID, domain.ChatActionReadOnlyInvestigation).Scan(&messageID, &topicID, &memberID, &binding, &policy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
