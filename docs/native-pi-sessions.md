@@ -1,6 +1,10 @@
 # Pi 受限文本原生会话（实验性）
 
-本适配器默认关闭、未接入工厂或能力目录。仅提供 `NewPiSessionExecutor` 显式入口；离线子进程 fixture 不代表真实 Pi 续接、权限重绑或服务重启已经通过验收。
+Pi 原生会话续接默认关闭。要在 `workspace` 中为符合条件的 Pi 1.4.0 文本投递启用续接，启动时同时传入 `--enable-execution`、`--enable-member-tools` 和 `--enable-native-session-resume`。用 `--pi-member-tools-extension` 指定受信且可读的 `extensions/pi-bridge/index.ts` 的绝对路径，保留相邻的 `bridge.mjs` 和加载依赖。原生续接会校验 `index.ts` 和 `bridge.mjs` 的文件内容。
+
+为当前成员选择目录中的 Pi 1.4.0，并显式填写精确的 `provider/model-id`。普通文本和未启用工作输入的 `chat_intake` 用 `--native-pi-thinking` 显式指定 thinking，可选 `off`、`minimal`、`low`、`medium`、`high`、`xhigh` 或 `max`。不指定时仍走普通 Pi 执行，`--role-thinking` 不替代它。能力目录只报告适配器支持，不保证当前投递或历史引用符合续接条件。
+
+如果已用 `--enable-coordination-roles` 和 `--enable-codex-app-server` 开启 Codex AppServer，可以保留这两个参数。Codex AppServer 仍走原有的全新单轮，不随 Pi 启用续接。
 
 ## 使用边界
 
@@ -42,4 +46,4 @@ Store/Runtime 必须先选最新同作用域记录，再核 succeeded、引用�
 
 引用不保存 transcript、token、raw claim、配置或 argv。代码不主动把它们加入会话，但普通 prompt、工具参数/结果、模型输出或 CLI 错误仍可能包含敏感内容，不能承诺任意正文绝无秘密；验收只扫描当前已知 token 和自有受控文件，不读取个人会话。
 
-真实 Pi 文件写入及新进程同文件/ID 续接、权限撤销后的旧 token/claim 拒绝、重启和同事务绑定仍需 root 独立验收。在此之前不能据 fixture 或版本声明开启产品 resume capability。
+Pi 1.4.0 在 v26 数据库上的实测只覆盖纯讨论的两轮投递。首轮新建会话，服务冷重启后第二轮用同一文件和原生会话 ID 续接。两轮都走原有资源 claim 关口，结算后均无残留资源 claim。第二轮运行时，旧 token 的工具请求被拒绝（403），新签发的 token 仍对当前运行的 claim 有效。Task 和 Mandate 相关的续接边界只有离线验证，不在这次实测范围内。
