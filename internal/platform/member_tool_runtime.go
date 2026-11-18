@@ -327,9 +327,10 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 	config.info, err = file.Stat()
 	if err == nil {
 		err = json.NewEncoder(file).Encode(struct {
-			Endpoint string `json:"endpoint"`
-			Token    string `json:"token"`
-		}{r.endpoint, token})
+			Endpoint     string `json:"endpoint"`
+			Token        string `json:"token"`
+			ContinueWork bool   `json:"continue_work,omitempty"`
+		}{r.endpoint, token, r.tools.issuedContinueWork(token)})
 	}
 	closeErr := file.Close()
 	if err != nil || closeErr != nil || !config.valid() {

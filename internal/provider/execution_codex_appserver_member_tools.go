@@ -68,7 +68,10 @@ func readMemberToolConfig(path string) (memberToolConfig, error) {
 		return config, errPiMemberToolConfiguration
 	}
 	fields, err := codexAppServerMap(raw)
-	if err != nil || len(fields) != 2 || json.Unmarshal(fields["endpoint"], &config.endpoint) != nil || json.Unmarshal(fields["token"], &config.token) != nil {
+	// The optional Pi schema hint is not authority; Codex discovers its schema
+	// from MCP under the same bound token rather than reading the hint.
+	if err != nil || len(fields) != 2 && !(len(fields) == 3 && string(fields["continue_work"]) == "true") ||
+		json.Unmarshal(fields["endpoint"], &config.endpoint) != nil || json.Unmarshal(fields["token"], &config.token) != nil {
 		return memberToolConfig{}, errPiMemberToolConfiguration
 	}
 	parts := memberToolEndpoint.FindStringSubmatch(config.endpoint)

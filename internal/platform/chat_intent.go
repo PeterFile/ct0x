@@ -52,9 +52,14 @@ func (s *MemberTools) AssessChatIntent(ctx context.Context, token string, input 
 func (s *MemberTools) withChatIntake(token string, use func(store.MemberToolScope, string) (domain.ChatAssessmentReceipt, error)) (domain.ChatAssessmentReceipt, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	entry, found := s.capabilities[sha256.Sum256([]byte(token))]
-	if !found || entry.purpose != domain.ChatIntakePurpose || s.chatEngine == nil || entry.candidate == nil || !slices.Contains(entry.grants.Operations, "send_message") {
+	entry := s.capabilities[sha256.Sum256([]byte(token))]
+	if !s.isChatIntake(entry) {
 		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
 	}
 	return use(entry.scope, entry.candidate.ID)
+}
+
+// Caller holds the registry lock; an absent registration cannot match.
+func (s *MemberTools) isChatIntake(entry memberToolRegistration) bool {
+	return entry.purpose == domain.ChatIntakePurpose && s.chatEngine != nil && entry.candidate != nil && slices.Contains(entry.grants.Operations, "send_message")
 }

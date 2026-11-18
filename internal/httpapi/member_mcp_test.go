@@ -127,7 +127,7 @@ func TestMemberMCPProtocolOptInLifecycleAndProfile(t *testing.T) {
 				AdditionalProperties bool                       `json:"additionalProperties"`
 				Required             []string                   `json:"required"`
 			}
-			if err := json.Unmarshal(tool.InputSchema.Properties["intent_assessment"], &assessment); err != nil || len(assessment.Properties) != 9 || assessment.AdditionalProperties || !slices.Equal(assessment.Required, []string{"disposition", "reason"}) {
+			if err := json.Unmarshal(tool.InputSchema.Properties["intent_assessment"], &assessment); err != nil || len(assessment.Properties) != 8 || assessment.AdditionalProperties || !slices.Equal(assessment.Required, []string{"disposition", "reason"}) {
 				t.Fatal("source-chat schema lost the complete bridge contract")
 			}
 			var action struct {
@@ -150,13 +150,11 @@ func TestMemberMCPProtocolOptInLifecycleAndProfile(t *testing.T) {
 			if json.Unmarshal(repair.Properties["authorization"], &authorization) != nil || !slices.Equal(authorization.Enum, []string{"review_request", "original_agreement", "chat_request"}) {
 				t.Fatal("repair authorization labels changed")
 			}
-			var followup struct {
-				Properties           map[string]json.RawMessage `json:"properties"`
-				Required             []string                   `json:"required"`
-				AdditionalProperties bool                       `json:"additionalProperties"`
-			}
-			if json.Unmarshal(assessment.Properties["followup"], &followup) != nil || len(followup.Properties) != 2 || followup.Properties["task_id"] == nil || followup.Properties["constraint"] == nil || len(followup.Required) != 0 || followup.AdditionalProperties {
-				t.Fatal("followup schema must contain only the optional reference and constraint")
+			var disposition struct{ Enum []string }
+			raw := tool.InputSchema.Properties["intent_assessment"]
+			if json.Unmarshal(assessment.Properties["disposition"], &disposition) != nil || !slices.Equal(disposition.Enum, []string{"discuss", "clarify", "request_work", "prepare_work"}) ||
+				bytes.Contains(raw, []byte("continue_work")) || bytes.Contains(raw, []byte("followup")) {
+				t.Fatal("default member schema advertised opt-in continuation")
 			}
 		}
 	}
@@ -222,6 +220,23 @@ func TestMemberMCPNativeHandlersIdentityReplayAndConflicts(t *testing.T) {
 	fresh := memberMCPText(t, memberMCPHTTP(t, f, body), false)
 	if fresh == text || f.counts(t)[1] != before[1]+1 {
 		t.Fatal("different run capability collided with the old RPC id")
+	}
+}
+
+func TestLegacySendMessageRetainsSurrogateDecode(t *testing.T) {
+	f := newMemberMCPHTTP(t, "send_message")
+	const body = `{"content":"before\ud800after"}`
+	native := decoded[memberToolHTTPSendResult](t, f.request(t, "send_message", body, "legacy-surrogate"), 201)
+	var mcp memberToolHTTPSendResult
+	text := memberMCPText(t, memberMCPHTTP(t, f, memberMCPCall(`"legacy-mcp"`, "send_message", body)), false)
+	if err := json.Unmarshal([]byte(text), &mcp); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{native.MessageID, mcp.MessageID} {
+		stored, err := f.db.GetMessage(context.Background(), f.groupID, id)
+		if err != nil || stored.Content != "before�after" {
+			t.Fatal("new work tool validation changed legacy send_message decoding")
+		}
 	}
 }
 

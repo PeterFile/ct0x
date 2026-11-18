@@ -68,6 +68,11 @@ func chatHTTPBody(extra string) string {
 
 func TestChatContinuationDisabledDoesNotConsumeLegacyIntake(t *testing.T) {
 	f := chatHTTPSetup(t)
+	f.handler = mustServer(t, DefaultAddress, append(f.routes, MemberMCPRoutes(f.tools)...)...).Handler
+	list := memberMCPHTTP(t, f, `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	if list.Code != 200 || !strings.Contains(list.Body.String(), `"name":"send_message"`) || strings.Contains(list.Body.String(), `"continue_work"`) || strings.Contains(list.Body.String(), `"followup"`) {
+		t.Fatalf("disabled service changed the intake schema: %s", list.Body)
+	}
 	before := f.counts(t)
 	body := `{"content":"继续。","intent_assessment":{"disposition":"continue_work","reason":"用户明确要求续办","followup":{"task_id":"hint"}}}`
 	w := f.request(t, "send_message", body, "disabled-continuation")

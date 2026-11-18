@@ -31,7 +31,7 @@ type piMemberToolOptions struct {
 // It reuses NewExecutor's metadata/path/version gate without probing or changing
 // selected. The caller must keep the trusted extension, config and their ancestors
 // immutable for the executor's lifetime. Config must be a private 0600 JSON file
-// containing exactly endpoint and token; only the bridge reads/validates its bytes.
+// containing endpoint, token and an optional issued continuation schema hint.
 // Only the config path enters the child environment; no token is issued here.
 // The trusted extension is not a host filesystem sandbox. Tools can perform only
 // server-authorized platform operations. Default Pi executors remain tool-disabled.

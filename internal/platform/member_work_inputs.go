@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"crypto/sha256"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/store"
@@ -15,6 +16,8 @@ import (
 // Callbacks run under the registry lock and must not reenter MemberTools.
 type MemberWorkInputService interface {
 	WorkInputGrants(ctx context.Context, scope store.CoordinationToolScope) (MemberWorkInputGrants, error)
+	// This unpaged preview requires a complete response within the transport
+	// budget. Production needs a same-scope bounded page and per-input segments.
 	ReadWorkInputs(ctx context.Context, scope store.CoordinationToolScope) ([]MemberWorkInput, error)
 	AckWorkInput(ctx context.Context, scope store.CoordinationToolScope, inputID, key string) error
 	HandBackWorkInput(ctx context.Context, scope store.CoordinationToolScope, inputID, reason, key string) error
@@ -35,6 +38,20 @@ type MemberContinueWorkInput struct{ Reason, TaskID, Constraint string }
 
 // WorkInputsEnabled controls startup route composition, not per-turn authority.
 func (s *MemberTools) WorkInputsEnabled() bool { return s != nil && s.workInputs != nil }
+
+// Caller holds the registry lock. The schema hint does not grant any operation.
+func (s *MemberTools) advertisesContinueWork(entry memberToolRegistration) bool {
+	return s.WorkInputsEnabled() && s.isChatIntake(entry)
+}
+
+func (s *MemberTools) issuedContinueWork(token string) bool {
+	if !s.WorkInputsEnabled() {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.advertisesContinueWork(s.capabilities[sha256.Sum256([]byte(token))])
+}
 
 func (s *MemberTools) ReadWorkInputs(ctx context.Context, token string) ([]MemberWorkInput, error) {
 	if !s.WorkInputsEnabled() {

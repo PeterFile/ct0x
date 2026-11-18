@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"slices"
 	"strings"
@@ -64,7 +66,9 @@ func (p *workInputProbe) ContinueWork(_ context.Context, scope store.MemberToolS
 func withWorkInputProbe(t *testing.T, p *workInputProbe) *roleRuntimeFixture {
 	t.Helper()
 	f := newRoleRuntime(t)
-	f.options.WorkInputs = p
+	if p != nil {
+		f.options.WorkInputs = p
+	}
 	f.options.ChatIntake = coordination.New(f.db)
 	var err error
 	f.runtime, err = platform.NewMemberToolRuntime(f.db, f.options)
@@ -103,6 +107,21 @@ func claimWorkInputWorker(t *testing.T, f *roleRuntimeFixture) roleRun {
 	assignment, err := f.db.MaterializeAssignment(ctx, decision.Assignment.ID, 1, time.Now().UTC())
 	roleOK(t, err)
 	return f.claim(t, assignment.Delivery.DeliveryID)
+}
+
+func assertInvalidWorkMCPUnicode(t *testing.T, f *roleRuntimeFixture, token, id, name, args string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":%q,"arguments":%s}}`, id, name, args)
+	r := httptest.NewRequest(http.MethodPost, "http://"+httpapi.DefaultAddress+"/api/v1/member-tools/mcp", strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "application/json, text/event-stream")
+	r.Header.Set("MCP-Protocol-Version", "2025-06-18")
+	w := httptest.NewRecorder()
+	f.handler.ServeHTTP(w, r)
+	if w.Code != 400 || !strings.Contains(w.Body.String(), `"code":-32602`) {
+		t.Fatalf("invalid %s Unicode was not rejected before MCP binding: %d %s", name, w.Code, w.Body)
+	}
 }
 
 func TestWorkInputsRealWorkerBindingNativeAndMCP(t *testing.T) {
@@ -190,9 +209,56 @@ func TestWorkInputsRealWorkerBindingNativeAndMCP(t *testing.T) {
 					if w.Code != 500 || !strings.Contains(w.Body.String(), "未确认") || strings.Contains(w.Body.String(), "PRIVATE") {
 						t.Fatal("unconfirmed backend error was classified as a rejection or leaked")
 					}
-					p.items[0].Content = strings.Repeat("<", 12000)
-					if w := f.http(t, token, "read_work_inputs", `{}`, ""); w.Code != 413 || strings.Contains(w.Body.String(), `"items"`) {
-						t.Fatal("escaped response overflow did not fail the whole read")
+					t.Run("envelope", func(t *testing.T) {
+						const readParams = `{"name":"read_work_inputs","arguments":{}}`
+						longID := `"` + strings.Repeat(`\u0000`, 128) + `"`
+						p.items[0].Content = ""
+						empty := memberMCPRoleHTTP(t, f, token, longID, "tools/call", readParams)
+						memberMCPRoleText(t, empty, false)
+						p.items[0].Content = strings.Repeat("x", 65536-empty.Body.Len())
+						full := memberMCPRoleHTTP(t, f, token, longID, "tools/call", readParams)
+						if text := memberMCPRoleText(t, full, false); full.Body.Len() != 65536 || !strings.Contains(text, p.items[0].Content) {
+							t.Fatal("exact-limit complete MCP work input should fit without clipping")
+						}
+						for _, content := range []string{strings.Repeat(`"`, 20000), strings.Repeat("<", 12000), p.items[0].Content + "x"} {
+							p.items[0].Content = content
+							w := f.http(t, token, "read_work_inputs", `{}`, "")
+							if w.Code != 413 || !strings.Contains(w.Body.String(), `"code":"tool_result_too_large"`) {
+								t.Errorf("native read accepted work input over the full envelope budget (len=%d, status=%d)", len(content), w.Code)
+								continue
+							}
+							text := memberMCPRoleText(t, memberMCPRoleHTTP(t, f, token, "4", "tools/call", readParams), true)
+							if !strings.HasPrefix(text, w.Body.String()) || strings.Contains(text, `"items"`) || strings.Contains(text, "limit") || strings.Contains(text, "length") {
+								t.Error("MCP used a different budget or suggested nonexistent pagination")
+							}
+						}
+					})
+					if withAck {
+						t.Run("unicode", func(t *testing.T) {
+							p.mutationErr = nil
+							before := len(p.calls)
+							for _, invalid := range []struct{ op, args string }{
+								{"ack_work_input", `{"input_id":"\ud800"}`},
+								{"hand_back_work_input", `{"input_id":"input-1","reason":"\udfff"}`},
+							} {
+								suffix := invalid.op + "-unicode"
+								if w := f.http(t, token, invalid.op, invalid.args, suffix); w.Code != 400 || len(p.calls) != before {
+									t.Errorf("invalid raw Unicode reached B: %d %s", w.Code, w.Body)
+								}
+							}
+							assertInvalidWorkMCPUnicode(t, f, token, `"ack-unicode"`, "ack_work_input", `{"input_id":"\ud801"}`)
+							assertInvalidWorkMCPUnicode(t, f, token, `"\ud800"`, "ack_work_input", `{"input_id":"not-the-replacement"}`)
+							assertInvalidWorkMCPUnicode(t, f, token, `"hand-back-unicode"`, "hand_back_work_input", `{"input_id":"input-1","reason":"\udfff"}`)
+							for _, id := range []string{`"ack-unicode"`, `"\ufffd"`} {
+								w := memberMCPRoleHTTP(t, f, token, id, "tools/call", `{"name":"ack_work_input","arguments":{"input_id":"actual-\ufffd"}}`)
+								memberMCPRoleText(t, w, false)
+							}
+							w := memberMCPRoleHTTP(t, f, token, `"hand-back-unicode"`, "tools/call", `{"name":"hand_back_work_input","arguments":{"input_id":"input-1","reason":"\ud83d\ude00"}}`)
+							memberMCPRoleText(t, w, false)
+							if got := p.calls[before:]; len(got) != 3 || got[0].inputID != "actual-�" || got[1].inputID != "actual-�" || got[2].reason != "😀" {
+								t.Fatal("malformed request bound its id or exact valid Unicode was not forwarded")
+							}
+						})
 					}
 					return roleNotStarted()
 				}), nil
@@ -213,6 +279,61 @@ func TestWorkInputsRealWorkerBindingNativeAndMCP(t *testing.T) {
 			before := len(p.calls)
 			if w := f.http(t, token, "read_work_inputs", `{}`, ""); w.Code != 403 || len(p.calls) != before {
 				t.Fatal("revoked capability reached B")
+			}
+		})
+	}
+}
+
+func TestWorkContinuationDiscoveryAndConfigFollowIssuedPurpose(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		service, intake bool
+	}{
+		{"no-service", false, true}, {"generic-with-service", true, false}, {"intake-with-service", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var p *workInputProbe
+			if tc.service {
+				p = &workInputProbe{}
+			}
+			f := withWorkInputProbe(t, p)
+			ctx := context.Background()
+			msg, err := f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: "topic", Content: "请续办。", RecipientIDs: []string{f.worker.ID}}, "source")
+			roleOK(t, err)
+			turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group, DeliveryID: msg.Deliveries[0].ID, MaxActive: 1})
+			roleOK(t, err)
+			binding := platform.MemberToolRunBinding{GroupID: turn.GroupID, MemberID: turn.MemberID, ConversationID: turn.ConversationID, DeliveryID: turn.DeliveryID, ProviderID: f.worker.ProviderID, Model: f.worker.Model}
+			wrap := f.runtime.Wrap
+			if tc.intake {
+				wrap = f.runtime.WrapChatIntake
+			}
+			want := tc.service && tc.intake
+			calls := 0
+			e, err := wrap(binding, func(path, _ string, _ []string) (provider.Executor, error) {
+				wire, err := os.ReadFile(path)
+				roleOK(t, err)
+				var fields map[string]json.RawMessage
+				roleOK(t, json.Unmarshal(wire, &fields))
+				var token string
+				roleOK(t, json.Unmarshal(fields["token"], &token))
+				marker, marked := fields["continue_work"]
+				if marked != want || marked && string(marker) != "true" || !marked && len(fields) != 2 || token == "" || token == turn.ClaimToken {
+					t.Error("config is not projected from the exact issued capability")
+				}
+				return roleNative(func(context.Context, provider.ExecuteRequest, func(provider.Event) error) provider.ExecutionReceipt {
+					calls++
+					list := memberMCPRoleHTTP(t, f, token, `"list"`, "tools/list", `{"_meta":{"continue_work":true,"purpose":"chat_intake/v1"}}`)
+					text := list.Body.String()
+					if !strings.Contains(text, `"name":"send_message"`) || strings.Contains(text, `"continue_work"`) != want || strings.Contains(text, `"followup"`) != want ||
+						want && (!strings.Contains(text, `"task_id"`) || !strings.Contains(text, `"constraint"`)) {
+						t.Errorf("discovery ignored configured service or issued purpose: %s", text)
+					}
+					return roleNotStarted()
+				}), nil
+			})
+			roleOK(t, err)
+			if receipt := e.Execute(ctx, provider.ExecuteRequest{RunID: turn.ID, RuntimeDir: f.root, Model: binding.Model}, nil); receipt != roleNotStarted() || calls != 1 {
+				t.Fatalf("unexpected runtime outcome: %v", receipt.Outcome)
 			}
 		})
 	}
@@ -259,8 +380,40 @@ func TestWorkContinuationUsesCapturedIntakeCandidate(t *testing.T) {
 			t.Fatalf("forged continuation reached B: %d %s", w.Code, w.Body)
 		}
 	}
-	params := fmt.Sprintf(`{"name":"send_message","arguments":%s}`, body)
-	text := memberMCPRoleText(t, memberMCPRoleHTTP(t, f, token, `"continue"`, "tools/call", params), false)
+	params := func(args string) string { return fmt.Sprintf(`{"name":"send_message","arguments":%s}`, args) }
+	t.Run("shape", func(t *testing.T) {
+		for i, invalid := range []string{
+			strings.Replace(body, `"content":"记录续办。",`, "", 1),
+			strings.Replace(body, "用户续办", strings.Repeat("🙂", 4097), 1),
+		} {
+			before := len(p.calls)
+			if w := f.http(t, token, "send_message", invalid, "invalid-shape"); w.Code != 400 || len(p.calls) != before {
+				t.Fatalf("invalid continuation shape reached B: %d %s", w.Code, w.Body)
+			}
+			w := memberMCPRoleHTTP(t, f, token, fmt.Sprintf("%d", i), "tools/call", params(invalid))
+			if text := memberMCPRoleText(t, w, true); !strings.Contains(text, `"code":"invalid_input"`) || len(p.calls) != before {
+				t.Fatal("MCP forwarded an invalid continuation shape")
+			}
+		}
+	})
+	t.Run("unicode", func(t *testing.T) {
+		for _, invalid := range []string{
+			`{"CoNtEnT":"\ud800","INTENT_ASSESSMENT":{"DiSpOsItIoN":"\u0063ontinue_work","reason":"reason"}}`,
+			strings.Replace(body, "用户续办", `\ud800`, 1),
+			strings.Replace(body, "reference-only", `\udfff`, 1),
+			strings.Replace(body, "仅校对", `\ud800`, 1),
+		} {
+			before := len(p.calls)
+			if w := f.http(t, token, "send_message", invalid, "invalid-unicode"); w.Code != 400 || len(p.calls) != before {
+				t.Fatalf("invalid Unicode reached B: %d %s", w.Code, w.Body)
+			}
+			assertInvalidWorkMCPUnicode(t, f, token, `"continue"`, "send_message", invalid)
+		}
+	})
+	if t.Failed() {
+		return
+	}
+	text := memberMCPRoleText(t, memberMCPRoleHTTP(t, f, token, `"continue"`, "tools/call", params(body)), false)
 	if len(p.issued) != 0 || len(p.calls) != 1 || !strings.Contains(text, `"disposition":"continue_work"`) {
 		t.Fatal("intake did not route to the separate continuation operation")
 	}
@@ -268,5 +421,9 @@ func TestWorkContinuationUsesCapturedIntakeCandidate(t *testing.T) {
 	if got.operation != "continue_work" || got.member != member || got.candidateID != candidate.ID || got.content != "记录续办。" ||
 		got.proposal != (platform.MemberContinueWorkInput{Reason: "用户续办", TaskID: "reference-only", Constraint: " 仅校对\n"}) || !strings.HasPrefix(got.key, "mcp-") {
 		t.Fatal("intake changed the authorized candidate, proposal or key")
+	}
+	boundary := strings.Replace(body, "用户续办", strings.Repeat("🙂", 4096), 1)
+	if w := f.http(t, token, "send_message", boundary, "max-reason"); w.Code != 201 || len(p.calls) != 2 || p.calls[1].proposal.Reason != strings.Repeat("🙂", 4096) {
+		t.Fatal("maxLength counts Unicode code points, not UTF-8 bytes")
 	}
 }

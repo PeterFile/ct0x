@@ -17,6 +17,10 @@ import (
 
 const memberMCPVersion = "2025-06-18"
 const memberMCPReconcile = "\n请保留相同 JSON-RPC id、服务器派生的原幂等键和原请求内容；结果未确认时先对账，不要自动重试。"
+const memberMCPMaxStringIDBytes = 128
+
+// NUL expands to six JSON bytes per input byte, the largest possible encoding.
+var memberMCPMaxEncodedID = strings.Repeat("\x00", memberMCPMaxStringIDBytes)
 
 // MemberMCPRoutes is opt-in; mount on the same NewServer and registry as native
 // routes. NewServer rejects GET with 405/Allow: POST: this endpoint has no SSE.
@@ -55,7 +59,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		memberMCPError(w, 400, id, -32600, "MCP-Protocol-Version 必须为 "+memberMCPVersion)
 		return
 	}
-	operations, err := a.tools.TransportOperations(r.Context(), token)
+	profile, err := a.tools.TransportProfile(r.Context(), token)
 	if err != nil && method != "tools/call" {
 		buffer = newMemberMCPBuffer()
 		memberToolError(buffer, err)
@@ -89,7 +93,10 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		}
 		tools := make([]memberMCPTool, 0, len(memberMCPTools))
 		for _, tool := range memberMCPTools {
-			if slices.Contains(operations, tool.Name) {
+			if slices.Contains(profile.Operations, tool.Name) {
+				if tool.Name == "send_message" && profile.ContinueWork {
+					tool.InputSchema = memberMCPSendMessageContinuationSchema
+				}
 				tools = append(tools, tool)
 			}
 		}
@@ -104,7 +111,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		switch name {
 		case "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact":
 			// Reject before fingerprint decoding or binding; metadata stays opaque.
-			if !validMemberWorkspaceJSONStrings(arguments) {
+			if !validMemberToolJSONStrings(arguments) {
 				memberMCPError(w, 400, id, -32602, "文件工具参数包含无效的 Unicode 字符串转义")
 				return
 			}
@@ -113,6 +120,18 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		if !paramsOK || name == "" || len(name) > 64 || json.Unmarshal(arguments, &object) != nil || object == nil {
 			memberMCPError(w, 400, id, -32602, "工具名称和 arguments 对象无效")
 			return
+		}
+		if name == "ack_work_input" || name == "hand_back_work_input" || name == "send_message" && isContinueWorkRequest(arguments) {
+			// Neither the derived key nor the fingerprint may alias replacement
+			// characters. Keep legacy send_message and opaque metadata unchanged.
+			if !validMemberToolJSONStrings(frame["id"]) {
+				memberMCPError(w, 400, nil, -32602, "工作工具调用 id 包含无效的 Unicode 字符串转义")
+				return
+			}
+			if !validMemberToolJSONStrings(arguments) {
+				memberMCPError(w, 400, id, -32602, "工作工具参数包含无效的 Unicode 字符串转义")
+				return
+			}
 		}
 		for _, tool := range memberMCPTools {
 			if tool.Name != name {
@@ -192,7 +211,7 @@ func memberMCPString(raw json.RawMessage) string {
 }
 
 // Keep IDs type-distinct and canonically encoded for stable idempotency. Integers
-// are restricted to the interoperable exact JSON/JavaScript range; strings to 128 bytes.
+// are restricted to the interoperable exact JSON/JavaScript range; strings have a byte cap.
 func memberMCPID(raw json.RawMessage) (any, bool) {
 	if raw == nil {
 		return nil, true
@@ -200,7 +219,7 @@ func memberMCPID(raw json.RawMessage) (any, bool) {
 	if len(raw) > 0 && raw[0] == '"' {
 		var value string
 		err := json.Unmarshal(raw, &value)
-		return value, err == nil && len(value) <= 128
+		return value, err == nil && len(value) <= memberMCPMaxStringIDBytes
 	}
 	value, err := strconv.ParseInt(string(raw), 10, 64)
 	return value, err == nil && value >= -9007199254740991 && value <= 9007199254740991
@@ -274,8 +293,12 @@ func memberMCPKey(token string, id any) string {
 	return fmt.Sprintf("mcp-%x", hash.Sum(nil))
 }
 
+func memberMCPEnvelope(id, result any) map[string]any {
+	return map[string]any{"jsonrpc": "2.0", "id": id, "result": result}
+}
+
 func memberMCPReply(w http.ResponseWriter, id, result any) {
-	WriteJSON(w, http.StatusOK, map[string]any{"jsonrpc": "2.0", "id": id, "result": result})
+	WriteJSON(w, http.StatusOK, memberMCPEnvelope(id, result))
 }
 
 func memberMCPError(w http.ResponseWriter, status int, id any, code int, message string) {
@@ -313,16 +336,22 @@ func (b *memberMCPBuffer) forward(w http.ResponseWriter) {
 	_, _ = w.Write(b.body)
 }
 
+func memberMCPToolEnvelope(id any, text string, failed bool) map[string]any {
+	return memberMCPEnvelope(id, map[string]any{"content": []map[string]string{{"type": "text", "text": text}}, "isError": failed})
+}
+
+func memberMCPEnvelopeFits(envelope map[string]any) bool {
+	encoded, err := json.Marshal(envelope)
+	return err == nil && len(encoded)+1 <= memberToolJSONBytes // WriteJSON adds a newline.
+}
+
 func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *memberMCPBuffer) {
 	failed, text := buffer.status >= 400, string(buffer.body)
 	if failed {
 		text += memberMCPReconcile
 	}
-	result := func() map[string]any {
-		return map[string]any{"content": []map[string]string{{"type": "text", "text": text}}, "isError": failed}
-	}
-	encoded, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "result": result()})
-	if buffer.overflow || len(encoded)+1 > memberToolJSONBytes {
+	envelope := memberMCPToolEnvelope(id, text, failed)
+	if buffer.overflow || !memberMCPEnvelopeFits(envelope) {
 		switch {
 		case write && !failed:
 			// Success is durable even when its projection cannot fit the envelope.
@@ -333,6 +362,7 @@ func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *membe
 			failed = true
 			text = `{"error":{"code":"tool_result_too_large","message":"工具结果过大，请减小 limit 或 length"}}`
 		}
+		envelope = memberMCPToolEnvelope(id, text, failed)
 	}
-	memberMCPReply(w, id, result())
+	WriteJSON(w, http.StatusOK, envelope)
 }

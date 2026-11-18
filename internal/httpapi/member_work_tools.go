@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/platform"
@@ -28,8 +29,10 @@ func (a memberToolAPI) readWorkInputs(w http.ResponseWriter, r *http.Request, to
 	WriteJSON(buffer, http.StatusOK, struct {
 		Items []platform.MemberWorkInput `json:"items"`
 	}{items})
-	if buffer.overflow {
-		WriteError(w, http.StatusRequestEntityTooLarge, "tool_result_too_large", "本轮工作输入超过 64 KiB，未返回部分内容")
+	// This preview has no pagination. Accept the same complete read over both
+	// transports, even with the largest encoded MCP id, or return nothing.
+	if buffer.overflow || !memberMCPEnvelopeFits(memberMCPToolEnvelope(memberMCPMaxEncodedID, string(buffer.body), false)) {
+		WriteError(w, http.StatusRequestEntityTooLarge, "tool_result_too_large", "本轮完整工作输入超过响应上限，未返回部分内容；当前工具不支持分段读取")
 		return
 	}
 	buffer.forward(w)
@@ -56,7 +59,7 @@ func (a memberToolAPI) mutateWorkInput(w http.ResponseWriter, r *http.Request, t
 		InputID memberToolField[string] `json:"input_id"`
 		Reason  memberToolField[string] `json:"reason"`
 	}
-	if !decodeMemberToolJSON(w, r, &input) {
+	if !decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: &input}) {
 		return
 	}
 	if !validWorkInputID(input.InputID.value) || handBack != input.Reason.present || handBack && strings.TrimSpace(input.Reason.value) == "" {
@@ -86,7 +89,18 @@ func validWorkInputID(id string) bool {
 	return id != "" && len(id) <= 256 && strings.TrimSpace(id) == id && !strings.ContainsFunc(id, unicode.IsControl)
 }
 
-func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Request, token string, raw json.RawMessage, content, key string) (domain.ChatAssessmentReceipt, bool) {
+// Select the stricter decode only for continuation. Use the same JSON field
+// matching as the native handler; the raw arguments remain the source of truth.
+func isContinueWorkRequest(body []byte) bool {
+	var probe struct {
+		Assessment struct {
+			Disposition string `json:"disposition"`
+		} `json:"intent_assessment"`
+	}
+	return json.Unmarshal(body, &probe) == nil && probe.Assessment.Disposition == "continue_work"
+}
+
+func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Request, token string, raw json.RawMessage, content memberToolField[string], key string) (domain.ChatAssessmentReceipt, bool) {
 	var assessment struct {
 		domain.ChatAssessment
 		Followup json.RawMessage `json:"followup"`
@@ -99,11 +113,11 @@ func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Req
 	}
 	if assessment.Disposition == "continue_work" {
 		input, ok := decodeContinueWork(raw)
-		if !ok {
+		if !ok || !content.present {
 			memberToolError(w, store.ErrInvalid)
 			return domain.ChatAssessmentReceipt{}, false
 		}
-		receipt, err := a.tools.ContinueWork(r.Context(), token, input, content, key)
+		receipt, err := a.tools.ContinueWork(r.Context(), token, input, content.value, key)
 		if err != nil {
 			memberRoleToolError(w, "continue_work", err)
 		}
@@ -113,7 +127,7 @@ func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Req
 		memberToolError(w, store.ErrInvalid)
 		return domain.ChatAssessmentReceipt{}, false
 	}
-	receipt, err := a.tools.AssessChatIntent(r.Context(), token, assessment.ChatAssessment, content, key)
+	receipt, err := a.tools.AssessChatIntent(r.Context(), token, assessment.ChatAssessment, content.value, key)
 	if err != nil {
 		memberToolError(w, err)
 	}
@@ -130,7 +144,7 @@ func decodeContinueWork(raw json.RawMessage) (platform.MemberContinueWorkInput, 
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&input) != nil || input.Disposition != "continue_work" || strings.TrimSpace(input.Reason.value) == "" {
+	if decoder.Decode(&input) != nil || input.Disposition != "continue_work" || strings.TrimSpace(input.Reason.value) == "" || utf8.RuneCountInString(input.Reason.value) > 4096 {
 		return platform.MemberContinueWorkInput{}, false
 	}
 	var followup struct {

@@ -45,9 +45,9 @@ function endpointURL(value) {
 /**
  * Read once; the launcher owns the config file's lifetime.
  * @param {string | undefined} path
- * @returns {Client}
+ * @returns {{ invoke: Client, continueWork: boolean }}
  */
-export function createClient(path) {
+export function openBridge(path) {
   let fd;
   try {
     if (!path || !isAbsolute(path)) throw new Error(CONFIG_ERROR);
@@ -66,7 +66,10 @@ export function createClient(path) {
     }
     if (size > CONFIG_LIMIT) throw new Error(CONFIG_ERROR);
     const config = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, size)));
-    if (!isRecord(config) || Object.keys(config).sort().join(",") !== "endpoint,token" ||
+    if (!isRecord(config)) throw new Error(CONFIG_ERROR);
+    const fields = Object.keys(config).sort().join(",");
+    const continueWork = fields === "continue_work,endpoint,token" && config.continue_work === true;
+    if ((fields !== "endpoint,token" && !continueWork) ||
         typeof config.token !== "string" || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token)) {
       throw new Error(CONFIG_ERROR);
     }
@@ -74,7 +77,10 @@ export function createClient(path) {
     const token = config.token;
     /** @type {WriteState} */
     const writes = {};
-    return (toolName, params, toolCallId, signal) => requestTool(endpoint, token, writes, toolName, params, toolCallId, signal);
+    return {
+      invoke: (toolName, params, toolCallId, signal) => requestTool(endpoint, token, writes, toolName, params, toolCallId, signal),
+      continueWork,
+    };
   } catch {
     throw new Error(CONFIG_ERROR);
   } finally {
@@ -82,6 +88,11 @@ export function createClient(path) {
       try { closeSync(fd); } catch { throw new Error(CONFIG_ERROR); }
     }
   }
+}
+
+/** @param {string | undefined} path @returns {Client} */
+export function createClient(path) {
+  return openBridge(path).invoke;
 }
 
 /** @param {Buffer} buffer @returns {{ text: string, json: unknown }} */
@@ -114,14 +125,16 @@ function validRoleReceiptWire(text, count = 4) {
   return field.lastIndex === wire.length;
 }
 
-/** @param {unknown} value @param {string} token @param {boolean} roleWrite */
-function serverError(value, token, roleWrite) {
+/** @param {unknown} value @param {string} token @param {boolean} roleWrite @param {string} toolName */
+function serverError(value, token, roleWrite, toolName) {
   if (!isRecord(value) || !isRecord(value.error) || typeof value.error.code !== "string") return undefined;
   const raw = value.error.code;
   let code = /^[a-z][a-z0-9_]{0,63}$/.test(raw) && !raw.includes(token) ? raw : "request_failed";
   if (code.includes(token)) code = "";
-  const message = (!roleWrite || raw === "request_canceled" || raw === "deadline_exceeded" ?
-    SERVER_ERROR_MESSAGES.get(raw) : undefined) || "成员工具请求失败";
+  const message = toolName === "read_work_inputs" && raw === "tool_result_too_large" ?
+    "完整工作输入超过响应上限，未返回部分内容；当前工具不支持分段读取" :
+    ((!roleWrite || raw === "request_canceled" || raw === "deadline_exceeded" ?
+      SERVER_ERROR_MESSAGES.get(raw) : undefined) || "成员工具请求失败");
   return code ? `${message}（${code}）。` : `${message}。`;
 }
 
@@ -301,11 +314,12 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
             toolName === "create_member" ? status === 200 || status === 201 : status === 200;
           const sensitive = result.text.includes(token) || JSON.stringify(result.json)?.includes(token);
           if (!success) {
-            const message = status >= 400 && status <= 599 ? serverError(result.json, token, roleWrite) : undefined;
+            const message = status >= 400 && status <= 599 ? serverError(result.json, token, roleWrite, toolName) : undefined;
             const error = isRecord(result.json) && isRecord(result.json.error) ? result.json.error : undefined;
             const code = error?.code;
             const rejected = !sensitive && typeof code === "string" && typeof error?.message === "string" &&
               (REJECTION_CODES.get(status)?.includes(code) ||
+                (toolName === "read_work_inputs" && status === 413 && code === "tool_result_too_large") ||
                 (toolName !== "decide_dispatch" && ((status === 404 && code === "not_found") || (status === 409 && code === "conflict"))) ||
                 (!roleWrite && status === 409 && code === "member_capacity"));
             const suffix = rejected || code === "request_canceled" || code === "deadline_exceeded" ? "" : ` ${unknown}`;

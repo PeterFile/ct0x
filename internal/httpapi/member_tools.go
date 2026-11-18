@@ -220,7 +220,7 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 		RecipientIDs memberToolField[[]memberToolField[string]] `json:"recipient_ids"`
 		Assessment   memberToolField[json.RawMessage]           `json:"intent_assessment"`
 	}
-	if !decodeMemberToolJSON(w, r, &input) {
+	if !decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: &input, required: isContinueWorkRequest}) {
 		return
 	}
 	if input.Assessment.present {
@@ -228,7 +228,7 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 			memberToolError(w, store.ErrInvalid)
 			return
 		}
-		receipt, ok := a.assessMemberChatIntent(w, r, token, input.Assessment.value, input.Content.value, key)
+		receipt, ok := a.assessMemberChatIntent(w, r, token, input.Assessment.value, input.Content, key)
 		if !ok {
 			return
 		}
