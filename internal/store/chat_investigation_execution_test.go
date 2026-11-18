@@ -192,7 +192,14 @@ func investigationTaskSubmitInput(role CoordinationToolScope, input AssignmentRe
 }
 
 func TestChatInvestigationMissingMigrationMarkerFailsClosed(t *testing.T) {
-	f, _, role := investigationUserWorker(t)
+	// Materialize the exact v27 prefix before testing the missing marker.
+	f, role := func() (chatFixture, CoordinationToolScope) {
+		prior := migrations
+		defer func() { migrations = prior }()
+		migrations = prior[:27]
+		f, _, role := investigationUserWorker(t)
+		return f, role
+	}()
 	messageSequenceLedger(t, f.s, 27)
 	id := role.Provenance.TaskID
 	if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); err != nil || scope.TaskID != id {
