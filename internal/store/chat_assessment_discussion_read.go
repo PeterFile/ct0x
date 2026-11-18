@@ -73,6 +73,16 @@ func chatDiscussionWorkArrivalInTx(ctx context.Context, tx *sql.Tx, thread domai
 // token without changing that history. Nil without error means no proved work
 // transition for this Turn. Only a separately proved Assignment is returned.
 func chatDiscussionWorkAdmissionInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, invitationMessageID, candidateID, turnID string) (*chatDiscussionWorkAdmission, error) {
+	return readChatDiscussionWorkAdmissionInTx(ctx, tx, thread, invitationMessageID, candidateID, turnID, false)
+}
+
+// chatDiscussionWorkAdmissionForDisplayInTx keeps proved admission evidence when
+// only the optional Assignment is unproved. Do not use it for authorization or formal returns.
+func chatDiscussionWorkAdmissionForDisplayInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, invitationMessageID, candidateID, turnID string) (*chatDiscussionWorkAdmission, error) {
+	return readChatDiscussionWorkAdmissionInTx(ctx, tx, thread, invitationMessageID, candidateID, turnID, true)
+}
+
+func readChatDiscussionWorkAdmissionInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, invitationMessageID, candidateID, turnID string, forDisplay bool) (*chatDiscussionWorkAdmission, error) {
 	a, err := chatDiscussionWorkArrivalInTx(ctx, tx, thread, invitationMessageID, candidateID, turnID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -134,7 +144,10 @@ func chatDiscussionWorkAdmissionInTx(ctx context.Context, tx *sql.Tx, thread dom
 	}
 	assignment, err := chatDiscussionWorkAssignmentInTx(ctx, tx, dispatch)
 	if err != nil {
-		return nil, err
+		if !forDisplay || !(errors.Is(err, sql.ErrNoRows) || errors.Is(err, ErrInvalid)) {
+			return nil, err
+		}
+		assignment = nil
 	}
 	return &chatDiscussionWorkAdmission{TaskID: d.TaskID, MandateID: m.ID, DispatchRequestID: dispatch.ID, Assignment: assignment}, nil
 }
