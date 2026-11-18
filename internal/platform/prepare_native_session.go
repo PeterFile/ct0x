@@ -21,20 +21,16 @@ func validNativePiThinking(thinking string) bool {
 	return false
 }
 
+func (p *Preparer) piNativeSessionConfigured(selected provider.Provider) bool {
+	return p.enableNativeSessionResume && selected.Name == provider.Pi &&
+		nativeSessionWorkspacePath(p.memberTools.executionRoot.resolvedRoot)
+}
+
 func (p *Preparer) nativeSessionEligible(selected provider.Provider, member domain.Member, thinking string) bool {
 	// Legacy grants select and preserve the raw configured root. Do not clean
 	// it into a different authority spelling just to fit the v23 profile.
-	if !p.enableNativeSessionResume || member.Workspace != "" && !nativeSessionWorkspacePath(member.Workspace) {
-		return false
-	}
-	switch selected.Name {
-	case provider.Codex:
-		return p.enableCodexAppServer && provider.NativeTextSessionProfileSupported(selected, member.Model, "")
-	case provider.Pi:
-		return provider.NativeTextSessionProfileSupported(selected, member.Model, thinking) &&
-			nativeSessionWorkspacePath(p.memberTools.executionRoot.resolvedRoot) && provider.PiNativeSessionBridgeSupported(p.piMemberToolsExtension)
-	}
-	return false
+	return p.piNativeSessionConfigured(selected) && (member.Workspace == "" || nativeSessionWorkspacePath(member.Workspace)) &&
+		provider.PiNativeTextSessionProfileSupported(selected, member.Model, thinking) && provider.PiNativeSessionBridgeSupported(p.piMemberToolsExtension)
 }
 
 func nativeSessionWorkspacePath(path string) bool {
@@ -48,13 +44,8 @@ func nativeSessionStaticProfile(selected provider.Provider, member domain.Member
 	profile := store.NativeRunProfile{ProviderID: selected.ID, Model: member.Model, Thinking: thinking,
 		CLIPath: selected.Path, CLIVersion: selected.Version, CWD: workspace.cwd, ConfiguredWorkspace: member.Workspace,
 		WorkspaceIdentity: workspace.key, ResourceKeys: []string{workspace.key}, Tools: names, MaxGroupMembers: maxMembers,
-		NativePolicy: store.NativeTextPolicy{Sandbox: "read-only", ApprovalPolicy: "never"}}
-	if selected.Name == provider.Pi {
-		profile.Adapter, profile.Protocol = provider.PiNativeSessionAdapterVersion, provider.PiNativeSessionProtocolVersion
-		profile.NativePolicy.Sandbox = "tools-only"
-	} else {
-		profile.Adapter, profile.Protocol = provider.CodexNativeSessionAdapterVersion, provider.CodexNativeSessionProtocolVersion
-	}
+		Adapter: provider.PiNativeSessionAdapterVersion, Protocol: provider.PiNativeSessionProtocolVersion,
+		NativePolicy: store.NativeTextPolicy{Sandbox: "tools-only", ApprovalPolicy: "never"}}
 	if grant := workspace.grant; grant.ID != "" {
 		profile.WorkspaceGrantID, profile.WorkspaceRoot, profile.WorkspaceResolvedRoot = grant.ID, grant.Root, grant.ResolvedRoot
 		switch grant.Scope {
@@ -140,32 +131,30 @@ func (p *Preparer) bindNativeSessionPreparation(executor provider.Executor, sele
 // Like the legacy factory, the per-turn registry samples implementation
 // capabilities and constructs an executor. All native work stays in Execute.
 func (p *Preparer) nativeSessionAdapterRegistry(selection provider.AdapterSelection, config provider.NativeMemberToolConfig, names []string, resume *provider.NativeSessionReference, binding json.RawMessage) (*provider.AdapterRegistry, error) {
-	var adapter provider.Adapter
-	switch selection.ID {
-	case provider.PiMemberToolAdapterID:
-		adapter = provider.NewPiNativeSessionMemberToolAdapter(p.piMemberToolsExtension, config, names, provider.PiSessionOptions{Resume: resume, Binding: binding})
-	case provider.CodexAppServerAdapterID:
-		adapter = provider.NewCodexAppServerNativeSessionMemberToolAdapter(config, names, provider.CodexAppServerSessionOptions{Resume: resume, Binding: binding})
-	default:
+	if selection.ID != provider.PiMemberToolAdapterID || selection.Protocol != provider.PiExtensionProtocol {
 		return nil, errMemberToolAdapterUnsupported
 	}
+	adapter := provider.NewPiNativeSessionMemberToolAdapter(p.piMemberToolsExtension, config, names, provider.PiSessionOptions{Resume: resume, Binding: binding})
 	return provider.NewAdapterRegistry(provider.AdapterRegistration{ID: selection.ID, Protocol: selection.Protocol, Adapter: adapter})
 }
 
 // Provider-wide reporting describes the process configuration only. It cannot
 // assert any member's model, claim, resources, or resumable history.
 func (p *Preparer) nativeReportTools(selected provider.Provider) []string {
-	if !p.enableNativeSessionResume {
+	if !p.piNativeSessionConfigured(selected) {
 		return nil
 	}
-	if selected.Name == provider.Pi && p.nativePiThinking == "" {
-		if p.roleThinking == "" || p.memberTools.roleFence == nil {
-			return nil
+	r := p.memberTools
+	if p.nativePiThinking != "" {
+		if r.tools.chatEngine == nil {
+			return r.operations
 		}
+		if !r.tools.WorkInputsEnabled() {
+			return chatIntakeOperations()
+		}
+	}
+	if p.roleThinking != "" && r.roleFence != nil {
 		return memberToolRoleOperations(store.CoordinationRoleCoordinator)
 	}
-	if p.memberTools.tools.chatEngine != nil {
-		return chatIntakeOperations()
-	}
-	return p.memberTools.operations
+	return nil
 }

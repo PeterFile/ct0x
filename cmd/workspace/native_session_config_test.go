@@ -55,11 +55,22 @@ func TestNativeSessionConfigDefaultOffAndPrerequisites(t *testing.T) {
 			t.Fatal("invalid flags created runtime state")
 		}
 	}
+	codexOnly := []string{"--enable-execution", "--enable-member-tools", "--enable-coordination-roles", "--enable-codex-app-server"}
+	if _, err := parseConfig(codexOnly, io.Discard); err != nil {
+		t.Fatalf("fresh Codex AppServer must not require a Pi extension: %v", err)
+	}
+	if _, err := parseConfig(append(slices.Clone(codexOnly), "--enable-native-session-resume"), io.Discard); err == nil {
+		t.Error("Pi resume opt-in accepted a Codex-only configuration without a trusted Pi extension")
+	}
+	mixed := append(slices.Clone(codexOnly), "--pi-member-tools-extension", base[len(base)-1], "--enable-native-session-resume", "--native-pi-thinking=off")
+	if c, err := parseConfig(mixed, io.Discard); err != nil || !c.enableNativeSessionResume || !c.enableCodexAppServer {
+		t.Fatalf("Pi resume and fresh Codex AppServer must coexist: %v", err)
+	}
 	var help bytes.Buffer
 	if err := runWithSearch(context.Background(), []string{"--help"}, &help, provider.Search{}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"--enable-native-session-resume", "--native-pi-thinking", "默认禁用", "不启用文件会话"} {
+	for _, want := range []string{"--enable-native-session-resume  实验性 Pi 1.4.0 原生文本会话续接", "--native-pi-thinking", "默认禁用", "Codex AppServer 仍为全新单轮", "不启用文件会话、调查续接或运行中追加"} {
 		if !strings.Contains(help.String(), want) {
 			t.Fatalf("help omits %q", want)
 		}

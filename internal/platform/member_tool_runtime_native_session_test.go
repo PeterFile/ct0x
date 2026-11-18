@@ -3,6 +3,7 @@ package platform
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -36,8 +37,11 @@ func nativeSessionPreparation(t *testing.T, purpose string) (*rolePrepareFixture
 	t.Helper()
 	f := newRolePrepareFixture(t)
 	f.enableRuntime(t)
-	f.opts.EnableNativeSessionResume, f.opts.EnableCodexAppServer = true, true
-	f.opts.Providers[1].Name, f.opts.Providers[1].Version = provider.Codex, "0.166.0"
+	useReleasePiBridge(t, f)
+	f.opts.EnableNativeSessionResume, f.opts.NativePiThinking, f.opts.RoleThinking = true, "off", "max"
+	const model = "fixture/model"
+	f.exec(t, "UPDATE members SET model=? WHERE id IN (?, ?)", model, f.coordinator.ID, f.worker.ID)
+	f.coordinator.Model, f.worker.Model, f.member.Model = model, model, model
 	if purpose == "worker" {
 		f.selectWorker(t)
 	} else if purpose == "generic" || purpose == domain.ChatIntakePurpose {
@@ -96,7 +100,8 @@ func runNativeSessionFixture(t *testing.T, f *rolePrepareFixture, prepared sched
 			if !slices.Equal(issued, names) {
 				t.Fatal("current token differs from the binding's actually issued tools")
 			}
-			id := "native-" + req.RunID
+			idDigest := sha256.Sum256([]byte(req.RunID))
+			id := fmt.Sprintf("019f0000-0000-7000-8000-%x", idDigest[:6])
 			if resume != nil {
 				id = memberToolNativeID(resume)
 			}
@@ -112,15 +117,21 @@ func runNativeSessionFixture(t *testing.T, f *rolePrepareFixture, prepared sched
 			if capture {
 				sha, err := store.NativeToolsProfileSHA256(names)
 				prepareRoleOK(t, err)
-				turns := 1
-				if resume != nil {
-					turns = resume.Codex.HistoryTurns + 1
-				}
+				// Synthetic file metadata exercises Store's same-file append contract.
+				// This fixture does not execute Pi or prove a real file append.
 				p := call.binding.Profile
-				call.raw.NativeRef = &provider.NativeSessionReference{Version: 1, Binding: bytes.Clone(binding), Codex: &provider.CodexNativeSessionReference{
-					Adapter: p.Adapter, Protocol: p.Protocol, CLIPath: p.CLIPath, CLIVersion: p.CLIVersion, Provider: "fixture-provider", Model: p.Model,
-					CWD: p.CWD, ToolsProfileSHA256: sha, NativeHome: p.CWD, NativeThreadID: id, NativeTurnID: fmt.Sprintf("native-turn-%d", turns),
-					HistorySHA256: fmt.Sprintf("%064x", turns), HistoryTurns: turns, HistoryItems: turns}}
+				ref := &provider.PiNativeSessionReference{
+					Adapter: p.Adapter, Protocol: p.Protocol, CLIPath: p.CLIPath, CLIVersion: p.CLIVersion, Model: p.Model, Thinking: p.Thinking,
+					CWD: p.CWD, ToolsProfileSHA256: sha, NativeSessionID: id,
+					SessionFile: filepath.Join(req.RuntimeDir, req.RunID, "native", "session.jsonl"), Device: 1, Inode: 1, Size: 1, MTimeNS: 1,
+				}
+				if resume != nil {
+					ref.SessionFile, ref.Device, ref.Inode = resume.Pi.SessionFile, resume.Pi.Device, resume.Pi.Inode
+					ref.Size, ref.MTimeNS = resume.Pi.Size+1, resume.Pi.MTimeNS+1
+				}
+				ref.FileSHA256 = fmt.Sprintf("%064x", ref.Size)
+				ref.LeafID, ref.LastCompletedAssistantID = fmt.Sprintf("leaf-%d", ref.Size), fmt.Sprintf("assistant-%d", ref.Size)
+				call.raw.NativeRef = &provider.NativeSessionReference{Version: provider.NativeSessionReferenceVersion, Binding: bytes.Clone(binding), Pi: ref}
 			}
 			return call.raw
 		}), nil
@@ -205,7 +216,7 @@ func TestNativeSessionRuntimeIssuedPurposeAndAuthority(t *testing.T) {
 			if receipt.Outcome != provider.OutcomeSucceeded || decodeNativeFixtureBinding(t, receipt).ResumedFromTurnID != "" {
 				t.Fatal("fresh capture changed native outcome or claimed historical resume")
 			}
-			if call.raw.NativeRef == receipt.NativeRef || call.raw.NativeRef.Codex == receipt.NativeRef.Codex {
+			if receipt.NativeRef.Pi == nil || receipt.NativeRef.Codex != nil || call.raw.NativeRef == receipt.NativeRef || call.raw.NativeRef.Pi == receipt.NativeRef.Pi {
 				t.Fatal("aggregate aliases raw native reference")
 			}
 		})
@@ -222,16 +233,18 @@ func TestNativeSessionRuntimeLegacyReceiptWire(t *testing.T) {
 	if !ok || old.Raw.NativeRef != nil || old.Raw.StdoutPath == "" || !old.Raw.Started {
 		t.Fatal("legacy nonzero capture is not a readable fixed point")
 	}
+	if encoded, ok := memberToolRoleEncodeReceipt(*old); !ok || string(encoded) != legacyCapture {
+		t.Fatal("legacy capture encoding changed")
+	}
 
 	f, prepared := nativeSessionPreparation(t, "coordinator")
 	claim, receipt, call := runNativeSessionFixture(t, f, prepared, nil, provider.OutcomeSucceeded, true)
-	if receipt.NativeRef == nil || receipt.NativeRef.Codex == nil {
+	if receipt.NativeRef == nil || receipt.NativeRef.Pi == nil {
 		t.Fatal("fixture did not create a nonzero native sidecar")
 	}
 	old.Raw.NativeRef, old.Aggregate.NativeRef = call.raw.NativeRef, receipt.NativeRef
-	encoded, ok := memberToolRoleEncodeReceipt(*old)
-	if !ok || string(encoded) != legacyCapture {
-		t.Fatal("native metadata changed the byte-exact legacy capture encoding")
+	if _, ok := memberToolRoleEncodeReceipt(*old); ok {
+		t.Fatal("diagnostic codec claimed full capture while omitting the private sidecar")
 	}
 
 	var stored, binding, reference string
@@ -241,15 +254,13 @@ func TestNativeSessionRuntimeLegacyReceiptWire(t *testing.T) {
 	if stored != want {
 		t.Fatal("Store changed the nonzero legacy normalized receipt JSON")
 	}
-	runtime := prepared.Executor.(*memberToolRuntimeRun).runtime
-	capture, err := os.ReadFile(filepath.Join(runtime.roleFence.executionRoot, memberToolRoleReceiptDirectory, memberToolRoleReceiptName(claim.GroupID, claim.TurnID)))
+	diagnostic, err := f.opts.MemberTools.InspectCoordinationRoleReceipt(context.Background(), claim.GroupID, claim.TurnID)
 	prepareRoleOK(t, err)
-	record, ok := memberToolRoleDecodeReceipt(bytes.NewReader(capture))
-	if !ok || record.Raw.NativeRef != nil || record.Aggregate.NativeRef != nil || !record.Raw.Accepted || record.Aggregate.NativeSessionID != receipt.NativeSessionID {
-		t.Fatal("current role diagnostic was not a legacy-format capture of actual evidence")
+	if diagnostic.Capture != nil || diagnostic.CaptureStatus != "missing" || diagnostic.Current.Turn.State != domain.TurnStateSucceeded {
+		t.Fatal("diagnostic refusal changed canonical settlement or claimed a complete capture")
 	}
 	for _, private := range []string{call.token, claim.Token, call.issued.Path, hex.EncodeToString(call.issued.SHA256[:])} {
-		if private == "" || strings.Contains(string(capture)+stored+binding+reference, private) {
+		if private == "" || strings.Contains(stored+binding+reference, private) {
 			t.Fatal("runtime config material leaked into persisted evidence")
 		}
 	}
@@ -273,7 +284,7 @@ func TestNativeSessionRuntimeResumeRestartRebindAndUnknownBarrier(t *testing.T) 
 	f.opts.MemberTools, err = NewMemberToolRuntime(f.s, f.runtimeOptions)
 	prepareRoleOK(t, err)
 	secondClaim, second, secondCall := runNativeSessionFixture(t, f, nextNativeSessionPreparation(t, f), func(call *nativeSessionFixtureCall) {
-		if call.resume == nil || call.resume.Codex.NativeThreadID != first.NativeSessionID || call.token == firstCall.token || call.token == firstClaim.Token {
+		if call.resume == nil || call.resume.Pi == nil || call.resume.Pi.NativeSessionID != first.NativeSessionID || call.resume.Pi.SessionFile != first.NativeRef.Pi.SessionFile || call.token == firstCall.token || call.token == firstClaim.Token {
 			t.Fatal("restart did not select exact native source with a new token")
 		}
 		if _, err := f.opts.MemberTools.Tools().TransportOperations(context.Background(), firstCall.token); !errors.Is(err, store.ErrMemberToolDenied) {
@@ -305,7 +316,7 @@ func TestNativeSessionRuntimeResumeRestartRebindAndUnknownBarrier(t *testing.T) 
 	unknownClaim, unknown, unknownCall := runNativeSessionFixture(t, f, nextNativeSessionPreparation(t, f), nil, provider.OutcomeUnknown, false)
 	var retained int
 	prepareRoleOK(t, f.db.QueryRow("SELECT count(*) FROM resource_claims WHERE turn_id=?", unknownClaim.TurnID).Scan(&retained))
-	if retained != 1 || unknown.NativeRef.Codex != nil {
+	if retained != 1 || unknown.NativeRef.Pi != nil || unknown.NativeRef.Codex != nil {
 		t.Fatal("unknown capture released a resource or fabricated a reference")
 	}
 	waiting := nextNativeSessionPreparation(t, f)
@@ -352,7 +363,7 @@ func TestNativeSessionRuntimeDoesNotResumeAcrossIssuedToolProfiles(t *testing.T)
 			t.Fatal("compatibility was not computed from newly issued grants")
 		}
 	}, provider.OutcomeSucceeded, true)
-	if second.NativeRef.Codex.ToolsProfileSHA256 == first.NativeRef.Codex.ToolsProfileSHA256 {
+	if second.NativeRef.Pi.ToolsProfileSHA256 == first.NativeRef.Pi.ToolsProfileSHA256 {
 		t.Fatal("change in issued tool contract was not reflected in provider evidence")
 	}
 }
@@ -414,15 +425,15 @@ func TestNativeSessionRuntimeAcceptedAssociationIsNotCandidate(t *testing.T) {
 			}
 			before := bytes.Clone(raw.NativeRef.Binding)
 			got := session.receipt(context.Background(), run, current, raw)
-			if decodeNativeFixtureBinding(t, got).ResumedFromTurnID != "" || got.NativeRef.Codex != nil || !bytes.Equal(before, raw.NativeRef.Binding) {
+			if decodeNativeFixtureBinding(t, got).ResumedFromTurnID != "" || got.NativeRef.Pi != nil || got.NativeRef.Codex != nil || !bytes.Equal(before, raw.NativeRef.Binding) {
 				t.Fatal("unaccepted candidate became actual resume or modified raw metadata")
 			}
 		})
 	}
 	copy := cloneMemberToolReceipt(receipt)
-	copy.NativeRef.Codex.NativeThreadID = "changed"
+	copy.NativeRef.Pi.NativeSessionID = "changed"
 	copy.NativeRef.Binding[0] = '['
-	if reflect.DeepEqual(copy.NativeRef, receipt.NativeRef) || receipt.NativeRef.Binding[0] != '{' || receipt.NativeRef.Codex.NativeThreadID == "changed" {
+	if reflect.DeepEqual(copy.NativeRef, receipt.NativeRef) || receipt.NativeRef.Binding[0] != '{' || receipt.NativeRef.Pi.NativeSessionID == "changed" {
 		t.Fatal("reference deep clone retained payload/RawMessage aliases")
 	}
 }

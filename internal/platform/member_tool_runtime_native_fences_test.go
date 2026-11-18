@@ -31,14 +31,19 @@ func TestNativeSessionRuntimeSameInodeConfigDrift(t *testing.T) {
 			t.Run(name+"/"+stage, func(t *testing.T) {
 				ctx := context.Background()
 				f, prepared := nativeSessionPreparation(t, "generic")
-				if name == provider.Pi {
-					useReleasePiBridge(t, f)
-					f.opts.Providers[1].Name, f.opts.Providers[1].Version = provider.Pi, "1.4.0"
-					f.opts.NativePiThinking = "off"
-					f.exec(t, "UPDATE members SET model='fixture/model' WHERE id=?", f.member.ID)
-					var err error
-					prepared, err = f.preparer(t).Prepare(ctx, f.pending)
-					prepareRoleOK(t, err)
+				run := prepared.Executor.(*memberToolRuntimeRun)
+				if name == provider.Codex {
+					// Exercise the provider-only fixture constructor through the same
+					// runtime fences; no released Preparer can build this Codex plan.
+					selected := f.opts.Providers[1]
+					selected.Name, selected.Version = provider.Codex, "0.166.0"
+					profile := &run.nativeSession.profile
+					profile.Adapter, profile.Protocol = provider.CodexNativeSessionAdapterVersion, provider.CodexNativeSessionProtocolVersion
+					profile.CLIVersion, profile.NativePolicy.Sandbox = selected.Version, "read-only"
+					profile.Thinking, prepared.Request.Thinking = "", ""
+					run.nativeSession.factory = func(config provider.NativeMemberToolConfig, names []string, resume *provider.NativeSessionReference, binding json.RawMessage) (provider.Executor, error) {
+						return provider.NewCodexAppServerNativeSessionMemberToolAdapter(config, names, provider.CodexAppServerSessionOptions{Resume: resume, Binding: binding}).NewExecutor(selected, 0)
+					}
 				}
 				// A second valid in-memory capability makes syntax checking insufficient.
 				other := f.message(t, f.group.ID, "separate-topic", "user", "fixture", f.worker.ID)
@@ -48,7 +53,6 @@ func TestNativeSessionRuntimeSameInodeConfigDrift(t *testing.T) {
 				otherToken, err := tools.Issue(ctx, store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}, MemberToolGrants{Operations: []string{"list_members"}})
 				prepareRoleOK(t, err)
 				t.Cleanup(func() { tools.Revoke(otherToken) })
-				run := prepared.Executor.(*memberToolRuntimeRun)
 				factory := run.nativeSession.factory
 				calls, constructed, invoked := 0, false, false
 				var currentToken string

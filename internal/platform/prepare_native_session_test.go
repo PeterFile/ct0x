@@ -20,37 +20,103 @@ import (
 
 func TestNativeSessionPrepareDefaultOffAndKnownSelectionOnly(t *testing.T) {
 	f, _ := nativeSessionPreparation(t, "generic")
-	f.opts.EnableNativeSessionResume = false
+	f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = false, ""
 	p := f.preparer(t)
 	legacy, err := p.Prepare(context.Background(), f.pending)
 	prepareRoleOK(t, err)
 	if legacy.Executor.(*memberToolRuntimeRun).nativeSession != nil || p.AdapterReports()[f.member.ProviderID].Capabilities.NativeResume != provider.SupportUnsupported {
 		t.Fatal("native sessions were enabled without the explicit flag")
 	}
-	f.opts.EnableNativeSessionResume = true
+	f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = true, "off"
 	p = f.preparer(t)
 	enabled, err := p.Prepare(context.Background(), f.pending)
 	prepareRoleOK(t, err)
-	if enabled.Executor.(*memberToolRuntimeRun).nativeSession == nil || !slices.Equal(enabled.ResourceKeys, legacy.ResourceKeys) || enabled.Request.Model != legacy.Request.Model || enabled.Request.Thinking != legacy.Request.Thinking {
+	if enabled.Executor.(*memberToolRuntimeRun).nativeSession == nil || !slices.Equal(enabled.ResourceKeys, legacy.ResourceKeys) || enabled.Request.Model != legacy.Request.Model || enabled.Request.Thinking != f.opts.NativePiThinking || legacy.Request.Thinking != "" {
 		t.Fatal("opt-in lost existing resources/model/thinking or failed to select its private plan")
 	}
 	if p.AdapterReports()[f.member.ProviderID].Capabilities.NativeResume != provider.SupportSupported {
 		t.Fatal("explicit native adapter report does not sample its actual builder")
 	}
-	f.opts.EnableNativeSessionResume = false
+	f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = false, ""
 	again, err := f.preparer(t).Prepare(context.Background(), f.pending)
 	prepareRoleOK(t, err)
 	if again.Request != legacy.Request || !slices.Equal(again.ResourceKeys, legacy.ResourceKeys) || again.Executor.(*memberToolRuntimeRun).nativeSession != nil {
 		t.Fatal("disabling flag changed the legacy preparation behavior")
 	}
-	f.opts.EnableNativeSessionResume = true
+	f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = true, "off"
 	f.opts.Providers[1].Version = "future"
 	if f.preparer(t).nativeSessionEligible(f.opts.Providers[1], f.member, "max") {
 		t.Fatal("unknown selected version promoted native resume")
 	}
-	f.opts.Providers[1].Version, f.opts.Providers[1].Path = "0.166.0", "relative"
+	f.opts.Providers[1].Version, f.opts.Providers[1].Path = "1.4.0", "relative"
 	if f.preparer(t).nativeSessionEligible(f.opts.Providers[1], f.member, "max") {
 		t.Fatal("relative selected CLI path promoted native resume")
+	}
+}
+
+func TestNativeSessionPrepareMixedAdaptersKeepCodexFresh(t *testing.T) {
+	f := newRolePrepareFixture(t)
+	f.enableRuntime(t)
+	useReleasePiBridge(t, f)
+	f.opts.Providers[1].Name, f.opts.Providers[1].Version = provider.Codex, "0.166.0"
+	const model = "fixture/model"
+	piID, codexID := f.opts.Providers[0].ID, f.opts.Providers[1].ID
+	f.exec(t, "UPDATE members SET model=? WHERE id=?", model, f.coordinator.ID)
+	f.exec(t, "UPDATE members SET provider_id=?, model=? WHERE id=?", piID, model, f.worker.ID)
+	piMessage := f.message(t, f.group.ID, f.trigger.TopicID, "user", "Pi text", f.worker.ID)
+	piPending := store.PendingDelivery{GroupID: f.group.ID, Delivery: piMessage.Deliveries[0]}
+	f.opts.EnableCodexAppServer, f.opts.RoleThinking = true, "max"
+	baseline := f.preparer(t)
+	f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = true, "off"
+	p := f.preparer(t)
+	ctx := context.Background()
+
+	t.Run("capabilities", func(t *testing.T) {
+		reports := p.AdapterReports()
+		pi, codex := reports[piID], reports[codexID]
+		if pi.ID != provider.PiMemberToolAdapterID || !pi.Enabled || pi.Capabilities == nil || pi.Capabilities.NativeResume != provider.SupportSupported {
+			t.Fatal("mixed selection lost qualified Pi resume capability")
+		}
+		if codex.ID != provider.CodexAppServerAdapterID || !codex.Enabled || codex.Capabilities == nil || !memberToolCapabilitiesSupported(*codex.Capabilities) || codex.Capabilities.NativeResume != provider.SupportUnsupported {
+			t.Fatalf("mixed selection must report fresh-only Codex AppServer with its platform tools and terminal evidence: %+v", codex.Capabilities)
+		}
+	})
+
+	t.Run("pi-plan", func(t *testing.T) {
+		prepared, err := p.Prepare(ctx, piPending)
+		prepareRoleOK(t, err)
+		if prepared.Executor.(*memberToolRuntimeRun).nativeSession == nil || prepared.Request.Model != model || prepared.Request.Thinking != "off" {
+			t.Fatal("mixed selection lost Pi's explicit native text plan")
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		pending store.PendingDelivery
+	}{{"codex-ordinary", f.ordinary}, {"codex-role", f.pending}} {
+		t.Run(tc.name, func(t *testing.T) {
+			legacy, err := baseline.Prepare(ctx, tc.pending)
+			prepareRoleOK(t, err)
+			prepared, err := p.Prepare(ctx, tc.pending)
+			prepareRoleOK(t, err)
+			if prepared.Executor.(*memberToolRuntimeRun).nativeSession != nil || prepared.Request != legacy.Request || !slices.Equal(prepared.ResourceKeys, legacy.ResourceKeys) {
+				t.Fatal("Pi opt-in selected Codex resume or changed its fresh prompt, model, thinking or claim keys")
+			}
+			_, receipt := executePreparedAdapterFixture(t, f, prepared, false, func(token string) {
+				names, err := f.opts.MemberTools.Tools().TransportOperations(ctx, token)
+				prepareRoleOK(t, err)
+				want := f.runtimeOptions.Operations
+				if tc.name == "codex-role" {
+					want = memberToolRoleOperations(store.CoordinationRoleCoordinator)
+				}
+				if !slices.Equal(names, want) {
+					t.Fatal("Pi opt-in changed fresh Codex grants")
+				}
+			})
+			if receipt.NativeRef != nil {
+				t.Fatal("fresh Codex execution entered native-session settlement")
+			}
+		})
 	}
 }
 
@@ -122,6 +188,32 @@ func TestNativeSessionPreparePiNonRoleThinkingIsIndependent(t *testing.T) {
 	}
 }
 
+func TestNativeSessionPreparePiTypedIntakeDoesNotAdvertiseResume(t *testing.T) {
+	f := newRolePrepareFixture(t)
+	f.enableRuntime(t)
+	useReleasePiBridge(t, f)
+	f.exec(t, "UPDATE members SET model='fixture/model' WHERE id=?", f.member.ID)
+	f.runtimeOptions.ChatIntake = coordination.New(f.s)
+	// The optional input service changes the schema; sampling must not call it.
+	f.runtimeOptions.WorkInputs = struct{ MemberWorkInputService }{}
+	var err error
+	f.opts.MemberTools, err = NewMemberToolRuntime(f.s, f.runtimeOptions)
+	prepareRoleOK(t, err)
+	ctx := context.Background()
+	legacy, err := f.preparer(t).Prepare(ctx, f.ordinary)
+	prepareRoleOK(t, err)
+	f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = true, "off"
+	p := f.preparer(t)
+	prepared, err := p.Prepare(ctx, f.ordinary)
+	prepareRoleOK(t, err)
+	if prepared.Executor.(*memberToolRuntimeRun).nativeSession != nil || prepared.Request != legacy.Request || !slices.Equal(prepared.ResourceKeys, legacy.ResourceKeys) {
+		t.Fatal("Pi text opt-in changed the typed intake plan")
+	}
+	if caps := p.AdapterReports()[f.member.ProviderID].Capabilities; caps == nil || caps.NativeResume != provider.SupportUnsupported || !memberToolCapabilitiesSupported(*caps) {
+		t.Fatal("typed intake must not establish provider-wide Pi resume support")
+	}
+}
+
 func TestNativeSessionPrepareUnqualifiedPiBridgeKeepsLegacy(t *testing.T) {
 	f := newRolePrepareFixture(t)
 	f.enableRuntime(t) // Readable legacy extension, not the audited digest pair.
@@ -180,10 +272,10 @@ func TestNativeSessionPrepareLegacyUncleanWorkspaceGrants(t *testing.T) {
 			if grant.Root != root || filepath.Clean(root) == root {
 				t.Fatal("fixture did not preserve a valid unclean grant root")
 			}
-			f.opts.EnableNativeSessionResume = false
+			f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = false, ""
 			legacy, err := f.preparer(t).Prepare(ctx, f.pending)
 			prepareRoleOK(t, err)
-			f.opts.EnableNativeSessionResume = true
+			f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = true, "off"
 			prepared, err := f.preparer(t).Prepare(ctx, f.pending)
 			prepareRoleOK(t, err)
 			if prepared.Executor.(*memberToolRuntimeRun).nativeSession != nil || prepared.Request != legacy.Request || !slices.Equal(prepared.ResourceKeys, []string{grant.ResourceKey}) {
@@ -205,10 +297,10 @@ func TestNativeSessionPrepareTrustedGrantUsesPhysicalCWDContract(t *testing.T) {
 				prepareRoleOK(t, os.Symlink(physical, alias))
 				f.opts.WorkspaceGrants = []WorkspaceGrant{{GroupID: f.group.ID, MemberID: f.member.ID, Root: alias}}
 				f.exec(t, "UPDATE members SET workspace=? WHERE id=?", alias, f.member.ID)
-				f.opts.EnableNativeSessionResume = false
+				f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = false, ""
 				legacy, err := f.preparer(t).Prepare(ctx, f.pending)
 				prepareRoleOK(t, err)
-				f.opts.EnableNativeSessionResume = true
+				f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = true, "off"
 				prepared, err := f.preparer(t).Prepare(ctx, f.pending)
 				prepareRoleOK(t, err)
 				plan := prepared.Executor.(*memberToolRuntimeRun).nativeSession
@@ -234,6 +326,7 @@ func TestNativeSessionPrepareFileWorkerRemainsIsolated(t *testing.T) {
 	for _, name := range []string{provider.Pi, provider.Codex} {
 		t.Run(name, func(t *testing.T) {
 			f, workspace, _ := newWorkspacePreparation(t)
+			useReleasePiBridge(t, f)
 			f.opts.EnableNativeSessionResume, f.opts.RoleThinking = true, "max"
 			f.exec(t, "UPDATE members SET model='openai-codex/gpt-6.1-sol' WHERE id=?", f.worker.ID)
 			ctx := context.Background()

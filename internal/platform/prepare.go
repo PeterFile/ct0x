@@ -45,7 +45,7 @@ type PrepareOptions struct {
 	RoleThinking           string        // Trusted role-only Pi thinking level; empty preserves CLI defaults.
 	ExecutionTimeout       time.Duration // Zero uses the provider default.
 
-	EnableNativeSessionResume bool   // Experimental, default false; requires member tools.
+	EnableNativeSessionResume bool   // Experimental Pi text only, default false; requires member tools and the Pi extension.
 	NativePiThinking          string // Exact Pi thinking for native generic/intake only; empty keeps legacy.
 }
 
@@ -135,7 +135,7 @@ func NewPreparer(s *store.Store, opts PrepareOptions) (*Preparer, error) {
 
 func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 	r, path := opts.MemberTools, opts.PiMemberToolsExtension
-	if opts.NativePiThinking != "" && (!opts.EnableNativeSessionResume || path == "" || !validNativePiThinking(opts.NativePiThinking)) {
+	if opts.NativePiThinking != "" && (!opts.EnableNativeSessionResume || !validNativePiThinking(opts.NativePiThinking)) {
 		return errPrepareConfig
 	}
 	if r == nil && path == "" && !opts.EnableCodexAppServer && !opts.EnableNativeSessionResume {
@@ -147,7 +147,7 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 		!memberToolRuntimeEndpoint(r.endpoint) || r.maxGroupMembers < 1 || r.maxGroupMembers > 200 || !r.rootValid() {
 		return errPrepareConfig
 	}
-	if opts.EnableNativeSessionResume && (r.executionRoot == nil || !r.executionRoot.rootValid(r.executionRoot.executionRoot)) {
+	if opts.EnableNativeSessionResume && (path == "" || r.executionRoot == nil || !r.executionRoot.rootValid(r.executionRoot.executionRoot)) {
 		return errPrepareConfig
 	}
 	// Prepare permits only the complete legacy or history profile, not subsets.
@@ -237,14 +237,12 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	var maxMembers int
 	intake := useMemberTools && p.memberTools.tools.chatEngine != nil
 	// The v23 text profile does not bind the optional continuation schema.
-	if useMemberTools && p.enableNativeSessionResume && !(intake && p.memberTools.tools.WorkInputsEnabled()) {
+	if useMemberTools && p.piNativeSessionConfigured(selected) && !(intake && p.memberTools.tools.WorkInputsEnabled()) {
 		names, maxMembers = p.memberTools.operations, p.memberTools.maxGroupMembers
 		if intake {
 			names, maxMembers = chatIntakeOperations(), 0
 		}
-		if selected.Name == provider.Pi {
-			thinking = p.nativePiThinking
-		}
+		thinking = p.nativePiThinking
 		// Separate typed scopes must select their own preparation before this text path.
 		nativeText, err = p.previewNativeSession(ctx, selected, member, conversation, thinking, names, maxMembers)
 		if err != nil {

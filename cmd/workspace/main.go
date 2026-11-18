@@ -160,7 +160,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if config.enableNativeSessionResume {
 		// Keep capacity reporting independent of native-session selection.
 		executionStatus = strings.TrimPrefix(executionStatus, "全新")
-		sessionStatus = "已显式选择实验性原生文本会话续接；仅固定版本及合格文本配置可用，Pi 须显式指定该用途的 thinking；每轮重新发证，续接出错不回退重试；不续接目录任务或调查；不支持运行中追加，后续输入仍排队"
+		sessionStatus = "已显式选择实验性 Pi 1.4.0 原生文本会话续接；须通过可信扩展校验并为该用途显式指定 thinking；仅当同一作用域最新持久引用合格时续接，每轮重新发证，续接出错不回退重试；Codex AppServer 仍为全新单轮；不续接目录任务或调查；不支持运行中追加，后续输入仍排队"
 	}
 	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录、任务创建、列表与详情、成果版本只读查询与下载及 CLI 目录；目录仅启动时探测、证据仅存内存；%s；%s；%s；工作目录不是主机读取沙箱，数据目录及祖先必须可信且目录身份稳定；其他功能尚未启用）\n", listener.Addr(), executionStatus, sessionStatus, toolStatus); err != nil {
 		return fmt.Errorf("输出启动信息失败：%w", err)

@@ -22,16 +22,11 @@ const (
 	PiNativeSessionProtocolVersion    = piSessionProtocol
 )
 
-// NativeTextSessionProfileSupported checks declared metadata only, not account
-// readiness, authority, or eligibility of any historical reference.
-func NativeTextSessionProfileSupported(selected Provider, model, thinking string) bool {
-	if !nativeTextSessionProviderSupported(selected) || !utf8.ValidString(model) {
-		return false
-	}
-	if selected.Name == Pi {
-		return len(model) <= 256 && piSessionModel.MatchString(model) && validPiThinking(thinking)
-	}
-	return codexAppServerIdentity(model) && thinking == ""
+// PiNativeTextSessionProfileSupported checks declared Pi metadata only, not
+// account readiness, authority, or eligibility of any historical reference.
+func PiNativeTextSessionProfileSupported(selected Provider, model, thinking string) bool {
+	return selected.Name == Pi && nativeTextSessionProviderSupported(selected) &&
+		utf8.ValidString(model) && len(model) <= 256 && piSessionModel.MatchString(model) && validPiThinking(thinking)
 }
 
 func nativeTextSessionProviderSupported(selected Provider) bool {
@@ -102,7 +97,8 @@ func NewPiNativeSessionMemberToolAdapter(extensionPath string, config NativeMemb
 	}
 }
 
-// NewCodexAppServerNativeSessionMemberToolAdapter is experimental and opt-in.
+// NewCodexAppServerNativeSessionMemberToolAdapter is experimental and used only
+// in offline tests. The service selects the fresh-only AppServer adapter.
 func NewCodexAppServerNativeSessionMemberToolAdapter(config NativeMemberToolConfig, toolNames []string, options CodexAppServerSessionOptions) Adapter {
 	return nativeSessionMemberToolAdapter{
 		memberToolAdapter: NewCodexAppServerMemberToolAdapter(config.Path, toolNames).(memberToolAdapter),
