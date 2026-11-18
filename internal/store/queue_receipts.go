@@ -26,24 +26,40 @@ func (s *Store) ApplyTurnReceipt(ctx context.Context, claim TurnClaim, receipt p
 	if err != nil {
 		return domain.Turn{}, queueError(action, err)
 	}
-	receipt = normalizeTurnReceipt(turn, receipt)
-	data, err := json.Marshal(receipt)
+	if receipt.NativePreflightFailure {
+		// A native startup refusal is not a new execution observation. Its
+		// first-evidence guard runs under the same claim lock as normal Apply.
+		turn, _, err = nativePreflightFailureInTx(ctx, tx, turn, nil)
+	} else {
+		turn, err = applyTurnReceiptInTx(ctx, tx, turn, normalizeTurnReceipt(turn, receipt))
+	}
 	if err != nil {
 		return domain.Turn{}, queueError(action, err)
 	}
+	if err := tx.Commit(); err != nil {
+		return domain.Turn{}, queueError(action, err)
+	}
+	return turn, nil
+}
+
+// applyTurnReceiptInTx shares the existing settlement policy with the native
+// first-evidence path. Callers hold the exact claim lock and pass a normalized receipt.
+func applyTurnReceiptInTx(ctx context.Context, tx *sql.Tx, turn domain.Turn, receipt provider.ExecutionReceipt) (domain.Turn, error) {
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		return domain.Turn{}, err
+	}
+	claim := TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
 	if !activeTurn(turn.State) {
 		var previous string
 		if err := tx.QueryRowContext(ctx, "SELECT receipt_json FROM turns WHERE group_id=? AND id=? AND claim_token=?", claim.GroupID, claim.TurnID, claim.Token).Scan(&previous); err != nil {
-			return domain.Turn{}, queueError(action, err)
+			return domain.Turn{}, err
 		}
 		if previous != string(data) {
-			return domain.Turn{}, queueError(action, ErrConflict)
+			return domain.Turn{}, ErrConflict
 		}
 		if err := applyNativeBindingInTx(ctx, tx, turn, receipt, true); err != nil {
-			return domain.Turn{}, queueError(action, err)
-		}
-		if err := tx.Commit(); err != nil {
-			return domain.Turn{}, queueError(action, err)
+			return domain.Turn{}, err
 		}
 		return turn, nil
 	}
@@ -58,17 +74,17 @@ func (s *Store) ApplyTurnReceipt(ctx context.Context, claim TurnClaim, receipt p
 	turn.State, turn.Reason = domain.TurnState(receipt.Outcome), receipt.Reason
 	if terminalOutcome(receipt.Outcome) && strings.TrimSpace(turn.CandidateText) != "" {
 		if err := publishTurnReply(ctx, tx, &turn); err != nil {
-			return domain.Turn{}, queueError(action, err)
+			return domain.Turn{}, err
 		}
 	}
 	if err := writeClaimedTurn(ctx, tx, &turn); err != nil {
-		return domain.Turn{}, queueError(action, err)
+		return domain.Turn{}, err
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE turns SET receipt_json=? WHERE group_id=? AND id=? AND claim_token=?", string(data), claim.GroupID, claim.TurnID, claim.Token); err != nil {
-		return domain.Turn{}, queueError(action, err)
+		return domain.Turn{}, err
 	}
 	if err := applyNativeBindingInTx(ctx, tx, turn, receipt, false); err != nil {
-		return domain.Turn{}, queueError(action, err)
+		return domain.Turn{}, err
 	}
 	if !activeTurn(turn.State) {
 		if turn.AcceptedAt == nil {
@@ -76,16 +92,13 @@ func (s *Store) ApplyTurnReceipt(ctx context.Context, claim TurnClaim, receipt p
 			 WHERE group_id=? AND id=? AND turn_id=? AND state<>'accepted'
 			 AND EXISTS(SELECT 1 FROM turns WHERE group_id=? AND id=? AND claim_token=?)`,
 				turn.Reason, turn.GroupID, turn.DeliveryID, turn.ID, claim.GroupID, claim.TurnID, claim.Token); err != nil {
-				return domain.Turn{}, queueError(action, err)
+				return domain.Turn{}, err
 			}
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM resource_claims WHERE turn_id=?
 		 AND EXISTS(SELECT 1 FROM turns WHERE group_id=? AND id=? AND claim_token=?)`, turn.ID, claim.GroupID, claim.TurnID, claim.Token); err != nil {
-			return domain.Turn{}, queueError(action, err)
+			return domain.Turn{}, err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return domain.Turn{}, queueError(action, err)
 	}
 	return turn, nil
 }

@@ -19,6 +19,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
 		return nil, nil, nil, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
 	}
+	if err := config.validateNativeSessionConfig(); err != nil {
+		return nil, nil, nil, err
+	}
 	runtime, err := privateExecutionRoot(config.dataDir, "runtime")
 	if err != nil {
 		return nil, nil, nil, err
@@ -49,6 +52,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			ConfigRoot: root, Endpoint: endpoint, MaxGroupMembers: config.memberToolsMaxMembers,
 			Operations: []string{"list_members", "read_channel", "send_message", "create_member", "search_history", "read_history"},
 		}
+		if config.enableNativeSessionResume {
+			toolOptions.NativeExecutionRoot = schedulerOptions.RuntimeDir
+		}
 		if config.enableCoordinationRoles {
 			toolOptions.RoleMaxActive, toolOptions.RoleExecutionRoot = schedulerOptions.MaxActive, schedulerOptions.RuntimeDir
 			toolOptions.ChatIntake = engine
@@ -65,6 +71,8 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		}
 		options.MemberTools, options.PiMemberToolsExtension = tools, config.piMemberToolsExtension
 		options.EnableCodexAppServer = config.enableCodexAppServer
+		options.EnableNativeSessionResume = config.enableNativeSessionResume
+		options.NativePiThinking = config.nativePiThinking
 	}
 	preparer, err := platform.NewPreparer(db, options)
 	if err != nil {

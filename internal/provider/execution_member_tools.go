@@ -1,6 +1,8 @@
 package provider
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +12,7 @@ import (
 
 const piMemberToolFrameLimit = 1 << 20
 const piMemberToolConfigEnv = "AGENT_WORKSPACE_MEMBER_TOOL_CONFIG"
+const piMemberToolConfigSHAEnv = "AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256"
 const piMemberToolNames = "list_members,read_channel,send_message,create_member"
 const workspaceWorkerToolNames = "read_channel,search_history,read_history,submit_result,workspace_list,workspace_read,workspace_write,publish_workspace_artifact"
 
@@ -25,6 +28,7 @@ type piMemberToolOptions struct {
 	extensionPath string
 	configPath    string
 	toolNames     []string
+	configSHA256  [sha256.Size]byte // Nonzero only for the runtime-bound profile.
 }
 
 // NewPiMemberToolExecutor opts into four native member tools on verified Pi 1.4.0.
@@ -114,12 +118,20 @@ func (a piWorkspaceMemberToolAdapter) NewExecutor(selected Provider, timeout tim
 	return NewPiMemberToolExecutorWithTools(selected, a.extensionPath, filepath.Clean(a.configPath), a.toolNames, timeout)
 }
 
-func piMemberToolEnvironment(inherited []string, configPath string) []string {
-	env := make([]string, 0, len(inherited)+1)
+func (o *piMemberToolOptions) environment(inherited []string) []string {
+	env := make([]string, 0, len(inherited)+2)
 	for _, value := range inherited {
-		if !strings.HasPrefix(value, piMemberToolConfigEnv+"=") {
+		if !strings.HasPrefix(value, piMemberToolConfigEnv+"=") && !strings.HasPrefix(value, piMemberToolConfigSHAEnv+"=") {
 			env = append(env, value)
 		}
 	}
-	return append(env, piMemberToolConfigEnv+"="+configPath)
+	env = append(env, piMemberToolConfigEnv+"="+o.configPath)
+	if o.boundConfig() {
+		env = append(env, piMemberToolConfigSHAEnv+"="+hex.EncodeToString(o.configSHA256[:]))
+	}
+	return env
+}
+
+func (o *piMemberToolOptions) boundConfig() bool {
+	return o != nil && o.configSHA256 != ([sha256.Size]byte{})
 }

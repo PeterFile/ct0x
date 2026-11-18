@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"unicode/utf8"
 
@@ -34,12 +35,7 @@ func (s *Store) SelectNativeSession(ctx context.Context, scope MemberToolScope, 
 			}
 		}
 	}()
-	// Copy/canonicalize caller-owned slices before opening the transaction.
-	data, err := CanonicalNativeRunBinding(binding)
-	if err != nil || binding.ResumedFromTurnID != "" {
-		return out, ErrInvalid
-	}
-	binding, err = decodeNativeRunBinding(data)
+	binding, err = nativeSelectionBinding(binding)
 	if err != nil {
 		return out, err
 	}
@@ -48,6 +44,75 @@ func (s *Store) SelectNativeSession(ctx context.Context, scope MemberToolScope, 
 		return out, err
 	}
 	defer tx.Rollback()
+	out, err = selectNativeSessionInTx(ctx, tx, scope, binding, nil)
+	if err != nil {
+		return out, err
+	}
+	return out, tx.Commit()
+}
+
+// NativeSessionLaunch ties construction evidence to the actual issued scope. It
+// is process-local; neither the selection nor this value is a launch permit.
+type NativeSessionLaunch struct {
+	Scope      MemberToolScope
+	Binding    NativeRunBinding
+	DeliveryID string
+	Role       CoordinationToolScope // Zero for generic/intake.
+	Selection  NativeSessionSelection
+}
+
+// CommitNativeSessionLaunch is the final native-only gate. The caller MUST
+// hold the issuing registry's revoke lock until this returns. admit is a
+// memory-only, one-shot check (no Store, filesystem, callback or provider IO).
+// Only a successful transaction commit authorizes invocation. The initial
+// conditional write excludes concurrent Store writers even across handles, so
+// policy, cancel, claim and receipt writes committed before this gate are seen;
+// writes after commit affect live tools/cancellation, not the committed launch.
+// No launch or acceptance evidence is persisted by this transaction.
+func (s *Store) CommitNativeSessionLaunch(ctx context.Context, launch NativeSessionLaunch, admit func() bool) (err error) {
+	const action = "提交原生会话启动失败"
+	defer func() {
+		if err != nil {
+			if errors.Is(err, ErrMemberToolDenied) {
+				err = fmt.Errorf("%s：%w", action, ErrMemberToolDenied)
+			} else {
+				err = queueError(action, err)
+			}
+		}
+	}()
+	binding, err := nativeSelectionBinding(launch.Binding)
+	if err != nil || launch.DeliveryID == "" || admit == nil {
+		return ErrInvalid
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	current, err := selectNativeSessionInTx(ctx, tx, launch.Scope, binding, &launch)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if current.SourceTurnID != launch.Selection.SourceTurnID || !reflect.DeepEqual(current.Reference, launch.Selection.Reference) || !admit() {
+		return ErrMemberToolDenied
+	}
+	return tx.Commit()
+}
+
+func nativeSelectionBinding(binding NativeRunBinding) (NativeRunBinding, error) {
+	// Copy/canonicalize caller-owned slices before opening the transaction.
+	data, err := CanonicalNativeRunBinding(binding)
+	if err != nil || binding.ResumedFromTurnID != "" {
+		return NativeRunBinding{}, ErrInvalid
+	}
+	return decodeNativeRunBinding(data)
+}
+
+func selectNativeSessionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, binding NativeRunBinding, launch *NativeSessionLaunch) (NativeSessionSelection, error) {
+	out := NativeSessionSelection{Reason: "当前执行授权或绑定无效，不能续接"}
 	if err := memberToolScopeInTx(ctx, tx, scope); err != nil {
 		if ctx.Err() != nil {
 			return out, ctx.Err()
@@ -58,12 +123,13 @@ func (s *Store) SelectNativeSession(ctx context.Context, scope MemberToolScope, 
 	if err != nil {
 		return out, err
 	}
-	var hasReceipt bool
-	if err := tx.QueryRowContext(ctx, "SELECT receipt_json<>'' FROM turns WHERE id=?", turn.ID).Scan(&hasReceipt); err != nil {
+	var hasEvidence bool
+	if err := tx.QueryRowContext(ctx, `SELECT receipt_json<>'' OR EXISTS(SELECT 1 FROM native_run_bindings WHERE turn_id=turns.id)
+	 FROM turns WHERE id=?`, turn.ID).Scan(&hasEvidence); err != nil {
 		return out, err
 	}
-	if turn.State != domain.TurnStateStarting || turn.AcceptedAt != nil || turn.NativeSessionID != "" || turn.CandidateText != "" ||
-		turn.CandidateTerminal != "" || hasReceipt || !nativeBindingIdentity(binding, turn, scope.TopicID) {
+	if !nativeFreshTurn(turn) || hasEvidence || !nativeBindingIdentity(binding, turn, scope.TopicID) ||
+		launch != nil && turn.DeliveryID != launch.DeliveryID {
 		return out, ErrMemberToolDenied
 	}
 	e, err := nativePurposeInTx(ctx, tx, turn, &binding)
@@ -73,7 +139,7 @@ func (s *Store) SelectNativeSession(ctx context.Context, scope MemberToolScope, 
 	if !nativeBindingEvidence(binding, turn, e) {
 		return out, ErrMemberToolDenied
 	}
-	if err := nativeCurrentPurposeInTx(ctx, tx, scope, e); err != nil {
+	if err := nativeCurrentPurposeInTx(ctx, tx, scope, e, launch); err != nil {
 		return out, err
 	}
 	var providerID, model, workspace string
@@ -108,13 +174,24 @@ func (s *Store) SelectNativeSession(ctx context.Context, scope MemberToolScope, 
 			return out, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return out, err
-	}
 	return out, nil
 }
 
-func nativeCurrentPurposeInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, e nativePurposeEvidence) error {
+func nativeFreshTurn(turn domain.Turn) bool {
+	return turn.State == domain.TurnStateStarting && turn.CancelRequestedAt == nil && turn.AcceptedAt == nil &&
+		turn.NativeSessionID == "" && turn.CandidateText == "" && turn.CandidateTerminal == ""
+}
+
+func nativeCurrentPurposeInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, e nativePurposeEvidence, launch *NativeSessionLaunch) error {
+	if launch != nil {
+		if e.role == (CoordinationRoleProvenance{}) {
+			if launch.Role != (CoordinationToolScope{}) {
+				return ErrMemberToolDenied
+			}
+		} else if launch.Role.Provenance != e.role || launch.Role.Member != scope {
+			return ErrMemberToolDenied
+		}
+	}
 	switch e.purpose {
 	case "generic":
 		return nil
@@ -142,8 +219,20 @@ func nativeCurrentPurposeInTx(ctx context.Context, tx *sql.Tx, scope MemberToolS
 		if err != nil {
 			return err
 		}
-		if state.Blocked != CoordinationReady {
+		if state.Blocked != CoordinationReady || launch != nil && launch.Role.AttemptID != state.AttemptID {
 			return ErrMemberToolDenied
+		}
+		if launch != nil && e.role.Kind == CoordinationRoleWorker {
+			if state.AttemptID == "" {
+				return ErrMemberToolDenied
+			}
+			// A file-scoped worker must never start on the native text profile.
+			if _, err := taskWorkspaceScopeInTx(ctx, tx, scope.Claim.GroupID, e.role.TaskID); !errors.Is(err, ErrNotFound) {
+				if err != nil {
+					return err
+				}
+				return ErrMemberToolDenied
+			}
 		}
 		return nil
 	}

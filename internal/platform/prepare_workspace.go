@@ -13,6 +13,7 @@ import (
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/scheduler"
+	"agentworkspace/internal/store"
 )
 
 func privatePreparationDirectory(path string) bool {
@@ -77,78 +78,97 @@ func (p *Preparer) revalidateWorkspaces() error {
 	return nil
 }
 
-func (p *Preparer) workspace(ctx context.Context, member domain.Member, conversation domain.Conversation) (string, string, error) {
-	return p.resolvePreparationWorkspace(ctx, member, conversation, true)
-}
-
 // Only Prepare may create a private scope. Inspect validates existing targets;
 // absence under a revalidated trusted root is not a future write/claim promise.
 func (p *Preparer) resolvePreparationWorkspace(ctx context.Context, member domain.Member, conversation domain.Conversation, createPrivate bool) (string, string, error) {
+	workspace, err := p.resolvePreparationWorkspaceSnapshot(ctx, member, conversation, createPrivate)
+	return workspace.cwd, workspace.key, err
+}
+
+type preparationWorkspace struct {
+	cwd, key string
+	grant    store.WorkspaceGrantReceipt
+}
+
+func (p *Preparer) resolvePreparationWorkspaceSnapshot(ctx context.Context, member domain.Member, conversation domain.Conversation, createPrivate bool) (preparationWorkspace, error) {
+	var empty preparationWorkspace
 	grants, err := p.store.WorkspaceGrantSnapshot(ctx)
 	if err != nil {
-		return "", "", preparationReadError(ctx, err)
+		return empty, preparationReadError(ctx, err)
 	}
 	if len(grants) != 0 {
 		if _, err := p.validateDurableWorkspaceRoots(grants, ""); err != nil {
 			if member.Workspace != "" || !errors.Is(err, scheduler.ErrNotReady) {
-				return "", "", err
+				return empty, err
 			}
 			if err := p.validateStalePrivateWorkspaceRoots(ctx, grants); err != nil {
-				return "", "", err
+				return empty, err
 			}
 		}
 	}
 	if member.Workspace != "" {
 		if !filepath.IsAbs(member.Workspace) {
-			return "", "", scheduler.ErrNotReady
+			return empty, scheduler.ErrNotReady
 		}
 		var key string
+		var issued store.WorkspaceGrantReceipt
 		if index, granted := p.grants[preparationRecipient{member.GroupID, member.ID}]; granted {
 			key = p.rootKeys[index]
 		} else {
-			var err error
 			key, err = durableWorkspaceKey(grants, member.GroupID, member.ID)
 			if err != nil {
-				return "", "", err
+				return empty, err
+			}
+			if p.enableNativeSessionResume {
+				for _, grant := range grants {
+					if grant.GroupID == member.GroupID && grant.MemberID == member.ID {
+						issued = grant
+						break
+					}
+				}
 			}
 		}
 		resolved, err := filepath.EvalSymlinks(member.Workspace)
 		if err != nil {
-			return "", "", scheduler.ErrNotReady
+			return empty, scheduler.ErrNotReady
 		}
 		keys, err := scheduler.WorkspaceResourceKeys([]string{resolved})
 		if err != nil || keys[0] != key {
-			return "", "", scheduler.ErrNotReady
+			return empty, scheduler.ErrNotReady
 		}
-		// Use the authorized root's key, not a key for an arbitrary selected child.
-		return resolved, key, nil
+		// Preserve the selected grant, not an unrelated receipt for this member.
+		return preparationWorkspace{cwd: resolved, key: key, grant: issued}, nil
 	}
-	// JSON makes the three opaque authoritative IDs unambiguous. Only the hash,
-	// never any ID or model-selected path component, enters the private path.
-	identity, _ := json.Marshal([]string{member.GroupID, member.ID, conversation.ID})
-	path := filepath.Join(p.privateRoot, fmt.Sprintf("scope-%x", sha256.Sum256(identity)))
+	path := p.privatePreparationPath(member, conversation)
 	if createPrivate {
 		if err := os.Mkdir(path, 0700); err != nil && !os.IsExist(err) {
-			return "", "", errPrepareWorkspace
+			return empty, errPrepareWorkspace
 		}
 		if !privatePreparationDirectory(path) {
-			return "", "", errPrepareWorkspace
+			return empty, errPrepareWorkspace
 		}
 	} else {
 		info, err := os.Lstat(path)
 		if errors.Is(err, os.ErrNotExist) {
-			return "", "", nil
+			return empty, nil
 		}
 		if err != nil {
-			return "", "", &preparationFailure{category: errPrepareWorkspace, cause: err}
+			return empty, &preparationFailure{category: errPrepareWorkspace, cause: err}
 		}
 		if info.Mode() != os.ModeDir|0700 {
-			return "", "", errPrepareWorkspace
+			return empty, errPrepareWorkspace
 		}
 	}
 	keys, err := scheduler.WorkspaceResourceKeys([]string{path})
 	if err != nil {
-		return "", "", errPrepareWorkspace
+		return empty, errPrepareWorkspace
 	}
-	return path, keys[0], nil
+	return preparationWorkspace{cwd: path, key: keys[0]}, nil
+}
+
+func (p *Preparer) privatePreparationPath(member domain.Member, conversation domain.Conversation) string {
+	// JSON makes the three opaque authoritative IDs unambiguous. Only the hash,
+	// never any ID or model-selected path component, enters the private path.
+	identity, _ := json.Marshal([]string{member.GroupID, member.ID, conversation.ID})
+	return filepath.Join(p.privateRoot, fmt.Sprintf("scope-%x", sha256.Sum256(identity)))
 }

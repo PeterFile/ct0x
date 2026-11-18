@@ -21,11 +21,10 @@ var (
 // supply the runtime's Store, scheduler capacity and actual execution root.
 // The root's ancestors must remain trusted and stable for the core's lifetime.
 type memberToolRoleFence struct {
-	maxActive                   int
-	executionRoot, resolvedRoot string
-	rootInfo                    os.FileInfo
-	readTurn                    func(context.Context, string, string) (domain.Turn, error)
-	admission                   chan struct{}
+	memberToolExecutionRoot
+	maxActive int
+	readTurn  func(context.Context, string, string) (domain.Turn, error)
+	admission chan struct{}
 
 	mu      sync.Mutex
 	records map[string]*memberToolRoleFenceOwner // TurnID alone, never token or root.
@@ -45,24 +44,43 @@ type memberToolRoleFenceOwner struct {
 }
 
 func newMemberToolRoleFence(db *store.Store, maxActive int, executionRoot string) (*memberToolRoleFence, error) {
-	if db == nil || maxActive < 1 || !filepath.IsAbs(executionRoot) {
+	if db == nil || maxActive < 1 {
 		return nil, errMemberToolRoleFenceConfig
 	}
-	root := filepath.Clean(executionRoot)
-	info, err := os.Lstat(root)
-	if err != nil || info.Mode() != os.ModeDir|0700 {
-		return nil, errMemberToolRoleFenceConfig
-	}
-	resolved, err := filepath.EvalSymlinks(root)
+	root, err := pinMemberToolExecutionRoot(executionRoot)
 	if err != nil {
 		return nil, errMemberToolRoleFenceConfig
 	}
-	return &memberToolRoleFence{maxActive: maxActive, executionRoot: root, resolvedRoot: resolved,
-		rootInfo: info, readTurn: db.GetTurn, admission: make(chan struct{}, 1), vacant: -1}, nil
+	return &memberToolRoleFence{memberToolExecutionRoot: root, maxActive: maxActive,
+		readTurn: db.GetTurn, admission: make(chan struct{}, 1), vacant: -1}, nil
 }
 
-func (f *memberToolRoleFence) rootValid(runtimeDir string) bool {
-	if !filepath.IsAbs(runtimeDir) {
+// Pin the scheduler's root at trusted construction, not the first RunID. This
+// detects namespace drift at the checks; the ancestors must stay trusted.
+type memberToolExecutionRoot struct {
+	executionRoot, resolvedRoot string
+	rootInfo                    os.FileInfo
+}
+
+func pinMemberToolExecutionRoot(path string) (memberToolExecutionRoot, error) {
+	var root memberToolExecutionRoot
+	if !filepath.IsAbs(path) {
+		return root, errMemberToolRuntimeConfig
+	}
+	path = filepath.Clean(path)
+	info, err := os.Lstat(path)
+	if err != nil || info.Mode() != os.ModeDir|0700 {
+		return root, errMemberToolRuntimeConfig
+	}
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return root, errMemberToolRuntimeConfig
+	}
+	return memberToolExecutionRoot{executionRoot: path, resolvedRoot: resolved, rootInfo: info}, nil
+}
+
+func (f *memberToolExecutionRoot) rootValid(runtimeDir string) bool {
+	if f == nil || !filepath.IsAbs(runtimeDir) {
 		return false
 	}
 	for _, path := range []string{f.executionRoot, filepath.Clean(runtimeDir)} {

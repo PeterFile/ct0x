@@ -44,6 +44,9 @@ type PrepareOptions struct {
 	RoleMaxContextBytes    int           // Zero defaults to 256 KiB; maximum is 1 MiB.
 	RoleThinking           string        // Trusted role-only Pi thinking level; empty preserves CLI defaults.
 	ExecutionTimeout       time.Duration // Zero uses the provider default.
+
+	EnableNativeSessionResume bool   // Experimental, default false; requires member tools.
+	NativePiThinking          string // Exact Pi thinking for native generic/intake only; empty keeps legacy.
 }
 
 type preparationRecipient struct{ group, member string }
@@ -70,6 +73,9 @@ type Preparer struct {
 	memberTools            *MemberToolRuntime
 	piMemberToolsExtension string
 	enableCodexAppServer   bool
+
+	enableNativeSessionResume bool
+	nativePiThinking          string
 }
 
 var (
@@ -129,13 +135,19 @@ func NewPreparer(s *store.Store, opts PrepareOptions) (*Preparer, error) {
 
 func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 	r, path := opts.MemberTools, opts.PiMemberToolsExtension
-	if r == nil && path == "" && !opts.EnableCodexAppServer {
+	if opts.NativePiThinking != "" && (!opts.EnableNativeSessionResume || path == "" || !validNativePiThinking(opts.NativePiThinking)) {
+		return errPrepareConfig
+	}
+	if r == nil && path == "" && !opts.EnableCodexAppServer && !opts.EnableNativeSessionResume {
 		return nil
 	}
 	if r == nil || path == "" && !opts.EnableCodexAppServer || r.tools == nil || r.tools.db != p.store || r.tools.capabilities == nil ||
 		opts.EnableCodexAppServer && r.roleFence == nil ||
 		r.rootInfo == nil || !filepath.IsAbs(r.configRoot) || !filepath.IsAbs(r.resolvedRoot) ||
 		!memberToolRuntimeEndpoint(r.endpoint) || r.maxGroupMembers < 1 || r.maxGroupMembers > 200 || !r.rootValid() {
+		return errPrepareConfig
+	}
+	if opts.EnableNativeSessionResume && (r.executionRoot == nil || !r.executionRoot.rootValid(r.executionRoot.executionRoot)) {
 		return errPrepareConfig
 	}
 	// Prepare permits only the complete legacy or history profile, not subsets.
@@ -168,6 +180,7 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 		}
 	}
 	p.memberTools, p.piMemberToolsExtension, p.enableCodexAppServer = r, path, opts.EnableCodexAppServer
+	p.enableNativeSessionResume, p.nativePiThinking = opts.EnableNativeSessionResume, opts.NativePiThinking
 	return nil
 }
 
@@ -218,20 +231,41 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			return empty, err
 		}
 	}
-	prompt, err := p.buildContext(group, member, conversation, trigger, history, useMemberTools, repairSource)
+	var nativeText bool
+	var thinking string
+	var names []string
+	var maxMembers int
+	intake := useMemberTools && p.memberTools.tools.chatEngine != nil
+	// The v23 text profile does not bind the optional continuation schema.
+	if useMemberTools && p.enableNativeSessionResume && !(intake && p.memberTools.tools.WorkInputsEnabled()) {
+		names, maxMembers = p.memberTools.operations, p.memberTools.maxGroupMembers
+		if intake {
+			names, maxMembers = chatIntakeOperations(), 0
+		}
+		if selected.Name == provider.Pi {
+			thinking = p.nativePiThinking
+		}
+		// Separate typed scopes must select their own preparation before this text path.
+		nativeText, err = p.previewNativeSession(ctx, selected, member, conversation, thinking, names, maxMembers)
+		if err != nil {
+			return empty, err
+		}
+	}
+	prompt, err := p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, nativeText, repairSource)
 	if err != nil {
 		return empty, err
 	}
 	if err := ctx.Err(); err != nil {
 		return empty, preparationReadError(ctx, err)
 	}
-	cwd, key, err := p.workspace(ctx, member, conversation)
+	workspace, err := p.resolvePreparationWorkspaceSnapshot(ctx, member, conversation, true)
 	if err != nil {
 		return empty, err
 	}
 	if err := ctx.Err(); err != nil {
 		return empty, preparationReadError(ctx, err)
 	}
+	request := provider.ExecuteRequest{CWD: workspace.cwd, Prompt: string(prompt), Model: member.Model}
 	if useMemberTools {
 		wrap := p.memberTools.Wrap
 		if p.memberTools.tools.chatEngine != nil {
@@ -243,9 +277,13 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 		if err != nil {
 			return empty, scheduler.ErrNotReady
 		}
+		if nativeText {
+			if err := p.bindNativeSessionPreparation(executor, selected, selection, member, workspace, thinking, names, maxMembers, &request); err != nil {
+				return empty, err
+			}
+		}
 	}
-	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{key},
-		Request: provider.ExecuteRequest{CWD: cwd, Prompt: string(prompt), Model: member.Model}}, nil
+	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{workspace.key}, Request: request}, nil
 }
 
 type preparationInput struct {
@@ -336,6 +374,11 @@ func preparationReadError(ctx context.Context, err error) error {
 
 func (p *Preparer) buildContext(group domain.Group, member domain.Member, conversation domain.Conversation,
 	trigger domain.Message, history []domain.Message, useMemberTools bool, repairs ...*domain.ChatRepairSource) ([]byte, error) {
+	return p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, false, repairs...)
+}
+
+func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Member, conversation domain.Conversation,
+	trigger domain.Message, history []domain.Message, useMemberTools, nativeText bool, repairs ...*domain.ChatRepairSource) ([]byte, error) {
 	metadata := struct {
 		Group        domain.Group        `json:"group"`
 		Conversation domain.Conversation `json:"conversation"`
@@ -409,6 +452,13 @@ func (p *Preparer) buildContext(group domain.Group, member domain.Member, conver
 					in.Permissions[0] = "仅支持所选 Codex AppServer 版本的全新单轮执行；不支持恢复或运行中追加输入。"
 				}
 				in.Permissions = append(in.Permissions, codexNativeTextPermission)
+			}
+		}
+		if nativeText {
+			if p.memberTools.tools.chatEngine == nil {
+				in.Permissions[0] = nativeSessionTextPermission
+			} else {
+				in.Permissions = append(in.Permissions, nativeSessionTextPermission)
 			}
 		}
 	}

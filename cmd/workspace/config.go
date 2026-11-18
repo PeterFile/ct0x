@@ -16,6 +16,9 @@ import (
 const defaultExecutionMaxActive = 1
 
 type config struct {
+	enableNativeSessionResume bool
+	nativePiThinking          string
+
 	listen, dataDir, webDir, devOrigin, piPath, codexPath       string
 	enableExecution, enableMemberTools, enableCoordinationRoles bool
 	enableCodexAppServer                                        bool
@@ -41,6 +44,8 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags.BoolVar(&config.enableCoordinationRoles, "enable-coordination-roles", false, "显式启用受信协调角色（默认禁用）")
 	flags.BoolVar(&config.enableCodexAppServer, "enable-codex-app-server", false, "显式选择实验性 Codex AppServer 与会话级平台 MCP（默认禁用）")
 	flags.StringVar(&config.roleThinking, "role-thinking", "", "协调角色的 Pi thinking 级别（默认空）")
+	flags.BoolVar(&config.enableNativeSessionResume, "enable-native-session-resume", false, "实验性原生文本会话续接（默认禁用）")
+	flags.StringVar(&config.nativePiThinking, "native-pi-thinking", "", "普通文本及 chat_intake 原生 Pi thinking 级别（须显式启用）")
 	for name, destination := range map[string]*string{"pi-path": &config.piPath, "codex-path": &config.codexPath} {
 		flags.Func(name, "CLI 绝对路径", func(value string) error {
 			if *destination != "" || !filepath.IsAbs(value) {
@@ -61,6 +66,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	})
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
+			fmt.Fprint(output, "  --enable-native-session-resume  实验性原生文本会话续接（默认禁用；须启用执行与成员工具；不启用文件会话、调查续接或运行中追加）\n  --native-pi-thinking 级别  仅 Pi 普通文本与 chat_intake 原生会话使用：off、minimal、low、medium、high、xhigh、max（须显式启用原生会话续接并配置可信 Pi 扩展；不指定则沿用普通 Pi 执行，不影响 --role-thinking）\n")
 			return config, err
 		}
 		return config, errors.New("命令行参数无效，请使用 --help 查看帮助")
@@ -126,6 +132,12 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 			return config, errors.New("关闭 Pi 成员工具扩展失败")
 		}
 	}
+	if set["native-pi-thinking"] && config.nativePiThinking == "" {
+		return config, errors.New("指定的原生 Pi thinking 级别不能为空")
+	}
+	if err := config.validateNativeSessionConfig(); err != nil {
+		return config, err
+	}
 	if !set["data-dir"] {
 		root, err := os.UserConfigDir()
 		if err != nil {
@@ -141,4 +153,19 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		return config, fmt.Errorf("解析数据目录失败：%w", err)
 	}
 	return config, nil
+}
+
+func (c config) validateNativeSessionConfig() error {
+	if c.enableNativeSessionResume && (!c.enableExecution || !c.enableMemberTools) {
+		return errors.New("启用原生会话续接必须同时启用执行和成员工具")
+	}
+	if c.nativePiThinking != "" && (!c.enableNativeSessionResume || c.piMemberToolsExtension == "") {
+		return errors.New("普通原生 Pi thinking 级别须启用原生会话续接并指定可信 Pi 扩展")
+	}
+	switch c.nativePiThinking {
+	case "", "off", "minimal", "low", "medium", "high", "xhigh", "max":
+		return nil
+	default:
+		return errors.New("原生 Pi thinking 级别无效，请使用 --help 查看允许的精确值")
+	}
 }
