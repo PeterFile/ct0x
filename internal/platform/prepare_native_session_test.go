@@ -208,8 +208,8 @@ func TestNativeSessionPreparePiIntakeBridgeSchemaCompatibility(t *testing.T) {
 	useReleasePiBridge(t, f)
 	prepared := nextNativeSessionPreparation(t, f)
 	run := prepared.Executor.(*memberToolRuntimeRun)
-	if !run.intakeSchema.piDiscussionExcerpt || run.intakeSchema.investigation || run.intakeBuilder != nil {
-		t.Fatal("v27 bridge must select the excerpt without enabling investigation")
+	if !run.intakeSchema.piDiscussionExcerpt || run.intakeSchema.investigation || run.intakeBuilder == nil {
+		t.Fatal("qualified bridge must bind the excerpt config without enabling investigation")
 	}
 	if run.nativeSession != nil {
 		_, wrong, _ := runNativeSessionFixture(t, f, prepared, nil, provider.OutcomeSucceeded, false)
