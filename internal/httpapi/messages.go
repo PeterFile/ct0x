@@ -8,10 +8,13 @@ import (
 
 func MessageRoutes(local *platform.LocalUser) []Route {
 	a := localAPI{local}
+	const discussionPolicyPath = "/api/v1/groups/{group}/coordination/discussion-policy"
 	return []Route{
 		{http.MethodGet, "/api/v1/groups/{group}/messages", a.listMessages},
 		{http.MethodPost, "/api/v1/groups/{group}/messages", noQuery(a.createMessage)},
 		{http.MethodGet, "/api/v1/groups/{group}/messages/{message}", noQuery(a.getMessage)},
+		{http.MethodGet, discussionPolicyPath, a.withDiscussionPolicy(a.getDiscussionPolicy)},
+		{http.MethodPut, discussionPolicyPath, a.withDiscussionPolicy(a.setDiscussionPolicy)},
 	}
 }
 

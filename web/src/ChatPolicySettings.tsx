@@ -1,5 +1,6 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { ApiError } from "./api";
+import { ChatDiscussionPolicySettings } from "./ChatDiscussionPolicySettings";
 import { ChatInvestigationSettings } from "./ChatInvestigationSettings";
 import type { InvestigationDraft } from "./ChatInvestigationSettings";
 import { chatInvestigationLimits, getChatPolicy, hasChatPolicyMetadata, isChatInvestigationPolicy,
@@ -233,6 +234,7 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
       </form>
       {state.receipt ? <p role="status">聊天策略保存已确认（历史版本 {state.receipt.revision}）；当前值以重新读取为准。</p> : null}
       <p className="tasks-note">草稿和未确认保存仅保留在本页；重载会丢失原幂等身份，不表示取消或保存失败。</p>
+      <ChatDiscussionPolicySettings key={groupId} groupId={groupId} active={enabled} />
     </div>
   </section>;
 }
