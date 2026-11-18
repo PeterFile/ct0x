@@ -70,6 +70,12 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
   useEffect(() => { onMembers?.(groupId, items); }, [groupId, items, onMembers]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const selected = items.find(member => member.id === selectedId);
+  function memberIdentity(id: string) {
+    const actor = items.find(member => member.id === id && member.group_id === groupId);
+    const label = id === "user" ? "本机用户" : actor?.name
+      ? `${actor.name}${actor.status === "left" ? "（已离开）" : actor.status === "active" ? "" : "（状态未知）"}` : "";
+    return <>{label ? `${label} · ` : null}<code>{id}</code></>;
+  }
   const selectedProvider = !catalogue.pending && !catalogue.error
     ? catalogue.items.find(provider => provider.id === selected?.provider_id) : undefined;
   const [draft, setDraft] = useState(emptyDraft);
@@ -154,6 +160,8 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
     {selected ? <section className="empty-panel member-detail" aria-label="成员详情">
       <h3>{selected.name}</h3><p>{selected.role}</p>
       <dl><dt>群内状态</dt><dd>{selected.status === "active" ? "在群" : selected.status === "left" ? "已离开" : "状态未知"}</dd>
+        {selected.creator_id.trim() ? <><dt>创建者</dt><dd>{memberIdentity(selected.creator_id)}</dd></> : null}
+        {selected.owner_id.trim() ? <><dt>所有者</dt><dd>{memberIdentity(selected.owner_id)}</dd></> : null}
         <dt>运行器配置</dt><dd>{selected.provider_id ? selectedProvider?.name || "已有配置，目录未验证" : "未绑定"}</dd>
         <dt>模型配置</dt><dd>{selected.model || "未指定"}</dd><dt>工作目录配置</dt><dd>{selected.workspace || "未配置"}</dd></dl>
       <MemberAdapterDetails provider={selectedProvider} />

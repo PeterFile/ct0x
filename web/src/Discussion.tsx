@@ -1,7 +1,7 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection, sendMessage } from "./api";
-import type { Delivery, Member, MessageInput } from "./api";
+import type { Delivery, Member, Message, MessageInput } from "./api";
 import { messageAuthor, messageSourceLabel } from "./message-source";
 import { RequestWork } from "./RequestWork";
 import type { RequestWorkHandle } from "./RequestWork";
@@ -51,6 +51,7 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
 }) {
   const formId = useId(), feed = useMessageFeed(groupId, active);
   const scroll = useMessageScroll(active, feed.items, feed.page);
+  const loaded = useMemo(() => new Map(feed.items.map(message => [message.id, message])), [feed.items]);
   const [content, setContent] = useState("");
   const [route, setRoute] = useState("default"), [recipients, setRecipients] = useState<string[]>([]);
   const [mention, setMention] = useState<{ start: number; end: number; query: string } | null>(null);
@@ -61,9 +62,10 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
   const requestWork = useRef<RequestWorkHandle>(null);
   const operation = useRef<{ key: string; input: MessageInput } | null>(null);
   const posting = useRef<AbortController | null>(null), mounted = useRef(false);
-  const eligible = members.filter(member => member.group_id === groupId && member.status === "active");
-  const memberNames = new Map(members.filter(member => member.group_id === groupId).map(member => [member.id, member.name]));
-  const authorName = (id: string) => id === "user" ? "我" : memberNames.get(id) ?? "未载入成员";
+  const scopedMembers = members.filter(member => member.group_id === groupId);
+  const eligible = scopedMembers.filter(member => member.status === "active");
+  const membersById = new Map(scopedMembers.map(member => [member.id, member]));
+  const authorName = (id: string) => id === "user" ? "我" : membersById.get(id)?.name ?? "未载入成员";
   const blocked = mutation.pending || mutation.uncertain;
   const suggestions = mention && active && !blocked ? eligible.filter(member => (route !== "selected" || !recipients.includes(member.id))
     && `${member.name} ${member.role} ${member.id}`.toLocaleLowerCase().includes(mention.query.toLocaleLowerCase())) : [];
@@ -155,11 +157,13 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
     {feed.page.next ? <button type="button" disabled={feed.page.pending} onClick={() => { scroll.beforeOlder(); void feed.loadPage(feed.page.next, false); }}>加载更早消息</button> : null}
     <RequestWork groupId={groupId} active={active} members={members} ref={requestWork} />
     <ol className="message-list" aria-label="群组消息" ref={scroll.listRef}>{feed.items.map(message => <li key={message.id} data-message-id={message.id}>
-      <article className={message.source_kind === "local_user_chat" || message.source_kind === "local_user_policy" ? "message-local" : undefined} aria-label={`消息 ${message.id}`}>
-        <header className="message-meta"><strong>{messageAuthor(message, memberNames.get(message.sender_id))}</strong><time dateTime={message.created_at}>{shortTime(message.created_at)}</time>
+      <article id={messageAnchor(formId, message.id)} tabIndex={-1}
+        className={message.source_kind === "local_user_chat" || message.source_kind === "local_user_policy" ? "message-local" : undefined} aria-label={`消息 ${message.id}`}>
+        <header className="message-meta"><strong>{messageAuthor(message, membersById.get(message.sender_id)?.name)}</strong><time dateTime={message.created_at}>{shortTime(message.created_at)}</time>
           <span className="feed-note">{messageSourceLabel(message.source_kind)}</span></header>
         {message.topic_id ? <p className="eyebrow accent">话题消息</p> : null}
         <p className="message-content">{message.content}</p>
+        {message.discussion ? <DiscussionContext message={message} loaded={loaded} members={membersById} scopeId={formId} /> : null}
         <div className="message-actions">
         <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
           onClick={event => requestWork.current?.open(message, event.currentTarget)}>转为任务</button>
@@ -221,7 +225,7 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
       </ul> : <p className="feed-note" role="status">没有匹配的已载入在群成员；可打开成员详情加载。</p> : null}
       {route === "selected" && recipients.length ? <fieldset disabled={blocked}>
         <ul className="selected-recipients" aria-label="已选接收者">{recipients.map(id => <li key={id}>
-          <span>{memberNames.get(id) ?? "未载入成员"} · {id}{!eligible.some(member => member.id === id) ? "（已失效，请移除或重新载入）" : ""}</span>
+          <span>{membersById.get(id)?.name ?? "未载入成员"} · {id}{!eligible.some(member => member.id === id) ? "（已失效，请移除或重新载入）" : ""}</span>
           <button type="button" aria-label={`移除接收者 ${id}`} onClick={() => removeRecipient(id)}>移除</button>
         </li>)}</ul>
       </fieldset> : null}
@@ -251,5 +255,69 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
       {mutation.notice ? <p role="status">{mutation.notice}</p> : null}
     </form>
     </section>
+  </div>;
+}
+
+const discussionLabels = { invite: "邀请协作", reply: "回送答复", resolve: "讨论总结" };
+// Escape opaque IDs into unambiguous fragments, namespaced to this mounted group scope.
+const messageAnchor = (scopeId: string, id: string) =>
+  `${scopeId}-message-${id.replace(/[^a-zA-Z0-9-]/gu, character => `_${character.codePointAt(0)!.toString(16)}_`)}`;
+function discussionPreview(content: string) {
+  let text = "", length = 0;
+  for (const character of content) {
+    if (length++ === 120) return `${text.trimEnd()}…`;
+    text += character;
+  }
+  return text;
+}
+
+function DiscussionContext({ message, loaded, members, scopeId }: {
+  message: Message; loaded: ReadonlyMap<string, Message>; members: ReadonlyMap<string, Member>; scopeId: string;
+}) {
+  const facts = message.discussion;
+  if (!facts) return null;
+  const { kind, root_message_id, invitation_message_id, parent_invitation_message_id, inviter_id, assignee_id, expected_reply } = facts;
+  const sameScope = (target: Message) => target.group_id === message.group_id && target.topic_id === message.topic_id;
+  const root = loaded.get(root_message_id);
+  // A missing row is not a contradiction. A loaded row must agree before lending its text or identity to this relation.
+  if (root && (!sameScope(root) || root.sender_id !== "user"
+    || (root.source_kind !== undefined && root.source_kind !== "unknown" && root.source_kind !== "local_user_chat"))) return null;
+  const invitationFacts = (target: Message) => sameScope(target) && target.discussion?.kind === "invite"
+    && target.discussion.root_message_id === root_message_id ? target.discussion : undefined;
+  const invitation = kind === "invite" ? undefined : loaded.get(invitation_message_id);
+  if (invitation) {
+    const evidence = invitationFacts(invitation);
+    if (!evidence || evidence.inviter_id !== inviter_id || evidence.assignee_id !== assignee_id
+      || evidence.parent_invitation_message_id !== parent_invitation_message_id || evidence.expected_reply !== expected_reply) return null;
+  }
+  const parent = parent_invitation_message_id ? loaded.get(parent_invitation_message_id) : undefined;
+  if (parent && invitationFacts(parent)?.assignee_id !== inviter_id) return null;
+  const actor = (id: string) => {
+    const member = members.get(id);
+    return member ? `${member.name || "未命名成员"}${member.status === "left" ? "（已离开）" : member.status === "active" ? "" : "（状态未知）"}` : "未载入成员";
+  };
+  const summary = kind === "invite" ? `${actor(inviter_id)} 邀请 ${actor(assignee_id)}`
+    : kind === "reply" ? `${actor(assignee_id)} 回送给 ${actor(inviter_id)}` : `${actor(inviter_id)} 向群组总结`;
+  return <details className="message-details message-discussion">
+    <summary><strong>{discussionLabels[kind]}</strong> · {summary}</summary>
+    <dl className="message-technical">
+      <DiscussionReference label="原始问题" id={root_message_id} target={root} scopeId={scopeId} />
+      <DiscussionReference label="对应邀请" id={invitation_message_id} target={invitation} scopeId={scopeId} self={kind === "invite"} />
+      {parent_invitation_message_id ? <DiscussionReference label="上级邀请" id={parent_invitation_message_id} target={parent} scopeId={scopeId} /> : null}
+      <div><dt>邀请者 ID</dt><dd><code>{inviter_id}</code></dd></div>
+      <div><dt>受邀者 ID</dt><dd><code>{assignee_id}</code></dd></div>
+      {expected_reply.trim() ? <div><dt>预期答复</dt><dd>{expected_reply}</dd></div> : null}
+    </dl>
+  </details>;
+}
+
+function DiscussionReference({ label, id, target, scopeId, self }: {
+  label: string; id: string; target?: Message; scopeId: string; self?: boolean;
+}) {
+  return <div>
+    <dt>{target ? <a href={`#${messageAnchor(scopeId, id)}`}>{label}</a> : label}</dt>
+    <dd><code>{id}</code>{self ? "（本条消息）" : !target ? "（未在当前窗口载入）" : null}
+      {target ? <p className="discussion-reference-preview">{discussionPreview(target.content)}</p> : null}
+    </dd>
   </div>;
 }

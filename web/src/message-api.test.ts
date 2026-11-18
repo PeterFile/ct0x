@@ -83,6 +83,15 @@ it.each([
   expect(error).toMatchObject({ status: 201, code: "invalid_response" });
   expect(isDefinitiveRejection(error)).toBe(false);
 });
+it("drops incompatible discussion metadata without losing a matching message receipt", async () => {
+  const discussion = { kind: "invite", root_message_id: "question-1", invitation_message_id: message.id,
+    inviter_id: "member-1", assignee_id: "member-2", expected_reply: "核对结论" };
+  const input = { content, discussion };
+  transport.mockResolvedValueOnce(json({ ...message, discussion }, 201));
+  expect(await sendMessage(group.id, input, "discussion-is-read-only")).toEqual(message);
+  expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toEqual({ content });
+});
+
 it("preserves known and future delivery states as data without promoting acknowledgements", async () => {
   const receipt = { ...message, deliveries: ["queued", "accepted", "failed", "future-state"].map((state, index) => ({ ...delivery, id: `delivery-${index}`, state })) };
   transport.mockResolvedValueOnce(json(receipt, 201));

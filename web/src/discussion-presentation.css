@@ -72,6 +72,14 @@
   cursor: pointer;
 }
 .discussion-feed .message-details summary:hover { color: var(--color-text); }
+.discussion-feed .message-discussion {
+  border-inline-start: var(--border-rule);
+  padding-inline: var(--space-2);
+}
+.discussion-feed .message-discussion summary strong { color: var(--color-text); font-weight: var(--weight-medium); }
+.discussion-feed .message-discussion .message-technical { margin: 0; border-block-end: 0; }
+.discussion-feed .message-discussion dt a { display: inline-block; padding-block: var(--space-1); color: var(--color-text); }
+.discussion-feed .discussion-reference-preview { color: var(--color-muted); }
 .discussion-feed .delivery-warning { color: var(--color-accent); }
 .discussion-feed .message-technical {
   display: grid;

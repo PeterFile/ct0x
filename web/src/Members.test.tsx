@@ -65,6 +65,20 @@ it.each([["active", "在群"], ["left", "已离开"], ["future", "状态未知"]
   expect(panel().queryByRole("textbox", { name: /运行器/ })).not.toBeInTheDocument();
   expect(await panel().findByRole("option", { name: /pi.*版本未知.*\/opt\/bin\/pi.*账户已登录（运行未验证）/ })).toHaveValue(provider.id);
 });
+it("shows the stored creator and owner separately without claiming current membership for the creator", async () => {
+  const creator = { ...member, id: "previous-creator", name: "原协作者", status: "left" };
+  const invited = { ...member, creator_id: creator.id, owner_id: "user" };
+  reads.mockResolvedValueOnce(page([invited, creator]));
+  await open(); fireEvent.click(await panel().findByRole("button", { name: invited.name }));
+  expect(detailValue("创建者")).toHaveTextContent(`${creator.name}（已离开） · ${creator.id}`);
+  expect(detailValue("所有者")).toHaveTextContent("本机用户 · user");
+  reads.mockResolvedValueOnce(page([{ ...invited, owner_id: "" }]));
+  fireEvent.click(panel().getByRole("button", { name: "刷新成员" }));
+  await act(async () => {});
+  expect(detailValue("创建者")).toHaveTextContent(/^previous-creator$/);
+  expect(panel().queryByText("所有者")).not.toBeInTheDocument();
+});
+
 it("reports member loading, error and real empty results with explicit retry", async () => {
   reads.mockResolvedValueOnce(json({ error: { code: "missing", message: "未找到" } }, 404));
   await open();

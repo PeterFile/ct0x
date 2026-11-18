@@ -28,9 +28,16 @@ export type Delivery = {
   id: string; message_id: string; conversation_id: string; recipient_id: string;
   state: string; turn_id: string; error: string; created_at: string;
 };
+export type MessageDiscussion = Readonly<{
+  kind: "invite" | "reply" | "resolve";
+  root_message_id: string; invitation_message_id: string; parent_invitation_message_id?: string;
+  inviter_id: string; assignee_id: string; expected_reply: string;
+}>;
 export type Message = MessageSource & {
   id: string; group_id: string; topic_id: string; sender_id: string; content: string; created_at: string; deliveries: Delivery[];
+  discussion?: MessageDiscussion | null;
 };
+export type WireMessage = Omit<Message, "discussion"> & { discussion?: unknown };
 export type MessageInput = Readonly<{ content: string; recipient_ids?: readonly string[]; topic_id?: string }>;
 type Page<T> = { items: T[]; next_cursor: string };
 export class ApiError extends Error {
@@ -50,13 +57,40 @@ const pageOf = <T>(valid: (value: unknown) => value is T) => (value: unknown): v
 const memberIn = (groupId: string) => (value: unknown): value is Member => isRecord(value)
   && ["id", "group_id", "name", "role", "provider_id", "model", "creator_id", "owner_id", "status", "workspace", "created_at"]
     .every(key => typeof value[key] === "string") && value.id !== "" && value.group_id === groupId;
-const messageIn = (groupId: string, topicId?: string) => (value: unknown): value is Message => isRecord(value)
+export const messageIn = (groupId: string, topicId?: string) => (value: unknown): value is WireMessage => isRecord(value) && !Array.isArray(value)
   && ["id", "group_id", "topic_id", "sender_id", "content", "created_at"].every(key => typeof value[key] === "string")
   && value.id !== "" && value.group_id === groupId && (topicId === undefined || value.topic_id === topicId)
   && hasValidMessageSource(value) && Array.isArray(value.deliveries)
-  && value.deliveries.every(delivery => isRecord(delivery)
+  && value.deliveries.every(delivery => isRecord(delivery) && !Array.isArray(delivery)
     && ["id", "message_id", "conversation_id", "recipient_id", "state", "turn_id", "error", "created_at"]
       .every(key => typeof delivery[key] === "string") && delivery.id !== "" && delivery.message_id === value.id);
+const boundedDiscussionText = (value: unknown, maxBytes: number): value is string => typeof value === "string"
+  && value.length <= maxBytes && !/[\0\ud800-\udfff]/u.test(value) && new TextEncoder().encode(value).length <= maxBytes;
+const discussionId = (value: unknown): value is string => boundedDiscussionText(value, 4096)
+  && value !== "" && !/^\p{White_Space}|\p{White_Space}$|[\r\n]/u.test(value);
+function discussionFor(value: unknown, message: Omit<Message, "discussion">): MessageDiscussion | undefined {
+  if (!isRecord(value) || Array.isArray(value)) return;
+  const { kind, root_message_id, invitation_message_id, parent_invitation_message_id, inviter_id, assignee_id, expected_reply } = value;
+  if ((kind !== "invite" && kind !== "reply" && kind !== "resolve")
+    || !discussionId(root_message_id) || !discussionId(invitation_message_id)
+    || !discussionId(inviter_id) || !discussionId(assignee_id) || !boundedDiscussionText(expected_reply, 16 * 1024)
+    || inviter_id === assignee_id || inviter_id === "user" || assignee_id === "user"
+    || message.sender_id !== (kind === "reply" ? assignee_id : inviter_id)
+    || (message.source_kind !== undefined && message.source_kind !== "unknown" && message.source_kind !== "member")
+    || root_message_id === message.id || root_message_id === invitation_message_id
+    || (kind === "invite") !== (invitation_message_id === message.id)
+    || (parent_invitation_message_id !== undefined && (!discussionId(parent_invitation_message_id)
+      || parent_invitation_message_id === root_message_id || parent_invitation_message_id === invitation_message_id
+      || parent_invitation_message_id === message.id))) return;
+  return { kind, root_message_id, invitation_message_id, inviter_id, assignee_id, expected_reply,
+    ...(parent_invitation_message_id === undefined ? {} : { parent_invitation_message_id }) };
+}
+export function decodeMessage({ discussion, ...message }: WireMessage): Message {
+  // Invalid optional evidence must not conceal an otherwise valid public row or change its receipt.
+  if (discussion === null) return { ...message, discussion };
+  const relation = discussionFor(discussion, message);
+  return relation ? { ...message, discussion: relation } : message;
+}
 function validProviderAdapter(value: unknown, current: Record<string, unknown>): value is ProviderAdapter {
   if (!isRecord(value) || typeof value.id !== "string" || !value.id || value.id.trim() !== value.id || value.id.includes("\0")
     || !["one_shot", "pi_extension", "codex_app_server"].some(protocol => protocol === value.protocol)
@@ -138,20 +172,21 @@ const messagesPath = (groupId: string) => `/api/v1/groups/${encodeURIComponent(g
 export function sendMessage(groupId: string, input: MessageInput, key: string, signal?: AbortSignal) {
   const sent = Object.freeze({ content: input.content,
     recipient_ids: Array.isArray(input.recipient_ids) ? Object.freeze([...input.recipient_ids]) : input.recipient_ids, topic_id: input.topic_id });
-  return post(messagesPath(groupId), sent, key, (value): value is Message => messageIn(groupId, sent.topic_id ?? "")(value)
-    && value.content === sent.content, signal);
+  return post(messagesPath(groupId), sent, key, (value): value is WireMessage => messageIn(groupId, sent.topic_id ?? "")(value)
+    && value.content === sent.content, signal).then(decodeMessage);
 }
-export function listMessages(groupId: string, before = "", signal?: AbortSignal) {
-  return request(`${messagesPath(groupId)}${pageQuery(before)}`, { signal }, pageOf(messageIn(groupId)));
+export async function listMessages(groupId: string, before = "", signal?: AbortSignal): Promise<Page<Message>> {
+  const result = await request(`${messagesPath(groupId)}${pageQuery(before)}`, { signal }, pageOf(messageIn(groupId)));
+  return { ...result, items: result.items.map(decodeMessage) };
 }
 export function getMessage(groupId: string, id: string, signal?: AbortSignal) {
   return request(`${messagesPath(groupId)}/${encodeURIComponent(id)}`, { signal },
-    (value): value is Message => {
+    (value): value is WireMessage => {
       if (isRecord(value) && value.group_id === groupId && value.id === id && hasMessageSourceIdentityConflict(value)) {
         throw new MessageSourceIdentityConflict("来源消息的来源类型与发送者身份矛盾，读取未确认。", 200, "invalid_response");
       }
       return messageIn(groupId)(value) && value.id === id;
-    });
+    }).then(decodeMessage);
 }
 export function listProviders(before = "", signal?: AbortSignal) {
   return request(`/api/v1/providers${pageQuery(before)}`, { signal }, pageOf(isProvider));
