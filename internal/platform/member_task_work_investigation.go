@@ -48,7 +48,8 @@ func (b *investigationWorkOwnerBinding) matchesRole() bool {
 func (entry memberToolRegistration) investigationWorkOwnerValid() bool {
 	b := entry.investigationOwner
 	if b == nil || b.role.Member != entry.scope || entry.taskWork != nil || entry.role != (store.CoordinationToolScope{}) ||
-		entry.purpose != "" || !b.matchesRole() || !slices.Equal(entry.grants.Operations, b.operations()) {
+		(entry.purpose != "" && entry.purpose != memberContinuingInvestigationOwnerPurpose) || !b.matchesRole() ||
+		!slices.Equal(entry.grants.Operations, entry.withOwnerManagementOperations(b.operations())) {
 		return false
 	}
 	if b.delivery.SourceKind == domain.TaskWorkSourceReport {
@@ -63,10 +64,19 @@ func (entry memberToolRegistration) investigationWorkOwnerValid() bool {
 // operations, not material grants or the ability to choose another report.
 // Borrow any Artifact owner through Revoke, which drains the tool callbacks.
 func (r *MemberToolRuntime) IssueFreshInvestigationOwnerTools(ctx context.Context, role store.CoordinationToolScope, expected domain.TaskWorkDelivery, artifacts *MemberArtifactGrant) (string, provider.PiFreshInvestigationProfile, error) {
-	var empty provider.PiFreshInvestigationProfile
+	token, profile, err := r.issueFreshInvestigationOwnerTools(ctx, role, expected, artifacts, false)
+	if err != nil {
+		return "", provider.PiFreshInvestigationProfile{}, err
+	}
+	return token, provider.PiFreshInvestigationProfile{Action: domain.ChatActionReadOnlyInvestigation,
+		SourceKind: expected.SourceKind, Operations: profile.Operations}, nil
+}
+
+func (r *MemberToolRuntime) issueFreshInvestigationOwnerTools(ctx context.Context, role store.CoordinationToolScope, expected domain.TaskWorkDelivery, artifacts *MemberArtifactGrant, managed bool) (string, InvestigationOwnerToolProfile, error) {
+	var empty InvestigationOwnerToolProfile
 	s := r.tools
 	b := &investigationWorkOwnerBinding{role: role, delivery: expected}
-	if !s.TaskWorkReportsEnabled() || !b.matchesRole() {
+	if !s.TaskWorkReportsEnabled() || !b.matchesRole() || managed && !s.InvestigationOwnerManagementEnabled() {
 		return "", empty, store.ErrMemberToolDenied
 	}
 	s.mu.Lock()
@@ -102,8 +112,13 @@ func (r *MemberToolRuntime) IssueFreshInvestigationOwnerTools(ctx context.Contex
 		if !pendingExactTaskWorkInput(expected, in) {
 			return "", empty, store.ErrMemberToolDenied
 		}
-		// Only a material ceiling for transport; every material use still
-		// resolves the live claim/policy and Attempt in B's read transaction.
+	default:
+		return "", empty, store.ErrMemberToolDenied
+	}
+	followup := expected.SourceKind == domain.TaskWorkSourceFollowup
+	if followup || managed {
+		// Only a material ceiling for transport; every use resolves its own
+		// live authority in B. A report owner gets no new read grants.
 		m, err := s.db.GetTaskInvestigationScope(ctx, expected.GroupID, expected.TaskID)
 		if err != nil {
 			return "", empty, investigationReadError(ctx, err)
@@ -112,19 +127,26 @@ func (r *MemberToolRuntime) IssueFreshInvestigationOwnerTools(ctx context.Contex
 			m.TopicID != expected.TopicID || m.MandateID != expected.MandateID {
 			return "", empty, store.ErrMemberToolDenied
 		}
-		b.allowTopic = m.AllowTopicMessages
-		b.versions = slices.Clone(m.ArtifactVersions)
-		if len(b.versions) != 0 {
-			if artifacts == nil || artifacts.db != s.db || artifacts.open == nil {
-				return "", empty, store.ErrMemberToolDenied
+		if followup {
+			b.allowTopic = m.AllowTopicMessages
+			b.versions = slices.Clone(m.ArtifactVersions)
+			if len(b.versions) != 0 {
+				if artifacts == nil || artifacts.db != s.db || artifacts.open == nil {
+					return "", empty, store.ErrMemberToolDenied
+				}
+				frozen := *artifacts
+				entry.grants.Artifacts = &frozen
 			}
-			frozen := *artifacts
-			entry.grants.Artifacts = &frozen
 		}
-	default:
-		return "", empty, store.ErrMemberToolDenied
+		if managed {
+			entry.purpose = memberContinuingInvestigationOwnerPurpose
+			entry.delegateCandidateIDs, err = s.investigationDelegateCandidates(ctx, role.Provenance, m)
+			if err != nil {
+				return "", empty, err
+			}
+		}
 	}
-	entry.grants.Operations = b.operations()
+	entry.grants.Operations = entry.withOwnerManagementOperations(b.operations())
 	token := rand.Text()
 	key := sha256.Sum256([]byte(token))
 	if _, exists := s.capabilities[key]; exists || token == role.Member.Claim.Token || !entry.investigationWorkOwnerValid() {
@@ -134,8 +156,7 @@ func (r *MemberToolRuntime) IssueFreshInvestigationOwnerTools(ctx context.Contex
 		return "", empty, err
 	}
 	s.capabilities[key] = entry
-	return token, provider.PiFreshInvestigationProfile{Action: domain.ChatActionReadOnlyInvestigation,
-		SourceKind: expected.SourceKind, Operations: slices.Clone(entry.grants.Operations)}, nil
+	return token, entry.investigationOwnerProfile(), nil
 }
 
 func (entry memberToolRegistration) investigationReadRole() store.CoordinationToolScope {

@@ -48,7 +48,7 @@ func (s *MemberTools) TransportProfile(ctx context.Context, token string) (Membe
 	if err := s.db.ValidateMemberTool(ctx, entry.scope); err != nil {
 		return MemberToolTransportProfile{}, memberRoleError(ctx, err)
 	}
-	if entry.purpose == memberInvestigationRolePurpose {
+	if entry.purpose == memberInvestigationRolePurpose || entry.initialInvestigationOwnerValid() {
 		names, err := s.investigationTransportOperations(ctx, entry)
 		if err != nil {
 			return MemberToolTransportProfile{}, err
