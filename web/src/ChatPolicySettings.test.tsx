@@ -29,7 +29,8 @@ function receipt(body: string, groupId = group.id) {
     action: input.action, max_admissions: input.max_admissions, revision: input.expected_revision + 1, authorized_by: "user",
     preparation_scope_kind: input.preparation_scope_kind ?? "", preparation_supported: input.allow_preparation,
     configuration_source_id: "actual-policy-command", preauthorization_message_id: input.allow_preparation ? "generated-rule-message" : "",
-    ...(input.allow_preparation ? { preauthorization_text: "本群主话题已有消息的纯文本摘要；目标与验收由服务端固定" } : {}) };
+    ...(input.allow_preparation ? { preauthorization_text: "本群主话题已有消息的纯文本摘要；目标与验收由服务端固定" } : {}),
+    ...(input.investigation ? { investigation: input.investigation } : {}) };
 }
 async function open() {
   const view = render(<Tasks group={group} />);
@@ -192,16 +193,17 @@ it("refreshes a confirmed workspace draft after revocation before a budget-only 
   expect(JSON.parse(attempt(1).body)).toEqual({ enabled: true, allow_preparation: false, action: "text_submission", max_admissions: 5, expected_revision: 3 });
   expect(attempt(1).key).not.toBe(attempt(0).key);
 });
-it("preserves edits made after a receipt while the current-policy read is still pending", async () => {
+it("bases edits during the post-save read on the confirmed receipt, not the prior GET", async () => {
   saved.set(policyURL(), workspacePolicy()); await open();
   const pending = deferred<Response>(); policyReads.mockReturnValueOnce(pending.promise);
-  writes.mockResolvedValueOnce(json(workspacePolicy(2, true, 4))); budget("4"); submit(); await flush();
+  writes.mockResolvedValueOnce(json(workspacePolicy(2, false, 4))); budget("4"); check("允许明确请求使用已授权写目录"); submit(); await flush();
   expect(screen.getByText(/保存已确认.*历史版本 2/)).toBeVisible();
   budget("6"); check("允许明确请求使用已授权写目录");
-  await act(async () => pending.resolve(json(workspacePolicy(3, true, 9))));
-  expect(screen.getByRole("region", { name: "当前聊天策略" })).toHaveTextContent("版本 3");
+  await act(async () => pending.resolve(json(workspacePolicy(3, false, 9))));
+  expect(currentPolicy()).toHaveTextContent("版本 3");
   expect(form().getByRole("spinbutton")).toHaveValue(6);
-  expect(form().getByRole("checkbox", { name: "允许明确请求使用已授权写目录" })).not.toBeChecked();
+  expect(form().getByRole("checkbox", { name: "允许明确请求使用已授权写目录" })).toBeChecked();
+  expect(saveButton()).toBeEnabled();
 });
 it("cleans only the confirmed group's draft when its save finishes while another group is edited", async () => {
   saved.set(policyURL(), workspacePolicy()); const view = await open(); budget("4");
@@ -306,6 +308,203 @@ it("blocks a budget-only save of historical workspace permission while capabilit
   expect(workspace).toBeChecked(); expect(workspace).toBeDisabled(); expect(form().getByRole("spinbutton")).toHaveValue(4);
   expect(screen.getByRole("region", { name: "当前聊天策略" })).toHaveTextContent("历史许可标记开启");
 });
+const investigationChoice = "配置只读调查";
+const topicEvidence = "允许使用本群主话题已保存消息";
+const currentPolicy = () => screen.getByRole("region", { name: "当前聊天策略" });
+const readPolicy = async () => {
+  fireEvent.click(screen.getByRole("button", { name: "读取当前聊天策略并保留草稿" })); await flush();
+};
+const goal = () => form().getByRole("textbox", { name: "调查目标" });
+const fill = (input: HTMLElement, value: string) => fireEvent.change(input, { target: { value } });
+const artifactId = (row: number) => form().getByRole("textbox", { name: `成果 ID（第 ${row} 项）` });
+const versionId = (row: number) => form().getByRole("textbox", { name: `版本 ID（第 ${row} 项）` });
+const addVersion = () => form().getByRole("button", { name: "添加确切成果版本" });
+const topicScope = { objective: "核对本话题仍未解决的问题", allow_topic_messages: true, artifact_versions: null, max_delegations: 0 };
+const opts = { investigation_supported: true, investigation_execution_enabled: false };
+const summaryScope = { allow_preparation: true, preparation_scope_kind: "topic_summary", preparation_supported: true,
+  preauthorization_message_id: "summary-rule", preauthorization_text: "仅本话题摘要" };
+const adoptLabel = "采用当前授权，保留任务上限草稿";
+const adopt = () => fireEvent.click(form().getByRole("button", { name: adoptLabel }));
+const saveButton = () => form().getByRole("button", { name: "保存聊天策略" });
+
+it.each([undefined, false])("keeps old policy writes unchanged when investigation capability is %s", async investigation_supported => {
+  saved.set(policyURL(), { ...blank(), investigation_supported }); await open();
+  const choice = form().getByRole("checkbox", { name: investigationChoice });
+  expect(choice).toBeDisabled(); expect(choice).not.toBeChecked();
+  expect(currentPolicy()).toHaveTextContent("只读调查记录：未确认");
+  expect(currentPolicy()).toHaveTextContent(investigation_supported === false ? "调查配置能力：当前实例不支持" : "调查配置能力：未确认");
+  expect(currentPolicy()).toHaveTextContent("调查运行时：未确认");
+  check("启用自然聊天工作"); submit(); await flush();
+  expect(JSON.parse(attempt(0).body)).toEqual({ enabled: true, allow_preparation: false,
+    action: "text_submission", max_admissions: 1, expected_revision: 0 });
+});
+it("explicitly saves a same-group exact version scope before runtime readiness without dropping other permissions", async () => {
+  saved.set(policyURL(), { ...workspacePolicy(), ...opts, allow_preparation: true, preparation_scope_kind: "topic_summary",
+    preparation_supported: true, preauthorization_message_id: "existing-rule", preauthorization_text: "仅本话题摘要" });
+  await open();
+  expect(form().getByRole("checkbox", { name: investigationChoice })).not.toBeChecked();
+  expect(currentPolicy()).toHaveTextContent("只读调查记录：未配置");
+  expect(currentPolicy()).toHaveTextContent("调查运行时：未启用");
+  check(investigationChoice); fill(goal(), "  核对未决问题  ");
+  expect(form().getByRole("checkbox", { name: topicEvidence })).not.toBeChecked();
+  fireEvent.click(addVersion()); fireEvent.click(addVersion());
+  fill(artifactId(2), "成果 /+?雪"); fill(versionId(2), "精确版本 /+?旧");
+  fireEvent.click(form().getByRole("button", { name: "移除第 1 项" }));
+  expect(artifactId(2)).toHaveValue("成果 /+?雪"); expect(versionId(2)).toHaveValue("精确版本 /+?旧");
+  fill(form().getByRole("combobox", { name: "每项调查最多委派次数" }), "4");
+  writes.mockImplementationOnce(async (url, init) => {
+    const actual = { ...receipt(String(init?.body)), ...opts, workspace_changes_supported: true, allow_workspace_changes: true };
+    saved.set(String(url), actual); return json(actual);
+  });
+  submit(); await flush();
+  expect(JSON.parse(attempt(0).body)).toEqual({ enabled: true, allow_preparation: true, preparation_scope_kind: "topic_summary",
+    allow_workspace_changes: true, action: "text_submission", max_admissions: 3, expected_revision: 1,
+    investigation: { objective: "  核对未决问题  ", allow_topic_messages: false,
+      artifact_versions: [{ artifact_id: "成果 /+?雪", version_id: "精确版本 /+?旧" }], max_delegations: 4 } });
+  expect(attempt(0).key).toBeTruthy(); expect(attempt(0).url).toBe(policyURL()); expect(messages).not.toHaveBeenCalled();
+  expect(currentPolicy()).toHaveTextContent("只读调查记录：已配置"); expect(currentPolicy()).toHaveTextContent("精确版本 /+?旧");
+  expect(currentPolicy()).toHaveTextContent("调查运行时：未启用");
+  expect(currentPolicy()).not.toHaveTextContent(/调查已执行|调查已提交|调查已接纳/);
+});
+it("requires explicit valid materials and prevents overlong objectives or more than 16 exact pairs", async () => {
+  saved.set(policyURL(), { ...blank(), ...opts }); await open(); check(investigationChoice);
+  fill(goal(), topicScope.objective); submit(); expect(writes).not.toHaveBeenCalled(); expect(screen.getByRole("alert")).toHaveTextContent("资料");
+  check(topicEvidence); fill(goal(), "字".repeat(86)); submit(); expect(writes).not.toHaveBeenCalled(); expect(screen.getByRole("alert")).toHaveTextContent("256");
+  const add = addVersion();
+  for (let n = 0; n < 16; n++) fireEvent.click(add);
+  expect(add).toBeDisabled(); expect(artifactId(16)).toBeVisible();
+  fireEvent.click(form().getByRole("button", { name: "移除第 1 项" }));
+  expect(add).toBeEnabled(); expect(artifactId(16)).toBeVisible(); expect(form().queryByRole("textbox", { name: "成果 ID（第 1 项）" })).not.toBeInTheDocument();
+});
+it("blocks permission-carrying saves without configure support but allows explicit removal", async () => {
+  const configured = { ...workspacePolicy(1, false), ...opts, investigation: topicScope };
+  saved.set(policyURL(), configured); await open(); budget("4");
+  saved.set(policyURL(), { ...configured, investigation_supported: false, investigation_execution_enabled: true,
+    investigation: { ...topicScope, artifact_versions: [] } }); await readPolicy();
+  const choice = form().getByRole("checkbox", { name: investigationChoice });
+  expect(choice).toBeChecked(); expect(goal()).toHaveValue(topicScope.objective); expect(goal()).toBeDisabled();
+  expect(currentPolicy()).toHaveTextContent("只读调查记录：已配置"); expect(currentPolicy()).toHaveTextContent("调查运行时：已报告就绪");
+  check("启用自然聊天工作"); submit(); expect(writes).not.toHaveBeenCalled();
+  expect(screen.getByRole("alert")).toHaveTextContent("不能保存带有只读调查权限的策略");
+  expect(choice).toBeEnabled(); check(investigationChoice); expect(choice).not.toBeChecked(); expect(choice).toBeDisabled();
+  submit(); await flush(); expect(JSON.parse(attempt(0).body)).toEqual({ enabled: false, allow_preparation: false,
+    action: "text_submission", max_admissions: 4, expected_revision: 1 });
+});
+it("requires adoption before a budget draft can save against newly configured investigation on a disabled policy", async () => {
+  saved.set(policyURL(), { ...workspacePolicy(), ...opts }); await open(); budget("7");
+  saved.set(policyURL(), { ...workspacePolicy(2, false, 8), ...opts, ...summaryScope, enabled: false, investigation: topicScope });
+  await readPolicy();
+  submit(); await flush(); expect(writes).not.toHaveBeenCalled();
+  expect(currentPolicy()).toHaveTextContent(/版本 2.*未启用/);
+  expect(currentPolicy()).toHaveTextContent("只读调查记录：已配置");
+  expect(saveButton()).toBeDisabled();
+  expect(form().getByRole("checkbox", { name: "启用自然聊天工作" })).toBeChecked();
+  expect(form().getByRole("checkbox", { name: "允许明确请求使用已授权写目录" })).toBeChecked();
+  expect(form().getByRole("checkbox", { name: "允许受限准备工作" })).not.toBeChecked();
+  expect(form().getByRole("checkbox", { name: investigationChoice })).not.toBeChecked();
+
+  adopt();
+  expect(form().getByRole("spinbutton")).toHaveValue(7);
+  expect(form().getByRole("checkbox", { name: "启用自然聊天工作" })).not.toBeChecked();
+  expect(form().getByRole("checkbox", { name: "允许明确请求使用已授权写目录" })).not.toBeChecked();
+  expect(form().getByRole("combobox", { name: "准备工作范围" })).toHaveValue("topic_summary");
+  expect(goal()).toHaveValue(topicScope.objective);
+  submit(); await flush();
+  expect(JSON.parse(attempt(0).body)).toEqual({ enabled: false, allow_preparation: true, preparation_scope_kind: "topic_summary",
+    max_admissions: 7, action: "text_submission", expected_revision: 2, investigation: { ...topicScope, artifact_versions: [] } });
+});
+it("requires adoption before an objective edit can save after the exact artifact version changes", async () => {
+  const scope = { ...topicScope, allow_topic_messages: false, artifact_versions: [{ artifact_id: "成果", version_id: "v1" }] };
+  saved.set(policyURL(), { ...workspacePolicy(1, false), ...opts, investigation: scope }); await open();
+  fill(goal(), "目标草稿");
+  const replacement = { ...scope, artifact_versions: [{ artifact_id: "成果", version_id: "v2" }] };
+  saved.set(policyURL(), { ...workspacePolicy(2, false), ...opts, investigation: replacement });
+  writes.mockResolvedValueOnce(refusal(409)); submit(); await flush();
+  expect(JSON.parse(attempt(0).body)).toMatchObject({ expected_revision: 1, investigation: { ...scope, objective: "目标草稿" } });
+  expect(currentPolicy()).toHaveTextContent("版本 ID：v2");
+  submit(); await flush(); expect(writes).toHaveBeenCalledTimes(1);
+  expect(saveButton()).toBeDisabled(); expect(goal()).toHaveValue("目标草稿"); expect(versionId(1)).toHaveValue("v1");
+
+  adopt();
+  expect(goal()).toHaveValue(replacement.objective); expect(versionId(1)).toHaveValue("v2");
+  fill(goal(), "在当前范围内调整目标"); submit(); await flush();
+  expect(JSON.parse(attempt(1).body)).toMatchObject({ expected_revision: 2, investigation: { ...replacement, objective: "在当前范围内调整目标" } });
+  expect(attempt(1).key).not.toBe(attempt(0).key);
+});
+it.each([{ enabled: false }, { allow_workspace_changes: true }, summaryScope])("gates standalone authority changes %j even without an investigation scope", async change => {
+  saved.set(policyURL(), workspacePolicy(1, false)); await open(); budget("5");
+  saved.set(policyURL(), { ...workspacePolicy(2, false), ...change }); await readPolicy();
+  expect(saveButton()).toBeDisabled(); submit(); await flush(); expect(writes).not.toHaveBeenCalled();
+  expect(form().getByRole("button", { name: adoptLabel })).toBeEnabled();
+});
+it("keeps the draft when a newer revision changes only budget, generated rule evidence and capability observations", async () => {
+  const configured = { ...workspacePolicy(1, false), ...opts, ...summaryScope, investigation: topicScope };
+  saved.set(policyURL(), configured); await open(); budget("5"); fill(goal(), "目标草稿");
+  saved.set(policyURL(), { ...configured, ...workspacePolicy(2, false, 8), ...summaryScope,
+    preauthorization_message_id: "new-summary-rule", preauthorization_text: "本版总准入额度=8；仅本话题摘要",
+    workspace_changes_supported: false, investigation_execution_enabled: true, investigation: { ...topicScope, artifact_versions: [] } });
+  await readPolicy();
+  expect(form().queryByRole("button", { name: adoptLabel })).not.toBeInTheDocument();
+  expect(saveButton()).toBeEnabled(); expect(goal()).toHaveValue("目标草稿");
+  submit(); await flush(); expect(JSON.parse(attempt(0).body)).toMatchObject({ max_admissions: 5, expected_revision: 2,
+    investigation: { ...topicScope, objective: "目标草稿", artifact_versions: [] } });
+});
+it("requires adoption for changed authority read during a definitively rejected save", async () => {
+  await open(); budget("4");
+  const pending = deferred<Response>(); writes.mockReturnValueOnce(pending.promise); submit();
+  saved.set(policyURL(), { ...workspacePolicy(2, false), investigation: topicScope }); await readPolicy();
+  const choice = form().getByRole("checkbox", { name: investigationChoice });
+  expect(choice).not.toBeChecked(); expect(choice).toBeDisabled();
+  expect(form().queryByRole("button", { name: adoptLabel })).not.toBeInTheDocument();
+  expect(currentPolicy()).toHaveTextContent("只读调查记录：已配置");
+  await act(async () => pending.resolve(json({ error: { code: "invalid_input", message: "请求被拒绝" } }, 400)));
+  expect(choice).not.toBeChecked(); expect(saveButton()).toBeDisabled();
+  submit(); await flush(); expect(writes).toHaveBeenCalledTimes(1);
+  adopt(); expect(choice).toBeChecked();
+  submit(); expect(writes).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("alert")).toHaveTextContent("不能保存带有只读调查权限的策略");
+});
+it("checks current investigation facts against the receipt but ignores same-revision capability changes", async () => {
+  saved.set(policyURL(), { ...blank(), ...opts }); await open(); check(investigationChoice);
+  fill(goal(), topicScope.objective); check(topicEvidence);
+  writes.mockImplementationOnce(async (url, init) => {
+    const actual = { ...receipt(String(init?.body)), ...opts, investigation: topicScope };
+    saved.set(String(url), { ...actual, investigation_execution_enabled: true, investigation: { ...topicScope, artifact_versions: [] } });
+    return json(actual);
+  });
+  submit(); await flush(); expect(currentPolicy()).toHaveTextContent("版本 1");
+  expect(currentPolicy()).toHaveTextContent("调查运行时：已报告就绪");
+  saved.set(policyURL(), { ...receipt(attempt(0).body), ...opts, investigation: { ...topicScope, max_delegations: 1 } });
+  await readPolicy(); expect(currentPolicy()).toHaveTextContent("当前策略读取过期或内容不一致");
+  expect(currentPolicy()).toHaveTextContent("上次确认的只读调查记录：已配置");
+  expect(form().getByRole("combobox", { name: "每项调查最多委派次数" })).toHaveValue("0");
+  submit(); expect(writes).toHaveBeenCalledTimes(1);
+});
+it("freezes an investigation PUT across groups, a mismatched receipt and stale and newer observations", async () => {
+  const configured = { ...workspacePolicy(4, false), ...opts, investigation: topicScope };
+  saved.set(policyURL(), configured); const view = await open();
+  fill(goal(), "新目标"); fireEvent.click(addVersion()); fill(artifactId(1), "成果"); fill(versionId(1), "原选中的版本");
+  const pending = deferred<Response>(); writes.mockReturnValueOnce(pending.promise); submit(); const original = attempt(0);
+  view.rerender(<Tasks group={other} />);
+  fireEvent.click(await screen.findByRole("button", { name: "展开自然聊天工作配置" })); await flush(); budget("8");
+  expect(writes.mock.calls[0][1]?.signal?.aborted ?? false).toBe(false);
+  await act(async () => pending.resolve(json({ ...receipt(original.body), investigation: topicScope })));
+  saved.set(policyURL(), { ...configured, investigation_supported: false, investigation: null });
+  view.rerender(<Tasks group={group} />); await flush();
+  expect(currentPolicy()).toHaveTextContent("当前策略读取过期或内容不一致");
+  expect(goal()).toHaveValue("新目标"); expect(versionId(1)).toHaveValue("原选中的版本"); expect(versionId(1)).toBeDisabled();
+  expect(currentPolicy()).toHaveTextContent("上次确认的只读调查记录：已配置");
+  saved.set(policyURL(), { ...workspacePolicy(7, false), investigation: null });
+  writes.mockResolvedValueOnce(refusal(409)); submit(); await flush(); expect(attempt(1)).toEqual(original);
+  expect(currentPolicy()).toHaveTextContent("版本 7"); expect(currentPolicy()).toHaveTextContent("只读调查记录：未确认");
+  expect(form().queryByRole("button", { name: adoptLabel })).not.toBeInTheDocument();
+  expect(form().getByRole("button", { name: "重试同一次聊天策略保存" })).toBeEnabled();
+  writes.mockResolvedValueOnce(json(receipt(original.body))); submit(); await flush(); expect(attempt(2)).toEqual(original);
+  expect(screen.getByText(/保存已确认.*历史版本 5/)).toBeVisible(); expect(currentPolicy()).toHaveTextContent("版本 7");
+  expect(form().getByRole("checkbox", { name: investigationChoice })).not.toBeChecked();
+  view.rerender(<Tasks group={other} />); await flush(); expect(form().getByRole("spinbutton")).toHaveValue(8);
+});
+
 it("preserves an explicit workspace opt-out across temporarily unconfirmed same-revision capability", async () => {
   saved.set(policyURL(), workspacePolicy()); await open();
   check("允许明确请求使用已授权写目录"); budget("4");

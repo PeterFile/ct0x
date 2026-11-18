@@ -149,6 +149,19 @@ it("rejects an automatic dispatch whose task revision contradicts the workspace 
   expect(screen.getByRole("alert")).toHaveTextContent("未确认"); expect(executions).not.toHaveBeenCalled();
 });
 
+it("labels read-only investigation as immutable admission, not execution, submission or acceptance", async () => {
+  admissions.mockResolvedValueOnce(json({ ...verifiedAdmission, action: "read_only_investigation", disposition: "prepare_work",
+    authority: "written_preauthorization", source_kind: "member", source_id: "member-command", source_sender_id: "member-A",
+    authorization_message_id: "recorded-investigation-policy" })); await open();
+  const evidence = screen.getByRole("region", { name: "聊天自动准入依据" });
+  expect(within(evidence).getByRole("heading", { name: "来自群聊的只读调查" })).toBeVisible();
+  expect(evidence).toHaveTextContent("只读调查（read_only_investigation）"); expect(evidence).not.toHaveTextContent("仅文本提交");
+  expect(evidence).toHaveTextContent("recorded-investigation-policy"); expect(evidence).toHaveTextContent("来源与评估职责已核验");
+  expect(evidence).toHaveTextContent("已登记分派不表示执行成功、交付或用户接纳");
+  expect(within(evidence).queryByRole("region", { name: "目录工作准入范围" })).not.toBeInTheDocument();
+  expect(requests).toHaveBeenCalledTimes(1);
+  expect(transport.mock.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+});
 it("shows a preparation's distinct written authorization and actual member source from the immutable receipt", async () => {
   admissions.mockResolvedValueOnce(json({ ...verifiedAdmission, disposition: "prepare_work", authority: "written_preauthorization",
     source_kind: "member", source_id: "member-command", source_sender_id: "member-context", authorization_message_id: "user-written-preauthorization" })); await open();
