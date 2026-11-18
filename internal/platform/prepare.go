@@ -46,7 +46,7 @@ type PrepareOptions struct {
 	ExecutionTimeout       time.Duration // Zero uses the provider default.
 
 	Investigation             *InvestigationPreparationOptions
-	EnableNativeSessionResume bool   // Experimental Pi text only, default false; requires member tools and the Pi extension.
+	EnableNativeSessionResume bool   // Experimental, default false; requires member tools and an opted-in adapter.
 	NativePiThinking          string // Exact Pi thinking for native generic/intake only; empty keeps legacy.
 }
 
@@ -143,7 +143,7 @@ func NewPreparer(s *store.Store, opts PrepareOptions) (*Preparer, error) {
 
 func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 	r, path := opts.MemberTools, opts.PiMemberToolsExtension
-	if opts.NativePiThinking != "" && (!opts.EnableNativeSessionResume || !validNativePiThinking(opts.NativePiThinking)) {
+	if opts.NativePiThinking != "" && (!opts.EnableNativeSessionResume || path == "" || !validNativePiThinking(opts.NativePiThinking)) {
 		return errPrepareConfig
 	}
 	if r == nil && path == "" && !opts.EnableCodexAppServer && !opts.EnableNativeSessionResume {
@@ -155,7 +155,7 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 		!memberToolRuntimeEndpoint(r.endpoint) || r.maxGroupMembers < 1 || r.maxGroupMembers > 200 || !r.rootValid() {
 		return errPrepareConfig
 	}
-	if opts.EnableNativeSessionResume && (path == "" || r.executionRoot == nil || !r.executionRoot.rootValid(r.executionRoot.executionRoot)) {
+	if opts.EnableNativeSessionResume && (r.executionRoot == nil || !r.executionRoot.rootValid(r.executionRoot.executionRoot)) {
 		return errPrepareConfig
 	}
 	// Prepare permits only the complete legacy or history profile, not subsets.
@@ -254,15 +254,19 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			return empty, err
 		}
 	}
-	// Native text bindings record tool names, not dynamic intake schemas.
-	// Keep intake on the fresh path when it changes the #193 send_message contract.
-	if useMemberTools && p.piNativeSessionConfigured(selected) && !intakeSchema.requiresIssuedPiConfig() &&
-		!(intake && p.memberTools.tools.WorkInputsEnabled()) {
+	// Preserve #193's Pi schema fence. Codex's only new profile is the
+	// ordinary v30 MCP intake; Review-derived and typed paths stay fresh.
+	piText := p.piNativeSessionConfigured(selected) && !intakeSchema.requiresIssuedPiConfig() &&
+		!(intake && p.memberTools.tools.WorkInputsEnabled())
+	codexIntake := p.codexNativeIntakeConfigured(selected) && preparationRepairReviewID(trigger) == ""
+	if useMemberTools && (piText || codexIntake) {
 		names, maxMembers = p.memberTools.operations, p.memberTools.maxGroupMembers
 		if intake {
 			names, maxMembers = chatIntakeOperations(), 0
 		}
-		thinking = p.nativePiThinking
+		if piText {
+			thinking = p.nativePiThinking
+		}
 		// Separate typed scopes must select their own preparation before this text path.
 		nativeText, err = p.previewNativeSession(ctx, selected, member, conversation, thinking, names, maxMembers)
 		if err != nil {

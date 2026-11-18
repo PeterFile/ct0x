@@ -53,6 +53,12 @@ func (s *MemberTools) TransportProfile(ctx context.Context, token string) (Membe
 		}
 		// Blocked is startup readiness, not historical replay authorization.
 	}
+	return s.textTransportProfile(entry), nil
+}
+
+// Derive the MCP schema from the issued entry. This is not an authorization
+// check; native text binding and MCP discovery must use the same projection.
+func (s *MemberTools) textTransportProfile(entry memberToolRegistration) MemberToolTransportProfile {
 	return MemberToolTransportProfile{Operations: slices.Clone(entry.grants.Operations), ContinueWork: s.advertisesContinueWork(entry),
-		DiscussionOnlyExcerpt: s.isChatIntake(entry), InvestigationIntake: entry.investigationIntake()}, nil
+		DiscussionOnlyExcerpt: s.isChatIntake(entry), InvestigationIntake: entry.investigationIntake()}
 }
