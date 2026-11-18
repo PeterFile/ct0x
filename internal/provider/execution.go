@@ -257,13 +257,16 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	r.Reason = "执行结果未知，需对账后再重试"
 	canSettle := r.OutputComplete && ctx.Err() == nil && !r.DeliveryFailed && r.Terminal != "" &&
 		(session == nil || r.Accepted && r.DirectChildReaped && !session.tracker.hasUncertainExecution())
-	if canSettle && session != nil && r.Terminal == OutcomeSucceeded {
-		// Response callbacks supply private candidates, not permission to publish.
-		// Only the verified persisted turn can make native-session success final.
-		ref := session.capture(r.NativeSessionID, e.path)
-		canSettle = ref != nil && ctx.Err() == nil
-		if canSettle {
-			r.NativeRef = ref
+	if canSettle && session != nil {
+		// Only success has a supported persistence proof. Withhold publication
+		// and claim release for other terminals pending reconciliation, without
+		// discarding the observed lifecycle evidence.
+		canSettle = false
+		if r.Terminal == OutcomeSucceeded {
+			if ref := session.capture(r.NativeSessionID, e.path); ref != nil && ctx.Err() == nil {
+				r.NativeRef = ref
+				canSettle = true
+			}
 		}
 	}
 	if canSettle {

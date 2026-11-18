@@ -30,7 +30,9 @@ executor, err := provider.NewPiSessionExecutor(
 
 仅在观察到 `agent_start` 且完整用户事件对与本轮提示词匹配后记录接纳。原有工具按当前 claim 授权，`starting` 和 `running` 均可使用，不依赖接纳事件先落库。
 
-收到成功的原生 `agent_settled` 后，须等 `Cmd.Wait`、输出排空、解析与回调全部结束，再严格验证同一 inode、旧完整字节前缀，以及新追加的本轮用户和 assistant 消息与 stdout 一致。验证末叶并同步会话文件及直到 RuntimeDir 的受控父目录后，才返回成功和原生引用。缺少这份证明时仍为 `unknown`，候选回复不可发布，已观察到的原生终态和直接子进程证据不变。
+收到成功的原生 `agent_settled` 后，须等 `Cmd.Wait`、输出排空、解析与回调全部结束，再验证同一 inode 和完整旧字节前缀，并按规范 JSON 摘要核对新追加的消息序列与 stdout 中的完整消息一致。首轮持久化的 system 消息也必须在 stdout 中有对应的事件。既有获批的 Pi 1.4.0 合成试验中，首轮两侧都有该消息，续接轮两侧都没有新增 system 消息；不能用文档示例补齐缺失帧。验证末叶并同步会话文件及直到 RuntimeDir 的受控父目录后，才返回成功和原生引用。
+
+缺少成功证明时，或观察到 `aborted`、`failed`、`truncated` 时，opt-in 路径的 `Outcome` 保持 `unknown`，等待对账。非成功终态目前没有独立的本轮持久化证明，不使用成功专用的引用捕获。此时不发布候选回复、不释放 claim；已观察到的 `Terminal`、`Accepted`、直接子进程回收及输出排空证据照常保留。未启用原生会话的执行不受此限制。
 
 引用是不可变的 server-only `ExecutionReceipt.NativeRef json:"-"`，不会进入旧 canonical receipt JSON。Binding 仅有界严格 canonical 验证和深拷贝，provider 不解释业务身份。失败时可只返回当前 Binding 屏障；复制 receipt 后不得原地修改共享指针。
 

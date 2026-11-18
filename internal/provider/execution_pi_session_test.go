@@ -201,7 +201,7 @@ func TestPiSessionExecutorOfflineChild(t *testing.T) {
 			t.Fatal("capture returned before child persisted after settled")
 		}
 	})
-	for _, mode := range []string{"tool-ok", "unknown-write", "missing-tool-end", "mismatched-tool-id", "pending-tool", "write-error-file-clean", "mismatched-result", "foreign-tool", "wrong-model", "wrong-thinking", "bad-lf", "replace-file"} {
+	for _, mode := range []string{"tool-ok", "unknown-write", "missing-tool-end", "mismatched-tool-id", "pending-tool", "write-error-file-clean", "mismatched-result", "foreign-tool", "wrong-model", "wrong-thinking", "missing-system-frames", "bad-lf", "replace-file"} {
 		t.Run(mode, func(t *testing.T) {
 			selected, extension, request := piSessionFixtureSetup(t, binary)
 			request.Prompt = "fixture:" + mode

@@ -74,7 +74,7 @@ func TestPiSessionReceiptRequiresCurrentAnswer(t *testing.T) {
 		}
 	})
 	for _, mode := range []string{"missing-user", "wrong-user", "missing-user-end", "missing-assistant-start",
-		"stale-assistant", "invalid-assistant-timestamp", "prior-response", "prior-response-after-user", "prior-response-reformatted"} {
+		"stale-assistant", "invalid-assistant-timestamp", "prior-response", "prior-response-after-user"} {
 		t.Run(mode, func(t *testing.T) {
 			selected, extension, request := piSessionFixtureSetup(t, binary)
 			options := PiSessionOptions{Binding: json.RawMessage(`{"turn":2}`)}
@@ -88,13 +88,41 @@ func TestPiSessionReceiptRequiresCurrentAnswer(t *testing.T) {
 			request.Prompt = "fixture:" + mode
 			e, _ := piSessionFixtureExecutor(t, selected, extension, piSessionTokenTwo, options)
 			accepted := !slices.Contains([]string{"missing-user", "wrong-user", "missing-user-end", "prior-response"}, mode)
-			var candidates []string
-			if mode == "prior-response-reformatted" {
-				// The candidate looks current on stdout alone. A callback is not
-				// publication; only the settled outcome can make it publishable.
-				candidates = []string{"offline complete"}
+			piSessionCheckReceiptEvents(t, e, request, OutcomeUnknown, OutcomeSucceeded, accepted, true, nil, string(options.Binding))
+		})
+	}
+}
+
+func TestPiSessionReceiptRequiresPersistedTurn(t *testing.T) {
+	binary := piSessionBuildFixture(t)
+	for _, tc := range []struct {
+		suffix   string
+		terminal Outcome
+	}{
+		{"", OutcomeSucceeded},
+		{"-aborted", OutcomeAborted},
+		{"-failed", OutcomeFailed},
+		{"-truncated", OutcomeTruncated},
+	} {
+		t.Run(string(tc.terminal), func(t *testing.T) {
+			selected, extension, request := piSessionFixtureSetup(t, binary)
+			e, _ := piSessionFixtureExecutor(t, selected, extension, piSessionTokenOne, PiSessionOptions{})
+			first := e.Execute(context.Background(), request, nil)
+			piSessionAssertSucceeded(t, first, true)
+
+			const binding = `{"turn":2}`
+			e, _ = piSessionFixtureExecutor(t, selected, extension, piSessionTokenTwo, PiSessionOptions{Resume: first.NativeRef, Binding: json.RawMessage(binding)})
+			request.RunID, request.Prompt = "run2", "fixture:prior-response-reformatted"+tc.suffix
+			// The old text looks current on stdout. Neither its candidate callback
+			// nor a clean terminal and Wait can settle the turn without persistence.
+			piSessionCheckReceiptEvents(t, e, request, OutcomeUnknown, tc.terminal, true, true, []string{"offline complete"}, binding)
+			data, err := os.ReadFile(first.NativeRef.Pi.SessionFile)
+			if err != nil {
+				t.Fatal(err)
 			}
-			piSessionCheckReceiptEvents(t, e, request, OutcomeUnknown, OutcomeSucceeded, accepted, true, candidates, string(options.Binding))
+			if piSessionBytesDigest(data) != first.NativeRef.Pi.FileSHA256 {
+				t.Fatal("reformatted prior response must not append to the native file")
+			}
 		})
 	}
 }

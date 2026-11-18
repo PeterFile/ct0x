@@ -105,6 +105,7 @@ func main() {
  persist:=func(message map[string]any) { appendEntry(map[string]any{"type":"message","message":message}) }
  // Pi 1.4 agent-loop.js emits a partial assistant start and an authoritative end.
  emitMessage:=func(body map[string]any) {
+  if mode=="fixture:missing-system-frames" && body["role"]=="system" { return }
   start:=body
   if body["role"]=="assistant" {
    start=map[string]any{}; for k,v:=range body { start[k]=v }
@@ -139,18 +140,23 @@ func main() {
     user["timestamp"]=entry.Message["timestamp"]
     message(user)
    }
-   if mode=="fixture:prior-response-reformatted" {
-    // Neither frame is persisted. The current prompt and a changed old
-    // message digest must not substitute for an actual appended turn.
+   suffix,reformatted:=strings.CutPrefix(mode,"fixture:prior-response-reformatted")
+   if reformatted {
+    // Neither message is persisted. A changed old message digest and the
+    // current prompt must not substitute for an actual appended turn.
     stamp:=entry.Message["timestamp"].(float64)+1
     user["timestamp"],entry.Message["timestamp"]=stamp,stamp
     entry.Message["fixtureMetadata"]=true
+    switch suffix {
+    case "-failed": entry.Message["stopReason"]="error"
+    case "-truncated": entry.Message["stopReason"]="length"
+    }
     emitMessage(user)
    }
    emitMessage(entry.Message)
    emit(map[string]any{"type":"turn_end","message":entry.Message,"toolResults":[]any{}})
    emit(map[string]any{"type":"agent_end","messages":[]any{entry.Message},"willRetry":false})
-   emit(map[string]any{"type":"agent_settled","aborted":false})
+   emit(map[string]any{"type":"agent_settled","aborted":suffix=="-aborted"})
    return
   }
   panic("missing synthetic prior assistant")
