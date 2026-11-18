@@ -252,6 +252,8 @@ func checkTaskInvestigationAuthorizationInTx(ctx context.Context, tx *sql.Tx, sc
 	  AND c.binding_revision=r.binding_revision AND c.dispatch_policy_revision=r.policy_revision
 	 JOIN chat_intake_executions e ON e.candidate_id=c.id AND e.turn_id=c.turn_id AND e.purpose=?
 	  AND typeof(e.claim_digest)='blob' AND length(e.claim_digest)=32 AND e.source_kind IN ('local_user_chat','member')
+	 JOIN turns rt ON rt.id=c.turn_id
+	 JOIN deliveries rd ON rd.id=rt.delivery_id
 	 JOIN coordination_triggers origin ON origin.id=m.origin_trigger_id AND origin.message_id=c.message_id
 	  AND origin.group_id=r.group_id AND origin.topic_id=r.topic_id AND origin.message_sequence=c.generation
 	 JOIN chat_policies p ON p.group_id=c.group_id AND p.topic_id=c.topic_id AND p.revision=c.policy_revision
@@ -264,6 +266,7 @@ func checkTaskInvestigationAuthorizationInTx(ctx context.Context, tx *sql.Tx, sc
 	 AND r.topic_id=? AND r.mandate_id=? AND tc.current_mandate_id=r.mandate_id AND tc.authority_generation=r.authority_generation
 	 AND r.task_revision=? AND t.revision=r.task_revision AND pr.enabled=1 AND pr.authorized_by='user'
 	 AND a.id=? AND p.revision=? AND cmd.id=? AND i.scope_json=?
+	 AND `+chatDiscussionReceiveMatches+`
 	 AND json_extract(a.receipt_json,'$.action')=? AND json_extract(a.receipt_json,'$.policy_revision') IS c.policy_revision
 	 AND json_extract(a.receipt_json,'$.authorization_message_id') IS cmd.message_id
 	 AND json_extract(a.receipt_json,'$.source_kind') IS e.source_kind AND json_extract(a.receipt_json,'$.source_id') IS e.source_id`,
