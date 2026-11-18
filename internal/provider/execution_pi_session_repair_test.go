@@ -200,13 +200,26 @@ func TestPiSessionRepairObservesToolsAfterAnchorLoss(t *testing.T) {
 }
 
 func TestPiSessionRepairMalformedHeaderDoesNotInventEvidence(t *testing.T) {
-	for _, mode := range []string{"invalid-uuid", "duplicate-key", "wrong-cwd", "invalid-timestamp"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, tc := range []struct{ name, extraFields string }{
+		{"invalid-uuid", ""},
+		{"wrong-cwd", ""},
+		{"invalid-timestamp", ""},
+		{"duplicate-key", `,"\u0069d":"` + piSessionTestUUID + `"`},
+		{"uninspectable-header", `,"metadata":"\ud800"`},
+		{"id-alias", `,"ID":"01a1ea7e-68d1-77cf-8c6c-76d9fd8dc804"`},
+		{"same-id-alias", `,"Id":"` + piSessionTestUUID + `"`},
+		{"cwd-alias", `,"CwD":"/wrong"`},
+		{"type-alias", `,"Type":"session"`},
+		{"version-alias", `,"ver\u017fion":3`},
+		{"timestamp-alias", `,"Timestamp":null`},
+		{"parent-session-alias", `,"ParentSession":"other"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			binary := executable(t, filepath.Join(piSessionPrivateTemp(t), "synthetic-child"), "/bin/cat >/dev/null\n/bin/cat events.jsonl\n")
 			selected, extension, request := piSessionFixtureSetup(t, binary)
 			events := piSessionRepairEvents(t, "valid")
 			events[0]["cwd"] = request.CWD
-			switch mode {
+			switch tc.name {
 			case "invalid-uuid":
 				events[0]["id"] = request.RunID
 			case "wrong-cwd":
@@ -215,8 +228,10 @@ func TestPiSessionRepairMalformedHeaderDoesNotInventEvidence(t *testing.T) {
 				events[0]["timestamp"] = "invalid"
 			}
 			data := piSessionTestBytes(events)
-			if mode == "duplicate-key" {
-				data = bytes.Replace(data, []byte(`"version":3`), []byte(`"version":3,"version":3`), 1)
+			if tc.extraFields != "" {
+				// Append after the canonical fields: the legacy struct decoder
+				// would otherwise let the later case-folded value win.
+				data = bytes.Replace(data, []byte("}\n"), []byte(tc.extraFields+"}\n"), 1)
 			}
 			if err := os.WriteFile(filepath.Join(request.CWD, "events.jsonl"), data, 0600); err != nil {
 				t.Fatal(err)
@@ -224,8 +239,43 @@ func TestPiSessionRepairMalformedHeaderDoesNotInventEvidence(t *testing.T) {
 			e, _ := piSessionFixtureExecutor(t, selected, extension, piSessionTokenOne, PiSessionOptions{})
 			callbacks := 0
 			r := e.Execute(context.Background(), request, func(Event) error { callbacks++; return nil })
-			if r.Outcome != OutcomeUnknown || r.NativeSessionID != "" || r.Accepted || r.Terminal != "" || callbacks != 0 || !r.Started || !r.DirectChildReaped || r.OutputComplete || r.NativeRef != nil {
+			if r.Outcome != OutcomeUnknown || r.NativeSessionID != "" || r.Accepted || r.Terminal != "" || callbacks != 0 || !r.Started || !r.DirectChildReaped || r.ExitCode != 0 || r.OutputComplete || r.NativeRef != nil {
 				t.Fatalf("malformed header manufactured associated lifecycle evidence: %+v callbacks=%d", r, callbacks)
+			}
+
+			header, _, _ := bytes.Cut(data, []byte("\n"))
+			profile := piSessionTestProfile()
+			profile.cwd = request.CWD
+			history := append(append(bytes.Clone(header), '\n'), piSessionTestBytes(piSessionTestLines()[1:])...)
+			if _, err := parsePiSession(history, profile); err == nil {
+				t.Fatal("malformed header qualified persisted history for resume")
+			}
+		})
+	}
+}
+
+func TestPiSessionRepairAdditionalHeaderStaysUnknown(t *testing.T) {
+	for _, mode := range []string{"duplicate-header", "folded-type-hides-header"} {
+		t.Run(mode, func(t *testing.T) {
+			binary := executable(t, filepath.Join(piSessionPrivateTemp(t), "synthetic-child"), "/bin/cat >/dev/null\n/bin/cat events.jsonl\n")
+			selected, extension, request := piSessionFixtureSetup(t, binary)
+			events := piSessionRepairEvents(t, "valid")
+			events[0]["cwd"] = request.CWD
+			data := piSessionTestBytes(events[:1])
+			if mode == "duplicate-header" {
+				data = append(data, data...)
+			} else {
+				// The later, canonical type used to hide the competing header.
+				data = append(data, `{"Type":"session","id":"01a1ea7e-68d1-77cf-8c6c-76d9fd8dc804","type":"message_update"}`+"\n"...)
+			}
+			data = append(data, piSessionTestBytes(events[1:])...)
+			if err := os.WriteFile(filepath.Join(request.CWD, "events.jsonl"), data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			e, _ := piSessionFixtureExecutor(t, selected, extension, piSessionTokenOne, PiSessionOptions{})
+			r := e.Execute(context.Background(), request, nil)
+			if r.Outcome != OutcomeUnknown || r.NativeSessionID != piSessionTestUUID || !r.Accepted || r.Terminal != OutcomeSucceeded || !r.Started || !r.DirectChildReaped || r.ExitCode != 0 || r.OutputComplete || r.NativeRef != nil {
+				t.Fatalf("later stop cleared uncertain identity or lost valid evidence: %+v", r)
 			}
 		})
 	}

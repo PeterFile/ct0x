@@ -90,6 +90,19 @@ func (o *executionOutput) emit(event Event) {
 // therefore the adapter's acceptance rule, not a native acknowledgement.
 // agent-session.js settles only after retries/recovery/queued work finish.
 func (o *executionOutput) recordPi(line []byte) {
+	if t := o.piSession; t != nil {
+		if !t.observe(line) {
+			o.damaged, o.last = true, ""
+			return
+		}
+		if o.receipt.NativeSessionID == "" {
+			// Only a validated header can be accepted before native identity is
+			// established. Publish that ID, not a case-folded struct field.
+			o.receipt.NativeSessionID = t.nativeID
+			o.emit(Event{Kind: SessionEvent})
+			return
+		}
+	}
 	var event struct {
 		Type, ID, CWD string
 		Version       int
@@ -103,10 +116,6 @@ func (o *executionOutput) recordPi(line []byte) {
 		o.damaged, o.last = true, ""
 		return
 	}
-	if o.piSession != nil && !o.piSession.observe(line) {
-		o.damaged, o.last = true, ""
-		return
-	}
 	r := o.receipt
 	if event.Type != "session" && r.NativeSessionID == "" {
 		o.damaged, o.last = true, ""
@@ -117,7 +126,7 @@ func (o *executionOutput) recordPi(line []byte) {
 	}
 	switch event.Type {
 	case "session":
-		if event.Version != 3 || (o.piSession == nil && event.ID != o.runID) || !filepath.IsAbs(event.CWD) || r.NativeSessionID != "" {
+		if o.piSession != nil || event.Version != 3 || event.ID != o.runID || !filepath.IsAbs(event.CWD) || r.NativeSessionID != "" {
 			o.damaged = true
 			return
 		}

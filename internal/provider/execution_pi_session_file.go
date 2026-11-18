@@ -77,12 +77,26 @@ func piSessionTimestamp(object map[string]any) bool {
 	return err == nil
 }
 
+// Reject alternate spellings of protocol fields, even if their values agree.
+// EqualFold matches the case folding used by encoding/json struct decoding.
+func piSessionHasFieldAlias(object map[string]any, fields ...string) bool {
+	for key := range object {
+		for _, field := range fields {
+			if key != field && strings.EqualFold(key, field) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func validPiSessionHeader(header map[string]any, cwd, expectedID string) bool {
 	version, ok := header["version"].(json.Number)
 	id := piSessionString(header, "id")
 	return piSessionString(header, "type") == "session" && ok && version.String() == "3" &&
 		piSessionUUID.MatchString(id) && (expectedID == "" || expectedID == id) &&
-		piSessionString(header, "cwd") == cwd && piSessionTimestamp(header) && header["parentSession"] == nil
+		piSessionString(header, "cwd") == cwd && piSessionTimestamp(header) && header["parentSession"] == nil &&
+		!piSessionHasFieldAlias(header, "type", "version", "id", "cwd", "timestamp", "parentSession")
 }
 
 func parsePiSession(data []byte, profile piSessionProfile) (piSessionContent, error) {

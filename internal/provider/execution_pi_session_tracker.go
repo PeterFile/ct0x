@@ -58,7 +58,9 @@ func (t *piSessionTracker) observe(line []byte) bool {
 		}
 		return true
 	}
-	if t.nativeID == "" || t.settled {
+	// A folded discriminator can hide a second session header among ordinary
+	// events. Treat that as stream damage, not just loss of the file anchor.
+	if t.nativeID == "" || t.settled || kind == "" || piSessionHasFieldAlias(event, "type") {
 		t.anchorEligible = false
 		return false
 	}
