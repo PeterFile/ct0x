@@ -55,19 +55,31 @@ func messageDiscussionsInTx(ctx context.Context, tx *sql.Tx, groupID string, mes
 
 	args := make([]any, 1+len(messages))
 	args[0] = groupID
+	for i := range messages {
+		args[i+1] = messages[i].ID
+	}
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(messages)), ",")
+	// Probe exact page keys first, resolving both tables and expected_reply
+	// even when there are no matching events in a registered schema.
+	var hasEvents bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+	 SELECT 1 FROM main.chat_discussion_events e
+	 CROSS JOIN main.chat_discussions c ON c.origin_message_id=e.origin_message_id AND c.group_id=e.group_id AND c.topic_id=e.topic_id
+	 WHERE e.group_id=? AND e.message_id IN (`+placeholders+`) AND e.expected_reply IS NOT NULL
+	)`, args...).Scan(&hasEvents); err != nil || !hasEvents {
+		return err
+	}
+
 	positions := make(map[string]int, len(messages))
 	for i := range messages {
-		id := messages[i].ID
-		args[i+1], positions[id] = id, i
+		positions[messages[i].ID] = i
 	}
 	// Find roots by exact page keys, then verify just those bounded paths once.
-	// Inlining published at each invitation/predecessor probe repeats planning
-	// of the provenance joins even on a page with no discussion events. Keep
-	// the exact-key evidence checks separate to avoid planning one wide join.
+	// Keep the exact-key evidence checks separate to avoid planning one wide join.
 	// Missing or contradictory evidence drops the relation, not the message.
 	rows, err := tx.QueryContext(ctx, `WITH page_events AS MATERIALIZED (
 	 SELECT message_id,origin_message_id,group_id,topic_id FROM main.chat_discussion_events
-	 WHERE group_id=? AND message_id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(messages)), ",")+`)
+	 WHERE group_id=? AND message_id IN (`+placeholders+`)
 	 ), roots AS (
 	 SELECT DISTINCT origin_message_id,group_id,topic_id FROM page_events
 	 ), published AS MATERIALIZED (
