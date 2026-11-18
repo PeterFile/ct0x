@@ -58,7 +58,14 @@ func (p *Preparer) configureInvestigation(opts *InvestigationPreparationOptions)
 		return nil, nil
 	}
 	r := p.memberTools
-	if r == nil || r.roleFence == nil || r.tools.chatEngine == nil || p.enableCodexAppServer || !provider.PiInvestigationBridgeSupported(p.piMemberToolsExtension) {
+	if r == nil || r.roleFence == nil || r.tools.chatEngine == nil || p.enableCodexAppServer {
+		return nil, errInvestigationAdapterUnavailable
+	}
+	if r.tools.FreshTaskWorkEnabled() {
+		if !provider.PiCombinedIntakeBridgeSupported(p.piMemberToolsExtension) {
+			return nil, errors.New("同时启用只读调查与 Pi 任务续办时，请用 --pi-member-tools-extension 选择新版可信普通 Pi 入口（须配套相邻的 bridge.mjs）")
+		}
+	} else if !provider.PiInvestigationBridgeSupported(p.piMemberToolsExtension) {
 		return nil, errInvestigationAdapterUnavailable
 	}
 	root, err := pinInvestigationDirectory(filepath.Join(p.privateRoot, InvestigationCWDName))

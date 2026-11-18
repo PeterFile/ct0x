@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"agentworkspace/internal/coordination"
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/httpapi"
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/provider"
@@ -84,6 +85,48 @@ func TestPiFreshTaskWorkFlagRequiresSeparateExplicitProfile(t *testing.T) {
 	}
 }
 
+// #200 (04cdc956) used the same parser and differed only in these descriptions.
+// Reconstruct the released entry in a temp dir without a second bridge pack.
+func pi200MemberToolsEntry(t *testing.T, current string) string {
+	t.Helper()
+	data, err := os.ReadFile(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const start = `  ], { description: "仅受信chat_intake/v1`
+	const end = "    ...chatAssessmentFields,"
+	prefix, rest, found := strings.Cut(string(data), start)
+	_, suffix, ended := strings.Cut(rest, end)
+	if !found || !ended {
+		t.Fatal("cannot reconstruct the #200 intake descriptions")
+	}
+	legacy := prefix + start + "解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。prepare_work仅限受支持的topic_summary。\" +\n" +
+		"    (continueWork ? `continue_work仅用于当前本机用户的明确续办请求；续办理由不得为空白，最多 ${workInputBytes.reason} UTF-8 字节。` : \"\") });\n" +
+		`  const assessment = Type.Object({
+    disposition,
+    action: Type.Optional(Type.Union([Type.Literal("text_submission"), Type.Literal("workspace_change"),
+      ...(investigation ? [Type.Literal(INVESTIGATION_ASSESSMENT_ACTION)] : []),
+    ], { description: investigation ? "仅为语义建议；只读调查使用 prepare_work 和 reason，目标和资料由服务器绑定。模型不能授予权限。" :
+      "结合可信来源和上下文提出文本交付或目录文件修改；只是一项语义建议，当前 Policy、目录授权和 Task 范围由服务器核定，模型不能授予 IO 权限。" })),
+` + end + suffix
+	impl, err := os.ReadFile(filepath.Join(filepath.Dir(current), "bridge.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	entry := filepath.Join(root, "index.ts")
+	if err := os.WriteFile(entry, []byte(legacy), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "bridge.mjs"), impl, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if !provider.PiInvestigationBridgeSupported(entry) {
+		t.Fatal("fixture does not match the released #200 pair")
+	}
+	return entry
+}
+
 func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 	ctx := context.Background()
 	ok := func(t *testing.T, err error) {
@@ -99,20 +142,35 @@ func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 	if len(providers) != 1 || providers[0].Version != "1.4.0" {
 		t.Fatal("missing synthetic Pi metadata")
 	}
-	for _, name := range []string{"default", "opt-in", "combined"} {
-		t.Run(name, func(t *testing.T) {
-			enabled, combined := name != "default", name == "combined"
-			dir := filepath.Join(t.TempDir(), "private")
-			ok(t, os.Mkdir(dir, 0700))
+	current := memberToolsEntry(t)
+	old := pi200MemberToolsEntry(t, current)
+	fresh := filepath.Join(filepath.Dir(current), "fresh-task-work.ts")
+	for _, tc := range []struct {
+		name, entry                    string
+		fresh, investigation, rejected bool
+	}{
+		{name: "default", entry: current},
+		{name: "opt-in", entry: old, fresh: true},
+		{name: "investigation-200", entry: old, investigation: true},
+		{name: "combined", entry: current, fresh: true, investigation: true},
+		{name: "combined-200", entry: old, fresh: true, investigation: true, rejected: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if tc.investigation {
+				ok(t, os.Chmod(dir, 0700))
+			}
 			db, err := store.Open(filepath.Join(dir, "workspace.db"))
 			ok(t, err)
 			defer db.Close()
-			args := append(memberToolsArgs(t, dir, fixture.path), "--enable-coordination-roles", "--enable-native-session-resume", "--native-pi-thinking=off")
-			if enabled {
-				args = append(args, "--pi-fresh-task-work-extension", filepath.Join(filepath.Dir(memberToolsEntry(t)), "fresh-task-work.ts"))
+			args := memberToolsArgs(t, dir, fixture.path)
+			args[slices.Index(args, "--pi-member-tools-extension")+1] = tc.entry
+			args = append(args, "--enable-coordination-roles", "--enable-native-session-resume", "--native-pi-thinking=off")
+			if tc.fresh {
+				args = append(args, "--pi-fresh-task-work-extension", fresh)
 			}
 			var workspace []platform.MemberWorkspaceOptions
-			if combined {
+			if tc.investigation {
 				args = append(args, "--enable-investigation-execution")
 				_, owner, err := artifactReadRoutes(dir, db)
 				ok(t, err)
@@ -123,18 +181,31 @@ func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 			}
 			cfg, err := parseConfig(args, io.Discard)
 			ok(t, err)
-			if cfg.executionMaxActive != defaultExecutionMaxActive || cfg.enableInvestigationExecution != combined {
-				t.Fatal("combined flags changed the default capacity or the investigation opt-in")
+			if cfg.executionMaxActive != defaultExecutionMaxActive || cfg.enableInvestigationExecution != tc.investigation {
+				t.Fatal("flags changed the default capacity or the investigation opt-in")
 			}
-			run, runtime, prep, err := executionRunner(cfg, db, coordination.New(db), catalog, "http://127.0.0.1:7310/api/v1/member-tools", io.Discard, workspace...)
+			engine := coordination.New(db)
+			run, runtime, prep, err := executionRunner(cfg, db, engine, catalog, "http://127.0.0.1:7310/api/v1/member-tools", io.Discard, workspace...)
+			if runtime != nil {
+				defer runtime.Close()
+			}
+			if tc.rejected {
+				if err == nil || !strings.Contains(err.Error(), "新版") || !strings.Contains(err.Error(), "--pi-member-tools-extension") ||
+					run != nil || runtime != nil || prep != nil {
+					t.Fatalf("joint intake must reject the #200 pair and request the new pair: %v", err)
+				}
+				return
+			}
 			ok(t, err)
-			defer runtime.Close()
+			if run == nil || runtime == nil || prep == nil {
+				t.Fatal("command composition did not return an execution runner")
+			}
 			tools := runtime.Tools()
-			if run == nil || tools.FreshTaskWorkEnabled() != enabled || tools.WorkInputsEnabled() {
+			if tools.FreshTaskWorkEnabled() != tc.fresh || tools.WorkInputsEnabled() {
 				t.Fatal("command composition selected the wrong execution or legacy preview profile")
 			}
 			_, err = os.Stat(filepath.Join(dir, "workspaces", platform.InvestigationCWDName))
-			if combined && err != nil || !combined && !os.IsNotExist(err) {
+			if tc.investigation && err != nil || !tc.investigation && !os.IsNotExist(err) {
 				t.Fatal("investigation private CWD did not follow its explicit opt-in")
 			}
 			local := platform.NewLocalUser(db)
@@ -142,14 +213,26 @@ func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 			ok(t, err)
 			lead, err := local.CreateMember(ctx, group.ID, platform.MemberInput{Name: "intake", Role: "text", ProviderID: providers[0].ID, Model: "fixture/model"}, "")
 			ok(t, err)
-			msg, err := local.CreateMessage(ctx, group.ID, platform.MessageInput{Content: "请续办原任务。", RecipientIDs: []string{lead.ID}}, "source")
+			const topic = "intake"
+			if tc.investigation {
+				// Startup enables readiness after runner and route composition.
+				engine.EnableInvestigationExecution()
+				_, err := engine.SetChatPolicy(ctx, domain.ThreadRef{GroupID: group.ID, TopicID: topic}, domain.ChatPolicyRequest{
+					Enabled: true, Action: domain.ChatActionTextSubmission, MaxAdmissions: 1,
+					Investigation: &domain.ChatInvestigationPolicy{Objective: "核对原文", AllowTopicMessages: true},
+				}, 0, "policy")
+				ok(t, err)
+			}
+			msg, err := local.CreateMessage(ctx, group.ID, platform.MessageInput{TopicID: topic, Content: "请评估这条消息。", RecipientIDs: []string{lead.ID}}, "source")
 			ok(t, err)
 			delivery := msg.Deliveries[0]
 			prepared, err := prep.Prepare(ctx, store.PendingDelivery{GroupID: group.ID, Delivery: delivery})
 			ok(t, err)
-			// The current bridge's excerpt changes intake even without fresh Task Work.
-			if strings.Contains(prepared.Request.Prompt, "continue_work") != enabled ||
-				!strings.Contains(prepared.Request.Prompt, "discussion_only_excerpt") || prepared.Request.Thinking != "" {
+			// Both investigation pairs offer the excerpt without fresh Task Work.
+			prompt := prepared.Request.Prompt
+			if strings.Contains(prompt, "continue_work") != tc.fresh ||
+				strings.Contains(prompt, domain.ChatActionReadOnlyInvestigation) != tc.investigation ||
+				!strings.Contains(prompt, "discussion_only_excerpt") || prepared.Request.Thinking != "" {
 				t.Errorf("intake prompt or native session selection did not match the installed schema (thinking=%q)", prepared.Request.Thinking)
 			}
 			turn, err := db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: group.ID, DeliveryID: delivery.ID, MaxActive: 1, ResourceKeys: prepared.ResourceKeys})
@@ -159,10 +242,10 @@ func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 			defer tools.Revoke(token)
 			profile, err := tools.TransportProfile(ctx, token)
 			ok(t, err)
-			if profile.ContinueWork != enabled {
-				t.Errorf("real command intake schema enabled=%v; want %v", profile.ContinueWork, enabled)
+			if profile.ContinueWork != tc.fresh {
+				t.Errorf("real command intake continuation enabled=%v; want %v", profile.ContinueWork, tc.fresh)
 			}
-			if !enabled {
+			if !tc.fresh {
 				server, err := httpapi.NewServer(httpapi.DefaultAddress, httpapi.MemberToolRoutes(tools)...)
 				ok(t, err)
 				req := httptest.NewRequest(http.MethodPost, "http://"+httpapi.DefaultAddress+"/api/v1/member-tools/send_message",

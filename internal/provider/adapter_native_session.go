@@ -71,6 +71,12 @@ func PiInvestigationBridgeSupported(extensionPath string) bool {
 	return qualifyPiInvestigationBridge(extensionPath) != ""
 }
 
+// PiCombinedIntakeBridgeSupported requires the pair whose tool descriptions
+// distinguish investigation from fresh Task Work continuation.
+func PiCombinedIntakeBridgeSupported(extensionPath string) bool {
+	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA) != ""
+}
+
 func qualifyPiInvestigationBridge(extensionPath string) string {
 	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA, piInvestigationBridgeEntry200SHA)
 }
