@@ -90,7 +90,8 @@ func (o *executionOutput) emit(event Event) {
 // therefore the adapter's acceptance rule, not a native acknowledgement.
 // agent-session.js settles only after retries/recovery/queued work finish.
 func (o *executionOutput) recordPi(line []byte) {
-	if t := o.piSession; t != nil {
+	t := o.piSession
+	if t != nil {
 		if !t.observe(line) {
 			o.damaged, o.last = true, ""
 			return
@@ -175,8 +176,12 @@ func (o *executionOutput) recordPi(line []byte) {
 		// Only a complete assistant's stop reason decides the final result.
 		// Earlier error messages must not poison a later successful retry.
 		o.last = map[string]Outcome{"stop": OutcomeSucceeded, "error": OutcomeFailed, "aborted": OutcomeAborted, "length": OutcomeTruncated}[event.Message.StopReason]
-		// Empty snapshots must also replace earlier assistant text, not retain it.
-		o.emit(Event{Kind: ResponseEvent, Text: text.String()})
+		// A strictly decoded stop reason is native evidence even if the answer
+		// cannot be attributed to this prompt. Only forward attributed snapshots.
+		// An empty snapshot still replaces earlier text.
+		if t == nil || !t.answerUncertain {
+			o.emit(Event{Kind: ResponseEvent, Text: text.String()})
+		}
 	case "agent_settled":
 		if event.Aborted == nil || !r.Accepted || r.NativeSessionID == "" || o.settled {
 			o.damaged = true

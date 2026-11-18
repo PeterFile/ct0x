@@ -179,6 +179,7 @@ func TestPiSessionRepairObservesToolsAfterAnchorLoss(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			binary := executable(t, filepath.Join(piSessionPrivateTemp(t), "synthetic-child"), "/bin/cat >/dev/null\n/bin/cat events.jsonl\nprintf done > child-finished\n")
 			selected, extension, request := piSessionFixtureSetup(t, binary)
+			request.Prompt = "hello"
 			events := piSessionRepairEvents(t, mode)
 			events[0]["cwd"] = request.CWD
 			if err := os.WriteFile(filepath.Join(request.CWD, "events.jsonl"), piSessionTestBytes(events), 0600); err != nil {
@@ -410,7 +411,7 @@ func BenchmarkPiSessionRepairObserver(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				r := ExecutionReceipt{}
-				out := executionOutput{receipt: &r, piSession: newPiSessionTracker(profile, "")}
+				out := executionOutput{receipt: &r, piSession: newPiSessionTracker(profile, "", "hello")}
 				for _, line := range lines {
 					out.recordPi(line)
 				}

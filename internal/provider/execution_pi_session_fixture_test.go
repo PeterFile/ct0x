@@ -96,6 +96,7 @@ func main() {
  if mode=="fixture:wrong-native-id" { outputHeader["id"]=uuid7() }
  emit(outputHeader)
  emit(map[string]any{"type":"agent_start"})
+ emit(map[string]any{"type":"turn_start"})
  if mode=="fixture:cancel" { time.Sleep(30*time.Second); return }
  appendEntry:=func(entry map[string]any) {
   entry["id"]=id(); entry["parentId"]=parent; entry["timestamp"]=time.Now().UTC().Format(time.RFC3339Nano); parent=entry["id"]
@@ -103,10 +104,19 @@ func main() {
   _,err=file.Write(encode(entry)); must(err); must(file.Close())
  }
  persist:=func(message map[string]any) { appendEntry(map[string]any{"type":"message","message":message}) }
+ // Pi 1.4 agent-loop.js emits a partial assistant start and an authoritative end.
+ emitMessage:=func(body map[string]any) {
+  start:=body
+  if body["role"]=="assistant" {
+   start=map[string]any{}; for k,v:=range body { start[k]=v }
+   start["content"],start["stopReason"]=[]any{},"pending"
+  }
+  if body["role"]!="assistant" || mode!="fixture:missing-assistant-start" { emit(map[string]any{"type":"message_start","message":start}) }
+  if body["role"]!="user" || mode!="fixture:missing-user-end" { emit(map[string]any{"type":"message_end","message":body}) }
+ }
  message:=func(body map[string]any) {
-  body["timestamp"]=time.Now().UnixMilli()
-  emit(map[string]any{"type":"message_start","message":body})
-  emit(map[string]any{"type":"message_end","message":body})
+  if body["timestamp"]==nil { body["timestamp"]=time.Now().UnixMilli() }
+  emitMessage(body)
   persist(body)
  }
  model:=strings.SplitN(args["--model"],"/",2)
@@ -117,7 +127,28 @@ func main() {
   declarations:=[]any{}; for _,name:=range tools { declarations=append(declarations,map[string]any{"name":name,"description":"offline fixture","parameters":map[string]any{}}) }
   message(map[string]any{"role":"system","content":"restricted offline text fixture","toolsAdded":declarations})
  }
- message(map[string]any{"role":"user","content":strings.TrimSpace(string(input))})
+ // Pi 1.4 agent-session.js constructs one text block for a plain stdin prompt.
+ text:=mode; if mode=="fixture:wrong-user" { text="different prompt" }
+ user:=map[string]any{"role":"user","content":[]any{map[string]any{"type":"text","text":text}}}
+ if !fresh && (mode=="fixture:prior-response" || mode=="fixture:prior-response-after-user") {
+  lines:=bytes.Split(bytes.TrimSpace(raw),[]byte{'\n'})
+  for i:=len(lines)-1;i>0;i-- {
+   var entry struct{ Message map[string]any }; must(json.Unmarshal(lines[i],&entry))
+   if entry.Message["role"]!="assistant" { continue }
+   if mode=="fixture:prior-response-after-user" {
+    // A timestamp tie alone cannot disambiguate a known historical answer.
+    user["timestamp"]=entry.Message["timestamp"]
+    message(user)
+   }
+   emitMessage(entry.Message)
+   emit(map[string]any{"type":"turn_end","message":entry.Message,"toolResults":[]any{}})
+   emit(map[string]any{"type":"agent_end","messages":[]any{entry.Message},"willRetry":false})
+   emit(map[string]any{"type":"agent_settled","aborted":false})
+   return
+  }
+  panic("missing synthetic prior assistant")
+ }
+ if mode!="fixture:missing-user" { message(user) }
  if mode=="fixture:eof" { return }
  assistant:=func(content []any,stop string) map[string]any {
   return map[string]any{"role":"assistant","content":content,"provider":model[0],"model":model[1],"thinkingLevel":args["--thinking"],"stopReason":stop}
@@ -126,7 +157,8 @@ func main() {
  if toolModes[mode] {
   callID:=id(); name:="send_message"; if mode=="fixture:foreign-tool" { name="bash" }
   arguments:=map[string]any{"text":"offline only"}
-  message(assistant([]any{map[string]any{"type":"toolCall","id":callID,"name":name,"arguments":arguments}},"toolUse"))
+  call:=assistant([]any{map[string]any{"type":"toolCall","id":callID,"name":name,"arguments":arguments}},"toolUse")
+  message(call)
   startID:=callID; if mode=="fixture:mismatched-tool-id" { startID=id() }
   emit(map[string]any{"type":"tool_execution_start","toolCallId":startID,"toolName":name,"args":arguments})
   if mode!="fixture:pending-tool" {
@@ -134,16 +166,22 @@ func main() {
    isError:=mode=="fixture:unknown-write"
    endContent:=content; if mode=="fixture:mismatched-result" { endContent=[]any{map[string]any{"type":"text","text":"different result"}} }
    if mode!="fixture:missing-tool-end" { emit(map[string]any{"type":"tool_execution_end","toolCallId":callID,"toolName":name,"result":map[string]any{"content":endContent},"isError":isError||mode=="fixture:write-error-file-clean"}) }
-   message(map[string]any{"role":"toolResult","toolCallId":callID,"toolName":name,"content":content,"isError":isError})
+   result:=map[string]any{"role":"toolResult","toolCallId":callID,"toolName":name,"content":content,"isError":isError}
+   message(result)
+   emit(map[string]any{"type":"turn_end","message":call,"toolResults":[]any{result}})
+   emit(map[string]any{"type":"turn_start"})
   }
  }
  final:=assistant([]any{map[string]any{"type":"text","text":"offline complete"}},"stop")
+ if mode=="fixture:stale-assistant" { final["timestamp"]=1 }
+ if mode=="fixture:invalid-assistant-timestamp" { final["timestamp"]=json.Number("9223372036854775808") }
  if mode=="fixture:wrong-model" { final["model"]="other" }
  if mode=="fixture:wrong-thinking" { final["thinkingLevel"]="off" }
  if mode=="fixture:after-settled" {
   final["timestamp"]=time.Now().UnixMilli()
-  emit(map[string]any{"type":"message_start","message":final}); emit(map[string]any{"type":"message_end","message":final})
+  emitMessage(final)
  } else { message(final) }
+ emit(map[string]any{"type":"turn_end","message":final,"toolResults":[]any{}})
  emit(map[string]any{"type":"agent_end","messages":[]any{},"willRetry":false})
  if mode=="fixture:queue" { emit(map[string]any{"type":"queue_update","steering":[]any{},"followUp":[]any{"unexpected"}}) }
  emit(map[string]any{"type":"agent_settled","aborted":false})

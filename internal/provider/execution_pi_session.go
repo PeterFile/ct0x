@@ -129,7 +129,10 @@ func (e executionCommand) preparePiSession(request ExecuteRequest, runDir string
 		}
 		run.ancestors = ancestors
 	}
-	run.tracker = newPiSessionTracker(profile, expectedID)
+	run.tracker = newPiSessionTracker(profile, expectedID, request.Prompt)
+	if run.before != nil {
+		run.tracker.priorMessages = run.before.content.messages
+	}
 	return run, nil
 }
 

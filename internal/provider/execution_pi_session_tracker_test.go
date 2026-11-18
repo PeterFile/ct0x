@@ -10,8 +10,8 @@ func piSessionToolHistory(name string) ([]map[string]any, piSessionProfile) {
 	profile.tools = []string{name}
 	lines := piSessionTestLines()
 	lines[3]["message"].(map[string]any)["toolsAdded"] = []any{map[string]any{"name": name}}
-	call := map[string]any{"role": "assistant", "provider": "synthetic", "model": "model", "thinkingLevel": "max", "stopReason": "toolUse", "content": []any{map[string]any{"type": "toolCall", "id": "call1", "name": name, "arguments": map[string]any{"text": "offline"}}}}
-	result := map[string]any{"role": "toolResult", "toolCallId": "call1", "toolName": name, "isError": false, "content": []any{map[string]any{"type": "text", "text": "ok"}}}
+	call := map[string]any{"role": "assistant", "provider": "synthetic", "model": "model", "thinkingLevel": "max", "stopReason": "toolUse", "timestamp": 3, "content": []any{map[string]any{"type": "toolCall", "id": "call1", "name": name, "arguments": map[string]any{"text": "offline"}}}}
+	result := map[string]any{"role": "toolResult", "toolCallId": "call1", "toolName": name, "isError": false, "timestamp": 3, "content": []any{map[string]any{"type": "text", "text": "ok"}}}
 	makeEntry := func(id, parent string, message map[string]any) map[string]any {
 		return map[string]any{"type": "message", "id": id, "parentId": parent, "timestamp": piSessionTestTime, "message": message}
 	}
@@ -56,7 +56,7 @@ func TestPiSessionPlatformWriteUnknownLatch(t *testing.T) {
 		for _, mode := range []string{"valid", "error-end", "error-result", "missing-end", "missing-start", "wrong-id", "wrong-name", "wrong-args", "missing-is-error", "duplicate-end", "duplicate-start", "missing-result", "different-result"} {
 			t.Run(tool+"/"+mode, func(t *testing.T) {
 				lines, profile := piSessionToolHistory(tool)
-				tracker := newPiSessionTracker(profile, "")
+				tracker := newPiSessionTracker(profile, "", "hello")
 				observe := func(event map[string]any) {
 					data, err := json.Marshal(event)
 					if err != nil {
