@@ -61,7 +61,10 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 		send(map[string]any{"id": request.ID, "error": map[string]any{"code": -32000, "message": memberToolTestToken}})
 		_, _ = io.Copy(io.Discard, input)
 	}
-	config := func() any {
+	config := func(overrideEnv string) any {
+		if override := os.Getenv(overrideEnv); override != "" {
+			return json.RawMessage(override)
+		}
 		return map[string]any{"config": map[string]any{"model_provider": "synthetic", "model_reasoning_effort": "high", "mcp_servers": map[string]any{
 			"workspace": map[string]any{"enabled": true}, "previous_run": map[string]any{"enabled": true}}},
 			"origins": map[string]any{"mcp_servers": map[string]any{"name": map[string]string{"type": "sessionFlags"}, "version": "flags-v1"}},
@@ -74,7 +77,7 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	}
 	respond(expect("initialize"), map[string]string{"userAgent": "synthetic", "platformFamily": "unix", "platformOs": "synthetic", "codexHome": home})
 	expect("initialized")
-	respond(expect("config/read"), config())
+	respond(expect("config/read"), config("AW_SESSION_CONFIG_BEFORE"))
 	threadRequest := read()
 	if threadRequest.Method == nil || (*threadRequest.Method != "thread/start" && *threadRequest.Method != "thread/resume") {
 		os.Exit(8)
@@ -122,15 +125,19 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 			_ = os.WriteFile("token-"+pid, []byte(hex.EncodeToString(tokenHash[:])), 0600)
 		}
 	}
+	nativeProvider, nativeEffort := "synthetic", "high"
+	if os.Getenv("AW_SESSION_NATIVE_DEFAULT") != "" {
+		nativeProvider, nativeEffort = "openai", "max"
+	}
 	thread := func(turns []any) map[string]any {
 		status := "idle"
 		if mode == "loaded-active" {
 			status = "active"
 		}
 		return map[string]any{"id": threadID, "turns": turns, "ephemeral": false, "status": map[string]any{"type": status},
-			"cliVersion": "0.166.0", "cwd": cwd, "modelProvider": "synthetic", "source": "appServer", "historyMode": "legacy"}
+			"cliVersion": "0.166.0", "cwd": cwd, "modelProvider": nativeProvider, "source": "appServer", "historyMode": "legacy"}
 	}
-	model, provider, effort, sandbox := "synthetic/model", "synthetic", "high", "readOnly"
+	model, provider, effort, sandbox := "synthetic/model", nativeProvider, nativeEffort, "readOnly"
 	switch mode {
 	case "wrong-model":
 		model = "synthetic/other"
@@ -142,8 +149,11 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 		sandbox = "workspaceWrite"
 	}
 	responseThread := thread([]any{})
-	if mode == "wrong-thread" {
+	switch mode {
+	case "wrong-thread":
 		responseThread["id"] = "other-thread"
+	case "wrong-thread-provider":
+		responseThread["modelProvider"] = "other"
 	}
 	// Inject resume-only metadata at deterministic wire boundaries, including
 	// before identity binding and on both sides of the new turn response.
@@ -198,7 +208,7 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	respond(threadRequest, map[string]any{"thread": responseThread, "approvalPolicy": "never", "approvalsReviewer": "user",
 		"sandbox": map[string]any{"type": sandbox, "networkAccess": false}, "cwd": cwd, "model": model, "modelProvider": provider, "reasoningEffort": effort})
 	replay("after-response")
-	respond(expect("config/read"), config())
+	respond(expect("config/read"), config("AW_SESSION_CONFIG_AFTER"))
 	statusRequest := expect("mcpServerStatus/list")
 	tools := make(map[string]any)
 	for _, name := range names {

@@ -368,7 +368,11 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			if p.session != nil {
 				// Disable persisted autonomous goals before native thread initialization.
 				threadConfig["features"].(map[string]any)["goals"] = false
-				params["modelProvider"] = p.session.provider
+				// Let Codex resolve an implicit provider; pinning the expected
+				// default here could mask a configured provider in the response.
+				if p.session.providerSet {
+					params["modelProvider"] = p.session.provider
+				}
 				params["approvalsReviewer"] = "user"
 				threadConfig["approvals_reviewer"] = "user"
 				if p.session.effort != "" {
@@ -894,6 +898,7 @@ type codexAppServerSession struct {
 	home         string
 	toolsProfile string
 	provider     string
+	providerSet  bool // The first config/read explicitly selected the provider.
 	effort       string
 	binding      json.RawMessage
 	resume       *CodexNativeSessionReference
@@ -914,18 +919,29 @@ func codexSessionToolsProfile(names []string) string {
 func (s *codexAppServerSession) currentConfig(raw json.RawMessage, first bool) bool {
 	fields, err := codexRPCObject(raw, "config")
 	config, configErr := codexRPCObject(fields["config"], "model_provider", "model_reasoning_effort")
-	provider, valid := codexAppServerString(config, "model_provider")
+	if err != nil || configErr != nil {
+		return false
+	}
+	// In 0.166.0 native resolution is required provider > runtime override >
+	// config setting > openai. This is an expectation checked on thread response.
+	provider, valid := "openai", true
+	providerSet := !codexAppServerNoError(config["model_provider"])
+	if providerSet {
+		provider, valid = codexAppServerString(config, "model_provider")
+	}
 	effort := ""
 	if !codexAppServerNoError(config["model_reasoning_effort"]) {
 		var effortOK bool
 		effort, effortOK = codexAppServerString(config, "model_reasoning_effort")
 		valid = valid && effortOK
 	}
-	if err != nil || configErr != nil || !valid || !first && (provider != s.provider || effort != s.effort) ||
+	if !valid || !first && (provider != s.provider || effort != s.effort) ||
 		s.resume != nil && (provider != s.resume.Provider || effort != s.resume.ReasoningEffort) {
 		return false
 	}
-	s.provider, s.effort = provider, effort
+	if first {
+		s.provider, s.providerSet, s.effort = provider, providerSet, effort
+	}
 	return true
 }
 
