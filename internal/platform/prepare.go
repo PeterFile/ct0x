@@ -346,6 +346,12 @@ func (p *Preparer) loadPreparationInput(ctx context.Context, pending store.Pendi
 		return empty, errPrepareBinding
 	}
 	state, err := p.store.ResolveCoordinationDelivery(ctx, group.ID, d.ID)
+	input := preparationInput{group: group, member: member, conversation: conversation, trigger: trigger, state: state}
+	// The B owner-role resolver returns reports but denies delegates. Probe
+	// only those paths; a joined Store/rollback failure is not a plain denial.
+	if (err == nil && state.Provenance.SourceKind == domain.TaskWorkSourceReport) || errors.Unwrap(err) == store.ErrMemberToolDenied {
+		return p.resolveUnsupportedTaskWork(ctx, input, d.ID, err)
+	}
 	if err != nil {
 		return empty, preparationResolutionError(ctx, err)
 	}
@@ -355,7 +361,7 @@ func (p *Preparer) loadPreparationInput(ctx context.Context, pending store.Pendi
 	if err := p.checkRepairPreparationReady(ctx, state, trigger); err != nil {
 		return empty, err
 	}
-	return preparationInput{group: group, member: member, conversation: conversation, trigger: trigger, state: state}, nil
+	return input, nil
 }
 
 func preparationReadError(ctx context.Context, err error) error {

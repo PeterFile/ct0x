@@ -14,6 +14,48 @@ import (
 	"agentworkspace/internal/store"
 )
 
+const taskWorkProfileUnavailable = "typed_profile_unavailable"
+
+// A successful typed peek is evidence of a wake, not permission to start it.
+// v30 delegation and report have no launch profile in this Preparer.
+func (p *Preparer) resolveUnsupportedTaskWork(ctx context.Context, input preparationInput, deliveryID string, coordinationErr error) (preparationInput, error) {
+	var empty preparationInput
+	work, err := p.store.ResolveTaskWorkDelivery(ctx, input.group.ID, deliveryID)
+	if err != nil {
+		// Keep the original denial on absent or damaged typed provenance.
+		if coordinationErr != nil && (errors.Unwrap(err) == store.ErrNotFound || errors.Unwrap(err) == store.ErrMemberToolDenied) {
+			err = coordinationErr
+		}
+		return empty, preparationResolutionError(ctx, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return empty, preparationReadError(ctx, err)
+	}
+	matches := work.GroupID == input.group.ID && work.DeliveryID == deliveryID && work.MemberID == input.member.ID &&
+		work.ConversationID == input.conversation.ID && work.MessageID == input.trigger.ID && work.TopicID == input.trigger.TopicID &&
+		work.SenderMemberID == input.trigger.SenderID && work.Blocked != "already_claimed"
+	prov := store.CoordinationRoleProvenance{
+		GroupID: work.GroupID, MemberID: work.MemberID, ConversationID: work.ConversationID, MessageID: work.MessageID,
+		DeliveryID: work.DeliveryID, TopicID: work.TopicID, SourceKind: work.SourceKind, SourceID: work.SourceID,
+		AssignmentID: work.AssignmentID, TaskID: work.TaskID, TaskRevision: work.TaskRevision,
+	}
+	if coordinationErr != nil {
+		if !matches || work.SourceKind != domain.TaskWorkSourceDelegation {
+			return empty, preparationResolutionError(ctx, coordinationErr)
+		}
+		// The delegate has typed provenance but no owner role or Attempt.
+	} else {
+		state := input.state
+		prov.Kind, prov.RequestID = store.CoordinationRoleWorker, state.Provenance.RequestID
+		if !matches || work.SourceKind != domain.TaskWorkSourceReport || prov != state.Provenance ||
+			state.ProviderID != input.member.ProviderID || state.Model != input.member.Model || state.AttemptID != "" {
+			return empty, errPrepareBinding
+		}
+	}
+	input.state.Provenance, input.state.Blocked = prov, taskWorkProfileUnavailable
+	return input, nil
+}
+
 type taskWorkPreparation struct {
 	delivery   domain.TaskWorkDelivery
 	mandate    domain.Mandate
@@ -61,7 +103,7 @@ func (p *Preparer) planFreshTaskWork(ctx context.Context, input preparationInput
 	}
 	if r == nil || r.roleFence == nil || !r.tools.FreshTaskWorkEnabled() || input.member.Workspace != "" ||
 		prov.SourceKind != domain.TaskWorkSourceFollowup {
-		return empty, rolePreparationBlocked(state, "typed_profile_unavailable", nil)
+		return empty, rolePreparationBlocked(state, taskWorkProfileUnavailable, nil)
 	}
 	if !r.rootValid() {
 		return empty, rolePreparationBlocked(state, "transport_root_unavailable", nil)
