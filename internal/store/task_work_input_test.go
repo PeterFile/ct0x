@@ -42,7 +42,7 @@ func newWorkInputCandidate(t *testing.T, f chatFixture, body string, recipients 
 }
 
 func TestTaskWorkInputUnsafeRouting(t *testing.T) {
-	for _, kind := range []string{"legacy-unknown", "legacy-original-task", "two-real-ids", "mixed-invalid-ids", "mixed-foreign-ids-with-hint", "unquoted-constraint", "workspace", "discussion-only"} {
+	for _, kind := range []string{"legacy-unknown", "legacy-original-task", "two-real-ids", "mixed-invalid-ids", "mixed-foreign-ids-with-hint", "list-invalid-ids-with-hint", "list-foreign-ids-with-hint", "unquoted-constraint", "workspace", "discussion-only"} {
 		t.Run(kind, func(t *testing.T) {
 			f := chatSetup(t, "user", false)
 			worker := chatAuthorityWorker(t, f)
@@ -69,16 +69,21 @@ func TestTaskWorkInputUnsafeRouting(t *testing.T) {
 				body = "应继续任务 " + worker.Provenance.TaskID + " 还是 " + other.ID + "？"
 				input.Followup = &domain.ChatFollowupAssessment{TaskID: worker.Provenance.TaskID}
 				reason = "ambiguous_followup_task"
-			case "mixed-invalid-ids", "mixed-foreign-ids-with-hint":
+			case "mixed-invalid-ids", "mixed-foreign-ids-with-hint", "list-invalid-ids-with-hint", "list-foreign-ids-with-hint":
 				f.s.EnableTaskWorkExecution() // A misroute would actually record and wake work.
-				id := worker.Provenance.TaskID
-				body = "继续任务 `" + id + "` 还是 `" + strings.Repeat("A", 26) + "`？"
-				if kind == "mixed-foreign-ids-with-hint" {
+				id, otherID := worker.Provenance.TaskID, strings.Repeat("A", 26)
+				if strings.Contains(kind, "foreign") {
 					other, err := f.s.CreateTask(ctx, taskInput(f.otherID))
 					if err != nil {
 						t.Fatal(err)
 					}
-					body = "继续任务 <" + id + "> 还是 <" + other.ID + ">？"
+					otherID = other.ID
+				}
+				body = "继续任务 <" + id + "> 还是 <" + otherID + ">？"
+				if strings.HasPrefix(kind, "list-") {
+					body = "应该继续任务 <" + id + ">、<" + otherID + "> 中的哪一个？"
+				}
+				if kind != "mixed-invalid-ids" {
 					input.Followup = &domain.ChatFollowupAssessment{TaskID: id}
 				}
 				reason = "ambiguous_followup_task"
