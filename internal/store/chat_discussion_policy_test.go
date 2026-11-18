@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"testing"
@@ -192,15 +193,40 @@ func TestChatDiscussionPolicySnappedCaps(t *testing.T) {
 }
 
 func TestChatDiscussionPolicyEarlierSchema(t *testing.T) {
-	f := setupMessages(t)
-	s := f.s
-	if chatDiscussionPolicyVersion != 0 {
-		coordinationDecideExec(t, s, "DROP TABLE chat_discussion_policy_revisions")
-		coordinationDecideExec(t, s, "DELETE FROM schema_migrations WHERE version>=?", chatDiscussionPolicyVersion)
+	const version = 25
+	if len(migrations) < version {
+		t.Fatalf("missing v%d migration in registry", version)
+	}
+	// Open without auto-migrating so neither the v26+ markers nor their tables exist.
+	s := queueHandle(t, filepath.Join(t.TempDir(), "v25.sqlite"), true)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY CHECK(version > 0))"); err != nil {
+		t.Fatal(err)
+	}
+	for i, migration := range migrations[:version] {
+		if _, err := tx.Exec(migration); err != nil {
+			t.Fatalf("apply v%d: %v", i+1, err)
+		}
+		if _, err := tx.Exec("INSERT INTO schema_migrations(version) VALUES(?)", i+1); err != nil {
+			t.Fatalf("record v%d: %v", i+1, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var got int
+	if err := s.db.QueryRow("SELECT max(version) FROM schema_migrations").Scan(&got); err != nil || got != version {
+		t.Fatalf("legacy schema version: %d (%v), want %d", got, err, version)
 	}
 	if available, err := s.ChatDiscussionPolicyAvailable(ctx); err != nil || available {
 		t.Fatalf("earlier schema claimed editable settings: %t %v", available, err)
 	}
+	groupID := group(t, s).ID
+	f := messageFixture{s: s, groupID: groupID, a: member(t, s, groupID).ID, b: member(t, s, groupID).ID}
 	origin := discussionUser(t, f, "", f.a)
 	a, ca := discussionArrive(t, s, f.groupID, origin.Deliveries[0].ID)
 	discussionAssess(t, s, a, ca)
