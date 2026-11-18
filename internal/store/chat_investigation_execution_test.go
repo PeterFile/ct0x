@@ -240,6 +240,81 @@ func TestChatInvestigationSchemaMismatchFailsClosed(t *testing.T) {
 	}
 }
 
+func TestChatInvestigationRetainedAdmissionWithoutSchema(t *testing.T) {
+	removeMetadata := func(t *testing.T, f chatFixture, role CoordinationToolScope) {
+		t.Helper()
+		messageSequenceLedger(t, f.s, 27)
+		if state, err := f.s.ResolveInvestigationExecution(ctx, role.Member, role.Provenance); err != nil ||
+			state.Blocked != CoordinationReady || state.AttemptID != role.AttemptID {
+			t.Fatalf("fixture has no live investigation role: %+v, %v", state, err)
+		}
+		// Leave the actual assessment and Mandate intact, but no v27 marker or objects.
+		coordinationDecideExec(t, f.s, `DROP TRIGGER chat_investigation_assessment_insert;
+		 DROP TRIGGER chat_investigation_artifact_insert;
+		 DROP TABLE chat_investigation_policy_revisions;
+		 DELETE FROM schema_migrations WHERE version=27`)
+		messageSequenceLedger(t, f.s, 26)
+		if objects := messageSequenceRows(t, f.s.db, "SELECT name FROM main.sqlite_schema WHERE name GLOB '*chat_investigation_*'"); len(objects) != 0 {
+			t.Fatalf("fixture still has investigation schema objects: %v", objects)
+		}
+		p := role.Provenance
+		if receipt, err := f.s.GetChatAdmission(ctx, p.GroupID, p.TaskID); err != nil || receipt.TaskID != p.TaskID ||
+			receipt.MandateID == "" || receipt.DispatchRequestID != p.RequestID || receipt.Action != domain.ChatActionReadOnlyInvestigation ||
+			receipt.Outcome != "admitted" || receipt.Authority != "written_preauthorization" || !receipt.AuthorityEvidenceVerified {
+			t.Fatalf("fixture lost the authorized investigation admission: %+v, %v", receipt, err)
+		}
+	}
+	t.Run("fresh-binding", func(t *testing.T) {
+		f, _ := investigationUserCandidate(t)
+		role := investigationClaimWorker(t, f)
+		removeMetadata(t, f, role)
+		before := coordinationDecideSnapshot(t, f.s)
+		if binding, err := f.s.BindAssignmentAttempt(ctx, role); !errors.Is(err, ErrMemberToolDenied) || binding != (domain.AssignmentAttemptBinding{}) {
+			t.Fatalf("retained investigation admission allowed a fresh binding: %+v, %v", binding, err)
+		}
+		coordinationDecidePreserved(t, f.s, before)
+	})
+	t.Run("bound-worker", func(t *testing.T) {
+		f, _, role := investigationUserWorker(t)
+		removeMetadata(t, f, role)
+		before := coordinationDecideSnapshot(t, f.s)
+		p := role.Provenance
+		if scope, err := f.s.GetTaskInvestigationScope(ctx, p.GroupID, p.TaskID); !errors.Is(err, ErrTaskInvestigationNotReady) || scope.TaskID != "" {
+			t.Errorf("retained investigation scope treated as legacy absence: %+v, %v", scope, err)
+		}
+		if err := f.s.CheckTaskInvestigationReady(ctx, p.GroupID, p.TaskID); !errors.Is(err, ErrTaskInvestigationNotReady) {
+			t.Errorf("retained investigation readiness treated as legacy absence: %v", err)
+		}
+		for _, key := range [][2]string{{f.otherID, p.TaskID}, {p.GroupID, "unrelated-task"}} {
+			scope, err := f.s.GetTaskInvestigationScope(ctx, key[0], key[1])
+			requestDispatchZero(t, scope, err, ErrNotFound)
+		}
+		state, err := f.s.ResolveInvestigationExecution(ctx, role.Member, p)
+		requestDispatchZero(t, state, err, ErrMemberToolDenied)
+		input := AssignmentResultInput{Summary: "调查结论。"}
+		submission, err := f.s.SubmitAssignmentResult(ctx, role, input, "damaged-submit")
+		requestDispatchZero(t, submission, err, ErrMemberToolDenied)
+		submission, err = f.s.SubmitTask(ctx, investigationTaskSubmitInput(role, input, "damaged-direct"))
+		requestDispatchZero(t, submission, err, ErrMemberToolDenied)
+
+		recorder := assignmentQueryStore(t, f.path)
+		if state, err := recorder.s.ResolveCoordinationExecution(ctx, role.Member, p); !errors.Is(err, ErrMemberToolDenied) || state != (CoordinationRoleState{}) {
+			t.Fatalf("retained investigation admission resolved as a generic worker: %+v, %v", state, err)
+		}
+		var plan string
+		for _, q := range recorder.queries {
+			if strings.Contains(q.query, "mandates_group_task") {
+				plan = resolutionPlan(t, f.s, q.query, q.args...)
+				break
+			}
+		}
+		if !strings.Contains(plan, "INDEX mandates_group_task (group_id=? AND task_id=?)") || !strings.Contains(plan, "(decision_id=?)") {
+			t.Fatalf("cold receipt probe did not use exact Mandate and assessment indexes: %s", plan)
+		}
+		coordinationDecidePreserved(t, f.s, before)
+	})
+}
+
 func TestChatInvestigationSubmitRejectsSupersededPolicy(t *testing.T) {
 	f, policy, role := investigationUserWorker(t)
 	// Even an enabled replacement with identical scope cannot authorize the old Task.

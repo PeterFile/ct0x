@@ -120,7 +120,7 @@ func TestChatInvestigationPolicyOnV22(t *testing.T) {
 
 func TestChatInvestigationHistoricalSchemaAndOrdinaryWorker(t *testing.T) {
 	registered := migrations
-	for _, version := range []int{23, 24, 25} {
+	for _, version := range []int{23, 24, 25, 26} {
 		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
 			defer func() { migrations = registered }()
 			migrations = registered[:version]
@@ -149,6 +149,8 @@ func TestChatInvestigationHistoricalSchemaAndOrdinaryWorker(t *testing.T) {
 
 			f.input = domain.ChatAssessment{Disposition: "prepare_work", Action: domain.ChatActionTextSubmission, Reason: "建议准备话题摘要。"}
 			worker := chatAuthorityWorker(t, f) // Ordinary admission, assignment and attempt binding.
+			scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, worker.Provenance.TaskID)
+			requestDispatchZero(t, scope, err, ErrNotFound)
 			if got, err := f.s.ResolveCoordinationExecution(ctx, worker.Member, worker.Provenance); err != nil ||
 				got.Blocked != CoordinationReady || got.AttemptID != worker.AttemptID {
 				t.Fatalf("ordinary worker requires investigation schema: %+v, %v", got, err)
