@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
@@ -23,25 +24,36 @@ func (s *MemberTools) FreshTaskWorkEnabled() bool {
 	return s != nil && s.freshTaskWork.Construct != nil
 }
 
+// FreshTaskWorkTransportEnabled mounts the native codecs, not the legacy
+// preview, an intake hint, or a scheduler launch profile.
+func (s *MemberTools) FreshTaskWorkTransportEnabled() bool {
+	return s.FreshTaskWorkEnabled() || s.TaskWorkReportsEnabled()
+}
+
 // IsFreshTaskWorkCapability selects the HTTP codec, not command authority.
 // The chosen handler must still hold the registry lock through the B call.
 func (s *MemberTools) IsFreshTaskWorkCapability(token string) bool {
-	if !s.FreshTaskWorkEnabled() {
+	if !s.FreshTaskWorkTransportEnabled() {
 		return false
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.capabilities[sha256.Sum256([]byte(token))].taskWork != nil
+	entry := s.capabilities[sha256.Sum256([]byte(token))]
+	return entry.taskWork != nil || entry.investigationOwner != nil
 }
 
 func taskWorkMatchesScope(scope store.MemberToolScope, work domain.TaskWorkDelivery) bool {
-	return work.Blocked == "" && work.SourceKind == domain.TaskWorkSourceFollowup && work.GroupID == scope.Claim.GroupID &&
+	return work.SourceKind == domain.TaskWorkSourceFollowup && taskWorkOwnerMatchesScope(scope, work)
+}
+
+func taskWorkOwnerMatchesScope(scope store.MemberToolScope, work domain.TaskWorkDelivery) bool {
+	return work.Blocked == "" && work.SourceKind.IsOwnerContinuation() && work.GroupID == scope.Claim.GroupID &&
 		work.MemberID == scope.MemberID && work.OwnerMemberID == scope.MemberID && work.ConversationID == scope.ConversationID && work.TopicID == scope.TopicID
 }
 
 func (entry memberToolRegistration) taskWorkProfileValid() bool {
 	b := entry.taskWork
-	return b != nil && entry.role == (store.CoordinationToolScope{}) && entry.purpose == "" &&
+	return b != nil && entry.role == (store.CoordinationToolScope{}) && entry.purpose == "" && entry.investigationOwner == nil && entry.workReport == nil &&
 		taskWorkMatchesScope(entry.scope, b.delivery) && slices.Equal(entry.grants.Operations, provider.PiFreshTaskWorkToolNames()) &&
 		memberToolRuntimeText(b.attempt.ID) && b.attempt.GroupID == b.delivery.GroupID && b.attempt.TaskID == b.delivery.TaskID &&
 		b.attempt.TaskRevision == b.delivery.TaskRevision && b.attempt.TurnID == entry.scope.Claim.TurnID
@@ -81,14 +93,20 @@ func (s *MemberTools) issueFreshTaskWork(ctx context.Context, scope store.Member
 
 // B derives the live owner and bound Attempt inside each operation. Do not
 // interpose a startup readiness check that would mask a confirmed B replay.
-func (s *MemberTools) withFreshTaskWork(token, op string, use func(store.MemberToolScope) error) error {
+func (s *MemberTools) withFreshTaskWork(token, op string, use func(*coordination.Engine, store.MemberToolScope) error) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry := s.capabilities[sha256.Sum256([]byte(token))]
-	if !s.FreshTaskWorkEnabled() || !entry.taskWorkProfileValid() || !slices.Contains(entry.grants.Operations, op) {
+	if !slices.Contains(entry.grants.Operations, op) {
 		return store.ErrMemberToolDenied
 	}
-	return use(entry.scope)
+	if s.FreshTaskWorkEnabled() && entry.taskWorkProfileValid() {
+		return use(s.chatEngine, entry.scope)
+	}
+	if s.TaskWorkReportsEnabled() && entry.investigationWorkOwnerValid() {
+		return use(s.workReportEngine, entry.scope)
+	}
+	return store.ErrMemberToolDenied
 }
 
 // MemberWorkInputRecord contains only what this wire profile can disclose.
@@ -98,9 +116,9 @@ type MemberWorkInputRecord struct {
 }
 
 func (s *MemberTools) ListFreshTaskWorkInputs(ctx context.Context, token string, opts store.ListOptions) (page store.Page[MemberWorkInputRecord], err error) {
-	err = s.withFreshTaskWork(token, "read_work_inputs", func(scope store.MemberToolScope) error {
+	err = s.withFreshTaskWork(token, "read_work_inputs", func(engine *coordination.Engine, scope store.MemberToolScope) error {
 		if opts.Before != nil {
-			anchor, err := s.chatEngine.GetWorkInputForMember(ctx, scope, opts.Before.ID)
+			anchor, err := engine.GetWorkInputForMember(ctx, scope, opts.Before.ID)
 			if err != nil {
 				return err
 			}
@@ -108,7 +126,7 @@ func (s *MemberTools) ListFreshTaskWorkInputs(ctx context.Context, token string,
 				return store.ErrNotFound
 			}
 		}
-		result, err := s.chatEngine.ListWorkInputHistoryForMember(ctx, scope, opts)
+		result, err := engine.ListWorkInputHistoryForMember(ctx, scope, opts)
 		if err != nil {
 			return err
 		}
@@ -123,8 +141,8 @@ func (s *MemberTools) ListFreshTaskWorkInputs(ctx context.Context, token string,
 }
 
 func (s *MemberTools) GetFreshTaskWorkInput(ctx context.Context, token, id string) (out MemberWorkInputRecord, err error) {
-	err = s.withFreshTaskWork(token, "read_work_inputs", func(scope store.MemberToolScope) error {
-		i, err := s.chatEngine.GetWorkInputForMember(ctx, scope, id)
+	err = s.withFreshTaskWork(token, "read_work_inputs", func(engine *coordination.Engine, scope store.MemberToolScope) error {
+		i, err := engine.GetWorkInputForMember(ctx, scope, id)
 		if err != nil {
 			return err
 		}
@@ -155,22 +173,22 @@ func (s *MemberTools) GetFreshTaskWorkInput(ctx context.Context, token, id strin
 }
 
 func (s *MemberTools) AckFreshTaskWorkInput(ctx context.Context, token, id, key string) error {
-	return s.withFreshTaskWork(token, "ack_work_input", func(scope store.MemberToolScope) error {
-		_, err := s.chatEngine.AcknowledgeWorkInputWithKey(ctx, scope, id, key)
+	return s.withFreshTaskWork(token, "ack_work_input", func(engine *coordination.Engine, scope store.MemberToolScope) error {
+		_, err := engine.AcknowledgeWorkInputWithKey(ctx, scope, id, key)
 		return err
 	})
 }
 
 func (s *MemberTools) HandBackFreshTaskWorkInput(ctx context.Context, token, id, reason, key string) error {
-	return s.withFreshTaskWork(token, "hand_back_work_input", func(scope store.MemberToolScope) error {
-		_, err := s.chatEngine.HandBackWorkInputWithKey(ctx, scope, id, reason, key)
+	return s.withFreshTaskWork(token, "hand_back_work_input", func(engine *coordination.Engine, scope store.MemberToolScope) error {
+		_, err := engine.HandBackWorkInputWithKey(ctx, scope, id, reason, key)
 		return err
 	})
 }
 
 func (s *MemberTools) SubmitFreshTaskWorkResult(ctx context.Context, token, summary, key string) (out domain.Submission, err error) {
-	err = s.withFreshTaskWork(token, "submit_result", func(scope store.MemberToolScope) error {
-		out, err = s.chatEngine.SubmitTaskWorkResult(ctx, scope, store.AssignmentResultInput{Summary: summary}, key)
+	err = s.withFreshTaskWork(token, "submit_result", func(engine *coordination.Engine, scope store.MemberToolScope) error {
+		out, err = engine.SubmitTaskWorkResult(ctx, scope, store.AssignmentResultInput{Summary: summary}, key)
 		return err
 	})
 	return out, err

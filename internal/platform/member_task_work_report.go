@@ -83,7 +83,6 @@ func (r *MemberToolRuntime) issueWorkReportProfile(ctx context.Context, claim st
 			d.DeliveryID != work.DeliveryID || d.MessageID != work.MessageID || d.ConversationID != work.ConversationID {
 			return "", store.ErrMemberToolDenied
 		}
-		grants.Operations = []string{ReportWorkOperation}
 		if d.AllowTopicMessages {
 			grants.Operations = append(grants.Operations, ReadInvestigationChannelOperation)
 		}
@@ -96,6 +95,7 @@ func (r *MemberToolRuntime) issueWorkReportProfile(ctx context.Context, claim st
 			binding.versions = slices.Clone(d.ArtifactVersions)
 			grants.Operations = append(grants.Operations, ReadInvestigationArtifactOperation)
 		}
+		grants.Operations = append(grants.Operations, ReportWorkOperation)
 		if err := s.workReportCurrent(ctx, scope, work); err != nil {
 			return "", err
 		}
@@ -146,7 +146,8 @@ func (s *MemberTools) withBoundWorkReport(token, op string, kind domain.TaskWork
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry := s.capabilities[sha256.Sum256([]byte(token))]
-	if entry.workReport == nil || entry.workReport.delivery.SourceKind != kind || !slices.Contains(entry.grants.Operations, op) {
+	if entry.workReport == nil || entry.workReport.delivery.SourceKind != kind || !slices.Contains(entry.grants.Operations, op) ||
+		entry.investigationOwner != nil && !entry.investigationWorkOwnerValid() {
 		return store.ErrMemberToolDenied
 	}
 	return use(entry)

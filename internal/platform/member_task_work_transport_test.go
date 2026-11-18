@@ -248,6 +248,14 @@ func TestBoundWorkDelegationTransport(t *testing.T) {
 	}
 	const channel, artifact = platform.ReadInvestigationChannelOperation, platform.ReadInvestigationArtifactOperation
 	memberMCPRoleProfile(t, f.roleRuntimeFixture, token, channel, artifact, "report_work")
+	names, err := tools.TransportOperations(ctx, token)
+	roleOK(t, err)
+	if !slices.Equal(names, []string{channel, artifact, "report_work"}) {
+		t.Fatal("delegate's B subset did not produce the canonical typed order")
+	}
+	_, _, err = provider.PiFreshInvestigationConfig(f.options.Endpoint, token, child.Claim.TurnID, provider.PiFreshInvestigationProfile{
+		Action: domain.ChatActionReadOnlyInvestigation, SourceKind: domain.TaskWorkSourceDelegation, Operations: names})
+	roleOK(t, err)
 	page := f.expectHTTP(t, token, channel, `{}`, "", http.StatusOK)
 	var material struct{ Items []domain.Message }
 	roleOK(t, json.Unmarshal([]byte(page), &material))

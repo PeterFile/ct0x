@@ -44,8 +44,8 @@ type MemberToolRuntimeOptions struct {
 	// FreshTaskWork composes typed continuation via the ChatIntake Engine and
 	// the role execution fence. It does not install the legacy preview.
 	FreshTaskWork *FreshTaskWorkLaunch
-	// TaskWorkReports opts into the experimental postclaim transport only. It
-	// neither enables B's Task Work execution nor installs a C launch profile.
+	// TaskWorkReports opts into the experimental postclaim report and typed
+	// investigation owner transport. It does not enable B or install a launcher.
 	TaskWorkReports *coordination.Engine
 }
 

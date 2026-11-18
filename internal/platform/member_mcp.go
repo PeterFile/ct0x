@@ -34,6 +34,15 @@ func (s *MemberTools) TransportProfile(ctx context.Context, token string) (Membe
 	if !found {
 		return MemberToolTransportProfile{}, store.ErrMemberToolDenied
 	}
+	if b := entry.investigationOwner; b != nil {
+		if !entry.investigationWorkOwnerValid() {
+			return MemberToolTransportProfile{}, store.ErrMemberToolDenied
+		}
+		if _, err := s.resolveInvestigationRole(ctx, b.role); err != nil {
+			return MemberToolTransportProfile{}, err
+		}
+		return MemberToolTransportProfile{Operations: slices.Clone(entry.grants.Operations)}, nil
+	}
 	if binding := entry.workReport; binding != nil {
 		if err := s.workReportCurrent(ctx, entry.scope, binding.delivery); err != nil {
 			return MemberToolTransportProfile{}, err

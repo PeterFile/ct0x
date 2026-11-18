@@ -28,15 +28,16 @@ type MemberToolGrants struct {
 }
 
 type memberToolRegistration struct {
-	scope      store.MemberToolScope
-	grants     MemberToolGrants
-	skills     *memberSkillState
-	role       store.CoordinationToolScope
-	candidate  *domain.ChatCandidate
-	purpose    string
-	intake     memberToolIntakeSchema
-	taskWork   *taskWorkToolBinding
-	workReport *taskWorkReportBinding
+	scope              store.MemberToolScope
+	grants             MemberToolGrants
+	skills             *memberSkillState
+	role               store.CoordinationToolScope
+	candidate          *domain.ChatCandidate
+	purpose            string
+	intake             memberToolIntakeSchema
+	taskWork           *taskWorkToolBinding
+	workReport         *taskWorkReportBinding
+	investigationOwner *investigationWorkOwnerBinding
 	// Frozen server capability facts are not grants or model-controlled input.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
