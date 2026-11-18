@@ -228,7 +228,7 @@ func TestChatDiscussionMemberInviteConcurrentAcrossStores(t *testing.T) {
 			}
 			req, r := requests[winner.index], winner.receipt
 			discussionCheckPublication(t, f.s, r, req.origin, domain.ChatDiscussionInvite, req.origin.ID, req.scope.MemberID,
-				r.Event.RecipientID, "", "", req.input.Content, req.input.Content, 1)
+				r.Event.RecipientID, "", "", req.input.Content, "", 1)
 			wantCounts := [6]int{counts[0] + 1, counts[1] + 2, counts[2] + 1, counts[3] + 1, counts[4] + 1, counts[5]}
 			if got := memberOperationCounts(t, f.s); got != wantCounts {
 				t.Fatalf("want one member, one join and one invitation/wake: got counts %v; want %v", got, wantCounts)
