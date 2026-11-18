@@ -130,7 +130,8 @@ func TestCodexAppServerRoutesAndCatalogOptIn(t *testing.T) {
 			if enabled {
 				wantID = provider.CodexAppServerAdapterID
 			}
-			if report == nil || report.ID != wantID || !report.Enabled || report.Capabilities == nil || report.Capabilities.Supports(provider.CapabilityPlatformTools) != enabled || page.Items[0].Account != provider.AccountUnknown {
+			if report == nil || report.ID != wantID || !report.Enabled || report.Capabilities == nil || report.Capabilities.Supports(provider.CapabilityPlatformTools) != enabled ||
+				report.Capabilities.NativeResume != provider.SupportUnsupported || page.Items[0].Account != provider.AccountUnknown {
 				t.Fatal("cmd provider route did not publish the actual adapter independent of account state")
 			}
 		})

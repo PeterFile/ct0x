@@ -226,13 +226,10 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 		in.Permissions[1] = "本轮基础角色工具为 " + strings.Join(names, "、") + "；仅在服务器实际提供工作输入工具时使用。读取不会确认已处理；处理后显式确认，无法处理则交回说明。调用者、群组、会话、话题和任务关系由服务端绑定。"
 	}
 	var nativeText bool
-	// Work-input grants and workspace tasks are outside the frozen text profile.
-	if workspace == nil && !workInputs {
-		thinking := ""
-		if selected.Name == provider.Pi {
-			thinking = p.roleThinking
-		}
-		nativeText, err = p.previewNativeSession(ctx, selected, member, conversation, thinking, names, 0)
+	// Keep the existing Pi text-role path. Codex native resume is intake-only;
+	// work-input grants and workspace tasks do not enter either text profile.
+	if selected.Name == provider.Pi && workspace == nil && !workInputs {
+		nativeText, err = p.previewNativeSession(ctx, selected, member, conversation, p.roleThinking, names, 0)
 		if err != nil {
 			return empty, roleWorkspacePreparationError(state, err)
 		}
