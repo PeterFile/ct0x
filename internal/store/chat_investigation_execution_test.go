@@ -191,6 +191,25 @@ func investigationTaskSubmitInput(role CoordinationToolScope, input AssignmentRe
 		ActorID: role.Member.MemberID, MemberScope: &role.Member, Summary: input.Summary, ArtifactVersions: input.ArtifactVersions, IdempotencyKey: key}
 }
 
+func TestChatInvestigationMissingMigrationMarkerFailsClosed(t *testing.T) {
+	f, _, role := investigationUserWorker(t)
+	messageSequenceLedger(t, f.s, 27)
+	id := role.Provenance.TaskID
+	if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); err != nil || scope.TaskID != id {
+		t.Fatalf("fixture does not have an investigation scope: %+v, %v", scope, err)
+	}
+	if ready, err := f.s.ResolveInvestigationExecution(ctx, role.Member, role.Provenance); err != nil || ready.Blocked != CoordinationReady || ready.AttemptID != role.AttemptID {
+		t.Fatalf("fixture does not have a live investigation worker: %+v, %v", ready, err)
+	}
+	coordinationDecideExec(t, f.s, "DELETE FROM schema_migrations WHERE version=27")
+	if state, err := f.s.ResolveCoordinationExecution(ctx, role.Member, role.Provenance); !errors.Is(err, ErrMemberToolDenied) || state != (CoordinationRoleState{}) {
+		t.Fatalf("a missing marker exposed a generic worker: %+v, %v", state, err)
+	}
+	if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); !errors.Is(err, ErrTaskInvestigationNotReady) || scope.TaskID != "" {
+		t.Fatalf("a missing marker was treated as legacy absence: %+v, %v", scope, err)
+	}
+}
+
 func TestChatInvestigationSubmitRejectsSupersededPolicy(t *testing.T) {
 	f, policy, role := investigationUserWorker(t)
 	// Even an enabled replacement with identical scope cannot authorize the old Task.

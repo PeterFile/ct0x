@@ -214,6 +214,120 @@ func TestChatDiscussionOnlyInvestigationSourceDistinctions(t *testing.T) {
 	}
 }
 
+func TestChatDiscussionOnlyLegacyIntake(t *testing.T) {
+	for _, name := range []string{"topic-summary", "investigation", "generic-second-hop", "wrong-command", "wrong-turn", "ambiguous-limit", "unassociated"} {
+		t.Run(name, func(t *testing.T) {
+			f := chatSetup(t, "user", true)
+			proposal := domain.ChatAssessment{Disposition: "prepare_work", Action: domain.ChatActionTextSubmission, Reason: "建议准备话题摘要。"}
+			if name == "investigation" {
+				investigationPolicy(t, f, domain.ChatInvestigationPolicy{Objective: investigationObjective, AllowTopicMessages: true}, 1)
+				f.s.EnableInvestigationExecution()
+				proposal = investigationProposal()
+			}
+			discussionEnd(t, f.s, f.scope)
+			targets := []string{f.a}
+			if name == "ambiguous-limit" {
+				targets = append(targets, f.b)
+			}
+			origin := chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID, ActorID: "user",
+				Content: discussionOnlyQuote + "，请先交换意见。", RecipientIDs: targets}, targets)
+			assess := func(delivery domain.Delivery) (MemberToolScope, string) {
+				t.Helper()
+				scope, id := discussionArrive(t, f.s, f.groupID, delivery.ID)
+				input := domain.ChatAssessment{Disposition: "discuss", Reason: "仅讨论。", DiscussionOnlyExcerpt: new(discussionOnlyQuote)}
+				r, err := f.s.ApplyChatAssessment(ctx, scope, id, input, "先交换意见。", "limit-"+id)
+				if err != nil || !r.DiscussionOnly || r.SourceID != origin.SourceID || r.TurnID != scope.Claim.TurnID {
+					t.Fatalf("restriction was not persisted for the local command: %+v, %v", r, err)
+				}
+				return scope, id
+			}
+			var a MemberToolScope
+			var ca string
+			for _, delivery := range origin.Deliveries {
+				scope, id := assess(delivery)
+				if delivery.RecipientID == f.a {
+					a, ca = scope, id
+				} else {
+					discussionEnd(t, f.s, scope)
+				}
+			}
+			input := MemberToolMessageInput{Content: "请提出意见。", RecipientIDs: []string{f.b}}
+			var msg domain.Message
+			var err error
+			sender := f.a
+			if name == "unassociated" {
+				// The text and sender label are not a receiving local-user command.
+				sender = f.b
+				legacy, createErr := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, TopicID: a.TopicID, ActorID: "user",
+					Content: discussionOnlyQuote}, []string{sender})
+				if createErr != nil {
+					t.Fatal(createErr)
+				}
+				peer, _ := discussionArrive(t, f.s, f.groupID, legacy.Deliveries[0].ID)
+				input.RecipientIDs = []string{f.a}
+				msg, err = f.s.SendMessageForTool(ctx, peer, input, "unassociated")
+				discussionEnd(t, f.s, peer)
+			} else {
+				msg, err = f.s.SendMessageForChatIntake(ctx, a, ca, input, "legacy-invite")
+			}
+			if err != nil || msg.SenderID != sender || msg.SourceKind != "member" || msg.SourceID == "" || len(msg.Deliveries) != 1 {
+				t.Fatalf("legacy directed send changed sender or delivery: %+v, %v", msg, err)
+			}
+			discussionEnd(t, f.s, a)
+			if name == "generic-second-hop" {
+				// Generic send can run on the receiving Turn without an intake capture.
+				turn, err := f.s.ClaimTurn(ctx, ClaimTurnInput{GroupID: f.groupID, DeliveryID: msg.Deliveries[0].ID, MaxActive: 2})
+				if err != nil {
+					t.Fatal(err)
+				}
+				peer, err := f.s.BindMemberTool(ctx, TurnClaim{GroupID: f.groupID, TurnID: turn.ID, Token: turn.ClaimToken})
+				if err != nil {
+					t.Fatal(err)
+				}
+				msg, err = f.s.SendMessageForTool(ctx, peer, MemberToolMessageInput{Content: "请继续核对。", RecipientIDs: []string{f.a}}, "generic-relay")
+				if err != nil || msg.SenderID != f.b || msg.SourceKind != "member" || len(msg.Deliveries) != 1 {
+					t.Fatalf("generic relay did not publish a member command: %+v, %v", msg, err)
+				}
+				discussionEnd(t, f.s, peer)
+			}
+			b, cb := discussionArrive(t, f.s, f.groupID, msg.Deliveries[0].ID)
+			switch name {
+			case "wrong-command":
+				coordinationDecideExec(t, f.s, "DROP TRIGGER chat_intake_executions_update")
+				coordinationDecideExec(t, f.s, "UPDATE chat_intake_executions SET source_id=? WHERE candidate_id=?", origin.SourceID, cb)
+			case "wrong-turn":
+				// Same actor and topic, but the other Turn did not send this command.
+				coordinationDecideExec(t, f.s, "DROP TRIGGER message_command_sources_update")
+				coordinationDecideExec(t, f.s, "UPDATE message_command_sources SET turn_id=? WHERE id=?", f.scope.Claim.TurnID, msg.SourceID)
+			}
+			r, err := f.s.ApplyChatAssessment(ctx, b, cb, proposal, "建议开始工作。", "propose")
+			switch name {
+			case "unassociated":
+				if err != nil || r.Outcome != "admitted" || r.Authority != "written_preauthorization" || r.SourceID != msg.SourceID {
+					t.Fatalf("unassociated legacy message lost ordinary preparation: %+v, %v", r, err)
+				}
+				return
+			case "wrong-command", "wrong-turn", "ambiguous-limit":
+				if !errors.Is(err, ErrMemberToolDenied) || r.ID != "" {
+					t.Fatalf("unproven restriction lineage was not closed: %+v, %v", r, err)
+				}
+			default:
+				chatAssertNotAdmitted(t, r, err, "discussion_only")
+				notice, err := f.s.GetMessage(ctx, f.groupID, r.NoticeMessageID)
+				if err != nil || r.SourceKind != "member" || r.SourceID != msg.SourceID || r.MessageID != msg.ID || r.SourceSenderID != msg.SenderID ||
+					len(notice.Deliveries) != 0 || !strings.Contains(notice.Content, origin.SourceID) || !strings.Contains(notice.Content, discussionOnlyQuote) {
+					t.Fatalf("denial must cite the exact root without attributing the proposal to it: %+v, %+v, %v", r, notice, err)
+				}
+			}
+			counts := messageSequenceRows(t, f.s.db, `SELECT (SELECT count(*) FROM tasks), (SELECT count(*) FROM mandates),
+			 (SELECT count(*) FROM coordination_dispatch_requests)`)
+			if !reflect.DeepEqual(counts, [][]any{{int64(0), int64(0), int64(0)}}) {
+				t.Fatalf("denied legacy proposal created work: %v", counts)
+			}
+		})
+	}
+}
+
 func TestChatDiscussionOnlyRejectsUnprovenExcerpt(t *testing.T) {
 	for _, failure := range []string{"empty", "different-quote", "wrong-disposition", "member", "sender-only", "stale-user"} {
 		t.Run(failure, func(t *testing.T) {

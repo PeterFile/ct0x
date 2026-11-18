@@ -73,6 +73,7 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 	if err := tx.Commit(); err != nil {
 		return domain.ChatCandidate{}, memberToolOperationError("保存聊天候选失败", err)
 	}
+	candidate.Policy = s.chatPolicyWithExecution(candidate.Policy)
 	return candidate, nil
 }
 

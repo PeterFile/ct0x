@@ -18,16 +18,20 @@ const (
 	investigationMaxDelegations    = 4
 )
 
-// The append position is resolved from the registry, not assumed by readers.
-// Truncated historical schemas remain usable; missing applied tables are errors.
+// Genuine legacy storage has neither the migration marker nor the scope table.
+// A mismatch must not make a restricted task look like ordinary work.
 func chatInvestigationSupportedInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	version := slices.Index(migrations, chatInvestigationSchema) + 1
-	if version == 0 {
-		return false, nil
+	var applied, present bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),
+	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_investigation_policy_revisions')`, version).Scan(&applied, &present)
+	if err != nil {
+		return false, err
 	}
-	var supported bool
-	err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?)", version).Scan(&supported)
-	return supported, err
+	if applied != present {
+		return false, fmt.Errorf("%w：只读调查迁移标记与策略表不一致", ErrTaskInvestigationNotReady)
+	}
+	return applied, nil
 }
 
 func validateChatInvestigationPolicy(input domain.ChatInvestigationPolicy) error {

@@ -127,8 +127,7 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 	if err := tx.Commit(); err != nil {
 		return domain.ChatPolicy{}, admissionError("保存聊天策略失败", err)
 	}
-	policy.InvestigationExecutionEnabled = policy.InvestigationSupported && s.investigationExecution.Load()
-	return policy, nil
+	return s.chatPolicyWithExecution(policy), nil
 }
 
 func (s *Store) GetChatPolicy(ctx context.Context, thread domain.ThreadRef) (domain.ChatPolicy, error) {
@@ -147,8 +146,13 @@ func (s *Store) GetChatPolicy(ctx context.Context, thread domain.ThreadRef) (dom
 	if err := tx.Commit(); err != nil {
 		return domain.ChatPolicy{}, admissionError("读取聊天策略失败", err)
 	}
+	return s.chatPolicyWithExecution(policy), nil
+}
+
+// Process readiness is live capability metadata, not part of the stored revision.
+func (s *Store) chatPolicyWithExecution(policy domain.ChatPolicy) domain.ChatPolicy {
 	policy.InvestigationExecutionEnabled = policy.InvestigationSupported && s.investigationExecution.Load()
-	return policy, nil
+	return policy
 }
 
 func chatPolicyCapabilitiesInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef) (domain.ChatPolicy, error) {

@@ -46,6 +46,55 @@ func TestChatInvestigationPolicyBeforeRuntime(t *testing.T) {
 	}
 }
 
+func TestChatInvestigationCandidateExecutionCapability(t *testing.T) {
+	f := chatSetup(t, "user", true)
+	policy := investigationPolicy(t, f, domain.ChatInvestigationPolicy{Objective: investigationObjective, AllowTopicMessages: true}, 1)
+	arrive := func(topic string) (MemberToolScope, string) {
+		t.Helper()
+		msg := chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: topic, ActorID: "user",
+			Content: "请提出建议。", RecipientIDs: []string{f.b}}, []string{f.b})
+		return discussionArrive(t, f.s, f.groupID, msg.Deliveries[0].ID)
+	}
+	check := func(scope MemberToolScope, id string, want domain.ChatPolicy) {
+		t.Helper()
+		if c, err := f.s.CaptureChatCandidate(ctx, scope); err != nil || c.ID != id || !reflect.DeepEqual(c.Policy, want) {
+			t.Fatalf("candidate policy=%+v, %v; want %+v", c.Policy, err, want)
+		}
+	}
+	b, cb := arrive(policy.TopicID)
+	ordinary := f.policy
+	for _, enabled := range []bool{false, true} {
+		if enabled {
+			f.s.EnableInvestigationExecution()
+		}
+		policy.InvestigationExecutionEnabled, ordinary.InvestigationExecutionEnabled = enabled, enabled
+		if current, err := f.s.GetChatPolicy(ctx, policy.ThreadRef); err != nil || !reflect.DeepEqual(current, policy) {
+			t.Fatalf("current policy=%+v, %v; want %+v", current, err, policy)
+		}
+		check(b, cb, policy)
+		check(f.scope, f.candidate.ID, ordinary) // Still bound to the ordinary revision without an investigation scope.
+	}
+	discussionEnd(t, f.s, b)
+	investigationDisablePolicy(t, f.s, policy)
+	b, cb = arrive(policy.TopicID)
+	current, err := f.s.GetChatPolicy(ctx, policy.ThreadRef)
+	if err != nil || current.Enabled || current.Revision != policy.Revision+1 || !current.InvestigationExecutionEnabled {
+		t.Fatalf("disabled policy and process readiness must stay independent: %+v, %v", current, err)
+	}
+	check(b, cb, current)
+	discussionEnd(t, f.s, b)
+	b, cb = arrive("unconfigured-topic")
+	thread := domain.ThreadRef{GroupID: f.groupID, TopicID: b.TopicID}
+	unset, err := f.s.GetChatPolicy(ctx, thread)
+	if err != nil || unset.Enabled || unset.Revision != 0 || !unset.InvestigationExecutionEnabled {
+		t.Fatalf("unexpected revision-zero policy: %+v, %v", unset, err)
+	}
+	if _, err := f.s.SetChatPolicy(ctx, thread, domain.ChatPolicyRequest{Enabled: true, Action: domain.ChatActionTextSubmission, MaxAdmissions: 1}, 0, "new-topic-policy"); err != nil {
+		t.Fatal(err)
+	}
+	check(b, cb, unset) // Revision zero is a disabled snapshot, not a lookup of the current policy.
+}
+
 func TestChatInvestigationPolicyOnV22(t *testing.T) {
 	original := migrations
 	defer func() { migrations = original }()
@@ -66,8 +115,15 @@ func TestChatInvestigationHistoricalSchemaAndOrdinaryWorker(t *testing.T) {
 			migrations = registered[:version]
 			f := chatSetup(t, "user", true)
 			messageSequenceLedger(t, f.s, version)
+			var present bool
+			if err := f.s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='chat_investigation_policy_revisions')`).Scan(&present); err != nil || present {
+				t.Fatalf("historical fixture has investigation storage: present=%v, %v", present, err)
+			}
 			migrations = registered // Current readers against the actual historical database.
 			f.s.EnableInvestigationExecution()
+			if candidate, err := f.s.CaptureChatCandidate(ctx, f.scope); err != nil || !reflect.DeepEqual(candidate, f.candidate) {
+				t.Fatalf("historical candidate policy changed: %+v, %v", candidate, err)
+			}
 			thread := f.policy.ThreadRef
 			if got, err := f.s.GetChatPolicy(ctx, thread); err != nil || !reflect.DeepEqual(got, f.policy) ||
 				!got.PreparationSupported || got.InvestigationSupported || got.InvestigationExecutionEnabled {

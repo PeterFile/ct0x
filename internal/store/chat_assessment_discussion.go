@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -69,8 +70,11 @@ func chatDiscussionWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCa
 		}
 	}
 	if !structured {
+		if c.SourceKind == "member" {
+			return chatDiscussionLegacyWorkGateInTx(ctx, tx, c)
+		}
 		if c.SourceKind != "local_user_chat" {
-			return nil // Ordinary member messages do not inherit a limit.
+			return nil
 		}
 		source, err := chatDiscussionRootSourceInTx(ctx, tx, c)
 		if err != nil {
@@ -114,6 +118,87 @@ func chatDiscussionWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCa
 		return chatStaleSource()
 	}
 	return chatDiscussionRootLimitInTx(ctx, tx, c.ThreadRef, origin, source)
+}
+
+// Generic sends can relay an arrival without capturing an intake on every hop.
+// Each message has at most one publishing Turn, and its input must be older.
+// Bound the indexed walk; an unproved prefix must not count as unrelated chat.
+func chatDiscussionLegacyWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) error {
+	const maxSourceHops = 16
+	for hops := 0; c.SourceKind == "member"; hops++ {
+		if hops == maxSourceHops {
+			return ErrMemberToolDenied
+		}
+		parent, err := chatDiscussionMemberParentInTx(ctx, tx, c)
+		if err != nil {
+			return err
+		}
+		c = parent
+	}
+	if c.SourceKind != "local_user_chat" {
+		return nil // No associated user chat command, regardless of sender labels or text.
+	}
+	root, err := chatDiscussionRootSourceInTx(ctx, tx, c)
+	if err != nil {
+		return err
+	}
+	limitErr := chatDiscussionRootLimitInTx(ctx, tx, c.ThreadRef, c.MessageID, root)
+	var limit *chatNonAdmission
+	if !errors.As(limitErr, &limit) {
+		return limitErr // No limit, or evidence that could not be verified.
+	}
+	stale, err := chatSourceSupersededInTx(ctx, tx, c.ThreadRef, root.sequence)
+	if err != nil || stale {
+		return err // A newer user command supersedes a verified legacy restriction.
+	}
+	return limitErr
+}
+
+// Resolve the actual publisher before following its incoming delivery. A
+// captured intake must agree with that history, but generic send need not have
+// one. Never depend on the publisher's current claim token or terminal state.
+func chatDiscussionMemberParentInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) (p domain.ChatCandidate, err error) {
+	p.ThreadRef = c.ThreadRef
+	var capturedKind, capturedID string
+	err = tx.QueryRowContext(ctx, `SELECT prior.id,prior.sender_id,pl.sequence,t.id,t.member_id,
+	 coalesce(i.source_kind,''),coalesce(i.source_id,'')
+	 FROM messages m JOIN message_log l ON (l.message_id,l.group_id,l.topic_id)=(m.id,m.group_id,m.topic_id)
+	 LEFT JOIN message_command_sources s ON s.message_id=m.id
+	 JOIN turns t ON (t.id,t.group_id,t.member_id)=(coalesce(s.turn_id,substr(:source,6)),m.group_id,m.sender_id)
+	 JOIN deliveries d ON (d.id,d.turn_id,d.group_id,d.topic_id,d.conversation_id,d.recipient_id)
+	    =(t.delivery_id,t.id,t.group_id,m.topic_id,t.conversation_id,t.member_id)
+	 JOIN conversations v ON (v.id,v.group_id,v.topic_id,v.member_id)=(d.conversation_id,d.group_id,d.topic_id,d.recipient_id)
+	 JOIN messages prior ON (prior.id,prior.group_id,prior.topic_id)=(d.message_id,d.group_id,d.topic_id)
+	 JOIN message_log pl ON (pl.message_id,pl.group_id,pl.topic_id)=(prior.id,prior.group_id,prior.topic_id) AND pl.sequence<l.sequence
+	 LEFT JOIN chat_candidates publisher ON publisher.turn_id=t.id
+	 LEFT JOIN chat_intake_executions i ON i.candidate_id=publisher.id
+	 WHERE (m.id,m.group_id,m.topic_id,l.sequence)=(:message,:group,:topic,:sequence)
+	 AND EXISTS(SELECT 1 FROM turns incoming JOIN deliveries delivered ON delivered.id=incoming.delivery_id
+	    WHERE (incoming.id,incoming.group_id,incoming.member_id)=(:turn,m.group_id,:recipient)
+	    AND (delivered.turn_id,delivered.message_id,delivered.group_id,delivered.topic_id,delivered.conversation_id,delivered.recipient_id)
+	    =(incoming.id,m.id,m.group_id,m.topic_id,incoming.conversation_id,incoming.member_id)
+	    AND NOT EXISTS(SELECT 1 FROM turns other WHERE other.delivery_id=delivered.id AND other.id<>incoming.id))
+	 AND ((s.id=:source AND s.kind='member' AND typeof(s.claim_digest)='blob' AND length(s.claim_digest)=32)
+	    OR (s.id IS NULL AND :source='turn:'||t.id AND t.reply_message_id=m.id))
+	 AND NOT EXISTS(SELECT 1 FROM turns other WHERE other.delivery_id=d.id AND other.id<>t.id)
+	 AND NOT EXISTS(SELECT 1 FROM turns other WHERE other.reply_message_id=m.id AND other.reply_message_id<>'' AND (s.id IS NOT NULL OR other.id<>t.id))
+	 AND (publisher.id IS NULL OR (publisher.group_id,publisher.topic_id,publisher.message_id,publisher.member_id,publisher.generation)
+	    =(prior.group_id,prior.topic_id,prior.id,t.member_id,pl.sequence))
+	 AND (i.candidate_id IS NULL OR (i.turn_id=t.id AND i.purpose=:purpose AND (s.id IS NULL OR i.claim_digest=s.claim_digest)))`,
+		sql.Named("source", c.SourceID), sql.Named("message", c.MessageID), sql.Named("group", c.GroupID), sql.Named("topic", c.TopicID),
+		sql.Named("sequence", c.Generation), sql.Named("turn", c.TurnID), sql.Named("recipient", c.MemberID), sql.Named("purpose", domain.ChatIntakePurpose)).Scan(
+		&p.MessageID, &p.SourceSenderID, &p.Generation, &p.TurnID, &p.MemberID, &capturedKind, &capturedID)
+	if err == sql.ErrNoRows {
+		return p, ErrMemberToolDenied
+	}
+	if err != nil {
+		return p, err
+	}
+	p.SourceKind, p.SourceID, err = messageSourceInTx(ctx, tx, p.MessageID)
+	if err == nil && capturedKind != "" && (capturedKind != p.SourceKind || capturedID != p.SourceID) {
+		err = ErrMemberToolDenied
+	}
+	return p, err
 }
 
 func chatDiscussionRootLimitInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, origin string, source chatDiscussionRootSource) error {
