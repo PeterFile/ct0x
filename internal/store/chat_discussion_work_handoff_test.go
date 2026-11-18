@@ -201,9 +201,11 @@ func TestChatDiscussionWorkHandoffRead(t *testing.T) {
 	checkDiscussionWorkMessage(t, s, f.groupID, invite.Message.ID, work, "")
 	messageSequencePreserved(t, s, before)
 
-	// Remove only the optional binding after verifying the assignment above.
-	coordinationDecideExec(t, s, `DROP TRIGGER coordination_assignment_dispatch_no_delete;
-	 DELETE FROM coordination_assignment_dispatch WHERE assignment_id=?`, decision.Assignment.ID)
+	// Persist a bad decision timestamp without breaking the assignment's foreign keys.
+	coordinationDecideExec(t, s, `DROP TRIGGER coordination_decisions_no_update;
+	 PRAGMA ignore_check_constraints=ON;
+	 UPDATE coordination_decisions SET created_at='2026-02-30T00:00:00.000000000Z' WHERE id=?;
+	 PRAGMA ignore_check_constraints=OFF`, decision.Decision.ID)
 	delete(work, "assignment_id")
 	delete(work, "worker_member_id")
 	checkDiscussionWorkMessage(t, s, f.groupID, invite.Message.ID, work, "")
