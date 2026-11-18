@@ -22,7 +22,8 @@ import (
 )
 
 // Real v30 queue/claim, Attempt, issued HTTP configuration and final B commit.
-// Native invocation is in-process; no Pi executable or model is started.
+// Normally native invocation is in-process. The startup-proof case uses a
+// shell emitting fixed lifecycle frames; no Pi executable or model is started.
 func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 	for _, tc := range []struct {
 		kind domain.TaskWorkSourceKind
@@ -37,6 +38,7 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 		{domain.TaskWorkSourceDelegation, "wrong-resource"},
 		{domain.TaskWorkSourceDelegation, "cancel-after-callback"},
 		{domain.TaskWorkSourceDelegation, "config-after-commit"},
+		{domain.TaskWorkSourceDelegation, "missing-startup-proof"},
 	} {
 		t.Run(string(tc.kind)+"/"+tc.mode, func(t *testing.T) {
 			ctx := t.Context()
@@ -77,7 +79,17 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 			root := t.TempDir()
 			private, cli := filepath.Join(root, "private"), filepath.Join(root, "metadata-only")
 			roleOK(t, os.Mkdir(private, 0700))
-			roleOK(t, os.WriteFile(cli, nil, 0700))
+			var script []byte
+			if tc.mode == "missing-startup-proof" {
+				// Plausible Pi lifecycle from a synthetic child that never bound the typed extension.
+				script = []byte(`#!/bin/sh
+while [ "$#" -gt 1 ] && [ "$1" != "--session-id" ]; do shift; done
+[ "$1" = "--session-id" ] || exit 2
+printf '{"type":"session","version":3,"id":"%s","cwd":"/fixture","timestamp":"2026-11-18T00:00:00.000Z"}\n' "$2"
+printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"未绑定的输出"}]}}' '{"type":"agent_settled","aborted":false}'
+`)
+			}
+			roleOK(t, os.WriteFile(cli, script, 0700))
 			bridgeRoot, err := filepath.Abs("../../extensions/pi-bridge")
 			roleOK(t, err)
 			selected := provider.Provider{ID: f.worker.ProviderID, Name: provider.Pi, Path: cli, Installation: provider.Installed, Version: "1.4.0"}
@@ -165,8 +177,9 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 			construct := launch.Construct
 			launch.Construct = func(check context.Context, p provider.Provider, b provider.PiFreshInvestigationBinding) (provider.Executor, error) {
 				constructed++
-				if _, err := construct(check, p, b); err != nil {
-					return nil, err // Actual pinned construction; never invoke this executor.
+				native, err := construct(check, p, b)
+				if err != nil {
+					return nil, err
 				}
 				path = b.ConfigPath
 				bytes, err := os.ReadFile(path)
@@ -196,7 +209,7 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 				}
 				return roleNative(func(check context.Context, req provider.ExecuteRequest, emit func(provider.Event) error) provider.ExecutionReceipt {
 					nativeCalls++
-					if tc.mode != "admitted" || !admitted || !commitReturned || check.Err() != nil || req != prepared.Request {
+					if (tc.mode != "admitted" && tc.mode != "missing-startup-proof") || !admitted || !commitReturned || check.Err() != nil || req != prepared.Request {
 						t.Fatal("native entered before successful final admission or with a changed request")
 					}
 					ops, err := f.runtime.Tools().TransportOperations(check, token)
@@ -204,6 +217,13 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 					if !slices.Equal(ops, wantOps) || strings.Contains(req.Prompt, token) || strings.Contains(req.Prompt, f.source.Content) ||
 						sourceText != "" && strings.Contains(req.Prompt, sourceText) || tc.kind == domain.TaskWorkSourceDelegation && !strings.Contains(req.Prompt, f.delegation.Question) {
 						t.Fatal("native context exceeded or lost the typed plan")
+					}
+					if tc.mode == "missing-startup-proof" {
+						r := native.Execute(check, req, emit)
+						if !r.Started || !r.DirectChildReaped || r.ExitCode != 0 || r.Outcome != provider.OutcomeUnknown || r.Accepted || r.Terminal != "" || r.OutputComplete {
+							t.Errorf("unproved native execution supplied trusted evidence: %+v", r)
+						}
+						return r
 					}
 					roleOK(t, emit(provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: req.RunID}))
 					f.expectHTTP(t, token, "read_channel", `{}`, "", http.StatusForbidden)
@@ -269,6 +289,8 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 			wantState, wantClaims := domain.TurnStateUnknown, 1
 			if tc.mode == "admitted" {
 				wantNativeCalls, wantState, wantClaims = 1, domain.TurnStateSucceeded, 0
+			} else if tc.mode == "missing-startup-proof" {
+				wantNativeCalls = 1 // Actually launched; unknown must retain the physical claim.
 			} else if tc.mode == "revoked-token" {
 				wantCommitCalls = 0
 			}
@@ -278,7 +300,8 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 			f.claims(t, roleRun{claim: physicalClaim}, wantState, wantClaims)
 			turn, err := f.db.GetTurn(ctx, f.group, physicalClaim.TurnID)
 			roleOK(t, err)
-			if turn.ReplyMessageID != "" || (wantState == domain.TurnStateUnknown && (turn.AcceptedAt != nil || turn.NativeSessionID != "")) {
+			if turn.ReplyMessageID != "" || (wantState == domain.TurnStateUnknown &&
+				(turn.AcceptedAt != nil || turn.NativeSessionID != "" || turn.CandidateText != "" || turn.CandidateTerminal != "")) {
 				t.Fatal("fixture setup published a reply or treated a denied launch as accepted")
 			}
 			if files, err := os.ReadDir(f.options.ConfigRoot); err != nil || len(files) != 0 {

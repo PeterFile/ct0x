@@ -15,7 +15,7 @@ import (
 
 // Only this entry (and its pinned pure bridge validators) implements the typed
 // investigation profile. It does not qualify either ordinary Pi entry point.
-const piFreshInvestigationEntrySHA = "ba79d6f902bd3289f5697c4cbd8912338663848716fee6fed85469eb473a4f2c"
+const piFreshInvestigationEntrySHA = "217884b1c05b05fc8bb30374d249c6a8057cec134c5855735cce74e31a54fee9"
 
 // PiFreshInvestigationProfile is the launcher-selected profile of an issued
 // investigation capability. Operation names describe transport, not grants.

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { syncBuiltinESMExports } from "node:module";
 import { dirname, join } from "node:path";
@@ -12,6 +12,7 @@ import { BASE, TOKEN, privateConfig, safeFailure } from "./helpers.mjs";
 import { loadExtensions, loadSessionSDK, runJSONPrint } from "./pi-loader.mjs";
 
 const entry = fileURLToPath(new URL("../fresh-investigation-work.ts", import.meta.url));
+const readyKind = "agent_workspace_investigation_ready_v1";
 const turn = "turn-investigation";
 const stamp = "2026-11-18T00:00:00.123456789Z";
 const channel = "read_investigation_channel", artifact = "read_investigation_artifact";
@@ -79,11 +80,11 @@ function intercept(t, respond) {
   return sent;
 }
 
-async function openSession(t, fx, operations, { id = turn, existing = false, persistent = false, modelRuntime } = {}) {
+async function openSession(t, fx, operations, { id = turn, existing = false, persistent = false, excludeTools, modelRuntime } = {}) {
   const { createAgentSession, SessionManager, SettingsManager } = await loadSessionSDK();
   const dir = dirname(fx.path);
   const loaded = fx.loaded ?? await load(fx.path, fx.digest);
-  assert.deepEqual(loaded.errors, []);
+  assert.deepEqual(loaded.errors, [], "typed startup must leave the input guard installed even on config failure");
   assert.equal(loaded.extensions[0].tools.size, 0, "registered before verifying the live session");
   const deny = name => () => assert.fail(`unexpected ${name}`);
   t.mock.method(globalThis, "fetch", deny("network"));
@@ -92,7 +93,7 @@ async function openSession(t, fx, operations, { id = turn, existing = false, per
   const sessionManager = persistent ? SessionManager.create(dir, dir, { id }) : SessionManager.inMemory(dir, { id });
   if (existing) sessionManager.appendMessage({ role: "user", content: "already used", timestamp: 1 });
   const { session } = await createAgentSession({
-    cwd: dir, agentDir: dir, model, noTools: "builtin", tools: operations,
+    cwd: dir, agentDir: dir, model, noTools: "builtin", tools: operations, excludeTools,
     modelRuntime: modelRuntime ?? new Proxy({}, { get: (_target, name) => deny(String(name)) }),
     sessionManager,
     settingsManager: SettingsManager.inMemory({ retry: { enabled: false }, cacheWarming: "off", enableInstallTelemetry: false }),
@@ -116,6 +117,20 @@ async function bind(t, fx, operations, options) {
   session.setActiveToolsByName([...operations, ...reportOwner, report, "bash", "read", "send_message", "decide_dispatch"]);
   const tools = new Map(session.agent.state.tools.map(tool => [tool.name, tool]));
   return { tools, session, active, errors, invoke: (op, args, id = "fixture-call", signal) => tools.get(op).execute(id, args, signal) };
+}
+
+function checkReady(frames, digest, source) {
+  assert.deepEqual(frames.slice(0, 2).map(frame => frame.type), ["session", "entry_appended"]);
+  assert.equal(frames[0].id, turn);
+  const { id, parentId, timestamp } = frames[1].entry;
+  assert.match(id, /^[-a-z0-9]+$/);
+  assert.ok(parentId === null || typeof parentId === "string");
+  assert.ok(Number.isFinite(Date.parse(timestamp)));
+  assert.deepEqual(frames[1], { type: "entry_appended", entry: {
+    type: "custom", customType: readyKind, data: { run_id: turn, source_kind: source, config_sha256: digest }, id, parentId, timestamp,
+  } });
+  assert.equal(frames.filter(f => f.type === "entry_appended" && f.entry.customType === readyKind).length, 1);
+  assert.ok(!JSON.stringify(frames[1]).includes(TOKEN));
 }
 
 function result(value) {
@@ -184,28 +199,33 @@ for (const [kind, operations] of [
 test("config digest and exact source profile are checked before session binding", async t => {
   const good = issue("delegation", [report]);
   const fx = await issueFile(t, good);
-  const denied = loaded => {
-    assert.equal(loaded.extensions.length, 0);
-    assert.equal(loaded.errors.length, 1);
-    assert.match(loaded.errors[0].error, /配置/);
-    assert.ok(!loaded.errors[0].error.includes(TOKEN));
+  const denied = async (path, digest) => {
+    const { tools, errors } = await bind(t, { path, digest }, [report]);
+    assert.equal(tools.size, 0);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /配置/);
+    assert.ok(!errors[0].includes(TOKEN));
   };
-  for (const digest of [undefined, "0".repeat(64), fx.digest.toUpperCase()]) denied(await load(fx.path, digest));
+  for (const digest of [undefined, "0".repeat(64), fx.digest.toUpperCase()]) await denied(fx.path, digest);
   for (const bad of [
     { ...good, task_id: "unbound" }, { ...good, run_id: "../run" }, { ...good, action: "text_submission" },
     issue("handback", [report]), issue("followup", [channel, "submit_result"]), issue("delegation", [report, readReport]),
     issue("report", [readReport]), issue("delegation", [artifact, channel, report]), issue("delegation", [report, report]),
   ]) {
     const changed = await issueFile(t, bad);
-    denied(await load(changed.path, changed.digest));
+    await denied(changed.path, changed.digest);
   }
   for (const wire of [fx.wire + " ", fx.wire.replace('"run_id":', '"run_id":"other","run_id":')]) {
     await writeFile(fx.path, wire);
-    denied(await load(fx.path, sha(wire)));
+    await denied(fx.path, sha(wire));
   }
   await writeFile(fx.path, fx.wire);
   for (const name of ["index.ts", "fresh-task-work.ts"]) {
-    denied(await load(fx.path, fx.digest, fileURLToPath(new URL(`../${name}`, import.meta.url))));
+    const { extensions, errors } = await load(fx.path, fx.digest, fileURLToPath(new URL(`../${name}`, import.meta.url)));
+    assert.equal(extensions.length, 0);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0].error, /配置/);
+    assert.ok(!errors[0].error.includes(TOKEN));
   }
 });
 
@@ -224,15 +244,19 @@ test("wrong, persistent or previously used native session registers no tools", a
 test("Pi JSON print refuses input before model admission when investigation startup didn't bind", async t => {
   const sent = intercept(t, () => assert.fail("unbound session called HTTP"));
   const fx = await issueFile(t, issue("delegation", [report]));
-  for (const options of [{ id: "other-turn" }, { existing: true }, { persistent: true }]) {
+  for (const [options, digest, denial] of [
+    [{}, "0".repeat(64), /配置.*未启用/], [{ id: "other-turn" }, fx.digest, /会话.*未发送/],
+    [{ existing: true }, fx.digest, /会话.*未发送/], [{ persistent: true }, fx.digest, /会话.*未发送/],
+    [{ excludeTools: [report] }, fx.digest, /会话.*未发送/],
+  ]) {
     let admissions = 0;
     const modelRuntime = { hasConfiguredAuth() { admissions++; throw new Error("synthetic model admission"); } };
-    const session = await openSession(t, fx, [report], { ...options, modelRuntime });
+    const session = await openSession(t, { ...fx, digest }, [report], { ...options, modelRuntime });
     const { frames, errors, exit } = await runJSONPrint(t, session, "should not enter the agent");
-    assert.equal(admissions, 0, "Pi reached model admission despite failing the session bind");
+    assert.equal(admissions, 0, "Pi reached model admission despite failing startup");
     assert.equal(exit, 0); // Pi's documented handled-input path, not an auth error or process kill.
     assert.equal(errors.length, 1);
-    assert.match(errors[0], /会话.*未发送/);
+    assert.match(errors[0], denial);
     assert.deepEqual(frames.map(frame => frame.type), ["session"]);
   }
   assert.equal(sent.length, 0);
@@ -243,9 +267,11 @@ test("investigation input gate neither swallows valid JSON nor intercepts TUI in
   const modelRuntime = { hasConfiguredAuth() { throw new Error(sentinel); } };
   const fx = await issueFile(t, issue("delegation", [report]));
   const session = await openSession(t, fx, [report], { modelRuntime });
-  const { errors, exit } = await runJSONPrint(t, session, "valid startup");
+  const { frames, errors, exit } = await runJSONPrint(t, session, "valid startup");
   assert.equal(exit, 1);
   assert.deepEqual(errors, [sentinel]);
+  checkReady(frames, fx.digest, "delegation");
+  assert.equal(frames.length, 2);
   const tui = await openSession(t, fx, [report], { id: "other-turn", modelRuntime });
   await tui.bindExtensions({ mode: "tui", onError: () => {} });
   assert.deepEqual(tui.getActiveToolNames(), []);
@@ -354,4 +380,53 @@ test("a malformed or missing write receipt never retries or permits a different 
   assert.deepEqual(await invoke(readReport, {}), result(boundReport));
   await assert.rejects(invoke("submit_result", submit), /阻止后续写入/);
   assert.deepEqual(sent.slice(n).map(call => call.op), ["ack_work_input", readReport]);
+});
+
+test("Pi 1.4.0 loader suppresses ambient SYSTEM.md and APPEND_SYSTEM.md only with explicit prompts", async t => {
+  t.mock.method(globalThis, "fetch", () => assert.fail("unexpected network"));
+  const { DefaultResourceLoader, SettingsManager } = await import("@earendil-works/pi-coding-agent");
+  const cwd = dirname(await privateConfig(t)), agentDir = join(cwd, "agent");
+  await mkdir(agentDir, { mode: 0o700 });
+  await writeFile(join(agentDir, "SYSTEM.md"), "ambient-system-fixture");
+  await writeFile(join(agentDir, "APPEND_SYSTEM.md"), "ambient-append-fixture");
+  const options = { cwd, agentDir, settingsManager: SettingsManager.inMemory({}), noContextFiles: true,
+    noExtensions: true, noThemes: true, noSkills: true, noPromptTemplates: true };
+  const baseline = new DefaultResourceLoader(options);
+  await baseline.reload();
+  assert.equal(baseline.getSystemPrompt(), "ambient-system-fixture");
+  assert.deepEqual(baseline.getAppendSystemPrompt(), ["ambient-append-fixture"]);
+  // The values are the exact argv pinned by TestPiFreshInvestigationExactBinding.
+  const systemPrompt = "你只可使用本轮注册的调查工具，在绑定范围内读取材料或执行工具定义的平台操作。";
+  const appendSystemPrompt = ["不得向宿主机请求文件、命令或网络工具。"];
+  const strict = new DefaultResourceLoader({ ...options, systemPrompt, appendSystemPrompt });
+  await strict.reload();
+  assert.equal(strict.getSystemPrompt(), systemPrompt);
+  assert.deepEqual(strict.getAppendSystemPrompt(), appendSystemPrompt);
+  assert.deepEqual(strict.getAgentsFiles().agentsFiles, []);
+});
+
+test("Pi JSON print proves typed startup on a synthetic successful turn", async t => {
+  const fx = await issueFile(t, issue("delegation", [report]));
+  const session = await openSession(t, fx, [report], { modelRuntime: {
+    hasConfiguredAuth: () => true,
+    streamSimple(model, context) {
+      assert.ok(!JSON.stringify(context).includes(fx.digest), "readiness leaked into the model context");
+      const stream = createAssistantMessageEventStream();
+      stream.push({ type: "done", reason: "stop", message: {
+        role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), stopReason: "stop",
+        content: [{ type: "text", text: "native stop" }],
+        usage: { input: 1, output: 1, totalTokens: 2, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0 } },
+      } });
+      return stream;
+    },
+  } });
+  const { frames, jsonl, errors, exit } = await runJSONPrint(t, session, "synthetic typed investigation");
+  assert.deepEqual(errors, []);
+  assert.equal(exit, 0);
+  checkReady(frames, fx.digest, "delegation");
+  assert.deepEqual(frames[2], { type: "agent_start" });
+  assert.ok(frames.some(f => f.type === "message_end" && f.message.role === "assistant" && f.message.stopReason === "stop"));
+  assert.deepEqual(frames.at(-1), { type: "agent_settled", aborted: false });
+  const dir = process.env.TEST_PI_TYPED_PRINT_FIXTURES;
+  if (dir) await writeFile(join(dir, "delegation-checked.jsonl"), jsonl, { mode: 0o600, flag: "wx" });
 });
