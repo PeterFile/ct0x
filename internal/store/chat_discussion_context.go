@@ -5,13 +5,16 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"slices"
+	"time"
+	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
 )
 
 const chatDiscussionContextJSONBytes = 16 * 1024
 
-var ErrChatDiscussionContextTooLarge = errors.New("聊天协作元数据超过 16 KiB，未返回部分路径；请用 read_history 按已知消息 ID 查看正文，或请用户用更短的要求重新发起讨论")
+var ErrChatDiscussionContextTooLarge = errors.New("聊天协作路径的元数据超过 16 KiB；请缩短独立回复要求或改用普通消息")
 
 // ReadChatDiscussionContext returns nil for a valid intake with no handoff.
 // It can run before assessment, but only on the claim that captured the intake.
@@ -39,26 +42,94 @@ func boundChatDiscussionContext(c *domain.ChatDiscussionContext) (*domain.ChatDi
 		return nil, nil
 	}
 	for {
-		data, err := json.Marshal(c)
-		if err != nil {
-			return nil, errors.New("编码聊天协作上下文失败")
-		}
-		if len(data)+1 <= chatDiscussionContextJSONBytes {
+		err := checkChatDiscussionContextSize(c)
+		if err == nil {
 			return c, nil
 		}
-		if c.ContentOmitted {
-			return nil, ErrChatDiscussionContextTooLarge
+		if err != ErrChatDiscussionContextTooLarge || c.ContentOmitted {
+			return nil, err
 		}
-		c.ContentOmitted, c.OriginContent = true, ""
-		for i := range c.Events {
-			r := &c.Events[i]
-			// Keep refinements that cannot be recovered from exact message history.
-			if r.Event.Kind == domain.ChatDiscussionInvite && r.Event.ExpectedReply == r.Message.Content {
-				r.Event.ExpectedReply = ""
-			}
-			r.Message.Content = ""
-		}
+		omitChatDiscussionBodies(c)
 	}
+}
+
+func omitChatDiscussionBodies(c *domain.ChatDiscussionContext) {
+	c.ContentOmitted, c.OriginContent = true, ""
+	for i := range c.Events {
+		c.Events[i].Message.Content = ""
+	}
+}
+
+func checkChatDiscussionContextSize(c *domain.ChatDiscussionContext) error {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return errors.New("编码聊天协作上下文失败")
+	}
+	if len(data)+1 > chatDiscussionContextJSONBytes {
+		return ErrChatDiscussionContextTooLarge
+	}
+	return nil
+}
+
+func chatDiscussionJSONStringSize(s string) int {
+	data, _ := json.Marshal(s) // Strings always encode.
+	return len(data)
+}
+
+func widerChatDiscussionRef(a, b string) string {
+	if chatDiscussionJSONStringSize(b) > chatDiscussionJSONStringSize(a) {
+		return b
+	}
+	return a
+}
+
+// Reserve the body-free context for the admitted prefix, all of its targeted
+// returns, and the final resolution. A later push must pass its own check.
+// This runs in the publication transaction; the probe is never persisted.
+func reserveChatDiscussionReturnContextInTx(ctx context.Context, tx *sql.Tx, chain *chatDiscussionChain, invite domain.ChatDiscussionReceipt) error {
+	probe := chain.ChatDiscussionContext
+	probe.Events = append(slices.Clone(probe.Events), invite) // At a push, the prefix contains only invites.
+	var rootConversation string
+	if err := tx.QueryRowContext(ctx, `SELECT id FROM conversations WHERE group_id=? AND member_id=? AND topic_id=?`,
+		probe.GroupID, probe.RootInviterID, probe.TopicID).Scan(&rootConversation); err != nil {
+		return err
+	}
+	if !utf8.ValidString(probe.GroupID) || !utf8.ValidString(probe.TopicID) || !utf8.ValidString(probe.RootInviterID) ||
+		!utf8.ValidString(rootConversation) || !utf8.ValidString(invite.Message.Deliveries[0].ConversationID) {
+		return ErrInvalid // JSON must preserve the exact route.
+	}
+
+	// Reuse freshly generated IDs for the widths of future IDs. Reserve the
+	// longest UTC timestamp and arrival/head/owner fields of any visible state.
+	msg := invite.Message
+	msg.CreatedAt = time.Unix(0, 1).UTC() // Nine fractional digits.
+	delivery := msg.Deliveries[0]
+	delivery.CreatedAt = msg.CreatedAt
+	probe.ActiveOwnerID, probe.ClosureReason = probe.RootInviterID, chatDiscussionRecipientLeftReason
+	probe.HeadMessageID = msg.ID
+	base := domain.ChatDiscussionEvent{OriginMessageID: probe.OriginMessageID, SourceMessageID: msg.ID, MessageID: msg.ID}
+	for i := len(probe.Events) - 1; i >= 0; i-- {
+		asked := probe.Events[i].Event
+		probe.HeadMessageID = widerChatDiscussionRef(probe.HeadMessageID, asked.MessageID)
+		probe.ActiveOwnerID = widerChatDiscussionRef(probe.ActiveOwnerID, asked.RecipientID)
+		delivery.ConversationID = rootConversation
+		if i > 0 {
+			delivery.ConversationID = probe.Events[i-1].Message.Deliveries[0].ConversationID
+		}
+		delivery.RecipientID = asked.ActorID
+		msg.SenderID, msg.Deliveries = asked.RecipientID, []domain.Delivery{delivery}
+		e := base
+		e.Kind, e.ActorID, e.RecipientID = domain.ChatDiscussionReply, msg.SenderID, delivery.RecipientID
+		e.DeliveryID, e.InvitationMessageID = delivery.ID, asked.MessageID
+		probe.Events = append(probe.Events, domain.ChatDiscussionReceipt{Message: msg, Event: e})
+	}
+	msg.SenderID, msg.Deliveries = probe.RootInviterID, nil
+	base.Kind, base.ActorID, base.InvitationMessageID = domain.ChatDiscussionResolve, msg.SenderID, probe.Events[0].Message.ID
+	probe.Events = append(probe.Events, domain.ChatDiscussionReceipt{Message: msg, Event: base})
+	probe.IncomingMessageID = widerChatDiscussionRef(probe.OriginMessageID, probe.HeadMessageID)
+	probe.ActiveInvitationMessageID = probe.HeadMessageID
+	omitChatDiscussionBodies(&probe)
+	return checkChatDiscussionContextSize(&probe)
 }
 
 func readChatDiscussionContextInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, candidateID string) (*domain.ChatDiscussionContext, error) {
@@ -184,12 +255,21 @@ func chatDiscussionChainInTx(ctx context.Context, tx *sql.Tx, thread domain.Thre
 		return nil, ErrMemberToolDenied
 	}
 	if !c.Closed {
-		// Only the recorded never-claimed failure closes a targeted head.
-		// The member's current status or a claimed delivery is not proof.
+		// The departure trigger records the unclaimed case. After a claim,
+		// rely only on the bound turn's terminal state and trusted normalized
+		// receipt. Project closure without settling or releasing anything here.
 		head := c.Events[len(c.Events)-1].Event
 		var departed bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM deliveries WHERE id=?
-		 AND state='failed' AND turn_id='' AND error=?)`, head.DeliveryID, chatDiscussionRecipientLeftReason).Scan(&departed); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM deliveries d WHERE d.id=? AND d.state='failed'
+		 AND ((d.turn_id='' AND d.error=?) OR EXISTS(
+		   SELECT 1 FROM turns t JOIN members m ON m.group_id=t.group_id AND m.id=t.member_id
+		   WHERE t.id=d.turn_id AND t.delivery_id=d.id AND t.group_id=d.group_id
+		     AND t.conversation_id=d.conversation_id AND t.member_id=d.recipient_id
+		     AND t.state='not_started' AND m.status='left' AND t.accepted_at IS NULL AND t.native_session_id=''
+		     AND CASE WHEN json_valid(t.receipt_json) THEN
+		       json_extract(t.receipt_json,'$.outcome')='not_started'
+		       AND json_type(t.receipt_json,'$.started')='false' AND json_type(t.receipt_json,'$.accepted')='false' END
+		 )))`, head.DeliveryID, chatDiscussionRecipientLeftReason).Scan(&departed); err != nil {
 			return nil, err
 		}
 		if departed {
@@ -225,5 +305,5 @@ func scanChatDiscussionReceipt(row scanner) (r domain.ChatDiscussionReceipt, err
 		(len(m.Deliveries) != 1 || m.Deliveries[0].ID != e.DeliveryID || m.Deliveries[0].RecipientID != e.RecipientID) {
 		return r, ErrMemberToolDenied
 	}
-	return chatDiscussionReceiptWithRequirement(r), nil
+	return r, nil
 }

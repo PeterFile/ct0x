@@ -7,8 +7,9 @@ const (
 )
 
 // ChatDiscussionAction never selects the source, caller, or return route.
-// Invite requires a recipient; ExpectedReply optionally refines its question.
-// When omitted, the invitation's Content is the reply requirement.
+// Invite requires a recipient; ExpectedReply optionally refines its question
+// and is limited to 1024 bytes as a JSON string, including quotes and escapes.
+// When omitted, the invitation's exact saved Content is the reply requirement.
 type ChatDiscussionAction struct {
 	Kind          string `json:"kind"`
 	Content       string `json:"content"`
@@ -20,6 +21,7 @@ type ChatDiscussionAction struct {
 // consumed by this step. InvitationMessageID is the new invitation on invite,
 // the answered invitation on reply, or the root invitation on resolve (if any).
 // RecipientID is the intended target; an empty DeliveryID means no wake was sent.
+// An invite with no ExpectedReply uses the exact question at MessageID.
 type ChatDiscussionEvent struct {
 	Kind                      string `json:"kind"`
 	OriginMessageID           string `json:"origin_message_id"`
@@ -35,6 +37,8 @@ type ChatDiscussionEvent struct {
 
 // ChatDiscussionReceipt is the immutable publication snapshot, not live
 // delivery state. GetMessage can read delivery progress separately.
+// Tool write responses should project the persisted relation and reference IDs,
+// not echo the Message body.
 type ChatDiscussionReceipt struct {
 	Message Message             `json:"message"`
 	Event   ChatDiscussionEvent `json:"event"`
@@ -43,11 +47,11 @@ type ChatDiscussionReceipt struct {
 // ChatDiscussionContext is scoped to an arriving turn. A new action needs the
 // current head and owner; an older arrival can still read its associated path.
 // After a root answer, the owner can resolve but no invitation is active.
-// Closed also covers a public-only return or a recorded unclaimed delivery
-// failure on departure; only the latter has ClosureReason.
+// Closed also covers a public-only return or a departed recipient's delivery
+// known not to have started; only the latter has ClosureReason.
 // When ContentOmitted is true, read full bodies via read_history using
-// OriginMessageID and each event's MessageID. An invite without inline
-// ExpectedReply in this projection uses its own message body as the requirement.
+// OriginMessageID and each event's MessageID. Independent reply requirements
+// remain inline even when the bodies are omitted.
 // Events retain the publication snapshots' routing facts, not live delivery state.
 type ChatDiscussionContext struct {
 	ThreadRef

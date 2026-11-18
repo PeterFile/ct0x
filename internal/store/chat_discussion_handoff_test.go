@@ -159,7 +159,7 @@ func TestChatDiscussionFlow(t *testing.T) {
 				}
 				delegate.RecipientID = cID
 				child := discussionApply(t, s, b, cb, "delegate", delegate)
-				discussionCheckPublication(t, s, child, origin, "invite", first.Message.ID, f.b, cID, "", first.Message.ID, delegate.Content, delegate.Content, 1)
+				discussionCheckPublication(t, s, child, origin, "invite", first.Message.ID, f.b, cID, "", first.Message.ID, delegate.Content, "", 1)
 				events = append(events, child)
 				c, cc := discussionArrive(t, s, f.groupID, child.Event.DeliveryID)
 				discussionCheckContext(t, s, c, cc, origin, f.a, cID, child.Message.ID, child.Message.ID, child.Message.ID, false, events...)

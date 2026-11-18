@@ -9,8 +9,9 @@ import (
 )
 
 const (
-	defaultDiscussionInviteHops    = 2
-	defaultDiscussionTargetedWakes = 4
+	defaultDiscussionInviteHops          = 2
+	defaultDiscussionTargetedWakes       = 4
+	chatDiscussionExpectedReplyJSONBytes = 1024
 )
 
 // ApplyChatDiscussion publishes an assessed handoff step using only the bound
@@ -25,6 +26,9 @@ func (s *Store) ApplyChatDiscussion(ctx context.Context, scope MemberToolScope, 
 	r, err := applyChatDiscussionInTx(ctx, tx, scope, candidateID, input, key)
 	if err == nil {
 		err = tx.Commit()
+	}
+	if err == ErrChatDiscussionContextTooLarge {
+		return domain.ChatDiscussionReceipt{}, err
 	}
 	if err != nil {
 		return domain.ChatDiscussionReceipt{}, memberToolOperationError(action, err)
@@ -113,7 +117,13 @@ func applyChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSc
 			return r, err
 		}
 	}
-	return publishChatDiscussionInTx(ctx, tx, scope, candidateID, input.Content, m, payload, len(chain.Events)+1, e, targets)
+	r, err = publishChatDiscussionInTx(ctx, tx, scope, candidateID, input.Content, m, payload, len(chain.Events)+1, e, targets)
+	if err == nil && e.Kind == domain.ChatDiscussionInvite {
+		// A push must leave room for its entire unwind. Never apply a new
+		// admission check to a reply, resolution, or an original replay.
+		err = reserveChatDiscussionReturnContextInTx(ctx, tx, chain, r)
+	}
+	return r, err
 }
 
 func publishChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, candidateID, content string, mutation mutationScope,
@@ -153,16 +163,7 @@ func publishChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberTool
 	 VALUES(?,?,?,?,?,?)`, mutation.operation, mutation.actorID, mutation.groupID, mutation.key, payload, msg.ID); err != nil {
 		return r, err
 	}
-	return chatDiscussionReceiptWithRequirement(domain.ChatDiscussionReceipt{Message: msg, Event: e}), nil
-}
-
-// The empty persisted refinement refers to the invitation's own immutable
-// message body. Expand it for both the original receipt and replay.
-func chatDiscussionReceiptWithRequirement(r domain.ChatDiscussionReceipt) domain.ChatDiscussionReceipt {
-	if r.Event.Kind == domain.ChatDiscussionInvite && r.Event.ExpectedReply == "" {
-		r.Event.ExpectedReply = r.Message.Content
-	}
-	return r
+	return domain.ChatDiscussionReceipt{Message: msg, Event: e}, nil
 }
 
 func validChatDiscussionAction(input domain.ChatDiscussionAction) bool {
@@ -171,7 +172,9 @@ func validChatDiscussionAction(input domain.ChatDiscussionAction) bool {
 	}
 	switch input.Kind {
 	case domain.ChatDiscussionInvite:
-		return validTriggerID(input.RecipientID) && (input.ExpectedReply == "" || memberToolTextValid(input.ExpectedReply, 4096))
+		return validTriggerID(input.RecipientID) && (input.ExpectedReply == "" ||
+			memberToolTextValid(input.ExpectedReply, chatDiscussionExpectedReplyJSONBytes) &&
+				chatDiscussionJSONStringSize(input.ExpectedReply) <= chatDiscussionExpectedReplyJSONBytes)
 	case domain.ChatDiscussionReply, domain.ChatDiscussionResolve:
 		return input.RecipientID == "" && input.ExpectedReply == ""
 	default:

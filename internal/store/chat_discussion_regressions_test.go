@@ -98,7 +98,26 @@ func TestChatDiscussionRecipientLeaves(t *testing.T) {
 				}
 				queueDeliveryState(t, s, settled, domain.DeliveryStateFailed)
 				queueCounts(t, s, 2, 2, 0)
-				discussionCheckContext(t, s, a, ca, origin, f.a, f.b, invite.Message.ID, origin.ID, invite.Message.ID, false, invite)
+				var receipt string
+				if err := s.db.QueryRow("SELECT receipt_json FROM turns WHERE id=?", turn.ID).Scan(&receipt); err != nil {
+					t.Fatal(err)
+				}
+				for _, unproven := range []string{"", `{"outcome":"not_started","started":true,"accepted":false}`} {
+					coordinationDecideExec(t, s, "UPDATE turns SET receipt_json=? WHERE id=?", unproven, turn.ID)
+					discussionCheckContext(t, s, a, ca, origin, f.a, f.b, invite.Message.ID, origin.ID, invite.Message.ID, false, invite)
+				}
+				coordinationDecideExec(t, s, "UPDATE turns SET receipt_json=? WHERE id=?", receipt, turn.ID)
+				before := messageSequenceSnapshot(t, s)
+				got, err := s.ReadChatDiscussionContext(ctx, a, ca)
+				if err != nil || got == nil || !got.Closed || got.ClosureReason != chatDiscussionRecipientLeftReason ||
+					got.HeadMessageID != invite.Message.ID || got.ActiveOwnerID != "" || got.ActiveInvitationMessageID != "" ||
+					!reflect.DeepEqual(got.Events, []domain.ChatDiscussionReceipt{invite}) {
+					t.Fatalf("trusted not_started after departure did not close the head: %+v, %v", got, err)
+				}
+				if replay := discussionApply(t, s, a, ca, "invite", input); !reflect.DeepEqual(replay, invite) {
+					t.Fatal("settlement changed the original receipt")
+				}
+				messageSequencePreserved(t, s, before)
 			}
 			dispatchAssertFK(t, s)
 		})
@@ -150,16 +169,32 @@ func TestChatDiscussionContextJSONBudget(t *testing.T) {
 		f := setupMessages(t)
 		s := f.s
 		originText := strings.Repeat("<&>\"\\\n原文 ", 400)
-		question := strings.Repeat("<&>\"\\\n证据 ", 400)
+		question := strings.Repeat("<", 5500)
 		origin := chatLocalMessage(t, s, MessageRequest{GroupID: f.groupID, TopicID: "large", ActorID: "user",
 			Content: originText, RecipientIDs: []string{f.a}}, []string{f.a})
 		a, ca := discussionArrive(t, s, f.groupID, origin.Deliveries[0].ID)
 		discussionAssess(t, s, a, ca)
-		first := discussionApply(t, s, a, ca, "first", domain.ChatDiscussionAction{Kind: "invite", Content: question, RecipientID: f.b})
+		input := domain.ChatDiscussionAction{Kind: "invite", Content: question, RecipientID: f.b}
+		first := discussionApply(t, s, a, ca, "first", input)
+		blob, err := json.Marshal(first)
+		if err != nil || first.Message.Content != question || strings.Contains(string(blob), `"expected_reply"`) {
+			t.Fatalf("omitted expectation must not duplicate the saved question in the receipt: %v", err)
+		}
 		b, cb := discussionArrive(t, s, f.groupID, first.Event.DeliveryID)
 		discussionAssess(t, s, b, cb)
 		cID := member(t, s, f.groupID).ID
-		child := discussionApply(t, s, b, cb, "child", domain.ChatDiscussionAction{Kind: "invite", Content: "请复核出处。", RecipientID: cID, ExpectedReply: "出处和日期"})
+		// An explicit refinement, even one equal to Content, is retained.
+		child := discussionApply(t, s, b, cb, "child", domain.ChatDiscussionAction{Kind: "invite", Content: "出处和日期", RecipientID: cID, ExpectedReply: "出处和日期"})
+		before := messageSequenceSnapshot(t, s)
+		if replay := discussionApply(t, s, a, ca, "first", input); !reflect.DeepEqual(replay, first) {
+			t.Fatal("replay changed the original receipt")
+		}
+		changed := input
+		changed.ExpectedReply = "不同的要求"
+		if _, err := s.ApplyChatDiscussion(ctx, a, ca, changed, "first"); !errors.Is(err, ErrConflict) {
+			t.Fatalf("the original key did not conflict: %v", err)
+		}
+		messageSequencePreserved(t, s, before)
 		c, cc := discussionArrive(t, s, f.groupID, child.Event.DeliveryID)
 		want := domain.ChatDiscussionContext{ThreadRef: domain.ThreadRef{GroupID: f.groupID, TopicID: origin.TopicID}, OriginMessageID: origin.ID,
 			OriginContent: origin.Content, RootInviterID: f.a, HeadMessageID: child.Message.ID, IncomingMessageID: child.Message.ID,
@@ -179,7 +214,6 @@ func TestChatDiscussionContextJSONBudget(t *testing.T) {
 			t.Fatalf("expected explicit omission in at most %d encoded bytes: length=%d, %v", limit, len(data)+1, err)
 		}
 		want.ContentOmitted, want.OriginContent = true, ""
-		want.Events[0].Event.ExpectedReply = "" // Refer to this invitation's message instead.
 		for i := range want.Events {
 			want.Events[i].Message.Content = ""
 		}
@@ -205,16 +239,118 @@ func TestChatDiscussionContextJSONBudget(t *testing.T) {
 		}
 	})
 
-	t.Run("oversized metadata", func(t *testing.T) {
+	t.Run("maximum independent requirements", func(t *testing.T) {
 		f := setupMessages(t)
+		s := f.s
 		origin := discussionUser(t, f, "metadata", f.a)
-		a, ca := discussionArrive(t, f.s, f.groupID, origin.Deliveries[0].ID)
-		discussionAssess(t, f.s, a, ca)
-		first := discussionApply(t, f.s, a, ca, "invite", domain.ChatDiscussionAction{Kind: "invite", Content: "请核对结论。",
-			RecipientID: f.b, ExpectedReply: strings.Repeat("<", 4000)})
-		b, cb := discussionArrive(t, f.s, f.groupID, first.Event.DeliveryID)
-		if got, err := f.s.ReadChatDiscussionContext(ctx, b, cb); got != nil || !errors.Is(err, ErrChatDiscussionContextTooLarge) || !strings.Contains(err.Error(), "read_history") {
-			t.Fatalf("oversized metadata must fail without a partial path, with history guidance: has_context=%t, %v", got != nil, err)
+		a, ca := discussionArrive(t, s, f.groupID, origin.Deliveries[0].ID)
+		discussionAssess(t, s, a, ca)
+		cID := member(t, s, f.groupID).ID
+		firstReq, childReq := strings.Repeat("<", 170)+"ab", strings.Repeat("&", 170)+"cd"
+		for _, requirement := range []string{firstReq, childReq} {
+			if data, err := json.Marshal(requirement); err != nil || len(data) != 1024 {
+				t.Fatalf("invalid boundary fixture: %d bytes, %v", len(data), err)
+			}
+		}
+		firstInput := domain.ChatDiscussionAction{Kind: "invite", Content: strings.Repeat("<", 5500), RecipientID: f.b}
+		before := messageSequenceSnapshot(t, s)
+		for _, invalid := range []string{strings.Repeat("<", 4000), firstReq + "c"} {
+			firstInput.ExpectedReply = invalid
+			if got, err := s.ApplyChatDiscussion(ctx, a, ca, firstInput, "invite"); !errors.Is(err, ErrInvalid) || got.Message.ID != "" {
+				t.Fatalf("oversized requirement was not rejected: published=%t, %v", got.Message.ID != "", err)
+			}
+			messageSequencePreserved(t, s, before)
+		}
+		firstInput.ExpectedReply = firstReq
+		first := discussionApply(t, s, a, ca, "invite", firstInput) // rejected writes did not spend the key or slot
+		b, cb := discussionArrive(t, s, f.groupID, first.Event.DeliveryID)
+		discussionAssess(t, s, b, cb)
+		child := discussionApply(t, s, b, cb, "child", domain.ChatDiscussionAction{Kind: "invite", Content: firstInput.Content,
+			RecipientID: cID, ExpectedReply: childReq})
+		c, cc := discussionArrive(t, s, f.groupID, child.Event.DeliveryID)
+		check := func(scope MemberToolScope, candidate, incoming, owner, active string, closed bool, events ...domain.ChatDiscussionReceipt) {
+			t.Helper()
+			got, err := s.ReadChatDiscussionContext(ctx, scope, candidate)
+			want := domain.ChatDiscussionContext{ThreadRef: domain.ThreadRef{GroupID: f.groupID, TopicID: origin.TopicID},
+				OriginMessageID: origin.ID, RootInviterID: f.a, IncomingMessageID: incoming, HeadMessageID: events[len(events)-1].Event.MessageID,
+				ActiveOwnerID: owner, ActiveInvitationMessageID: active, Closed: closed, ContentOmitted: true, Events: slices.Clone(events)}
+			for i := range want.Events {
+				want.Events[i].Message.Content = ""
+			}
+			if err != nil || !reflect.DeepEqual(got, &want) || got.Events[0].Event.ExpectedReply != firstReq || got.Events[1].Event.ExpectedReply != childReq {
+				t.Fatalf("incomplete compact path (%d events): %v", len(events), err)
+			}
+			data, err := json.Marshal(got)
+			if err != nil || len(data)+1 > 16*1024 {
+				t.Fatalf("compact path exceeds budget: %d bytes, %v", len(data)+1, err)
+			}
+			t.Logf("compact path with %d events and two maximum refinements: %d bytes including newline", len(events), len(data)+1)
+		}
+		check(c, cc, child.Message.ID, cID, child.Message.ID, false, first, child)
+		discussionAssess(t, s, c, cc)
+		reply := domain.ChatDiscussionAction{Kind: "reply", Content: "已复核。"}
+		back := discussionApply(t, s, c, cc, "child-reply", reply)
+		if back.Event.InvitationMessageID != child.Message.ID || back.Event.RecipientID != f.b {
+			t.Fatal("child reply did not take its reserved return route")
+		}
+		discussionEnd(t, s, b)
+		b, cb = discussionArrive(t, s, f.groupID, back.Event.DeliveryID)
+		check(b, cb, back.Message.ID, f.b, first.Message.ID, false, first, child, back)
+		discussionAssess(t, s, b, cb)
+		answer := discussionApply(t, s, b, cb, "root-reply", reply)
+		if answer.Event.InvitationMessageID != first.Message.ID || answer.Event.RecipientID != f.a {
+			t.Fatal("root reply did not take its reserved return route")
+		}
+		if replay := discussionApply(t, s, a, ca, "invite", firstInput); !reflect.DeepEqual(replay, first) {
+			t.Fatal("the original receipt changed after unwinding")
+		}
+		discussionEnd(t, s, a)
+		a, ca = discussionArrive(t, s, f.groupID, answer.Event.DeliveryID)
+		check(a, ca, answer.Message.ID, f.a, "", false, first, child, back, answer)
+		discussionAssess(t, s, a, ca)
+		resolved := discussionApply(t, s, a, ca, "resolve", domain.ChatDiscussionAction{Kind: "resolve", Content: "结论已确认。"})
+		check(a, ca, answer.Message.ID, "", "", true, first, child, back, answer, resolved)
+	})
+
+	t.Run("opaque scope", func(t *testing.T) {
+		for _, count := range []int{4000, 480} {
+			t.Run(fmt.Sprint(count), func(t *testing.T) {
+				f := setupMessages(t)
+				s := f.s
+				origin := discussionUser(t, f, strings.Repeat("<", count), f.a)
+				a, ca := discussionArrive(t, s, f.groupID, origin.Deliveries[0].ID)
+				discussionAssess(t, s, a, ca)
+				input := domain.ChatDiscussionAction{Kind: "invite", Content: "请核对结论。", RecipientID: f.b}
+				reject := func(scope MemberToolScope, candidate string, input domain.ChatDiscussionAction) {
+					t.Helper()
+					before := messageSequenceSnapshot(t, s)
+					if got, err := s.ApplyChatDiscussion(ctx, scope, candidate, input, "oversized"); !errors.Is(err, ErrChatDiscussionContextTooLarge) || got.Message.ID != "" {
+						t.Fatalf("unsafe route was not rejected: published=%t, %v", got.Message.ID != "", err)
+					}
+					messageSequencePreserved(t, s, before)
+				}
+				if count == 4000 {
+					reject(a, ca, input)
+					// The envelope guard applies only to structured handoffs.
+					plain, err := s.SendMessageForChatIntake(ctx, a, ca, MemberToolMessageInput{Content: input.Content, RecipientIDs: []string{f.b}}, "oversized")
+					if err != nil || plain.TopicID != origin.TopicID || len(plain.Deliveries) != 1 {
+						t.Fatalf("oversized opaque topic blocked ordinary chat: %v", err)
+					}
+					return
+				}
+				first := discussionApply(t, s, a, ca, "first", input)
+				b, cb := discussionArrive(t, s, f.groupID, first.Event.DeliveryID)
+				discussionCheckContext(t, s, b, cb, origin, f.a, f.b, first.Message.ID, first.Message.ID, first.Message.ID, false, first)
+				discussionAssess(t, s, b, cb)
+				input.RecipientID = member(t, s, f.groupID).ID
+				reject(b, cb, input) // two invites alone fit; their reserved returns and resolve would not
+				back := discussionApply(t, s, b, cb, "oversized", domain.ChatDiscussionAction{Kind: "reply", Content: "已核对。"})
+				discussionEnd(t, s, a)
+				a, ca = discussionArrive(t, s, f.groupID, back.Event.DeliveryID)
+				discussionAssess(t, s, a, ca)
+				resolved := discussionApply(t, s, a, ca, "resolve", domain.ChatDiscussionAction{Kind: "resolve", Content: "结论已确认。"})
+				discussionCheckContext(t, s, a, ca, origin, f.a, "", "", back.Message.ID, resolved.Message.ID, true, first, back, resolved)
+			})
 		}
 	})
 }
