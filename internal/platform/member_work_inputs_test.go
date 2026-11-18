@@ -63,11 +63,14 @@ func (p *workInputProbe) ContinueWork(_ context.Context, scope store.MemberToolS
 	return domain.ChatAssessmentReceipt{ID: "assessment-fixture", Disposition: "continue_work", NoticeMessageID: "notice-fixture", CreatedAt: time.Now().UTC()}, p.mutationErr
 }
 
-func withWorkInputProbe(t *testing.T, p *workInputProbe) *roleRuntimeFixture {
+func withWorkInputProbe(t *testing.T, p *workInputProbe, fresh bool) *roleRuntimeFixture {
 	t.Helper()
 	f := newRoleRuntime(t)
 	if p != nil {
 		f.options.WorkInputs = p
+	}
+	if fresh {
+		f.options.FreshTaskWork = platform.NewPiFreshTaskWorkLaunch("", 0) // Intake fixture never constructs a typed worker.
 	}
 	f.options.ChatIntake = coordination.New(f.db)
 	var err error
@@ -161,7 +164,7 @@ func TestWorkInputsRealWorkerBindingNativeAndMCP(t *testing.T) {
 		t.Run(fmt.Sprintf("ack=%v", withAck), func(t *testing.T) {
 			p := &workInputProbe{grants: platform.MemberWorkInputGrants{Read: true, Ack: withAck, HandBack: true},
 				items: []platform.MemberWorkInput{{InputID: "input-1", Content: "正文", Constraint: "仅校对"}}}
-			f := withWorkInputProbe(t, p)
+			f := withWorkInputProbe(t, p, false)
 			ctx := context.Background()
 			run := claimWorkInputWorker(t, f)
 			if len(p.issued) != 0 || len(p.calls) != 0 {
@@ -349,17 +352,18 @@ func TestWorkInputsRejectTypedNilAtRuntimeConstruction(t *testing.T) {
 
 func TestWorkContinuationDiscoveryAndConfigFollowIssuedPurpose(t *testing.T) {
 	for _, tc := range []struct {
-		name            string
-		service, intake bool
+		name                   string
+		service, fresh, intake bool
 	}{
-		{"no-service", false, true}, {"generic-with-service", true, false}, {"intake-with-service", true, true},
+		{"no-service", false, false, true}, {"generic-with-service", true, false, false}, {"intake-with-service", true, false, true},
+		{"generic-with-fresh", false, true, false}, {"intake-with-fresh", false, true, true}, {"intake-with-both", true, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var p *workInputProbe
 			if tc.service {
 				p = &workInputProbe{}
 			}
-			f := withWorkInputProbe(t, p)
+			f := withWorkInputProbe(t, p, tc.fresh)
 			ctx := context.Background()
 			msg, err := f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: "topic", Content: "请续办。", RecipientIDs: []string{f.worker.ID}}, "source")
 			roleOK(t, err)
@@ -370,7 +374,7 @@ func TestWorkContinuationDiscoveryAndConfigFollowIssuedPurpose(t *testing.T) {
 			if tc.intake {
 				wrap = f.runtime.WrapChatIntake
 			}
-			want := tc.service && tc.intake
+			want := (tc.service || tc.fresh) && tc.intake
 			calls := 0
 			e, err := wrap(binding, func(path, _ string, _ []string) (provider.Executor, error) {
 				wire, err := os.ReadFile(path)
@@ -389,7 +393,17 @@ func TestWorkContinuationDiscoveryAndConfigFollowIssuedPurpose(t *testing.T) {
 					text := list.Body.String()
 					if !strings.Contains(text, `"name":"send_message"`) || strings.Contains(text, `"continue_work"`) != want || strings.Contains(text, `"followup"`) != want ||
 						want && (!strings.Contains(text, `"task_id"`) || !strings.Contains(text, `"constraint"`)) {
-						t.Errorf("discovery ignored configured service or issued purpose: %s", text)
+						t.Error("discovery ignored configured service or issued purpose")
+					}
+					body := `{"content":"记录续办。","intent_assessment":{"disposition":"continue_work","reason":"续办原任务"}}`
+					if !want && f.http(t, token, "send_message", body, "closed").Code != http.StatusForbidden {
+						t.Error("the issued capability accepted a disabled continuation")
+					}
+					if tc.intake && tc.service && tc.fresh {
+						w := f.http(t, token, "send_message", body, "classic")
+						if w.Code != http.StatusCreated || len(p.calls) != 1 || p.calls[0].operation != "continue_work" || p.calls[0].key != "classic" {
+							t.Fatal("fresh wiring displaced the injected intake service")
+						}
 					}
 					return roleNotStarted()
 				}), nil
@@ -404,7 +418,7 @@ func TestWorkContinuationDiscoveryAndConfigFollowIssuedPurpose(t *testing.T) {
 
 func TestWorkContinuationUsesCapturedIntakeCandidate(t *testing.T) {
 	p := &workInputProbe{}
-	f := withWorkInputProbe(t, p)
+	f := withWorkInputProbe(t, p, false)
 	ctx := context.Background()
 	msg, err := f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: "topic", Content: "请继续原工作，仅校对。", RecipientIDs: []string{f.worker.ID}}, "source")
 	roleOK(t, err)

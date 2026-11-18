@@ -90,6 +90,10 @@ func validatePreparationRole(state store.CoordinationRoleState, group domain.Gro
 		state.ProviderID != member.ProviderID || state.Model != member.Model || state.AttemptID != "" {
 		return errPrepareBinding
 	}
+	if (p.SourceKind != "" || p.SourceID != "") &&
+		(p.Kind != store.CoordinationRoleWorker || p.SourceKind != domain.TaskWorkSourceFollowup || !memberToolRuntimeText(p.SourceID)) {
+		return errPrepareBinding
+	}
 	switch p.Kind {
 	case store.CoordinationRoleOrdinary:
 		if p.RequestID != "" || p.TaskID != "" || p.TaskRevision != 0 || p.AssignmentID != "" ||
@@ -106,6 +110,9 @@ func validatePreparationRole(state store.CoordinationRoleState, group domain.Gro
 			(p.Kind == store.CoordinationRoleCoordinator && p.AssignmentID != "") ||
 			(p.Kind == store.CoordinationRoleWorker && !memberToolRuntimeText(p.AssignmentID)) {
 			return errPrepareBinding
+		}
+		if p.SourceKind == domain.TaskWorkSourceFollowup {
+			return nil // Typed readiness codes are owned by B, not the legacy role profile.
 		}
 		switch state.Blocked {
 		case store.CoordinationReady, store.CoordinationDependencyNotAccepted, store.CoordinationTaskStale,

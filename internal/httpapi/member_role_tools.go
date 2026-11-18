@@ -25,7 +25,7 @@ func MemberRoleToolRoutes(tools *platform.MemberTools) []Route {
 		{http.MethodPost, "/api/v1/member-tools/workspace_write", memberToolNative(a.workspaceWrite)},
 		{http.MethodPost, "/api/v1/member-tools/publish_workspace_artifact", memberToolNative(a.publishWorkspaceArtifact)},
 	}
-	if tools.WorkInputsEnabled() {
+	if tools.WorkInputsEnabled() || tools.FreshTaskWorkEnabled() {
 		routes = append(routes,
 			Route{http.MethodPost, "/api/v1/member-tools/read_work_inputs", memberToolNative(a.readWorkInputs)},
 			Route{http.MethodPost, "/api/v1/member-tools/ack_work_input", memberToolNative(a.ackWorkInput)},
@@ -93,6 +93,10 @@ func (a memberToolAPI) submitResult(w http.ResponseWriter, r *http.Request, toke
 	}
 	if key == "" {
 		operationError(w, store.ErrInvalid)
+		return
+	}
+	if a.tools.IsFreshTaskWorkCapability(token) {
+		a.submitFreshTaskWorkResult(w, r, token, key)
 		return
 	}
 	var input struct {
