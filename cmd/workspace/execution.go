@@ -99,11 +99,13 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			options.RoleThinking = config.roleThinking
 		}
 		toolOptions.FreshTaskWork = freshTaskWork
-		if investigationTaskWork != nil {
-			// The existing role and investigation HTTP mounts consume this
-			// same registry. No delegate-authoring tool is added here.
+		switch {
+		case config.enableInvestigationOwnerManagement:
+			tools, err = platform.NewMemberToolRuntimeWithInvestigationOwnerManagement(db, toolOptions, engine,
+				investigationTaskWork.DelegateSupport(providers), investigationTaskWork)
+		case investigationTaskWork != nil:
 			tools, err = platform.NewMemberToolRuntimeWithTaskWorkReports(db, toolOptions, engine, investigationTaskWork)
-		} else {
+		default:
 			tools, err = platform.NewMemberToolRuntime(db, toolOptions)
 		}
 		if err != nil {

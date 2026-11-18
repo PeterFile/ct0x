@@ -101,6 +101,27 @@ func (f *boundWorkReportFixture) delegate(t *testing.T, parentRefs, childRefs []
 
 func (f *boundWorkReportFixture) prepareInvestigationOwner(t *testing.T, parentRefs []domain.ArtifactVersionRef, maxDelegations int, workerIDs ...string) store.CoordinationToolScope {
 	t.Helper()
+	deliveryID := f.queueInvestigationOwner(t, parentRefs, maxDelegations, workerIDs...)
+	owner := f.claim(t, deliveryID)
+	ownerScope, err := f.db.BindMemberTool(t.Context(), owner.claim)
+	roleOK(t, err)
+	return store.CoordinationToolScope{Member: ownerScope, Provenance: owner.provenance}
+}
+
+func (f *boundWorkReportFixture) queueInvestigationOwner(t *testing.T, parentRefs []domain.ArtifactVersionRef, maxDelegations int, workerIDs ...string) string {
+	t.Helper()
+	admitted := f.assessInvestigationFixture(t, true, parentRefs, maxDelegations, workerIDs...)
+	if admitted.Outcome != "admitted" || !admitted.AuthorityEvidenceVerified {
+		t.Fatalf("fixture lacks verified v30 investigation admission: %s %s", admitted.Outcome, admitted.ReasonCode)
+	}
+	decision := f.decideInvestigationFixture(t, admitted, "assign")
+	assignment, err := f.db.MaterializeAssignment(t.Context(), decision.Assignment.ID, 1, time.Now().UTC())
+	roleOK(t, err)
+	return assignment.Delivery.DeliveryID
+}
+
+func (f *boundWorkReportFixture) assessInvestigationFixture(t *testing.T, enabled bool, parentRefs []domain.ArtifactVersionRef, maxDelegations int, workerIDs ...string) domain.ChatAssessmentReceipt {
+	t.Helper()
 	ctx := t.Context()
 	_, err := f.db.SetDispatchPolicy(ctx, f.group, append([]string{f.worker.ID}, workerIDs...), 1, "report-workers")
 	roleOK(t, err)
@@ -108,7 +129,9 @@ func (f *boundWorkReportFixture) prepareInvestigationOwner(t *testing.T, parentR
 	f.policy, err = f.engine.SetChatPolicy(ctx, thread, domain.ChatPolicyRequest{Enabled: true, Action: domain.ChatActionTextSubmission, MaxAdmissions: 1,
 		Investigation: &domain.ChatInvestigationPolicy{Objective: "Check the notes", AllowTopicMessages: true, MaxDelegations: maxDelegations, ArtifactVersions: parentRefs}}, 0, "report-policy")
 	roleOK(t, err)
-	f.engine.EnableInvestigationExecution()
+	if enabled {
+		f.engine.EnableInvestigationExecution()
+	}
 	f.engine.EnableTaskWorkExecution() // Fixture only: no C executable is installed.
 	f.source, err = f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: thread.TopicID, Content: "请调查公开讨论。", RecipientIDs: []string{f.lead.ID}}, "source")
 	roleOK(t, err)
@@ -118,27 +141,29 @@ func (f *boundWorkReportFixture) prepareInvestigationOwner(t *testing.T, parentR
 	admitted, err := f.engine.AssessChatIntent(ctx, intake, candidate.ID, domain.ChatAssessment{Disposition: "prepare_work", Action: domain.ChatActionReadOnlyInvestigation,
 		Reason: "按原规则调查"}, "记录授权范围。", "admit")
 	roleOK(t, err)
-	if admitted.Outcome != "admitted" || !admitted.AuthorityEvidenceVerified {
-		t.Fatalf("fixture lacks verified v30 investigation admission: %s %s", admitted.Outcome, admitted.ReasonCode)
-	}
 	f.settleWork(t, intake, false)
+	return admitted
+}
+
+func (f *boundWorkReportFixture) decideInvestigationFixture(t *testing.T, admitted domain.ChatAssessmentReceipt, kind string) domain.DecisionReceipt {
+	t.Helper()
+	ctx := t.Context()
 	dispatch, err := f.db.MaterializeDispatchRequest(ctx, admitted.DispatchRequestID, 1, time.Now().UTC())
 	roleOK(t, err)
 	co := f.claim(t, dispatch.Delivery.DeliveryID)
 	coMember, err := f.db.BindMemberTool(ctx, co.claim)
 	roleOK(t, err)
-	decision, err := f.db.DecideDispatchWithCapabilities(ctx, store.CoordinationToolScope{Member: coMember, Provenance: co.provenance},
-		store.CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: f.worker.ID, Reason: "调查"}, "assign", []store.DispatchWorkerCapabilityFact{{
-			GroupID: f.group, MemberID: f.worker.ID, ProviderID: f.worker.ProviderID, Model: f.worker.Model, TaskID: co.provenance.TaskID,
-			TaskRevision: co.provenance.TaskRevision, RequiredProfile: store.DispatchInvestigationWorkerProfile}})
+	input := store.CoordinatorDecisionInput{Kind: kind, Reason: "调查"}
+	var facts []store.DispatchWorkerCapabilityFact
+	if kind == "assign" {
+		input.WorkerMemberID = f.worker.ID
+		facts = []store.DispatchWorkerCapabilityFact{{GroupID: f.group, MemberID: f.worker.ID, ProviderID: f.worker.ProviderID,
+			Model: f.worker.Model, TaskID: co.provenance.TaskID, TaskRevision: co.provenance.TaskRevision, RequiredProfile: store.DispatchInvestigationWorkerProfile}}
+	}
+	decision, err := f.db.DecideDispatchWithCapabilities(ctx, store.CoordinationToolScope{Member: coMember, Provenance: co.provenance}, input, kind, facts)
 	roleOK(t, err)
 	f.settleWork(t, coMember, false)
-	assignment, err := f.db.MaterializeAssignment(ctx, decision.Assignment.ID, 1, time.Now().UTC())
-	roleOK(t, err)
-	owner := f.claim(t, assignment.Delivery.DeliveryID)
-	ownerScope, err := f.db.BindMemberTool(ctx, owner.claim)
-	roleOK(t, err)
-	return store.CoordinationToolScope{Member: ownerScope, Provenance: owner.provenance}
+	return decision
 }
 
 func (f *boundWorkReportFixture) bindInvestigationOwner(t *testing.T, owner store.CoordinationToolScope) store.CoordinationToolScope {

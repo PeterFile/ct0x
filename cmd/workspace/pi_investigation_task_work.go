@@ -26,10 +26,12 @@ func (c *config) registerPiFreshInvestigationWorkFlag(flags *flag.FlagSet, outpu
 		c.piFreshInvestigationWorkExtension = path
 		return nil
 	})
+	flags.BoolVar(&c.enableInvestigationOwnerManagement, "enable-investigation-owner-management", false, "Pi 调查绑定负责人管理（默认禁用）")
 	usage := flags.Usage
 	flags.Usage = func() {
 		usage()
 		fmt.Fprintln(output, "  --pi-fresh-investigation-work-extension 路径  Pi 调查补充、委派和报告新轮（默认禁用；须启用只读调查并指定独立的可信扩展，不新增工作授权）")
+		fmt.Fprintln(output, "  --enable-investigation-owner-management  Pi 调查负责人有限委派及续轮整项交回（默认禁用；须同时启用前两项；仍由平台核验授权与余额）")
 	}
 }
 

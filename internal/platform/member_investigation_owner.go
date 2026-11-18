@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	DelegateWorkOperation = "delegate_work"
-	HandbackWorkOperation = "handback_work"
+	DelegateWorkOperation = provider.DelegateWorkTool
+	HandbackWorkOperation = provider.HandbackWorkTool
 
 	memberInitialInvestigationOwnerPurpose    = "investigation_initial_owner/v1"
 	memberContinuingInvestigationOwnerPurpose = "investigation_continuing_owner/v1"
@@ -26,13 +26,14 @@ const (
 type InvestigationDelegateSupport func(domain.Member, provider.PiFreshInvestigationProfile) bool
 
 // NewMemberToolRuntimeWithInvestigationOwnerManagement is a separate trusted
-// opt-in. It requires Roles and the same Store as the reports Engine. It does
-// not enable B execution or select any launcher or native tool profile.
-func NewMemberToolRuntimeWithInvestigationOwnerManagement(db *store.Store, options MemberToolRuntimeOptions, engine *coordination.Engine, sample InvestigationDelegateSupport) (*MemberToolRuntime, error) {
+// opt-in. It requires Roles and the same Store as the reports Engine. With no
+// launcher it only enables explicit postclaim issuance, never native startup.
+func NewMemberToolRuntimeWithInvestigationOwnerManagement(db *store.Store, options MemberToolRuntimeOptions, engine *coordination.Engine,
+	sample InvestigationDelegateSupport, launches ...*InvestigationTaskWorkLaunch) (*MemberToolRuntime, error) {
 	if sample == nil {
 		return nil, errMemberToolRuntimeConfig
 	}
-	r, err := NewMemberToolRuntimeWithTaskWorkReports(db, options, engine)
+	r, err := NewMemberToolRuntimeWithTaskWorkReports(db, options, engine, launches...)
 	if err != nil {
 		return nil, err
 	}
@@ -71,16 +72,36 @@ func (entry memberToolRegistration) investigationOwnerProfile() InvestigationOwn
 	return InvestigationOwnerToolProfile{Operations: slices.Clone(entry.grants.Operations), DelegateCandidateIDs: slices.Clone(entry.delegateCandidateIDs)}
 }
 
-func (entry memberToolRegistration) withOwnerManagementOperations(operations []string) []string {
-	if entry.purpose == memberInitialInvestigationOwnerPurpose || entry.purpose == memberContinuingInvestigationOwnerPurpose {
-		if len(entry.delegateCandidateIDs) != 0 {
-			operations = append(operations, DelegateWorkOperation)
-		}
-		if entry.purpose == memberContinuingInvestigationOwnerPurpose {
-			operations = append(operations, HandbackWorkOperation)
-		}
+func (r *MemberToolRuntime) investigationOwnerLaunchEnabled() bool {
+	return r.investigationTaskWork != nil && r.tools.InvestigationOwnerManagementEnabled()
+}
+
+func investigationOwnerOperations(operations, candidates []string, continuing bool) []string {
+	if len(candidates) != 0 {
+		operations = append(operations, DelegateWorkOperation)
+	}
+	if continuing {
+		operations = append(operations, HandbackWorkOperation)
 	}
 	return operations
+}
+
+func (entry memberToolRegistration) withOwnerManagementOperations(operations []string) []string {
+	if entry.purpose == memberInitialInvestigationOwnerPurpose || entry.purpose == memberContinuingInvestigationOwnerPurpose {
+		return investigationOwnerOperations(operations, entry.delegateCandidateIDs, entry.purpose == memberContinuingInvestigationOwnerPurpose)
+	}
+	return operations
+}
+
+func investigationOwnerPermissions(candidates []string, continuing bool) []string {
+	var permissions []string
+	if len(candidates) != 0 {
+		permissions = append(permissions, "delegate_work 只能请求 delegate_candidate_ids 中的同伴核对一个问题，材料仅限确切获准的子集；不确定时省略材料。当前授权和余额由平台核验。若要等待报告，不要先提交成果。")
+	}
+	if continuing {
+		permissions = append(permissions, "无法继续整项调查时，用 handback_work 说明原因，通知绑定的协调员；不改派或唤醒。hand_back_work_input 只交回单条输入，两者不可替代。")
+	}
+	return permissions
 }
 
 func (entry memberToolRegistration) initialInvestigationOwnerValid() bool {

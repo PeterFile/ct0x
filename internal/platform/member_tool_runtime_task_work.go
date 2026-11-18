@@ -171,7 +171,7 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	if err != nil || checkCtx.Err() != nil || !memberToolRoleFenceMatches(turn, claim) ||
 		turn.DeliveryID != e.plan.delivery.DeliveryID || turn.ConversationID != scope.ConversationID || turn.MemberID != scope.MemberID ||
 		!r.roleFence.rootValid(request.RuntimeDir) ||
-		(investigation != nil && raw.NativeRef != nil) ||
+		(investigation != nil && (raw.NativeRef != nil || investigation.managed && ctx.Err() != nil && raw.Outcome != provider.OutcomeUnknown)) ||
 		(raw.Outcome == provider.OutcomeNotStarted && (ctx.Err() != nil || !base.fresh(turn))) {
 		raw.Outcome, raw.Reason = unknown.Outcome, unknown.Reason
 	}

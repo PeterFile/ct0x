@@ -24,14 +24,17 @@ func TestPiFreshInvestigationWorkComposition(t *testing.T) {
 	entry := filepath.Join(filepath.Dir(ordinary), "fresh-investigation-work.ts")
 	textEntry := filepath.Join(filepath.Dir(ordinary), "fresh-task-work.ts")
 	const opt = "--pi-fresh-investigation-work-extension"
+	const ownerOpt = "--enable-investigation-owner-management"
 	catalog := platform.DiscoverProviders(ctx, provider.Search{Explicit: []provider.Location{{Name: provider.Pi, Path: fake.path}}}, provider.Runner{})
 	providers, err := providerSnapshot(catalog)
 	if err != nil || len(providers) != 1 || providers[0].Version != "1.4.0" {
 		t.Fatalf("missing synthetic Pi provider: %v", err)
 	}
-	for _, mode := range []string{"first-only", "typed-only", "typed-with-text"} {
+	for _, mode := range []string{"first-only", "typed-only", "typed-with-text", "managed-owners", "managed-with-text-and-resume"} {
 		t.Run(mode, func(t *testing.T) {
-			wantTyped, wantText := mode != "first-only", mode == "typed-with-text"
+			wantTyped := mode != "first-only"
+			wantOwners := mode == "managed-owners" || mode == "managed-with-text-and-resume"
+			wantText := mode == "typed-with-text" || mode == "managed-with-text-and-resume"
 			private := filepath.Join(t.TempDir(), "private")
 			if err := os.Mkdir(private, 0700); err != nil {
 				t.Fatal(err)
@@ -41,7 +44,7 @@ func TestPiFreshInvestigationWorkComposition(t *testing.T) {
 				t.Fatal("typed opt-in accepted without existing investigation startup fences")
 			}
 			base = append(base, "--enable-investigation-execution")
-			for _, wrong := range [][]string{{opt, ordinary}, {opt, "relative.ts"}, {opt, entry, opt, entry}} {
+			for _, wrong := range [][]string{{opt, ordinary}, {opt, "relative.ts"}, {opt, entry, opt, entry}, {ownerOpt}} {
 				if _, err := parseConfig(append(slices.Clone(base), wrong...), io.Discard); err == nil {
 					t.Fatal("ambiguous typed extension option accepted")
 				}
@@ -51,6 +54,12 @@ func TestPiFreshInvestigationWorkComposition(t *testing.T) {
 			}
 			if wantText {
 				base = append(base, "--pi-fresh-task-work-extension", textEntry)
+			}
+			if wantOwners {
+				base = append(base, ownerOpt)
+			}
+			if mode == "managed-with-text-and-resume" {
+				base = append(base, "--enable-native-session-resume", "--native-pi-thinking", "max")
 			}
 			cfg, err := parseConfig(base, io.Discard)
 			if err != nil {
@@ -94,13 +103,15 @@ func TestPiFreshInvestigationWorkComposition(t *testing.T) {
 			}
 			defer runtime.Close()
 			tools := runtime.Tools()
-			if tools.TaskWorkReportsEnabled() != wantTyped || tools.FreshTaskWorkEnabled() != wantText || tools.WorkInputsEnabled() {
+			if tools.TaskWorkReportsEnabled() != wantTyped || tools.InvestigationOwnerManagementEnabled() != wantOwners ||
+				tools.FreshTaskWorkEnabled() != wantText || tools.WorkInputsEnabled() {
 				t.Fatal("default or explicit profiles changed their separate opt-ins")
 			}
 			routes := httpapi.MemberRoleToolRoutes(tools)
-			for _, op := range []string{"report_work", "read_work_report", "read_work_inputs", "delegate_work"} {
+			for op, want := range map[string]bool{"report_work": wantTyped, "read_work_report": wantTyped, "read_work_inputs": wantTyped,
+				"delegate_work": wantOwners, "handback_work": wantOwners, "hand_back_work": false} {
 				found := slices.ContainsFunc(routes, func(r httpapi.Route) bool { return r.Pattern == "/api/v1/member-tools/"+op })
-				if found != (wantTyped && op != "delegate_work") {
+				if found != want {
 					t.Fatalf("wrong route availability for %s", op)
 				}
 			}
