@@ -20,7 +20,7 @@ func TestCodexSessionReviewCaptureContradictionsStayUnknown(t *testing.T) {
 		"capture-partial-multi-user", "capture-partial-text-drift", "capture-late-external-safe-prefix",
 		"capture-deep-active", "capture-deep-idle", "capture-deep-external",
 		"capture-mcp-arguments-drift", "capture-mcp-result-drift", "capture-mcp-arguments-drift-no-result", "capture-mcp-server-drift",
-		"capture-late-active", "capture-late-unknown-status",
+		"capture-late-active", "capture-late-unknown-status", "capture-idle-active-flags",
 	} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("AW_SESSION_MODE", mode)
@@ -84,6 +84,62 @@ func TestCodexSessionReviewCaptureContradictionsStayUnknown(t *testing.T) {
 	}
 }
 
+func TestCodexSessionReviewTerminalContradictionsStayUnknown(t *testing.T) {
+	for _, tc := range []struct {
+		mode           string
+		terminal       Outcome
+		captureReads   int
+		outputComplete bool
+	}{
+		{"capture-active-before-error", OutcomeSucceeded, 1, true},
+		{"capture-active-before-missing", OutcomeSucceeded, 1, false},
+		{"failed-turn-late-active", OutcomeFailed, 0, true},
+		{"interrupted-turn-late-ambiguous-active", OutcomeAborted, 0, true},
+		{"terminal-mcp-arguments-drift", OutcomeSucceeded, 0, true},
+		{"terminal-mcp-result-drift", OutcomeSucceeded, 0, true},
+		{"terminal-mcp-hint-drift", OutcomeSucceeded, 0, true},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			t.Setenv("AW_SESSION_MODE", tc.mode)
+			selected, config, request := appServerSessionFixture(t)
+			binding := json.RawMessage(`{"purpose":"generic"}`)
+			executor, err := NewCodexAppServerSessionExecutor(selected, config, []string{"read_channel"}, CodexAppServerSessionOptions{Binding: binding}, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var terminals []Outcome
+			r := executor.Execute(context.Background(), request, func(event Event) error {
+				if event.Kind == TerminalEvent {
+					terminals = append(terminals, event.Terminal)
+				}
+				return nil
+			})
+			if r.Outcome != OutcomeUnknown || !r.Started || !r.Accepted || r.Terminal != tc.terminal || !r.DirectChildReaped || r.OutputComplete != tc.outputComplete || r.ExitCode != 0 || r.DeliveryFailed || r.NativeRef == nil || r.NativeRef.Codex != nil || string(r.NativeRef.Binding) != string(binding) {
+				t.Fatalf("contradictory terminal evidence must not settle or erase the receipt: %+v", r)
+			}
+			if len(terminals) != 1 || terminals[0] != tc.terminal {
+				t.Fatalf("want one actual terminal callback (%s), got %v", tc.terminal, terminals)
+			}
+			frames := sessionClientFrames(t, request.CWD)
+			if len(frames) != 1 {
+				t.Fatalf("want one native child, got %d", len(frames))
+			}
+			reads := 0
+			for _, frame := range frames[0] {
+				if *frame.Method == "thread/read" {
+					reads++
+				}
+			}
+			if reads != tc.captureReads {
+				t.Fatalf("want %d capture requests, got %d", tc.captureReads, reads)
+			}
+			if _, err := NewCodexAppServerSessionExecutor(selected, config, []string{"read_channel"}, CodexAppServerSessionOptions{Resume: r.NativeRef}, 5*time.Second); err == nil {
+				t.Fatal("unknown execution exposed replayable evidence")
+			}
+		})
+	}
+}
+
 func TestCodexSessionReviewOptionalCaptureUnavailableStillSucceeds(t *testing.T) {
 	for _, mode := range []string{"capture-error", "capture-unsupported-anchor", "capture-questions-no-drift", "capture-plan-complete", "capture-partial-missing-observed", "capture-mcp-missing-result"} {
 		t.Run(mode, func(t *testing.T) {
@@ -106,7 +162,7 @@ func TestCodexSessionReviewOptionalCaptureUnavailableStillSucceeds(t *testing.T)
 }
 
 func TestCodexSessionReviewCaptureMatchingEvidenceKeepsReference(t *testing.T) {
-	for _, mode := range []string{"capture-mcp-equivalent-json", "capture-late-idle"} {
+	for _, mode := range []string{"capture-mcp-equivalent-json", "capture-late-idle", "terminal-mcp-omitted"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("AW_SESSION_MODE", mode)
 			selected, config, request := appServerSessionFixture(t)
@@ -130,6 +186,7 @@ func TestCodexSessionReviewCaptureVerifiedPrefix(t *testing.T) {
 	}{
 		{"capture-prefix-extra-plan", OutcomeUnknown},
 		{"capture-prefix-questions-text-drift", OutcomeUnknown},
+		{"capture-prefix-local-image-text-drift", OutcomeUnknown},
 		{"capture-prefix-questions-only", OutcomeSucceeded},
 		{"capture-prefix-partial-only", OutcomeSucceeded},
 		{"capture-prefix-missing-result", OutcomeSucceeded},
@@ -155,7 +212,7 @@ func TestCodexSessionReviewCaptureVerifiedPrefix(t *testing.T) {
 			request.RunID, request.Prompt = "prefix-review", "second independently authorized input"
 			r := executor.Execute(context.Background(), request, nil)
 			assertSessionReviewClientStarts(t, request.CWD, request.Prompt, 1)
-			if r.Outcome != tc.want || !r.Accepted || r.Terminal != OutcomeSucceeded || !r.OutputComplete || !r.DirectChildReaped || r.ExitCode != 0 || r.NativeRef == nil || r.NativeRef.Codex != nil || string(r.NativeRef.Binding) != string(binding) {
+			if r.Outcome != tc.want || !r.Started || !r.Accepted || r.Terminal != OutcomeSucceeded || !r.OutputComplete || !r.DirectChildReaped || r.ExitCode != 0 || r.NativeRef == nil || r.NativeRef.Codex != nil || string(r.NativeRef.Binding) != string(binding) {
 				t.Fatalf("capture of verified prefix: want %s without native reference; outcome=%s accepted=%v terminal=%s reaped=%v outputComplete=%v exit=%d", tc.want, r.Outcome, r.Accepted, r.Terminal, r.DirectChildReaped, r.OutputComplete, r.ExitCode)
 			}
 		})

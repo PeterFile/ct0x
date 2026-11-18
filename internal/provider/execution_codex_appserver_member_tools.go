@@ -356,7 +356,7 @@ func (p *codexAppServerProtocol) memberNotification(message codexRPCMessage) boo
 }
 
 func (p *codexAppServerProtocol) memberItem(raw json.RawMessage, completed bool) (codexAppServerItem, bool) {
-	fields, err := codexRPCObject(raw, "id", "status", "server", "tool", "arguments", "result", "error", "appContext", "mcpAppUi", "pluginId", "mcpAppResourceUri")
+	fields, err := codexRPCObject(raw, "id", "status", "server", "tool", "arguments", "result", "error", "readOnlyHint", "appContext", "mcpAppUi", "pluginId", "mcpAppResourceUri")
 	id, idOK := codexAppServerString(fields, "id")
 	server, serverOK := codexAppServerString(fields, "server")
 	tool, toolOK := codexAppServerString(fields, "tool")
@@ -390,13 +390,12 @@ func (p *codexAppServerProtocol) memberItem(raw json.RawMessage, completed bool)
 			return item, false
 		}
 	}
-	if p.session != nil && !previous.completed {
-		// Fingerprint the completion notification, not the later terminal or
-		// history copy. Neither tool payload survives in per-item state.
-		item.mcp = &codexSessionMCPContent{
-			arguments: codexSessionHashField(fields["arguments"]),
-			result:    codexSessionHashField(fields["result"]),
-		}
+	// Fingerprint the completion notification, not the later terminal or
+	// history copy. Neither tool payload survives in per-item state.
+	item.mcp = &codexSessionMCPContent{
+		arguments:    codexSessionHashField(fields["arguments"]),
+		result:       codexSessionHashField(fields["result"]),
+		readOnlyHint: codexSessionHashField(fields["readOnlyHint"]),
 	}
 	return item, true
 }

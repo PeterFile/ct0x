@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -266,8 +267,11 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	_ = json.Unmarshal(params["input"], &currentInput)
 	user := map[string]any{"id": "user-" + turnID, "type": "userMessage", "content": currentInput}
 	call := map[string]any{"id": "mcp-" + turnID, "type": "mcpToolCall", "server": server, "tool": "read_channel", "status": "inProgress", "arguments": map[string]any{"limit": 1}, "result": nil, "error": nil}
-	if mode == "capture-mcp-equivalent-json" {
+	switch mode {
+	case "capture-mcp-equivalent-json":
 		call["arguments"] = json.RawMessage(`{"nested":{"b":[true],"a":3},"limit":1}`)
+	case "terminal-mcp-hint-drift":
+		call["readOnlyHint"] = true
 	}
 	notify("item/started", map[string]any{"threadId": threadID, "turnId": turnID, "item": call})
 	call["status"], call["result"] = "completed", map[string]any{"content": []any{map[string]any{"type": "text", "text": "synthetic historical text"}}, "_meta": nil, "structuredContent": nil}
@@ -287,15 +291,56 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 		return
 	}
 	terminal := turn("completed", items)
-	if mode == "failed-turn" {
+	switch mode {
+	case "failed-turn", "failed-turn-late-active":
 		terminal["status"], terminal["error"] = "failed", map[string]any{"message": "synthetic failure"}
+	case "interrupted-turn-late-ambiguous-active":
+		terminal["status"] = "interrupted"
+	case "terminal-mcp-omitted":
+		terminal["items"] = []any{}
+	case "terminal-mcp-arguments-drift", "terminal-mcp-result-drift", "terminal-mcp-hint-drift", "capture-mcp-equivalent-json":
+		// Only change the terminal copy; a later capture agrees with item/completed.
+		duplicate := maps.Clone(call)
+		switch mode {
+		case "terminal-mcp-arguments-drift":
+			duplicate["arguments"] = map[string]any{"limit": 2}
+		case "terminal-mcp-result-drift":
+			duplicate["result"] = json.RawMessage(`{"content":[{"type":"text","text":"different result in terminal"}],"_meta":null,"structuredContent":null}`)
+		case "terminal-mcp-hint-drift":
+			duplicate["readOnlyHint"] = false
+		case "capture-mcp-equivalent-json":
+			duplicate["arguments"] = json.RawMessage(`{"limit":1,"nested":{"a":3,"b":[true]}}`)
+			duplicate["result"] = json.RawMessage(`{"content":[{"text":"synthetic historical text","type":"text"}],"structuredContent":null,"_meta":null}`)
+		}
+		terminal["items"] = []any{user, duplicate, answer}
 	}
 	notify("turn/completed", map[string]any{"threadId": threadID, "turn": terminal})
+	threadStatus := func(kind string, flags []any) {
+		status := map[string]any{"type": kind}
+		if flags != nil {
+			status["activeFlags"] = flags
+		}
+		notify("thread/status/changed", map[string]any{"threadId": threadID, "status": status})
+	}
+	switch mode {
+	case "failed-turn-late-active":
+		threadStatus("active", []any{})
+	case "interrupted-turn-late-ambiguous-active":
+		threadStatus("idle", []any{"waitingOnApproval"})
+	}
 	capture := read()
 	if capture.Method == nil || *capture.Method != "thread/read" {
 		os.Exit(8)
 	}
-	if mode == "capture-error" {
+	switch mode {
+	case "capture-active-before-error", "capture-active-before-missing":
+		threadStatus("active", []any{})
+		if mode == "capture-active-before-missing" {
+			return
+		}
+		threadStatus("idle", nil) // Later idle must not erase the earlier contradiction.
+		fallthrough
+	case "capture-error":
 		fail(capture)
 		return
 	}
@@ -323,7 +368,7 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	case "capture-mcp-equivalent-json":
 		call["arguments"] = map[string]any{"limit": 1, "nested": map[string]any{"a": 3, "b": []any{true}}}
 		call["result"] = json.RawMessage(`{"content":[{"type":"text","text":"synthetic historical text"}],"structuredContent":null,"_meta":null}`)
-	case "capture-prefix-extra-plan", "capture-prefix-questions-text-drift", "capture-prefix-questions-only", "capture-prefix-partial-only", "capture-prefix-missing-result":
+	case "capture-prefix-extra-plan", "capture-prefix-questions-text-drift", "capture-prefix-questions-only", "capture-prefix-partial-only", "capture-prefix-missing-result", "capture-prefix-local-image-text-drift":
 		old := history[0].(map[string]any)
 		items := old["items"].([]any)
 		oldAnswer := items[len(items)-1].(map[string]any)
@@ -334,6 +379,11 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 			old["itemsView"], old["items"] = "summary", []any{oldAnswer}
 		case "capture-prefix-missing-result":
 			delete(items[1].(map[string]any), "result")
+		case "capture-prefix-local-image-text-drift":
+			items[0].(map[string]any)["content"] = []any{
+				map[string]any{"type": "text", "text": "different verified old input"},
+				map[string]any{"type": "localImage", "path": "/synthetic/local-image.png"},
+			}
 		default:
 			oldAnswer["questions"] = []any{}
 			if mode == "capture-prefix-questions-text-drift" {
@@ -422,6 +472,8 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	switch mode {
 	case "capture-active", "capture-deep-active":
 		captureThread["status"] = map[string]any{"type": "active", "activeFlags": []any{}}
+	case "capture-idle-active-flags":
+		captureThread["status"] = map[string]any{"type": "idle", "activeFlags": []any{"waitingOnApproval"}}
 	case "capture-wrong-thread":
 		captureThread["id"] = "foreign-thread"
 	}

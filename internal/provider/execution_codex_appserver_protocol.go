@@ -469,7 +469,6 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 	case 9:
 		// Optional anchor unavailability drops only the reference. Positive
 		// contradictory evidence instead fences settlement inside verification.
-		p.session.captureReceived = true
 		if message.Error == nil {
 			p.verifySessionHistory(message.Result, true)
 		}
@@ -669,13 +668,13 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 		if p.session != nil && p.turnID == "" && (method == "thread/closed" || method == "thread/status/changed" && !codexSessionIdle(message.Params, "status")) {
 			p.fail()
 		}
-		if p.session != nil && p.session.captureReceived && method == "thread/status/changed" {
-			// The capture already observed idle. A later non-idle or unrecognized
-			// status fences settlement without damaging the terminal or drain.
+		if method == "thread/status/changed" && p.receipt.Terminal != "" {
+			// Once a terminal is observed, active or ambiguous status fences
+			// settlement independently of any capture, without damaging the drain.
 			status := codexSessionStatus(message.Params, "status")
-			if string(status["type"]) != `"idle"` {
+			if string(status["type"]) != `"idle"` || status["activeFlags"] != nil {
 				p.external = true
-			} else if len(status) != 1 {
+			} else if len(status) != 1 && p.session != nil {
 				p.session.pending = nil
 			}
 		}
@@ -796,26 +795,34 @@ func (p *codexAppServerProtocol) turnNotification(method string, raw json.RawMes
 		fields, err := codexRPCObject(raw, "id", "type", "text", "status")
 		id, idOK := codexAppServerString(fields, "id")
 		kind, kindOK := codexAppServerString(fields, "type")
-		status, statusOK := "", true
-		if fields["status"] != nil {
-			status, statusOK = codexAppServerString(fields, "status")
-		}
 		known, exists := p.items[id]
-		if err != nil || !idOK || !kindOK || !statusOK || seen[id] || exists && (known.kind != kind || known.status != status || !known.completed) {
+		if err != nil || !idOK || !kindOK || seen[id] {
 			p.fail()
 			return
 		}
 		seen[id] = true
+		if p.member != nil && (kind == "mcpToolCall" || known.kind == "mcpToolCall") {
+			value, err := nativeSessionJSON(raw, 64, false)
+			item, _ := value.(map[string]any)
+			projected, complete := codexSessionPublicItem(item, p.member.names)
+			if err != nil || !complete || !p.comparedSessionItemMatches(projected, true) {
+				// Inconsistent item copies fence settlement, not the actual terminal.
+				p.external = true
+			}
+			continue
+		}
+		status, statusOK := "", true
+		if fields["status"] != nil {
+			status, statusOK = codexAppServerString(fields, "status")
+		}
+		if !statusOK || exists && (known.kind != kind || known.status != status || !known.completed) {
+			p.fail()
+			return
+		}
 		if kind == "agentMessage" {
 			var text string
 			item := p.items[id]
 			if json.Unmarshal(fields["text"], &text) != nil || !item.completed || item.kind != kind || item.textHash != sha256.Sum256([]byte(text)) {
-				p.fail()
-				return
-			}
-		} else if kind == "mcpToolCall" && p.member != nil {
-			item, valid := p.memberItem(raw, true)
-			if !valid || !exists || !known.completed || known.server != item.server || known.tool != item.tool {
 				p.fail()
 				return
 			}
@@ -909,18 +916,17 @@ func mustCodexAppServerJSON(value any) json.RawMessage {
 // The original native writer is acquired by cold thread/resume and retained
 // through the final history read and ordinary stdin shutdown.
 type codexAppServerSession struct {
-	cliPath         string
-	home            string
-	toolsProfile    string
-	provider        string
-	providerSet     bool // The first config/read explicitly selected the provider.
-	effort          string
-	source          string // Thread.source bound by this invocation's start/resume response.
-	binding         json.RawMessage
-	resume          *CodexNativeSessionReference
-	pending         *NativeSessionReference
-	captureReceived bool
-	priorTurns      map[string]codexSessionVerifiedTurn
+	cliPath      string
+	home         string
+	toolsProfile string
+	provider     string
+	providerSet  bool // The first config/read explicitly selected the provider.
+	effort       string
+	source       string // Thread.source bound by this invocation's start/resume response.
+	binding      json.RawMessage
+	resume       *CodexNativeSessionReference
+	pending      *NativeSessionReference
+	priorTurns   map[string]codexSessionVerifiedTurn
 }
 
 func codexSessionToolsProfile(names []string) string {
@@ -1031,8 +1037,9 @@ type codexSessionFieldEvidence struct {
 }
 
 type codexSessionMCPContent struct {
-	arguments codexSessionFieldEvidence
-	result    codexSessionFieldEvidence
+	arguments    codexSessionFieldEvidence
+	result       codexSessionFieldEvidence
+	readOnlyHint codexSessionFieldEvidence
 }
 
 func codexSessionValueHash(value any) [32]byte {
@@ -1047,8 +1054,11 @@ func codexSessionHashField(raw json.RawMessage) codexSessionFieldEvidence {
 	return codexSessionFieldEvidence{hash: codexSessionValueHash(value), known: true}
 }
 
-func (e codexSessionFieldEvidence) contradicts(value any) bool {
-	return e.known && e.hash != codexSessionValueHash(value)
+func (e codexSessionFieldEvidence) agreesWith(value any, requireProof bool) bool {
+	if !e.known {
+		return !requireProof
+	}
+	return e.hash == codexSessionValueHash(value)
 }
 
 // Keep only bounded identities and digests from the verified resume read. A
@@ -1101,8 +1111,9 @@ func (prior codexSessionVerifiedTurn) matchesItem(item map[string]any, tools []s
 	if !ok || known.kind != item["type"] || full && known.index != index {
 		return false
 	}
+	// A visible item from an already verified turn must remain comparable.
 	projected, _ := codexSessionPublicItem(item, tools)
-	if projected != nil && known.fields != codexSessionStableItemHash(projected) {
+	if projected == nil || known.fields != codexSessionStableItemHash(projected) {
 		return false
 	}
 	return known.kind != "mcpToolCall" || item["result"] == nil || known.result == codexSessionValueHash(item["result"])
@@ -1150,7 +1161,8 @@ func (p *codexAppServerProtocol) inspectSessionHistory(thread map[string]any, ca
 	// Active is a native projection, not proof of newly spawned work. It still
 	// prevents proving absence of other activity after the observed terminal.
 	status, ok := thread["status"].(map[string]any)
-	if !ok || status["type"] != "idle" {
+	_, hasActiveFlags := status["activeFlags"]
+	if !ok || status["type"] != "idle" || hasActiveFlags {
 		return false
 	}
 	turns, ok := thread["turns"].([]any)
@@ -1216,7 +1228,7 @@ func (p *codexAppServerProtocol) inspectSessionHistory(thread map[string]any, ca
 			itemIDs[id] = true
 			if current {
 				seen[id] = true
-				if !p.capturedSessionItemMatches(item) {
+				if !p.comparedSessionItemMatches(item, false) {
 					return false
 				}
 				if kind == "userMessage" {
@@ -1377,7 +1389,7 @@ func codexSessionPublicItem(item map[string]any, tools []string) (projected map[
 	return projected, eligible
 }
 
-func (p *codexAppServerProtocol) capturedSessionItemMatches(item map[string]any) bool {
+func (p *codexAppServerProtocol) comparedSessionItemMatches(item map[string]any, requireMCPProof bool) bool {
 	id, kind := item["id"].(string), item["type"].(string)
 	known, exists := p.items[id]
 	if exists && (known.kind != kind || !known.completed) {
@@ -1393,13 +1405,15 @@ func (p *codexAppServerProtocol) capturedSessionItemMatches(item map[string]any)
 		text, textOK := part["text"].(string)
 		return ok && textOK && part["type"] == "text" && text == p.request.Prompt
 	case "mcpToolCall":
-		// The completed notification bound this item to the exact current
-		// server/tool. Compare its contents, not just another allowlisted shape.
-		if !exists || known.status != "completed" || known.server != item["server"] || known.tool != item["tool"] {
+		// Match the real item/completed, not another copy from the terminal or
+		// history. A partial copy need not report optional output or hints.
+		if !exists || known.status != "completed" || known.status != item["status"] || known.server != item["server"] || known.tool != item["tool"] {
 			return false
 		}
-		return known.mcp == nil || !known.mcp.arguments.contradicts(item["arguments"]) &&
-			(item["result"] == nil || !known.mcp.result.contradicts(item["result"]))
+		proof := known.mcp
+		return proof != nil && proof.arguments.agreesWith(item["arguments"], requireMCPProof) &&
+			(item["result"] == nil || proof.result.agreesWith(item["result"], requireMCPProof)) &&
+			(item["readOnlyHint"] == nil || proof.readOnlyHint.agreesWith(item["readOnlyHint"], requireMCPProof))
 	case "agentMessage":
 		text, ok := item["text"].(string)
 		return exists && ok && known.textHash == sha256.Sum256([]byte(text))
