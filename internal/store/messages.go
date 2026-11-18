@@ -168,10 +168,14 @@ func (s *Store) GetMessage(ctx context.Context, groupID, messageID string) (doma
 		return domain.Message{}, storeError("读取讨论中断状态失败", err)
 	}
 	m.DiscussionClosureReason = closures[m.ID]
+	messages := []domain.Message{m}
+	if err := messageDiscussionsInTx(ctx, tx, groupID, messages); err != nil {
+		return domain.Message{}, storeError("读取讨论关联失败", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return domain.Message{}, storeError("读取消息失败", err)
 	}
-	return m, nil
+	return messages[0], nil
 }
 
 func messageInTx(ctx context.Context, tx *sql.Tx, groupID, messageID string) (domain.Message, error) {
