@@ -1,7 +1,9 @@
 package store
 
 import (
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -9,7 +11,7 @@ import (
 	"agentworkspace/internal/provider"
 )
 
-// Adapt A's two-hop preview fixture to A24's scoped investigation worker fact.
+// Build a two-hop discussion with a scoped investigation worker.
 // The original inviter, last inviter, assessor and coordinator are distinct.
 func a7HandbackOwner(t *testing.T) (chatFixture, domain.ChatDiscussionReceipt, CoordinationToolScope) {
 	t.Helper()
@@ -59,15 +61,22 @@ func a7HandbackOwner(t *testing.T) (chatFixture, domain.ChatDiscussionReceipt, C
 	owner := coordinationDecideWorker(t, requestDispatchFixture{s: s, worker: f.b}, r, decision, true)
 	taskWorkTestReceipt(t, s, co.Member, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}, domain.TurnStateNotStarted)
 	queueEvent(t, s, owner.Member.Claim, provider.AcceptedEvent, "", "")
+	s.EnableTaskWorkExecution()
 	return f, head, owner
 }
 
 const a7HandbackKey = "a7-handback"
 
 func TestBHandbackA7(t *testing.T) {
-	const priorVersion = 28
-	if len(migrations) != priorVersion+1 || migrations[priorVersion] != chatDiscussionWorkReturnSchema {
-		t.Fatal("private A24 ledger must append only A7 at v29")
+	const priorVersion = 30
+	const a7Version = priorVersion + 1
+	if len(migrations) < a7Version || migrations[priorVersion] != chatDiscussionWorkReturnSchema {
+		t.Fatal("A7 must follow the published v30 ledger at v31")
+	}
+	// Fingerprint the ordered, NUL-separated v1–v30 SQL from c38b5f2 (#195).
+	const frozenV30 = "7cf235d45d09ac131ae61c34c6c5a8158bababdd44885fa6005bd4e248b05619"
+	if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(migrations[:priorVersion], "\x00")))); got != frozenV30 {
+		t.Fatalf("published v30 migration prefix changed: %s; want %s", got, frozenV30)
 	}
 	input := domain.HandbackWorkInput{Summary: "尚需确认第三项约束。"}
 	handback := func(t *testing.T, s *Store, owner CoordinationToolScope) domain.TaskWorkHandback {
@@ -158,6 +167,7 @@ func TestBHandbackA7(t *testing.T) {
 			t.Fatalf("discussion return acquired work authority: %+v %v", role, err)
 		}
 		coordinationDecideExec(t, s, "UPDATE members SET status='left' WHERE id=?", f.a)
+		reopened.EnableTaskWorkExecution()
 		replay(t, reopened, owner, h)
 	})
 
@@ -209,21 +219,29 @@ func TestBHandbackA7(t *testing.T) {
 		replay(t, s, owner, h)
 	})
 
-	t.Run("pre-v29-replay", func(t *testing.T) {
+	t.Run("v30-to-v31-replay", func(t *testing.T) {
 		all := migrations
 		defer func() { migrations = all }()
-		migrations = all[:priorVersion] // Disposable v28 fixture, not a published ledger.
+		migrations = all[:priorVersion]
 		f, _, owner := a7HandbackOwner(t)
 		messageSequenceLedger(t, f.s, priorVersion)
+		counts := workReportWakeCounts(t, f.s)
 		h := handback(t, f.s, owner)
-		before := messageSequenceSnapshot(t, f.s)
-		migrations = all
-		s := queueHandle(t, f.path, false)
-		messageSequenceLedger(t, s, priorVersion+1)
-		messageSequencePreserved(t, s, before)
-		replay(t, s, owner, h)
-		if len(messageSequenceTableRows(t, s, "chat_discussion_work_returns")) != 0 {
-			t.Fatal("upgrade/replay backfilled an old Handback's return")
+		if got := workReportWakeCounts(t, f.s); got != ([3]int{counts[0] + 1, counts[1], counts[2]}) {
+			t.Fatalf("v30 Handback should publish only its notice; before %v, got %v", counts, got)
 		}
+		before := messageSequenceSnapshot(t, f.s)
+		if err := f.s.Close(); err != nil {
+			t.Fatal(err)
+		}
+		migrations = all[:a7Version]
+		s := queueHandle(t, f.path, false)
+		messageSequenceLedger(t, s, a7Version)
+		messageSequencePreserved(t, s, before)
+		if len(messageSequenceTableRows(t, s, "chat_discussion_work_returns")) != 0 {
+			t.Fatal("v31 migration backfilled a v30 Handback return")
+		}
+		s.EnableTaskWorkExecution()
+		replay(t, s, owner, h)
 	})
 }
