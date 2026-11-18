@@ -141,6 +141,50 @@ printf '%s\n' '{"type":"session","id":"turn-owner","version":3,"cwd":"/fixture"}
 	assertDenied(e, request)
 }
 
+func TestPiFreshInvestigationWriteUncertainty(t *testing.T) {
+	for _, tc := range []struct {
+		kind  domain.TaskWorkSourceKind
+		tools []string
+		op    string
+	}{
+		{domain.TaskWorkSourceFollowup, PiFreshTaskWorkToolNames(), "ack_work_input"},
+		{domain.TaskWorkSourceDelegation, []string{"report_work"}, "report_work"},
+		{domain.TaskWorkSourceReport, append([]string{"read_work_report"}, PiFreshTaskWorkToolNames()...), "submit_result"},
+	} {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			identity := memberToolJSON(t, typedWriteTestDetails(string(tc.kind), "run1", tc.op))
+			frame := typedWriteTestEnd(tc.op, `{"`+typedWriteTestField+`":`+identity+`}`)
+			selected, req, bridges := typedWriteTestChild(t, strings.Join([]string{
+				`{"type":"session","id":"run1","version":3,"cwd":"/fixture"}`, executionStart, frame, executionAssistant("stop"), executionSettled, "",
+			}, "\n"))
+			profile := PiFreshInvestigationProfile{Action: domain.ChatActionReadOnlyInvestigation, SourceKind: tc.kind, Operations: tc.tools}
+			config, digest, err := PiFreshInvestigationConfig("http://127.0.0.1:1/api/v1/member-tools", "fixture-bearer", req.RunID, profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(req.CWD, "issued.json")
+			if err := os.WriteFile(path, config, 0600); err != nil {
+				t.Fatal(err)
+			}
+			a := NewPiFreshInvestigationAdapter(filepath.Join(bridges, "fresh-investigation-work.ts"), 0)
+			ctx := context.Background()
+			e, err := a.NewExecutor(ctx, selected, PiFreshInvestigationBinding{ConfigPath: path, ConfigSHA256: digest, RunID: req.RunID, Profile: profile})
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := e.Execute(ctx, req, nil)
+			if got.Outcome != OutcomeUnknown || got.Terminal != OutcomeSucceeded || !got.OutputComplete ||
+				!got.Accepted || !got.DirectChildReaped || got.ExitCode != 0 || got.NativeRef != nil || !strings.Contains(got.Reason, "写入") {
+				t.Fatalf("typed role lost write uncertainty or native terminal: %+v", got)
+			}
+			log, err := os.ReadFile(got.StdoutPath)
+			if err != nil || !strings.Contains(string(log), frame+"\n") {
+				t.Fatal("private stdout did not retain exact write identity", err)
+			}
+		})
+	}
+}
+
 func TestPiFreshInvestigationProfiles(t *testing.T) {
 	owner := []string{"read_work_inputs", "ack_work_input", "hand_back_work_input", "submit_result"}
 	for _, c := range []struct {

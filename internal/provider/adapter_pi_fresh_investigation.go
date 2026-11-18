@@ -15,7 +15,7 @@ import (
 
 // Only this entry (and its pinned pure bridge validators) implements the typed
 // investigation profile. It does not qualify either ordinary Pi entry point.
-const piFreshInvestigationEntrySHA = "609dd6a97deaba304aa30eddf59548a246ff547b430bbfc43ffc497f1ed00fbf"
+const piFreshInvestigationEntrySHA = "ba79d6f902bd3289f5697c4cbd8912338663848716fee6fed85469eb473a4f2c"
 
 // PiFreshInvestigationProfile is the launcher-selected profile of an issued
 // investigation capability. Operation names describe transport, not grants.
@@ -119,7 +119,7 @@ func (a PiFreshInvestigationAdapter) NewExecutor(ctx context.Context, selected P
 	}
 	pi := baseline.(piExecutor)
 	pi.memberTools = &piMemberToolOptions{extensionPath: bridge, configPath: filepath.Clean(binding.ConfigPath),
-		toolNames: issued.Operations, configSHA256: binding.ConfigSHA256, investigationConfigFile: file}
+		toolNames: issued.Operations, configSHA256: binding.ConfigSHA256, investigationConfigFile: file, typedWorkRole: string(issued.SourceKind)}
 	return &piFreshInvestigationExecutor{pi: pi, adapter: a, runID: binding.RunID}, nil
 }
 

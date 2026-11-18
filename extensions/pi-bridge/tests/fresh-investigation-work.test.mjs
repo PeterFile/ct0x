@@ -8,7 +8,7 @@ import { dirname } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { BASE, TOKEN, privateConfig, safeFailure } from "./helpers.mjs";
-import { loadExtensions, loadSessionSDK } from "./pi-loader.mjs";
+import { loadExtensions, loadSessionSDK, runJSONPrint } from "./pi-loader.mjs";
 
 const entry = fileURLToPath(new URL("../fresh-investigation-work.ts", import.meta.url));
 const turn = "turn-investigation";
@@ -78,7 +78,7 @@ function intercept(t, respond) {
   return sent;
 }
 
-async function bind(t, fx, operations, { id = turn, existing = false, persistent = false } = {}) {
+async function openSession(t, fx, operations, { id = turn, existing = false, persistent = false, modelRuntime } = {}) {
   const { createAgentSession, SessionManager, SettingsManager } = await loadSessionSDK();
   const dir = dirname(fx.path);
   const loaded = fx.loaded ?? await load(fx.path, fx.digest);
@@ -92,7 +92,7 @@ async function bind(t, fx, operations, { id = turn, existing = false, persistent
   if (existing) sessionManager.appendMessage({ role: "user", content: "already used", timestamp: 1 });
   const { session } = await createAgentSession({
     cwd: dir, agentDir: dir, model, noTools: "builtin", tools: operations,
-    modelRuntime: new Proxy({}, { get: (_target, name) => deny(String(name)) }),
+    modelRuntime: modelRuntime ?? new Proxy({}, { get: (_target, name) => deny(String(name)) }),
     sessionManager,
     settingsManager: SettingsManager.inMemory({ retry: { enabled: false }, cacheWarming: "off", enableInstallTelemetry: false }),
     resourceLoader: {
@@ -103,7 +103,11 @@ async function bind(t, fx, operations, { id = turn, existing = false, persistent
     },
   });
   t.after(() => session.dispose());
-  session.prompt = session.agent.prompt = session.agent.streamFn = deny("prompt or stream");
+  return session;
+}
+
+async function bind(t, fx, operations, options) {
+  const session = await openSession(t, fx, operations, options);
   const errors = [];
   await session.bindExtensions({ mode: "json", onError: err => errors.push(err.error) });
   const active = session.getActiveToolNames();
@@ -115,6 +119,17 @@ async function bind(t, fx, operations, { id = turn, existing = false, persistent
 
 function result(value) {
   return { content: [{ type: "text", text: JSON.stringify(value) }], details: undefined };
+}
+
+function checkUnknown(answer, role, call) {
+  assert.equal(answer.isError, true);
+  assert.equal(call.key, sha(call.op + "fixture-call"));
+  assert.deepEqual(answer.details, {
+    agent_workspace_write_unknown_v1: { role, run_id: turn, operation: call.op, tool_call_id: "fixture-call",
+      idempotency_key: call.key, request_sha256: sha(call.body) },
+  });
+  assert.match(answer.content[0].text, /未知.*不要自动重试/);
+  assert.ok(!JSON.stringify(answer).includes(TOKEN));
 }
 
 const fragmentArgs = { artifact_id: "artifact-1", version_id: "approved-v2", offset: 2, max_bytes: 4 };
@@ -205,6 +220,37 @@ test("wrong, persistent or previously used native session registers no tools", a
   assert.equal(sent.length, 0);
 });
 
+test("Pi JSON print refuses input before model admission when investigation startup didn't bind", async t => {
+  const sent = intercept(t, () => assert.fail("unbound session called HTTP"));
+  const fx = await issueFile(t, issue("delegation", [report]));
+  for (const options of [{ id: "other-turn" }, { existing: true }, { persistent: true }]) {
+    let admissions = 0;
+    const modelRuntime = { hasConfiguredAuth() { admissions++; throw new Error("synthetic model admission"); } };
+    const session = await openSession(t, fx, [report], { ...options, modelRuntime });
+    const { frames, errors, exit } = await runJSONPrint(t, session, "should not enter the agent");
+    assert.equal(admissions, 0, "Pi reached model admission despite failing the session bind");
+    assert.equal(exit, 0); // Pi's documented handled-input path, not an auth error or process kill.
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /会话.*未发送/);
+    assert.deepEqual(frames.map(frame => frame.type), ["session"]);
+  }
+  assert.equal(sent.length, 0);
+});
+
+test("investigation input gate neither swallows valid JSON nor intercepts TUI input", async t => {
+  const sentinel = "synthetic model admission";
+  const modelRuntime = { hasConfiguredAuth() { throw new Error(sentinel); } };
+  const fx = await issueFile(t, issue("delegation", [report]));
+  const session = await openSession(t, fx, [report], { modelRuntime });
+  const { errors, exit } = await runJSONPrint(t, session, "valid startup");
+  assert.equal(exit, 1);
+  assert.deepEqual(errors, [sentinel]);
+  const tui = await openSession(t, fx, [report], { id: "other-turn", modelRuntime });
+  await tui.bindExtensions({ mode: "tui", onError: () => {} });
+  assert.deepEqual(tui.getActiveToolNames(), []);
+  await assert.rejects(tui.prompt("interactive input"), /synthetic model admission/);
+});
+
 test("report owner denies selectors, mixed work input reads, versions on submit, and malformed evidence", async t => {
   let answer = boundReport;
   const segment = { input_id: "one", offset: 5, next_offset: 9, byte_count: 4, text: "🧪", complete: false };
@@ -257,16 +303,16 @@ test("a malformed or missing write receipt never retries or permits a different 
       { ...reportArgs, summary: "界".repeat(2731) }, { ...reportArgs, summary: "\u3000" }]) {
       assert.throws(() => tools.get(report).prepareArguments(bad), /参数.*未发送/);
     }
-    const first = await invoke(report, reportArgs).catch(error => error);
-    safeFailure(first, /未知/);
-    await assert.rejects(invoke(report, reportArgs), error => error === first);
+    const first = await invoke(report, reportArgs);
+    checkUnknown(first, "delegation", sent[n]);
+    await assert.rejects(invoke(report, reportArgs), error => safeFailure(error, /未知/) && error.message === first.content[0].text);
     await assert.rejects(invoke(report, reportArgs, "new-id"), /阻止后续写入/);
     assert.equal(sent.length, n + 1);
   }
   const fx = await issueFile(t, issue("report", reportOwner));
   const { invoke } = await bind(t, fx, reportOwner);
   const n = sent.length;
-  await assert.rejects(invoke("ack_work_input", args.ack_work_input), /未知/);
+  checkUnknown(await invoke("ack_work_input", args.ack_work_input), "report", sent[n]);
   assert.deepEqual(await invoke(readReport, {}), result(boundReport));
   await assert.rejects(invoke("submit_result", submit), /阻止后续写入/);
   assert.deepEqual(sent.slice(n).map(call => call.op), ["ack_work_input", readReport]);

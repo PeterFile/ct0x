@@ -5,7 +5,7 @@ import { request, type ClientRequest, type IncomingMessage } from "node:http";
 import { isAbsolute } from "node:path";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { validWorkInputCursor, validWorkInputID } from "./fresh-task-work.mjs";
+import { freshTypedToolResult, validTypedWriteCallID, validWorkInputCursor, validWorkInputID } from "./fresh-task-work.mjs";
 
 const CONFIG_ERROR = "调查传输配置无效，未启用工具。";
 const SESSION_ERROR = "调查会话绑定无效，未发送请求。";
@@ -72,8 +72,8 @@ const versionHandle = (value: unknown) => validText(value, 128) && typeof value 
 const channelCursor = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9_-]{1,2048}$/.test(value);
 const reportKind = (value: unknown) => reportKinds.some(kind => value === kind);
 
-function validProfile(kind: unknown, operations: unknown): operations is Operation[] {
-  if (typeof kind !== "string" || !Object.hasOwn(roles, kind) || !Array.isArray(operations)) return false;
+function validProfile(kind: string, operations: unknown): operations is Operation[] {
+  if (!Object.hasOwn(roles, kind) || !Array.isArray(operations)) return false;
   let start = 0;
   for (const op of [channel, artifact]) if (operations[start] === op) start++;
   const suffix = roles[kind as keyof typeof roles];
@@ -103,11 +103,11 @@ function readConfig(path: string | undefined, digest: string | undefined) {
     if (typeof endpoint !== "string" || !/^http:\/\/(127\.0\.0\.1|\[::1\]):[0-9]{1,5}\/api\/v1\/member-tools$/.test(endpoint) ||
         typeof token !== "string" || token.length > 256 || !/^[A-Za-z0-9._~+/-]+=*$/.test(token) ||
         typeof run_id !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$/.test(run_id) ||
-        action !== "read_only_investigation" || !validProfile(source_kind, operations) ||
+        action !== "read_only_investigation" || typeof source_kind !== "string" || !validProfile(source_kind, operations) ||
         wire !== JSON.stringify({ endpoint, token, run_id, action, source_kind, operations }) + "\n") throw new Error();
     const url = new URL(endpoint);
     if (url.port === "0") throw new Error();
-    return { endpoint: url, token, runID: run_id, operations: Object.freeze(operations) };
+    return { endpoint: url, token, runID: run_id, role: source_kind, operations: Object.freeze(operations) };
   } catch {
     throw new Error(CONFIG_ERROR);
   } finally {
@@ -259,10 +259,12 @@ function investigationClient(endpoint: URL, token: string) {
   let writing = false;
   const safe = (message: string) => new Error(message.replaceAll(token, "〔已隐藏〕"));
   return async (op: Operation, args: Args, id: string, signal?: AbortSignal) => {
-    if (typeof id !== "string" || !id.trim() || !unicode(id)) throw safe("工具调用标识无效，未发送请求。");
+    const write = writes.has(op);
+    if (typeof id !== "string" || !id.trim() || !unicode(id) || (write && !validTypedWriteCallID(id, token))) {
+      throw safe("工具调用标识无效，未发送请求。");
+    }
     const json = JSON.stringify(args), body = Buffer.from(json, "utf8");
     if (body.length > wireLimit || json.includes(token)) throw safe(ARG_ERROR);
-    const write = writes.has(op);
     const key = write ? sha(op + id) : "", fingerprint = write ? sha(body) : "";
     if (write && uncertain) {
       if (uncertain.key === key && uncertain.fingerprint === fingerprint) throw uncertain.error;
@@ -282,7 +284,7 @@ function investigationClient(endpoint: URL, token: string) {
       });
       const text = JSON.stringify(value);
       if (reply.text.includes(token) || text.includes(token)) throw new Error();
-      if (reply.status === status[op] && validReply(op, value, args, reply.text)) return text;
+      if (reply.status === status[op] && validReply(op, value, args, reply.text)) return { text };
       const envelope = /^\s*\{\s*"error"\s*:\s*(\{[\s\S]*\})\s*\}\s*$/.exec(reply.text);
       if (envelope && record(value) && record(value.error) && keys(value.error, "code", "message") && typeof value.error.code === "string" &&
           typeof value.error.message === "string" && flatWire(envelope[1], 2)) {
@@ -295,16 +297,25 @@ function investigationClient(endpoint: URL, token: string) {
     } catch { /* Missing or malformed evidence must remain unknown. */ }
     finally { if (write) writing = false; }
     const error = safe(failure);
-    if (write && failure === UNKNOWN) uncertain = { key, fingerprint, error };
+    if (write && failure === UNKNOWN) {
+      uncertain = { key, fingerprint, error };
+      return { text: error.message, writeUnknown: { operation: op, tool_call_id: id, idempotency_key: key, request_sha256: fingerprint } };
+    }
     throw error;
   };
 }
 
 export default function freshInvestigationWork(pi: ExtensionAPI) {
-  const { endpoint, token, runID, operations } = readConfig(process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG,
+  const { endpoint, token, runID, role, operations } = readConfig(process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG,
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256);
   const invoke = investigationClient(endpoint, token);
   let started = false, active = false;
+  // Pi 1.4.0 reports session_start errors and still calls prompt() in print
+  // mode. Consume that one-shot JSON input before prompt's model/auth path.
+  // Never exit the process or intercept interactive input.
+  pi.on("input", (_event, ctx) => {
+    if (ctx.mode === "json" && !active) return { action: "handled" };
+  });
   pi.on("session_start", (event, ctx) => {
     if (started) { active = false; throw new Error(SESSION_ERROR); }
     started = true;
@@ -318,13 +329,15 @@ export default function freshInvestigationWork(pi: ExtensionAPI) {
         prepareArguments(raw) { return checkedArgs(op, raw); },
         async execute(id, params, signal, _onUpdate, toolContext) {
           if (!active || toolContext.sessionManager.getSessionId() !== runID) throw new Error(SESSION_ERROR);
-          const text = await invoke(op, checkedArgs(op, params), id, signal);
-          return { content: [{ type: "text", text }], details: undefined };
+          const reply = await invoke(op, checkedArgs(op, params), id, signal);
+          return freshTypedToolResult(reply, role, runID);
         },
       });
     }
-    active = true;
     pi.setActiveTools([...operations]);
+    const selected = pi.getActiveTools();
+    if (selected.length !== operations.length || selected.some((name, index) => name !== operations[index])) throw new Error(SESSION_ERROR);
+    active = true;
   });
   pi.on("session_shutdown", () => { active = false; });
 }
