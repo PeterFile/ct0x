@@ -145,6 +145,29 @@ func TestChatDiscussionClosureLeavesUnsettledClaims(t *testing.T) {
 	check(domain.TurnStateUnknown)
 }
 
+func TestChatDiscussionClosureRejectsDuplicateTurn(t *testing.T) {
+	f, _, invite, b := discussionSerialHandoff(t)
+	s := f.s
+	queueEvent(t, s, b, provider.AcceptedEvent, "", "")
+	if turn, err := s.ApplyTurnReceipt(ctx, b, queueReceipt(provider.OutcomeFailed)); err != nil || turn.State != domain.TurnStateFailed {
+		t.Fatalf("recipient did not reach trusted terminal: %+v, %v", turn, err)
+	}
+	discussionCheckMessageClosure(t, s, f.groupID, invite.Message.ID, chatDiscussionAbnormalExitReason)
+
+	// Add an unsettled Turn for the same delivery without changing its terminal binding.
+	const duplicateID = "duplicate-discussion-turn"
+	coordinationDecideExec(t, s, `INSERT INTO turns(id,group_id,delivery_id,conversation_id,member_id,claim_token,state,created_at,updated_at)
+	 SELECT ?,group_id,delivery_id,conversation_id,member_id,'duplicate-claim','unknown',created_at,updated_at
+	 FROM turns WHERE id=?`, duplicateID, b.TurnID)
+	coordinationDecideExec(t, s, "INSERT INTO resource_claims(resource_key,turn_id) VALUES('discussion-held',?)", duplicateID)
+
+	discussionCheckMessageClosure(t, s, f.groupID, invite.Message.ID, "")
+	var owner string
+	if err := s.db.QueryRow("SELECT turn_id FROM resource_claims WHERE resource_key='discussion-held'").Scan(&owner); err != nil || owner != duplicateID {
+		t.Fatalf("resource holder = %q, %v; want %q", owner, err, duplicateID)
+	}
+}
+
 func TestChatDiscussionClosureDoesNotFollowAnAdvancedTurn(t *testing.T) {
 	f, origin, invite, b := discussionSerialHandoff(t)
 	s := f.s

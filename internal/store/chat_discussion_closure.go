@@ -36,8 +36,9 @@ const chatDiscussionClosureSelect = `SELECT e.message_id, r.status, coalesce(t.s
  AND EXISTS(SELECT 1 FROM message_command_sources WHERE message_id=m.id AND kind='member')
  AND NOT EXISTS(SELECT 1 FROM chat_discussion_events n WHERE n.origin_message_id=e.origin_message_id AND n.step>e.step)
  AND NOT EXISTS(SELECT 1 FROM deliveries extra WHERE extra.message_id=m.id AND extra.id<>d.id)
- AND ((d.state='failed' AND d.turn_id='' AND d.error='` + chatDiscussionRecipientLeftReason + `'
-       AND NOT EXISTS(SELECT 1 FROM turns WHERE delivery_id=d.id))
+ AND NOT EXISTS(SELECT 1 FROM turns extra WHERE extra.delivery_id=d.id
+       AND (d.turn_id='' OR extra.id<>d.turn_id))
+ AND ((d.state='failed' AND d.turn_id='' AND d.error='` + chatDiscussionRecipientLeftReason + `')
    OR (d.state='failed' AND t.state='not_started' AND d.error=t.reason AND t.accepted_at IS NULL
        AND t.native_session_id='' AND t.candidate_text='' AND t.reply_message_id='')
    OR (d.state='accepted' AND t.state IN ('succeeded','failed','aborted','truncated') AND d.error=''
