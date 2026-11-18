@@ -2,6 +2,7 @@ package platform_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -446,8 +447,10 @@ func TestBoundWorkReportMCPReserve(t *testing.T) {
 			child := f.claimWork(t, f.delegation.DeliveryID)
 			token, err := f.runtime.IssueWorkDelegationTools(t.Context(), child.Claim, nil)
 			roleOK(t, err)
-			defer f.runtime.Tools().Revoke(token)
+			tools := f.runtime.Tools()
+			defer tools.Revoke(token)
 			const op, channel = platform.ReportWorkOperation, platform.ReadInvestigationChannelOperation
+			const firstReadID, lastReadID = `"first-read"`, `"last-read"`
 			before := f.workCounts(t)
 			progress := func(i int) {
 				t.Helper()
@@ -460,15 +463,25 @@ func TestBoundWorkReportMCPReserve(t *testing.T) {
 				progress(0)
 			}
 			page := f.expectHTTP(t, token, channel, `{}`, "", http.StatusOK)
-			for i := 1; i <= boundWorkOrdinaryMCPLimit; i++ {
-				if got := f.call(t, token, fmt.Sprintf(`"read-%d"`, i), channel, `{}`, false); got != page {
-					t.Fatalf("scoped MCP read %d differs from HTTP", i)
+			if got := f.call(t, token, firstReadID, channel, `{}`, false); got != page {
+				t.Fatal("first scoped MCP read differs from HTTP")
+			}
+			// Fill only the interior ordinary slots on this token without repeating
+			// the SQLite read. The first and last slots still go through MCP.
+			fingerprint := sha256.Sum256([]byte("synthetic ordinary read"))
+			for i := 2; i < boundWorkOrdinaryMCPLimit; i++ {
+				requestID := sha256.Sum256([]byte(fmt.Sprintf("reserve-test-fill-%d", i)))
+				if err := tools.BindMCPRequest(token, requestID, fingerprint); err != nil {
+					t.Fatalf("bind ordinary MCP slot %d: %v", i, err)
 				}
+			}
+			if got := f.call(t, token, lastReadID, channel, `{}`, false); got != page {
+				t.Fatal("last in-budget MCP read differs from HTTP")
 			}
 			if text := f.call(t, token, `"extra-read"`, channel, `{}`, true); !strings.Contains(text, `"code":"mcp_request_capacity"`) {
 				t.Fatalf("ordinary tool reached the report reserve: %s", text)
 			}
-			if got := f.call(t, token, `"read-1"`, channel, `{}`, false); got != page {
+			if got := f.call(t, token, firstReadID, channel, `{}`, false); got != page {
 				t.Fatal("capacity blocked an ordinary replay")
 			}
 			if !reportFirst {
