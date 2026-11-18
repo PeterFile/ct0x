@@ -1,11 +1,13 @@
 package provider
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"regexp"
 	"slices"
+	"strings"
 )
 
 const piTypedWriteUnknown = "agent_workspace_write_unknown_v1"
@@ -30,6 +32,34 @@ type piTypedWorkOutput struct {
 	// IDs and their names; a closed ID retains an empty name to reject reuse.
 	writes  map[string]string
 	unknown *piTypedWriteEvidence
+}
+
+// After recordPi validates the JSON, require one exact top-level discriminator
+// before dispatch. Leave nested payloads opaque to this check.
+func piTypedWorkHasExactType(line []byte) bool {
+	decoder := json.NewDecoder(bytes.NewReader(line))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return false
+	}
+	var seen bool
+	var value json.RawMessage
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, ok := token.(string)
+		if err != nil || !ok {
+			return false
+		}
+		if strings.EqualFold(key, "type") {
+			if key != "type" || seen {
+				return false
+			}
+			seen = true
+		}
+		if decoder.Decode(&value) != nil {
+			return false
+		}
+	}
+	return seen
 }
 
 func (p *piTypedWorkOutput) boundWrite(name string) bool {
@@ -97,9 +127,9 @@ func (p *piTypedWorkOutput) observeEnd(line []byte, runID string, active bool) b
 	}
 	details, _ := result["details"].(map[string]any)
 	if result["details"] == nil || details != nil && len(details) == 0 {
-		// Pi puts isError on the outer frame for a thrown error, including
-		// definite business denials. A bridge-returned error needs its marker.
-		if flag, present := result["isError"]; present && flag != false {
+		// Pi sets only the outer flag for a thrown denial. Without a marker,
+		// an explicit inner flag must be false and agree with the outer flag.
+		if flag, present := result["isError"]; present && (flag != false || isError) {
 			return false
 		}
 	} else if !bound || !isError || result["isError"] != true || !p.observeMarker(details, runID, name, id) {

@@ -114,7 +114,8 @@ func (o *executionOutput) recordPi(line []byte) {
 			Content          json.RawMessage
 		}
 	}
-	if !utf8.Valid(line) || json.Unmarshal(line, &event) != nil || event.Type == "" {
+	if !utf8.Valid(line) || json.Unmarshal(line, &event) != nil || event.Type == "" ||
+		o.piTypedWork != nil && !piTypedWorkHasExactType(line) {
 		o.damaged, o.last = true, ""
 		return
 	}

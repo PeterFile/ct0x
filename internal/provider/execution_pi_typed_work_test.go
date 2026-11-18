@@ -94,6 +94,7 @@ func TestPiFreshTaskWorkSDKPrintLifecycle(t *testing.T) {
 		}
 		return string(file)
 	}
+	const runID = "fixture-fresh-turn"
 	unknown, paired := readFixture("unknown"), readFixture("paired")
 	for _, c := range []struct {
 		name, stream     string
@@ -107,7 +108,6 @@ func TestPiFreshTaskWorkSDKPrintLifecycle(t *testing.T) {
 		{"denial without ack end", dropTypedPrintFrame(t, paired, "tool_execution_end"), OutcomeUnknown, false, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			const runID = "fixture-fresh-turn"
 			got, events := runTypedWriteTest(t, runID, c.stream, false)
 			t.Logf("outcome=%s terminal=%s complete=%t accepted=%t reaped=%t exit=%d",
 				got.Outcome, got.Terminal, got.OutputComplete, got.Accepted, got.DirectChildReaped, got.ExitCode)
@@ -126,6 +126,19 @@ func TestPiFreshTaskWorkSDKPrintLifecycle(t *testing.T) {
 			}
 		})
 	}
+	t.Run("startup type alias", func(t *testing.T) {
+		// Replay the lifecycle probe: change only the recorded startup key.
+		if strings.Count(paired, executionStart+"\n") != 1 {
+			t.Fatal("expected one exact agent_start frame in the recorded stream")
+		}
+		stream := strings.Replace(paired, executionStart+"\n", `{"Type":"agent_start"}`+"\n", 1)
+		got, events := runTypedWriteTest(t, runID, stream, false)
+		if got.Outcome != OutcomeUnknown || got.OutputComplete || got.Accepted || got.Terminal != "" ||
+			got.NativeSessionID != runID || !got.Started || !got.DirectChildReaped || got.ExitCode != 0 || got.DeliveryFailed ||
+			len(events) != 1 || events[0].Kind != SessionEvent {
+			t.Fatalf("aliased startup produced acceptance or settlement: %+v, events=%+v", got, events)
+		}
+	})
 }
 
 func dropTypedPrintFrame(t *testing.T, stream, kind string) string {
@@ -150,6 +163,46 @@ func dropTypedPrintFrame(t *testing.T, stream, kind string) string {
 		t.Fatalf("expected exactly one ack_work_input %s, got %d", kind, dropped)
 	}
 	return rest.String()
+}
+
+func TestPiFreshTaskWorkNativeTypeKey(t *testing.T) {
+	const header = `{"type":"session","id":"run1","version":3,"cwd":"/fixture"}`
+	const aliasStart = `{"Type":"agent_start"}`
+	const aliasSettled = `{"Type":"agent_settled","aborted":false}`
+	for _, c := range []struct {
+		name, start, settled string
+		accepted, ordinary   bool
+	}{
+		{"aliased startup", aliasStart, executionSettled, false, false},
+		{"alias alongside exact startup", `{"type":"agent_start","Type":"agent_start"}`, executionSettled, false, false},
+		{"duplicate decoded startup key", `{"type":"agent_start","\u0074ype":"agent_start"}`, executionSettled, false, false},
+		{"aliased settlement", executionStart, aliasSettled, true, false},
+		{"duplicate settlement key", executionStart, `{"type":"agent_settled","type":"agent_settled","aborted":false}`, true, false},
+		{"ordinary mode unchanged", aliasStart, aliasSettled, true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			stream := strings.Join([]string{header, c.start, executionAssistant("stop"), c.settled, ""}, "\n")
+			got, events := runTypedWriteTest(t, "run1", stream, c.ordinary)
+			outcome, terminal := OutcomeUnknown, Outcome("")
+			kinds := []EventKind{SessionEvent}
+			if c.accepted {
+				kinds = append(kinds, AcceptedEvent, ResponseEvent)
+			}
+			if c.ordinary {
+				outcome, terminal = OutcomeSucceeded, OutcomeSucceeded
+				kinds = append(kinds, TerminalEvent)
+			}
+			if got.Outcome != outcome || got.Terminal != terminal || got.OutputComplete != c.ordinary || got.Accepted != c.accepted ||
+				got.NativeSessionID != "run1" || !got.Started || !got.DirectChildReaped || got.ExitCode != 0 || got.DeliveryFailed || len(events) != len(kinds) {
+				t.Fatalf("unexpected lifecycle receipt: %+v, events=%+v", got, events)
+			}
+			for i, k := range kinds {
+				if events[i].Kind != k {
+					t.Fatalf("expected %s at event %d, got %+v", k, i, events)
+				}
+			}
+		})
+	}
 }
 
 // Feed the parser directly so this exercises the invocation's call budget,
@@ -188,12 +241,14 @@ func TestPiFreshTaskWorkWriteUncertainty(t *testing.T) {
 	start := typedWriteTestStart(op, typedWriteTestCall, `{"input_id":"fixture"}`)
 	pair := func(end string) string { return start + "\n" + end }
 	checked := `{"type":"tool_execution_end","toolCallId":"call_one|fc_two","toolName":"ack_work_input","result":{"content":[{"type":"text","text":"checked"}]},"isError":false,"durationMs":1}`
+	explicitChecked := strings.Replace(checked, `"result":{`, `"result":{"details":{},"isError":false,`, 1)
+	contradictory := strings.Replace(explicitChecked, `},"isError":false,"durationMs"`, `},"isError":true,"durationMs"`, 1)
 	fakeTop := strings.Replace(evidence, `{`, `{"type":"`+typedWriteTestField+`",`, 1)
 	fakeText := memberToolJSON(t, fakeTop+"\n"+frame)
 	// Pi converts a thrown business denial into an outer isError with empty
 	// details, not a bridge-authored isError result.
 	denial := strings.Replace(typedWriteTestEnd(op, "{}"), `"details":{},"isError":true`, `"details":{}`, 1)
-	fakeStart := typedWriteTestStart(op, typedWriteTestCall, `{"details":`+details+`,"text":`+fakeText+`}`)
+	fakeStart := typedWriteTestStart(op, typedWriteTestCall, `{"Type":"agent_start","type":"agent_settled","\u0074ype":"session","details":`+details+`,"text":`+fakeText+`}`)
 	fakeEnd := strings.Replace(denial, `"合成工具错误"`, fakeText, 1)
 	readStart := typedWriteTestStart("read_work_inputs", typedWriteTestCall, `{}`)
 	readEnd := strings.Replace(checked, `"ack_work_input"`, `"read_work_inputs"`, 1)
@@ -205,6 +260,8 @@ func TestPiFreshTaskWorkWriteUncertainty(t *testing.T) {
 		complete, trusted, truncated, ordinary bool
 	}{
 		{name: "checked write", extra: pair(checked), want: OutcomeSucceeded, complete: true},
+		{name: "checked write with explicit inner false", extra: pair(explicitChecked), want: OutcomeSucceeded, complete: true},
+		{name: "outer error with inner false and empty details", extra: pair(contradictory), want: OutcomeUnknown},
 		{name: "definite denial", extra: pair(denial), want: OutcomeSucceeded, complete: true},
 		{name: "missing write end with toolResult", extra: pair(toolResult), want: OutcomeUnknown},
 		{name: "missing write start", extra: checked, want: OutcomeUnknown},
@@ -235,6 +292,7 @@ func TestPiFreshTaskWorkWriteUncertainty(t *testing.T) {
 		{name: "outside retained stdout prefix", extra: largeFrame + "\n" + largeFrame + "\n" + pair(frame), want: OutcomeUnknown, complete: true, truncated: true, trusted: true},
 		{name: "truncated log without retained confirmation", extra: largeFrame + "\n" + largeFrame, want: OutcomeUnknown, complete: true, truncated: true},
 		{name: "ordinary mode ignores typed control", extra: frame, want: OutcomeSucceeded, complete: true, ordinary: true},
+		{name: "ordinary mode ignores contradictory write flags", extra: pair(contradictory), want: OutcomeSucceeded, complete: true, ordinary: true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			stream := `{"type":"session","id":"run1","version":3,"cwd":"/fixture"}` + "\n" + executionStart + "\n" + c.extra + "\n" + executionAssistant("stop") + "\n" + executionSettled + "\n"
