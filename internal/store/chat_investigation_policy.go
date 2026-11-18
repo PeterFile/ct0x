@@ -20,12 +20,14 @@ const (
 	investigationMaxDelegations    = 4
 )
 
-// Genuine legacy storage has neither the migration marker nor the scope table.
+// Resolve the version from the registry, independently of the database's prefix.
+var chatInvestigationVersion = slices.Index(migrations, chatInvestigationSchema) + 1
+
+// A missing marker is legacy only if no investigation objects or later markers remain.
 // A mismatch must not make a restricted task look like ordinary work.
 func chatInvestigationSupportedInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
-	version := slices.Index(migrations, chatInvestigationSchema) + 1
 	var applied bool
-	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?)", version).Scan(&applied); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?)", chatInvestigationVersion).Scan(&applied); err != nil {
 		return false, err
 	}
 	if applied {
@@ -44,19 +46,25 @@ func chatInvestigationSupportedInTx(ctx context.Context, tx *sql.Tx) (bool, erro
 		if !errors.As(err, &cause) || cause.Code() != sqlite3.SQLITE_ERROR {
 			return false, err
 		}
-	} else {
-		// Only a missing marker can take the legacy path. Prove absence of the
-		// specific table in this snapshot, rather than inferring it from a SQL error.
-		var present bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
-		 WHERE type='table' AND name='chat_investigation_policy_revisions')`).Scan(&present); err != nil {
-			return false, err
-		}
-		if !present {
-			return false, nil
-		}
+		return false, fmt.Errorf("%w：只读调查迁移标记与策略表不一致", ErrTaskInvestigationNotReady)
 	}
-	return false, fmt.Errorf("%w：只读调查迁移标记与策略表不一致", ErrTaskInvestigationNotReady)
+
+	// Only consult the catalog on the cold path. Guards installed on other
+	// tables can survive a dropped scope table; a same-named view is also evidence.
+	var incomplete bool
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version>?)
+	 OR EXISTS(SELECT 1 FROM main.sqlite_schema
+	  WHERE type IN ('table','view','trigger') AND name COLLATE NOCASE IN (
+	   'chat_investigation_policy_revisions',
+	   'chat_investigation_policy_insert', 'chat_investigation_policy_update', 'chat_investigation_policy_delete',
+	   'chat_investigation_assessment_insert', 'chat_investigation_artifact_insert'))`, chatInvestigationVersion).Scan(&incomplete)
+	if err != nil {
+		return false, err
+	}
+	if incomplete {
+		return false, fmt.Errorf("%w：只读调查迁移标记缺失，但存在相关数据库对象或更高版本", ErrTaskInvestigationNotReady)
+	}
+	return false, nil
 }
 
 func validateChatInvestigationPolicy(input domain.ChatInvestigationPolicy) error {

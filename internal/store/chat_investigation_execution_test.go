@@ -192,12 +192,22 @@ func investigationTaskSubmitInput(role CoordinationToolScope, input AssignmentRe
 }
 
 func TestChatInvestigationSchemaMismatchFailsClosed(t *testing.T) {
-	const dropScope = "DROP TABLE chat_investigation_policy_revisions"
+	const (
+		dropMarker = "DELETE FROM schema_migrations WHERE version=27"
+		dropScope  = "DROP TABLE chat_investigation_policy_revisions"
+		scopeView  = `CREATE VIEW chat_investigation_policy_revisions AS
+		 SELECT group_id,topic_id,revision,'{}' AS scope_json FROM chat_policy_scopes WHERE 0`
+		// These guards survive DROP TABLE because they belong to other tables.
+		dropGuards = "DROP TRIGGER chat_investigation_assessment_insert; DROP TRIGGER chat_investigation_artifact_insert"
+	)
 	for _, tc := range []struct{ name, damage string }{
-		{"missing-marker", "DELETE FROM schema_migrations WHERE version=27"},
+		{"missing-marker", dropMarker},
 		{"missing-table", dropScope},
-		{"view-for-table", dropScope + `; CREATE VIEW chat_investigation_policy_revisions AS
-		 SELECT group_id,topic_id,revision,'{}' AS scope_json FROM chat_policy_scopes WHERE 0`},
+		{"view-for-table", dropScope + "; " + scopeView},
+		{"missing-marker-and-table", dropMarker + "; " + dropScope},
+		// Isolate the view and later ledger entry from the surviving triggers.
+		{"missing-marker-with-view", dropMarker + "; " + dropScope + "; " + dropGuards + "; " + scopeView},
+		{"missing-marker-with-later-version", dropMarker + "; " + dropScope + "; " + dropGuards + "; INSERT INTO schema_migrations(version) VALUES(28)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f, policy, role := investigationUserWorker(t)
@@ -210,6 +220,10 @@ func TestChatInvestigationSchemaMismatchFailsClosed(t *testing.T) {
 				t.Fatalf("fixture does not have a live investigation worker: %+v, %v", ready, err)
 			}
 			coordinationDecideExec(t, f.s, tc.damage)
+			if receipt, err := f.s.GetChatAdmission(ctx, f.groupID, id); err != nil || receipt.TaskID != id ||
+				receipt.Action != domain.ChatActionReadOnlyInvestigation || !receipt.AuthorityEvidenceVerified {
+				t.Fatalf("damage did not preserve the authorized investigation admission: %+v, %v", receipt, err)
+			}
 			if state, err := f.s.ResolveCoordinationExecution(ctx, role.Member, role.Provenance); !errors.Is(err, ErrMemberToolDenied) || state != (CoordinationRoleState{}) {
 				t.Fatalf("schema mismatch exposed a generic worker: %+v, %v", state, err)
 			}
