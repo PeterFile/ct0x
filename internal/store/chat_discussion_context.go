@@ -131,6 +131,8 @@ func reserveChatDiscussionReturnContextInTx(ctx context.Context, tx *sql.Tx, cha
 	probe.Events = append(probe.Events, domain.ChatDiscussionReceipt{Message: msg, Event: base})
 	probe.IncomingMessageID = widerChatDiscussionRef(probe.OriginMessageID, probe.HeadMessageID)
 	probe.ActiveInvitationMessageID = probe.HeadMessageID
+	// WorkAdmitted replaces the larger active-route fields, so this also
+	// reserves enough space for the work-owned state.
 	omitChatDiscussionBodies(&probe)
 	return checkChatDiscussionContextSize(&probe)
 }
@@ -258,12 +260,17 @@ func chatDiscussionChainInTx(ctx context.Context, tx *sql.Tx, thread domain.Thre
 		return nil, ErrMemberToolDenied
 	}
 	if !c.Closed {
-		closures, err := chatDiscussionClosuresInTx(ctx, tx, c.GroupID, c.HeadMessageID)
+		// Only proof for the head can transfer the active invitation to formal
+		// work. Historical work is display-only and cannot consume a later route.
+		states, err := chatDiscussionEvidenceInTx(ctx, tx, c.GroupID, c.HeadMessageID)
 		if err != nil {
 			return nil, err
 		}
-		if reason := closures[c.HeadMessageID]; reason != "" {
-			c.Closed, c.ClosureReason = true, reason
+		head := states[c.HeadMessageID]
+		c.pendingProof = head.pendingProof
+		c.WorkAdmitted, c.ClosureReason = head.work != nil, head.closureReason
+		c.Closed = c.WorkAdmitted || c.ClosureReason != ""
+		if c.Closed || c.pendingProof {
 			c.ActiveInvitationMessageID, c.ActiveOwnerID = "", ""
 		}
 	}

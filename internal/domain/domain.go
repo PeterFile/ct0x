@@ -60,8 +60,9 @@ type Message struct {
 	CreatedAt  time.Time          `json:"created_at"`
 	Deliveries []Delivery         `json:"deliveries"`
 	Discussion *MessageDiscussion `json:"discussion,omitempty"`
-	// Read projection on the interrupted discussion head, not a publication receipt.
-	DiscussionClosureReason string `json:"discussion_closure_reason,omitempty"`
+	// Read projections on the discussion head, not publication receipts.
+	DiscussionClosureReason string              `json:"discussion_closure_reason,omitempty"`
+	DiscussionWork          *ChatDiscussionWork `json:"discussion_work,omitempty"`
 }
 
 // MessageDiscussion is the read-only projection of a published handoff. The
