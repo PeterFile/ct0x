@@ -172,7 +172,7 @@ func executePreparedAdapterFixture(t *testing.T, f *rolePrepareFixture, prepared
 		if err != nil || actual == nil {
 			t.Fatalf("actual claimed adapter factory failed: %v", err)
 		}
-		endpoint, token := memberToolRuntimeConfig(t, path)
+		endpoint, token := memberToolRuntimeConfigWithDiscussion(t, path, run.intakeSchema.piDiscussionExcerpt)
 		if endpoint != f.runtimeOptions.Endpoint {
 			t.Fatal("factory changed the original endpoint/config contract")
 		}

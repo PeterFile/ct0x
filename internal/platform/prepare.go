@@ -254,9 +254,10 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			return empty, err
 		}
 	}
-	// The v23 text profile does not bind either new intake action. An
-	// investigation root is fresh; ordinary intake keeps its existing selection.
-	if useMemberTools && p.piNativeSessionConfigured(selected) && !intakeSchema.investigation && !(intake && p.memberTools.tools.WorkInputsEnabled()) {
+	// Native text bindings record tool names, not dynamic intake schemas.
+	// Keep intake on the fresh path when it changes the #193 send_message contract.
+	if useMemberTools && p.piNativeSessionConfigured(selected) && !intakeSchema.investigation &&
+		!intakeSchema.piDiscussionExcerpt && !(intake && p.memberTools.tools.WorkInputsEnabled()) {
 		names, maxMembers = p.memberTools.operations, p.memberTools.maxGroupMembers
 		if intake {
 			names, maxMembers = chatIntakeOperations(), 0
