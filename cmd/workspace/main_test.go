@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -174,7 +175,7 @@ func startRunWithSearch(t *testing.T, search provider.Search, args ...string) (s
 		}
 		executionStatus := "执行已禁用，投递仅排队"
 		if parsed.enableExecution {
-			executionStatus = "全新单轮执行已启用，最大并发 1"
+			executionStatus = fmt.Sprintf("全新单轮执行已启用，最大并发 %d；", parsed.executionMaxActive)
 		}
 		for _, want := range []string{"消息持久化", "历史与详情", "排队投递记录", executionStatus, "不支持恢复", "平台工具", "不是主机读取沙箱", "祖先必须可信"} {
 			if !strings.Contains(line, want) {
@@ -194,6 +195,10 @@ func startRunWithSearch(t *testing.T, search provider.Search, args ...string) (s
 		t.Fatal("startup timed out")
 	}
 	return "", stop
+}
+
+func TestStartupReportsConfiguredExecutionCapacity(t *testing.T) {
+	startRun(t, "--listen", "127.0.0.1:0", "--data-dir", t.TempDir(), "--enable-execution", "--execution-max-active", "3")
 }
 
 func TestRunWebDir(t *testing.T) {

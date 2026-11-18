@@ -103,7 +103,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		if err != nil {
 			return err
 		}
-		executionStatus = "全新单轮执行已启用，最大并发 1；目录授权与Task执行权限分开，只有获准目录Task及实际验证的完整文件工具适配器可读写和发布版本"
+		executionStatus = fmt.Sprintf("全新单轮执行已启用，最大并发 %d；目录授权与Task执行权限分开，只有获准目录Task及实际验证的完整文件工具适配器可读写和发布版本", config.executionMaxActive)
 	}
 	if memberTools != nil {
 		adapterStatus := "仅已验证 Pi 1.4.0 且显式指定模型时可用六项成员工具（含只读历史搜索与分段读取）；Codex 仅原生只读工具且无平台令牌"

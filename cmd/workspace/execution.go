@@ -31,7 +31,11 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	schedulerOptions := scheduler.Options{MaxActive: 1, Recovered: true, RuntimeDir: runtime}
+	maxActive := config.executionMaxActive
+	if maxActive == 0 { // Direct config literals may leave the CLI default unset.
+		maxActive = defaultExecutionMaxActive
+	}
+	schedulerOptions := scheduler.Options{MaxActive: maxActive, Recovered: true, RuntimeDir: runtime}
 	// Only explicit local-user receipts authorize external directories. Protect
 	// the entire private data root, not just per-conversation workspaces.
 	options := platform.PrepareOptions{Providers: providers, PrivateWorkspaceRoot: workspaces, PrivateDataRoot: config.dataDir}
