@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
 )
@@ -56,10 +58,71 @@ func (s *Store) chatInvestigationAdmissionInTx(ctx context.Context, tx *sql.Tx, 
 	return authorization, nil
 }
 
-// Only a direct request for the original task qualifies without an exact ID.
-// Chinese commands can be followed by another action without a separator.
-var chatInvestigationOriginalTaskCue = regexp.MustCompile(
-	`^(?:(?:请)?(?:继续|续办)原任务|(?i:(?:please )?(?:continue|resume) the original task)(?:$|[\s\p{Z},.!?;:，。！？；：、]))`)
+const (
+	chatInvestigationSentenceBreaks   = ".!?;。！？；\r\n\u0085\u2028\u2029"
+	chatInvestigationClauseSeparators = ",:，：、"
+	chatInvestigationMetaLabelPrefix  = `(?:这句(?:话)?|这条消息)[\s\p{Z}]*(?:只|仅)?是[\s\p{Z}]*`
+)
+
+var (
+	chatInvestigationEnglishCue = regexp.MustCompile(
+		`^(?i:(?:please )?(?:continue|resume) the original task)(?:$|[\s\p{Z},.!?;:，。！？；：、])`)
+	chatInvestigationDirectMeta = regexp.MustCompile(
+		`^(?:` + chatInvestigationMetaLabelPrefix + `(?:旧消息(?:示例)?|(?:一个)?(?:示例|例子))|并?(?:非|不是)本次指令)$`)
+	chatInvestigationCompactMeta = regexp.MustCompile(
+		"^[^\"'`“”‘’「」『』《》]*" + chatInvestigationMetaLabelPrefix + `旧消息(?:示例)?$`)
+	chatInvestigationContinuationAssertion = regexp.MustCompile(`^(?:不能|无法|非|不是|没有|未曾)`)
+)
+
+func chatInvestigationFirstClause(text string) string {
+	if end := strings.IndexAny(text, chatInvestigationSentenceBreaks+chatInvestigationClauseSeparators); end >= 0 {
+		text = text[:end]
+	}
+	return strings.TrimSpace(text)
+}
+
+// This opening cue neither interprets arbitrary phrasing nor supplies authority.
+// A delimited command takes precedence over any later constraints or examples.
+func chatInvestigationHasOriginalTaskCue(content string) bool {
+	content = strings.TrimSpace(content)
+	text := strings.TrimSpace(strings.TrimPrefix(content, "请"))
+	rest, ok := strings.CutPrefix(text, "继续原任务")
+	if !ok {
+		rest, ok = strings.CutPrefix(text, "续办原任务")
+	}
+	if !ok {
+		return chatInvestigationEnglishCue.MatchString(content)
+	}
+	rest = strings.TrimPrefix(rest, "吧")
+	first, _ := utf8.DecodeRuneInString(rest)
+	switch {
+	case rest == "" || strings.ContainsRune(chatInvestigationSentenceBreaks, first):
+		return true
+	case unicode.IsSpace(first) || strings.ContainsRune(chatInvestigationClauseSeparators, first):
+		// A soft separator can also introduce a label of the opening itself.
+		next := strings.TrimLeftFunc(rest, func(r rune) bool {
+			return !strings.ContainsRune(chatInvestigationSentenceBreaks, r) &&
+				(unicode.IsSpace(r) || strings.ContainsRune(chatInvestigationClauseSeparators, r))
+		})
+		return !chatInvestigationDirectMeta.MatchString(chatInvestigationFirstClause(next))
+	}
+
+	clause := chatInvestigationFirstClause(rest)
+	for _, connective := range [...]string{"并且", "并", "然后", "同时", "再"} {
+		if activity, ok := strings.CutPrefix(clause, connective); ok {
+			activity = strings.TrimSpace(activity)
+			first, _ := utf8.DecodeRuneInString(activity)
+			// A subordinate prohibition is an activity modifier, not an assertion about continuing.
+			if !unicode.IsLetter(first) || chatInvestigationContinuationAssertion.MatchString(activity) {
+				return false
+			}
+			// After compact activity, require an unquoted old-message label;
+			// a generic example label may refer to the material being examined.
+			return !chatInvestigationDirectMeta.MatchString(activity) && !chatInvestigationCompactMeta.MatchString(activity)
+		}
+	}
+	return false
+}
 
 func chatInvestigationReferencesExistingWorkInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) (bool, error) {
 	if c.SourceKind != "local_user_chat" {
@@ -70,7 +133,7 @@ func chatInvestigationReferencesExistingWorkInTx(ctx context.Context, tx *sql.Tx
 		return false, err
 	}
 	var found bool
-	if chatInvestigationOriginalTaskCue.MatchString(strings.TrimSpace(source.content)) {
+	if chatInvestigationHasOriginalTaskCue(source.content) {
 		// Walk only the bound thread's indexed lineage, stopping at the first prior Task.
 		err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 		 SELECT 1 FROM coordination_triggers o INDEXED BY coordination_triggers_thread_created_id
