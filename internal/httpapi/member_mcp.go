@@ -74,12 +74,16 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 	if reportTools {
 		catalog = memberMCPWithReports
 	}
-	profile, err := a.tools.TransportProfile(r.Context(), token)
-	if err != nil && method != "tools/call" {
-		buffer = newMemberMCPBuffer()
-		memberToolError(buffer, err)
-		buffer.forward(w)
-		return
+	var profile platform.MemberToolTransportProfile
+	var err error
+	if method != "tools/call" {
+		profile, err = a.tools.TransportProfile(r.Context(), token)
+		if err != nil {
+			buffer = newMemberMCPBuffer()
+			memberToolError(buffer, err)
+			buffer.forward(w)
+			return
+		}
 	}
 	switch method {
 	case "initialize":
@@ -157,6 +161,9 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				return
 			}
 		}
+		if !reportWrite {
+			profile, err = a.tools.TransportProfile(r.Context(), token)
+		}
 		if reportTools && name == platform.ReadWorkReportOperation && (err != nil || !slices.Contains(profile.Operations, name)) {
 			// Withheld report reads don't reserve IDs. The handler will still
 			// recheck the exact report in B when discovery succeeds.
@@ -183,14 +190,21 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				return
 			}
 			requestID := sha256.Sum256([]byte(key))
-			if reportWrite && err == nil {
-				bindErr = a.tools.BindMCPReportRequest(token, requestID, fingerprint, profile)
+			var finish func(bool)
+			if reportWrite {
+				// No readiness preflight: the report handler lets B look up
+				// the original key before checking new-write eligibility.
+				finish, bindErr = a.tools.BeginMCPReportRequest(token, requestID, fingerprint)
 			} else {
 				bindErr = a.tools.BindMCPRequest(token, requestID, fingerprint)
 			}
 			if bindErr != nil {
 				memberMCPBindingError(w, id, bindErr)
 				return
+			}
+			rejected := false
+			if finish != nil {
+				defer func() { finish(rejected && r.Context().Err() == nil) }()
 			}
 			// Discovery preflight is not command outcome evidence: its generic
 			// validator sanitizes SQL errors that role writes must keep unknown.
@@ -209,7 +223,8 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				buffer.readLimitAdvice = memberInvestigationArtifactTooLarge
 			}
 			tool.invoke(a, buffer, native, token)
-			memberMCPToolReply(w, id, tool.write, buffer)
+			intact := memberMCPToolReply(w, id, tool.write, buffer)
+			rejected = finish != nil && intact && memberMCPReportRejected(buffer)
 			return
 		}
 		if err != nil {
@@ -394,13 +409,15 @@ func memberMCPEnvelopeFits(envelope map[string]any) bool {
 	return err == nil && len(encoded)+1 <= memberToolJSONBytes // WriteJSON adds a newline.
 }
 
-func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *memberMCPBuffer) {
+// Return whether the response writer accepted the complete, original envelope.
+func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *memberMCPBuffer) bool {
 	failed, text := buffer.status >= 400, string(buffer.body)
 	if failed {
 		text += memberMCPReconcile
 	}
 	envelope := memberMCPToolEnvelope(id, text, failed)
-	if buffer.overflow || !memberMCPEnvelopeFits(envelope) {
+	intact := !buffer.overflow && memberMCPEnvelopeFits(envelope)
+	if !intact {
 		switch {
 		case write && !failed:
 			// Success is durable even when its projection cannot fit the envelope.
@@ -417,5 +434,5 @@ func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *membe
 		}
 		envelope = memberMCPToolEnvelope(id, text, failed)
 	}
-	WriteJSON(w, http.StatusOK, envelope)
+	return writeJSON(w, http.StatusOK, envelope) && intact
 }

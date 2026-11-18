@@ -48,7 +48,7 @@ type MemberTools struct {
 	db               *store.Store
 	mu               sync.RWMutex
 	capabilities     map[[sha256.Size]byte]memberToolRegistration
-	mcpRequests      map[[sha256.Size]byte]map[[sha256.Size]byte][sha256.Size]byte
+	mcpRequests      map[[sha256.Size]byte]*memberMCPRequests
 	chatEngine       *coordination.Engine
 	workInputs       MemberWorkInputService // Immutable after runtime construction.
 	freshTaskWork    FreshTaskWorkLaunch    // Independent of the legacy work-input preview.

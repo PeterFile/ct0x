@@ -7,6 +7,7 @@ import (
 	"slices"
 	"time"
 
+	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/store"
 )
@@ -21,6 +22,31 @@ const (
 type taskWorkReportBinding struct {
 	delivery domain.TaskWorkDelivery
 	versions []domain.ArtifactVersionRef
+}
+
+// NewMemberToolRuntimeWithTaskWorkReports opts into postclaim report,
+// delegation, and typed investigation owner transports. It does not enable B
+// execution. Trusted composition may also supply one investigation launcher
+// with B's final commit; without it this is just the postclaim transport.
+func NewMemberToolRuntimeWithTaskWorkReports(db *store.Store, options MemberToolRuntimeOptions, engine *coordination.Engine, launches ...*InvestigationTaskWorkLaunch) (*MemberToolRuntime, error) {
+	if !engine.UsesStore(db) || len(launches) > 1 {
+		return nil, errMemberToolRuntimeConfig
+	}
+	runtime, err := NewMemberToolRuntime(db, options)
+	if err != nil {
+		return nil, err
+	}
+	if runtime.roleFence == nil {
+		return nil, errMemberToolRuntimeConfig
+	}
+	if len(launches) == 1 {
+		runtime.investigationTaskWork, err = freezeInvestigationTaskWorkLaunch(db, launches[0])
+		if err != nil {
+			return nil, err
+		}
+	}
+	runtime.tools.workReportEngine = engine
+	return runtime, nil
 }
 
 func (s *MemberTools) TaskWorkReportsEnabled() bool { return s != nil && s.workReportEngine != nil }
@@ -141,12 +167,16 @@ func (s *MemberTools) workReportCurrent(ctx context.Context, scope store.MemberT
 	return ctx.Err()
 }
 
+func (entry memberToolRegistration) hasBoundWorkReport(op string, kind domain.TaskWorkSourceKind) bool {
+	return entry.workReport != nil && entry.workReport.delivery.SourceKind == kind && slices.Contains(entry.grants.Operations, op)
+}
+
 // Hold the registry lock through B's transaction so Revoke drains live calls.
 func (s *MemberTools) withBoundWorkReport(token, op string, kind domain.TaskWorkSourceKind, use func(memberToolRegistration) error) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry := s.capabilities[sha256.Sum256([]byte(token))]
-	if entry.workReport == nil || entry.workReport.delivery.SourceKind != kind || !slices.Contains(entry.grants.Operations, op) ||
+	if !entry.hasBoundWorkReport(op, kind) ||
 		entry.investigationOwner != nil && !entry.investigationWorkOwnerValid() {
 		return store.ErrMemberToolDenied
 	}

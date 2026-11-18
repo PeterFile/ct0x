@@ -44,12 +44,6 @@ type MemberToolRuntimeOptions struct {
 	// FreshTaskWork composes typed continuation via the ChatIntake Engine and
 	// the role execution fence. It does not install the legacy preview.
 	FreshTaskWork *FreshTaskWorkLaunch
-	// TaskWorkReports opts into the experimental postclaim report and typed
-	// investigation owner transport. It does not enable B or install a launcher.
-	TaskWorkReports *coordination.Engine
-	// InvestigationTaskWork is a separate trusted launcher. It requires the
-	// report transport and B's final commit, not the pure-text launch gate.
-	InvestigationTaskWork *InvestigationTaskWorkLaunch
 }
 
 type MemberToolRunBinding struct {
@@ -140,12 +134,6 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 	}
 	tools := NewMemberTools(db)
 	tools.workInputs = options.WorkInputs
-	if engine := options.TaskWorkReports; engine != nil {
-		if roleFence == nil || !engine.UsesStore(db) {
-			return nil, errMemberToolRuntimeConfig
-		}
-		tools.workReportEngine = engine
-	}
 	if launch := options.FreshTaskWork; launch != nil {
 		if roleFence == nil || !options.ChatIntake.UsesStore(db) || launch.Supports == nil || launch.Construct == nil {
 			return nil, errMemberToolRuntimeConfig
@@ -160,13 +148,9 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 			return nil, errMemberToolRuntimeConfig
 		}
 	}
-	investigation, err := freezeInvestigationTaskWorkLaunch(db, options)
-	if err != nil {
-		return nil, err
-	}
 	return &MemberToolRuntime{tools: tools, configRoot: root, resolvedRoot: resolved,
 		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence,
-		executionRoot: executionRoot, investigationTaskWork: investigation}, nil
+		executionRoot: executionRoot}, nil
 }
 
 func memberToolRuntimeEndpoint(endpoint string) bool {

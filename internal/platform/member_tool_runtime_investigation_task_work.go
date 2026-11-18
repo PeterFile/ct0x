@@ -32,12 +32,8 @@ func NewPiInvestigationTaskWorkLaunch(extensionPath string, timeout time.Duratio
 	return &InvestigationTaskWorkLaunch{Supports: a.Supports, Construct: a.NewExecutor, Commit: commit}
 }
 
-func freezeInvestigationTaskWorkLaunch(db *store.Store, options MemberToolRuntimeOptions) (*InvestigationTaskWorkLaunch, error) {
-	launch := options.InvestigationTaskWork
-	if launch == nil {
-		return nil, nil
-	}
-	if options.TaskWorkReports == nil || launch.Supports == nil || launch.Construct == nil || launch.Commit == nil {
+func freezeInvestigationTaskWorkLaunch(db *store.Store, launch *InvestigationTaskWorkLaunch) (*InvestigationTaskWorkLaunch, error) {
+	if launch == nil || launch.Supports == nil || launch.Construct == nil || launch.Commit == nil {
 		return nil, errMemberToolRuntimeConfig
 	}
 	frozen := *launch

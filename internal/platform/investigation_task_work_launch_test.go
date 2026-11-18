@@ -218,8 +218,7 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 						Terminal: provider.OutcomeSucceeded, NativeSessionID: req.RunID, DirectChildReaped: true, OutputComplete: true}
 				}), nil
 			}
-			f.options.InvestigationTaskWork = launch
-			f.runtime, err = platform.NewMemberToolRuntime(f.db, f.options)
+			f.runtime, err = platform.NewMemberToolRuntimeWithTaskWorkReports(f.db, f.options, f.engine, launch)
 			roleOK(t, err)
 			f.mount(t)
 			prep, err := platform.NewPreparer(f.db, platform.PrepareOptions{Providers: []provider.Provider{selected}, PrivateWorkspaceRoot: private,

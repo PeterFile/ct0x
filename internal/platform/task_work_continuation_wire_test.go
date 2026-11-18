@@ -407,14 +407,15 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 				// must still use the real text gate and bootstrap.
 				entry, err := filepath.Abs("../../extensions/pi-bridge/fresh-investigation-work.ts")
 				roleOK(t, err)
-				f.options.TaskWorkReports = engine
-				f.options.InvestigationTaskWork = platform.NewPiInvestigationTaskWorkLaunch(entry, 0,
+				launch := platform.NewPiInvestigationTaskWorkLaunch(entry, 0,
 					func(context.Context, store.FreshTaskWorkLaunch, func() bool) error {
 						t.Error("text followup reached the investigation commit")
 						return store.ErrMemberToolDenied
 					})
+				f.runtime, err = platform.NewMemberToolRuntimeWithTaskWorkReports(f.db, f.options, engine, launch)
+			} else {
+				f.runtime, err = platform.NewMemberToolRuntime(f.db, f.options)
 			}
-			f.runtime, err = platform.NewMemberToolRuntime(f.db, f.options)
 			roleOK(t, err)
 			defer f.runtime.Close()
 			tools := f.runtime.Tools()
