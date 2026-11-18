@@ -58,8 +58,9 @@ function AdmissionSample({ groupId, taskId, observations }: { groupId: string; t
   if (read.error) return <div><p role="alert">{read.error}</p><button type="button" onClick={() => setVersion(value => value + 1)}>重试读取聊天准入依据</button></div>;
   const receipt = read.receipt, observation = read.observation;
   if (!receipt || !observation) return null;
+  const investigation = receipt.action === "read_only_investigation";
   return <section className="tasks-lifecycle" aria-label="聊天自动准入依据">
-    <h3>{receipt.repair_link ? "来自正式拒收的修复工作" : "来自普通群聊的工作"}</h3>
+    <h3>{receipt.repair_link ? "来自正式拒收的修复工作" : investigation ? "来自群聊的只读调查" : "来自普通群聊的工作"}</h3>
     <p className="tasks-note">以下来自服务端不可变准入回执，不是模型正文推断。已登记分派不表示执行成功、交付或用户接纳。</p>
     <p className="tasks-note">来源核验不证明自然语言意图零误判，也不等同人类签批；最终用户审查与接纳仍独立。</p>
     {!receipt.authority_evidence_verified ? <p role="status">历史来源未核验或当前评估证据待确认。保留原授权声明，不补成真人批准；既有任务、交付与用户审查不因此受阻。</p> : null}
@@ -75,7 +76,8 @@ function AdmissionSample({ groupId, taskId, observations }: { groupId: string; t
       <dt>来源发送者 ID</dt><dd className="tasks-meta">{receipt.source_sender_id}</dd>
       <dt>授权来源消息</dt><dd className="tasks-meta">{receipt.repair_link && !receipt.authorization_message_id
         ? "实际用户审查（无聊天消息 ID）" : receipt.authorization_message_id}</dd>
-      <dt>范围</dt><dd>当前群 / {receipt.topic_id ? `话题 ${receipt.topic_id}` : "主话题"} · {receipt.action === "workspace_change" ? "目录改动（workspace_change）" : "仅文本提交"}</dd>
+      <dt>范围</dt><dd>当前群 / {receipt.topic_id ? `话题 ${receipt.topic_id}` : "主话题"} · {receipt.action === "workspace_change" ? "目录改动（workspace_change）"
+        : investigation ? "只读调查（read_only_investigation）" : "仅文本提交"}</dd>
       <dt>聊天策略</dt><dd>聊天策略版本 {receipt.policy_revision}</dd>
       <dt>授权标识</dt><dd className="tasks-meta">{receipt.mandate_id}</dd>
       <dt>评估成员</dt><dd className="tasks-meta">{receipt.assessed_by}</dd>
