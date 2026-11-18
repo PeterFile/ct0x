@@ -47,6 +47,7 @@ type executionOutput struct {
 	line                       []byte
 	dropping, damaged, settled bool
 	last                       Outcome
+	piSession                  *piSessionTracker
 }
 
 func (o *executionOutput) Write(p []byte) (int, error) {
@@ -102,6 +103,10 @@ func (o *executionOutput) recordPi(line []byte) {
 		o.damaged, o.last = true, ""
 		return
 	}
+	if o.piSession != nil && !o.piSession.observe(line) {
+		o.damaged, o.last = true, ""
+		return
+	}
 	r := o.receipt
 	if event.Type != "session" && r.NativeSessionID == "" {
 		o.damaged, o.last = true, ""
@@ -112,7 +117,7 @@ func (o *executionOutput) recordPi(line []byte) {
 	}
 	switch event.Type {
 	case "session":
-		if event.Version != 3 || event.ID != o.runID || !filepath.IsAbs(event.CWD) || r.NativeSessionID != "" {
+		if event.Version != 3 || (o.piSession == nil && event.ID != o.runID) || !filepath.IsAbs(event.CWD) || r.NativeSessionID != "" {
 			o.damaged = true
 			return
 		}
