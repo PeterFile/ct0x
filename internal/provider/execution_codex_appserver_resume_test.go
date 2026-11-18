@@ -28,12 +28,16 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	}
 	defer os.Exit(0)
 	mode := os.Getenv("AW_SESSION_MODE")
+	earlyStatus := strings.HasPrefix(mode, "early-status-")
 	pid := strconv.Itoa(os.Getpid())
 	_ = os.WriteFile("argv-"+pid+".json", mustCodexAppServerJSON(os.Args[1:]), 0600)
 	input := bufio.NewReader(os.Stdin)
 	read := func() codexRPCMessage {
 		line, err := input.ReadBytes('\n')
 		if err != nil {
+			if earlyStatus && err == io.EOF {
+				_ = os.WriteFile("eof-"+pid, nil, 0600)
+			}
 			os.Exit(0)
 		}
 		message, err := decodeCodexRPCFrame(line)
@@ -257,9 +261,14 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	turn := func(status string, items []any) map[string]any {
 		return map[string]any{"id": turnID, "status": status, "items": items, "error": nil}
 	}
+	replyTurn := func() {
+		respond(request, map[string]any{"turn": turn("inProgress", []any{})})
+		replay("after-turn-response")
+	}
 	replay("before-turn-response")
-	respond(request, map[string]any{"turn": turn("inProgress", []any{})})
-	replay("after-turn-response")
+	if !earlyStatus {
+		replyTurn()
+	}
 	notify("turn/started", map[string]any{"threadId": threadID, "turn": turn("inProgress", []any{})})
 	replay("after-turn-started")
 	_ = json.Unmarshal(request.Params, &params)
@@ -314,19 +323,27 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 		}
 		terminal["items"] = []any{user, duplicate, answer}
 	}
-	notify("turn/completed", map[string]any{"threadId": threadID, "turn": terminal})
-	threadStatus := func(kind string, flags []any) {
+	threadStatus := func(thread, kind string, flags []any) {
 		status := map[string]any{"type": kind}
 		if flags != nil {
 			status["activeFlags"] = flags
 		}
-		notify("thread/status/changed", map[string]any{"threadId": threadID, "status": status})
+		notify("thread/status/changed", map[string]any{"threadId": thread, "status": status})
 	}
+	if mode == "early-status-active-first" {
+		threadStatus(threadID, "active", []any{})
+	}
+	notify("turn/completed", map[string]any{"threadId": threadID, "turn": terminal})
 	switch mode {
-	case "failed-turn-late-active":
-		threadStatus("active", []any{})
+	case "failed-turn-late-active", "early-status-terminal-first":
+		threadStatus(threadID, "active", []any{})
+	case "early-status-foreign":
+		threadStatus("foreign-thread", "active", []any{})
 	case "interrupted-turn-late-ambiguous-active":
-		threadStatus("idle", []any{"waitingOnApproval"})
+		threadStatus(threadID, "idle", []any{"waitingOnApproval"})
+	}
+	if earlyStatus {
+		replyTurn()
 	}
 	capture := read()
 	if capture.Method == nil || *capture.Method != "thread/read" {
@@ -334,11 +351,11 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	}
 	switch mode {
 	case "capture-active-before-error", "capture-active-before-missing":
-		threadStatus("active", []any{})
+		threadStatus(threadID, "active", []any{})
 		if mode == "capture-active-before-missing" {
 			return
 		}
-		threadStatus("idle", nil) // Later idle must not erase the earlier contradiction.
+		threadStatus(threadID, "idle", nil) // Later idle must not erase the earlier contradiction.
 		fallthrough
 	case "capture-error":
 		fail(capture)
@@ -560,6 +577,75 @@ func sessionClientFrames(t *testing.T, cwd string) [][]codexRPCMessage {
 		result = append(result, messages)
 	}
 	return result
+}
+
+func TestCodexAppServerEarlyThreadStatusOrder(t *testing.T) {
+	const threadID = "session-native-thread"
+	for _, profile := range []string{"legacy", "session"} {
+		for _, tc := range []struct {
+			mode  string
+			want  Outcome
+			owned bool
+		}{
+			{"early-status-terminal-first", OutcomeUnknown, true},
+			{"early-status-active-first", OutcomeSucceeded, true},
+			{"early-status-foreign", OutcomeUnknown, false},
+		} {
+			t.Run(profile+"/"+tc.mode, func(t *testing.T) {
+				t.Setenv("AW_SESSION_MODE", tc.mode)
+				selected, config, request := appServerSessionFixture(t)
+				binding := json.RawMessage(`{"purpose":"generic"}`)
+				var executor Executor
+				var err error
+				if profile == "session" {
+					executor, err = NewCodexAppServerSessionExecutor(selected, config, []string{"read_channel"}, CodexAppServerSessionOptions{Binding: binding}, 5*time.Second)
+				} else {
+					executor, err = NewCodexAppServerMemberToolExecutor(selected, config, []string{"read_channel"}, 5*time.Second)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				var events []Event
+				r := executor.Execute(context.Background(), request, func(event Event) error {
+					events = append(events, event)
+					return nil
+				})
+				var terminal Outcome
+				wantEvents := []Event{{Kind: SessionEvent, NativeSessionID: threadID}}
+				if tc.owned {
+					terminal = OutcomeSucceeded
+					wantEvents = append(wantEvents,
+						Event{Kind: AcceptedEvent, NativeSessionID: threadID},
+						Event{Kind: ResponseEvent, NativeSessionID: threadID, Text: "synthetic session answer"},
+						Event{Kind: TerminalEvent, NativeSessionID: threadID, Terminal: terminal},
+					)
+				}
+				if r.Outcome != tc.want || !r.Started || r.Accepted != tc.owned || r.Terminal != terminal || r.NativeSessionID != threadID || !r.DirectChildReaped || r.OutputComplete != tc.owned || r.ExitCode != 0 || r.DeliveryFailed {
+					t.Fatalf("want outcome %s with owned evidence=%v, got %+v", tc.want, tc.owned, r)
+				}
+				if !reflect.DeepEqual(events, wantEvents) {
+					t.Fatalf("want events %+v, got %+v", wantEvents, events)
+				}
+				if files, err := filepath.Glob(filepath.Join(request.CWD, "eof-*")); err != nil || len(files) != 1 {
+					t.Fatal("child did not observe stdin shutdown")
+				}
+				wantCaptures := 0
+				if profile == "session" {
+					if tc.want == OutcomeSucceeded {
+						wantCaptures = 1
+					}
+					if r.NativeRef == nil || string(r.NativeRef.Binding) != string(binding) || (r.NativeRef.Codex != nil) != (wantCaptures == 1) {
+						t.Fatal("session reference did not reflect the settled outcome")
+					}
+				} else if r.NativeRef != nil {
+					t.Fatal("legacy path issued a session reference")
+				}
+				if files, err := filepath.Glob(filepath.Join(request.CWD, "capture-meta-*.json")); err != nil || len(files) != wantCaptures {
+					t.Fatalf("want %d capture reads, got %d (err=%v)", wantCaptures, len(files), err)
+				}
+			})
+		}
+	}
 }
 
 func TestCodexSessionRejectsDriftBeforeNewPrompt(t *testing.T) {

@@ -294,16 +294,13 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 		provisional := p.awaiting == 3 && (resumeMetadata || slices.Contains([]string{"thread/status/changed", "thread/name/updated", "thread/project/updated", "mcpServer/startupStatus/updated"}, method)) || p.awaiting == 5 &&
 			(strings.HasPrefix(method, "turn/") || strings.HasPrefix(method, "item/") || strings.HasPrefix(method, "hook/") || strings.HasPrefix(method, "model/") || method == "thread/tokenUsage/updated" || method == "error")
 		if provisional {
-			size := len(method) + len(message.Params) + len(message.ID)
-			if len(p.buffer) >= executionFramesCountLimit || size > executionFramesByteLimit-p.bufferBytes {
-				p.fail()
-				return
-			}
-			p.buffer = append(p.buffer, message)
-			p.bufferBytes += size
+			p.bufferNotification(message)
 			return
 		}
 		p.notification(message)
+		if method == "turn/completed" {
+			p.captureSession()
+		}
 		return
 	}
 	if p.interruptSent && !p.interruptAcknowledged && bytes.Equal(bytes.TrimSpace(message.ID), []byte("6")) {
@@ -454,6 +451,8 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 		}
 		p.turnID = turnID
 		p.replayBuffer()
+		// Already-buffered status can contradict the terminal before capture.
+		p.captureSession()
 	case 7:
 		if p.member == nil {
 			p.fail()
@@ -487,6 +486,16 @@ func (p *codexAppServerProtocol) startTurn() {
 		}
 	}
 	p.next(5, "turn/start", params)
+}
+
+func (p *codexAppServerProtocol) bufferNotification(message codexRPCMessage) {
+	size := len(*message.Method) + len(message.Params) + len(message.ID)
+	if len(p.buffer) >= executionFramesCountLimit || size > executionFramesByteLimit-p.bufferBytes {
+		p.fail()
+		return
+	}
+	p.buffer = append(p.buffer, message)
+	p.bufferBytes += size
 }
 
 func (p *codexAppServerProtocol) replayBuffer() {
@@ -665,6 +674,13 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 		if id := fields["turnId"]; id != nil && (p.turnID == "" || string(id) != string(mustCodexAppServerJSON(p.turnID))) {
 			p.fail()
 		}
+		if method == "thread/status/changed" && p.awaiting == 5 {
+			// The thread is bound, but earlier turn frames may still be buffered.
+			if !p.damaged {
+				p.bufferNotification(message)
+			}
+			return
+		}
 		if p.session != nil && p.turnID == "" && (method == "thread/closed" || method == "thread/status/changed" && !codexSessionIdle(message.Params, "status")) {
 			p.fail()
 		}
@@ -832,7 +848,10 @@ func (p *codexAppServerProtocol) turnNotification(method string, raw json.RawMes
 	}
 	p.receipt.Terminal = terminal
 	p.emit(Event{Kind: TerminalEvent, Terminal: terminal})
-	if p.session != nil && terminal == OutcomeSucceeded && p.settled() {
+}
+
+func (p *codexAppServerProtocol) captureSession() {
+	if p.session != nil && p.receipt.Terminal == OutcomeSucceeded && p.settled() {
 		p.next(9, "thread/read", map[string]any{"threadId": p.threadID, "includeTurns": true})
 	}
 }
