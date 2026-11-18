@@ -2,9 +2,12 @@ package store
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
+	"strings"
 	"testing"
 
 	"agentworkspace/internal/domain"
@@ -39,11 +42,13 @@ func discussionCapture(t *testing.T, s *Store, claim TurnClaim) (MemberToolScope
 	return scope, candidate.ID
 }
 
-func discussionAssess(t *testing.T, s *Store, scope MemberToolScope, candidate string) {
+func discussionAssess(t *testing.T, s *Store, scope MemberToolScope, candidate string) string {
 	t.Helper()
-	if _, err := s.ApplyChatAssessment(ctx, scope, candidate, domain.ChatAssessment{Disposition: "discuss", Reason: "仅讨论问题。"}, "需要核对讨论的依据。", "assessment-"+candidate); err != nil {
+	r, err := s.ApplyChatAssessment(ctx, scope, candidate, domain.ChatAssessment{Disposition: "discuss", Reason: "仅讨论问题。"}, "需要核对讨论的依据。", "assessment-"+candidate)
+	if err != nil {
 		t.Fatal(err)
 	}
+	return r.NoticeMessageID
 }
 
 func discussionEnd(t *testing.T, s *Store, scope MemberToolScope) {
@@ -85,8 +90,59 @@ func discussionCheckPublication(t *testing.T, s *Store, r domain.ChatDiscussionR
 	if r.Event != want {
 		t.Fatalf("wrong event: %+v; want %+v", r.Event, want)
 	}
-	if stored, err := s.GetMessage(ctx, m.GroupID, m.ID); err != nil || !reflect.DeepEqual(stored, m) {
+	stored, err := s.GetMessage(ctx, m.GroupID, m.ID)
+	stored.Discussion = nil // The read-side projection is not part of the publication receipt.
+	if err != nil || !reflect.DeepEqual(stored, m) {
 		t.Fatalf("not a regular visible message: %+v %v", stored, err)
+	}
+}
+
+// The timeline carries the optional refinement, not the receipt's derived requirement.
+func discussionWire(kind, root string, invite domain.ChatDiscussionEvent, refinement string) map[string]string {
+	want := map[string]string{"kind": kind, "root_message_id": root, "invitation_message_id": invite.MessageID,
+		"inviter_id": invite.ActorID, "assignee_id": invite.RecipientID, "expected_reply": refinement}
+	if invite.ParentInvitationMessageID != "" {
+		want["parent_invitation_message_id"] = invite.ParentInvitationMessageID
+	}
+	return want
+}
+
+func discussionCheckTimeline(t *testing.T, s *Store, groupID string, want map[string]map[string]string) {
+	t.Helper()
+	seen := 0
+	options := MessageListOptions{Limit: 2}
+	for {
+		page, err := s.ListMessages(ctx, groupID, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range page.Items {
+			w, ok := want[m.ID]
+			if !ok {
+				t.Fatalf("unexpected timeline message: %+v", m)
+			}
+			if exact, err := s.GetMessage(ctx, groupID, m.ID); err != nil || !reflect.DeepEqual(exact, m) {
+				t.Fatalf("page/detail mismatch: %+v / %+v %v", m, exact, err)
+			}
+			var wire struct {
+				Discussion map[string]string `json:"discussion"`
+			}
+			data, err := json.Marshal(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := json.Unmarshal(data, &wire); err != nil || !reflect.DeepEqual(wire.Discussion, w) {
+				t.Fatalf("%s discussion = %v, %v; want %v", m.ID, wire.Discussion, err, w)
+			}
+			seen++
+		}
+		if page.NextCursor == nil {
+			break
+		}
+		options.Before = page.NextCursor
+	}
+	if seen != len(want) {
+		t.Fatalf("visible messages = %d; want %d", seen, len(want))
 	}
 }
 
@@ -115,7 +171,8 @@ func TestChatDiscussionFlow(t *testing.T) {
 			if got, err := f.s.ReadChatDiscussionContext(ctx, a, ca); err != nil || got != nil {
 				t.Fatalf("plain human source had a handoff: %+v %v", got, err)
 			}
-			discussionAssess(t, f.s, a, ca)
+			want := map[string]map[string]string{origin.ID: nil}
+			want[discussionAssess(t, f.s, a, ca)] = nil
 			resolve := domain.ChatDiscussionAction{Kind: "resolve", Content: "给提问者的公开结论。@旁观者"}
 			if hops == 0 {
 				r := discussionApply(t, f.s, a, ca, "resolve", resolve)
@@ -124,11 +181,14 @@ func TestChatDiscussionFlow(t *testing.T) {
 				dispatchReject(t, f.s, "讨论事件投递集合不可修改", coordinatorSQL{`INSERT INTO deliveries(id,message_id,conversation_id,recipient_id,group_id,topic_id,created_at)
 				 SELECT ?,?,conversation_id,recipient_id,group_id,topic_id,created_at FROM deliveries WHERE id=?`,
 					[]any{"extra-wake", r.Message.ID, origin.Deliveries[0].ID}})
+				want[r.Message.ID] = nil
+				discussionCheckTimeline(t, f.s, f.groupID, want)
 				return
 			}
 
 			invite := domain.ChatDiscussionAction{Kind: "invite", Content: "请核对三条摘要要点。@旁观者", RecipientID: f.b, ExpectedReply: "有依据的要点列表"}
 			first := discussionApply(t, f.s, a, ca, "first", invite)
+			rootClaim, rootCandidate := a.Claim, ca
 			discussionCheckPublication(t, f.s, first, origin, "invite", origin.ID, f.a, f.b, "", "", invite.Content, invite.ExpectedReply, 1)
 			legacy := MemberToolMessageInput{Content: "额外唤醒", RecipientIDs: []string{f.b}}
 			if _, err := f.s.SendMessageForChatIntake(ctx, a, ca, legacy, "first"); !errors.Is(err, ErrConflict) {
@@ -153,7 +213,7 @@ func TestChatDiscussionFlow(t *testing.T) {
 			if _, err := s.ApplyChatDiscussion(ctx, b, cb, reply, "answer"); !errors.Is(err, ErrMemberToolDenied) {
 				t.Fatalf("invited turn wrote without assessment: %v", err)
 			}
-			discussionAssess(t, s, b, cb)
+			want[discussionAssess(t, s, b, cb)] = nil
 			sourceID := first.Message.ID
 			events := []domain.ChatDiscussionReceipt{first}
 			if hops == 2 {
@@ -168,7 +228,7 @@ func TestChatDiscussionFlow(t *testing.T) {
 				events = append(events, child)
 				c, cc := discussionArrive(t, s, f.groupID, child.Event.DeliveryID)
 				discussionCheckContext(t, s, c, cc, origin, f.a, cID, child.Message.ID, child.Message.ID, child.Message.ID, false, events...)
-				discussionAssess(t, s, c, cc)
+				want[discussionAssess(t, s, c, cc)] = nil
 				over := domain.ChatDiscussionAction{Kind: "invite", Content: "请再加一位成员。", RecipientID: dID}
 				if _, err := s.ApplyChatDiscussion(ctx, c, cc, over, "at-limit"); !errors.Is(err, ErrMemberToolDenied) {
 					t.Fatalf("accepted third invite without its reserved return: %v", err)
@@ -185,7 +245,7 @@ func TestChatDiscussionFlow(t *testing.T) {
 				b, cb = discussionArrive(t, s, f.groupID, returned.Event.DeliveryID)
 				sourceID = returned.Message.ID
 				discussionCheckContext(t, s, b, cb, origin, f.a, f.b, first.Message.ID, sourceID, sourceID, false, events...)
-				discussionAssess(t, s, b, cb)
+				want[discussionAssess(t, s, b, cb)] = nil
 				if _, err := s.ApplyChatDiscussion(ctx, b, cb, over, "second-child"); !errors.Is(err, ErrMemberToolDenied) {
 					t.Fatalf("parent opened a second child: %v", err)
 				}
@@ -219,7 +279,7 @@ func TestChatDiscussionFlow(t *testing.T) {
 			}
 			a, ca = discussionArrive(t, s, f.groupID, answer.Event.DeliveryID)
 			discussionCheckContext(t, s, a, ca, origin, f.a, f.a, "", answer.Message.ID, answer.Message.ID, false, events...)
-			discussionAssess(t, s, a, ca)
+			want[discussionAssess(t, s, a, ca)] = nil
 			if _, err := s.ApplyChatDiscussion(ctx, a, ca, invite, "first"); !errors.Is(err, ErrConflict) {
 				t.Fatalf("same actor/key/action on another candidate did not conflict: %v", err)
 			}
@@ -243,6 +303,178 @@ func TestChatDiscussionFlow(t *testing.T) {
 				}
 			}
 			dispatchAssertFK(t, s)
+
+			// Read the full path through ordinary pages after reopening. The
+			// answer's invitation need not be on the same page.
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			reopened := queueHandle(t, f.path, false)
+			want[first.Message.ID] = discussionWire("invite", origin.ID, first.Event, invite.ExpectedReply)
+			want[answer.Message.ID] = discussionWire("reply", origin.ID, first.Event, invite.ExpectedReply)
+			want[closed.Message.ID] = discussionWire("resolve", origin.ID, first.Event, invite.ExpectedReply)
+			if hops == 2 {
+				child, returned := events[1].Event, events[2].Event
+				want[child.MessageID] = discussionWire("invite", origin.ID, child, "")
+				want[returned.MessageID] = discussionWire("reply", origin.ID, child, "")
+			}
+			discussionCheckTimeline(t, reopened, f.groupID, want)
+			if _, err := reopened.GetMessage(ctx, f.otherID, answer.Message.ID); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("foreign group read discussion answer: %v", err)
+			}
+			// Bypass write guards only to exercise damaged or older optional evidence.
+			coordinationDecideExec(t, reopened, `PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;
+				DROP TRIGGER chat_discussion_events_update;`)
+			if hops == 1 {
+				plain, err := reopened.GetMessage(ctx, f.groupID, first.Message.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				coordinationDecideExec(t, reopened, `DROP TRIGGER message_command_sources_update;
+					DROP TRIGGER messages_identity; DROP TRIGGER chat_discussion_deliveries_identity;
+					DROP TRIGGER chat_intake_executions_update;`)
+				rootDigest := sha256.Sum256([]byte(rootClaim.Token))
+				for id := range want {
+					want[id] = nil
+				}
+				for _, fault := range []struct {
+					name, update, id string
+					bad, good        any
+				}{
+					{"event_topic", `UPDATE chat_discussion_events SET topic_id=? WHERE message_id=?`, first.Message.ID, "other-topic", topic},
+					{"invitation_message_topic", `UPDATE messages SET topic_id=? WHERE id=?`, first.Message.ID, "other-topic", topic},
+					{"original_topic", `UPDATE messages SET topic_id=? WHERE id=?`, origin.ID, "other-topic", topic},
+					{"original_source", `UPDATE message_command_sources SET kind=? WHERE message_id=?`, origin.ID, "local_user_policy", "local_user_chat"},
+					{"delivery_topic", `UPDATE deliveries SET topic_id=? WHERE id=?`, first.Event.DeliveryID, "other-topic", topic},
+					{"wrong_delivery", `UPDATE chat_discussion_events SET delivery_id=? WHERE message_id=?`, first.Message.ID, origin.Deliveries[0].ID, first.Event.DeliveryID},
+					{"null_recipient", `UPDATE chat_discussion_events SET recipient_id=? WHERE message_id=?`, first.Message.ID, nil, f.b},
+					{"member_command_turn", `UPDATE message_command_sources SET turn_id=? WHERE message_id=?`, first.Message.ID, b.Claim.TurnID, rootClaim.TurnID},
+					{"member_command_claim", `UPDATE message_command_sources SET claim_digest=? WHERE message_id=?`, first.Message.ID, make([]byte, 32), rootDigest[:]},
+					{"captured_source", `UPDATE chat_intake_executions SET source_id=? WHERE candidate_id=?`, rootCandidate, "forged-source", origin.SourceID},
+				} {
+					t.Run(fault.name, func(t *testing.T) {
+						coordinationDecideExec(t, reopened, fault.update, fault.bad, fault.id)
+						defer coordinationDecideExec(t, reopened, fault.update, fault.good, fault.id)
+						discussionCheckTimeline(t, reopened, f.groupID, want)
+						if m, err := reopened.GetMessage(ctx, f.groupID, first.Message.ID); err != nil ||
+							m.Content != plain.Content || !reflect.DeepEqual(m.Deliveries, plain.Deliveries) {
+							t.Fatalf("bad relation changed the public message or live deliveries: %+v, %v", m, err)
+						}
+					})
+				}
+			} else {
+				f.s = reopened
+				sameTopic := discussionUser(t, f, topic)
+				crossTopic := discussionUser(t, f, "other-topic")
+				want[sameTopic.ID], want[crossTopic.ID] = nil, nil
+				child, returned := events[1].Event, events[2].Event
+				const sourceUpdate = `UPDATE chat_discussion_events SET source_message_id=? WHERE message_id=?`
+				for _, fault := range []struct {
+					name, update, id, dependent string
+					bad, good                   any
+				}{
+					{"reply_forged_same_topic_source", sourceUpdate, answer.Message.ID, closed.Message.ID, sameTopic.ID, answer.Event.SourceMessageID},
+					{"reply_step_gap", `UPDATE chat_discussion_events SET step=? WHERE message_id=?`, answer.Message.ID, closed.Message.ID, 6, 4},
+					{"resolve_cross_topic_source", sourceUpdate, closed.Message.ID, "", crossTopic.ID, closed.Event.SourceMessageID},
+					{"relay_wrong_return", `UPDATE chat_discussion_events SET related_invitation_id=? WHERE message_id=?`, returned.MessageID, answer.Message.ID, first.Message.ID, child.MessageID},
+				} {
+					t.Run(fault.name, func(t *testing.T) {
+						coordinationDecideExec(t, reopened, fault.update, fault.bad, fault.id)
+						defer coordinationDecideExec(t, reopened, fault.update, fault.good, fault.id)
+						damaged := maps.Clone(want)
+						damaged[fault.id] = nil
+						if fault.dependent != "" {
+							damaged[fault.dependent] = nil
+						}
+						discussionCheckTimeline(t, reopened, f.groupID, damaged)
+					})
+				}
+
+				// A relay missing its recorded parent is not a new root invitation or a valid return.
+				coordinationDecideExec(t, reopened, `UPDATE chat_discussion_events SET related_invitation_id=NULL WHERE message_id=?`, child.MessageID)
+				want[child.MessageID], want[returned.MessageID], want[answer.Message.ID] = nil, nil, nil
+				discussionCheckTimeline(t, reopened, f.groupID, want)
+			}
+		})
+	}
+}
+
+func TestChatDiscussionTimelineInterruptedHead(t *testing.T) {
+	for _, kind := range []string{domain.ChatDiscussionInvite, domain.ChatDiscussionReply} {
+		t.Run(kind, func(t *testing.T) {
+			f, _, head, incoming := discussionSerialHandoff(t)
+			s := f.s
+			if kind == domain.ChatDiscussionReply {
+				queueEvent(t, s, incoming, provider.AcceptedEvent, "", "")
+				peer, cb := discussionCapture(t, s, incoming)
+				discussionAssess(t, s, peer, cb)
+				head = discussionApply(t, s, peer, cb, "reply", domain.ChatDiscussionAction{Kind: kind, Content: "已核对结论。"})
+				if _, err := s.ApplyTurnReceipt(ctx, incoming, queueReceipt(provider.OutcomeSucceeded)); err != nil {
+					t.Fatal(err)
+				}
+				receiver, _ := discussionArrive(t, s, f.groupID, head.Event.DeliveryID)
+				incoming = receiver.Claim
+			}
+			checkNewest := func(wantReason string, hasDiscussion bool) *Cursor {
+				t.Helper()
+				page, err := s.ListMessages(ctx, f.groupID, MessageListOptions{Limit: 1})
+				if err != nil || len(page.Items) != 1 || page.NextCursor == nil {
+					t.Fatalf("newest page: %+v, %v", page, err)
+				}
+				m := page.Items[0]
+				if m.ID != head.Message.ID || m.Content != head.Message.Content || m.DiscussionClosureReason != wantReason {
+					t.Fatalf("page head = %+v; want %s with reason %q", m, head.Message.ID, wantReason)
+				}
+				if hasDiscussion && (m.Discussion == nil || m.Discussion.Kind != kind) || !hasDiscussion && m.Discussion != nil {
+					t.Fatalf("unexpected discussion projection: %+v", m.Discussion)
+				}
+				if exact := discussionCheckMessageClosure(t, s, f.groupID, m.ID, wantReason); !reflect.DeepEqual(exact, m) {
+					t.Fatalf("page/detail mismatch: %+v / %+v", m, exact)
+				}
+				return page.NextCursor
+			}
+			checkNewest("", true)
+			if _, err := s.ApplyTurnReceipt(ctx, incoming, queueReceipt(provider.OutcomeFailed)); err != nil {
+				t.Fatal(err)
+			}
+			before := messageSequenceSnapshot(t, s)
+			cursor := checkNewest("讨论已中断：接收成员的轮次异常结束，未提交结构化讨论动作", true)
+			older, err := s.ListMessages(ctx, f.groupID, MessageListOptions{Limit: 5, Before: cursor})
+			if err != nil || len(older.Items) == 0 || older.NextCursor != nil {
+				t.Fatalf("older page: %+v, %v", older, err)
+			}
+			for _, m := range older.Items {
+				if m.ID == head.Message.ID || m.DiscussionClosureReason != "" {
+					t.Fatalf("closure escaped its page and head: %+v", m)
+				}
+			}
+			messageSequencePreserved(t, s, before)
+
+			// A terminal receipt cannot make an unverified publication into a discussion link.
+			coordinationDecideExec(t, s, "DROP TRIGGER message_command_sources_update")
+			coordinationDecideExec(t, s, "UPDATE message_command_sources SET claim_digest=? WHERE message_id=?", make([]byte, 32), head.Message.ID)
+			checkNewest("", false)
+		})
+	}
+}
+
+func TestChatDiscussionTimelineReadError(t *testing.T) {
+	for _, fault := range []struct{ name, ddl, missing string }{
+		{"missing_column", `ALTER TABLE chat_discussion_events RENAME COLUMN expected_reply TO unexpected_reply`, "expected_reply"},
+		{"missing_kind", `ALTER TABLE chat_discussion_events RENAME COLUMN kind TO event_kind`, "kind"},
+		{"missing_events", `DROP TABLE chat_discussion_events`, "chat_discussion_events"},
+		{"missing_discussions", `DROP TABLE chat_discussions`, "chat_discussions"},
+	} {
+		t.Run(fault.name, func(t *testing.T) {
+			f := setupMessages(t) // The discussion migration is registered and applied.
+			m := discussionUser(t, f, "discussion")
+			coordinationDecideExec(t, f.s, fault.ddl)
+			if _, err := f.s.ListMessages(ctx, f.groupID, MessageListOptions{}); err == nil || !strings.Contains(err.Error(), fault.missing) {
+				t.Fatalf("timeline hid incompatible evidence schema: %v", err)
+			}
+			if _, err := f.s.GetMessage(ctx, f.groupID, m.ID); err == nil || !strings.Contains(err.Error(), fault.missing) {
+				t.Fatalf("detail hid incompatible evidence schema: %v", err)
+			}
 		})
 	}
 }
@@ -334,18 +566,21 @@ func TestChatDiscussionReplyToDepartedMember(t *testing.T) {
 			f := setupMessages(t)
 			origin := discussionUser(t, f, "discussion", f.a)
 			a, ca := discussionArrive(t, f.s, f.groupID, origin.Deliveries[0].ID)
-			discussionAssess(t, f.s, a, ca)
+			want := map[string]map[string]string{origin.ID: nil}
+			want[discussionAssess(t, f.s, a, ca)] = nil
 			invitation := discussionApply(t, f.s, a, ca, "ask", domain.ChatDiscussionAction{Kind: "invite", Content: "请提出证据。", RecipientID: f.b})
 			discussionEnd(t, f.s, a)
 			coordinationDecideExec(t, f.s, "UPDATE members SET status='left' WHERE id=?", f.a)
 			b, cb := discussionArrive(t, f.s, f.groupID, invitation.Event.DeliveryID)
-			discussionAssess(t, f.s, b, cb)
+			want[discussionAssess(t, f.s, b, cb)] = nil
 			legacy := MemberToolMessageInput{Content: "公开补充一条线索。"}
 			sendPublic := func() {
 				t.Helper()
-				if public, err := f.s.SendMessageForChatIntake(ctx, b, cb, legacy, "public"); err != nil || len(public.Deliveries) != 0 {
+				public, err := f.s.SendMessageForChatIntake(ctx, b, cb, legacy, "public")
+				if err != nil || len(public.Deliveries) != 0 {
 					t.Fatalf("optional legacy public message: %+v, %v", public, err)
 				}
+				want[public.ID] = nil
 			}
 			if publicBefore {
 				sendPublic()
@@ -365,6 +600,14 @@ func TestChatDiscussionReplyToDepartedMember(t *testing.T) {
 				t.Fatalf("public fallback replay: %+v", replay)
 			}
 			messageSequencePreserved(t, f.s, before)
+
+			// Fencing the live claim after a restart does not rewrite the public reply's recorded claim.
+			if n, err := f.s.RecoverInFlight(ctx); err != nil || n != 1 {
+				t.Fatalf("recover active reply turn: %d, %v", n, err)
+			}
+			want[invitation.Message.ID] = discussionWire("invite", origin.ID, invitation.Event, "")
+			want[r.Message.ID] = discussionWire("reply", origin.ID, invitation.Event, "")
+			discussionCheckTimeline(t, f.s, f.groupID, want)
 		})
 	}
 }
@@ -376,7 +619,7 @@ func TestChatDiscussionV22LegacyDirectedMessage(t *testing.T) {
 	f := setupMessages(t)
 	origin := discussionUser(t, f, "legacy", f.a)
 	a, ca := discussionArrive(t, f.s, f.groupID, origin.Deliveries[0].ID)
-	discussionAssess(t, f.s, a, ca)
+	assessment := discussionAssess(t, f.s, a, ca)
 	legacy := MemberToolMessageInput{Content: "旧版本无结构提问。", RecipientIDs: []string{f.b}}
 	// Seed the V22 member command receipt without the post-upgrade slot query.
 	plain, err := f.s.SendMessageForTool(ctx, a, legacy, "old-directed")
@@ -386,14 +629,19 @@ func TestChatDiscussionV22LegacyDirectedMessage(t *testing.T) {
 	if stored := discussionCheckMessageClosure(t, f.s, f.groupID, plain.ID, ""); !reflect.DeepEqual(stored, plain) {
 		t.Fatalf("pre-v24 read changed the message: %+v", stored)
 	}
+	want := map[string]map[string]string{origin.ID: nil, assessment: nil, plain.ID: nil}
+	discussionCheckTimeline(t, f.s, f.groupID, want)
+	migrations = current
+	// The current registry alone does not mean the migration has run on this handle.
+	discussionCheckTimeline(t, f.s, f.groupID, want)
 	if err := f.s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	migrations = current
 	s := queueHandle(t, f.path, false)
 	if replay, err := s.SendMessageForChatIntake(ctx, a, ca, legacy, "old-directed"); err != nil || !reflect.DeepEqual(replay, plain) {
 		t.Fatalf("upgrade changed legacy replay or sender: %+v %v", replay, err)
 	}
+	discussionCheckTimeline(t, s, f.groupID, want)
 	invite := domain.ChatDiscussionAction{Kind: "invite", Content: legacy.Content, RecipientID: f.b}
 	if _, err := s.ApplyChatDiscussion(ctx, a, ca, invite, "old-directed"); !errors.Is(err, ErrConflict) {
 		t.Fatalf("structured key bypassed legacy namespace: %v", err)

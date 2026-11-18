@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { isDefinitiveRejection, sendMessage } from "./api";
+import { decodeMessage, isDefinitiveRejection, listMessages, sendMessage } from "./api";
 import type { Message } from "./api";
 import { group, json, other } from "./test/groups";
 
@@ -83,6 +83,101 @@ it.each([
   expect(error).toMatchObject({ status: 201, code: "invalid_response" });
   expect(isDefinitiveRejection(error)).toBe(false);
 });
+it("drops incompatible discussion metadata without losing a matching message receipt", async () => {
+  const discussion = { kind: "invite", root_message_id: "question-1", invitation_message_id: message.id,
+    inviter_id: "member-1", assignee_id: "member-2", expected_reply: "核对结论" };
+  const input = { content, discussion };
+  transport.mockResolvedValueOnce(json({ ...message, discussion }, 201));
+  expect(await sendMessage(group.id, input, "discussion-is-read-only")).toEqual(message);
+  expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toEqual({ content });
+});
+
+const invitation = { ...message, sender_id: "inviter", source_kind: "member", source_id: "invite-command",
+  discussion: { kind: "invite", root_message_id: "question", invitation_message_id: message.id,
+    inviter_id: "inviter", assignee_id: delivery.recipient_id, expected_reply: "核对结论" } } satisfies Message;
+const reply = { ...invitation, id: "reply", sender_id: delivery.recipient_id, source_id: "reply-command", deliveries: [],
+  discussion: { ...invitation.discussion, kind: "reply" } } satisfies Message;
+const summary = { ...invitation, id: "summary", source_id: "summary-command", deliveries: [],
+  discussion: { ...invitation.discussion, kind: "resolve" } } satisfies Message;
+const returnDelivery = { ...delivery, message_id: reply.id, recipient_id: invitation.sender_id };
+
+it("preserves both public and targeted replies, invitations, summaries and legacy source-optional wire", async () => {
+  const { source_kind: _kind, source_id: _id, ...legacyInvitation } = invitation;
+  const items = [legacyInvitation, reply, { ...reply, id: "targeted", deliveries: [{ ...returnDelivery, message_id: "targeted" }] }, summary];
+  transport.mockResolvedValueOnce(json({ items, next_cursor: "" }));
+  expect((await listMessages(group.id)).items).toEqual(items);
+});
+it.each([
+  ["invitation without a delivery", invitation, []],
+  ["invitation delivered to the wrong member", invitation, [{ ...delivery, recipient_id: invitation.sender_id }]],
+  ["invitation with an extra delivery", invitation, [delivery, { ...delivery, id: "extra" }]],
+  ["invitation without a conversation ID", invitation, [{ ...delivery, conversation_id: "" }]],
+  ["invitation with a malformed delivery ID", invitation, [{ ...delivery, id: " delivery-1" }]],
+  ["reply delivered to the wrong member", reply, [{ ...returnDelivery, recipient_id: reply.sender_id }]],
+  ["reply with an extra delivery", reply, [returnDelivery, { ...returnDelivery, id: "extra" }]],
+  ["reply with an oversized conversation ID", reply, [{ ...returnDelivery, conversation_id: "会".repeat(1366) }]],
+  ["reply with an oversized delivery ID", reply, [{ ...returnDelivery, id: "d".repeat(4097) }]],
+  ["summary with a delivery", summary, [{ ...delivery, message_id: summary.id }]],
+] as const)("keeps a message row but not the relation: %s", async (_label, { discussion, ...row }, deliveries) => {
+  const plain = { ...row, deliveries };
+  transport.mockResolvedValueOnce(json({ items: [{ ...plain, discussion }], next_cursor: "next" }));
+  expect(await listMessages(group.id)).toEqual({ items: [plain], next_cursor: "next" });
+});
+
+it("omits a summary relation with an unloaded parent invitation", async () => {
+  const { discussion, ...row } = summary;
+  transport.mockResolvedValueOnce(json({ items: [{ ...row, discussion: { ...discussion, parent_invitation_message_id: "earlier-parent" } }], next_cursor: "" }));
+  expect((await listMessages(group.id)).items).toStrictEqual([row]);
+});
+
+const notStarted = "接收成员的讨论轮未启动";
+const departed = "接收成员已离开，讨论交接未启动";
+const noAction = "讨论已中断：接收成员已完成本轮，但未提交结构化讨论动作";
+const interrupted = "讨论已中断：接收成员的轮次异常结束，未提交结构化讨论动作";
+const accepted = { ...delivery, state: "accepted", turn_id: "receiving-turn" };
+const failed = { ...accepted, state: "failed", error: "执行未启动" };
+const unclaimed = { ...delivery, state: "failed", error: departed };
+it.each([
+  ["accepted Turn that ended abnormally", accepted, interrupted],
+  ["accepted Turn that completed without a handoff", accepted, noAction],
+  ["bound Turn that did not start", failed, notStarted],
+  ["departure after binding a Turn", failed, departed],
+  ["unclaimed departure", unclaimed, departed],
+] as const)("preserves closure for consistent delivery: %s", (_label, receipt, reason) => {
+  const closed = { ...invitation, deliveries: [receipt], discussion_closure_reason: reason };
+  expect(decodeMessage(closed)).toEqual(closed);
+});
+it.each([
+  ["acceptance without a Turn", { ...accepted, turn_id: "" }, interrupted],
+  ["acceptance with an error", { ...accepted, error: "投递失败" }, interrupted],
+  ["acceptance with an unstarted reason", accepted, notStarted],
+  ["acceptance with a departure reason", accepted, departed],
+  ["acceptance with prose", accepted, "本轮已核对结论，无需交接。"],
+  ["bound failure without an error", { ...failed, error: "" }, notStarted],
+  ["bound failure with a blank error", { ...failed, error: " " }, notStarted],
+  ["bound failure with an abnormal-exit reason", failed, interrupted],
+  ["bound failure with an unknown execution result", { ...failed, error: "执行结果未知，需对账后再处理" }, notStarted],
+  ["abnormal exit claimed for an unknown execution result", { ...failed, error: "执行结果未知，需对账后再处理" }, interrupted],
+  ["bound failure with the unclaimed marker", { ...failed, error: departed }, departed],
+  ["unclaimed failure without the marker", { ...failed, turn_id: "" }, notStarted],
+  ["departure text without the matching delivery marker", { ...unclaimed, error: `${departed} ` }, departed],
+  ["departure marker with unrelated closure text", unclaimed, notStarted],
+  ["departure with a malformed Turn ID", { ...unclaimed, turn_id: " " }, departed],
+  ["pending delivery", delivery, interrupted],
+] as const)("discards closure but keeps the relation for %s", (_label, receipt, reason) => {
+  const row = { ...invitation, deliveries: [receipt] };
+  expect(decodeMessage({ ...row, discussion_closure_reason: reason })).toEqual(row);
+});
+it("discards malformed closure text and closure without a verified targeted member handoff", () => {
+  const row = { ...invitation, deliveries: [accepted] };
+  for (const invalid of [null, 1, {}, "", "   ", ` ${interrupted}`, `${interrupted}\n附注`, "答".repeat(150)]) {
+    expect(decodeMessage({ ...row, discussion_closure_reason: invalid })).toEqual(row);
+  }
+  for (const plain of [message, reply, summary, { ...row, discussion: null }, { ...row, source_kind: "unknown" as const, source_id: undefined }]) {
+    expect(decodeMessage({ ...plain, discussion_closure_reason: interrupted })).toEqual(plain);
+  }
+});
+
 it("preserves known and future delivery states as data without promoting acknowledgements", async () => {
   const receipt = { ...message, deliveries: ["queued", "accepted", "failed", "future-state"].map((state, index) => ({ ...delivery, id: `delivery-${index}`, state })) };
   transport.mockResolvedValueOnce(json(receipt, 201));

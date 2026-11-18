@@ -68,6 +68,9 @@ func (s *Store) ListMessages(ctx context.Context, groupID string, options Messag
 	if err := messageSourcesInTx(ctx, tx, page.Items); err != nil {
 		return Page[domain.Message]{}, storeError("读取消息来源失败", err)
 	}
+	if err := projectMessageDiscussionsInTx(ctx, tx, groupID, page.Items); err != nil {
+		return Page[domain.Message]{}, err
+	}
 	if err := tx.Commit(); err != nil {
 		return Page[domain.Message]{}, storeError("读取消息历史失败", err)
 	}

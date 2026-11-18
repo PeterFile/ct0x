@@ -87,6 +87,159 @@ it("uses newly supplied members without fetching or caching a separate roster", 
   expect(within(record).getByText("未载入成员")).toBeVisible();
   expect(fetch).toHaveBeenCalledTimes(1);
 });
+const question = { ...message, id: "root /+%", topic_id: "discussion-topic", content: "需要核对哪些数据？", deliveries: [],
+  source_kind: "local_user_chat" as const, source_id: "question-command" };
+const helper = { ...member, id: "discussion-helper", name: "复核员", status: "left" };
+const invitation = { ...question, id: "invite-1", sender_id: member.id, source_kind: "member" as const, source_id: "invite-command",
+  content: "请独立核对这份数据", discussion: { kind: "invite" as const, root_message_id: question.id, invitation_message_id: "invite-1",
+    inviter_id: member.id, assignee_id: helper.id, expected_reply: "列出待复核的数据项" },
+  deliveries: [{ ...delivery, message_id: "invite-1", recipient_id: helper.id, state: "accepted", turn_id: "receiving-turn" }] };
+const reply = { ...invitation, id: "reply-1", sender_id: helper.id, source_id: "reply-command", content: "这里是核对意见",
+  discussion: { ...invitation.discussion, kind: "reply" as const }, deliveries: [] };
+const resolution = { ...invitation, id: "resolve-1", source_id: "resolve-command", content: "综合以上意见，这是本次讨论的结论",
+  discussion: { ...invitation.discussion, kind: "resolve" as const }, deliveries: [] };
+
+it("links persisted invitation, return and resolution in the existing timeline without annotating legacy prose", async () => {
+  const legacy = { ...message, deliveries: [], content: `@${member.name} 请邀请并答复这个问题。`, discussion: null };
+  reads.mockResolvedValueOnce(page([resolution, reply, question, legacy, invitation]));
+  render(<main aria-label="讨论"><Discussion groupId={group.id} members={{ [group.id]: [member, helper,
+    { ...member, name: "外群同 ID", group_id: other.id }] }} /></main>);
+  await panel().findByRole("article", { name: `消息 ${resolution.id}` });
+  for (const [row, label, actors] of [
+    [invitation, "邀请协作", `${member.name} 邀请 ${helper.name}（已离开）`],
+    [reply, "回送答复", `${helper.name}（已离开） 回送给 ${member.name}`],
+    [resolution, "讨论总结", `${member.name} 向群组总结`],
+  ] as const) {
+    const record = article(row.id);
+    const summary = within(record).getByText(label, { selector: "summary strong" }).closest("summary")!;
+    const disclosure = summary.closest("details")!;
+    expect(summary).toBeVisible(); expect(summary).toHaveTextContent(actors);
+    expect(record).not.toHaveTextContent("外群同 ID");
+    expect(disclosure).not.toHaveAttribute("open");
+    fireEvent.click(summary);
+    const evidence = within(disclosure);
+    const rootLink = evidence.getByRole("link", { name: "原始问题" });
+    expect(rootLink).toHaveAttribute("href", `#${article(question.id).id}`);
+    expect(article(question.id)).toHaveAttribute("tabindex", "-1");
+    expect(evidence.getByText(question.content)).toBeVisible();
+    if (row !== invitation) {
+      expect(evidence.getByRole("link", { name: "对应邀请" })).toHaveAttribute("href", `#${article(invitation.id).id}`);
+      expect(evidence.getByText(invitation.content)).toBeVisible();
+    }
+    for (const value of [question.id, invitation.id, member.id, helper.id, invitation.discussion.expected_reply]) {
+      expect(evidence.getByText(value, { exact: true })).toBeVisible();
+    }
+    expect(within(record).getByText("成员消息", { exact: true })).toBeVisible();
+    expect(within(record).getByText(row === invitation ? /投递详情.*CLI已接收 1/ : /投递详情.*暂无投递记录/)).toBeVisible();
+    expect(within(record).getByRole("button", { name: `转为任务，消息 ${row.id}` })).toBeEnabled();
+  }
+  for (const row of [question, legacy]) expect(article(row.id).querySelectorAll("summary")).toHaveLength(1);
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
+it("shows the interrupted reply on its row when the existing newest-page poll supplies the reason", async () => {
+  const target = { ...reply, deliveries: [{ ...delivery, message_id: reply.id, recipient_id: member.id,
+    state: "accepted", turn_id: "receiving-turn" }] };
+  const reason = "讨论已中断：接收成员的轮次异常结束，未提交结构化讨论动作";
+  vi.useFakeTimers();
+  try {
+    reads.mockResolvedValueOnce(page([target, invitation, question]));
+    render(<main aria-label="讨论"><Discussion groupId={group.id} members={{ [group.id]: [member, helper] }} /></main>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const record = article(target.id);
+    expect(within(record).getByText(/投递详情.*CLI已接收 1/)).toBeVisible();
+    expect(panel().queryByText(reason)).not.toBeInTheDocument();
+
+    reads.mockResolvedValueOnce(page([{ ...target, discussion_closure_reason: reason }, invitation, question]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(within(record).getByText(reason)).toBeVisible();
+    expect(panel().getAllByText(reason)).toHaveLength(1);
+    expect(within(record).getByText(/投递详情.*CLI已接收 1/)).toBeVisible();
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(Array(2).fill(`/api/v1/groups/${group.id}/messages?limit=50`));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("refreshes an older accepted handoff in place without starting another polling path", async () => {
+  const latest = Array.from({ length: 50 }, (_, index) => ({ ...message, id: `newest-${index}`, deliveries: [],
+    created_at: "2026-10-30T12:01:00Z" }));
+  const reason = "讨论已中断：接收成员的轮次异常结束，未提交结构化讨论动作";
+  const flush = (ms = 0) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+  vi.useFakeTimers();
+  try {
+    reads.mockResolvedValueOnce(page(latest, "older+/"));
+    render(<main aria-label="讨论"><Discussion groupId={group.id} members={{ [group.id]: [member, helper] }} /></main>);
+    await flush();
+    expect(panel().queryByRole("article", { name: `消息 ${invitation.id}` })).not.toBeInTheDocument();
+    reads.mockResolvedValueOnce(page([invitation, question]));
+    fireEvent.click(panel().getByRole("button", { name: "加载更早消息" }));
+    await flush();
+    const older = within(article(invitation.id));
+    expect(older.getByText(/投递详情.*CLI已接收 1/)).toBeVisible();
+
+    reads.mockResolvedValueOnce(page(latest, "older+/"));
+    await flush(5000);
+    expect(details).not.toHaveBeenCalled();
+    expect(older.queryByText(reason)).not.toBeInTheDocument();
+    expect(panel().getByText("最新页自动更新")).toBeVisible();
+
+    const pending = deferred<Response>();
+    details.mockReturnValueOnce(pending.promise);
+    const button = older.getByRole("button", { name: `刷新消息 ${invitation.id} 讨论状态` });
+    expect(button).toBeVisible();
+    fireEvent.click(button);
+    expect(button).toBeDisabled();
+    await act(async () => pending.resolve(json({ ...invitation, discussion_closure_reason: reason })));
+    expect(older.getByText(reason)).toBeVisible();
+    expect(older.getByText(/投递详情.*CLI已接收 1/)).toBeVisible();
+    expect(button).toBeEnabled();
+    expect(panel().getAllByRole("article")).toHaveLength(latest.length + 2);
+    const listURL = `/api/v1/groups/${group.id}/messages?limit=50`;
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual([
+      listURL, `${listURL}&before=older%2B%2F`, listURL, `/api/v1/groups/${group.id}/messages/${invitation.id}`,
+    ]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("keeps unloaded relation IDs, but does not assert provenance from contradictory records", async () => {
+  const unloaded = { ...reply, id: "unloaded-reply", sender_id: "missing-assignee",
+    discussion: { ...reply.discussion, root_message_id: "earlier-question", invitation_message_id: "earlier-invitation",
+      parent_invitation_message_id: "earlier-parent", assignee_id: "missing-assignee", inviter_id: "missing-inviter" } };
+  const otherTopic = { ...question, id: "other-topic-root", topic_id: "different-topic" };
+  const wrongTopic = { ...reply, id: "wrong-topic", discussion: { ...reply.discussion,
+    root_message_id: otherTopic.id, invitation_message_id: "not-loaded" } };
+  const policy = { ...question, id: "policy-row", source_kind: "local_user_policy", content: "不是用户问题" };
+  const fromPolicy = { ...invitation, id: "from-policy", discussion: { ...invitation.discussion,
+    invitation_message_id: "from-policy", root_message_id: policy.id },
+    deliveries: [{ ...invitation.deliveries[0], message_id: "from-policy" }] };
+  const wrongRecipient = { ...reply, id: "wrong-recipient", discussion: { ...reply.discussion, inviter_id: "other-inviter" } };
+  const wrongSender = { ...reply, id: "wrong-sender", sender_id: member.id };
+  const wrongSource = { ...reply, id: "wrong-source", source_kind: "platform" };
+  const oversized = { ...reply, id: "oversized", discussion: { ...unloaded.discussion, assignee_id: helper.id, expected_reply: "答".repeat(5500) } };
+  const mismatches = [wrongTopic, fromPolicy, wrongRecipient, wrongSender, wrongSource, oversized];
+  reads.mockResolvedValueOnce(page([unloaded, question, invitation, otherTopic, policy, ...mismatches]));
+  render(<main aria-label="讨论"><Discussion groupId={group.id} members={{ [group.id]: [member, helper,
+    { ...member, id: "missing-inviter", name: "外群邀请者", group_id: other.id }] }} /></main>);
+  await panel().findByRole("article", { name: `消息 ${unloaded.id}` });
+  const summary = within(article(unloaded.id)).getByText("回送答复", { selector: "summary strong" }).closest("summary")!;
+  expect(summary).not.toHaveTextContent("外群邀请者");
+  fireEvent.click(summary);
+  const evidence = within(summary.closest("details")!);
+  for (const id of ["earlier-question", "earlier-invitation", "earlier-parent", "missing-assignee", "missing-inviter"]) {
+    expect(evidence.getByText(id, { exact: true })).toBeVisible();
+  }
+  expect(evidence.queryByRole("link")).not.toBeInTheDocument();
+  for (const row of mismatches) {
+    expect(article(row.id).querySelectorAll("summary")).toHaveLength(1);
+    expect(within(article(row.id)).queryByRole("button", { name: /讨论状态/ })).not.toBeInTheDocument();
+    expect(within(article(row.id)).getByText(row.content)).toBeVisible();
+  }
+  expect(fetch).toHaveBeenCalledTimes(1);
+});
+
 it("renders exact inert raw text with a truthful topic and folded technical records", async () => {
   const received = raw.replace("@研究员\n", "@研究员\r\n");
   reads.mockResolvedValueOnce(page([{ ...message, content: received, topic_id: "topic-A", deliveries: ["queued", "queued", "accepted", "failed", "future"].map((state, index) => ({ ...delivery, id: `d-${index}`, state })) }]));
@@ -105,7 +258,7 @@ it("renders exact inert raw text with a truthful topic and folded technical reco
   const technical = expandDetails(record);
   for (const value of [message.id, message.sender_id, "topic-A", message.created_at]) expect(technical.getByText(value, { exact: true })).toBeVisible();
   expect(technical.getByText(/状态未知.*future/)).toBeVisible();
-  expect(panel().getByText("自动更新")).toBeVisible();
+  expect(panel().getByText("最新页自动更新")).toBeVisible();
   expect(panel().getByText("已载入 1 条（含话题，片段可能有间隔）。")).toBeVisible();
 });
 it.each([
