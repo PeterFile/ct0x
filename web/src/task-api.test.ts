@@ -38,12 +38,18 @@ const inputReturn = { member_id: "owner-1", turn_id: "turn-1", attempt_id: "atte
   reason: "  超出原授权。  ", question: "是否保持原范围？", returned_at: "2026-10-30T12:00:02.123456789Z" };
 const consumption = { turn_id: "turn-1", consumed_at: "2026-10-30T12:00:01Z" };
 
-it("preserves returned work input evidence and accepts legacy absent or null evidence", async () => {
+it("preserves returned work input evidence and accepts legacy and current confirmation formats", async () => {
   const items = [workInput, { ...workInput, id: "input-null", return: null, consumption: null },
-    { ...workInput, id: "input-confirmed", return: null, consumption },
+    { ...workInput, id: "input-confirmed-legacy", return: null, consumption },
+    { ...workInput, id: "input-confirmed", consumption: { ...consumption, attempt_id: "attempt-1" } },
     { ...workInput, id: "input-returned", return: inputReturn, consumption: null }];
   transport.mockResolvedValueOnce(page(items));
   await expect(listTaskWorkInputs(group.id, task.id)).resolves.toEqual({ items, next_cursor: "" });
+});
+
+it.each([7, null, "", " \t\u0085\u3000"])("rejects a page with invalid confirmation attempt_id (case %#)", async attempt_id => {
+  transport.mockResolvedValueOnce(page([workInput, { ...workInput, id: "input-confirmed", consumption: { ...consumption, attempt_id } }]));
+  await expect(listTaskWorkInputs(group.id, task.id)).rejects.toMatchObject({ status: 200, code: "invalid_response" });
 });
 
 const invalidReturns: [string, object][] = [

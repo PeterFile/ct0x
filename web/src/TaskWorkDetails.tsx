@@ -29,27 +29,26 @@ function WorkSurface<T extends { id: string }>({ groupId, taskId, title, load, r
   renderItem: (item: T) => ReactNode; note?: string;
 }) {
   const [request, setRequest] = useState({ before: "" });
-  const [page, setPage] = useState<{ request: typeof request | null; items: T[]; next: string; error: string; unavailable: boolean }>(
-    { request: null, items: [], next: "", error: "", unavailable: false });
+  const [page, setPage] = useState<{ request: typeof request | null; items: T[]; next: string; error: string }>(
+    { request: null, items: [], next: "", error: "" });
   const pending = page.request !== request;
   useEffect(() => {
     const controller = new AbortController();
     // A closed or replaced panel cannot publish even when the transport ignores abort.
     void load(groupId, taskId, request.before, controller.signal).then(result => {
       if (controller.signal.aborted) return;
-      setPage(previous => ({ request, next: result.next_cursor, error: "", unavailable: false,
+      setPage(previous => ({ request, next: result.next_cursor, error: "",
         items: [...new Map([...(request.before ? previous.items : []), ...result.items].map(item => [item.id, item])).values()] }));
     }, error => {
       if (controller.signal.aborted) return;
-      const unavailable = error instanceof ApiError && error.status === 404;
-      setPage(previous => ({ request, items: unavailable ? [] : previous.items, next: "", unavailable,
-        error: unavailable ? "" : error instanceof ApiError ? error.message : "请求未完成，请重试。" }));
+      setPage(previous => ({ request, items: previous.items, next: "",
+        error: error instanceof ApiError ? error.message : "请求未完成，请重试。" }));
     });
     return () => controller.abort();
   }, [groupId, taskId, request, load]);
   return <section className="tasks-delivery" aria-label={title} aria-busy={pending}>
     <h3>{title}</h3>
-    {pending ? <p role="status">正在读取{title}…</p> : page.unavailable ? <p className="tasks-note">当前服务不提供{title}。</p>
+    {pending ? <p role="status">正在读取{title}…</p>
       : !page.error && !page.items.length ? <p className="tasks-note">未返回{title}记录。</p> : null}
     {page.items.length ? <>
       {note ? <p className="tasks-note">{note}</p> : null}
@@ -101,7 +100,8 @@ function WorkInput({ item }: { item: TaskWorkInput }) {
     <Identifiers entries={[["输入标识", item.id], ["话题标识", item.topic_id], ["来源标识", item.source_id],
       ["用户消息标识", item.reply_message_id], ["通知消息标识", item.notice_message_id], ["触发标识", item.trigger_id],
       ["授权标识", item.mandate_id], ["分配标识", item.assignment_id], ["执行成员标识", item.worker_member_id],
-      ["确认轮次标识", confirmation?.turn_id], ["交回成员标识", returned?.member_id], ["交回轮次标识", returned?.turn_id],
+      ["确认轮次标识", confirmation?.turn_id], ["确认尝试标识", confirmation?.attempt_id],
+      ["交回成员标识", returned?.member_id], ["交回轮次标识", returned?.turn_id],
       ["交回尝试标识", returned?.attempt_id], ["交回通知消息标识", returned?.notice_message_id]]} />
   </>;
 }

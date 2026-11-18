@@ -39,7 +39,7 @@ export type TaskWorkInput = WorkRecord & {
   trigger_id?: string; mandate_id?: string; assignment_id?: string; worker_member_id?: string;
   before_constraint_revision?: number; before_constraint?: string;
   after_constraint_revision?: number; after_constraint?: string;
-  consumption?: { turn_id: string; consumed_at: string } | null;
+  consumption?: { turn_id: string; attempt_id?: string; consumed_at: string } | null;
   return?: TaskWorkInputReturn | null;
 };
 export type TaskWorkReport = WorkRecord & {
@@ -185,7 +185,8 @@ export function listTaskWorkInputs(groupId: string, taskId: string, before = "",
       "before_constraint", "after_constraint"].every(key => value[key] === undefined || typeof value[key] === "string")
     && optionalConstraintRevision(value.before_constraint_revision) && optionalConstraintRevision(value.after_constraint_revision)
     && (value.consumption === undefined || value.consumption === null || (isRecord(value.consumption)
-      && nonblank(value.consumption.turn_id) && validEvidenceTime(value.consumption.consumed_at)))
+      && nonblank(value.consumption.turn_id) && validEvidenceTime(value.consumption.consumed_at)
+      && (!("attempt_id" in value.consumption) || nonblank(value.consumption.attempt_id))))
     && (value.return === undefined || value.return === null
       || ((value.consumption === undefined || value.consumption === null) && validWorkInputReturn(value.return))));
 }

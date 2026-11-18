@@ -34,9 +34,12 @@ afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 it("lazily reads separate scoped work pages and distinguishes explicit handling without leaking a previous selection", async () => {
   vi.useFakeTimers();
   const initial = deferred<Response>(), oldInputs = deferred<Response>(), oldReports = deferred<Response>();
+  const recoveredInput = { ...scope(third), id: "input-retried", content: "重试读取的输入。" };
   const readInputs = vi.fn<typeof fetch>()
     .mockReturnValueOnce(initial.promise).mockReturnValueOnce(oldInputs.promise)
-    .mockResolvedValueOnce(page([rawInput])).mockResolvedValueOnce(new Response("404 page not found\n", { status: 404 }));
+    .mockResolvedValueOnce(page([rawInput])).mockResolvedValueOnce(new Response("404 page not found\n", { status: 404 }))
+    .mockResolvedValueOnce(json({ error: { code: "not_found", message: "接口不存在" } }, 404))
+    .mockResolvedValueOnce(page([recoveredInput]));
   const readReports = vi.fn<typeof fetch>()
     .mockResolvedValueOnce(page([delivered(first, "成员报告交付，尚未正式提交。")]))
     .mockResolvedValueOnce(page([{ ...delivered(second, "当前任务的报告。"), kind: "progress" }], "more-reports"))
@@ -72,7 +75,7 @@ it("lazily reads separate scoped work pages and distinguishes explicit handling 
     reason: "该输入超出原授权范围。", question: "是否只复查已有内容？", returned_at: "2026-10-30T12:00:02.123456789Z",
   } };
   await act(async () => initial.resolve(page([rawInput, { ...scope(first), id: "input-confirmed", content: "经执行成员确认的输入。",
-    consumption: { turn_id: "worker-turn-1", consumed_at: "2026-10-30T12:00:01.123456789Z" } },
+    consumption: { turn_id: "worker-turn-1", attempt_id: "worker-attempt-1", consumed_at: "2026-10-30T12:00:01.123456789Z" } },
   { ...scope(first), id: "legacy-input", consumption: null, return: null }, returnedInput], "older/+&")));
   const [pending, confirmed, legacy, returned] = inputs().getAllByRole("listitem");
   expect(within(pending).getByText(rawInput.content)).toBeVisible();
@@ -84,9 +87,11 @@ it("lazily reads separate scoped work pages and distinguishes explicit handling 
   expect(within(legacy).getByText("待确认处理")).toBeVisible();
   expect(within(confirmed).getByText("已明确确认处理")).toBeVisible();
   const turnId = within(confirmed).getByText("worker-turn-1");
-  expect(turnId).not.toBeVisible();
+  const attemptId = within(confirmed).getByText("确认尝试标识").nextElementSibling;
+  expect(attemptId).toHaveTextContent("worker-attempt-1");
+  expect(turnId).not.toBeVisible(); expect(attemptId).not.toBeVisible();
   fireEvent.click(within(confirmed).getByText("标识详情", { selector: "summary" })); await tick();
-  expect(turnId).toBeVisible();
+  expect(turnId).toBeVisible(); expect(attemptId).toBeVisible();
 
   const returnedDetails = within(returned);
   const evidence = returnedInput.return;
@@ -128,14 +133,21 @@ it("lazily reads separate scoped work pages and distinguishes explicit handling 
   await toggle();
   await act(async () => oldReports.resolve(page([delivered(second, "迟到的原群报告")])));
   expect(screen.queryByText("迟到的原群报告")).not.toBeInTheDocument();
-  expect(inputs().getByText("当前服务不提供工作输入。")).toBeVisible();
-  expect(inputs().queryByRole("alert")).not.toBeInTheDocument();
   expect(reports().getByText("另一群的报告。")).toBeVisible();
   expect(reports().getByText("未知报告类型")).toBeVisible();
   expect(reports().queryByText("已接纳")).not.toBeInTheDocument();
+  for (const index of [4, 5]) {
+    expect(inputs().getByRole("alert")).toHaveTextContent("工作输入读取未确认。未找到请求的服务或记录（HTTP 404）。");
+    expect(inputs().queryByRole("list")).not.toBeInTheDocument();
+    fireEvent.click(inputs().getByRole("button", { name: "重试读取工作输入" })); await flush();
+    expect(readInputs.mock.calls[index][0]).toBe(`${path(third)}/work-inputs?limit=50`);
+  }
+  expect(inputs().queryByRole("alert")).not.toBeInTheDocument();
+  expect(inputs().getByText(recoveredInput.content)).toBeVisible();
   await toggle(); await tick(10000);
+  expect(screen.queryByText(recoveredInput.content)).not.toBeInTheDocument();
   expect(screen.queryByText("另一群的报告。")).not.toBeInTheDocument();
-  expect(readInputs).toHaveBeenCalledTimes(4); expect(readReports).toHaveBeenCalledTimes(4);
+  expect(readInputs).toHaveBeenCalledTimes(6); expect(readReports).toHaveBeenCalledTimes(4);
   expect(transport.mock.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
 });
 
@@ -150,6 +162,7 @@ it("refreshes both expanded work pages on demand without coupling their paginati
     .mockReturnValueOnce(lateInputs.promise).mockResolvedValueOnce(page([newInput]));
   const readReports = vi.fn<typeof fetch>()
     .mockResolvedValueOnce(page([delivered(first, "初始报告。")], "older-reports"))
+    .mockResolvedValueOnce(json({ error: { code: "not_found", message: "任务不存在" } }, 404))
     .mockResolvedValueOnce(page([{ ...delivered(first, "已加载的旧报告。"), id: "report-older" }], "older-reports-2"))
     .mockReturnValueOnce(lateReports.promise).mockResolvedValueOnce(page([newReport]));
   const readDetail = vi.fn<typeof fetch>(async () => json(first));
@@ -173,25 +186,33 @@ it("refreshes both expanded work pages on demand without coupling their paginati
   expect(readInputs).not.toHaveBeenCalled(); expect(readReports).not.toHaveBeenCalled();
 
   await toggle(); await loadMore();
+  expect(reports().getByRole("alert")).toHaveTextContent("工作报告读取未确认。未找到请求的服务或记录（HTTP 404）。");
+  expect(reports().getByText("初始报告。")).toBeVisible();
+  fireEvent.click(reports().getByRole("button", { name: "重试读取工作报告" })); await flush();
+  expect(readReports.mock.calls[1][0]).toBe(`${path(first)}/work-reports?limit=50&before=older-reports`);
+  expect(readReports.mock.calls[2][0]).toBe(readReports.mock.calls[1][0]);
+  expect(reports().queryByRole("alert")).not.toBeInTheDocument();
+  expect(reports().getByText("初始报告。")).toBeVisible();
+
   const openDisclosure = disclosure().closest("details");
   await tick(5000);
   expect(readDetail).toHaveBeenCalledTimes(3);
-  expect(readInputs).toHaveBeenCalledTimes(2); expect(readReports).toHaveBeenCalledTimes(2);
+  expect(readInputs).toHaveBeenCalledTimes(2); expect(readReports).toHaveBeenCalledTimes(3);
   expect(inputs().getByText("已加载的旧输入。")).toBeVisible();
   expect(reports().getByText("已加载的旧报告。")).toBeVisible();
 
   await loadMore();
   const [inputURL, inputInit] = readInputs.mock.calls[2];
-  const [reportURL, reportInit] = readReports.mock.calls[2];
+  const [reportURL, reportInit] = readReports.mock.calls[3];
   expect(inputURL).toBe(`${path(first)}/work-inputs?limit=50&before=older-inputs-2`);
   expect(reportURL).toBe(`${path(first)}/work-reports?limit=50&before=older-reports-2`);
   refreshDetails(); await flush();
   expect(readDetail).toHaveBeenCalledTimes(4);
   expect(disclosure().closest("details")).toBe(openDisclosure);
   expect(openDisclosure).toHaveAttribute("open");
-  expect(readInputs).toHaveBeenCalledTimes(4); expect(readReports).toHaveBeenCalledTimes(4);
+  expect(readInputs).toHaveBeenCalledTimes(4); expect(readReports).toHaveBeenCalledTimes(5);
   expect(readInputs.mock.calls[3][0]).toBe(`${path(first)}/work-inputs?limit=50`);
-  expect(readReports.mock.calls[3][0]).toBe(`${path(first)}/work-reports?limit=50`);
+  expect(readReports.mock.calls[4][0]).toBe(`${path(first)}/work-reports?limit=50`);
   expect(inputInit?.signal?.aborted).toBe(true); expect(reportInit?.signal?.aborted).toBe(true);
 
   await act(async () => {
