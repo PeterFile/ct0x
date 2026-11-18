@@ -14,7 +14,7 @@ import (
 )
 
 func TestChatDiscussionRecipientLeaves(t *testing.T) {
-	for _, phase := range []domain.TurnState{"", domain.TurnStateStarting, domain.TurnStateRunning, domain.TurnStateCancelRequested, domain.TurnStateUnknown} {
+	for _, phase := range []domain.TurnState{"", domain.TurnStateStarting, domain.TurnStateRunning, domain.TurnStateCancelRequested, domain.TurnStateUnknown, domain.TurnStateNotStarted} {
 		t.Run(fmt.Sprintf("claim=%q", phase), func(t *testing.T) {
 			f := setupMessages(t)
 			s := f.s
@@ -60,7 +60,10 @@ func TestChatDiscussionRecipientLeaves(t *testing.T) {
 			before := messageSequenceSnapshot(t, s)
 			delete(before, "members")
 			delete(before, "deliveries")
-			coordinationDecideExec(t, s, "UPDATE members SET status='left' WHERE id=?", f.b)
+			departs := phase != domain.TurnStateNotStarted
+			if departs {
+				coordinationDecideExec(t, s, "UPDATE members SET status='left' WHERE id=?", f.b)
+			}
 			messageSequencePreserved(t, s, before)
 			if got := otherDeliveries(); !reflect.DeepEqual(got, others) {
 				t.Fatal("departure changed other deliveries")
@@ -91,10 +94,11 @@ func TestChatDiscussionRecipientLeaves(t *testing.T) {
 			if replay := discussionApply(t, s, a, ca, "invite", input); !reflect.DeepEqual(replay, invite) {
 				t.Fatalf("departure changed original receipt: %+v", replay)
 			}
-			if phase == domain.TurnStateCancelRequested {
+			queueCounts(t, s, 2, 2, 1)
+			if phase == domain.TurnStateCancelRequested || !departs {
 				settled, err := s.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted, ExitCode: -1})
-				if err != nil || settled.State != domain.TurnStateNotStarted || settled.CancelRequestedAt == nil {
-					t.Fatalf("known cancellation failed to settle: %+v, %v", settled, err)
+				if err != nil || settled.State != domain.TurnStateNotStarted || (settled.CancelRequestedAt != nil) != (phase == domain.TurnStateCancelRequested) {
+					t.Fatalf("trusted not_started failed to settle: %+v, %v", settled, err)
 				}
 				queueDeliveryState(t, s, settled, domain.DeliveryStateFailed)
 				queueCounts(t, s, 2, 2, 0)
@@ -108,11 +112,18 @@ func TestChatDiscussionRecipientLeaves(t *testing.T) {
 				}
 				coordinationDecideExec(t, s, "UPDATE turns SET receipt_json=? WHERE id=?", receipt, turn.ID)
 				before := messageSequenceSnapshot(t, s)
+				wantReason := chatDiscussionRecipientLeftReason
+				if !departs {
+					wantReason = "接收成员的讨论轮未启动"
+				}
 				got, err := s.ReadChatDiscussionContext(ctx, a, ca)
-				if err != nil || got == nil || !got.Closed || got.ClosureReason != chatDiscussionRecipientLeftReason ||
+				if err != nil || got == nil || !got.Closed || got.ClosureReason != wantReason ||
 					got.HeadMessageID != invite.Message.ID || got.ActiveOwnerID != "" || got.ActiveInvitationMessageID != "" ||
 					!reflect.DeepEqual(got.Events, []domain.ChatDiscussionReceipt{invite}) {
-					t.Fatalf("trusted not_started after departure did not close the head: %+v, %v", got, err)
+					t.Fatalf("trusted not_started did not close the head with reason %q: %+v, %v", wantReason, got, err)
+				}
+				if r, err := s.ApplyChatDiscussion(ctx, a, ca, input, "re-push"); !errors.Is(err, ErrMemberToolDenied) || r.Message.ID != "" {
+					t.Fatalf("closed discussion allowed a re-push: %+v, %v", r, err)
 				}
 				if replay := discussionApply(t, s, a, ca, "invite", input); !reflect.DeepEqual(replay, invite) {
 					t.Fatal("settlement changed the original receipt")
