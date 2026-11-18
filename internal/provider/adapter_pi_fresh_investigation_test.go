@@ -95,7 +95,11 @@ printf '%s\n' '{"type":"session","id":"turn-owner","version":3,"cwd":"/fixture"}
 		}
 		return e
 	}
-	request := ExecuteRequest{RunID: binding.RunID, RuntimeDir: t.TempDir(), CWD: root, Prompt: "synthetic"}
+	runtimeDir := t.TempDir()
+	if err := os.Chmod(runtimeDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	request := ExecuteRequest{RunID: binding.RunID, RuntimeDir: runtimeDir, CWD: root, Prompt: "synthetic"}
 	assertDenied := func(e Executor, r ExecuteRequest) {
 		t.Helper()
 		if got := e.Execute(ctx, r, nil); got.Started || got.Outcome != OutcomeUnknown {
