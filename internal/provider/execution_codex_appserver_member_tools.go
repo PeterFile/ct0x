@@ -162,7 +162,8 @@ func NewCodexAppServerMemberToolExecutor(selected Provider, configPath string, t
 // exact-thread cold resume on Codex 0.166.0. The caller must qualify the latest
 // platform receipt and freeze current grants before supplying Resume. A reference
 // is not authorization. Nil Resume means fresh-and-capture; errors never fall back.
-// Each Execute retains the original HOME/auth and uses a new process and MCP token.
+// Each Execute retains the original HOME/auth and starts a new process. The
+// caller must supply the current turn's MCP token via its issued config.
 func NewCodexAppServerSessionExecutor(selected Provider, configPath string, toolNames []string, options CodexAppServerSessionOptions, timeout time.Duration) (Executor, error) {
 	if !validNativeSessionBinding(options.Binding) || options.Resume != nil && !validCodexNativeReference(options.Resume) {
 		return nil, errExecutorConfiguration
@@ -341,7 +342,7 @@ func (p *codexAppServerProtocol) memberNotification(message codexRPCMessage) boo
 		p.external = true
 		p.cancel()
 		if !valid {
-			p.fail()
+			p.failResumeNotification(message, "notification_not_allowed")
 		}
 		return true
 	}
