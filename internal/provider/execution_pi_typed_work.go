@@ -170,7 +170,7 @@ func (p *piTypedWorkOutput) observeMarker(details map[string]any, runID, name, i
 // frame unless it was clipped. In that case use the reserved tail for just the
 // checked identity, not unbounded native bytes or any tool payload. This extra
 // log record is parent-authored and never parsed as a live provider frame.
-func (e *piTypedWriteEvidence) retain(log *executionLog, kind string) bool {
+func (e *piTypedWriteEvidence) retain(log *executionLog, kind string, bearer *piInvestigationBearerFingerprint) bool {
 	if log.failed {
 		return false
 	}
@@ -180,7 +180,8 @@ func (e *piTypedWriteEvidence) retain(log *executionLog, kind string) bool {
 			piTypedWriteEvidence
 		}{kind, *e}) // Only bounded strings.
 		data := append(append([]byte{'\n'}, record...), '\n')
-		if len(data) > log.tailReserve {
+		// JSON escaping can introduce a match absent from the decoded fields.
+		if len(data) > log.tailReserve || bearer != nil && bearer.inBytes(data) {
 			return false
 		}
 		n, err := log.file.Write(data)

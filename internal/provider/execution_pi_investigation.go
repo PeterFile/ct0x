@@ -22,18 +22,28 @@ type piInvestigationStartup struct {
 }
 
 // A plausible native call ID (or digest) can contain the issued bearer. Keep
-// only its fingerprint and compare against windows of the bounded fields.
+// only its fingerprint and compare against windows of the bounded evidence.
 type piInvestigationBearerFingerprint struct {
 	size   int
 	digest [sha256.Size]byte
 }
 
+func (b piInvestigationBearerFingerprint) inBytes(data []byte) bool {
+	if b.size <= 0 {
+		return false
+	}
+	for i := 0; i+b.size <= len(data); i++ {
+		if sha256.Sum256(data[i:i+b.size]) == b.digest {
+			return true
+		}
+	}
+	return false
+}
+
 func (b piInvestigationBearerFingerprint) inEvidence(e *piTypedWriteEvidence) bool {
 	for _, field := range [...]string{e.Role, e.RunID, e.Operation, e.ToolCallID, e.IdempotencyKey, e.RequestSHA256} {
-		for i := 0; i+b.size <= len(field); i++ {
-			if sha256.Sum256([]byte(field[i:i+b.size])) == b.digest {
-				return true
-			}
+		if b.inBytes([]byte(field)) {
+			return true
 		}
 	}
 	return false
