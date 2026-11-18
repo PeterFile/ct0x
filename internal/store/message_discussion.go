@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"slices"
 	"strings"
 
 	"agentworkspace/internal/domain"
@@ -14,11 +15,14 @@ func messageDiscussionsInTx(ctx context.Context, tx *sql.Tx, groupID string, mes
 	if len(messages) == 0 {
 		return nil
 	}
-	// An unregistered candidate or older schema has no discussion table.
-	// Do not turn errors from an installed table into missing metadata.
-	var available bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
-	 WHERE type='table' AND name='chat_discussion_events')`).Scan(&available); err != nil || !available {
+	// The migration ledger, not table presence, distinguishes legacy storage
+	// from a damaged installation. Let the projection surface schema errors.
+	version := slices.Index(migrations, chatDiscussionSchema) + 1
+	if version == 0 {
+		return nil
+	}
+	var applied bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?)`, version).Scan(&applied); err != nil || !applied {
 		return err
 	}
 
@@ -29,27 +33,41 @@ func messageDiscussionsInTx(ctx context.Context, tx *sql.Tx, groupID string, mes
 		id := messages[i].ID
 		args[i+1], positions[id] = id, i
 	}
-	// Probe only the selected events and their exact invitation and parent keys.
-	// Missing or NULL evidence drops the relation, not the message. Delivery
-	// state and current membership status are not part of the recorded route.
+	// Probe only selected events and exact invitation and predecessor keys.
+	// Compare the recorded claim facts, not the live token or mutable status.
+	// Missing or contradictory evidence drops the relation, not the message.
 	rows, err := tx.QueryContext(ctx, `WITH published AS NOT MATERIALIZED (
 	 SELECT e.message_id,e.origin_message_id,e.group_id,e.topic_id,e.step,e.kind,e.actor_id,e.recipient_id,
-	    e.delivery_id,e.related_invitation_id,e.expected_reply
+	    e.source_message_id,e.delivery_id,e.related_invitation_id,e.expected_reply,t.delivery_id AS incoming_delivery_id
 	 FROM main.chat_discussion_events e
 	 JOIN main.messages m ON m.id=e.message_id AND m.group_id=e.group_id AND m.topic_id=e.topic_id AND m.sender_id=e.actor_id
-	 JOIN main.message_command_sources s ON s.message_id=m.id AND s.kind='member'
 	 JOIN main.members a ON a.id=e.actor_id AND a.group_id=e.group_id
+	 JOIN main.chat_candidates b ON b.id=e.candidate_id AND b.message_id=e.source_message_id
+	    AND b.group_id=e.group_id AND b.topic_id=e.topic_id AND b.member_id=e.actor_id
+	 JOIN main.chat_assessments assessment ON assessment.candidate_id=b.id
+	 JOIN main.chat_intake_executions x ON x.candidate_id=b.id AND x.turn_id=b.turn_id
+	    AND x.purpose='`+domain.ChatIntakePurpose+`' AND length(x.claim_digest)=32
+	 JOIN main.message_command_sources s ON s.message_id=m.id AND s.kind='member' AND s.turn_id=b.turn_id AND s.claim_digest=x.claim_digest
+	 JOIN main.message_command_sources source ON source.message_id=b.message_id AND source.id=x.source_id AND source.kind=x.source_kind
+	 JOIN main.message_log l ON l.sequence=b.generation AND l.message_id=b.message_id AND l.group_id=b.group_id AND l.topic_id=b.topic_id
+	 JOIN main.turns t ON t.id=b.turn_id AND t.group_id=b.group_id AND t.member_id=b.member_id
+	 JOIN main.deliveries incoming ON incoming.id=t.delivery_id AND incoming.turn_id=t.id AND incoming.conversation_id=t.conversation_id
+	    AND incoming.message_id=b.message_id AND incoming.group_id=b.group_id AND incoming.topic_id=b.topic_id AND incoming.recipient_id=b.member_id
+	 JOIN main.conversations arrival ON arrival.id=t.conversation_id
+	    AND arrival.group_id=b.group_id AND arrival.topic_id=b.topic_id AND arrival.member_id=b.member_id
 	 WHERE e.actor_id NOT IN ('','user')
+	   AND ((e.step=1 AND e.source_message_id=e.origin_message_id AND e.related_invitation_id IS NULL AND source.kind='local_user_chat')
+	     OR (e.step>1 AND e.source_message_id<>e.origin_message_id AND e.related_invitation_id IS NOT NULL AND source.kind='member'))
 	   AND (e.delivery_id IS NULL OR EXISTS(
 	      SELECT 1 FROM main.deliveries d
 	      JOIN main.conversations c ON c.id=d.conversation_id AND c.group_id=d.group_id AND c.topic_id=d.topic_id AND c.member_id=d.recipient_id
 	      JOIN main.members r ON r.id=d.recipient_id AND r.group_id=d.group_id
 	      WHERE d.id=e.delivery_id AND d.message_id=e.message_id AND d.group_id=e.group_id AND d.topic_id=e.topic_id AND d.recipient_id=e.recipient_id))
 	   AND NOT EXISTS(SELECT 1 FROM main.deliveries d WHERE d.message_id=e.message_id AND d.id IS NOT e.delivery_id)
-	   AND (e.kind<>'invite' OR (e.delivery_id IS NOT NULL AND e.recipient_id IS NOT NULL
-	      AND e.recipient_id NOT IN ('','user',e.actor_id) AND e.expected_reply IS NOT NULL
-	      AND ((e.step=1 AND e.source_message_id=e.origin_message_id AND e.related_invitation_id IS NULL)
-	        OR (e.step>1 AND e.source_message_id<>e.origin_message_id AND e.related_invitation_id=e.source_message_id))))
+	   AND ((e.kind='invite' AND e.delivery_id IS NOT NULL AND e.recipient_id NOT IN ('','user',e.actor_id)
+	         AND e.expected_reply IS NOT NULL AND (e.step=1 OR e.related_invitation_id=e.source_message_id))
+	     OR (e.kind='reply' AND e.step>1 AND e.recipient_id IS NOT NULL AND e.expected_reply='')
+	     OR (e.kind='resolve' AND e.recipient_id IS NULL AND e.delivery_id IS NULL AND e.expected_reply=''))
 	 )
 	 SELECT e.message_id,e.kind,e.origin_message_id,i.message_id,
 	    coalesce(i.related_invitation_id,''),i.actor_id,i.recipient_id,i.expected_reply
@@ -61,12 +79,23 @@ func messageDiscussionsInTx(ctx context.Context, tx *sql.Tx, groupID string, mes
 	    AND i.origin_message_id=e.origin_message_id AND i.group_id=e.group_id AND i.topic_id=e.topic_id AND i.kind='invite'
 	 WHERE e.group_id=? AND e.message_id IN (`+strings.TrimSuffix(strings.Repeat("?,", len(messages)), ",")+`)
 	   AND ((i.step=1 AND i.actor_id=c.root_inviter_id) OR (i.step>1 AND EXISTS(
-	      SELECT 1 FROM published p WHERE p.message_id=i.related_invitation_id AND p.kind='invite'
+	      SELECT 1 FROM published p WHERE p.message_id=i.source_message_id AND p.kind='invite'
 	        AND p.origin_message_id=i.origin_message_id AND p.group_id=i.group_id AND p.topic_id=i.topic_id
-	        AND p.step=i.step-1 AND p.recipient_id=i.actor_id AND (p.step<>1 OR p.actor_id=c.root_inviter_id))))
-	   AND (e.kind='invite' OR (e.step>i.step AND (
-	      (e.kind='reply' AND e.actor_id=i.recipient_id AND e.recipient_id=i.actor_id)
-	      OR (e.kind='resolve' AND i.step=1 AND e.actor_id=i.actor_id AND e.recipient_id IS NULL AND e.delivery_id IS NULL))))`, args...)
+	        AND p.step=i.step-1 AND p.recipient_id=i.actor_id AND p.delivery_id=i.incoming_delivery_id
+	        AND (p.step<>1 OR p.actor_id=c.root_inviter_id))))
+	   -- The triggering delivery may carry a child reply rather than the invitation being answered.
+	   AND (e.kind='invite' OR (e.step>i.step AND EXISTS(
+	      SELECT 1 FROM published p WHERE p.message_id=e.source_message_id
+	        AND p.origin_message_id=e.origin_message_id AND p.group_id=e.group_id AND p.topic_id=e.topic_id
+	        AND p.step=e.step-1 AND p.recipient_id=e.actor_id AND p.delivery_id=e.incoming_delivery_id
+	        AND ((e.kind='reply' AND e.actor_id=i.recipient_id AND e.recipient_id=i.actor_id
+	              AND ((p.kind='invite' AND p.message_id=i.message_id) OR (p.kind='reply' AND EXISTS(
+	                 SELECT 1 FROM published child WHERE child.message_id=p.related_invitation_id AND child.kind='invite'
+	                   AND child.origin_message_id=i.origin_message_id AND child.group_id=i.group_id AND child.topic_id=i.topic_id
+	                   AND child.related_invitation_id=i.message_id AND child.step=i.step+1 AND child.step<p.step
+	                   AND child.actor_id=p.recipient_id AND child.recipient_id=p.actor_id))))
+	          OR (e.kind='resolve' AND i.step=1 AND e.actor_id=i.actor_id AND p.kind='reply'
+	              AND p.related_invitation_id=i.message_id AND p.actor_id=i.recipient_id)))))`, args...)
 	if err != nil {
 		return err
 	}

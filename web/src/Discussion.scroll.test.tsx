@@ -269,15 +269,26 @@ it.each([["send", "原始问题", 2], ["reset", "对应邀请", 4]] as const)(
     expect(fireEvent.click(link, { detail: 0 })).toBe(true); // Keyboard activation must keep the native default.
     // Model the native fragment jump; the scroll event can be delivered after the response.
     tops.set(container, top);
-    await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(items.slice(1))));
+    const resetItems = items.slice(4); // The reset page excludes the linked invitation.
+    await act(async () => pending.resolve(operation === "send" ? json({ ...row(9), content: raw }, 201) : page(resetItems)));
     fireEvent.scroll(container);
     expect(offset(id)).toBe(0);
     if (operation === "send") {
       expect(container.scrollTop).toBe(top);
       expect(item(row(9).id)).toHaveTextContent("公开原文");
       expect(screen.getByText(/消息已持久化/)).toBeVisible();
+      expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages`]);
+    } else {
+      expect(screen.getAllByRole("article")).toHaveLength(resetItems.length + 1);
+      expect(screen.queryByText(resetNotice)).not.toBeInTheDocument();
+      expectRequests([latestURL(), latestURL()]);
+      reads.mockResolvedValueOnce(page(resetItems));
+      fireEvent.click(within(container).getByRole("button", { name: "刷新并重置历史窗口" }));
+      await flush();
+      expect(screen.queryByRole("article", { name: `消息 ${id}` })).not.toBeInTheDocument();
+      expectTail(container);
+      expectRequests([latestURL(), latestURL(), latestURL()]);
     }
-    expectRequests(operation === "send" ? [latestURL(), `/api/v1/groups/${group.id}/messages`] : [latestURL(), latestURL()]);
   },
 );
 

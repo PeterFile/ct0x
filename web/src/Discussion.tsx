@@ -164,7 +164,7 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
         {message.topic_id ? <p className="eyebrow accent">话题消息</p> : null}
         <p className="message-content">{message.content}</p>
         {message.discussion ? <DiscussionContext message={message} loaded={loaded} members={membersById} scopeId={formId}
-          onNavigateReference={scroll.onNavigateReference} /> : null}
+          onNavigateReference={id => { scroll.onNavigateReference(id); feed.preserveReference(id); }} /> : null}
         <div className="message-actions">
         <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
           onClick={event => requestWork.current?.open(message, event.currentTarget)}>转为任务</button>

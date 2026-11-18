@@ -89,6 +89,20 @@ export function useMessageFeed(groupId: string, active: boolean) {
       return { ...previous, entries };
     });
   }, []);
+  function preserveReference(id: string) {
+    if (!active || !lastRequest.current.reset || (!pageBusy.current && !page.pending)) return;
+    const loaded = feed.entries.get(id);
+    if (loaded?.message.group_id !== groupId) return;
+    const version = ++clock.current;
+    setFeed(previous => {
+      // A reset may already be queued while this known row is still rendered.
+      const current = previous.entries.get(id) ?? loaded;
+      if (version <= previous.floor || version <= current.presenceVersion) return previous;
+      const entries = new Map(previous.entries);
+      entries.set(id, { ...current, presenceVersion: version });
+      return { ...previous, entries };
+    });
+  }
   const items = useMemo(() => [...feed.entries.values()].map(record => record.message)
     .sort((a, b) => compare(timeKey(a.created_at), timeKey(b.created_at)) || compare(a.id, b.id)), [feed]);
   const loaded = useRef<Message[]>([]);
@@ -130,6 +144,6 @@ export function useMessageFeed(groupId: string, active: boolean) {
     timer = setTimeout(() => void cycle(), 5000);
     return () => { stopped = true; clearTimeout(timer); };
   }, [active, groupId, beginRead, refreshDetail]);
-  return { items, page, pollError, details, loadPage, refreshDetail, beginSend, confirm,
+  return { items, page, pollError, details, loadPage, refreshDetail, beginSend, confirm, preserveReference,
     retry: () => loadPage(lastRequest.current.before, lastRequest.current.reset) };
 }
