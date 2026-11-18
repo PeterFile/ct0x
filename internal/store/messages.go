@@ -163,14 +163,9 @@ func (s *Store) GetMessage(ctx context.Context, groupID, messageID string) (doma
 	if err != nil {
 		return domain.Message{}, storeError("读取消息失败", err)
 	}
-	closures, err := chatDiscussionClosuresInTx(ctx, tx, m.GroupID, m.ID)
-	if err != nil {
-		return domain.Message{}, storeError("读取讨论中断状态失败", err)
-	}
-	m.DiscussionClosureReason = closures[m.ID]
 	messages := []domain.Message{m}
-	if err := messageDiscussionsInTx(ctx, tx, groupID, messages); err != nil {
-		return domain.Message{}, storeError("读取讨论关联失败", err)
+	if err := projectMessageDiscussionsInTx(ctx, tx, groupID, messages); err != nil {
+		return domain.Message{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Message{}, storeError("读取消息失败", err)

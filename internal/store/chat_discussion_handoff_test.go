@@ -399,6 +399,65 @@ func TestChatDiscussionFlow(t *testing.T) {
 	}
 }
 
+func TestChatDiscussionTimelineInterruptedHead(t *testing.T) {
+	for _, kind := range []string{domain.ChatDiscussionInvite, domain.ChatDiscussionReply} {
+		t.Run(kind, func(t *testing.T) {
+			f, _, head, incoming := discussionSerialHandoff(t)
+			s := f.s
+			if kind == domain.ChatDiscussionReply {
+				queueEvent(t, s, incoming, provider.AcceptedEvent, "", "")
+				peer, cb := discussionCapture(t, s, incoming)
+				discussionAssess(t, s, peer, cb)
+				head = discussionApply(t, s, peer, cb, "reply", domain.ChatDiscussionAction{Kind: kind, Content: "已核对结论。"})
+				if _, err := s.ApplyTurnReceipt(ctx, incoming, queueReceipt(provider.OutcomeSucceeded)); err != nil {
+					t.Fatal(err)
+				}
+				receiver, _ := discussionArrive(t, s, f.groupID, head.Event.DeliveryID)
+				incoming = receiver.Claim
+			}
+			checkNewest := func(wantReason string, hasDiscussion bool) *Cursor {
+				t.Helper()
+				page, err := s.ListMessages(ctx, f.groupID, MessageListOptions{Limit: 1})
+				if err != nil || len(page.Items) != 1 || page.NextCursor == nil {
+					t.Fatalf("newest page: %+v, %v", page, err)
+				}
+				m := page.Items[0]
+				if m.ID != head.Message.ID || m.Content != head.Message.Content || m.DiscussionClosureReason != wantReason {
+					t.Fatalf("page head = %+v; want %s with reason %q", m, head.Message.ID, wantReason)
+				}
+				if hasDiscussion && (m.Discussion == nil || m.Discussion.Kind != kind) || !hasDiscussion && m.Discussion != nil {
+					t.Fatalf("unexpected discussion projection: %+v", m.Discussion)
+				}
+				if exact := discussionCheckMessageClosure(t, s, f.groupID, m.ID, wantReason); !reflect.DeepEqual(exact, m) {
+					t.Fatalf("page/detail mismatch: %+v / %+v", m, exact)
+				}
+				return page.NextCursor
+			}
+			checkNewest("", true)
+			if _, err := s.ApplyTurnReceipt(ctx, incoming, queueReceipt(provider.OutcomeFailed)); err != nil {
+				t.Fatal(err)
+			}
+			before := messageSequenceSnapshot(t, s)
+			cursor := checkNewest("讨论已中断：接收成员的轮次异常结束，未提交结构化讨论动作", true)
+			older, err := s.ListMessages(ctx, f.groupID, MessageListOptions{Limit: 5, Before: cursor})
+			if err != nil || len(older.Items) == 0 || older.NextCursor != nil {
+				t.Fatalf("older page: %+v, %v", older, err)
+			}
+			for _, m := range older.Items {
+				if m.ID == head.Message.ID || m.DiscussionClosureReason != "" {
+					t.Fatalf("closure escaped its page and head: %+v", m)
+				}
+			}
+			messageSequencePreserved(t, s, before)
+
+			// A terminal receipt cannot make an unverified publication into a discussion link.
+			coordinationDecideExec(t, s, "DROP TRIGGER message_command_sources_update")
+			coordinationDecideExec(t, s, "UPDATE message_command_sources SET claim_digest=? WHERE message_id=?", make([]byte, 32), head.Message.ID)
+			checkNewest("", false)
+		})
+	}
+}
+
 func TestChatDiscussionTimelineReadError(t *testing.T) {
 	for _, fault := range []struct{ name, ddl, missing string }{
 		{"missing_column", `ALTER TABLE chat_discussion_events RENAME COLUMN expected_reply TO unexpected_reply`, "expected_reply"},

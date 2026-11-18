@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { isDefinitiveRejection, sendMessage } from "./api";
+import { decodeMessage, isDefinitiveRejection, sendMessage } from "./api";
 import type { Message } from "./api";
 import { group, json, other } from "./test/groups";
 
@@ -90,6 +90,24 @@ it("drops incompatible discussion metadata without losing a matching message rec
   transport.mockResolvedValueOnce(json({ ...message, discussion }, 201));
   expect(await sendMessage(group.id, input, "discussion-is-read-only")).toEqual(message);
   expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toEqual({ content });
+});
+
+it("keeps closure text only on a verified member handoff with its single intended delivery", () => {
+  const invite: Message = { ...message, sender_id: "inviter", source_kind: "member", source_id: "invite-command",
+    deliveries: [{ ...delivery, state: "failed" }], discussion: { kind: "invite", root_message_id: "question",
+      invitation_message_id: message.id, inviter_id: "inviter", assignee_id: delivery.recipient_id, expected_reply: "核对结论" } };
+  const reason = "接收成员的讨论轮未启动";
+  const closed = { ...invite, discussion_closure_reason: reason };
+  expect(decodeMessage(closed)).toEqual(closed);
+  for (const invalid of [null, 1, {}, "", "   ", ` ${reason}`, `${reason}\n附注`, "答".repeat(150)]) {
+    expect(decodeMessage({ ...invite, discussion_closure_reason: invalid })).toEqual(invite);
+  }
+  for (const row of [message, { ...invite, discussion: null }, { ...invite, source_kind: "unknown" as const, source_id: undefined },
+    { ...invite, deliveries: [] }, { ...invite, deliveries: [...invite.deliveries, delivery] },
+    { ...invite, deliveries: [{ ...invite.deliveries[0], recipient_id: "another-member" }] },
+    { ...invite, deliveries: [delivery] }]) {
+    expect(decodeMessage({ ...row, discussion_closure_reason: reason })).toEqual(row);
+  }
 });
 
 it("preserves known and future delivery states as data without promoting acknowledgements", async () => {

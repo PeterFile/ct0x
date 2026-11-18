@@ -136,6 +136,30 @@ it("links persisted invitation, return and resolution in the existing timeline w
   expect(fetch).toHaveBeenCalledTimes(1);
 });
 
+it("shows the interrupted reply on its row when the existing newest-page poll supplies the reason", async () => {
+  const target = { ...reply, deliveries: [{ ...delivery, message_id: reply.id, recipient_id: member.id,
+    state: "accepted", turn_id: "receiving-turn" }] };
+  const reason = "讨论已中断：接收成员的轮次异常结束，未提交结构化讨论动作";
+  vi.useFakeTimers();
+  try {
+    reads.mockResolvedValueOnce(page([target, invitation, question]));
+    render(<main aria-label="讨论"><Discussion groupId={group.id} members={{ [group.id]: [member, helper] }} /></main>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    const record = article(target.id);
+    expect(within(record).getByText(/投递详情.*CLI已接收 1/)).toBeVisible();
+    expect(panel().queryByText(reason)).not.toBeInTheDocument();
+
+    reads.mockResolvedValueOnce(page([{ ...target, discussion_closure_reason: reason }, invitation, question]));
+    await act(async () => { await vi.advanceTimersByTimeAsync(5000); });
+    expect(within(record).getByText(reason)).toBeVisible();
+    expect(panel().getAllByText(reason)).toHaveLength(1);
+    expect(within(record).getByText(/投递详情.*CLI已接收 1/)).toBeVisible();
+    expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual(Array(2).fill(`/api/v1/groups/${group.id}/messages?limit=50`));
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("keeps unloaded relation IDs, but does not assert provenance from contradictory records", async () => {
   const unloaded = { ...reply, id: "unloaded-reply", sender_id: "missing-assignee",
     discussion: { ...reply.discussion, root_message_id: "earlier-question", invitation_message_id: "earlier-invitation",

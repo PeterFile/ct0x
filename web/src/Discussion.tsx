@@ -300,19 +300,22 @@ function DiscussionContext({ message, loaded, members, scopeId, onNavigateRefere
   };
   const summary = kind === "invite" ? `${actor(inviter_id)} 邀请 ${actor(assignee_id)}`
     : kind === "reply" ? `${actor(assignee_id)} 回送给 ${actor(inviter_id)}` : `${actor(inviter_id)} 向群组总结`;
-  return <details className="message-details message-discussion">
-    <summary><strong>{discussionLabels[kind]}</strong> · {summary}</summary>
-    <dl className="message-technical">
-      <DiscussionReference label="原始问题" id={root_message_id} target={root} scopeId={scopeId} onNavigate={onNavigateReference} />
-      <DiscussionReference label="对应邀请" id={invitation_message_id} target={invitation} scopeId={scopeId} self={kind === "invite"}
-        onNavigate={onNavigateReference} />
-      {parent_invitation_message_id ? <DiscussionReference label="上级邀请" id={parent_invitation_message_id} target={parent} scopeId={scopeId}
-        onNavigate={onNavigateReference} /> : null}
-      <div><dt>邀请者 ID</dt><dd><code>{inviter_id}</code></dd></div>
-      <div><dt>受邀者 ID</dt><dd><code>{assignee_id}</code></dd></div>
-      {expected_reply.trim() ? <div><dt>预期答复</dt><dd>{expected_reply}</dd></div> : null}
-    </dl>
-  </details>;
+  return <>
+    <details className="message-details message-discussion">
+      <summary><strong>{discussionLabels[kind]}</strong> · {summary}</summary>
+      <dl className="message-technical">
+        <DiscussionReference label="原始问题" id={root_message_id} target={root} scopeId={scopeId} onNavigate={onNavigateReference} />
+        <DiscussionReference label="对应邀请" id={invitation_message_id} target={invitation} scopeId={scopeId} self={kind === "invite"}
+          onNavigate={onNavigateReference} />
+        {parent_invitation_message_id ? <DiscussionReference label="上级邀请" id={parent_invitation_message_id} target={parent} scopeId={scopeId}
+          onNavigate={onNavigateReference} /> : null}
+        <div><dt>邀请者 ID</dt><dd><code>{inviter_id}</code></dd></div>
+        <div><dt>受邀者 ID</dt><dd><code>{assignee_id}</code></dd></div>
+        {expected_reply.trim() ? <div><dt>预期答复</dt><dd>{expected_reply}</dd></div> : null}
+      </dl>
+    </details>
+    {message.discussion_closure_reason ? <p className="feed-note discussion-closure">{message.discussion_closure_reason}</p> : null}
+  </>;
 }
 
 function DiscussionReference({ label, id, target, scopeId, self, onNavigate }: {

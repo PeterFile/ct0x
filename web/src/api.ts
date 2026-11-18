@@ -36,8 +36,11 @@ export type MessageDiscussion = Readonly<{
 export type Message = MessageSource & {
   id: string; group_id: string; topic_id: string; sender_id: string; content: string; created_at: string; deliveries: Delivery[];
   discussion?: MessageDiscussion | null;
+  discussion_closure_reason?: string;
 };
-export type WireMessage = Omit<Message, "discussion"> & { discussion?: unknown };
+export type WireMessage = Omit<Message, "discussion" | "discussion_closure_reason"> & {
+  discussion?: unknown; discussion_closure_reason?: unknown;
+};
 export type MessageInput = Readonly<{ content: string; recipient_ids?: readonly string[]; topic_id?: string }>;
 type Page<T> = { items: T[]; next_cursor: string };
 export class ApiError extends Error {
@@ -85,11 +88,21 @@ function discussionFor(value: unknown, message: Omit<Message, "discussion">): Me
   return { kind, root_message_id, invitation_message_id, inviter_id, assignee_id, expected_reply,
     ...(parent_invitation_message_id === undefined ? {} : { parent_invitation_message_id }) };
 }
-export function decodeMessage({ discussion, ...message }: WireMessage): Message {
+function discussionClosureFor(value: unknown, message: Omit<Message, "discussion">, relation: MessageDiscussion): string | undefined {
+  if (relation.kind === "resolve" || message.source_kind !== "member" || !discussionId(message.source_id) || message.deliveries.length !== 1
+    || !boundedDiscussionText(value, 256) || value === "" || value.trim() !== value || /[\p{Cc}\p{Cf}\u2028\u2029]/u.test(value)) return;
+  const [delivery] = message.deliveries;
+  const recipient = relation.kind === "invite" ? relation.assignee_id : relation.inviter_id;
+  if (delivery.message_id === message.id && delivery.recipient_id === recipient
+    && (delivery.state === "accepted" || delivery.state === "failed")) return value;
+}
+export function decodeMessage({ discussion, discussion_closure_reason, ...message }: WireMessage): Message {
   // Invalid optional evidence must not conceal an otherwise valid public row or change its receipt.
   if (discussion === null) return { ...message, discussion };
   const relation = discussionFor(discussion, message);
-  return relation ? { ...message, discussion: relation } : message;
+  if (!relation) return message;
+  const reason = discussionClosureFor(discussion_closure_reason, message, relation);
+  return { ...message, discussion: relation, ...(reason === undefined ? {} : { discussion_closure_reason: reason }) };
 }
 function validProviderAdapter(value: unknown, current: Record<string, unknown>): value is ProviderAdapter {
   if (!isRecord(value) || typeof value.id !== "string" || !value.id || value.id.trim() !== value.id || value.id.includes("\0")

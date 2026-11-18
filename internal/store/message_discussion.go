@@ -9,8 +9,35 @@ import (
 	"agentworkspace/internal/domain"
 )
 
-// messageDiscussionsInTx enriches only the selected public messages, not write
-// receipts or delivery state. The same read works for a page or an exact message.
+// projectMessageDiscussionsInTx uses the same read snapshot for the verified
+// relationship and the interruption reason. It never changes publication receipts.
+func projectMessageDiscussionsInTx(ctx context.Context, tx *sql.Tx, groupID string, messages []domain.Message) error {
+	if err := messageDiscussionsInTx(ctx, tx, groupID, messages); err != nil {
+		return storeError("读取讨论关联失败", err)
+	}
+	var targets []string
+	for i := range messages {
+		m := &messages[i]
+		if d := m.Discussion; m.SourceKind == "member" && len(m.Deliveries) == 1 && d != nil &&
+			(d.Kind == domain.ChatDiscussionInvite || d.Kind == domain.ChatDiscussionReply) {
+			targets = append(targets, m.ID)
+		}
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	closures, err := chatDiscussionClosuresInTx(ctx, tx, groupID, targets...)
+	if err != nil {
+		return storeError("读取讨论中断状态失败", err)
+	}
+	if len(closures) != 0 {
+		for i := range messages {
+			messages[i].DiscussionClosureReason = closures[messages[i].ID]
+		}
+	}
+	return nil
+}
+
 func messageDiscussionsInTx(ctx context.Context, tx *sql.Tx, groupID string, messages []domain.Message) error {
 	if len(messages) == 0 {
 		return nil
