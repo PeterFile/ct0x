@@ -87,6 +87,41 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	if threadRequest.Method == nil || (*threadRequest.Method != "thread/start" && *threadRequest.Method != "thread/resume") {
 		os.Exit(8)
 	}
+	if wire := os.Getenv("AW_SESSION_PREBIND_WIRE"); wire != "" {
+		// Handwritten v0.166 wire shapes, not original native frames.
+		_, _ = fmt.Fprintln(os.Stdout, wire)
+	}
+	switch mode {
+	case "bootstrap-close":
+		return
+	case "bootstrap-pending":
+		if *threadRequest.Method != "thread/resume" {
+			os.Exit(8)
+		}
+		_, _ = fmt.Fprintln(os.Stderr, codexBootstrapPrivatePayload, memberToolTestToken)
+		if os.WriteFile("resume-pending-"+pid, nil, 0600) != nil {
+			os.Exit(8)
+		}
+		// No response. The executor must close stdin and reap on context completion.
+		if _, err := input.ReadByte(); err != io.EOF {
+			os.Exit(8)
+		}
+		return
+	case "bootstrap-incomplete-frame":
+		_, _ = fmt.Fprint(os.Stdout, `{"id":3,"result":{}}`)
+		return
+	case "bootstrap-oversize-frame":
+		notify("warning", map[string]string{"message": strings.Repeat("x", codexRPCFrameLimit)})
+		return
+	case "bootstrap-warning-count":
+		for range executionFramesCountLimit + 1 {
+			_, _ = fmt.Fprintln(os.Stdout, codexFixtureScopedWarning)
+		}
+	case "bootstrap-warning-bytes":
+		for range executionFramesByteLimit / (codexRPCFrameLimit / 2) {
+			notify("warning", map[string]string{"threadId": "session-native-thread", "message": strings.Repeat("x", codexRPCFrameLimit/2)})
+		}
+	}
 	lock, _ := os.OpenFile("synthetic-writer.lock", os.O_CREATE|os.O_RDWR, 0600)
 	if lock == nil || syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
 		fail(threadRequest)
@@ -140,7 +175,7 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 			status = "active"
 		}
 		return map[string]any{"id": threadID, "turns": turns, "ephemeral": false, "status": map[string]any{"type": status},
-			"cliVersion": "0.166.0", "cwd": cwd, "modelProvider": nativeProvider, "source": "appServer", "historyMode": "legacy"}
+			"cliVersion": "0.166.0", "cwd": cwd, "modelProvider": nativeProvider, "source": "vscode", "historyMode": "legacy"}
 	}
 	model, provider, effort, sandbox := "synthetic/model", nativeProvider, nativeEffort, "readOnly"
 	switch mode {
@@ -209,9 +244,24 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 			}
 		}
 	}
+	response := map[string]any{"thread": responseThread, "approvalPolicy": "never", "approvalsReviewer": "user",
+		"sandbox": map[string]any{"type": sandbox, "networkAccess": false}, "cwd": cwd, "model": model, "modelProvider": provider, "reasoningEffort": effort}
+	if *threadRequest.Method == "thread/resume" {
+		// v0.166 metadata-only response with extra passive fields.
+		maps.Copy(response, map[string]any{"disabledPluginIds": []string{}, "instructionSources": []string{}, "serviceTier": nil,
+			"turnsBackwardsCursor": nil, "itemsBackwardsCursor": nil,
+			"collaborationMode": map[string]any{"mode": "default", "settings": map[string]any{"model": model, "reasoning_effort": effort}}})
+		maps.Copy(responseThread, map[string]any{"sessionId": "synthetic-session", "preview": codexBootstrapPrivatePayload,
+			"projectId": nil, "forkedFromId": nil, "parentThreadId": nil, "createdAt": 1, "updatedAt": 2})
+		notify("thread/status/changed", map[string]any{"threadId": threadID, "status": map[string]string{"type": "idle"}})
+	}
 	replay("before-response")
-	respond(threadRequest, map[string]any{"thread": responseThread, "approvalPolicy": "never", "approvalsReviewer": "user",
-		"sandbox": map[string]any{"type": sandbox, "networkAccess": false}, "cwd": cwd, "model": model, "modelProvider": provider, "reasoningEffort": effort})
+	respond(threadRequest, response)
+	if mode == "bootstrap-bound-thread-closed" {
+		notify("thread/closed", map[string]string{"threadId": threadID})
+		_, _ = io.Copy(io.Discard, input)
+		return
+	}
 	replay("after-response")
 	respond(expect("config/read"), config("AW_SESSION_CONFIG_AFTER"))
 	statusRequest := expect("mcpServerStatus/list")
@@ -219,8 +269,15 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	for _, name := range names {
 		tools[name] = map[string]any{"name": name}
 	}
-	respond(statusRequest, map[string]any{"data": []any{map[string]any{"name": server, "runtimeStatus": "connected", "authStatus": "bearerToken",
-		"httpOrigin": "http://127.0.0.1:1", "tools": tools, "toolsError": nil, "pluginId": nil}}, "nextCursor": nil})
+	origin, auth := "http://127.0.0.1:1", "bearerToken"
+	switch mode {
+	case "bootstrap-wrong-mcp-origin":
+		origin = "http://127.0.0.1:2"
+	case "bootstrap-wrong-mcp-auth":
+		auth = "notLoggedIn"
+	}
+	respond(statusRequest, map[string]any{"data": []any{map[string]any{"name": server, "runtimeStatus": "connected", "authStatus": auth,
+		"httpOrigin": origin, "tools": tools, "toolsError": nil, "pluginId": nil}}, "nextCursor": nil})
 	request := read()
 	if request.Method != nil && *request.Method == "thread/read" {
 		before := history
@@ -838,6 +895,7 @@ func TestCodexSessionReusedTurnIDAndCapturePrefixDrift(t *testing.T) {
 
 func TestCodexSessionDefaultConstructorsDoNotCaptureOrResume(t *testing.T) {
 	selected, config, request := appServerSessionFixture(t)
+	t.Setenv("AW_SESSION_PREBIND_WIRE", codexFixtureUnscopedWarnings)
 	e, err := NewCodexAppServerMemberToolExecutor(selected, config, []string{"read_channel"}, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
@@ -860,11 +918,13 @@ func TestCodexSessionDefaultConstructorsDoNotCaptureOrResume(t *testing.T) {
 
 func TestCodexSessionFreshCaptureThenColdResume(t *testing.T) {
 	selected, config, request := appServerSessionFixture(t)
-	options := CodexAppServerSessionOptions{Binding: json.RawMessage(`{"purpose":"generic","version":1}`)}
-	e, err := NewCodexAppServerSessionExecutor(selected, config, []string{"read_channel"}, options, 5*time.Second)
+	tools := []string{"read_channel"}
+	options := CodexAppServerSessionOptions{Binding: json.RawMessage(`{"turn":1}`)}
+	e, err := NewCodexAppServerNativeSessionMemberToolAdapter(testIssuedMemberConfig(t, config), tools, options).NewExecutor(selected, 5*time.Second)
 	if err != nil {
 		t.Fatal("valid fresh session rejected")
 	}
+	t.Setenv("AW_SESSION_PREBIND_WIRE", codexFixtureUnscopedWarnings)
 	first := e.Execute(context.Background(), request, nil)
 	if first.Outcome != OutcomeSucceeded || first.NativeRef == nil || first.NativeRef.Codex == nil {
 		t.Fatal("successful fresh native Turn did not capture a settled reference")
@@ -880,19 +940,31 @@ func TestCodexSessionFreshCaptureThenColdResume(t *testing.T) {
 	if os.WriteFile(secondConfig, mustCodexAppServerJSON(map[string]string{"endpoint": "http://127.0.0.1:1/api/v1/member-tools", "token": secondToken}), 0600) != nil {
 		t.Fatal("fixture config unavailable")
 	}
-	options.Resume = cloneNativeSessionReference(first.NativeRef)
-	e, err = NewCodexAppServerSessionExecutor(selected, secondConfig, []string{"read_channel"}, options, 5*time.Second)
+	options.Resume, options.Binding = new(NativeSessionReference), json.RawMessage(`{"turn":2}`)
+	if err := json.Unmarshal(mustCodexAppServerJSON(first.NativeRef), options.Resume); err != nil || !reflect.DeepEqual(options.Resume, first.NativeRef) {
+		t.Fatal("typed reference did not round-trip before construction")
+	}
+	e, err = NewCodexAppServerNativeSessionMemberToolAdapter(testIssuedMemberConfig(t, secondConfig), tools, options).NewExecutor(selected, 5*time.Second)
 	if err != nil {
 		t.Fatal("qualified reference rejected")
 	}
 	// Constructor input is not retained by alias.
 	options.Resume.Codex.NativeThreadID = "caller-mutated-thread"
 	options.Binding[0] = ' '
+	t.Setenv("AW_SESSION_PREBIND_WIRE", codexFixtureUnscopedWarnings+"\n"+codexFixtureScopedWarning+"\n"+codexFixtureThreadAnnouncement)
 	request.RunID, request.Prompt = "session2", "new input two"
-	second := e.Execute(context.Background(), request, nil)
-	if second.Outcome != OutcomeSucceeded || second.NativeRef == nil || second.NativeRef.Codex == nil || second.NativeSessionID != ref.NativeThreadID ||
+	var events []EventKind
+	second := e.Execute(context.Background(), request, func(event Event) error {
+		events = append(events, event.Kind)
+		return nil
+	})
+	if second.Outcome != OutcomeSucceeded || !second.Accepted || second.Terminal != OutcomeSucceeded || !second.OutputComplete || !second.DirectChildReaped ||
+		second.NativeRef == nil || second.NativeRef.Codex == nil || second.NativeSessionID != ref.NativeThreadID || string(second.NativeRef.Binding) != `{"turn":2}` ||
 		second.NativeRef.Codex.NativeTurnID != "session-turn-2" || second.NativeRef.Codex.HistoryTurns != 2 || second.NativeRef.Codex.HistoryItems != 6 || second.NativeRef.Codex.HistorySHA256 == ref.HistorySHA256 {
-		t.Fatal("cold new-process resume did not retain thread and create exactly one new Turn")
+		t.Fatalf("matching pending warning blocked same-thread cold resume: outcome=%s accepted=%t terminal=%s", second.Outcome, second.Accepted, second.Terminal)
+	}
+	if !reflect.DeepEqual(events, []EventKind{SessionEvent, AcceptedEvent, ResponseEvent, TerminalEvent}) {
+		t.Fatal("passive warning changed the verified lifecycle")
 	}
 	frames := sessionClientFrames(t, request.CWD)
 	if len(frames) != 2 {
@@ -908,6 +980,11 @@ func TestCodexSessionFreshCaptureThenColdResume(t *testing.T) {
 			if *frame.Method == "thread/start" || *frame.Method == "thread/resume" {
 				if params["history"] != nil || params["path"] != nil || params["dynamicTools"] != nil || string(params["approvalPolicy"]) != `"never"` || string(params["sandbox"]) != `"read-only"` || string(params["modelProvider"]) != `"synthetic"` {
 					t.Fatal("native selection or current isolation bundle widened")
+				}
+				if *frame.Method == "thread/resume" && (string(params["excludeTurns"]) != "true" || params["ephemeral"] != nil || params["initialTurnsPage"] != nil ||
+					string(params["threadId"]) != string(mustCodexAppServerJSON(ref.NativeThreadID)) || string(params["cwd"]) != string(mustCodexAppServerJSON(request.CWD)) ||
+					string(params["model"]) != string(mustCodexAppServerJSON(request.Model)) || string(params["approvalsReviewer"]) != `"user"`) {
+					t.Fatal("resume changed the exact metadata-only selection or profile")
 				}
 				var config struct {
 					Servers map[string]struct {
@@ -953,12 +1030,16 @@ func TestCodexSessionFreshCaptureThenColdResume(t *testing.T) {
 	if !observed[hex.EncodeToString(oldHash[:])] || !observed[hex.EncodeToString(newHash[:])] {
 		t.Fatal("current child token not rebound")
 	}
+	private := []string{"new input one", request.Prompt, memberToolTestToken, secondToken, "synthetic historical text", "synthetic session answer", codexBootstrapPrivatePayload}
 	for _, receipt := range []ExecutionReceipt{first, second} {
-		for _, path := range []string{receipt.StdoutPath, receipt.StderrPath} {
-			data, _ := os.ReadFile(path)
-			if strings.Contains(string(data), request.Prompt) || strings.Contains(string(data), secondToken) || strings.Contains(string(data), "synthetic historical text") {
-				t.Fatal("native history or token entered product logs")
-			}
+		out := readCodexFixtureProjection(t, receipt.StdoutPath, private...)
+		err := readCodexFixtureProjection(t, receipt.StderrPath, private...)
+		if len(out["bootstrap_failure"]) != 0 || len(err["bootstrap_failure"]) != 0 {
+			t.Fatal("successful run logged a bootstrap failure")
+		}
+		life := out["lifecycle_summary"]
+		if len(life) != 4 || life[0]["thread_id"] != ref.NativeThreadID || life[3]["turn_id"] != receipt.NativeRef.Codex.NativeTurnID || life[3]["terminal"] != string(OutcomeSucceeded) {
+			t.Fatal("sanitized logging dropped verified reconciliation IDs")
 		}
 	}
 }

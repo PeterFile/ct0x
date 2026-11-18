@@ -30,6 +30,13 @@ func PiNativeTextSessionProfileSupported(selected Provider, model, thinking stri
 		utf8.ValidString(model) && len(model) <= 256 && piSessionModel.MatchString(model) && validPiThinking(thinking)
 }
 
+// CodexNativeTextSessionProfileSupported checks declared metadata only, not
+// installation, account readiness, authority, or eligibility of a reference.
+func CodexNativeTextSessionProfileSupported(selected Provider, model, thinking string) bool {
+	return selected.Name == Codex && nativeTextSessionProviderSupported(selected) &&
+		utf8.ValidString(model) && codexAppServerIdentity(model) && thinking == ""
+}
+
 func nativeTextSessionProviderSupported(selected Provider) bool {
 	return utf8.ValidString(selected.Path) && strings.TrimSpace(selected.Path) == selected.Path && nativeSessionPath(selected.Path) &&
 		(selected.Name == Pi && selected.Version == "1.4.0" || selected.Name == Codex && selected.Version == "0.166.0")
@@ -122,8 +129,10 @@ func NewPiNativeSessionMemberToolAdapter(extensionPath string, config NativeMemb
 	}
 }
 
-// NewCodexAppServerNativeSessionMemberToolAdapter is experimental and used only
-// in offline tests. The service selects the fresh-only AppServer adapter.
+// NewCodexAppServerNativeSessionMemberToolAdapter constructs the explicit
+// native text path. Capability sampling does not validate a claim or a reference.
+// Execution requires the current issued config digest and, on resume, a qualified
+// reference supplied by the caller. This does not register or enable the path.
 func NewCodexAppServerNativeSessionMemberToolAdapter(config NativeMemberToolConfig, toolNames []string, options CodexAppServerSessionOptions) Adapter {
 	return nativeSessionMemberToolAdapter{
 		memberToolAdapter: NewCodexAppServerMemberToolAdapter(config.Path, toolNames).(memberToolAdapter),
