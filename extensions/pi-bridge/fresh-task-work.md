@@ -49,8 +49,25 @@ content nor quote. After handling changes, start reading from offset zero.
 Reads do not acknowledge input, and submission is not acceptance. There is no
 report, delegation, investigation, file tool, MCP or generic fallback.
 
-Keep the original call ID, derived key and request if a write outcome is
-unknown. The bridge does not resend it and blocks subsequent writes for that
-client, even after a successful read. This is not durable reconciliation. Remove
-the fresh flag on restart to disable new launches. That does not settle previous
-claims, release unknown resources or authorize retry of in-flight work.
+If a write's receipt can't be confirmed, the bridge refuses replays and all
+later writes in that client, even after a successful read. Only the first
+unconfirmed write adds `result.details.agent_workspace_write_unknown_v1` to
+Pi's native `tool_execution_end`. The record holds the bound role and RunID,
+operation, original native call ID (at most 256 visible ASCII bytes), the key
+`SHA256(operation + call ID)`, and the SHA-256 of the exact HTTP request bytes.
+It holds no request body or capability. Checked successes and definite denials
+don't set this marker.
+
+The pinned typed adapter retains the record in the private `stdout.jsonl` and
+returns `OutcomeUnknown`, even if Pi reports a successful terminal and exits
+normally. It preserves the observed Terminal and child wait facts, not a native
+resume reference. Assistant text and tool arguments can't set or clear the
+marker. A damaged stream or clipped typed stdout log can't authorize settlement.
+If a valid marker was observed despite clipping, a reserved tail in the same
+1 MiB log holds a parent-written copy of just the identity, with type
+`agent_workspace_write_unknown_v1`. A lost frame or failed log can still leave
+no identity to recover. The log helps same-key reconciliation; it doesn't
+supply the original request, reconcile the write, or authorize replay.
+
+Remove the fresh flag on restart to disable new launches. That does not settle
+previous claims, release unknown resources or authorize retry of in-flight work.

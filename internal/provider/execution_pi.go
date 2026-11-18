@@ -17,14 +17,14 @@ const executionLogLimit = 1 << 20
 type executionLog struct {
 	file              *os.File
 	cancel            context.CancelFunc
-	size              int
+	size, tailReserve int
 	truncated, failed bool
 }
 
 func (l *executionLog) Write(p []byte) (int, error) {
 	n := len(p)
-	if len(p) > executionLogLimit-l.size {
-		p, l.truncated = p[:executionLogLimit-l.size], true
+	if room := executionLogLimit - l.tailReserve - l.size; len(p) > room {
+		p, l.truncated = p[:room], true
 	}
 	if !l.failed && len(p) != 0 {
 		written, err := l.file.Write(p)
@@ -48,6 +48,7 @@ type executionOutput struct {
 	dropping, damaged, settled bool
 	last                       Outcome
 	piSession                  *piSessionTracker
+	piTypedWork                *piTypedWorkOutput
 }
 
 func (o *executionOutput) Write(p []byte) (int, error) {
@@ -142,6 +143,12 @@ func (o *executionOutput) recordPi(line []byte) {
 		o.emit(Event{Kind: SessionEvent})
 	case "agent_start":
 		o.last = ""
+	case "tool_execution_end":
+		if o.piTypedWork != nil && !o.piTypedWork.observe(line, o.runID, r.Accepted && !o.settled) {
+			// An invalid control frame cannot settle the invocation. It does not
+			// change what the native assistant or the child lifecycle showed.
+			o.damaged = true
+		}
 	case "message_start", "message_end":
 		if event.Message.Role == "" {
 			o.damaged, o.last = true, ""
