@@ -44,9 +44,6 @@ type MemberToolRuntimeOptions struct {
 	// FreshTaskWork composes typed continuation via the ChatIntake Engine and
 	// the role execution fence. It does not install the legacy preview.
 	FreshTaskWork *FreshTaskWorkLaunch
-	// TaskWorkReports opts into the experimental postclaim report and typed
-	// investigation owner transport. It does not enable B or install a launcher.
-	TaskWorkReports *coordination.Engine
 }
 
 type MemberToolRunBinding struct {
@@ -136,12 +133,6 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 	}
 	tools := NewMemberTools(db)
 	tools.workInputs = options.WorkInputs
-	if engine := options.TaskWorkReports; engine != nil {
-		if roleFence == nil || !engine.UsesStore(db) {
-			return nil, errMemberToolRuntimeConfig
-		}
-		tools.workReportEngine = engine
-	}
 	if launch := options.FreshTaskWork; launch != nil {
 		if roleFence == nil || !options.ChatIntake.UsesStore(db) || launch.Supports == nil || launch.Construct == nil {
 			return nil, errMemberToolRuntimeConfig

@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"slices"
 
-	"agentworkspace/internal/domain"
 	"agentworkspace/internal/store"
 )
 
@@ -15,9 +14,6 @@ type MemberToolTransportProfile struct {
 	DiscussionOnlyExcerpt bool
 	InvestigationIntake   bool
 	InvestigationRole     bool
-
-	// Only a current delegation snapshot can use the extra report bindings.
-	mcpReportDelegation *taskWorkReportBinding
 }
 
 func (s *MemberTools) TransportOperations(ctx context.Context, token string) ([]string, error) {
@@ -47,11 +43,7 @@ func (s *MemberTools) TransportProfile(ctx context.Context, token string) (Membe
 		if err := s.workReportCurrent(ctx, entry.scope, binding.delivery); err != nil {
 			return MemberToolTransportProfile{}, err
 		}
-		profile := MemberToolTransportProfile{Operations: slices.Clone(entry.grants.Operations)}
-		if binding.delivery.SourceKind == domain.TaskWorkSourceDelegation && slices.Contains(profile.Operations, ReportWorkOperation) {
-			profile.mcpReportDelegation = binding
-		}
-		return profile, nil
+		return MemberToolTransportProfile{Operations: slices.Clone(entry.grants.Operations)}, nil
 	}
 	if err := s.db.ValidateMemberTool(ctx, entry.scope); err != nil {
 		return MemberToolTransportProfile{}, memberRoleError(ctx, err)

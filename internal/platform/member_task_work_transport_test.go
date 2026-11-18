@@ -1,16 +1,19 @@
 package platform_test
 
 import (
-	"crypto/sha256"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -37,9 +40,8 @@ func newBoundWorkReportFixture(t *testing.T) *boundWorkReportFixture {
 	t.Helper()
 	f := &boundWorkReportFixture{roleRuntimeFixture: newRoleRuntime(t)}
 	f.engine = coordination.New(f.db)
-	f.options.TaskWorkReports = f.engine
 	var err error
-	f.runtime, err = platform.NewMemberToolRuntime(f.db, f.options)
+	f.runtime, err = platform.NewMemberToolRuntimeWithTaskWorkReports(f.db, f.options, f.engine)
 	roleOK(t, err)
 	f.mount(t)
 	return f
@@ -415,6 +417,12 @@ func TestBoundWorkReportReadTransport(t *testing.T) {
 	}
 	f.call(t, thirdToken, `"third"`, "list_members", `{}`, false) // The withheld read didn't reserve this ID.
 	f.expectHTTP(t, thirdToken, write, testReportBody, "third-write", http.StatusForbidden)
+	if text := f.call(t, thirdToken, `"third-write"`, write, testReportBody, true); !strings.Contains(text, `"code":"forbidden"`) {
+		t.Fatal("ordinary token acquired report authority")
+	}
+	if text := f.call(t, thirdToken, `"third-write"`, "list_members", `{}`, true); !strings.Contains(text, "同一 JSON-RPC id") {
+		t.Fatal("unscoped report rejection changed ordinary binding semantics")
+	}
 	tools.Revoke(ownerToken)
 	if text := f.call(t, ownerToken, `"revoked"`, read, `{}`, true); !strings.Contains(text, `"code":"forbidden"`) {
 		t.Fatal("revoked capability still read a report on the live claim")
@@ -434,7 +442,91 @@ func TestBoundWorkReportReadTransport(t *testing.T) {
 
 const boundWorkOrdinaryMCPLimit = 256
 
-func TestBoundWorkReportOnlyMCPReserve(t *testing.T) {
+func TestBoundWorkReportMCPReserve(t *testing.T) {
+	for _, reportFirst := range []bool{false, true} {
+		name := "reads-first"
+		if reportFirst {
+			name = "report-first"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newBoundWorkReportFixture(t)
+			f.delegate(t, nil, nil, true)
+			child := f.claimWork(t, f.delegation.DeliveryID)
+			token, err := f.runtime.IssueWorkDelegationTools(t.Context(), child.Claim, nil)
+			roleOK(t, err)
+			defer f.runtime.Tools().Revoke(token)
+			const op, channel = platform.ReportWorkOperation, platform.ReadInvestigationChannelOperation
+			before := f.workCounts(t)
+			progress := func(i int) {
+				t.Helper()
+				text := f.call(t, token, fmt.Sprintf(`"progress-%d"`, i), op, testReportBody, false)
+				if !strings.Contains(text, `"wake_queued":false`) {
+					t.Fatal("progress queued a wake")
+				}
+			}
+			if reportFirst {
+				progress(0)
+			}
+			page := f.expectHTTP(t, token, channel, `{}`, "", http.StatusOK)
+			for i := 1; i <= boundWorkOrdinaryMCPLimit; i++ {
+				if got := f.call(t, token, fmt.Sprintf(`"read-%d"`, i), channel, `{}`, false); got != page {
+					t.Fatalf("scoped MCP read %d differs from HTTP", i)
+				}
+			}
+			if text := f.call(t, token, `"extra-read"`, channel, `{}`, true); !strings.Contains(text, `"code":"mcp_request_capacity"`) {
+				t.Fatalf("ordinary tool reached the report reserve: %s", text)
+			}
+			if got := f.call(t, token, `"read-1"`, channel, `{}`, false); got != page {
+				t.Fatal("capacity blocked an ordinary replay")
+			}
+			if !reportFirst {
+				progress(0)
+			}
+			for i := 1; i < domain.MaxWorkReportsPerDelegation-1; i++ {
+				progress(i)
+			}
+			before[3] += domain.MaxWorkReportsPerDelegation - 1
+			if text := f.call(t, token, `"excess-progress"`, op, testReportBody, true); !strings.Contains(text, `"code":"conflict"`) {
+				t.Fatalf("fourth progress did not reach B's reserved-wake rule: %s", text)
+			}
+			f.expectHTTP(t, token, op, testReportBody, "http-excess-progress", http.StatusConflict)
+			if f.workCounts(t) != before || f.reportReceipts(t) != domain.MaxWorkReportsPerDelegation-1 {
+				t.Fatal("rejected progress left a report, receipt, or wake")
+			}
+			text := f.call(t, token, `"fresh-delivered"`, op, testDeliveredBody, false)
+			key := f.reportKey(t, text)
+			for i := range before {
+				before[i]++
+			}
+			if !strings.Contains(text, `"wake_queued":true`) || f.expectHTTP(t, token, op, testDeliveredBody, key, http.StatusCreated) != text ||
+				f.workCounts(t) != before || f.reportReceipts(t) != domain.MaxWorkReportsPerDelegation {
+				t.Fatal("MCP did not create exactly one waking report replayable through HTTP")
+			}
+		})
+	}
+}
+
+const testDeliveredBody = `{"kind":"delivered","summary":"Evidence verified"}`
+
+func (f *boundWorkReportFixture) reportReceipts(t *testing.T) int {
+	t.Helper()
+	var count int
+	roleOK(t, f.raw.QueryRow(`SELECT count(*) FROM mutation_idempotency WHERE operation='report_work'`).Scan(&count))
+	return count
+}
+
+func (f *boundWorkReportFixture) reportKey(t *testing.T, text string) string {
+	t.Helper()
+	var receipt struct {
+		ReportID string `json:"report_id"`
+	}
+	roleOK(t, json.Unmarshal([]byte(text), &receipt))
+	var key string
+	roleOK(t, f.raw.QueryRow(`SELECT idempotency_key FROM mutation_idempotency WHERE operation='report_work' AND record_id=?`, receipt.ReportID).Scan(&key))
+	return key
+}
+
+func TestBoundWorkReportMCPUnknownReplay(t *testing.T) {
 	ctx := t.Context()
 	f := newBoundWorkReportFixture(t)
 	f.delegate(t, nil, nil, false)
@@ -446,14 +538,7 @@ func TestBoundWorkReportOnlyMCPReserve(t *testing.T) {
 	const op = "report_work"
 	memberMCPRoleProfile(t, f.roleRuntimeFixture, token, op)
 
-	// Match d966: seed the ordinary registry, then exercise the reserve via MCP.
-	fingerprint := sha256.Sum256([]byte("ordinary request"))
-	for i := 0; i < boundWorkOrdinaryMCPLimit; i++ {
-		roleOK(t, tools.BindMCPRequest(token, sha256.Sum256([]byte(fmt.Sprintf("ordinary-%d", i))), fingerprint))
-	}
-	if text := f.call(t, token, `"not-report"`, "list_members", `{}`, true); !strings.Contains(text, `"code":"mcp_request_capacity"`) {
-		t.Fatal("non-report operation reached the report reserve")
-	}
+	// Leave the ordinary bucket empty: new report IDs cannot spill into it.
 	var first string
 	for i := 0; i < domain.MaxWorkReportsPerDelegation-1; i++ {
 		text := f.call(t, token, fmt.Sprintf(`"progress-%d"`, i), op, testReportBody, false)
@@ -461,36 +546,30 @@ func TestBoundWorkReportOnlyMCPReserve(t *testing.T) {
 			first = text
 		}
 	}
-	const id, delivered = `"delivery"`, `{"kind":"delivered","summary":"Evidence verified"}`
-	// Real COMMIT failure after ReportWork has built the report and its wake.
-	_, err = f.raw.Exec(`CREATE TABLE report_commit_guard(id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED);
-		CREATE TRIGGER report_commit_failure AFTER INSERT ON task_work_reports BEGIN INSERT INTO report_commit_guard VALUES('missing-group'); END`)
-	roleOK(t, err)
+	if text := f.call(t, token, `"invalid-report"`, op, `{"kind":"invalid","summary":"x"}`, true); !strings.Contains(text, `"code":"invalid_input"`) {
+		t.Fatalf("invalid report did not reach the handler's 400: %s", text)
+	}
+	const id = `"delivery"`
+	restore := f.failReportCommits(t)
 	before := f.workCounts(t)
-	if text := f.call(t, token, id, op, delivered, true); !strings.Contains(text, `"code":"internal_error"`) || !strings.Contains(text, "原幂等键") ||
+	if text := f.call(t, token, id, op, testDeliveredBody, true); !strings.Contains(text, `"code":"internal_error"`) || !strings.Contains(text, "原幂等键") ||
 		strings.Contains(text, `"wake_queued"`) || strings.Contains(text, "report_commit_guard") || f.workCounts(t) != before {
 		t.Fatal("B commit uncertainty was reclassified, leaked, or treated as success")
 	}
-	if text := f.call(t, token, `"new-id"`, op, delivered, true); !strings.Contains(text, `"code":"mcp_request_capacity"`) {
-		t.Fatal("unknown result freed its reserved MCP ID")
+	if text := f.call(t, token, `"new-id"`, op, testDeliveredBody, true); !strings.Contains(text, `"code":"mcp_request_capacity"`) {
+		t.Fatalf("unknown result freed its reserved MCP ID or spilled into the ordinary budget: %s", text)
 	}
 	if text := f.call(t, token, id, op, testReportBody, true); !strings.Contains(text, "同一 JSON-RPC id") {
 		t.Fatal("changed body reused the uncertain request binding")
 	}
-	_, err = f.raw.Exec(`DROP TRIGGER report_commit_failure`)
-	roleOK(t, err)
+	restore()
 	// This fixture checked rollback. A manual replay uses the original ID/body.
-	text := f.call(t, token, id, op, delivered, false)
-	var receipt struct {
-		ReportID string `json:"report_id"`
-	}
-	roleOK(t, json.Unmarshal([]byte(text), &receipt))
-	var key string
-	roleOK(t, f.raw.QueryRow(`SELECT idempotency_key FROM mutation_idempotency WHERE operation='report_work' AND record_id=?`, receipt.ReportID).Scan(&key))
+	text := f.call(t, token, id, op, testDeliveredBody, false)
+	key := f.reportKey(t, text)
 	for i := range before {
 		before[i]++
 	}
-	if again := f.expectHTTP(t, token, op, delivered, key, http.StatusCreated); again != text || f.workCounts(t) != before {
+	if again := f.expectHTTP(t, token, op, testDeliveredBody, key, http.StatusCreated); again != text || f.workCounts(t) != before {
 		t.Fatal("cross-transport replay did not return the same single durable B result")
 	}
 	f.expectHTTP(t, token, op, testReportBody, key, http.StatusConflict)
@@ -502,8 +581,168 @@ func TestBoundWorkReportOnlyMCPReserve(t *testing.T) {
 	}
 	_, err = f.db.RequestTurnCancel(ctx, f.group, child.Claim.TurnID)
 	roleOK(t, err)
-	if text := f.call(t, token, id, op, delivered, true); !strings.Contains(text, `"code":"forbidden"`) {
+	if text := f.call(t, token, id, op, testDeliveredBody, true); !strings.Contains(text, `"code":"forbidden"`) {
 		t.Fatal("a canceled claim replayed a report")
+	}
+}
+
+func (f *boundWorkReportFixture) failReportCommits(t *testing.T) func() {
+	t.Helper()
+	// Real COMMIT failure after ReportWork has prepared the report and wake.
+	_, err := f.raw.Exec(`CREATE TABLE report_commit_guard(id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED);
+		CREATE TRIGGER report_commit_failure AFTER INSERT ON task_work_reports BEGIN INSERT INTO report_commit_guard VALUES('missing-group'); END`)
+	roleOK(t, err)
+	return func() {
+		t.Helper()
+		_, err := f.raw.Exec(`DROP TRIGGER report_commit_failure`)
+		roleOK(t, err)
+	}
+}
+
+func boundWorkReportMCPRequest(ctx context.Context, token, id, body string) *http.Request {
+	payload := fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"report_work","arguments":%s}}`, id, body)
+	r := httptest.NewRequestWithContext(ctx, http.MethodPost, "http://"+httpapi.DefaultAddress+"/api/v1/member-tools/mcp", strings.NewReader(payload))
+	r.Header.Set("Authorization", "Bearer "+token)
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("Accept", "application/json, text/event-stream")
+	r.Header.Set("MCP-Protocol-Version", "2025-06-18")
+	return r
+}
+
+type boundWorkMCPReply struct {
+	*httptest.ResponseRecorder
+	write func([]byte) (int, error)
+}
+
+func (w boundWorkMCPReply) Write(body []byte) (int, error) { return w.write(body) }
+
+func TestBoundWorkReportMCPInFlightPolicyLoss(t *testing.T) {
+	f := newBoundWorkReportFixture(t)
+	f.delegate(t, nil, nil, true)
+	child := f.claimWork(t, f.delegation.DeliveryID)
+	token, err := f.runtime.IssueWorkDelegationTools(t.Context(), child.Claim, nil)
+	roleOK(t, err)
+	tools := f.runtime.Tools()
+	defer tools.Revoke(token)
+	const report, channel = platform.ReportWorkOperation, platform.ReadInvestigationChannelOperation
+	const activeID, readID, confirmedID = `"active-delivery"`, `"confirmed-read"`, `"confirmed-progress"`
+	f.call(t, token, readID, channel, `{}`, false)
+	confirmed := f.call(t, token, confirmedID, report, testReportBody, false)
+	key := f.reportKey(t, confirmed)
+	before := f.workCounts(t)
+
+	restore := f.failReportCommits(t)
+	recorder := httptest.NewRecorder()
+	entered, resume, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	w := boundWorkMCPReply{recorder, func(body []byte) (int, error) {
+		// The real Store transaction ended, but the first MCP response hasn't.
+		close(entered)
+		<-resume
+		return recorder.Write(body)
+	}}
+	r := boundWorkReportMCPRequest(t.Context(), token, activeID, testDeliveredBody)
+	go func() {
+		defer close(done)
+		f.handler.ServeHTTP(w, r)
+	}()
+	finish := sync.OnceFunc(func() { close(resume); <-done })
+	defer finish()
+	select {
+	case <-entered:
+	case <-done:
+		t.Fatal("initial MCP call did not reach the response barrier")
+	}
+	restore()
+	if f.workCounts(t) != before || f.reportReceipts(t) != 1 {
+		t.Fatal("the first COMMIT fault persisted an effect")
+	}
+	f.stopScope(t)
+	afterPolicy := f.workCounts(t)
+	if text := f.call(t, token, activeID, report, testDeliveredBody, true); !strings.Contains(text, `"code":"mcp_request_in_flight"`) {
+		t.Fatalf("duplicate ran before the original MCP response (and could report a later B rejection): %s", text)
+	}
+	mismatch := func(id, op, body string) {
+		t.Helper()
+		if text := f.call(t, token, id, op, body, true); !strings.Contains(text, `"code":"conflict"`) || !strings.Contains(text, "同一 JSON-RPC id") {
+			t.Fatalf("same ID crossed the binding namespace: %s", text)
+		}
+	}
+	mismatch(activeID, channel, `{}`)
+	mismatch(readID, report, testDeliveredBody)
+	finish()
+	if text := memberMCPRoleText(t, recorder, true); !strings.Contains(text, `"code":"internal_error"`) || !strings.Contains(text, "原幂等键") {
+		t.Fatalf("first response lost real commit uncertainty: %s", text)
+	}
+	// B now definitively rejects this *attempt*. That cannot erase the prior
+	// unknown binding, or turn a different body/tool into its reconciliation.
+	if text := f.call(t, token, activeID, report, testDeliveredBody, true); !strings.Contains(text, `"code":"conflict"`) || strings.Contains(text, "同一 JSON-RPC id") {
+		t.Fatalf("original replay did not reach B's policy rejection: %s", text)
+	}
+	mismatch(activeID, report, testReportBody)
+	mismatch(activeID, channel, `{}`)
+	mismatch(confirmedID, channel, `{}`)
+	for i := 0; i <= domain.MaxWorkReportsPerDelegation; i++ {
+		if text := f.call(t, token, fmt.Sprintf(`"denied-%d"`, i), report, testDeliveredBody, true); !strings.Contains(text, `"code":"conflict"`) {
+			t.Fatalf("definitive policy rejections consumed report capacity: %s", text)
+		}
+	}
+	if f.call(t, token, confirmedID, report, testReportBody, false) != confirmed ||
+		f.expectHTTP(t, token, report, testReportBody, key, http.StatusCreated) != confirmed ||
+		f.workCounts(t) != afterPolicy || f.reportReceipts(t) != 1 {
+		t.Fatal("a call after policy loss changed the original B receipt or effects")
+	}
+	tools.Revoke(token)
+	if text := f.call(t, token, activeID, report, testDeliveredBody, true); !strings.Contains(text, `"code":"forbidden"`) {
+		t.Fatal("revoked token reached B through an old binding")
+	}
+}
+
+func TestBoundWorkReportMCPUncertainRejection(t *testing.T) {
+	for _, fault := range []string{"write-error", "cancel-at-reply", "canceled-handler"} {
+		t.Run(fault, func(t *testing.T) {
+			f := newBoundWorkReportFixture(t)
+			f.delegate(t, nil, nil, false)
+			child := f.claimWork(t, f.delegation.DeliveryID)
+			token, err := f.runtime.IssueWorkDelegationTools(t.Context(), child.Claim, nil)
+			roleOK(t, err)
+			defer f.runtime.Tools().Revoke(token)
+			const report, id = platform.ReportWorkOperation, `"fourth"`
+			for i := 0; i < domain.MaxWorkReportsPerDelegation-1; i++ {
+				f.call(t, token, fmt.Sprintf(`"progress-%d"`, i), report, testReportBody, false)
+			}
+			before := f.workCounts(t)
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			recorder := httptest.NewRecorder()
+			w := boundWorkMCPReply{recorder, func(body []byte) (int, error) {
+				n, err := recorder.Write(body) // Capture the attempted response for assertions.
+				switch fault {
+				case "write-error":
+					return 0, io.ErrClosedPipe
+				case "cancel-at-reply":
+					cancel()
+				}
+				return n, err
+			}}
+			want := `"code":"conflict"`
+			if fault == "canceled-handler" {
+				cancel()
+				want = `"code":"request_canceled"`
+			}
+			f.handler.ServeHTTP(w, boundWorkReportMCPRequest(ctx, token, id, testReportBody))
+			if text := memberMCPRoleText(t, recorder, true); !strings.Contains(text, want) {
+				t.Fatalf("fixture did not exercise %s: %s", fault, text)
+			}
+			if text := f.call(t, token, id, report, testDeliveredBody, true); !strings.Contains(text, "同一 JSON-RPC id") {
+				t.Fatalf("response fault or cancellation freed the request fingerprint: %s", text)
+			}
+			if text := f.call(t, token, `"new-delivered"`, report, testDeliveredBody, true); !strings.Contains(text, `"code":"mcp_request_capacity"`) {
+				t.Fatalf("uncertain rejection freed a report slot: %s", text)
+			}
+			if f.workCounts(t) != before || f.reportReceipts(t) != domain.MaxWorkReportsPerDelegation-1 {
+				t.Fatal("fault or rejected replay persisted an effect")
+			}
+		})
 	}
 }
 
@@ -511,7 +750,6 @@ func TestBoundWorkReportTransportDefaultClosed(t *testing.T) {
 	f := newBoundWorkReportFixture(t)
 	f.delegate(t, nil, nil, false)
 	child := f.claimWork(t, f.delegation.DeliveryID)
-	f.options.TaskWorkReports = nil
 	var err error
 	f.runtime, err = platform.NewMemberToolRuntime(f.db, f.options)
 	roleOK(t, err)
@@ -522,8 +760,12 @@ func TestBoundWorkReportTransportDefaultClosed(t *testing.T) {
 	if w := f.http(t, child.Claim.Token, "report_work", testReportBody, "default-closed"); w.Code != http.StatusNotFound {
 		t.Fatalf("default transport mounted report_work: %d", w.Code)
 	}
-	f.options.TaskWorkReports = coordination.New(nil)
-	if runtime, err := platform.NewMemberToolRuntime(f.db, f.options); runtime != nil || err == nil {
+	if runtime, err := platform.NewMemberToolRuntimeWithTaskWorkReports(f.db, f.options, coordination.New(nil)); runtime != nil || err == nil {
 		t.Fatal("report transport accepted an Engine without the registry Store")
+	}
+	withoutFence := f.options
+	withoutFence.RoleMaxActive, withoutFence.RoleExecutionRoot = 0, ""
+	if runtime, err := platform.NewMemberToolRuntimeWithTaskWorkReports(f.db, withoutFence, f.engine); runtime != nil || err == nil {
+		t.Fatal("report transport accepted a runtime without the role fence")
 	}
 }
