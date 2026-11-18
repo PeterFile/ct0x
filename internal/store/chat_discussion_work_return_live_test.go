@@ -20,7 +20,7 @@ func checkWorkReturnIntakeResource(t *testing.T, f workReturnFixture, held bool)
 	}
 }
 
-func checkWorkReturnWake(t *testing.T, f workReturnFixture) domain.TaskWorkHandback {
+func checkWorkReturnWake(t *testing.T, f workReturnFixture) (domain.TaskWorkHandback, domain.ChatDiscussionWorkReturnReceipt) {
 	t.Helper()
 	s := f.s
 	counts := workReportWakeCounts(t, s)
@@ -28,20 +28,49 @@ func checkWorkReturnWake(t *testing.T, f workReturnFixture) domain.TaskWorkHandb
 	r := readWorkReturn(t, s, h)
 	if h.AuthorTurnID != f.owner.Claim.TurnID || h.AuthorAttemptID != f.ownerAttempt || h.TaskID != f.admission.TaskID || h.MandateID != f.admission.MandateID ||
 		r == nil || r.ThreadRef != f.admission.ThreadRef || r.OriginMessageID != f.candidate.MessageID || r.InvitationMessageID != f.invite.Message.ID ||
-		r.RecipientID != f.a || r.RecipientID == f.intake.MemberID || r.DeliveryID == "" ||
+		r.RecipientID != f.a || r.RecipientID == f.intake.MemberID || r.ConversationID != f.scope.ConversationID || r.DeliveryID == "" ||
 		workReportWakeCounts(t, s) != ([3]int{counts[0] + 2, counts[1] + 1, counts[2]}) {
 		t.Fatalf("expected exact B handback, A publication and one wake: %+v / %+v", h, r)
 	}
-	m, err := s.GetMessage(ctx, f.groupID, r.MessageID)
-	if err != nil || m.TopicID != h.TopicID || len(m.Deliveries) != 1 || m.Deliveries[0].ID != r.DeliveryID ||
-		m.Deliveries[0].RecipientID != f.a || m.Deliveries[0].State != domain.DeliveryStateQueued || m.Deliveries[0].TurnID != "" {
-		t.Fatalf("return did not queue just the original root: %+v %v", m, err)
-	}
+	checkWorkReturnDelivery(t, s, *r)
 	notice, err := s.GetMessage(ctx, f.groupID, h.NoticeMessageID)
-	if err != nil || notice.ID == m.ID || notice.SourceID != "work:handback:"+h.ID || len(notice.Deliveries) != 0 {
+	if err != nil || notice.ID == r.MessageID || notice.SourceID != "work:handback:"+h.ID || len(notice.Deliveries) != 0 {
 		t.Fatalf("B notice must remain separate and non-waking: %+v %v", notice, err)
 	}
-	return h
+	return h, *r
+}
+
+func checkWorkReturnDelivery(t *testing.T, s *Store, r domain.ChatDiscussionWorkReturnReceipt) {
+	t.Helper()
+	if got, err := s.ResolveChatDiscussionWorkReturnDelivery(ctx, r.GroupID, r.DeliveryID); err != nil || got != r {
+		t.Fatalf("wrong typed return route: %+v %v; want %+v", got, err, r)
+	}
+	m, err := s.GetMessage(ctx, r.GroupID, r.MessageID)
+	if err != nil || m.TopicID != r.TopicID || len(m.Deliveries) != 1 || m.Deliveries[0].ID != r.DeliveryID ||
+		m.Deliveries[0].RecipientID != r.RecipientID || m.Deliveries[0].ConversationID != r.ConversationID ||
+		m.Deliveries[0].State != domain.DeliveryStateQueued || m.Deliveries[0].TurnID != "" {
+		t.Fatalf("return did not queue just the original root: %+v %v", m, err)
+	}
+}
+
+func assertNoWorkReturnDiscussionReply(t *testing.T, f workReturnFixture, scope MemberToolScope) {
+	t.Helper()
+	if r, err := f.s.ApplyChatDiscussion(ctx, scope, f.admission.CandidateID,
+		domain.ChatDiscussionAction{Kind: domain.ChatDiscussionReply, Content: "尝试沿原路径回复。"}, "late-reply"); !errors.Is(err, ErrMemberToolDenied) || r.Message.ID != "" {
+		t.Fatalf("admitted intake advanced the structured discussion: %+v %v", r, err)
+	}
+}
+
+func checkWorkReturnNativeReply(t *testing.T, f workReturnFixture, turn domain.Turn, text string, before [3]int) {
+	t.Helper()
+	if after := workReportWakeCounts(t, f.s); turn.ReplyMessageID == "" || after != ([3]int{before[0] + 1, before[1], before[2]}) {
+		t.Fatalf("trusted settlement must publish one reply without a wake: reply=%q, counts=%v (was %v)", turn.ReplyMessageID, after, before)
+	}
+	m := checkDiscussionWorkMessage(t, f.s, f.groupID, turn.ReplyMessageID, nil, "") // Public detail and timeline.
+	if m.TopicID != f.intake.TopicID || m.SenderID != f.intake.MemberID || m.Content != text ||
+		m.SourceKind != "member" || m.SourceID != "turn:"+f.intake.Claim.TurnID || len(m.Deliveries) != 0 || m.Discussion != nil {
+		t.Fatalf("native output was not an ordinary public reply: %+v", m)
+	}
 }
 
 func TestChatDiscussionWorkReturnWhileIntakeActive(t *testing.T) {
@@ -49,18 +78,22 @@ func TestChatDiscussionWorkReturnWhileIntakeActive(t *testing.T) {
 	f := setupWorkReturnAdmission(t)
 	f.startWorker(t) // Real dispatch and Worker attempt while the invite is still running.
 	s := f.s
-	queueEvent(t, s, f.intake.Claim, provider.ResponseEvent, "正在核对。", "")
+	const text = "正在核对。"
+	counts := workReportWakeCounts(t, s)
+	queueEvent(t, s, f.intake.Claim, provider.ResponseEvent, text, "")
 	intake := queueTurn(t, s, f.intake.Claim)
-	if intake.State != domain.TurnStateRunning || intake.AcceptedAt == nil || intake.CandidateTerminal != "" {
-		t.Fatalf("intake must be known active: %+v", intake)
+	if intake.State != domain.TurnStateRunning || intake.AcceptedAt == nil || intake.CandidateTerminal != "" ||
+		intake.CandidateText != text || intake.ReplyMessageID != "" {
+		t.Fatalf("intake must be known active with private candidate output: %+v", intake)
 	}
-	// The same active intake cannot consume the path via an ordinary directed step.
-	if r, err := s.ApplyChatDiscussion(ctx, f.intake, f.admission.CandidateID,
-		domain.ChatDiscussionAction{Kind: domain.ChatDiscussionReply, Content: "并发下尝试沿原路径回复。"}, "late-reply"); !errors.Is(err, ErrMemberToolDenied) || r.Message.ID != "" {
-		t.Fatalf("A5 did not seal the admitted head: %+v %v", r, err)
+	assertNoWorkReturnDiscussionReply(t, f, f.intake) // A5 seals the head before handback.
+	if after := workReportWakeCounts(t, s); after != counts {
+		t.Fatalf("active intake published a message or delivery: %v; was %v", after, counts)
 	}
 	checkWorkReturnIntakeResource(t, f, true)
-	h := checkWorkReturnWake(t, f)
+	h, returned := checkWorkReturnWake(t, f)
+	counts = workReportWakeCounts(t, s)
+	assertNoWorkReturnDiscussionReply(t, f, f.intake) // A7 must not reopen the still-live claim's path.
 	if after := queueTurn(t, s, f.intake.Claim); !reflect.DeepEqual(after, intake) {
 		t.Fatalf("return changed active intake: %+v; was %+v", after, intake)
 	}
@@ -77,12 +110,15 @@ func TestChatDiscussionWorkReturnWhileIntakeActive(t *testing.T) {
 	}
 	checkProjection()
 	if c, err := s.ReadChatDiscussionContext(ctx, f.intake, f.admission.CandidateID); err != nil || c == nil ||
-		!c.WorkAdmitted || !c.Closed || c.ClosureReason != "" || c.ActiveOwnerID != "" {
+		!c.WorkAdmitted || !c.Closed || c.ClosureReason != "" || c.ActiveOwnerID != "" ||
+		c.HeadMessageID != f.invite.Message.ID || c.ActiveInvitationMessageID != "" {
 		t.Fatalf("admitted discussion did not stay closed to directed moves: %+v %v", c, err)
 	}
 	f.settleIntake(t)
 	checkWorkReturnIntakeResource(t, f, false)
+	checkWorkReturnNativeReply(t, f, queueTurn(t, s, f.intake.Claim), text, counts)
 	checkProjection() // The trusted terminal still does not make this an interruption.
+	checkWorkReturnDelivery(t, s, returned)
 }
 
 func TestChatDiscussionWorkReturnRejectsUnprovedLiveIntake(t *testing.T) {
@@ -129,34 +165,48 @@ func TestChatDiscussionWorkReturnAfterIntakeReconciliation(t *testing.T) {
 	requireWorkReturnSchema(t)
 	f := setupWorkReturnAdmission(t)
 	s, old := f.s, f.intake.Claim
+	const text = "已核对讨论材料。"
+	counts := workReportWakeCounts(t, s)
+	queueEvent(t, s, old, provider.ResponseEvent, text, "")
 	if n, err := s.RecoverInFlight(ctx); err != nil || n != 1 {
 		t.Fatalf("recover the receiving Turn before dispatch: %d %v", n, err)
 	}
 	recovered := queueTurn(t, s, old)
-	if recovered.ID != old.TurnID || recovered.State != domain.TurnStateUnknown || recovered.ClaimToken == old.Token || recovered.AcceptedAt == nil {
-		t.Fatalf("recovery did not preserve and fence the accepted intake: %+v", recovered)
+	if recovered.ID != old.TurnID || recovered.State != domain.TurnStateUnknown || recovered.ClaimToken == old.Token || recovered.AcceptedAt == nil ||
+		recovered.CandidateText != text || recovered.ReplyMessageID != "" || workReportWakeCounts(t, s) != counts {
+		t.Fatalf("recovery did not preserve and fence the accepted intake and its private output: %+v", recovered)
 	}
 	checkWorkReturnIntakeResource(t, f, true)
 	f.startWorker(t) // A separate, currently authorized Worker can run during reconciliation.
 	owner := queueTurn(t, s, f.owner.Claim)
 	assertNoWorkReturn(t, s, f.owner, ErrMemberToolDenied)
 
+	counts = workReportWakeCounts(t, s)
 	receipt := queueReceipt(provider.OutcomeSucceeded)
 	if got, err := s.ApplyTurnReceipt(ctx, old, receipt); !errors.Is(err, ErrStaleClaim) || got.ID != "" {
 		t.Fatalf("stale intake claim settled unknown: %+v %v", got, err)
 	}
+	assertNoWorkReturnDiscussionReply(t, f, f.intake)
 	checkWorkReturnIntakeResource(t, f, true)
-	fresh := TurnClaim{GroupID: old.GroupID, TurnID: old.TurnID, Token: recovered.ClaimToken}
+	fresh := f.intake
+	fresh.Claim.Token = recovered.ClaimToken
 	incomplete := receipt
 	incomplete.OutputComplete = false
-	if got, err := s.ApplyTurnReceipt(ctx, fresh, incomplete); err != nil || got.State != domain.TurnStateUnknown {
-		t.Fatalf("candidate terminal evidence settled unknown: %+v %v", got, err)
+	if got, err := s.ApplyTurnReceipt(ctx, fresh.Claim, incomplete); err != nil || got.State != domain.TurnStateUnknown || got.ReplyMessageID != "" {
+		t.Fatalf("incomplete receipt settled unknown or published a reply: %+v %v", got, err)
 	}
+	assertNoWorkReturnDiscussionReply(t, f, fresh) // Rotation grants no tool authority while unknown.
 	checkWorkReturnIntakeResource(t, f, true)
 	assertNoWorkReturn(t, s, f.owner, ErrMemberToolDenied)
-	if got, err := s.ApplyTurnReceipt(ctx, fresh, receipt); err != nil || got.State != domain.TurnStateSucceeded || got.ClaimToken != fresh.Token {
-		t.Fatalf("trusted receipt failed to reconcile the original Turn: %+v %v", got, err)
+	if after := workReportWakeCounts(t, s); after != counts {
+		t.Fatalf("unknown intake published a message or delivery: %v; was %v", after, counts)
 	}
+	settled, err := s.ApplyTurnReceipt(ctx, fresh.Claim, receipt)
+	if err != nil || settled.ID != old.TurnID || settled.State != domain.TurnStateSucceeded || settled.ClaimToken != fresh.Claim.Token {
+		t.Fatalf("trusted receipt failed to reconcile the original Turn: %+v %v", settled, err)
+	}
+	assertNoWorkReturnDiscussionReply(t, f, fresh)
+	checkWorkReturnNativeReply(t, f, settled, text, counts)
 	checkWorkReturnIntakeResource(t, f, false)
 	if after := queueTurn(t, s, f.owner.Claim); !reflect.DeepEqual(owner, after) {
 		t.Fatalf("reconciliation changed the independent Worker claim: %+v", after)

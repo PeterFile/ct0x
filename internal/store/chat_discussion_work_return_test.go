@@ -42,6 +42,7 @@ func setupWorkReturnAdmission(t *testing.T) workReturnFixture {
 	}
 	investigationPolicy(t, f, domain.ChatInvestigationPolicy{Objective: investigationObjective, AllowTopicMessages: true}, 1)
 	s.EnableInvestigationExecution()
+	s.EnableTaskWorkExecution()
 	chatNextCandidate(t, &f, true)
 	settle := func(scope MemberToolScope) {
 		t.Helper()
@@ -165,7 +166,6 @@ func TestChatDiscussionWorkReturnOrdinaryHandback(t *testing.T) {
 func TestChatDiscussionWorkReturnPublishesAndReplaysAfterSupplement(t *testing.T) {
 	f := setupWorkReturn(t)
 	s := f.s
-	s.EnableTaskWorkExecution()
 	const constraint = "注明结论来源"
 	scope, supplement := newWorkInputCandidate(t, f.chatFixture, "请继续调查，并"+constraint+"。", f.intake.MemberID)
 	if supplement.ThreadRef != f.candidate.ThreadRef || supplement.Generation <= f.candidate.Generation || supplement.SourceKind != "local_user_chat" {
@@ -188,6 +188,7 @@ func TestChatDiscussionWorkReturnPublishesAndReplaysAfterSupplement(t *testing.T
 	counts := workReportWakeCounts(t, s)
 	other := queueHandle(t, f.path, false)
 	other.EnableInvestigationExecution()
+	other.EnableTaskWorkExecution()
 	type result struct {
 		h   domain.TaskWorkHandback
 		err error
@@ -411,6 +412,7 @@ func TestChatDiscussionWorkReturnLegacyReplay(t *testing.T) {
 
 	migrations = all
 	s := queueHandle(t, f.path, false)
+	s.EnableTaskWorkExecution()
 	before := messageSequenceSnapshot(t, s)
 	if again := workReturnHandback(t, s, f.owner); again != h || readWorkReturn(t, s, h) != nil {
 		t.Fatalf("legacy B replay changed or retroactively woke: %+v", again)
