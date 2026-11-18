@@ -24,6 +24,7 @@ const memberMCPMaxStringIDBytes = 128
 var memberMCPMaxEncodedID = strings.Repeat("\x00", memberMCPMaxStringIDBytes)
 
 var memberMCPComposedTools = slices.Concat(memberMCPTools, memberInvestigationMCPTools())
+var memberMCPWithReports = slices.Concat(memberMCPComposedTools, memberWorkReportMCPTools)
 
 // MemberMCPRoutes is opt-in; mount on the same NewServer and registry as native
 // routes. NewServer rejects GET with 405/Allow: POST: this endpoint has no SSE.
@@ -68,6 +69,11 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		memberMCPError(w, 400, id, -32600, "MCP-Protocol-Version 必须为 "+memberMCPVersion)
 		return
 	}
+	catalog := memberMCPComposedTools
+	reportTools := a.tools.TaskWorkReportsEnabled()
+	if reportTools {
+		catalog = memberMCPWithReports
+	}
 	profile, err := a.tools.TransportProfile(r.Context(), token)
 	if err != nil && method != "tools/call" {
 		buffer = newMemberMCPBuffer()
@@ -101,7 +107,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			return
 		}
 		tools := make([]memberMCPTool, 0, len(profile.Operations))
-		for _, tool := range memberMCPComposedTools {
+		for _, tool := range catalog {
 			if slices.Contains(profile.Operations, tool.Name) {
 				if tool.Name == "send_message" && (profile.ContinueWork || profile.DiscussionOnlyExcerpt || profile.InvestigationIntake) {
 					tool.InputSchema = memberMCPSendMessageSchema(profile.ContinueWork, profile.DiscussionOnlyExcerpt, profile.InvestigationIntake)
@@ -138,7 +144,8 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		if name == "send_message" {
 			continuation, excerpt = memberToolSendAssessmentFields(arguments)
 		}
-		if name == "ack_work_input" || name == "hand_back_work_input" || continuation || excerpt {
+		reportWrite := reportTools && name == platform.ReportWorkOperation
+		if name == "ack_work_input" || name == "hand_back_work_input" || continuation || excerpt || reportWrite {
 			// Neither the derived key nor the fingerprint may alias replacement
 			// characters. Keep legacy send_message and opaque metadata unchanged.
 			if !validMemberToolJSONStrings(frame["id"]) {
@@ -150,7 +157,18 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				return
 			}
 		}
-		for _, tool := range memberMCPComposedTools {
+		if reportTools && name == platform.ReadWorkReportOperation && (err != nil || !slices.Contains(profile.Operations, name)) {
+			// Withheld report reads don't reserve IDs. The handler will still
+			// recheck the exact report in B when discovery succeeds.
+			if err == nil {
+				err = store.ErrMemberToolDenied
+			}
+			buffer = newMemberMCPBuffer()
+			memberToolError(buffer, err)
+			memberMCPToolReply(w, id, false, buffer)
+			return
+		}
+		for _, tool := range catalog {
 			if tool.Name != name {
 				continue
 			}
@@ -164,7 +182,13 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				memberMCPError(w, 400, id, -32602, "工具 arguments 无效")
 				return
 			}
-			if bindErr = a.tools.BindMCPRequest(token, sha256.Sum256([]byte(key)), fingerprint); bindErr != nil {
+			requestID := sha256.Sum256([]byte(key))
+			if reportWrite && err == nil {
+				bindErr = a.tools.BindMCPReportRequest(token, requestID, fingerprint, profile)
+			} else {
+				bindErr = a.tools.BindMCPRequest(token, requestID, fingerprint)
+			}
+			if bindErr != nil {
 				memberMCPBindingError(w, id, bindErr)
 				return
 			}
