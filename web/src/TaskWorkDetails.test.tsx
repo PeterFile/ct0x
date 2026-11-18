@@ -1,0 +1,121 @@
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, expect, it, vi } from "vitest";
+import { Tasks } from "./Tasks";
+import type { Task } from "./task-api";
+import { deferred, group, json, other, page } from "./test/groups";
+import { secondTask, task } from "./test/tasks";
+
+const selectedGroup = { ...group, id: "group /+?雪" };
+const first = { ...task, group_id: selectedGroup.id, id: "task /+?旧", revision: 4 };
+const second = { ...secondTask, group_id: selectedGroup.id };
+const third = { ...second, group_id: other.id };
+const path = (value: Task) => `/api/v1/groups/${encodeURIComponent(value.group_id)}/tasks/${encodeURIComponent(value.id)}`;
+const scope = (value: Task) => ({ group_id: value.group_id, task_id: value.id, topic_id: "", task_revision: 1, created_at: value.created_at });
+const rawInput = { ...scope(first), id: "input-1", source_id: "source-1", reply_message_id: "user-message-1", notice_message_id: "notice-1",
+  content: "补充原文：<b>逐项复查</b>", before_constraint_revision: 0, before_constraint: "",
+  after_constraint_revision: 1, after_constraint: "必须记录复查结果。" };
+const delivered = (value: Task, summary: string) => ({ ...scope(value), id: "report-1", kind: "delivered", summary,
+  actor_id: "worker-1", owner_member_id: "owner-1" });
+const flush = () => act(async () => {});
+const tick = (ms = 1) => act(() => vi.advanceTimersByTimeAsync(ms));
+const disclosure = () => within(screen.getByRole("region", { name: "任务详情" })).getByText("工作输入与报告", { selector: "summary" });
+const inputs = () => within(screen.getByRole("region", { name: "工作输入" }));
+const reports = () => within(screen.getByRole("region", { name: "工作报告" }));
+async function select(value: Task) {
+  fireEvent.click(screen.getByRole("button", { name: `${value.title}，待交付` }));
+  await flush();
+}
+async function toggle() {
+  fireEvent.click(disclosure());
+  await tick();
+}
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+it("lazily reads separate scoped work pages and distinguishes explicit handling without leaking a previous selection", async () => {
+  vi.useFakeTimers();
+  const initial = deferred<Response>(), oldInputs = deferred<Response>(), oldReports = deferred<Response>();
+  const readInputs = vi.fn<typeof fetch>()
+    .mockReturnValueOnce(initial.promise).mockReturnValueOnce(oldInputs.promise)
+    .mockResolvedValueOnce(page([rawInput])).mockResolvedValueOnce(new Response("404 page not found\n", { status: 404 }));
+  const readReports = vi.fn<typeof fetch>()
+    .mockResolvedValueOnce(page([delivered(first, "成员报告交付，尚未正式提交。")]))
+    .mockResolvedValueOnce(page([{ ...delivered(second, "当前任务的报告。"), kind: "progress" }], "more-reports"))
+    .mockReturnValueOnce(oldReports.promise).mockResolvedValueOnce(page([delivered(third, "另一群的报告。"),
+      { ...delivered(third, "旧服务报告原文。"), id: "unrecognized-report", kind: "accepted" }]));
+  const transport = vi.fn<typeof fetch>((input, init) => {
+    const url = new URL(String(input), "http://fixture.invalid");
+    if (url.pathname.endsWith("/work-inputs")) return readInputs(input, init);
+    if (url.pathname.endsWith("/work-reports")) return readReports(input, init);
+    if (url.pathname.endsWith("/tasks")) return Promise.resolve(page(url.pathname.startsWith(`/api/v1/groups/${other.id}/`) ? [third] : [first, second]));
+    const value = [first, second, third].find(item => url.pathname === path(item));
+    return Promise.resolve(value ? json(value) : json({ error: { code: "not_found", message: "记录不存在" } }, 404));
+  });
+  vi.stubGlobal("fetch", transport);
+  const view = render(<Tasks group={selectedGroup} />); await flush(); await select(first);
+  expect(disclosure().closest("details")).not.toHaveAttribute("open");
+  await tick(10000);
+  expect(readInputs).not.toHaveBeenCalled(); expect(readReports).not.toHaveBeenCalled();
+
+  await toggle();
+  expect(String(readInputs.mock.calls[0][0])).toBe(`${path(first)}/work-inputs?limit=50`);
+  expect(String(readReports.mock.calls[0][0])).toBe(`${path(first)}/work-reports?limit=50`);
+  expect(inputs().getByRole("status")).toHaveTextContent("正在读取工作输入");
+  expect(reports().getByText("交付报告")).toBeVisible();
+  expect(reports().getByText("成员报告不等于正式提交或用户验收。")).toBeVisible();
+  expect(reports().getByText("成员报告交付，尚未正式提交。")).toBeVisible();
+  expect(reports().getByText("报告成员标识").nextElementSibling?.textContent).toBe("worker-1");
+  expect(screen.getByRole("button", { name: `${first.title}，待交付` })).toHaveAttribute("aria-pressed", "true");
+  expect(screen.queryByRole("button", { name: "接纳交付" })).not.toBeInTheDocument();
+
+  await act(async () => initial.resolve(page([rawInput, { ...scope(first), id: "input-confirmed", content: "经执行成员确认的输入。",
+    consumption: { turn_id: "worker-turn-1", consumed_at: "2026-10-30T12:00:01.123456789Z" } },
+  { ...scope(first), id: "legacy-input", consumption: null }], "older/+&")));
+  const [pending, confirmed, legacy] = inputs().getAllByRole("listitem");
+  expect(within(pending).getByText(rawInput.content)).toBeVisible();
+  expect(pending.querySelector("b")).toBeNull();
+  expect(within(pending).getByText("输入前约束 · 版本 0")).toBeVisible();
+  expect(within(pending).getByText("输入后约束 · 版本 1")).toBeVisible();
+  expect(within(pending).getByText(rawInput.after_constraint)).toBeVisible();
+  expect(within(pending).getByText("待确认处理")).toBeVisible();
+  expect(within(legacy).getByText("待确认处理")).toBeVisible();
+  expect(within(confirmed).getByText("已明确确认处理")).toBeVisible();
+  const turnId = within(confirmed).getByText("worker-turn-1");
+  expect(turnId).not.toBeVisible();
+  fireEvent.click(within(confirmed).getByText("标识详情", { selector: "summary" })); await tick();
+  expect(turnId).toBeVisible();
+
+  fireEvent.click(inputs().getByRole("button", { name: "加载更多工作输入" }));
+  const [olderURL, olderInit] = readInputs.mock.calls[1];
+  expect(new URL(String(olderURL), "http://fixture.invalid").searchParams.get("before")).toBe("older/+&");
+  await select(second);
+  expect(olderInit?.signal?.aborted).toBe(true);
+  expect(disclosure().closest("details")).not.toHaveAttribute("open");
+  expect(screen.queryByText(rawInput.content)).not.toBeInTheDocument();
+  expect(readInputs).toHaveBeenCalledTimes(2); expect(readReports).toHaveBeenCalledTimes(1);
+  await toggle();
+  await act(async () => oldInputs.resolve(page([{ ...rawInput, content: "迟到的原任务输入" }])));
+  expect(screen.queryByText("迟到的原任务输入")).not.toBeInTheDocument();
+  expect(inputs().getByRole("alert")).toHaveTextContent("服务响应不符合约定");
+  expect(reports().getByText("进度报告")).toBeVisible();
+  expect(reports().getByText("当前任务的报告。")).toBeVisible();
+
+  fireEvent.click(reports().getByRole("button", { name: "加载更多工作报告" }));
+  view.rerender(<Tasks group={other} />);
+  expect(readReports.mock.calls[2][1]?.signal?.aborted).toBe(true);
+  expect(screen.queryByText("当前任务的报告。")).not.toBeInTheDocument();
+  await flush(); await select(third);
+  await tick(10000);
+  expect(readInputs).toHaveBeenCalledTimes(3); expect(readReports).toHaveBeenCalledTimes(3);
+  await toggle();
+  await act(async () => oldReports.resolve(page([delivered(second, "迟到的原群报告")])));
+  expect(screen.queryByText("迟到的原群报告")).not.toBeInTheDocument();
+  expect(inputs().getByText("当前服务不提供工作输入。")).toBeVisible();
+  expect(inputs().queryByRole("alert")).not.toBeInTheDocument();
+  expect(reports().getByText("另一群的报告。")).toBeVisible();
+  expect(reports().getByText("未知报告类型")).toBeVisible();
+  expect(reports().queryByText("已接纳")).not.toBeInTheDocument();
+  await toggle(); await tick(10000);
+  expect(screen.queryByText("另一群的报告。")).not.toBeInTheDocument();
+  expect(readInputs).toHaveBeenCalledTimes(4); expect(readReports).toHaveBeenCalledTimes(4);
+  expect(transport.mock.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
+});

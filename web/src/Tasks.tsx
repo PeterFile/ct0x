@@ -6,6 +6,7 @@ import { CoordinationSettings } from "./CoordinationSettings";
 import { ChatPolicySettings } from "./ChatPolicySettings";
 import { ChatAdmissionDetails } from "./ChatAdmissionDetails";
 import { TaskDispatch } from "./TaskDispatch";
+import { TaskWorkDetails } from "./TaskWorkDetails";
 import { useActiveRefresh } from "./useActiveRefresh";
 import { createTask, getTask, getTaskAttempt, getTaskSubmission, listTasks, registerTaskAttempt, reviewTask, submitTask } from "./task-api";
 import type { Task, TaskAttempt, TaskAttemptInput, TaskInput, TaskReview, TaskReviewInput, TaskSubmission, TaskSubmissionInput } from "./task-api";
@@ -183,6 +184,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
             <dt>创建时间</dt><dd className="tasks-meta"><time dateTime={selected.created_at}>{selected.created_at}</time></dd>
           </dl>
         </> : null}
+        <TaskWorkDetails groupId={groupId} taskId={selection.id} active={active} />
         {/* Retain each task's drafts and immutable operation without reading hidden tasks. */}
         {openedTasks.map(id => <div key={id} hidden={id !== selection.id}>
           <TaskLifecycle groupId={groupId} taskId={id} task={active && selected?.id === id ? selected : null}

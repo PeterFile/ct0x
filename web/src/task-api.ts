@@ -27,7 +27,20 @@ export type TaskSubmissionInput = Readonly<{
 export type TaskReviewInput = Readonly<{
   expected_revision: number; submission_id: string; outcome: TaskReview["outcome"]; reason?: string;
 }>;
-type TaskPage = { items: Task[]; next_cursor: string };
+type WorkRecord = {
+  id: string; group_id: string; topic_id: string; task_id: string; task_revision: number; created_at: string;
+};
+export type TaskWorkInput = WorkRecord & {
+  content?: string; source_id?: string; reply_message_id?: string; notice_message_id?: string;
+  trigger_id?: string; mandate_id?: string; assignment_id?: string; worker_member_id?: string;
+  before_constraint_revision?: number; before_constraint?: string;
+  after_constraint_revision?: number; after_constraint?: string;
+  consumption?: { turn_id: string; consumed_at: string } | null;
+};
+export type TaskWorkReport = WorkRecord & {
+  kind: string; summary: string; actor_id: string; owner_member_id: string;
+};
+type TaskPage<T = Task> = { items: T[]; next_cursor: string };
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const taskIn = (groupId: string) => (value: unknown): value is Task => isRecord(value)
   && ["id", "group_id", "title", "description", "acceptance", "assignee_id", "active_attempt_id", "current_submission_id", "created_at"]
@@ -139,6 +152,37 @@ export function reviewTask(groupId: string, taskId: string, input: TaskReviewInp
       && value.submission_id === body.submission_id && value.outcome === body.outcome && value.reason === (body.reason ?? "") && value.reviewed_by === "user"
       && source.group_id === groupId && source.task_id === taskId && source.id === value.submission_id && source.task_revision === value.task_revision
       && sameRefs(value.artifact_versions, source.artifact_versions), signal);
+}
+const workRecordIn = (groupId: string, taskId: string) => {
+  const scoped = evidenceIn(groupId, taskId);
+  return (value: unknown): value is WorkRecord & Record<string, unknown> => scoped(value) && typeof value.topic_id === "string";
+};
+const optionalConstraintRevision = (value: unknown) => value === undefined
+  || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+
+async function listTaskWorkPage<T>(groupId: string, taskId: string, surface: "work-inputs" | "work-reports", before: string,
+  signal: AbortSignal | undefined, valid: (value: unknown) => value is T) {
+  if ([groupId, taskId].some(id => !nonblank(id) || id === "." || id === ".." || /[\ud800-\udfff]/u.test(id))) {
+    throw new ApiError("群组或任务标识无效。");
+  }
+  const query = new URLSearchParams({ limit: "50" });
+  if (before) query.set("before", before);
+  return request(`${taskPath(groupId, taskId)}/${surface}?${query}`, { signal }, (value): value is TaskPage<T> => isRecord(value)
+    && Array.isArray(value.items) && value.items.every(valid) && typeof value.next_cursor === "string");
+}
+export function listTaskWorkInputs(groupId: string, taskId: string, before = "", signal?: AbortSignal) {
+  const scoped = workRecordIn(groupId, taskId);
+  return listTaskWorkPage(groupId, taskId, "work-inputs", before, signal, (value): value is TaskWorkInput => scoped(value)
+    && ["content", "source_id", "reply_message_id", "notice_message_id", "trigger_id", "mandate_id", "assignment_id", "worker_member_id",
+      "before_constraint", "after_constraint"].every(key => value[key] === undefined || typeof value[key] === "string")
+    && optionalConstraintRevision(value.before_constraint_revision) && optionalConstraintRevision(value.after_constraint_revision)
+    && (value.consumption === undefined || value.consumption === null || (isRecord(value.consumption)
+      && nonblank(value.consumption.turn_id) && validEvidenceTime(value.consumption.consumed_at))));
+}
+export function listTaskWorkReports(groupId: string, taskId: string, before = "", signal?: AbortSignal) {
+  const scoped = workRecordIn(groupId, taskId);
+  return listTaskWorkPage(groupId, taskId, "work-reports", before, signal, (value): value is TaskWorkReport => scoped(value)
+    && ["kind", "summary", "actor_id", "owner_member_id"].every(key => typeof value[key] === "string"));
 }
 export function listTasks(groupId: string, before = "", signal?: AbortSignal) {
   const query = new URLSearchParams({ limit: "50" });
