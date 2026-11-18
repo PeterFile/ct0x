@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
 )
@@ -56,14 +58,48 @@ func (s *Store) chatInvestigationAdmissionInTx(ctx context.Context, tx *sql.Tx, 
 	return authorization, nil
 }
 
-const chatInvestigationCueBoundary = `(?:$|[\s\p{Z},.!?;:，。！？；：、])`
+var (
+	chatInvestigationEnglishCue = regexp.MustCompile(
+		`^(?i:(?:please )?(?:continue|resume) the original task)(?:$|[\s\p{Z},.!?;:，。！？；：、])`)
+	chatInvestigationMetaCue = regexp.MustCompile(
+		`(?:(?:这句(?:话)?|这条消息)[\s\p{Z}]*(?:只|仅)?是[\s\p{Z}]*(?:旧消息(?:示例)?|(?:一个)?(?:示例|例子))|` +
+			`(?:^|[,:，：、])[\s\p{Z}]*并?(?:非|不是)本次指令)[\s\p{Z}]*(?:$|[,，])`)
+	chatInvestigationNegatedActivity = regexp.MustCompile(`^(?:非|不是|不要|不必|不用|无需|没有|未曾)`)
+)
 
-// Only a direct request for the original task qualifies without an exact ID.
-// Without a separator, require the coordinated check action, not a bare
-// conjunction that can also introduce negation or metatext.
-var chatInvestigationOriginalTaskCue = regexp.MustCompile(
-	`^(?:(?:请)?(?:继续|续办)原任务(?:(?:吧)?` + chatInvestigationCueBoundary + `|并(?:且)?核对)|` +
-		`(?i:(?:please )?(?:continue|resume) the original task)` + chatInvestigationCueBoundary + `)`)
+// This high-precision cue only considers the opening sentence. It neither
+// interprets arbitrary phrasing (the model IntentPass handles meaning) nor
+// supplies authority. Keep quoted openings and explicit mentions distinct.
+func chatInvestigationHasOriginalTaskCue(content string) bool {
+	content = strings.TrimSpace(content)
+	text := strings.TrimSpace(strings.TrimPrefix(content, "请"))
+	rest, ok := strings.CutPrefix(text, "继续原任务")
+	if !ok {
+		rest, ok = strings.CutPrefix(text, "续办原任务")
+	}
+	if !ok {
+		return chatInvestigationEnglishCue.MatchString(content)
+	}
+	rest = strings.TrimPrefix(rest, "吧")
+	if end := strings.IndexAny(rest, ".!?;。！？；"); end >= 0 {
+		rest = rest[:end]
+	}
+	if chatInvestigationMetaCue.MatchString(rest) {
+		return false
+	}
+	tail := strings.TrimLeftFunc(rest, func(r rune) bool {
+		return unicode.IsSpace(r) || strings.ContainsRune(",:，：、", r)
+	})
+	for _, connective := range [...]string{"并且", "并", "然后", "同时", "再"} {
+		if activity, ok := strings.CutPrefix(tail, connective); ok {
+			activity = strings.TrimSpace(activity)
+			first, _ := utf8.DecodeRuneInString(activity)
+			// Require activity text, not a bare connective or an explicit negation.
+			return unicode.IsLetter(first) && !chatInvestigationNegatedActivity.MatchString(activity)
+		}
+	}
+	return rest == "" || tail != rest // End of sentence or an ordinary separator.
+}
 
 func chatInvestigationReferencesExistingWorkInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) (bool, error) {
 	if c.SourceKind != "local_user_chat" {
@@ -74,7 +110,7 @@ func chatInvestigationReferencesExistingWorkInTx(ctx context.Context, tx *sql.Tx
 		return false, err
 	}
 	var found bool
-	if chatInvestigationOriginalTaskCue.MatchString(strings.TrimSpace(source.content)) {
+	if chatInvestigationHasOriginalTaskCue(source.content) {
 		// Walk only the bound thread's indexed lineage, stopping at the first prior Task.
 		err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 		 SELECT 1 FROM coordination_triggers o INDEXED BY coordination_triggers_thread_created_id
