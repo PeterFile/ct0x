@@ -3,13 +3,16 @@ package domain
 type TaskWorkSourceKind string
 
 const (
-	TaskWorkSourceFollowup TaskWorkSourceKind = "followup"
-
-	// Reserved for future report types; B1 neither writes nor resolves them.
+	TaskWorkSourceFollowup   TaskWorkSourceKind = "followup"
 	TaskWorkSourceReport     TaskWorkSourceKind = "report"
 	TaskWorkSourceDelegation TaskWorkSourceKind = "delegation"
-	TaskWorkSourceHandback   TaskWorkSourceKind = "handback"
+	// Handback is a non-waking return, never authority to continue or reopen a Task.
+	TaskWorkSourceHandback TaskWorkSourceKind = "handback"
 )
+
+func (k TaskWorkSourceKind) IsOwnerContinuation() bool {
+	return k == TaskWorkSourceFollowup || k == TaskWorkSourceReport
+}
 
 // TaskWorkDelivery is internal provenance, not a transport DTO or grant.
 // Blocked is a current startup observation, not part of the immutable identity.

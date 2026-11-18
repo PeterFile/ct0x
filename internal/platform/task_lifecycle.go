@@ -61,6 +61,10 @@ func (s *LocalUser) ListTaskWorkInputs(ctx context.Context, groupID, taskID stri
 	return s.db.ListTaskWorkInputs(ctx, groupID, taskID, options)
 }
 
+func (s *LocalUser) ListTaskWorkReports(ctx context.Context, groupID, taskID string, options store.ListOptions) (store.Page[domain.TaskWorkReport], error) {
+	return s.db.ListTaskWorkReports(ctx, groupID, taskID, options)
+}
+
 func (s *LocalUser) ReviewTask(ctx context.Context, groupID, taskID string, input TaskReviewInput, key string) (domain.ReviewDecision, error) {
 	return s.db.ReviewTask(ctx, store.ReviewTaskInput{
 		GroupID: groupID, TaskID: taskID, ActorID: "user", ExpectedRevision: input.ExpectedRevision,

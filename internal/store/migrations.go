@@ -235,7 +235,8 @@ WHEN NEW.status='accepted' AND NOT EXISTS(SELECT 1 FROM task_review_decisions
         AND task_revision=NEW.revision AND outcome='accepted')
 BEGIN SELECT RAISE(ABORT, '接纳任务必须有明确接纳的评审'); END;
 `, artifactSchemaV6, taskArtifactSchemaV7, messageSequenceSchemaV8, coordinationTriggerSchemaV9, coordinationAdmissionSchemaV10, coordinatorSchemaV11, coordinationDispatchSchemaV12, coordinationAssignmentSchemaV13, coordinationAssignmentResolutionSchemaV14, workspaceGrantSchemaV15, chatIntentSchemaV16, chatAuthoritySchemaV17, chatReviewNoticeSchemaV18, workspaceWriteGrantSchemaV19, chatWorkspaceSchemaV20, workspaceOperationSchemaV21, chatRepairSchemaV22, nativeRunBindingsSchemaV23, chatDiscussionSchema, taskArtifactDependencySchema, chatDiscussionPolicySchema, chatInvestigationSchema,
-	taskWorkInputSchema, taskWorkDeliverySchema, // Private B1 candidate slots 28 and 29.
+	taskWorkInputSchema, taskWorkDeliverySchema,
+	taskWorkReportSchema,
 }
 
 // Migration history is explicit and contiguous; never infer it from table shape.

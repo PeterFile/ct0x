@@ -72,7 +72,7 @@ func workInputReceiptInTx(ctx context.Context, tx *sql.Tx, role CoordinationTool
 		return nil
 	}
 	p := role.Provenance
-	if turnID == "" || attemptID == "" || p.SourceKind != domain.TaskWorkSourceFollowup {
+	if turnID == "" || attemptID == "" || !p.SourceKind.IsOwnerContinuation() {
 		return ErrMemberToolDenied
 	}
 	// The worker gate already verified this Assignment's original binding.
@@ -143,6 +143,9 @@ func (s *Store) taskWorkMandateRequestInTx(ctx context.Context, tx *sql.Tx, scop
 	}
 	if err != nil {
 		return domain.DispatchRequest{}, err
+	}
+	if !f.d.SourceKind.IsOwnerContinuation() {
+		return domain.DispatchRequest{}, ErrMemberToolDenied
 	}
 	blocked, active, err := s.taskWorkReadinessInTx(ctx, tx, f, scope.Claim.TurnID)
 	if err != nil {

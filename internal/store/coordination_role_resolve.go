@@ -74,7 +74,7 @@ func (s *Store) ResolveCoordinationDelivery(ctx context.Context, groupID, delive
 	}
 	work, err := lookupTaskWorkDeliveryInTx(ctx, tx, groupID, deliveryID)
 	if err == nil {
-		state, err = s.taskWorkFollowupRoleInTx(ctx, tx, work, "")
+		state, err = s.taskWorkOwnerRoleInTx(ctx, tx, work, "")
 	} else if errors.Is(err, ErrNotFound) {
 		var actual CoordinationRoleProvenance
 		actual, err = coordinationQueuedProvenanceInTx(ctx, tx, *p, sender)
@@ -178,13 +178,13 @@ func (s *Store) resolveCoordinationExecution(ctx context.Context, scope MemberTo
 	var state CoordinationRoleState
 	work, err := lookupTaskWorkExecutionInTx(ctx, tx, scope)
 	if err == nil {
-		if expected != taskWorkFollowupProvenance(work) {
+		if !work.d.SourceKind.IsOwnerContinuation() || expected != taskWorkOwnerProvenance(work) {
 			return out, ErrMemberToolDenied
 		}
 		if _, err := s.investigationProfileInTx(ctx, tx, expected, investigation); err != nil {
 			return out, err
 		}
-		state, err = s.taskWorkFollowupRoleInTx(ctx, tx, work, scope.Claim.TurnID)
+		state, err = s.taskWorkOwnerRoleInTx(ctx, tx, work, scope.Claim.TurnID)
 	} else if errors.Is(err, ErrNotFound) {
 		var p CoordinationRoleProvenance
 		p, err = coordinationExecutionProvenanceInTx(ctx, tx, scope, expected)

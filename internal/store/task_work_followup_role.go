@@ -3,11 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
-
-	"agentworkspace/internal/domain"
 )
 
-func taskWorkFollowupProvenance(f taskWorkFacts) CoordinationRoleProvenance {
+func taskWorkOwnerProvenance(f taskWorkFacts) CoordinationRoleProvenance {
 	d := f.d
 	return CoordinationRoleProvenance{
 		Kind: CoordinationRoleWorker, GroupID: d.GroupID, DeliveryID: d.DeliveryID, MessageID: d.MessageID,
@@ -16,17 +14,16 @@ func taskWorkFollowupProvenance(f taskWorkFacts) CoordinationRoleProvenance {
 	}
 }
 
-func (s *Store) taskWorkFollowupRoleInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, turnID string) (CoordinationRoleState, error) {
-	return s.taskWorkFollowupOwnerRoleInTx(ctx, tx, f, turnID, false)
+func (s *Store) taskWorkOwnerRoleInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, turnID string) (CoordinationRoleState, error) {
+	return s.taskWorkOwnerContinuationRoleInTx(ctx, tx, f, turnID, false)
 }
 
-func (s *Store) taskWorkFollowupOwnerRoleInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, turnID string, returnOnly bool) (CoordinationRoleState, error) {
-	// Other typed sources do not fall through as chat. Their role policy is
-	// deliberately not defined by the followup path.
-	if f.d.SourceKind != domain.TaskWorkSourceFollowup || f.turnID != turnID {
+func (s *Store) taskWorkOwnerContinuationRoleInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts, turnID string, returnOnly bool) (CoordinationRoleState, error) {
+	// Delegation has a separate subset profile and no formal owner Attempt.
+	if !f.d.SourceKind.IsOwnerContinuation() || f.turnID != turnID {
 		return CoordinationRoleState{}, ErrMemberToolDenied
 	}
-	p := taskWorkFollowupProvenance(f)
+	p := taskWorkOwnerProvenance(f)
 	state := CoordinationRoleState{Provenance: p}
 	if err := tx.QueryRowContext(ctx, `SELECT provider_id,model FROM members WHERE group_id=? AND id=?`, p.GroupID, p.MemberID).
 		Scan(&state.ProviderID, &state.Model); err != nil {
