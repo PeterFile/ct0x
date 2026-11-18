@@ -37,6 +37,7 @@ type piMemberToolOptions struct {
 
 	// Only typed investigation uses its own wire schema and in-memory session.
 	investigationConfigFile os.FileInfo
+	investigationBearer     piInvestigationBearerFingerprint
 }
 
 // NewPiMemberToolExecutor opts into four native member tools on verified Pi 1.4.0.

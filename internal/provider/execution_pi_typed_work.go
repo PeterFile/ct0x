@@ -13,6 +13,7 @@ import (
 )
 
 const piTypedWriteUnknown = "agent_workspace_write_unknown_v1"
+const piTypedWriteUnverified = "agent_workspace_write_unknown_unverified_v1"
 const piTypedWriteLogReserve = 2048 // One bounded identity record, even at the raw stdout cap.
 
 var piTypedWriteCallID = regexp.MustCompile(`^[!-~]{1,256}$`)
@@ -178,25 +179,23 @@ func (p *piTypedWorkOutput) observeMarker(details map[string]any, runID, name, i
 // frame unless it was clipped. In that case use the reserved tail for just the
 // checked identity, not unbounded native bytes or any tool payload. This extra
 // log record is parent-authored and never parsed as a live provider frame.
-func (p *piTypedWorkOutput) retain(log *executionLog) {
+func (e *piTypedWriteEvidence) retain(log *executionLog, kind string) bool {
 	if log.failed {
-		return
+		return false
 	}
 	if log.truncated {
 		record, _ := json.Marshal(struct {
 			Type string `json:"type"`
 			piTypedWriteEvidence
-		}{piTypedWriteUnknown, *p.unknown}) // Only bounded strings.
+		}{kind, *e}) // Only bounded strings.
 		data := append(append([]byte{'\n'}, record...), '\n')
 		if len(data) > log.tailReserve {
-			log.failed = true
-			return
+			return false
 		}
 		n, err := log.file.Write(data)
 		if err != nil || n != len(data) {
-			log.failed = true
-			return
+			return false
 		}
 	}
-	log.failed = log.file.Sync() != nil
+	return log.file.Sync() == nil
 }

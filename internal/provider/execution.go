@@ -218,7 +218,8 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		typedInvestigation := opts.investigationConfigFile != nil
 		if typedInvestigation {
 			args = append(args, "--no-session") // Exact --session-id, but never load or append to a session file.
-			out.piInvestigation = &piInvestigationStartup{role: opts.typedWorkRole, configSHA256: hex.EncodeToString(opts.configSHA256[:])}
+			out.piInvestigation = &piInvestigationStartup{role: opts.typedWorkRole, configSHA256: hex.EncodeToString(opts.configSHA256[:]),
+				unverifiedWrites: piTypedWorkOutput{role: opts.typedWorkRole, tools: opts.toolNames}, bearer: opts.investigationBearer}
 		}
 		args = append(args, "--tools", strings.Join(opts.toolNames, ","), "--extension", opts.extensionPath)
 		if opts.investigation || typedInvestigation {
@@ -284,7 +285,12 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	}
 	writeUnknown := out.piTypedWork != nil && out.piTypedWork.unknown != nil
 	if writeUnknown {
-		out.piTypedWork.retain(outLog)
+		outLog.failed = !out.piTypedWork.unknown.retain(outLog, piTypedWriteUnknown)
+	} else if s := out.piInvestigation; s != nil && !r.Accepted && outLog.truncated {
+		if evidence := s.unverifiedWrites.unknown; evidence != nil {
+			// Best effort; diagnostic retention does not update execution state.
+			_ = evidence.retain(outLog, piTypedWriteUnverified)
+		}
 	}
 	outClose, errClose := stdout.Close(), stderr.Close()
 	r.LogsTruncated = outLog.truncated || errLog.truncated

@@ -138,6 +138,9 @@ func (o *executionOutput) recordPi(line []byte) {
 		return
 	}
 	if s := o.piInvestigation; s != nil && !s.allow(o, event.Type, line) {
+		if s.invalid && !o.receipt.Accepted {
+			s.observeUnverifiedWrite(event.Type, line, o.runID)
+		}
 		return
 	}
 	r := o.receipt

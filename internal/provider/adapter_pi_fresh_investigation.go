@@ -145,7 +145,8 @@ func (a PiFreshInvestigationAdapter) NewExecutor(ctx context.Context, selected P
 	pi := baseline.(piExecutor)
 	pi.memberTools = &piMemberToolOptions{extensionPath: bridge, configPath: filepath.Clean(binding.ConfigPath),
 		toolNames: issued.Operations, configSHA256: binding.ConfigSHA256, investigationConfigFile: file, typedWorkRole: string(issued.SourceKind),
-		investigation: issued.SourceKind == PiInitialInvestigationOwnerRole || slices.Contains(issued.Operations, HandbackWorkTool)}
+		investigation:       issued.SourceKind == PiInitialInvestigationOwnerRole || slices.Contains(issued.Operations, HandbackWorkTool),
+		investigationBearer: piInvestigationBearerFingerprint{size: len(issued.Token), digest: sha256.Sum256([]byte(issued.Token))}}
 	return &piFreshInvestigationExecutor{pi: pi, adapter: a, runID: binding.RunID}, nil
 }
 
