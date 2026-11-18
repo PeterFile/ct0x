@@ -8,22 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"slices"
 	"strings"
 	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
 )
-
-const taskWorkInputVersion = 28
-
-const workInputSchemaExists = `EXISTS(SELECT 1 FROM schema_migrations WHERE version=?)`
-
-func workInputSchemaInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
-	var installed bool
-	err := tx.QueryRowContext(ctx, "SELECT "+workInputSchemaExists, taskWorkInputVersion).Scan(&installed)
-	return installed, err
-}
 
 // A trusted source has one follow-up decision, even when delivered to multiple
 // assessors. Its first immutable receipt, not a new assessment, is replayed.
@@ -92,7 +81,7 @@ func (s *Store) prepareChatFollowupInTx(ctx context.Context, tx *sql.Tx, scope M
 	case taskID != "" && !containsWorkTaskToken(body, taskID):
 		referenceErr = chatDeny("unproven_task_reference", "原用户消息中没有此精确的任务编号。", "请在本话题写出要继续的原任务编号，可以吗？")
 	default:
-		refs, idShaped, referenceErr = chatTaskReferencesInTx(ctx, tx, c.GroupID, body, taskID)
+		refs, idShaped, referenceErr = chatTaskReferencesInTx(ctx, tx, c.ThreadRef, body, taskID, continuing || input.Followup != nil)
 	}
 	if !continuing && input.Followup == nil && len(refs) == 0 && referenceErr == nil {
 		plausible, err := chatLegacyWorkReferenceInTx(ctx, tx, c, body)
@@ -178,82 +167,156 @@ func workTaskTokenSeparator(r rune) bool {
 }
 
 const (
-	workTaskLabel    = `(?:任务|\btask\b)`
-	workTaskIDLabel  = `(?:任务[ \t]*(?:编号|id\b|#)|\btask[ \t]+(?:id\b|#))`
-	workTaskIDOpen   = `[ \t:#：<"'“‘\x60]*`
-	workTaskIDShape  = `([a-z2-7]{26})`
-	workTaskTokenEnd = `(?:$|[^a-z0-9_-])`
+	workTaskLabel            = `(?:任务|\btask\b)`
+	workTaskIDLabel          = `(?:任务[ \t]*(?:编号|id\b|#)|\btask[ \t]+(?:id\b|#))`
+	workTaskIDOpen           = `[ \t:#：<"'“‘\x60]*`
+	workTaskIDShape          = `([a-z2-7]{26})`
+	workTaskTokenEnd         = `(?:$|[^a-z0-9_-])`
+	workTaskIDObject         = `[ \t]*(?:(?:其他|其它|另一)话题的?[ \t]*)?(?:工作|` + workTaskIDLabel + `|` + workTaskLabel + `)?` + workTaskIDOpen + workTaskIDShape + workTaskTokenEnd
+	workTaskClauseDelimiters = "，。！？；,.!?;\r\n"
 )
 
 var (
 	labeledWorkTaskID = regexp.MustCompile(`(?i)` + workTaskLabel + workTaskIDOpen + workTaskIDShape + workTaskTokenEnd)
 	markedWorkTaskID  = regexp.MustCompile(`(?i)` + workTaskIDLabel + workTaskIDOpen + `([a-z0-9_-]+)` + workTaskTokenEnd)
-	// A choice inherits its first task label across the choice operator, not
-	// across arbitrary prose. An unrelated ID-shaped token remains just a token.
-	workTaskIDChoice = regexp.MustCompile(`(?i)(?:` + workTaskIDLabel + `|` + workTaskLabel + `)` + workTaskIDOpen + workTaskIDShape +
-		`[ \t>"'”’\x60]*(?:还是|或者?|\bor\b)[ \t]*(?:` + workTaskIDLabel + `|` + workTaskLabel + `)?` + workTaskIDOpen + workTaskIDShape + workTaskTokenEnd)
+	// Only an entire, positively typed value can be metadata. A generic
+	// reference number does not establish the kind of the ID.
+	workNonTaskValue = regexp.MustCompile(`(?i)^(?:备注码|校验(?:码|值)|checksum\b|(?:artifact\b|成果)(?:[ \t]*(?:编号|id\b|#))?)` +
+		workTaskIDOpen + workTaskIDShape + `[ \t>"'”’\x60]*$`)
+	workTaskCitation = regexp.MustCompile(`(?i)^` + legacyWorkPolite + `(?:(?:可(?:以)?|(?:may|can|optionally)\b)[ \t]*)?` +
+		`(?:引用|参考|(?:cite|reference)\b)` + workTaskIDObject)
+	workSeparateRequest = regexp.MustCompile(`(?i)^` + legacyWorkPolite +
+		`(?:(?:另开|新开|新建)[ \t]*(?:一项|一个|个)?[ \t]*(?:独立)?[ \t]*(?:工作|任务)|` +
+		`(?:start|open)[ \t]+(?:a[ \t]+)?(?:new|separate|independent)[ \t]+(?:work|task)\b)`)
+	continuedWorkID = regexp.MustCompile(`(?i)` + legacyWorkContinue + workTaskIDObject)
+	workTaskIDToken = regexp.MustCompile(`(?i)^` + workTaskIDShape + `$`)
 )
 
-func unresolvedWorkTaskReference(body, hint string, refs []string) bool {
-	if hint != "" && !slices.Contains(refs, hint) {
-		return true
+func workTaskClauseSeparator(r rune) bool { return strings.ContainsRune(workTaskClauseDelimiters, r) }
+
+func unresolvedWorkTaskReference(body, hint string, otherTopicByID map[string]bool, followup bool) bool {
+	if hint != "" {
+		otherTopic, found := otherTopicByID[hint]
+		if !found || otherTopic {
+			return true
+		}
 	}
-	for _, pattern := range []*regexp.Regexp{labeledWorkTaskID, markedWorkTaskID} {
-		for _, match := range pattern.FindAllStringSubmatch(body, -1) {
-			if !slices.Contains(refs, match[1]) {
-				return true
+	var crossTopic bool
+	for _, otherTopic := range otherTopicByID {
+		if otherTopic {
+			if followup {
+				return true // A citation cannot make another topic a continuation target.
+			}
+			crossTopic = true
+			break
+		}
+	}
+	for clause := range strings.FieldsFuncSeq(body, workTaskClauseSeparator) {
+		clause = strings.TrimSpace(clause)
+		if crossTopic && !workSeparateRequest.MatchString(clause) {
+			// A known cross-topic ID requires positive evidence of separate
+			// work or a citation, regardless of the verbs used to address it.
+			// Exempt only the citation object, not all occurrences of its ID.
+			parts := [2]string{clause}
+			if span := workTaskCitation.FindStringSubmatchIndex(clause); span != nil {
+				parts = [2]string{clause[:span[2]], clause[span[3]:]}
+			}
+			for _, part := range parts {
+				for id := range strings.FieldsFuncSeq(part, workTaskTokenSeparator) {
+					if otherTopicByID[id] {
+						return true
+					}
+				}
+			}
+		}
+		// Even without a matching row, an explicit target is not new work.
+		for _, pattern := range []*regexp.Regexp{labeledWorkTaskID, markedWorkTaskID, continuedWorkID} {
+			for _, match := range pattern.FindAllStringSubmatchIndex(clause, -1) {
+				if _, found := otherTopicByID[clause[match[2]:match[3]]]; !found {
+					return true
+				}
 			}
 		}
 	}
 	return false
 }
 
-// Task IDs are generated by crypto/rand.Text. Probe all such tokens within
-// the source group even with an explicit hint; never look up a foreign task.
-// Unresolved tokens alone cannot select an implicit target.
-func chatTaskReferencesInTx(ctx context.Context, tx *sql.Tx, groupID, body, hint string) ([]string, bool, error) {
-	ids := map[string]struct{}{}
-	for token := range strings.FieldsFuncSeq(body, workTaskTokenSeparator) {
-		if token != hint && (len(token) != 26 || strings.IndexFunc(token, func(r rune) bool { return !(r >= 'A' && r <= 'Z' || r >= '2' && r <= '7') }) >= 0) {
-			continue
-		}
-		ids[token] = struct{}{}
-		if len(ids) > 64 {
-			return nil, true, chatAmbiguousWorkInput()
-		}
-	}
-	if len(ids) == 0 {
-		if unresolvedWorkTaskReference(body, hint, nil) {
-			return nil, true, chatUnavailableWorkInputTarget()
-		}
-		return nil, false, nil
-	}
-	tokens := make([]string, 0, len(ids))
-	for id := range ids {
-		tokens = append(tokens, id)
-	}
-	data, err := json.Marshal(tokens)
-	if err != nil {
-		return nil, true, err
-	}
-	refs, err := workTaskIDsInTx(ctx, tx, `SELECT id FROM tasks WHERE group_id=? AND id IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT 2`, groupID, string(data))
-	if err != nil || len(refs) > 1 {
-		return refs, true, err
-	}
-	for _, choice := range workTaskIDChoice.FindAllStringSubmatch(body, -1) {
-		if choice[1] != choice[2] {
-			// Neither lookup failure nor an assessor hint can resolve a user
-			// choice. Do not report an unverified ID as a candidate task.
-			return refs, true, chatAmbiguousWorkInput()
+// A continuation must consider unresolved source IDs, not just successful
+// lookups or the assessor hint. Old new-work proposals instead require evidence
+// of a task reference before an ID-shaped value can block ordinary work.
+func chatTaskReferencesInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, body, hint string, followup bool) ([]string, bool, error) {
+	ids := map[string]bool{} // ID -> also occurs outside a typed metadata clause.
+	var possible int
+	for clause := range strings.FieldsFuncSeq(body, workTaskClauseSeparator) {
+		metadata := workNonTaskValue.MatchString(strings.TrimSpace(clause))
+		for token := range strings.FieldsFuncSeq(clause, workTaskTokenSeparator) {
+			if token != hint && (len(token) != 26 || !workTaskIDToken.MatchString(token)) {
+				continue
+			}
+			if !metadata && !ids[token] {
+				possible++
+			}
+			ids[token] = ids[token] || !metadata
+			if len(ids) > 64 || followup && possible > 1 {
+				return nil, true, chatAmbiguousWorkInput()
+			}
 		}
 	}
-	if unresolvedWorkTaskReference(body, hint, refs) {
+
+	var refs []string
+	otherTopicByID := map[string]bool{}
+	if len(ids) != 0 {
+		tokens := make([]string, 0, len(ids))
+		for id := range ids {
+			tokens = append(tokens, id)
+		}
+		data, err := json.Marshal(tokens)
+		if err != nil {
+			return nil, true, err
+		}
+		// Resolve exact IDs only in the source group. A task with no recorded
+		// topic is still a possible reference, but cannot pass the target gate.
+		rows, err := tx.QueryContext(ctx, `SELECT t.id,coalesce(c.topic_id<>?,0) FROM tasks t
+		 LEFT JOIN task_coordination c ON c.task_id=t.id AND c.group_id=t.group_id
+		 WHERE t.group_id=? AND t.id IN (SELECT value FROM json_each(?)) ORDER BY t.id`, thread.TopicID, thread.GroupID, string(data))
+		if err != nil {
+			return nil, true, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			var otherTopic bool
+			if err := rows.Scan(&id, &otherTopic); err != nil {
+				return nil, true, err
+			}
+			otherTopicByID[id] = otherTopic
+			if !ids[id] {
+				possible++ // A durable Task match cannot be erased by a value label.
+			}
+			// Metadata alone cannot select a continuation target, even if
+			// its value happens to resolve to a Task.
+			if !otherTopic && (!followup || ids[id]) {
+				refs = append(refs, id)
+				if len(refs) == 2 {
+					return refs, true, nil
+				}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return nil, true, err
+		}
+	}
+	unresolved := followup && hint != "" && !ids[hint] || unresolvedWorkTaskReference(body, hint, otherTopicByID, followup)
+	if possible > 1 && (followup || len(refs) != 0 || unresolved) {
+		return nil, true, chatAmbiguousWorkInput()
+	}
+	if unresolved {
 		return refs, true, chatUnavailableWorkInputTarget()
 	}
-	return refs, true, nil
+	return refs, len(ids) != 0, nil
 }
 
-const chatWorkThread = ` FROM task_coordination tc
+const chatWorkThread = ` FROM task_coordination tc INDEXED BY ` + workInputThreadIndex + `
  JOIN tasks t ON t.id=tc.task_id AND t.group_id=tc.group_id
  JOIN mandates m ON m.id=tc.current_mandate_id
  JOIN coordination_triggers origin ON origin.id=m.origin_trigger_id`

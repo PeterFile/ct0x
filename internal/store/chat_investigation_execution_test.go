@@ -191,30 +191,137 @@ func investigationTaskSubmitInput(role CoordinationToolScope, input AssignmentRe
 		ActorID: role.Member.MemberID, MemberScope: &role.Member, Summary: input.Summary, ArtifactVersions: input.ArtifactVersions, IdempotencyKey: key}
 }
 
-func TestChatInvestigationMissingMigrationMarkerFailsClosed(t *testing.T) {
-	// Materialize the exact v27 prefix before testing the missing marker.
-	f, role := func() (chatFixture, CoordinationToolScope) {
-		prior := migrations
-		defer func() { migrations = prior }()
-		migrations = prior[:27]
-		f, _, role := investigationUserWorker(t)
-		return f, role
-	}()
-	messageSequenceLedger(t, f.s, 27)
-	id := role.Provenance.TaskID
-	if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); err != nil || scope.TaskID != id {
-		t.Fatalf("fixture does not have an investigation scope: %+v, %v", scope, err)
+func investigationWorkerAtV27(t *testing.T, prepare func(*testing.T, chatFixture) CoordinationToolScope) (chatFixture, domain.ChatPolicy, CoordinationToolScope) {
+	t.Helper()
+	// Materialize only v1–27 so later schema objects cannot mask the cold-path cases.
+	prior := migrations
+	defer func() { migrations = prior }()
+	migrations = prior[:27]
+	f, policy := investigationUserCandidate(t)
+	return f, policy, prepare(t, f)
+}
+
+func TestChatInvestigationSchemaMismatchFailsClosed(t *testing.T) {
+	const (
+		dropMarker = "DELETE FROM schema_migrations WHERE version=27"
+		dropScope  = "DROP TABLE chat_investigation_policy_revisions"
+		scopeView  = `CREATE VIEW chat_investigation_policy_revisions AS
+		 SELECT group_id,topic_id,revision,'{}' AS scope_json FROM chat_policy_scopes WHERE 0`
+		// These guards survive DROP TABLE because they belong to other tables.
+		dropGuards = "DROP TRIGGER chat_investigation_assessment_insert; DROP TRIGGER chat_investigation_artifact_insert"
+	)
+	for _, tc := range []struct{ name, damage string }{
+		{"missing-marker", dropMarker},
+		{"missing-table", dropScope},
+		{"view-for-table", dropScope + "; " + scopeView},
+		{"missing-marker-and-table", dropMarker + "; " + dropScope},
+		// Isolate the view and later ledger entry from the surviving triggers.
+		{"missing-marker-with-view", dropMarker + "; " + dropScope + "; " + dropGuards + "; " + scopeView},
+		{"missing-marker-with-later-version", dropMarker + "; " + dropScope + "; " + dropGuards + "; INSERT INTO schema_migrations(version) VALUES(28)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, policy, role := investigationWorkerAtV27(t, investigationBindWorker)
+			messageSequenceLedger(t, f.s, 27)
+			id := role.Provenance.TaskID
+			if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); err != nil || scope.TaskID != id {
+				t.Fatalf("fixture does not have an investigation scope: %+v, %v", scope, err)
+			}
+			if ready, err := f.s.ResolveInvestigationExecution(ctx, role.Member, role.Provenance); err != nil || ready.Blocked != CoordinationReady || ready.AttemptID != role.AttemptID {
+				t.Fatalf("fixture does not have a live investigation worker: %+v, %v", ready, err)
+			}
+			coordinationDecideExec(t, f.s, tc.damage)
+			if receipt, err := f.s.GetChatAdmission(ctx, f.groupID, id); err != nil || receipt.TaskID != id ||
+				receipt.Action != domain.ChatActionReadOnlyInvestigation || !receipt.AuthorityEvidenceVerified {
+				t.Fatalf("damage did not preserve the authorized investigation admission: %+v, %v", receipt, err)
+			}
+			if state, err := f.s.ResolveCoordinationExecution(ctx, role.Member, role.Provenance); !errors.Is(err, ErrMemberToolDenied) || state != (CoordinationRoleState{}) {
+				t.Fatalf("schema mismatch exposed a generic worker: %+v, %v", state, err)
+			}
+			if state, err := f.s.ResolveInvestigationExecution(ctx, role.Member, role.Provenance); !errors.Is(err, ErrMemberToolDenied) || state != (CoordinationRoleState{}) {
+				t.Fatalf("schema mismatch exposed an investigation worker: %+v, %v", state, err)
+			}
+			if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); !errors.Is(err, ErrTaskInvestigationNotReady) || scope.TaskID != "" {
+				t.Fatalf("schema mismatch hid historical scope as legacy absence: %+v, %v", scope, err)
+			}
+			if got, err := f.s.GetChatPolicy(ctx, policy.ThreadRef); !errors.Is(err, ErrTaskInvestigationNotReady) || got.Revision != 0 {
+				t.Fatalf("schema mismatch returned a policy: %+v, %v", got, err)
+			}
+		})
 	}
-	if ready, err := f.s.ResolveInvestigationExecution(ctx, role.Member, role.Provenance); err != nil || ready.Blocked != CoordinationReady || ready.AttemptID != role.AttemptID {
-		t.Fatalf("fixture does not have a live investigation worker: %+v, %v", ready, err)
+}
+
+func TestChatInvestigationRetainedAdmissionWithoutSchema(t *testing.T) {
+	removeMetadata := func(t *testing.T, f chatFixture, role CoordinationToolScope) {
+		t.Helper()
+		messageSequenceLedger(t, f.s, 27)
+		if state, err := f.s.ResolveInvestigationExecution(ctx, role.Member, role.Provenance); err != nil ||
+			state.Blocked != CoordinationReady || state.AttemptID != role.AttemptID {
+			t.Fatalf("fixture has no live investigation role: %+v, %v", state, err)
+		}
+		// Leave the actual assessment and Mandate intact, but no v27 marker or objects.
+		coordinationDecideExec(t, f.s, `DROP TRIGGER chat_investigation_assessment_insert;
+		 DROP TRIGGER chat_investigation_artifact_insert;
+		 DROP TABLE chat_investigation_policy_revisions;
+		 DELETE FROM schema_migrations WHERE version=27`)
+		messageSequenceLedger(t, f.s, 26)
+		if objects := messageSequenceRows(t, f.s.db, "SELECT name FROM main.sqlite_schema WHERE name GLOB '*chat_investigation_*'"); len(objects) != 0 {
+			t.Fatalf("fixture still has investigation schema objects: %v", objects)
+		}
+		p := role.Provenance
+		if receipt, err := f.s.GetChatAdmission(ctx, p.GroupID, p.TaskID); err != nil || receipt.TaskID != p.TaskID ||
+			receipt.MandateID == "" || receipt.DispatchRequestID != p.RequestID || receipt.Action != domain.ChatActionReadOnlyInvestigation ||
+			receipt.Outcome != "admitted" || receipt.Authority != "written_preauthorization" || !receipt.AuthorityEvidenceVerified {
+			t.Fatalf("fixture lost the authorized investigation admission: %+v, %v", receipt, err)
+		}
 	}
-	coordinationDecideExec(t, f.s, "DELETE FROM schema_migrations WHERE version=27")
-	if state, err := f.s.ResolveCoordinationExecution(ctx, role.Member, role.Provenance); !errors.Is(err, ErrMemberToolDenied) || state != (CoordinationRoleState{}) {
-		t.Fatalf("a missing marker exposed a generic worker: %+v, %v", state, err)
-	}
-	if scope, err := f.s.GetTaskInvestigationScope(ctx, f.groupID, id); !errors.Is(err, ErrTaskInvestigationNotReady) || scope.TaskID != "" {
-		t.Fatalf("a missing marker was treated as legacy absence: %+v, %v", scope, err)
-	}
+	t.Run("fresh-binding", func(t *testing.T) {
+		f, _, role := investigationWorkerAtV27(t, investigationClaimWorker)
+		removeMetadata(t, f, role)
+		before := coordinationDecideSnapshot(t, f.s)
+		if binding, err := f.s.BindAssignmentAttempt(ctx, role); !errors.Is(err, ErrMemberToolDenied) || binding != (domain.AssignmentAttemptBinding{}) {
+			t.Fatalf("retained investigation admission allowed a fresh binding: %+v, %v", binding, err)
+		}
+		coordinationDecidePreserved(t, f.s, before)
+	})
+	t.Run("bound-worker", func(t *testing.T) {
+		f, _, role := investigationWorkerAtV27(t, investigationBindWorker)
+		removeMetadata(t, f, role)
+		before := coordinationDecideSnapshot(t, f.s)
+		p := role.Provenance
+		if scope, err := f.s.GetTaskInvestigationScope(ctx, p.GroupID, p.TaskID); !errors.Is(err, ErrTaskInvestigationNotReady) || scope.TaskID != "" {
+			t.Errorf("retained investigation scope treated as legacy absence: %+v, %v", scope, err)
+		}
+		if err := f.s.CheckTaskInvestigationReady(ctx, p.GroupID, p.TaskID); !errors.Is(err, ErrTaskInvestigationNotReady) {
+			t.Errorf("retained investigation readiness treated as legacy absence: %v", err)
+		}
+		for _, key := range [][2]string{{f.otherID, p.TaskID}, {p.GroupID, "unrelated-task"}} {
+			scope, err := f.s.GetTaskInvestigationScope(ctx, key[0], key[1])
+			requestDispatchZero(t, scope, err, ErrNotFound)
+		}
+		state, err := f.s.ResolveInvestigationExecution(ctx, role.Member, p)
+		requestDispatchZero(t, state, err, ErrMemberToolDenied)
+		input := AssignmentResultInput{Summary: "调查结论。"}
+		submission, err := f.s.SubmitAssignmentResult(ctx, role, input, "damaged-submit")
+		requestDispatchZero(t, submission, err, ErrMemberToolDenied)
+		submission, err = f.s.SubmitTask(ctx, investigationTaskSubmitInput(role, input, "damaged-direct"))
+		requestDispatchZero(t, submission, err, ErrMemberToolDenied)
+
+		recorder := assignmentQueryStore(t, f.path)
+		if state, err := recorder.s.ResolveCoordinationExecution(ctx, role.Member, p); !errors.Is(err, ErrMemberToolDenied) || state != (CoordinationRoleState{}) {
+			t.Fatalf("retained investigation admission resolved as a generic worker: %+v, %v", state, err)
+		}
+		var plan string
+		for _, q := range recorder.queries {
+			if strings.Contains(q.query, "mandates_group_task") {
+				plan = resolutionPlan(t, f.s, q.query, q.args...)
+				break
+			}
+		}
+		if !strings.Contains(plan, "INDEX mandates_group_task (group_id=? AND task_id=?)") || !strings.Contains(plan, "(decision_id=?)") {
+			t.Fatalf("cold receipt probe did not use exact Mandate and assessment indexes: %s", plan)
+		}
+		coordinationDecidePreserved(t, f.s, before)
+	})
 }
 
 func TestChatInvestigationSubmitRejectsSupersededPolicy(t *testing.T) {

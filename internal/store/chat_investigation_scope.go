@@ -25,7 +25,7 @@ func (scope taskInvestigationEvidence) matchesDispatch(r domain.DispatchRequest)
 }
 
 // GetTaskInvestigationScope is a trusted historical lookup. ErrNotFound means
-// no investigation admission; a changed or disabled current policy is not absence.
+// no retained investigation admission; a changed or disabled current policy is not absence.
 func (s *Store) GetTaskInvestigationScope(ctx context.Context, groupID, taskID string) (domain.TaskInvestigationScope, error) {
 	evidence, err := s.readTaskInvestigation(ctx, groupID, taskID, false)
 	return evidence.TaskInvestigationScope, err
@@ -73,6 +73,19 @@ func taskInvestigationInTx(ctx context.Context, tx *sql.Tx, groupID, taskID stri
 		return taskInvestigationEvidence{}, err
 	}
 	if !supported {
+		// The catalog can look legacy even though this Task retained its
+		// investigation admission. That receipt proves restriction, not readiness.
+		var admitted bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+		 SELECT 1 FROM main.mandates m INDEXED BY mandates_group_task
+		 CROSS JOIN main.chat_assessments a ON a.decision_id=m.decision_id
+		 WHERE m.group_id=? AND m.task_id=? AND json_extract(a.receipt_json,'$.action')=?)`,
+			groupID, taskID, domain.ChatActionReadOnlyInvestigation).Scan(&admitted); err != nil {
+			return taskInvestigationEvidence{}, err
+		}
+		if admitted {
+			return taskInvestigationEvidence{}, ErrTaskInvestigationNotReady
+		}
 		return taskInvestigationEvidence{}, ErrNotFound
 	}
 	var out taskInvestigationEvidence
