@@ -485,6 +485,146 @@ func TestPiInvestigationOwnerNativeFollowupAndAdmissionRefusal(t *testing.T) {
 	}
 }
 
+func TestInvestigationOwnerManagementRequiresOriginalUserAdmission(t *testing.T) {
+	for _, sourceKind := range []string{"local_user_chat", "member"} {
+		for _, kind := range []domain.TaskWorkSourceKind{domain.TaskWorkSourceFollowup, domain.TaskWorkSourceReport} {
+			t.Run(sourceKind+"/"+string(kind), func(t *testing.T) {
+				ctx := t.Context()
+				f := newBoundWorkReportFixture(t)
+				peer := ownerFixtureMember(t, f, f.group, "peer")
+				strict := sourceKind == "local_user_chat"
+				var sender string
+				if !strict {
+					sender = peer.ID
+				}
+				admitted := f.assessInvestigationFixtureFrom(t, true, sender, nil, 2, peer.ID)
+				if admitted.Outcome != "admitted" || !admitted.AuthorityEvidenceVerified || admitted.SourceKind != sourceKind ||
+					admitted.SourceID != f.source.SourceID || admitted.MessageID != f.source.ID || admitted.SourceSenderID != f.source.SenderID {
+					t.Fatalf("fixture did not legally admit the original %s source: %s/%s", sourceKind, admitted.Outcome, admitted.ReasonCode)
+				}
+				decision := f.decideInvestigationFixture(t, admitted, "assign")
+				assigned, err := f.db.MaterializeAssignment(ctx, decision.Assignment.ID, 1, time.Now().UTC())
+				roleOK(t, err)
+				initial := f.claim(t, assigned.Delivery.DeliveryID)
+				initialScope, err := f.db.BindMemberTool(ctx, initial.claim)
+				roleOK(t, err)
+				original := f.bindInvestigationOwner(t, store.CoordinationToolScope{Member: initialScope, Provenance: initial.provenance})
+				f.acceptWork(t, original.Member)
+				// Seed real B history without assuming the original owner had C management tools.
+				f.delegation, err = f.engine.DelegateWork(ctx, original.Member, domain.DelegateWorkInput{MemberID: peer.ID, Question: "核对原材料。"}, "seed-delegation")
+				roleOK(t, err)
+				f.settleWork(t, original.Member, true)
+				child := f.claimWork(t, f.delegation.DeliveryID)
+				isReport := kind == domain.TaskWorkSourceReport
+				var report domain.TaskWorkReport
+				if isReport {
+					f.acceptWork(t, child)
+					report, err = f.engine.ReportWork(ctx, child, domain.ReportWorkInput{Kind: domain.TaskWorkReportDelivered, Summary: "已核对原材料。"}, "seed-report")
+					roleOK(t, err)
+				}
+				f.settleWork(t, child, isReport)
+				input, userReply := queueInvestigationWorkInput(t, f, "保留原文。", isReport)
+				messageID, wakeSourceID, read := input.WorkWakeMessageID, input.WorkInputID, platform.ReadInvestigationChannelOperation
+				if isReport {
+					messageID, wakeSourceID, read = report.MessageID, report.ID, platform.ReadWorkReportOperation
+				}
+				msg, err := f.db.GetMessage(ctx, f.group, messageID)
+				roleOK(t, err)
+				wake := msg.Deliveries[0]
+				work, err := f.engine.ResolveTaskWorkDelivery(ctx, f.group, wake.ID)
+				roleOK(t, err)
+				if work.Blocked != "" || work.SourceKind != kind || work.SourceID != wakeSourceID {
+					t.Fatalf("fixture lacks its exact ready B continuation: %s/%s", work.SourceKind, work.Blocked)
+				}
+				want := append([]string{read}, provider.PiFreshTaskWorkToolNames()...)
+				var candidates []string
+				if strict {
+					want = append(want, delegateWorkOp, handbackWorkOp)
+					candidates = []string{peer.ID}
+				}
+				var offered provider.PiFreshInvestigationProfile
+				launch := &platform.InvestigationTaskWorkLaunch{
+					Supports: func(_ provider.Provider, p provider.PiFreshInvestigationProfile) bool { offered = p; return true },
+					Construct: func(context.Context, provider.Provider, provider.PiFreshInvestigationBinding) (provider.Executor, error) {
+						t.Fatal("preflight must not construct an adapter")
+						return nil, nil
+					},
+					Commit: func(context.Context, store.FreshTaskWorkLaunch, func() bool) error {
+						t.Fatal("preflight must not admit a launch")
+						return nil
+					},
+				}
+				f.runtime, err = platform.NewMemberToolRuntimeWithInvestigationOwnerManagement(f.db, f.options, f.engine,
+					func(domain.Member, provider.PiFreshInvestigationProfile) bool { return true }, launch)
+				roleOK(t, err)
+				t.Cleanup(func() { roleOK(t, f.runtime.Close()) })
+				extension := filepath.Join(t.TempDir(), "unused-extension.ts")
+				roleOK(t, os.WriteFile(extension, nil, 0600))
+				prep, err := platform.NewPreparer(f.db, platform.PrepareOptions{PrivateWorkspaceRoot: t.TempDir(), MemberTools: f.runtime,
+					PiMemberToolsExtension: extension, Providers: []provider.Provider{{ID: f.worker.ProviderID, Name: provider.Pi}}})
+				roleOK(t, err)
+				prepared, err := prep.Prepare(ctx, store.PendingDelivery{GroupID: f.group, Delivery: wake, SenderID: msg.SenderID})
+				roleOK(t, err)
+				if prepared.Executor == nil || offered.SourceKind != kind || !slices.Equal(offered.Operations, want) ||
+					strings.Contains(prepared.Request.Prompt, "delegate_candidate_ids") != strict ||
+					strings.Contains(prepared.Request.Prompt, delegateWorkOp) != strict || strings.Contains(prepared.Request.Prompt, handbackWorkOp) != strict {
+					t.Errorf("preflight advertised %v, want %v", offered.Operations, want)
+				}
+
+				state, err := f.db.ResolveCoordinationDelivery(ctx, f.group, wake.ID)
+				roleOK(t, err)
+				owner := f.claimWork(t, wake.ID)
+				attempt, err := f.engine.BindTaskWorkContinuation(ctx, owner)
+				roleOK(t, err)
+				role := store.CoordinationToolScope{Member: owner, Provenance: state.Provenance, AttemptID: attempt.ID}
+				tools := f.runtime.Tools()
+				token, managed, err := f.runtime.IssueFreshInvestigationOwnerManagementTools(ctx, role, work, nil)
+				if strict {
+					roleOK(t, err)
+					if token == "" || !slices.Equal(managed.Operations, want) || !slices.Equal(managed.DelegateCandidateIDs, candidates) {
+						t.Fatal("strict original user admission lost the managed owner profile")
+					}
+				} else {
+					if token != "" || !errors.Is(err, store.ErrMemberToolDenied) {
+						t.Fatalf("explicit issuance did not deny management for the original member source: %v", err)
+					}
+					// A denial must not occupy the Turn's one registration slot.
+					token, _, err = f.runtime.IssueFreshInvestigationOwnerTools(ctx, role, work, nil)
+					roleOK(t, err)
+				}
+				defer tools.Revoke(token)
+				ops, err := tools.TransportOperations(ctx, token)
+				roleOK(t, err)
+				if !slices.Equal(ops, want) {
+					t.Fatalf("registered %v, want %v", ops, want)
+				}
+				f.acceptWork(t, owner)
+				if isReport {
+					got, err := tools.ReadWorkReport(ctx, token)
+					roleOK(t, err)
+					if got.ReportID != report.ID || got.Summary != report.Summary {
+						t.Fatal("did not read the exact wake-selected report")
+					}
+				} else {
+					_, err := tools.ReadInvestigationChannel(ctx, token, store.ListOptions{})
+					roleOK(t, err)
+				}
+				got, err := tools.GetFreshTaskWorkInput(ctx, token, input.WorkInputID)
+				roleOK(t, err)
+				if got.Content != userReply.Content || got.Disposition != "pending" {
+					t.Fatal("did not read the exact pending input")
+				}
+				roleOK(t, tools.AckFreshTaskWorkInput(ctx, token, input.WorkInputID, "ack"))
+				sub, err := tools.SubmitFreshTaskWorkResult(ctx, token, "本轮调查结论。", "submit")
+				roleOK(t, err)
+				if sub.TaskID != admitted.TaskID || sub.AttemptID != attempt.ID {
+					t.Fatal("submission was not bound to the original task and current Attempt")
+				}
+			})
+		}
+	}
+}
+
 func TestPiInvestigationOwnerNativeNoAuthorityNoLaunch(t *testing.T) {
 	for _, mode := range []string{"admission-disabled", "coordinator-declined"} {
 		t.Run(mode, func(t *testing.T) {

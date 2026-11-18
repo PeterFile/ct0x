@@ -52,6 +52,21 @@ func investigationRootDelivery(ctx context.Context, db *store.Store, thread doma
 	return d, ctx.Err()
 }
 
+func investigationAdmissionMatchesScope(admission domain.ChatAssessmentReceipt, scope domain.TaskInvestigationScope, requestID string) bool {
+	return admission.DispatchRequestID == requestID && admission.ThreadRef == scope.ThreadRef && admission.TaskID == scope.TaskID &&
+		admission.MandateID == scope.MandateID && admission.PolicyRevision == scope.PolicyRevision && admission.Action == domain.ChatActionReadOnlyInvestigation
+}
+
+func requireStrictInvestigationAdmissionRoot(ctx context.Context, db *store.Store, admission domain.ChatAssessmentReceipt) error {
+	if admission.SourceKind != "local_user_chat" || admission.SourceSenderID != "user" || admission.Purpose != domain.ChatIntakePurpose ||
+		admission.Outcome != "admitted" || admission.Disposition != "prepare_work" || !admission.AuthorityEvidenceVerified ||
+		admission.DiscussionOnly || admission.DiscussionOnlyExcerpt != "" {
+		return investigationReadError(ctx, errInvestigationFirstRoot)
+	}
+	_, err := investigationRootDelivery(ctx, db, admission.ThreadRef, admission.MessageID, admission.SourceID, admission.AssessedBy, admission.TurnID)
+	return investigationReadError(ctx, err)
+}
+
 // Historical lookup classifies a formal role delivery even if its current
 // policy is disabled. An error or mismatched investigation must not fall back
 // to ordinary role tools, context or workspace.
@@ -76,17 +91,10 @@ func taskInvestigationForRole(ctx context.Context, db *store.Store, role store.C
 	if err != nil {
 		return nil, investigationReadError(ctx, err)
 	}
-	if admission.DispatchRequestID != role.RequestID || admission.TaskID != scope.TaskID ||
-		admission.GroupID != scope.GroupID || admission.TopicID != scope.TopicID || admission.MandateID != scope.MandateID ||
-		admission.PolicyRevision != scope.PolicyRevision || admission.Action != domain.ChatActionReadOnlyInvestigation {
+	if !investigationAdmissionMatchesScope(admission, scope, role.RequestID) {
 		return nil, store.ErrMemberToolDenied
 	}
-	if admission.SourceKind != "local_user_chat" || admission.SourceSenderID != "user" || admission.Purpose != domain.ChatIntakePurpose ||
-		admission.Outcome != "admitted" || admission.Disposition != "prepare_work" || !admission.AuthorityEvidenceVerified ||
-		admission.DiscussionOnly || admission.DiscussionOnlyExcerpt != "" {
-		return nil, errInvestigationFirstRoot
-	}
-	if _, err := investigationRootDelivery(ctx, db, admission.ThreadRef, admission.MessageID, admission.SourceID, admission.AssessedBy, admission.TurnID); err != nil {
+	if err := requireStrictInvestigationAdmissionRoot(ctx, db, admission); err != nil {
 		return nil, err
 	}
 	if role.Kind == store.CoordinationRoleWorker {

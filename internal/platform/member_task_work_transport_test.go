@@ -122,6 +122,11 @@ func (f *boundWorkReportFixture) queueInvestigationOwner(t *testing.T, parentRef
 
 func (f *boundWorkReportFixture) assessInvestigationFixture(t *testing.T, enabled bool, parentRefs []domain.ArtifactVersionRef, maxDelegations int, workerIDs ...string) domain.ChatAssessmentReceipt {
 	t.Helper()
+	return f.assessInvestigationFixtureFrom(t, enabled, "", parentRefs, maxDelegations, workerIDs...)
+}
+
+func (f *boundWorkReportFixture) assessInvestigationFixtureFrom(t *testing.T, enabled bool, sender string, parentRefs []domain.ArtifactVersionRef, maxDelegations int, workerIDs ...string) domain.ChatAssessmentReceipt {
+	t.Helper()
 	ctx := t.Context()
 	_, err := f.db.SetDispatchPolicy(ctx, f.group, append([]string{f.worker.ID}, workerIDs...), 1, "report-workers")
 	roleOK(t, err)
@@ -133,8 +138,18 @@ func (f *boundWorkReportFixture) assessInvestigationFixture(t *testing.T, enable
 		f.engine.EnableInvestigationExecution()
 	}
 	f.engine.EnableTaskWorkExecution() // Fixture only: no C executable is installed.
-	f.source, err = f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: thread.TopicID, Content: "请调查公开讨论。", RecipientIDs: []string{f.lead.ID}}, "source")
+	recipient := f.lead.ID
+	if sender != "" {
+		recipient = sender
+	}
+	f.source, err = f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: thread.TopicID, Content: "请调查公开讨论。", RecipientIDs: []string{recipient}}, "source")
 	roleOK(t, err)
+	if sender != "" {
+		publisher := f.claimWork(t, f.source.Deliveries[0].ID)
+		f.source, err = f.db.SendMessageForTool(ctx, publisher, store.MemberToolMessageInput{Content: "建议按书面策略调查。", RecipientIDs: []string{f.lead.ID}}, "member-source")
+		roleOK(t, err)
+		f.settleWork(t, publisher, false)
+	}
 	intake := f.claimWork(t, f.source.Deliveries[0].ID)
 	candidate, err := f.engine.CaptureChatCandidate(ctx, intake)
 	roleOK(t, err)

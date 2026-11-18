@@ -76,10 +76,8 @@ func (p *Preparer) planInvestigationTaskWork(ctx context.Context, input preparat
 	if err != nil {
 		return empty, preparationResolutionError(ctx, err)
 	}
-	if admission.Action != domain.ChatActionReadOnlyInvestigation || admission.Outcome != "admitted" || !admission.AuthorityEvidenceVerified ||
-		admission.WorkspaceScope != nil || admission.GroupID != work.GroupID || admission.TopicID != work.TopicID ||
-		admission.TaskID != work.TaskID || admission.MandateID != work.MandateID || admission.DispatchRequestID != req.ID ||
-		admission.PolicyRevision != scope.PolicyRevision {
+	if !investigationAdmissionMatchesScope(admission, scope, req.ID) || admission.Outcome != "admitted" ||
+		!admission.AuthorityEvidenceVerified || admission.WorkspaceScope != nil {
 		return empty, errPrepareBinding
 	}
 	mandate, err := currentTaskWorkMandate(ctx, p.store, work)
@@ -112,7 +110,16 @@ func (p *Preparer) planInvestigationTaskWork(ctx context.Context, input preparat
 	if len(versions) != 0 && r.investigationTaskWork.Artifacts == nil {
 		return empty, rolePreparationBlocked(state, "investigation_artifacts_unavailable", nil)
 	}
-	managed := work.SourceKind.IsOwnerContinuation() && r.investigationOwnerLaunchEnabled()
+	var managed bool
+	if work.SourceKind.IsOwnerContinuation() && r.investigationOwnerLaunchEnabled() {
+		// A ready B continuation can have a broader original admission. Only
+		// a definite non-strict root keeps the base profile; failed reads abort.
+		err := requireStrictInvestigationAdmissionRoot(ctx, p.store, admission)
+		if err != nil && err != errInvestigationFirstRoot {
+			return empty, preparationResolutionError(ctx, err)
+		}
+		managed = err == nil
+	}
 	var candidates []string
 	if managed {
 		candidates, err = r.tools.investigationDelegateCandidates(ctx, state.Provenance, scope)

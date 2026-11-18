@@ -139,6 +139,21 @@ func (r *MemberToolRuntime) issueFreshInvestigationOwnerTools(ctx context.Contex
 			}
 		}
 		if managed {
+			// Resolve the original intake again, independently of preparation.
+			// This wake's input or reporter is not the source of management authority.
+			admission, err := s.db.GetChatAdmission(ctx, m.GroupID, m.TaskID)
+			if err != nil {
+				return "", empty, investigationReadError(ctx, err)
+			}
+			if !investigationAdmissionMatchesScope(admission, m, role.Provenance.RequestID) || admission.WorkspaceScope != nil {
+				return "", empty, store.ErrMemberToolDenied
+			}
+			if err := requireStrictInvestigationAdmissionRoot(ctx, s.db, admission); err != nil {
+				if err == errInvestigationFirstRoot {
+					err = store.ErrMemberToolDenied
+				}
+				return "", empty, err
+			}
 			entry.purpose = memberContinuingInvestigationOwnerPurpose
 			entry.delegateCandidateIDs, err = s.investigationDelegateCandidates(ctx, role.Provenance, m)
 			if err != nil {
