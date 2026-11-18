@@ -205,6 +205,9 @@ type memberToolRuntimeRun struct {
 	used          atomic.Bool
 	role          *store.CoordinationRoleProvenance
 	intake        bool
+	intakeSchema  memberToolIntakeSchema
+	intakeBuilder func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh investigation intake only.
+	investigation *investigationRolePreparation
 	nativeSession *memberToolNativeSessionPlan
 	// Cloned at trusted wrapping and again when the claimed token is registered.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
@@ -241,7 +244,7 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
 	var token string
 	if e.intake {
-		token, err = r.tools.IssueChatIntake(ctx, claim)
+		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema)
 	} else {
 		token, err = r.tools.Issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers, ProviderID: e.binding.ProviderID, Model: e.binding.Model})
 	}
@@ -376,11 +379,26 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 	if !r.rootValid() {
 		return nil, errMemberToolRuntimeConfig
 	}
+	entry, found := r.nativeRegistration(token)
+	if !found {
+		return nil, errMemberToolRuntimeBinding
+	}
+	var action string
+	if entry.investigationIntake() {
+		action = domain.ChatActionReadOnlyInvestigation
+	}
+	var strictTools []string
+	if entry.purpose == memberInvestigationRolePurpose {
+		strictTools = entry.grants.Operations
+	}
 	data, err := json.Marshal(struct {
-		Endpoint     string `json:"endpoint"`
-		Token        string `json:"token"`
-		ContinueWork bool   `json:"continue_work,omitempty"`
-	}{r.endpoint, token, r.tools.issuedContinueWork(token)})
+		Endpoint               string   `json:"endpoint"`
+		Token                  string   `json:"token"`
+		ContinueWork           bool     `json:"continue_work,omitempty"`
+		DiscussionOnlyExcerpt  bool     `json:"discussion_only_excerpt,omitempty"`
+		IntakeAssessmentAction string   `json:"intake_assessment_action,omitempty"`
+		InvestigationTools     []string `json:"investigation_tools,omitempty"`
+	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools})
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}

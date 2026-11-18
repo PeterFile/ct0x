@@ -99,9 +99,9 @@ func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 	if len(providers) != 1 || providers[0].Version != "1.4.0" {
 		t.Fatal("missing synthetic Pi metadata")
 	}
-	for _, name := range []string{"default", "opt-in"} {
+	for _, name := range []string{"default", "opt-in", "combined"} {
 		t.Run(name, func(t *testing.T) {
-			enabled := name == "opt-in"
+			enabled, combined := name != "default", name == "combined"
 			dir := t.TempDir()
 			db, err := store.Open(filepath.Join(dir, "workspace.db"))
 			ok(t, err)
@@ -110,14 +110,31 @@ func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 			if enabled {
 				args = append(args, "--pi-fresh-task-work-extension", filepath.Join(filepath.Dir(memberToolsEntry(t)), "fresh-task-work.ts"))
 			}
+			var workspace []platform.MemberWorkspaceOptions
+			if combined {
+				args = append(args, "--enable-investigation-execution")
+				_, owner, err := artifactReadRoutes(dir, db)
+				ok(t, err)
+				defer owner.Close()
+				opts, err := workspaceRuntimeOptions(dir, owner)
+				ok(t, err)
+				workspace = append(workspace, opts)
+			}
 			cfg, err := parseConfig(args, io.Discard)
 			ok(t, err)
-			run, runtime, prep, err := executionRunner(cfg, db, coordination.New(db), catalog, "http://127.0.0.1:7310/api/v1/member-tools", io.Discard)
+			if cfg.executionMaxActive != defaultExecutionMaxActive || cfg.enableInvestigationExecution != combined {
+				t.Fatal("combined flags changed the default capacity or the investigation opt-in")
+			}
+			run, runtime, prep, err := executionRunner(cfg, db, coordination.New(db), catalog, "http://127.0.0.1:7310/api/v1/member-tools", io.Discard, workspace...)
 			ok(t, err)
 			defer runtime.Close()
 			tools := runtime.Tools()
 			if run == nil || tools.FreshTaskWorkEnabled() != enabled || tools.WorkInputsEnabled() {
 				t.Fatal("command composition selected the wrong execution or legacy preview profile")
+			}
+			_, err = os.Stat(filepath.Join(dir, "workspaces", platform.InvestigationCWDName))
+			if combined && err != nil || !combined && !os.IsNotExist(err) {
+				t.Fatal("investigation private CWD did not follow its explicit opt-in")
 			}
 			local := platform.NewLocalUser(db)
 			group, err := local.CreateGroup(ctx, platform.GroupInput{Name: "intake fixture"}, "")
@@ -129,7 +146,9 @@ func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 			delivery := msg.Deliveries[0]
 			prepared, err := prep.Prepare(ctx, store.PendingDelivery{GroupID: group.ID, Delivery: delivery})
 			ok(t, err)
-			if strings.Contains(prepared.Request.Prompt, "continue_work") != enabled || (prepared.Request.Thinking == "off") != !enabled {
+			// The current bridge's excerpt changes intake even without fresh Task Work.
+			if strings.Contains(prepared.Request.Prompt, "continue_work") != enabled ||
+				!strings.Contains(prepared.Request.Prompt, "discussion_only_excerpt") || prepared.Request.Thinking != "" {
 				t.Errorf("intake prompt or native session selection did not match the installed schema (thinking=%q)", prepared.Request.Thinking)
 			}
 			turn, err := db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: group.ID, DeliveryID: delivery.ID, MaxActive: 1, ResourceKeys: prepared.ResourceKeys})

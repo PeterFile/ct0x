@@ -76,6 +76,11 @@ func (f memberToolRuntimeFixture) wrap(t *testing.T, factory MemberToolExecutorF
 
 func memberToolRuntimeConfig(t *testing.T, path string) (string, string) {
 	t.Helper()
+	return memberToolRuntimeConfigWithDiscussion(t, path, false)
+}
+
+func memberToolRuntimeConfigWithDiscussion(t *testing.T, path string, discussion bool) (string, string) {
+	t.Helper()
 	info, err := os.Lstat(path)
 	if err != nil || info.Mode() != 0600 || !filepath.IsAbs(path) {
 		t.Fatalf("config must be an absolute regular 0600 file: %v", err)
@@ -84,11 +89,23 @@ func memberToolRuntimeConfig(t *testing.T, path string) (string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var config map[string]string
-	if json.Unmarshal(data, &config) != nil || len(config) != 2 || config["endpoint"] == "" || config["token"] == "" {
-		t.Fatal("config must contain exactly endpoint and token")
+	var config map[string]json.RawMessage
+	var endpoint, secret string
+	if json.Unmarshal(data, &config) != nil || json.Unmarshal(config["endpoint"], &endpoint) != nil ||
+		json.Unmarshal(config["token"], &secret) != nil || endpoint == "" || secret == "" {
+		t.Fatal("invalid issued config")
 	}
-	return config["endpoint"], config["token"]
+	count := 2
+	if discussion {
+		count++
+		if string(config["discussion_only_excerpt"]) != "true" {
+			t.Fatal("intake omitted the issued discussion hint")
+		}
+	}
+	if len(config) != count {
+		t.Fatal("issued config contains unapproved fields")
+	}
+	return endpoint, secret
 }
 
 func memberToolRuntimeEmpty(t *testing.T, path string) {

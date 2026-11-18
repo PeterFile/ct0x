@@ -135,6 +135,7 @@ type rolePreparationPlan struct {
 	selection            provider.AdapterSelection
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 	workspace            *domain.TaskWorkspaceScope
+	investigation        *investigationRolePreparation
 	nativeText           bool
 	input                contextpack.Input
 }
@@ -154,6 +155,16 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 	}
 	if r.tools == nil || r.tools.db != p.store || !r.rootValid() {
 		return empty, preparationFailureWithCause(ctx, errPrepareConfig, errMemberToolRuntimeConfig)
+	}
+	investigation, err := taskInvestigationForRole(ctx, p.store, state.Provenance)
+	if errors.Is(err, errInvestigationFirstRoot) {
+		return empty, rolePreparationBlocked(state, "investigation_first_root_required", nil)
+	}
+	if err != nil {
+		return empty, preparationResolutionError(ctx, err)
+	}
+	if investigation != nil {
+		return p.planInvestigationRole(ctx, state, member, *investigation)
 	}
 	workspace, err := p.taskWorkspaceForPreparation(ctx, state.Provenance)
 	if err != nil {
@@ -260,6 +271,9 @@ func (p *Preparer) prepareCoordinationRole(ctx context.Context, state store.Coor
 	}
 	if err != nil {
 		return empty, err
+	}
+	if plan.investigation != nil {
+		return p.prepareInvestigationRole(ctx, plan, member, string(packet))
 	}
 	var workspace preparationWorkspace
 	if plan.workspace != nil && state.Provenance.Kind == store.CoordinationRoleWorker {

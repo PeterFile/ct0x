@@ -9,8 +9,11 @@ import (
 )
 
 type MemberToolTransportProfile struct {
-	Operations   []string
-	ContinueWork bool
+	Operations            []string
+	ContinueWork          bool
+	DiscussionOnlyExcerpt bool
+	InvestigationIntake   bool
+	InvestigationRole     bool
 }
 
 func (s *MemberTools) TransportOperations(ctx context.Context, token string) ([]string, error) {
@@ -30,6 +33,13 @@ func (s *MemberTools) TransportProfile(ctx context.Context, token string) (Membe
 	if err := s.db.ValidateMemberTool(ctx, entry.scope); err != nil {
 		return MemberToolTransportProfile{}, memberRoleError(ctx, err)
 	}
+	if entry.purpose == memberInvestigationRolePurpose {
+		names, err := s.investigationTransportOperations(ctx, entry)
+		if err != nil {
+			return MemberToolTransportProfile{}, err
+		}
+		return MemberToolTransportProfile{Operations: names, InvestigationRole: true}, nil
+	}
 	if entry.role.Provenance.Kind != "" {
 		if entry.role.Member != entry.scope {
 			return MemberToolTransportProfile{}, store.ErrMemberToolDenied
@@ -43,5 +53,6 @@ func (s *MemberTools) TransportProfile(ctx context.Context, token string) (Membe
 		}
 		// Blocked is startup readiness, not historical replay authorization.
 	}
-	return MemberToolTransportProfile{Operations: slices.Clone(entry.grants.Operations), ContinueWork: s.advertisesContinueWork(entry)}, nil
+	return MemberToolTransportProfile{Operations: slices.Clone(entry.grants.Operations), ContinueWork: s.advertisesContinueWork(entry),
+		DiscussionOnlyExcerpt: s.isChatIntake(entry), InvestigationIntake: entry.investigationIntake()}, nil
 }

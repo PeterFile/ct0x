@@ -79,7 +79,7 @@ func (a memberToolAdapter) NewExecutor(selected Provider, timeout time.Duration)
 		return nil, err
 	}
 	if a.name == Pi {
-		if _, err := readMemberToolConfig(a.configPath); err != nil {
+		if _, err := readPiMemberToolConfig(a.configPath, false); err != nil {
 			return nil, err
 		}
 		return NewPiMemberToolExecutorWithTools(selected, a.extensionPath, filepath.Clean(a.configPath), a.toolNames, timeout)

@@ -22,7 +22,13 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
 		return nil, nil, nil, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
 	}
+	if err := config.validateInvestigationOption(); err != nil {
+		return nil, nil, nil, err
+	}
 	if err := config.validateNativeSessionConfig(); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := config.validateInvestigationDataDir(); err != nil {
 		return nil, nil, nil, err
 	}
 	runtime, err := privateExecutionRoot(config.dataDir, "runtime")
@@ -49,6 +55,24 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	// Only explicit local-user receipts authorize external directories. Protect
 	// the entire private data root, not just per-conversation workspaces.
 	options := platform.PrepareOptions{Providers: providers, PrivateWorkspaceRoot: workspaces, PrivateDataRoot: config.dataDir}
+	if config.enableInvestigationExecution {
+		// Borrow the existing immutable blob owner independently of file grants.
+		if len(workspace) == 0 || workspace[0].Blobs == nil {
+			return nil, nil, nil, errors.New("只读调查需要成果读取服务")
+		}
+		artifacts, err := platform.NewArtifacts(db, workspace[0].Blobs)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		grant, err := platform.NewMemberArtifactGrant(artifacts)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if _, err := privateExecutionRoot(workspaces, platform.InvestigationCWDName); err != nil {
+			return nil, nil, nil, err
+		}
+		options.Investigation = &platform.InvestigationPreparationOptions{PiPath: config.piPath, Artifacts: grant}
+	}
 	var tools *platform.MemberToolRuntime
 	if config.enableMemberTools {
 		root, err := privateExecutionRoot(config.dataDir, "member-tools")

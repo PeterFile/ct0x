@@ -365,3 +365,42 @@ test("native execution forwards cancellation and never returns partial results o
     error => safeFailure(error, /取消.*未发送/));
   assert.equal(requests.length, 0);
 });
+
+test("issued discussion excerpt is verbatim and cannot be coerced or normalized", async t => {
+  const { tools, requests } = await toolsFor(t, (_, response) => json(response, {
+    message_id: "notice", created_at: "2026-11-18T00:00:00Z", delivery_count: 0, content_omitted: true,
+  }, 201), { discussion_only_excerpt: true });
+  const send = tools.get("send_message");
+  const exact = " \n只讨论🙂e\u0301\n";
+  const payload = { content: "先讨论。", intent_assessment: { disposition: "discuss", reason: "明确范围", discussion_only_excerpt: exact } };
+  assert.deepEqual(send.prepareArguments(payload), payload);
+  for (const bad of [null, 42, false]) {
+    assert.throws(() => send.prepareArguments({ ...payload, intent_assessment: { ...payload.intent_assessment, discussion_only_excerpt: bad } }), /未发送/);
+  }
+  assert.throws(() => send.prepareArguments({ ...payload, recipient_ids: null }), /未发送/);
+  for (const bad of ["\u0085", "\ud800", "\0", "🙂".repeat(1024) + "x"]) {
+    await assert.rejects(execute(send, { ...payload, intent_assessment: { ...payload.intent_assessment, discussion_only_excerpt: bad } }), /未发送/);
+  }
+  await execute(send, payload);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(JSON.parse(requests[0].body), payload);
+});
+
+test("strict investigation registers only the digested tool set and blocks host calls", async t => {
+  const names = ["read_investigation_artifact", "submit_result"];
+  const config = await privateConfig(t, { investigation_tools: names });
+  const digest = createHash("sha256").update(await readFile(config)).digest("hex");
+  for (const bad of [undefined, "0".repeat(64)]) {
+    assert.equal((await load(config, bad)).extensions.length, 0);
+  }
+  const loaded = await load(config, digest);
+  assert.deepEqual(loaded.errors, []);
+  const ext = loaded.extensions[0];
+  assert.deepEqual([...ext.tools.keys()], names);
+  const call = ext.handlers.get("tool_call")[0];
+  for (const toolName of ["read", "bash", "write", "mcp__foreign", "read_channel", "workspace_write"]) {
+    assert.equal((await call({ type: "tool_call", toolName }, {})).block, true);
+  }
+  assert.equal(await call({ type: "tool_call", toolName: names[0] }, {}), undefined);
+  assert.equal(ext.tools.get("submit_result").definition.parameters.properties.artifact_versions, undefined);
+});

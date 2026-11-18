@@ -23,6 +23,8 @@ const memberMCPMaxStringIDBytes = 128
 // NUL expands to six JSON bytes per input byte, the largest possible encoding.
 var memberMCPMaxEncodedID = strings.Repeat("\x00", memberMCPMaxStringIDBytes)
 
+var memberMCPComposedTools = slices.Concat(memberMCPTools, memberInvestigationMCPTools())
+
 // MemberMCPRoutes is opt-in; mount on the same NewServer and registry as native
 // routes. NewServer rejects GET with 405/Allow: POST: this endpoint has no SSE.
 // No session ID, initialization state, execution queue or additional authority.
@@ -98,11 +100,15 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			memberMCPError(w, 200, id, -32602, "工具列表无需游标")
 			return
 		}
-		tools := make([]memberMCPTool, 0, len(memberMCPTools))
-		for _, tool := range memberMCPTools {
+		tools := make([]memberMCPTool, 0, len(profile.Operations))
+		for _, tool := range memberMCPComposedTools {
 			if slices.Contains(profile.Operations, tool.Name) {
-				if tool.Name == "send_message" && profile.ContinueWork {
-					tool.InputSchema = memberMCPSendMessageContinuationSchema
+				if tool.Name == "send_message" && (profile.ContinueWork || profile.DiscussionOnlyExcerpt || profile.InvestigationIntake) {
+					tool.InputSchema = memberMCPSendMessageSchema(profile.ContinueWork, profile.DiscussionOnlyExcerpt, profile.InvestigationIntake)
+				}
+				if tool.Name == "submit_result" && profile.InvestigationRole {
+					tool.Description = "提交当前调查的纯文本结论，不附成果版本；提交不代表接纳。未知结果先对账。"
+					tool.InputSchema = json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":8192}},"required":["summary"],"additionalProperties":false}`)
 				}
 				tools = append(tools, tool)
 			}
@@ -116,7 +122,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			arguments = json.RawMessage(`{}`)
 		}
 		switch name {
-		case "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact":
+		case "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", platform.ReadInvestigationArtifactOperation:
 			// Reject before fingerprint decoding or binding; metadata stays opaque.
 			if !validMemberToolJSONStrings(arguments) {
 				memberMCPError(w, 400, id, -32602, "文件工具参数包含无效的 Unicode 字符串转义")
@@ -128,8 +134,11 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			memberMCPError(w, 400, id, -32602, "工具名称和 arguments 对象无效")
 			return
 		}
-		continuation := name == "send_message" && isContinueWorkRequest(arguments)
-		if name == "ack_work_input" || name == "hand_back_work_input" || continuation {
+		continuation, excerpt := false, false
+		if name == "send_message" {
+			continuation, excerpt = memberToolSendAssessmentFields(arguments)
+		}
+		if name == "ack_work_input" || name == "hand_back_work_input" || continuation || excerpt {
 			// Neither the derived key nor the fingerprint may alias replacement
 			// characters. Keep legacy send_message and opaque metadata unchanged.
 			if !validMemberToolJSONStrings(frame["id"]) {
@@ -141,7 +150,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				return
 			}
 		}
-		for _, tool := range memberMCPTools {
+		for _, tool := range memberMCPComposedTools {
 			if tool.Name != name {
 				continue
 			}
@@ -172,6 +181,9 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				native.Header.Set("Idempotency-Key", key)
 			}
 			buffer = newMemberMCPBuffer()
+			if name == platform.ReadInvestigationArtifactOperation {
+				buffer.readLimitAdvice = memberInvestigationArtifactTooLarge
+			}
 			tool.invoke(a, buffer, native, token)
 			memberMCPToolReply(w, id, tool.write, buffer)
 			return
@@ -320,10 +332,11 @@ func memberMCPError(w http.ResponseWriter, status int, id any, code int, message
 // A bounded sink, not httptest. Write consumes excess bytes without propagating
 // an error back across a handler's already-committed write boundary.
 type memberMCPBuffer struct {
-	header   http.Header
-	body     []byte
-	status   int
-	overflow bool
+	readLimitAdvice string
+	header          http.Header
+	body            []byte
+	status          int
+	overflow        bool
 }
 
 func newMemberMCPBuffer() *memberMCPBuffer     { return &memberMCPBuffer{header: make(http.Header)} }
@@ -372,7 +385,11 @@ func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *membe
 			text = `{"error":{"code":"internal_error","message":"操作结果尚未确认，错误响应过大"}}` + memberMCPReconcile
 		default:
 			failed = true
-			text = `{"error":{"code":"tool_result_too_large","message":"工具结果过大，请减小 limit 或 length"}}`
+			message := buffer.readLimitAdvice
+			if message == "" {
+				message = "工具结果过大，请减小 limit 或 length"
+			}
+			text = `{"error":{"code":"tool_result_too_large","message":` + strconv.Quote(message) + `}}`
 		}
 		envelope = memberMCPToolEnvelope(id, text, failed)
 	}

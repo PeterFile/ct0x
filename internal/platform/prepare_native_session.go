@@ -138,6 +138,10 @@ func (p *Preparer) nativeSessionAdapterRegistry(selection provider.AdapterSelect
 	return provider.NewAdapterRegistry(provider.AdapterRegistration{ID: selection.ID, Protocol: selection.Protocol, Adapter: adapter})
 }
 
+func (p *Preparer) piIntakeChangesNativeSchema() bool {
+	return p.piDiscussionSchema || p.memberTools.tools.continueWorkEnabled()
+}
+
 // Provider-wide reporting describes the process configuration only. It cannot
 // assert any member's model, claim, resources, or resumable history.
 func (p *Preparer) nativeReportTools(selected provider.Provider) []string {
@@ -149,7 +153,7 @@ func (p *Preparer) nativeReportTools(selected provider.Provider) []string {
 		if r.tools.chatEngine == nil {
 			return r.operations
 		}
-		if !r.tools.continueWorkEnabled() {
+		if !p.piIntakeChangesNativeSchema() {
 			return chatIntakeOperations()
 		}
 	}

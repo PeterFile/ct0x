@@ -1,8 +1,11 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -55,9 +58,13 @@ func verifyChatDiscussionOnlyInTx(ctx context.Context, tx *sql.Tx, scope MemberT
 	return nil
 }
 
-// A local user source may have multiple recipient Turns. A structured handoff
-// inherits the same source limit, but never the origin's work authority.
 func chatDiscussionWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) error {
+	return chatDiscussionSourceGateInTx(ctx, tx, c, true)
+}
+
+// Relays inherit the same source limit, not the origin's work authority.
+// Recency constrains new admissions, not execution of already admitted work.
+func chatDiscussionSourceGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, checkRecency bool) error {
 	var available, structured bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version>=24)
 	 OR EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN ('chat_discussions','chat_discussion_events'))`).Scan(&available); err != nil {
@@ -71,7 +78,7 @@ func chatDiscussionWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCa
 	}
 	if !structured {
 		if c.SourceKind == "member" {
-			return chatDiscussionLegacyWorkGateInTx(ctx, tx, c)
+			return chatDiscussionLegacyWorkGateInTx(ctx, tx, c, checkRecency)
 		}
 		if c.SourceKind != "local_user_chat" {
 			return nil
@@ -109,13 +116,15 @@ func chatDiscussionWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCa
 	if err != nil {
 		return err
 	}
-	// A newer handoff cannot make the root current again after a user command.
-	stale, err := chatSourceSupersededInTx(ctx, tx, c.ThreadRef, source.sequence)
-	if err != nil {
-		return err
-	}
-	if stale {
-		return chatStaleSource()
+	if checkRecency {
+		// A newer handoff cannot make the root current again after a user command.
+		stale, err := chatSourceSupersededInTx(ctx, tx, c.ThreadRef, source.sequence)
+		if err != nil {
+			return err
+		}
+		if stale {
+			return chatStaleSource()
+		}
 	}
 	return chatDiscussionRootLimitInTx(ctx, tx, c.ThreadRef, origin, source)
 }
@@ -123,7 +132,7 @@ func chatDiscussionWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCa
 // Generic sends can relay an arrival without capturing an intake on every hop.
 // Each message has at most one publishing Turn, and its input must be older.
 // Bound the indexed walk; an unproved prefix must not count as unrelated chat.
-func chatDiscussionLegacyWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) error {
+func chatDiscussionLegacyWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, checkRecency bool) error {
 	const maxSourceHops = 16
 	for hops := 0; c.SourceKind == "member"; hops++ {
 		if hops == maxSourceHops {
@@ -144,8 +153,8 @@ func chatDiscussionLegacyWorkGateInTx(ctx context.Context, tx *sql.Tx, c domain.
 	}
 	limitErr := chatDiscussionRootLimitInTx(ctx, tx, c.ThreadRef, c.MessageID, root)
 	var limit *chatNonAdmission
-	if !errors.As(limitErr, &limit) {
-		return limitErr // No limit, or evidence that could not be verified.
+	if !checkRecency || !errors.As(limitErr, &limit) {
+		return limitErr
 	}
 	// A newer command can make the verified root stale, but cannot authorize its relay.
 	stale, err := chatSourceSupersededInTx(ctx, tx, c.ThreadRef, root.sequence)
@@ -205,56 +214,119 @@ func chatDiscussionMemberParentInTx(ctx context.Context, tx *sql.Tx, c domain.Ch
 	return p, err
 }
 
+// Prove the historical receive identity for candidate c and its Turn rt and
+// delivery rd. Neither recovery nor terminal settlement invalidates a capture.
+const chatDiscussionReceiveMatches = `(rt.delivery_id,rt.id,rt.group_id,rt.conversation_id,rt.member_id)
+	 =(rd.id,rd.turn_id,rd.group_id,rd.conversation_id,rd.recipient_id)
+	 AND (c.message_id,c.group_id,c.topic_id,c.member_id)=(rd.message_id,rd.group_id,rd.topic_id,rd.recipient_id)
+	 AND EXISTS(SELECT 1 FROM conversations v WHERE (v.id,v.group_id,v.topic_id,v.member_id)
+	    =(rd.conversation_id,rd.group_id,rd.topic_id,rd.recipient_id))
+	 AND EXISTS(SELECT 1 FROM messages m JOIN message_log l ON (l.message_id,l.group_id,l.topic_id)=(m.id,m.group_id,m.topic_id)
+	    WHERE (m.id,m.group_id,m.topic_id,l.sequence)=(c.message_id,c.group_id,c.topic_id,c.generation))
+	 AND NOT EXISTS(SELECT 1 FROM turns other WHERE other.delivery_id=rd.id AND other.id<>rt.id)
+	 AND NOT EXISTS(SELECT 1 FROM deliveries other WHERE other.message_id=rd.message_id AND other.turn_id=rt.id AND other.id<>rd.id)`
+
+const chatDiscussionReceiptSuspect = `CASE WHEN json_valid(a.receipt_json) THEN
+	 json_type(a.receipt_json,'$.discussion_only') IS NOT NULL OR json_type(a.receipt_json,'$.discussion_only_excerpt') IS NOT NULL
+	 ELSE 1 END`
+
 func chatDiscussionRootLimitInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, origin string, source chatDiscussionRootSource) error {
-	// Start at the root's deliveries, not the topic's assessment history. Read
-	// at most two claims: multiple rows fail closed without choosing a quote.
-	// Historical proof does not depend on the assessor's live claim or status.
+	// Consider only the root's indexed deliveries. Either pointer can locate a
+	// suspected restriction, but both must agree to prove it. The BLOB marker
+	// can also occur in plain text, so stream the audience without a raw hit cap.
+	const maxProofBytes = 192 << 10
 	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.notice_message_id,c.id,c.member_id,c.turn_id,coalesce(c.policy_revision,0),
-	 coalesce((c.group_id,c.topic_id,c.message_id,c.member_id,c.generation)=(d.group_id,d.topic_id,d.message_id,d.recipient_id,?)
-	 AND (i.turn_id,i.purpose,i.source_id,i.source_kind)=(c.turn_id,?,?,'local_user_chat')
-	 AND a.decision_id IS NULL AND a.dispatch_request_id IS NULL,0)
-	 FROM deliveries d
-	 JOIN turns t ON (t.delivery_id,t.group_id,t.conversation_id,t.member_id)=(d.id,d.group_id,d.conversation_id,d.recipient_id)
-	 JOIN chat_candidates c ON c.turn_id=t.id
-	 JOIN chat_assessments a ON a.candidate_id=c.id
+	 CASE WHEN typeof(a.payload)='blob' AND length(a.payload)<=:max_bytes THEN a.payload END,
+	 substr(CAST(a.receipt_json AS BLOB),1,:max_bytes+1), `+chatDiscussionReceiptSuspect+`,
+	 coalesce((c.group_id,c.topic_id,c.message_id,c.generation)=(:group,:topic,:origin,:sequence)
+	 AND (i.turn_id,i.purpose,i.source_id,i.source_kind)=(c.turn_id,:purpose,:source,'local_user_chat')
+	 AND typeof(i.claim_digest)='blob' AND length(i.claim_digest)=32
+	 AND a.decision_id IS NULL AND a.dispatch_request_id IS NULL
+	 AND EXISTS(SELECT 1 FROM messages n WHERE (n.id,n.group_id,n.topic_id,n.sender_id)=(a.notice_message_id,c.group_id,c.topic_id,c.member_id))
+	 AND `+chatDiscussionReceiveMatches+`,0)
+	 FROM deliveries rd
+	 CROSS JOIN turns rt ON rt.delivery_id=rd.id OR rt.id=rd.turn_id
+	 CROSS JOIN chat_candidates c ON c.turn_id=rt.id
+	 CROSS JOIN chat_assessments a ON a.candidate_id=c.id
 	 LEFT JOIN chat_intake_executions i ON i.candidate_id=c.id
-	 WHERE d.message_id=? AND d.group_id=? AND d.topic_id=?
-	 AND (json_type(a.receipt_json,'$.discussion_only') IS NOT NULL OR json_type(a.receipt_json,'$.discussion_only_excerpt') IS NOT NULL)
-	 LIMIT 2`, source.sequence, domain.ChatIntakePurpose, source.id, origin, thread.GroupID, thread.TopicID)
+	 WHERE rd.message_id=:origin
+	 AND (`+chatDiscussionReceiptSuspect+` OR instr(CAST(a.payload AS BLOB),CAST('"discussion_only_excerpt"' AS BLOB))>0)`,
+		sql.Named("origin", origin), sql.Named("group", thread.GroupID), sql.Named("topic", thread.TopicID),
+		sql.Named("sequence", source.sequence), sql.Named("purpose", domain.ChatIntakePurpose), sql.Named("source", source.id),
+		sql.Named("max_bytes", maxProofBytes))
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
-	if !rows.Next() {
-		return rows.Err()
+	var quote string
+	for rows.Next() {
+		var receiptID, candidateID, memberID, turnID string
+		var noticeID sql.NullString
+		var revision int64
+		var payload, data []byte
+		var suspect, bound bool
+		if err := rows.Scan(&receiptID, &noticeID, &candidateID, &memberID, &turnID, &revision, &payload, &data, &suspect, &bound); err != nil {
+			return err
+		}
+		excerpt, err := chatDiscussionLimitExcerpt(payload, candidateID)
+		if err != nil {
+			return err
+		}
+		if excerpt == nil && !suspect {
+			continue // A text-only marker does not count as a restriction.
+		}
+		if excerpt == nil || !suspect || !bound || quote != "" || len(data) > maxProofBytes {
+			return ErrMemberToolDenied
+		}
+		// Decode the immutable receipt, not the live follow-up projection.
+		var r domain.ChatAssessmentReceipt
+		if !decodeChatDiscussionProof(data, &r) || !r.DiscussionOnly || r.DiscussionOnlyExcerpt != *excerpt ||
+			r.ID != receiptID || r.CandidateID != candidateID || r.ThreadRef != thread || r.MessageID != origin ||
+			r.SourceKind != "local_user_chat" || r.SourceID != source.id || r.SourceSenderID != "user" || r.CandidateGeneration != source.sequence ||
+			r.AssessedBy != memberID || r.TurnID != turnID || r.Purpose != domain.ChatIntakePurpose || r.PolicyRevision != revision ||
+			r.NoticeMessageID == "" || r.NoticeMessageID != noticeID.String || r.Disposition != "discuss" || r.Outcome != "discuss" ||
+			r.Action != "" || r.Authority != "" || r.AuthorizationMessageID != "" || r.AuthorityEvidenceVerified ||
+			r.TaskID != "" || r.MandateID != "" || r.DispatchRequestID != "" || r.WorkInputID != "" || !strings.Contains(source.content, *excerpt) {
+			return ErrMemberToolDenied
+		}
+		quote = *excerpt
 	}
-	var receiptID, candidateID, memberID, turnID string
-	var noticeID sql.NullString
-	var revision int64
-	var bound bool
-	if err := rows.Scan(&receiptID, &noticeID, &candidateID, &memberID, &turnID, &revision, &bound); err != nil {
+	if err := rows.Err(); err != nil || quote == "" {
 		return err
 	}
-	if !bound || rows.Next() {
-		return ErrMemberToolDenied
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	r, err := chatAssessmentReceiptInTx(ctx, tx, receiptID, candidateID)
-	if err != nil {
-		return err
-	}
-	if !r.DiscussionOnly || r.ID != receiptID || r.CandidateID != candidateID || r.ThreadRef != thread || r.MessageID != origin ||
-		r.SourceKind != "local_user_chat" || r.SourceID != source.id || r.SourceSenderID != "user" || r.CandidateGeneration != source.sequence ||
-		r.AssessedBy != memberID || r.TurnID != turnID || r.Purpose != domain.ChatIntakePurpose || r.PolicyRevision != revision ||
-		r.NoticeMessageID == "" || r.NoticeMessageID != noticeID.String || r.Disposition != "discuss" || r.Outcome != "discuss" ||
-		r.Authority != "" || r.AuthorityEvidenceVerified || r.TaskID != "" || r.MandateID != "" || r.DispatchRequestID != "" ||
-		!memberToolTextValid(r.DiscussionOnlyExcerpt, chatDiscussionOnlyExcerptBytes) || !strings.Contains(source.content, r.DiscussionOnlyExcerpt) {
-		return ErrMemberToolDenied
-	}
-	return chatDeny("discussion_only", fmt.Sprintf("本机用户在消息 %s（来源 %s）中明确限制：「%s」。", origin, r.SourceID, r.DiscussionOnlyExcerpt),
+	return chatDeny("discussion_only", fmt.Sprintf("本机用户在消息 %s（来源 %s）中明确限制：「%s」。", origin, source.id, quote),
 		"是否发出一条新消息，明确现在需要开展哪项工作？")
+}
+
+func chatDiscussionLimitExcerpt(payload []byte, candidateID string) (*string, error) {
+	// mutationPayload writes four byte strings, each prefixed by a uint64 length.
+	var fields [4][]byte
+	for i := range fields {
+		if len(payload) < 8 {
+			return nil, ErrMemberToolDenied
+		}
+		n := binary.BigEndian.Uint64(payload[:8])
+		payload = payload[8:]
+		if n > uint64(len(payload)) {
+			return nil, ErrMemberToolDenied
+		}
+		fields[i], payload = payload[:n], payload[n:]
+	}
+	var input domain.ChatAssessment
+	if len(payload) != 0 || string(fields[0]) != "chat_assessment/v1" || string(fields[1]) != candidateID ||
+		!decodeChatDiscussionProof(fields[2], &input) || validateChatAssessment(input, string(fields[3])) != nil {
+		return nil, ErrMemberToolDenied
+	}
+	return input.DiscussionOnlyExcerpt, nil
+}
+
+func decodeChatDiscussionProof(data []byte, target any) bool {
+	if err := json.Unmarshal(data, target); err != nil {
+		return false
+	}
+	// Store-generated proofs use the typed encoder, with no duplicate keys.
+	encoded, err := json.Marshal(target)
+	return err == nil && bytes.Equal(data, encoded)
 }
 
 func chatSourceSupersededInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, generation int64) (bool, error) {
