@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Value } from "typebox/value";
-import { createFreshTaskWorkClient, validWorkInputCursor, validWorkInputID } from "./fresh-task-work.mjs";
+import { createFreshTaskWorkClient, freshTypedToolResult, validWorkInputCursor, validWorkInputID } from "./fresh-task-work.mjs";
 
 const inputID = Type.String({ minLength: 1, maxLength: 256, description: "本轮服务端给出的工作输入 ID，不是 Task 或 Assignment ID。" });
 const pageFields = {
@@ -85,9 +85,9 @@ export default function freshTaskWork(pi: ExtensionAPI) {
       ...tool,
       // Check original values before Pi can coerce or drop optional fields.
       prepareArguments(raw) { return checkedArgs(tool, raw); },
-      async execute(toolCallId, params, signal, _onUpdate, _ctx) {
+      async execute(toolCallId, params, signal, _onUpdate, ctx) {
         const result = await invoke(tool.name, checkedArgs(tool, params), toolCallId, signal);
-        return { content: [{ type: "text", text: result.text }], details: undefined };
+        return freshTypedToolResult(result, "followup", result.writeUnknown ? ctx.sessionManager.getSessionId() : "");
       },
     });
   }

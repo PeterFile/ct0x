@@ -202,6 +202,10 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		frameLimit, toolFlag = piMemberToolFrameLimit, "--no-builtin-tools"
 	}
 	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex, frameLimit: frameLimit}
+	if opts := e.memberTools; opts != nil && opts.typedWorkRole != "" {
+		out.piTypedWork = &piTypedWorkOutput{role: opts.typedWorkRole, tools: opts.toolNames}
+		outLog.tailReserve = piTypedWriteLogReserve
+	}
 	args := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", toolFlag, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--session-dir", dir, "--session-id", request.RunID}
 	if session != nil {
 		out.piSession = session.tracker
@@ -263,6 +267,10 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	if r.DirectChildReaped {
 		r.ExitCode = cmd.ProcessState.ExitCode()
 	}
+	writeUnknown := out.piTypedWork != nil && out.piTypedWork.unknown != nil
+	if writeUnknown {
+		out.piTypedWork.retain(outLog)
+	}
 	outClose, errClose := stdout.Close(), stderr.Close()
 	r.LogsTruncated = outLog.truncated || errLog.truncated
 	normalExit := err == nil
@@ -273,7 +281,11 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	r.OutputComplete = normalExit && outDrain.complete && errDrain.complete && !out.damaged && len(out.line) == 0 && !out.dropping && !outLog.failed && !errLog.failed && outClose == nil && errClose == nil
 	r.Reason = "执行结果未知，需对账后再重试"
 	canSettle := r.OutputComplete && ctx.Err() == nil && !r.DeliveryFailed && r.Terminal != "" &&
+		(out.piTypedWork == nil || !writeUnknown && !outLog.truncated) &&
 		(session == nil || r.Accepted && r.DirectChildReaped && !session.tracker.hasUncertainExecution())
+	if writeUnknown {
+		r.Reason = "成员工具写入结果未知，需对账后再处理"
+	}
 	if canSettle && session != nil {
 		// Only success has a supported persistence proof. Withhold publication
 		// and claim release for other terminals pending reconciliation, without

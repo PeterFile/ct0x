@@ -20,8 +20,8 @@ const piFreshTaskWorkTools = "read_work_inputs,ack_work_input,hand_back_work_inp
 // Independent from the ordinary index.ts/bridge.mjs pair used by native resume.
 // Update both digests together after offline Pi 1.4.0 loader/config checks.
 const (
-	piFreshTaskWorkEntrySHA = "0f42260dfd4ce255da065315a929cbc715128de0f82211f3762b8eadb41f2f81"
-	piFreshTaskWorkImplSHA  = "228eeb89a4bb39ea1715e74625a88b3131763ae1566975d8efce4009a5bccb5f"
+	piFreshTaskWorkEntrySHA = "834dced6bdfbcd6bae9ca04ca9a1501a980407d02995efbaa9743ca6e701c866"
+	piFreshTaskWorkImplSHA  = "0da78b82aa74e0d3f2cdd38131dc62997b4d67d6041a2efe8b247bc3d789fa6f"
 )
 
 func PiFreshTaskWorkToolNames() []string { return strings.Split(piFreshTaskWorkTools, ",") }
@@ -73,7 +73,7 @@ func (a PiFreshTaskWorkAdapter) NewExecutor(ctx context.Context, selected Provid
 	}
 	pi := baseline.(piExecutor)
 	pi.memberTools = &piMemberToolOptions{extensionPath: bridge, configPath: filepath.Clean(binding.ConfigPath),
-		toolNames: names, configSHA256: binding.ConfigSHA256}
+		toolNames: names, configSHA256: binding.ConfigSHA256, typedWorkRole: "followup"}
 	return &piFreshTaskWorkExecutor{pi: pi, adapter: a, runID: binding.RunID, configFile: config.file}, nil
 }
 

@@ -3,8 +3,8 @@ import { constants, openSync, readSync, fstatSync, closeSync } from "node:fs";
 import { request } from "node:http";
 import { isAbsolute } from "node:path";
 
-// This exact implementation is loaded only by fresh-task-work.ts. Keep the
-// published ordinary index.ts/bridge.mjs pair independent (including its pins).
+// Shared only by the pinned fresh typed entries. Keep the published ordinary
+// index.ts/bridge.mjs pair independent (including its pins).
 const CONFIG_ERROR = "任务续办配置无效，未启用任何工具。";
 const UNKNOWN = "执行结果未知；请保留原调用标识、幂等键和内容先对账，不要自动重试。";
 const BYTE_LIMIT = 64 * 1024;
@@ -25,6 +25,23 @@ const record = value => value !== null && typeof value === "object" && !Array.is
 const hasKeys = (obj, keys) => Object.keys(obj).sort().join(",") === keys;
 /** @param {string} value */
 const unicode = value => !/[\ud800-\udfff]/u.test(value);
+
+/** @param {string} id @param {string} token */
+export function validTypedWriteCallID(id, token) {
+  // Require a retainable native ID before sending a write. Keep its exact bytes.
+  return id.length > 0 && id.length <= 256 && !/[^!-~]/.test(id) && !id.includes(token);
+}
+
+/** @typedef {{operation: string, tool_call_id: string, idempotency_key: string, request_sha256: string}} UnknownWrite */
+
+/** @param {{text: string, writeUnknown?: UnknownWrite}} reply @param {string} role @param {string} runID */
+export function freshTypedToolResult(reply, role, runID) {
+  const content = [{ type: /** @type {const} */ ("text"), text: reply.text }];
+  if (!reply.writeUnknown) return { content, details: undefined };
+  // Pi serializes details in native tool_execution_end. The model-facing text
+  // is still the same fixed, sanitized error and goes through normal recovery.
+  return { content, isError: true, details: { agent_workspace_write_unknown_v1: { role, run_id: runID, ...reply.writeUnknown } } };
+}
 
 /** @param {unknown} value */
 export function validWorkInputID(value) {
@@ -177,12 +194,14 @@ export function createFreshTaskWorkClient(path, digest) {
   /** @param {string} name @param {Record<string, unknown>} params @param {string} id @param {AbortSignal} [signal] */
   return async (name, params, id, signal) => {
     const expected = statuses.get(name);
-    if (!expected || typeof id !== "string" || !id.trim() || !unicode(id)) throw safe("成员工具调用无效，未发送请求。");
+    const write = name !== "read_work_inputs";
+    if (!expected || typeof id !== "string" || !id.trim() || !unicode(id) || (write && !validTypedWriteCallID(id, token))) {
+      throw safe("成员工具调用无效，未发送请求。");
+    }
     // The entry has already snapshotted and checked the argument shape.
     const json = JSON.stringify(params);
     const body = Buffer.from(json, "utf8");
     if (body.length > BYTE_LIMIT || json.includes(token)) throw safe("成员工具参数无效，未发送请求。");
-    const write = name !== "read_work_inputs";
     const key = write ? sha256(name + id) : "";
     const fingerprint = write ? sha256(body) : "";
     if (write && uncertain) {
@@ -213,7 +232,10 @@ export function createFreshTaskWorkClient(path, digest) {
     } catch { /* Missing or invalid evidence must remain unknown. */ }
     finally { if (write) writing = false; }
     const error = safe(failure);
-    if (write && failure === UNKNOWN) uncertain = { key, fingerprint, error };
+    if (write && failure === UNKNOWN) {
+      uncertain = { key, fingerprint, error };
+      return { text: error.message, writeUnknown: { operation: name, tool_call_id: id, idempotency_key: key, request_sha256: fingerprint } };
+    }
     throw error;
   };
 }

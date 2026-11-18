@@ -25,6 +25,10 @@ func WorkspaceWorkerToolNames() []string {
 var errPiMemberToolConfiguration = errors.New("成员工具执行配置无效")
 
 type piMemberToolOptions struct {
+	// Trusted only from the exact pinned fresh typed adapters, never inferred
+	// from tool names, ordinary digest options, the child stream or the prompt.
+	typedWorkRole string
+
 	extensionPath string
 	configPath    string
 	toolNames     []string
