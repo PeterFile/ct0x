@@ -59,11 +59,13 @@ func messageDiscussionsInTx(ctx context.Context, tx *sql.Tx, groupID string, mes
 		args[i+1] = messages[i].ID
 	}
 	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(messages)), ",")
-	// Probe exact page keys first, resolving both tables and expected_reply
-	// even when there are no matching events in a registered schema.
+	// Probe exact page keys first. Resolve the discussion columns used below
+	// even when the registered schema has no matching events for this page.
 	var hasEvents bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
-	 SELECT 1 FROM main.chat_discussion_events e
+	 SELECT e.message_id,e.origin_message_id,e.kind,e.actor_id,e.recipient_id,e.delivery_id,
+	    e.source_message_id,e.candidate_id,e.step,e.related_invitation_id,e.expected_reply,e.group_id,e.topic_id,c.root_inviter_id
+	 FROM main.chat_discussion_events e
 	 CROSS JOIN main.chat_discussions c ON c.origin_message_id=e.origin_message_id AND c.group_id=e.group_id AND c.topic_id=e.topic_id
 	 WHERE e.group_id=? AND e.message_id IN (`+placeholders+`) AND e.expected_reply IS NOT NULL
 	)`, args...).Scan(&hasEvents); err != nil || !hasEvents {

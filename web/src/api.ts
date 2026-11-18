@@ -82,27 +82,32 @@ function discussionFor(value: unknown, message: Omit<Message, "discussion">): Me
     || (message.source_kind !== undefined && message.source_kind !== "unknown" && message.source_kind !== "member")
     || root_message_id === message.id || root_message_id === invitation_message_id
     || (kind === "invite") !== (invitation_message_id === message.id)
-    || (parent_invitation_message_id !== undefined && (!discussionId(parent_invitation_message_id)
+    || (parent_invitation_message_id !== undefined && (kind === "resolve" || !discussionId(parent_invitation_message_id)
       || parent_invitation_message_id === root_message_id || parent_invitation_message_id === invitation_message_id
       || parent_invitation_message_id === message.id))) return;
   const { deliveries } = message;
   const [delivery] = deliveries;
   if (deliveries.length > 1 || (kind === "invite" && deliveries.length !== 1) || (kind === "resolve" && deliveries.length !== 0)
-    || (delivery && (delivery.message_id !== message.id || delivery.recipient_id !== (kind === "invite" ? assignee_id : inviter_id)))) return;
+    || (delivery && (!discussionId(delivery.id) || !discussionId(delivery.conversation_id)
+      || delivery.message_id !== message.id || delivery.recipient_id !== (kind === "invite" ? assignee_id : inviter_id)))) return;
   return { kind, root_message_id, invitation_message_id, inviter_id, assignee_id, expected_reply,
     ...(parent_invitation_message_id === undefined ? {} : { parent_invitation_message_id }) };
 }
-const unclaimedDiscussionDeparture = "接收成员已离开，讨论交接未启动";
+const discussionNoAction = "讨论已中断：接收成员已完成本轮，但未提交结构化讨论动作";
+const discussionAbnormalExit = "讨论已中断：接收成员的轮次异常结束，未提交结构化讨论动作";
+const discussionNotStarted = "接收成员的讨论轮未启动";
+const discussionDeparture = "接收成员已离开，讨论交接未启动";
 function discussionClosureFor(value: unknown, message: Omit<Message, "discussion">): string | undefined {
-  // Called only after discussionFor has verified the visible delivery set.
+  // Match the Store's projected reasons and normalized delivery errors exactly.
   const [delivery] = message.deliveries;
-  if (!delivery || message.source_kind !== "member" || !discussionId(message.source_id)
-    || !boundedDiscussionText(value, 256) || value === "" || value.trim() !== value || /[\p{Cc}\p{Cf}\u2028\u2029]/u.test(value)) return;
-  if (delivery.state === "accepted" && discussionId(delivery.turn_id) && delivery.error === "") return value;
+  if (!delivery || message.source_kind !== "member" || !discussionId(message.source_id)) return;
+  if (delivery.state === "accepted" && discussionId(delivery.turn_id) && delivery.error === ""
+    && (value === discussionNoAction || value === discussionAbnormalExit)) return value;
   if (delivery.state === "failed") {
     if (delivery.turn_id === "") {
-      if (value === unclaimedDiscussionDeparture && delivery.error === value) return value;
-    } else if (discussionId(delivery.turn_id) && delivery.error.trim() !== "") return value;
+      if (value === discussionDeparture && delivery.error === value) return value;
+    } else if (discussionId(delivery.turn_id) && delivery.error === "执行未启动"
+      && (value === discussionNotStarted || value === discussionDeparture)) return value;
   }
 }
 export function decodeMessage({ discussion, discussion_closure_reason, ...message }: WireMessage): Message {

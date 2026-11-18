@@ -461,6 +461,7 @@ func TestChatDiscussionTimelineInterruptedHead(t *testing.T) {
 func TestChatDiscussionTimelineReadError(t *testing.T) {
 	for _, fault := range []struct{ name, ddl, missing string }{
 		{"missing_column", `ALTER TABLE chat_discussion_events RENAME COLUMN expected_reply TO unexpected_reply`, "expected_reply"},
+		{"missing_kind", `ALTER TABLE chat_discussion_events RENAME COLUMN kind TO event_kind`, "kind"},
 		{"missing_events", `DROP TABLE chat_discussion_events`, "chat_discussion_events"},
 		{"missing_discussions", `DROP TABLE chat_discussions`, "chat_discussions"},
 	} {

@@ -111,8 +111,12 @@ it.each([
   ["invitation without a delivery", invitation, []],
   ["invitation delivered to the wrong member", invitation, [{ ...delivery, recipient_id: invitation.sender_id }]],
   ["invitation with an extra delivery", invitation, [delivery, { ...delivery, id: "extra" }]],
+  ["invitation without a conversation ID", invitation, [{ ...delivery, conversation_id: "" }]],
+  ["invitation with a malformed delivery ID", invitation, [{ ...delivery, id: " delivery-1" }]],
   ["reply delivered to the wrong member", reply, [{ ...returnDelivery, recipient_id: reply.sender_id }]],
   ["reply with an extra delivery", reply, [returnDelivery, { ...returnDelivery, id: "extra" }]],
+  ["reply with an oversized conversation ID", reply, [{ ...returnDelivery, conversation_id: "会".repeat(1366) }]],
+  ["reply with an oversized delivery ID", reply, [{ ...returnDelivery, id: "d".repeat(4097) }]],
   ["summary with a delivery", summary, [{ ...delivery, message_id: summary.id }]],
 ] as const)("keeps a message row but not the relation: %s", async (_label, { discussion, ...row }, deliveries) => {
   const plain = { ...row, deliveries };
@@ -120,14 +124,22 @@ it.each([
   expect(await listMessages(group.id)).toEqual({ items: [plain], next_cursor: "next" });
 });
 
+it("omits a summary relation with an unloaded parent invitation", async () => {
+  const { discussion, ...row } = summary;
+  transport.mockResolvedValueOnce(json({ items: [{ ...row, discussion: { ...discussion, parent_invitation_message_id: "earlier-parent" } }], next_cursor: "" }));
+  expect((await listMessages(group.id)).items).toStrictEqual([row]);
+});
+
 const notStarted = "接收成员的讨论轮未启动";
 const departed = "接收成员已离开，讨论交接未启动";
+const noAction = "讨论已中断：接收成员已完成本轮，但未提交结构化讨论动作";
 const interrupted = "讨论已中断：接收成员的轮次异常结束，未提交结构化讨论动作";
 const accepted = { ...delivery, state: "accepted", turn_id: "receiving-turn" };
 const failed = { ...accepted, state: "failed", error: "执行未启动" };
 const unclaimed = { ...delivery, state: "failed", error: departed };
 it.each([
-  ["accepted terminal Turn", accepted, interrupted],
+  ["accepted Turn that ended abnormally", accepted, interrupted],
+  ["accepted Turn that completed without a handoff", accepted, noAction],
   ["bound Turn that did not start", failed, notStarted],
   ["departure after binding a Turn", failed, departed],
   ["unclaimed departure", unclaimed, departed],
@@ -138,8 +150,15 @@ it.each([
 it.each([
   ["acceptance without a Turn", { ...accepted, turn_id: "" }, interrupted],
   ["acceptance with an error", { ...accepted, error: "投递失败" }, interrupted],
+  ["acceptance with an unstarted reason", accepted, notStarted],
+  ["acceptance with a departure reason", accepted, departed],
+  ["acceptance with prose", accepted, "本轮已核对结论，无需交接。"],
   ["bound failure without an error", { ...failed, error: "" }, notStarted],
   ["bound failure with a blank error", { ...failed, error: " " }, notStarted],
+  ["bound failure with an abnormal-exit reason", failed, interrupted],
+  ["bound failure with an unknown execution result", { ...failed, error: "执行结果未知，需对账后再处理" }, notStarted],
+  ["abnormal exit claimed for an unknown execution result", { ...failed, error: "执行结果未知，需对账后再处理" }, interrupted],
+  ["bound failure with the unclaimed marker", { ...failed, error: departed }, departed],
   ["unclaimed failure without the marker", { ...failed, turn_id: "" }, notStarted],
   ["departure text without the matching delivery marker", { ...unclaimed, error: `${departed} ` }, departed],
   ["departure marker with unrelated closure text", unclaimed, notStarted],
