@@ -17,13 +17,14 @@ func (s *Store) chatTextSubmissionInTx(ctx context.Context, tx *sql.Tx, input Su
 	if err != nil {
 		return evidence, err
 	}
+	// Both chat relations are mandatory in the applied v28 prefix. Do not
+	// infer their absence on the normal path; the keyed join must resolve.
+	hasChat, hasScope := hasInputs, hasInputs
 	if hasInputs {
 		if err := requireHandledWorkConstraintsInTx(ctx, tx, input); err != nil {
 			return evidence, err
 		}
-	}
-	var hasChat, hasScope bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_assessments'),
+	} else if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_assessments'),
 	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_policy_scopes')`).Scan(&hasChat, &hasScope); err != nil {
 		return evidence, err
 	}
@@ -34,7 +35,7 @@ func (s *Store) chatTextSubmissionInTx(ctx context.Context, tx *sql.Tx, input Su
 	scopeColumn, scopeJoin := "''", ""
 	if hasScope {
 		scopeColumn = "coalesce(s.scope_kind,'')"
-		scopeJoin = " LEFT JOIN chat_policy_scopes s ON s.group_id=c.group_id AND s.topic_id=c.topic_id AND s.revision=c.policy_revision"
+		scopeJoin = " LEFT JOIN chat_policy_scopes s ON (s.group_id,s.topic_id,s.revision)=(c.group_id,c.topic_id,c.policy_revision)"
 	}
 	err = tx.QueryRowContext(ctx, `SELECT coalesce(json_extract(a.receipt_json,'$.action'),''),coalesce(json_extract(a.receipt_json,'$.authority'),''),`+scopeColumn+`
 	 FROM mandates m INDEXED BY mandates_group_task JOIN chat_assessments a ON a.decision_id=m.decision_id

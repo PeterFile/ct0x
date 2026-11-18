@@ -14,32 +14,6 @@ import (
 	"agentworkspace/internal/domain"
 )
 
-const taskWorkInputVersion = 28
-
-// The marker alone is not proof that the work-input fence is usable.
-const workInputSchemaExists = `EXISTS(SELECT 1 FROM schema_migrations WHERE version=?)`
-
-var errWorkInputSchemaMismatch = errors.New("工作输入迁移标记与表结构不一致")
-
-func workInputSchemaInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
-	var installed, later bool
-	var tables int
-	err := tx.QueryRowContext(ctx, `SELECT `+workInputSchemaExists+`,
-	 (SELECT count(*) FROM main.sqlite_schema WHERE type='table' AND name IN
-	 ('chat_followup_routes','task_work_inputs','task_work_input_consumptions','task_work_input_returns')),
-	 EXISTS(SELECT 1 FROM schema_migrations WHERE version>?) OR EXISTS(SELECT 1 FROM main.sqlite_schema
-	 WHERE name IN ('task_coordination_followup_thread','task_work_deliveries','task_work_continuations'))`,
-		taskWorkInputVersion, taskWorkInputVersion).Scan(&installed, &tables, &later)
-	if err != nil {
-		return false, err
-	}
-	// Only a real older prefix can omit the input and source fences.
-	if installed && tables != 4 || !installed && (tables != 0 || later) {
-		return false, errWorkInputSchemaMismatch
-	}
-	return installed, nil
-}
-
 // A trusted source has one follow-up decision, even when delivered to multiple
 // assessors. Its first immutable receipt, not a new assessment, is replayed.
 func chatFollowupReceiptInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) (domain.ChatAssessmentReceipt, error) {
@@ -205,12 +179,17 @@ const (
 var (
 	labeledWorkTaskID = regexp.MustCompile(`(?i)` + workTaskLabel + workTaskIDOpen + workTaskIDShape + workTaskTokenEnd)
 	markedWorkTaskID  = regexp.MustCompile(`(?i)` + workTaskIDLabel + workTaskIDOpen + `([a-z0-9_-]+)` + workTaskTokenEnd)
-	// A whole tagged value is not a second task reference. Don't strip IDs
-	// from free prose, lists, or another occurrence of the same token.
-	workTaskNoteValue = regexp.MustCompile(`(?i)^(?:备注码|参考编号)` + workTaskIDOpen + workTaskIDShape + `[ \t>"'”’\x60]*$`)
-	workTaskCitation  = regexp.MustCompile(`(?i)^(?:引用|参考|(?:cite|reference)\b)` + workTaskIDObject)
-	continuedWorkID   = regexp.MustCompile(`(?i)` + legacyWorkContinue + workTaskIDObject)
-	workTaskIDToken   = regexp.MustCompile(`(?i)^` + workTaskIDShape + `$`)
+	// Only an entire, positively typed value can be metadata. A generic
+	// reference number does not establish the kind of the ID.
+	workNonTaskValue = regexp.MustCompile(`(?i)^(?:备注码|校验(?:码|值)|checksum\b|(?:artifact\b|成果)(?:[ \t]*(?:编号|id\b|#))?)` +
+		workTaskIDOpen + workTaskIDShape + `[ \t>"'”’\x60]*$`)
+	workTaskCitation = regexp.MustCompile(`(?i)^` + legacyWorkPolite + `(?:(?:可(?:以)?|(?:may|can|optionally)\b)[ \t]*)?` +
+		`(?:引用|参考|(?:cite|reference)\b)` + workTaskIDObject)
+	workSeparateRequest = regexp.MustCompile(`(?i)^` + legacyWorkPolite +
+		`(?:(?:另开|新开|新建)[ \t]*(?:一项|一个|个)?[ \t]*(?:独立)?[ \t]*(?:工作|任务)|` +
+		`(?:start|open)[ \t]+(?:a[ \t]+)?(?:new|separate|independent)[ \t]+(?:work|task)\b)`)
+	continuedWorkID = regexp.MustCompile(`(?i)` + legacyWorkContinue + workTaskIDObject)
+	workTaskIDToken = regexp.MustCompile(`(?i)^` + workTaskIDShape + `$`)
 )
 
 func workTaskClauseSeparator(r rune) bool { return strings.ContainsRune(workTaskClauseDelimiters, r) }
@@ -222,25 +201,38 @@ func unresolvedWorkTaskReference(body, hint string, otherTopicByID map[string]bo
 			return true
 		}
 	}
+	var crossTopic bool
+	for _, otherTopic := range otherTopicByID {
+		if otherTopic {
+			if followup {
+				return true // A citation cannot make another topic a continuation target.
+			}
+			crossTopic = true
+			break
+		}
+	}
 	for clause := range strings.FieldsFuncSeq(body, workTaskClauseSeparator) {
 		clause = strings.TrimSpace(clause)
-		citationEnd := 0
-		if !followup {
-			if span := workTaskCitation.FindStringIndex(clause); span != nil {
-				citationEnd = span[1]
+		if crossTopic && !workSeparateRequest.MatchString(clause) {
+			// A known cross-topic ID requires positive evidence of separate
+			// work or a citation, regardless of the verbs used to address it.
+			// Exempt only the citation object, not all occurrences of its ID.
+			parts := [2]string{clause}
+			if span := workTaskCitation.FindStringSubmatchIndex(clause); span != nil {
+				parts = [2]string{clause[:span[2]], clause[span[3]:]}
 			}
-			if legacyWorkHead.MatchString(clause) {
-				for id := range strings.FieldsFuncSeq(clause, workTaskTokenSeparator) {
+			for _, part := range parts {
+				for id := range strings.FieldsFuncSeq(part, workTaskTokenSeparator) {
 					if otherTopicByID[id] {
-						return true // A direct continuation/address, not a citation.
+						return true
 					}
 				}
 			}
 		}
+		// Even without a matching row, an explicit target is not new work.
 		for _, pattern := range []*regexp.Regexp{labeledWorkTaskID, markedWorkTaskID, continuedWorkID} {
 			for _, match := range pattern.FindAllStringSubmatchIndex(clause, -1) {
-				otherTopic, found := otherTopicByID[clause[match[2]:match[3]]]
-				if !found || otherTopic && match[3] > citationEnd {
+				if _, found := otherTopicByID[clause[match[2]:match[3]]]; !found {
 					return true
 				}
 			}
@@ -249,24 +241,23 @@ func unresolvedWorkTaskReference(body, hint string, otherTopicByID map[string]bo
 	return false
 }
 
-// A continuation must resolve the source's plausible ID tokens before any
-// lookup or assessor hint can narrow them. A legacy new-work proposal instead
-// needs evidence of an existing task reference, not merely an ID-shaped value.
+// A continuation must consider unresolved source IDs, not just successful
+// lookups or the assessor hint. Old new-work proposals instead require evidence
+// of a task reference before an ID-shaped value can block ordinary work.
 func chatTaskReferencesInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, body, hint string, followup bool) ([]string, bool, error) {
-	ids := map[string]struct{}{}
-	var idShaped bool
+	ids := map[string]bool{} // ID -> also occurs outside a typed metadata clause.
+	var possible int
 	for clause := range strings.FieldsFuncSeq(body, workTaskClauseSeparator) {
-		if workTaskNoteValue.MatchString(strings.TrimSpace(clause)) {
-			idShaped = true
-			continue
-		}
+		metadata := workNonTaskValue.MatchString(strings.TrimSpace(clause))
 		for token := range strings.FieldsFuncSeq(clause, workTaskTokenSeparator) {
 			if token != hint && (len(token) != 26 || !workTaskIDToken.MatchString(token)) {
 				continue
 			}
-			idShaped = true
-			ids[token] = struct{}{}
-			if len(ids) > 64 || followup && len(ids) > 1 {
+			if !metadata && !ids[token] {
+				possible++
+			}
+			ids[token] = ids[token] || !metadata
+			if len(ids) > 64 || followup && possible > 1 {
 				return nil, true, chatAmbiguousWorkInput()
 			}
 		}
@@ -299,7 +290,12 @@ func chatTaskReferencesInTx(ctx context.Context, tx *sql.Tx, thread domain.Threa
 				return nil, true, err
 			}
 			otherTopicByID[id] = otherTopic
-			if !otherTopic {
+			if !ids[id] {
+				possible++ // A durable Task match cannot be erased by a value label.
+			}
+			// Metadata alone cannot select a continuation target, even if
+			// its value happens to resolve to a Task.
+			if !otherTopic && (!followup || ids[id]) {
 				refs = append(refs, id)
 				if len(refs) == 2 {
 					return refs, true, nil
@@ -310,17 +306,17 @@ func chatTaskReferencesInTx(ctx context.Context, tx *sql.Tx, thread domain.Threa
 			return nil, true, err
 		}
 	}
-	unresolved := unresolvedWorkTaskReference(body, hint, otherTopicByID, followup)
-	if len(ids) > 1 && (len(refs) != 0 || unresolved) {
+	unresolved := followup && hint != "" && !ids[hint] || unresolvedWorkTaskReference(body, hint, otherTopicByID, followup)
+	if possible > 1 && (followup || len(refs) != 0 || unresolved) {
 		return nil, true, chatAmbiguousWorkInput()
 	}
 	if unresolved {
 		return refs, true, chatUnavailableWorkInputTarget()
 	}
-	return refs, idShaped, nil
+	return refs, len(ids) != 0, nil
 }
 
-const chatWorkThread = ` FROM task_coordination tc
+const chatWorkThread = ` FROM task_coordination tc INDEXED BY ` + workInputThreadIndex + `
  JOIN tasks t ON t.id=tc.task_id AND t.group_id=tc.group_id
  JOIN mandates m ON m.id=tc.current_mandate_id
  JOIN coordination_triggers origin ON origin.id=m.origin_trigger_id`

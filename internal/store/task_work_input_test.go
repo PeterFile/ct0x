@@ -42,7 +42,11 @@ func newWorkInputCandidate(t *testing.T, f chatFixture, body string, recipients 
 }
 
 func TestTaskWorkInputUnsafeRouting(t *testing.T) {
-	for _, kind := range []string{"legacy-unknown", "legacy-original-task", "two-real-ids", "mixed-invalid-ids", "mixed-foreign-ids-with-hint", "list-invalid-ids-with-hint", "list-foreign-ids-with-hint", "unquoted-constraint", "workspace", "discussion-only"} {
+	for _, kind := range []string{
+		"legacy-unknown", "legacy-original-task", "two-real-ids", "mixed-invalid-ids", "mixed-foreign-ids-with-hint",
+		"list-invalid-ids-with-hint", "list-foreign-ids-with-hint", "reference-number-known", "reference-number-invalid",
+		"reference-number-foreign", "note-code-known", "unquoted-constraint", "workspace", "discussion-only",
+	} {
 		t.Run(kind, func(t *testing.T) {
 			f := chatSetup(t, "user", false)
 			worker := chatAuthorityWorker(t, f)
@@ -86,6 +90,31 @@ func TestTaskWorkInputUnsafeRouting(t *testing.T) {
 				if kind != "mixed-invalid-ids" {
 					input.Followup = &domain.ChatFollowupAssessment{TaskID: id}
 				}
+				reason = "ambiguous_followup_task"
+			case "reference-number-known", "reference-number-invalid", "reference-number-foreign", "note-code-known":
+				f.s.EnableTaskWorkExecution()
+				id, otherID, label := worker.Provenance.TaskID, strings.Repeat("A", 26), "参考编号"
+				if strings.HasSuffix(kind, "known") {
+					m := chatLocalMessage(t, f.s, MessageRequest{GroupID: f.groupID, TopicID: f.scope.TopicID,
+						ActorID: "user", Content: "整理另一份资料。"}, []string{})
+					other, err := f.s.RequestWork(ctx, f.groupID, domain.RequestWorkRequest{TopicID: m.TopicID, MessageID: m.ID,
+						Mode: domain.RoutingDecisionCreateNew, Reason: "独立工作", NewTask: &domain.NewTaskRequest{Title: "另一个任务", Acceptance: "列出索引"}}, "other-task")
+					if err != nil {
+						t.Fatal(err)
+					}
+					otherID = other.Task.ID
+				} else if kind == "reference-number-foreign" {
+					other, err := f.s.CreateTask(ctx, taskInput(f.otherID))
+					if err != nil {
+						t.Fatal(err)
+					}
+					otherID = other.ID
+				}
+				if kind == "note-code-known" {
+					label = "备注码"
+				}
+				body = "继续下面哪个任务：任务 " + id + "，" + label + " " + otherID + "？"
+				input.Followup = &domain.ChatFollowupAssessment{TaskID: id}
 				reason = "ambiguous_followup_task"
 			case "unquoted-constraint":
 				input.Followup = &domain.ChatFollowupAssessment{Constraint: "删除全部引用"}
@@ -317,12 +346,14 @@ func TestTaskWorkInputForeignReferenceAndIndependentLegacyWork(t *testing.T) {
 	chatAssertNotAdmitted(t, r, err, "unproven_task_reference")
 	taskWorkTestReceipt(t, f.s, s, stopped, domain.TurnStateNotStarted)
 
-	s, c = newWorkInputCandidate(t, f, "继续任务 <"+worker.Provenance.TaskID+">，备注码 <"+foreign.ID+">。")
-	r, err = f.s.ApplyChatAssessmentDormant(ctx, s, c.ID, input, "评估后续。", "explicit")
-	if err != nil || r.Outcome != "continued" || r.TaskID != worker.Provenance.TaskID || r.WorkInputID == "" {
-		t.Fatalf("unrelated ID-shaped note prevented an explicit single target: %+v %v", r, err)
+	for _, metadata := range []string{"备注码 <" + foreign.ID + ">", "校验码 <" + strings.Repeat("A", 26) + ">"} {
+		s, c = newWorkInputCandidate(t, f, "继续任务 <"+worker.Provenance.TaskID+">，"+metadata+"。")
+		r, err = f.s.ApplyChatAssessmentDormant(ctx, s, c.ID, input, "评估后续。", "explicit")
+		if err != nil || r.Outcome != "continued" || r.TaskID != worker.Provenance.TaskID || r.WorkInputID == "" {
+			t.Fatalf("non-Task metadata %q prevented an explicit single target: %+v %v", metadata, r, err)
+		}
+		taskWorkTestReceipt(t, f.s, s, stopped, domain.TurnStateNotStarted)
 	}
-	taskWorkTestReceipt(t, f.s, s, stopped, domain.TurnStateNotStarted)
 
 	s, c = newWorkInputCandidate(t, f, "请整理下周议程，参考编号 "+foreign.ID+"。")
 	independent := f.input

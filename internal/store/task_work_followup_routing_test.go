@@ -159,14 +159,19 @@ func TestTaskWorkOtherTopicReference(t *testing.T) {
 	f.s.EnableTaskWorkExecution()
 	old := chatAuthorityWorker(t, f).Provenance
 	thread := domain.ThreadRef{GroupID: f.groupID, TopicID: "new-work-topic"}
-	if _, err := f.s.SetChatPolicy(ctx, thread, f.policy.ChatPolicyRequest, 0, "new-topic-policy"); err != nil {
+	policy := f.policy.ChatPolicyRequest
+	policy.MaxAdmissions = 3
+	if _, err := f.s.SetChatPolicy(ctx, thread, policy, 0, "new-topic-policy"); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
 		name, body, denial string
 		continuing         bool
 	}{
+		{"legacy-postposed-continue", "请帮我把 " + old.TaskID + " 接着做。", "followup_target_unavailable", false},
 		{"independent", "另开一项工作整理议程，引用其它话题任务 <" + old.TaskID + "> 的结论。", "", false},
+		{"optional-citation", "另开一项工作整理议程，可以参考其它话题任务 " + old.TaskID + " 的结论。", "", false},
+		{"independent-framing", "另开一项独立工作整理会议议程（关联材料 " + old.TaskID + "）。", "", false},
 		{"continue", "请继续任务 <" + old.TaskID + ">。", "followup_target_unavailable", true},
 		{"legacy-continue", "应该继续工作 <" + old.TaskID + ">。", "followup_target_unavailable", false},
 		{"legacy-choice", "应该继续工作 <" + old.TaskID + ">、<AAAAAAAAAAAAAAAAAAAAAAAAAA> 中的哪一个？", "ambiguous_followup_task", false},
@@ -183,9 +188,16 @@ func TestTaskWorkOtherTopicReference(t *testing.T) {
 				proposal = domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork, Reason: "继续原工作",
 					Followup: &domain.ChatFollowupAssessment{TaskID: old.TaskID}}
 			}
+			protected := make(map[string][][]any)
+			if tc.denial != "" {
+				for _, table := range []string{"tasks", "mandates", "coordination_dispatch_requests", "task_work_inputs", "task_work_deliveries", "task_attempts", "turns", "resource_claims"} {
+					protected[table] = messageSequenceTableRows(t, f.s, table)
+				}
+			}
 			r, err := f.s.ApplyChatAssessment(ctx, scope, c.ID, proposal, "评估用户请求。", tc.name)
 			if tc.denial != "" {
 				chatAssertNotAdmitted(t, r, err, tc.denial)
+				messageSequencePreserved(t, f.s, protected)
 			} else if err != nil || r.Outcome != "admitted" || r.TaskID == "" || r.TaskID == old.TaskID || r.DispatchRequestID == "" ||
 				!r.AuthorityEvidenceVerified || r.AuthorizationMessageID != m.ID {
 				t.Fatalf("contextual citation captured an independent request: %+v %v", r, err)
@@ -227,6 +239,7 @@ func TestTaskWorkLegacyRequestAfterClosedTask(t *testing.T) {
 	for _, tc := range []struct{ name, body, code string }{
 		{"contextual", "继续做日报。", "existing_task_reference"},
 		{"explicit-closed", "请整理任务 " + p.TaskID, "existing_task_reference"},
+		{"mixed", "请整理任务 " + p.TaskID + "，参考编号 " + strings.Repeat("A", 26), "ambiguous_followup_task"},
 		{"explicit-invalid", "请整理任务 `" + strings.Repeat("A", 26) + "`", "followup_target_unavailable"},
 		{"explicit-malformed", "请整理任务编号: no-such-task", "followup_target_unavailable"},
 	} {

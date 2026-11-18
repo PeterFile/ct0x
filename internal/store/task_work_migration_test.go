@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"agentworkspace/internal/domain"
@@ -77,6 +78,67 @@ func TestTaskWorkLegacyV27UpgradePreservesLiveHistory(t *testing.T) {
 	dispatchAssertFK(t, upgraded)
 }
 
+func TestTaskWorkAppliedSchemaAndResolverPlans(t *testing.T) {
+	f := taskWorkChatAtPrefix(t, 29)
+	p := chatAuthorityWorker(t, f).Provenance
+	for _, tc := range []struct {
+		name, query string
+		args        []any
+		searches    []string
+	}{
+		{"prefix", workInputPrefixCount, []any{taskWorkInputVersion}, []string{"schema_migrations USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)"}},
+		{"shape", workInputShapeProbe, nil, []string{
+			"task_coordination_followup_thread (group_id=? AND topic_id=? AND task_id=?)",
+			"task_work_inputs_constraints (group_id=? AND task_id=? AND task_revision=?)",
+			"task_work_inputs_history (group_id=? AND task_id=? AND created_at=? AND id=?)",
+			"task_work_inputs_inbox (assignment_id=? AND task_revision=?)",
+		}},
+		{"thread", `SELECT a.id` + chatFollowupAssignments + ` ORDER BY tc.task_id`, []any{p.GroupID, p.TopicID, int64(999)}, []string{
+			"task_coordination_followup_thread (group_id=? AND topic_id=?)",
+		}},
+		{"target", `SELECT a.id` + chatFollowupAssignments + ` AND tc.task_id=?`, []any{p.GroupID, p.TopicID, int64(999), p.TaskID}, []string{
+			"task_coordination_followup_thread (group_id=? AND topic_id=? AND task_id=?)",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := resolutionPlan(t, f.s, tc.query, tc.args...)
+			for line := range strings.SplitSeq(plan, "\n") {
+				// The scalar output row and the keys of one named index are
+				// bounded; neither is a scan of application/catalog tables.
+				if line == "SCAN CONSTANT ROW" || strings.HasPrefix(line, "SCAN pragma_index_info VIRTUAL TABLE INDEX ") {
+					continue
+				}
+				if strings.Contains(line, "sqlite_schema") || strings.Contains(line, "SCAN ") {
+					t.Fatalf("expected keyed applied-path searches: %s", plan)
+				}
+			}
+			for _, search := range tc.searches {
+				if !strings.Contains(plan, search) {
+					t.Fatalf("expected keyed lookup %q in %s", search, plan)
+				}
+			}
+		})
+	}
+}
+
+func TestTaskWorkLegacyV27OrdinarySubmission(t *testing.T) {
+	f := taskWorkChatAtPrefix(t, 27)
+	worker := chatAuthorityWorker(t, f)
+	p := worker.Provenance
+	protected := map[string][][]any{
+		"turns":           messageSequenceTableRows(t, f.s, "turns"),
+		"resource_claims": messageSequenceTableRows(t, f.s, "resource_claims"),
+	}
+	got, err := f.s.SubmitAssignmentResult(ctx, worker, AssignmentResultInput{Summary: "文本交付。"}, "legacy-result")
+	if err != nil || got.ID == "" || got.TaskID != p.TaskID || got.AttemptID != worker.AttemptID {
+		t.Fatalf("v27 failed to persist an ordinary result: %+v %v", got, err)
+	}
+	if saved, err := f.s.GetTaskSubmission(ctx, p.GroupID, p.TaskID, got.ID); err != nil || !reflect.DeepEqual(saved, got) {
+		t.Fatalf("legacy result did not survive readback: %+v %v", saved, err)
+	}
+	messageSequencePreserved(t, f.s, protected)
+}
+
 func TestTaskWorkInputSchemaDisagreementFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -86,6 +148,11 @@ func TestTaskWorkInputSchemaDisagreementFailsClosed(t *testing.T) {
 		{"missing-v28-with-v29", 29, "DELETE FROM schema_migrations WHERE version=28"},
 		{"missing-v28-with-tables", 28, "DELETE FROM schema_migrations WHERE version=28"},
 		{"missing-mandatory-table", 28, "DROP TABLE task_work_input_returns"},
+		{"missing-v27-in-v29", 29, "DELETE FROM schema_migrations WHERE version=27"},
+		{"missing-thread-index", 28, "DROP INDEX task_coordination_followup_thread"},
+		{"wrong-thread-index-keys", 28, `DROP INDEX task_coordination_followup_thread;
+			CREATE INDEX task_coordination_followup_thread ON task_coordination(current_mandate_id)`},
+		{"wrong-return-shape", 28, "DROP TABLE task_work_input_returns; CREATE TABLE task_work_input_returns(input_id TEXT PRIMARY KEY NOT NULL)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := taskWorkChatAtPrefix(t, tc.version)
@@ -101,6 +168,7 @@ func TestTaskWorkInputSchemaDisagreementFailsClosed(t *testing.T) {
 			if _, err := f.s.SubmitAssignmentResult(ctx, worker, result, "fresh-result"); !errors.Is(err, ErrConflict) {
 				t.Fatalf("fixture lacks an outstanding-input fence: %v", err)
 			}
+			freshScope, fresh := newWorkInputCandidate(t, f, "整理独立的会议议程。")
 			coordinationDecideExec(t, f.s, tc.damage)
 			before := messageSequenceSnapshot(t, f.s)
 			t.Run("history", func(t *testing.T) {
@@ -123,9 +191,32 @@ func TestTaskWorkInputSchemaDisagreementFailsClosed(t *testing.T) {
 					t.Fatalf("same-source RequestWork did not detect inconsistent schema: %+v %v", got, err)
 				}
 			})
+			t.Run("chat-admission", func(t *testing.T) {
+				got, err := f.s.ApplyChatAssessment(ctx, freshScope, fresh.ID, f.input, "登记独立工作。", "fresh-admission")
+				if tc.name == "missing-v27-in-v29" {
+					// The earlier candidate policy read fails on v27 and the
+					// tool boundary intentionally hides its internal cause.
+					if err == nil || err.Error() != "验证聊天候选失败" || got.ID != "" {
+						t.Fatalf("missing v27 did not fail at candidate policy read: %+v %v", got, err)
+					}
+					return
+				}
+				if !errors.Is(err, errWorkInputSchemaMismatch) || got.ID != "" {
+					t.Fatalf("fresh chat admission did not detect inconsistent schema: %+v %v", got, err)
+				}
+			})
 			messageSequencePreserved(t, f.s, before)
 		})
 	}
+
+	t.Run("legacy-gap", func(t *testing.T) {
+		f := taskWorkChatAtPrefix(t, 27)
+		p := chatAuthorityWorker(t, f).Provenance
+		coordinationDecideExec(t, f.s, "DELETE FROM schema_migrations WHERE version=26")
+		if got, err := f.s.ListTaskWorkInputs(ctx, p.GroupID, p.TaskID, ListOptions{}); !errors.Is(err, errWorkInputSchemaMismatch) || got.Items != nil {
+			t.Fatalf("incomplete ledger was treated as a genuine v27 prefix: %+v %v", got, err)
+		}
+	})
 
 	t.Run("later-marker-alone", func(t *testing.T) {
 		f := taskWorkChatAtPrefix(t, 29)
