@@ -249,16 +249,26 @@ func TestChatRepairPreparationWaitsUnclaimedAndSchedulerContinues(t *testing.T) 
 	if receipt.Outcome != "admitted" || receipt.RepairLink == nil || receipt.MessageID != f.notice.ID || receipt.SourceKind != "platform" || receipt.SourceID != f.notice.SourceID || receipt.RepairLink.ParentReviewID != f.review.ID {
 		t.Fatalf("repair required another user action or changed source: %+v", receipt)
 	}
+	// Use the Store's single connection so the observer cannot contend with the receipt commit.
+	observeCtx, cancelObserve := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelObserve()
 	for {
-		var terminal int
-		prepareRoleOK(t, f.db.QueryRow("SELECT count(*) FROM turns WHERE delivery_id=? AND state='succeeded'", f.pendingReview.Delivery.ID).Scan(&terminal))
-		if terminal == 1 {
+		turn, err := f.s.GetTurn(observeCtx, f.group.ID, receipt.TurnID)
+		if err != nil {
+			t.Fatalf("read automatic intake turn %s: %v", receipt.TurnID, err)
+		}
+		if turn.DeliveryID != f.pendingReview.Delivery.ID {
+			t.Fatalf("automatic intake used delivery %s, want %s", turn.DeliveryID, f.pendingReview.Delivery.ID)
+		}
+		if turn.State == domain.TurnStateSucceeded {
 			break
 		}
 		select {
 		case err := <-done:
 			joined = true
 			t.Fatalf("automatic intake receipt failed: %v", err)
+		case <-observeCtx.Done():
+			t.Fatalf("automatic intake turn %s did not succeed: last state %s", turn.ID, turn.State)
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
