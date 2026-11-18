@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -143,21 +144,7 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 			if _, err := assess(); !errors.Is(err, store.ErrTaskWorkExecutionNotReady) {
 				t.Fatalf("default readiness was not closed: %v", err)
 			}
-			engine.EnableTaskWorkExecution()
-			wake, err := assess()
-			roleOK(t, err)
-			settle(intake.Claim, provider.OutcomeNotStarted)
-			if wake.WorkInputID == "" || wake.WorkDeliveryID == "" || wake.MandateID != admission.MandateID {
-				t.Fatal("v29 did not bind the input and typed wake to the original Mandate")
-			}
-			queued := pending(wake.WorkWakeMessageID)
-			if got, err := off.Prepare(ctx, queued); got.Executor != nil || !errors.Is(err, scheduler.ErrNotReady) {
-				t.Fatalf("ordinary role profile could prepare a typed delivery: %v", err)
-			}
-			if got, err := off.InspectRoleReadiness(ctx, queued); err != nil || got.Blocked == nil || got.HistoryLimit != 0 {
-				t.Fatalf("typed delivery inspected as legacy: %+v %v", got, err)
-			}
-
+			var wake domain.ChatAssessmentReceipt
 			var token, configPath, typedCWD string
 			var live store.MemberToolScope
 			calls := 0
@@ -409,13 +396,64 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 			defer f.runtime.Close()
 			tools := f.runtime.Tools()
 			if tools.WorkInputsEnabled() {
-				t.Fatal("fresh profile enabled the legacy intake seam")
+				t.Fatal("fresh profile enabled the legacy work-input preview")
 			}
 			routes := append(httpapi.MemberToolRoutes(tools), httpapi.MemberRoleToolRoutes(tools)...)
 			routes = append(routes, httpapi.MemberMCPRoutes(tools)...)
 			server, err := httpapi.NewServer(httpapi.DefaultAddress, routes...)
 			roleOK(t, err)
 			f.handler = server.Handler
+			engine.EnableTaskWorkExecution()
+			switch mode {
+			case "confirmed", "replaced-original-cwd":
+				wake = assessFreshTaskWorkThroughIntake(t, f, intake, c, followup(constraint).Followup, "")
+			default:
+				wake, err = assess()
+				roleOK(t, err)
+			}
+			settle(intake.Claim, provider.OutcomeNotStarted)
+			if wake.WorkInputID == "" || wake.WorkDeliveryID == "" || wake.MandateID != admission.MandateID {
+				t.Fatal("B did not bind the input and typed wake to the original Mandate")
+			}
+			queued := pending(wake.WorkWakeMessageID)
+			if mode == "confirmed" {
+				foreign, err := f.db.CreateTask(ctx, store.CreateTaskInput{GroupID: f.other, Title: "另一组的任务", Acceptance: "只交付文本", ActorID: "user"})
+				roleOK(t, err)
+				scope, candidate := capture("请继续任务 <"+foreign.ID+">。", "foreign-source")
+				denied := assessFreshTaskWorkThroughIntake(t, f, scope, candidate, &domain.ChatFollowupAssessment{TaskID: foreign.ID}, "followup_target_unavailable")
+				if denied.TaskID != "" || denied.WorkInputID != "" || denied.WorkDeliveryID != "" || denied.Question == "" {
+					t.Fatal("B denial changed a Task or lost its clarification")
+				}
+				settle(scope.Claim, provider.OutcomeNotStarted)
+				inputs, err := f.db.ListTaskWorkInputs(ctx, f.group, admission.TaskID, store.ListOptions{})
+				roleOK(t, err)
+				if len(inputs.Items) != 2 || inputs.Items[1].ID != older.WorkInputID {
+					t.Fatalf("expected one new WorkInput after the dormant fixture input, got %d total", len(inputs.Items))
+				}
+				i := inputs.Items[0]
+				if i.ID != wake.WorkInputID || i.CandidateID != c.ID || i.SourceID != c.SourceID || i.ReplyMessageID != c.MessageID ||
+					i.Content != body || i.AfterConstraint != detail || i.AssignmentID != decision.Assignment.ID || i.WorkerMemberID != f.worker.ID || i.Consumption != nil || i.Return != nil {
+					t.Fatal("new WorkInput did not preserve the bound source, quote or original owner")
+				}
+				page, err := f.db.ListPendingDeliveries(ctx, store.PendingOptions{Lane: "work"})
+				roleOK(t, err)
+				if len(page.Items) != 1 || page.Items[0].Delivery.ID != queued.Delivery.ID || queued.Delivery.State != domain.DeliveryStateQueued || queued.Delivery.TurnID != "" {
+					t.Fatalf("expected exactly one new queued wake, got %d", len(page.Items))
+				}
+				d, err := engine.ResolveTaskWorkDelivery(ctx, f.group, queued.Delivery.ID)
+				roleOK(t, err)
+				if d.Blocked != "" || d.SourceKind != domain.TaskWorkSourceFollowup || d.SourceID != i.ID || d.TaskID != admission.TaskID ||
+					d.MandateID != admission.MandateID || d.AssignmentID != decision.Assignment.ID || d.OwnerMemberID != f.worker.ID || d.MemberID != f.worker.ID ||
+					d.ConversationID != oldScope.ConversationID || d.GroupID != f.group || d.TopicID != thread.TopicID {
+					t.Fatal("queued wake did not resolve to the original B typed target")
+				}
+			}
+			if got, err := off.Prepare(ctx, queued); got.Executor != nil || !errors.Is(err, scheduler.ErrNotReady) {
+				t.Fatalf("ordinary role profile could prepare a typed delivery: %v", err)
+			}
+			if got, err := off.InspectRoleReadiness(ctx, queued); err != nil || got.Blocked == nil || got.HistoryLimit != 0 {
+				t.Fatalf("typed delivery inspected as legacy: %+v %v", got, err)
+			}
 			opts.MemberTools = f.runtime
 			prep, err := platform.NewPreparer(f.db, opts)
 			roleOK(t, err)
@@ -576,4 +614,103 @@ func TestFreshTaskWorkB29NativeWire(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Only the in-process native adapter is substituted. The normal intake wrapper
+// issues the capability and its config; only send_message can commit the input.
+func assessFreshTaskWorkThroughIntake(t *testing.T, f *roleRuntimeFixture, scope store.MemberToolScope, candidate domain.ChatCandidate, followup *domain.ChatFollowupAssessment, reasonCode string) domain.ChatAssessmentReceipt {
+	t.Helper()
+	ctx := context.Background()
+	turn, err := f.db.GetTurn(ctx, scope.Claim.GroupID, scope.Claim.TurnID)
+	roleOK(t, err)
+	binding := platform.MemberToolRunBinding{GroupID: turn.GroupID, MemberID: turn.MemberID, ConversationID: turn.ConversationID,
+		DeliveryID: turn.DeliveryID, ProviderID: f.lead.ProviderID, Model: f.lead.Model}
+	const content = "模型回复不能替代 B 的通知。"
+	body, err := json.Marshal(map[string]any{"content": content, "intent_assessment": domain.ChatAssessment{
+		Disposition: domain.ChatDispositionContinueWork, Reason: "续办原文本任务", Followup: followup,
+	}})
+	roleOK(t, err)
+	key := "continue-" + candidate.ID // Only a replay of this candidate's request reuses the key.
+	if w := f.http(t, scope.Claim.Token, "send_message", string(body), key); w.Code != http.StatusForbidden {
+		t.Fatal("claim token was accepted as a member tool capability")
+	}
+	var token string
+	var projected domain.ChatAssessmentReceipt
+	executor, err := f.runtime.WrapChatIntake(binding, func(path, _ string, names []string) (provider.Executor, error) {
+		wire, err := os.ReadFile(path)
+		roleOK(t, err)
+		var config struct {
+			Token        string `json:"token"`
+			ContinueWork bool   `json:"continue_work"`
+		}
+		roleOK(t, json.Unmarshal(wire, &config))
+		token = config.Token
+		if !config.ContinueWork || token == "" || token == scope.Claim.Token {
+			t.Error("intake config did not advertise its bound continuation schema")
+		}
+		return roleNative(func(context.Context, provider.ExecuteRequest, func(provider.Event) error) provider.ExecutionReceipt {
+			list := memberMCPRoleHTTP(t, f, token, `"list"`, "tools/list", `{}`).Body.String()
+			if !strings.Contains(list, `"continue_work"`) || !strings.Contains(list, `"followup"`) || strings.Contains(list, `"read_work_inputs"`) {
+				t.Error("MCP discovery lacked the bound continuation schema or included legacy preview")
+			}
+			for _, tc := range []struct{ op, body string }{
+				{"read_work_inputs", `{}`}, {"ack_work_input", `{"input_id":"input"}`},
+				{"hand_back_work_input", `{"input_id":"input","reason":"不属于本轮"}`},
+			} {
+				if w := f.http(t, token, tc.op, tc.body, key); w.Code != http.StatusForbidden {
+					t.Errorf("intake acquired %s: status=%d", tc.op, w.Code)
+				}
+			}
+			forged := strings.Replace(string(body), `"intent_assessment":`, `"worker_member_id":"foreign","intent_assessment":`, 1)
+			if w := f.http(t, token, "send_message", forged, key); w.Code != http.StatusBadRequest {
+				t.Fatal("transport accepted a caller-selected owner")
+			}
+			first := f.http(t, token, "send_message", string(body), key)
+			if first.Code != http.StatusCreated {
+				t.Fatalf("bound intake continuation POST = %d, want 201 (denial reason %q)", first.Code, reasonCode)
+			}
+			again := f.http(t, token, "send_message", string(body), key)
+			if again.Code != first.Code || again.Body.String() != first.Body.String() {
+				t.Fatal("same-key intake replay changed the B receipt")
+			}
+			var response struct {
+				Assessment domain.ChatAssessmentReceipt `json:"intent_assessment"`
+			}
+			roleOK(t, json.Unmarshal(first.Body.Bytes(), &response))
+			projected = response.Assessment
+			return roleNotStarted()
+		}), nil
+	})
+	roleOK(t, err)
+	if got := executor.Execute(ctx, provider.ExecuteRequest{RunID: turn.ID, RuntimeDir: f.root, Model: binding.Model}, nil); got != roleNotStarted() || projected.ID == "" {
+		t.Fatal("bound intake did not execute the HTTP fixture")
+	}
+	if w := f.http(t, token, "send_message", string(body), key); w.Code != http.StatusForbidden {
+		t.Fatal("revoked intake could replay the receipt")
+	}
+	var data string
+	roleOK(t, f.raw.QueryRow(`SELECT a.receipt_json FROM chat_assessments a JOIN chat_followup_routes r ON r.assessment_id=a.id
+		WHERE a.candidate_id=? AND r.source_id=?`, candidate.ID, candidate.SourceID).Scan(&data))
+	var receipt domain.ChatAssessmentReceipt
+	roleOK(t, json.Unmarshal([]byte(data), &receipt))
+	outcome := "continued"
+	if reasonCode != "" {
+		outcome = "not_admitted"
+	}
+	if receipt.ID != projected.ID || receipt.CandidateID != candidate.ID || receipt.TurnID != turn.ID || receipt.AssessedBy != scope.MemberID ||
+		receipt.SourceKind != "local_user_chat" || receipt.Purpose != domain.ChatIntakePurpose || receipt.Disposition != domain.ChatDispositionContinueWork ||
+		receipt.Outcome != outcome || projected.Outcome != outcome || receipt.ReasonCode != reasonCode || projected.ReasonCode != reasonCode ||
+		receipt.Question != projected.Question || receipt.NoticeMessageID != projected.NoticeMessageID || receipt.WorkInputPending || receipt.DispatchRequestID != "" {
+		t.Fatal("HTTP outcome did not preserve the bound, durable B assessment and route")
+	}
+	notice, err := f.db.GetMessage(ctx, f.group, receipt.NoticeMessageID)
+	roleOK(t, err)
+	if notice.TopicID != candidate.TopicID || strings.Contains(notice.Content, content) || len(notice.Deliveries) != 0 {
+		t.Fatal("B's topic notice was replaced or treated as the wake")
+	}
+	if receipt.WorkInputID != "" {
+		roleOK(t, f.raw.QueryRow(`SELECT delivery_id,message_id FROM task_work_deliveries WHERE source_kind='followup' AND source_id=?`,
+			receipt.WorkInputID).Scan(&receipt.WorkDeliveryID, &receipt.WorkWakeMessageID))
+	}
+	return receipt
 }

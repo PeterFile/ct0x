@@ -9,10 +9,20 @@ and stable. Both typed files must match the built-in pair; do not replace
 ordinary `index.ts` or `bridge.mjs`. The ordinary native digest profile, when
 also configured, uses its own published bytes and pins.
 
-This profile consumes an existing B v29 typed followup for a plain-text Task.
-It does not turn on any new intake schema or provide a second authorization
-path. Preparation keeps the original Task, Mandate and Assignment, not the
-original conversation directory or its contents. A separate 0700 directory
+With the flag enabled, a bound chat intake can use `continue_work` in its
+existing `send_message` assessment. B checks the current user source and, when
+eligible, records a WorkInput and queues a typed wake for the original owner.
+An optional Task reference must appear in the source, and a constraint must
+quote it verbatim. A receipt isn't proof of execution. If B denies the request
+or the typed wake isn't ready to run, there's no generic fallback. This flag
+doesn't enable the legacy unpaged work-input preview.
+
+The Pi intake with that schema is fresh-only: the ordinary native resume
+profile doesn't bind the optional schema. Other eligible native resumes keep
+their existing profile and digest checks.
+
+Typed worker preparation keeps the original Task, Mandate and Assignment, not
+the original conversation directory or its contents. A separate 0700 directory
 under the trusted private workspace root is selected by typed delivery. It
 contains only a private delivery/inode seal, never task data or a capability.
 Inspection does not create it. An unsealed, replaced or non-dedicated entry

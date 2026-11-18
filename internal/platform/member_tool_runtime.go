@@ -38,11 +38,11 @@ type MemberToolRuntimeOptions struct {
 	NativeExecutionRoot string
 	// ChatIntake reuses the same Engine and requires the role execution path.
 	ChatIntake *coordination.Engine
-	// WorkInputs is trusted startup composition. Nil keeps work inputs closed;
-	// a typed nil is a configuration error. ContinueWork also requires ChatIntake.
+	// WorkInputs opts into the legacy preview. A typed nil is a configuration
+	// error. Its ContinueWork implementation takes precedence and requires ChatIntake.
 	WorkInputs MemberWorkInputService
-	// FreshTaskWork uses the same role fence and Engine as ChatIntake.
-	// Nil (default) does not compose typed continuation or change #181 grants.
+	// FreshTaskWork composes typed continuation via the ChatIntake Engine and
+	// the role execution fence. It does not install the legacy preview.
 	FreshTaskWork *FreshTaskWorkLaunch
 }
 

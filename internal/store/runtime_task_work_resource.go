@@ -97,7 +97,7 @@ func (s *Store) checkFreshTaskWorkLaunch(ctx context.Context, launch FreshTaskWo
 	}
 	// Preserve the former role resolver's exclusion of retained or damaged
 	// investigation evidence, even though this admission is text-only.
-	if _, err := s.investigationProfileInTx(ctx, tx, taskWorkFollowupProvenance(f), false); err != nil {
+	if _, err := s.investigationProfileInTx(ctx, tx, taskWorkOwnerProvenance(f), false); err != nil {
 		return memberToolOperationError(action, err)
 	}
 	// Check the remaining B readiness predicates (including the current

@@ -48,16 +48,20 @@ func nilWorkInputService(service MemberWorkInputService) bool {
 	}
 }
 
-// WorkInputsEnabled controls startup route composition, not per-turn authority.
+// WorkInputsEnabled controls the legacy preview, not per-turn authority.
 func (s *MemberTools) WorkInputsEnabled() bool { return s != nil && s.workInputs != nil }
+
+func (s *MemberTools) continueWorkEnabled() bool {
+	return s.WorkInputsEnabled() || s.FreshTaskWorkEnabled()
+}
 
 // Caller holds the registry lock. The schema hint does not grant any operation.
 func (s *MemberTools) advertisesContinueWork(entry memberToolRegistration) bool {
-	return s.WorkInputsEnabled() && s.isChatIntake(entry)
+	return s.continueWorkEnabled() && s.isChatIntake(entry)
 }
 
 func (s *MemberTools) issuedContinueWork(token string) bool {
-	if !s.WorkInputsEnabled() {
+	if !s.continueWorkEnabled() {
 		return false
 	}
 	s.mu.RLock()
@@ -100,10 +104,18 @@ func (s *MemberTools) HandBackWorkInput(ctx context.Context, token, inputID, rea
 }
 
 func (s *MemberTools) ContinueWork(ctx context.Context, token string, input MemberContinueWorkInput, content, key string) (domain.ChatAssessmentReceipt, error) {
-	if !s.WorkInputsEnabled() {
+	if !s.continueWorkEnabled() {
 		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
 	}
 	return s.withChatIntake(token, func(scope store.MemberToolScope, candidateID string) (domain.ChatAssessmentReceipt, error) {
-		return s.workInputs.ContinueWork(ctx, scope, candidateID, input, content, key)
+		if s.workInputs != nil {
+			return s.workInputs.ContinueWork(ctx, scope, candidateID, input, content, key)
+		}
+		assessment := domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork, Reason: input.Reason}
+		if input.TaskID != "" || input.Constraint != "" {
+			assessment.Followup = &domain.ChatFollowupAssessment{TaskID: input.TaskID, Constraint: input.Constraint}
+		}
+		// B owns the receipt and the typed wake in one assessment transaction.
+		return s.chatEngine.AssessChatIntent(ctx, scope, candidateID, assessment, content, key)
 	})
 }

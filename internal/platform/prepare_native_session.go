@@ -149,7 +149,7 @@ func (p *Preparer) nativeReportTools(selected provider.Provider) []string {
 		if r.tools.chatEngine == nil {
 			return r.operations
 		}
-		if !r.tools.WorkInputsEnabled() {
+		if !r.tools.continueWorkEnabled() {
 			return chatIntakeOperations()
 		}
 	}

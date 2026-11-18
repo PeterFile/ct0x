@@ -240,7 +240,7 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	var maxMembers int
 	intake := useMemberTools && p.memberTools.tools.chatEngine != nil
 	// The v23 text profile does not bind the optional continuation schema.
-	if useMemberTools && p.piNativeSessionConfigured(selected) && !(intake && p.memberTools.tools.WorkInputsEnabled()) {
+	if useMemberTools && p.piNativeSessionConfigured(selected) && !(intake && p.memberTools.tools.continueWorkEnabled()) {
 		names, maxMembers = p.memberTools.operations, p.memberTools.maxGroupMembers
 		if intake {
 			names, maxMembers = chatIntakeOperations(), 0
@@ -445,6 +445,10 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 			}
 			if p.memberTools.tools.WorkInputsEnabled() {
 				in.Permissions = append(in.Permissions, "仅当绑定的本机用户消息明确要求续办已有工作时，才用 continue_work 和 reason，可在 followup 中提供明确引用的 task_id 及 constraint。省略 task_id 时由服务器判定能否唯一确定活跃工作；引用不授予权限，不另建 Task 或选择负责人。")
+			} else if p.memberTools.tools.FreshTaskWorkEnabled() {
+				in.Permissions = append(in.Permissions,
+					"仅当绑定的本机用户明确要求在原授权内续办已有纯文本任务时，用 continue_work 和 reason，不填 action 或新任务字段。followup 可省略；task_id 只引用当前用户原文中的正式任务编号，constraint 只能是本条原文的连续逐字摘录。由服务端核对目标、授权和原负责人；不得把文件或外部动作要求改称纯文本。",
+					"continued 仅表示已记录原任务输入，不代表已启动、处理、提交或接纳；not_admitted 以 reason_code/question 与原话题通知为准。已排队、缺少执行条件或上轮未结算时，不另建 Task、不改走通用执行、不代原负责人执行。")
 			}
 		}
 		if selected, ok := p.providers[member.ProviderID]; ok {
