@@ -134,10 +134,41 @@ func TestExecutionFlagHelp(t *testing.T) {
 	if err := runWithSearch(context.Background(), []string{"--help"}, &output, provider.Search{}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"--enable-execution", "默认禁用", "全新单轮", "最大并发 1", "平台工具", "祖先", "不是"} {
+	for _, want := range []string{"--enable-execution", "默认禁用", "全新单轮", "--execution-max-active 数量  最大并发（默认 1，1..8；须启用执行）", "平台工具", "祖先", "不是"} {
 		if !strings.Contains(output.String(), want) {
 			t.Errorf("execution help missing %q: %s", want, &output)
 		}
+	}
+}
+
+func TestExecutionMaxActiveConfig(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		args    []string
+		want    int
+		wantErr string
+	}{
+		{"disabled default", nil, 1, ""},
+		{"enabled default", []string{"--enable-execution"}, 1, ""},
+		{"minimum", []string{"--enable-execution", "--execution-max-active=1"}, 1, ""},
+		{"maximum", []string{"--enable-execution", "--execution-max-active", "8"}, 8, ""},
+		{"below range", []string{"--enable-execution", "--execution-max-active=0"}, 0, "执行最大并发必须在 1..8 之间"},
+		{"above range", []string{"--enable-execution", "--execution-max-active=9"}, 0, "执行最大并发必须在 1..8 之间"},
+		{"without execution", []string{"--execution-max-active=2"}, 0, "执行禁用时不能指定最大并发"},
+		{"explicitly disabled", []string{"--enable-execution=false", "--execution-max-active=1"}, 0, "执行禁用时不能指定最大并发"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config, err := parseConfig(append([]string{"--data-dir", t.TempDir()}, tt.args...), io.Discard)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("want error %q, got %v", tt.wantErr, err)
+				}
+				return
+			}
+			if err != nil || config.executionMaxActive != tt.want {
+				t.Fatalf("want capacity %d, got %d: %v", tt.want, config.executionMaxActive, err)
+			}
+		})
 	}
 }
 
