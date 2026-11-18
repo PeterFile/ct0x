@@ -10,12 +10,14 @@ import (
 	"agentworkspace/internal/provider"
 )
 
-// Final fixtures require actual contiguous v21/v22 migrations, never a
-// hand-built authority schema or a synthetic migration registration.
+// Final fixtures require the real v22 migration, even on a later DB.
 func chatRepairInstall(t *testing.T, s *Store) {
 	t.Helper()
+	if len(migrations) < 22 || migrations[21] != chatRepairSchemaV22 {
+		t.Fatal("the exact chat repair schema must occupy v22")
+	}
 	var version int
-	if err := s.db.QueryRow("SELECT max(version) FROM schema_migrations").Scan(&version); err != nil || version < 22 {
+	if err := s.db.QueryRow("SELECT version FROM schema_migrations WHERE version=22").Scan(&version); err != nil || version != 22 {
 		t.Fatalf("real v21 -> v22 schema required: version=%d, %v", version, err)
 	}
 }

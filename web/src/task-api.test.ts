@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ApiError, isDefinitiveRejection } from "./api";
-import { createTask, getTask, listTasks } from "./task-api";
+import { createTask, getTask, listTasks, listTaskWorkInputs, listTaskWorkReports } from "./task-api";
 import { group, json, other, page } from "./test/groups";
 import { acceptedTask, submittedTask, task, taskInput } from "./test/tasks";
 
@@ -30,6 +30,55 @@ it("reads authoritative detail with both path IDs encoded", async () => {
   expect(transport).toHaveBeenCalledExactlyOnceWith(
     "/api/v1/groups/%E7%BE%A4%2F%E7%BB%84%3F%2B/tasks/%E4%BB%BB%E5%8A%A1%2F%E4%B8%80%3F%2B%23", { signal },
   );
+});
+
+const workInput = { id: "input-1", group_id: group.id, task_id: task.id, topic_id: "", task_revision: task.revision,
+  created_at: task.created_at };
+const inputReturn = { member_id: "owner-1", turn_id: "turn-1", attempt_id: "attempt-1", notice_message_id: "return-notice-1",
+  reason: "  超出原授权。  ", question: "是否保持原范围？", returned_at: "2026-10-30T12:00:02.123456789Z" };
+const consumption = { turn_id: "turn-1", consumed_at: "2026-10-30T12:00:01Z" };
+
+it("preserves returned work input evidence and accepts legacy and current confirmation formats", async () => {
+  const items = [workInput, { ...workInput, id: "input-null", return: null, consumption: null },
+    { ...workInput, id: "input-confirmed-legacy", return: null, consumption },
+    { ...workInput, id: "input-confirmed", consumption: { ...consumption, attempt_id: "attempt-1" } },
+    { ...workInput, id: "input-returned", return: inputReturn, consumption: null }];
+  transport.mockResolvedValueOnce(page(items));
+  await expect(listTaskWorkInputs(group.id, task.id)).resolves.toEqual({ items, next_cursor: "" });
+});
+
+it.each([7, null, "", " \t\u0085\u3000"])("rejects a page with invalid confirmation attempt_id (case %#)", async attempt_id => {
+  transport.mockResolvedValueOnce(page([workInput, { ...workInput, id: "input-confirmed", consumption: { ...consumption, attempt_id } }]));
+  await expect(listTaskWorkInputs(group.id, task.id)).rejects.toMatchObject({ status: 200, code: "invalid_response" });
+});
+
+const invalidReturns: [string, object][] = [
+  ["an array", { return: [] }],
+  ["a missing question", { return: { ...inputReturn, question: undefined } }],
+  ...["member_id", "turn_id", "attempt_id", "notice_message_id", "reason", "question"].map((field): [string, object] =>
+    [`blank ${field}`, { return: { ...inputReturn, [field]: " \t\u0085\u3000" } }]),
+  ["a non-UTC timestamp", { return: { ...inputReturn, returned_at: "2026-10-30T12:00:02+01:00" } }],
+  ["an invalid UTC date", { return: { ...inputReturn, returned_at: "2026-02-30T12:00:02Z" } }],
+  ["simultaneous consumption", { return: inputReturn, consumption }],
+];
+it.each(invalidReturns)("rejects work input return evidence with %s", async (_name, invalid) => {
+  transport.mockResolvedValueOnce(page([{ ...workInput, ...invalid }]));
+  await expect(listTaskWorkInputs(group.id, task.id)).rejects.toMatchObject({ status: 200, code: "invalid_response" });
+});
+
+const workReport = { id: "report-1", group_id: group.id, task_id: task.id, topic_id: "", task_revision: task.revision,
+  created_at: task.created_at, kind: "future-kind", summary: "  保留报告原文。  ", actor_id: "actor-1", owner_member_id: "owner-1" };
+
+it.each(["actor_id", "owner_member_id", "summary", "kind"])("rejects blank work report %s in a list response", async field => {
+  for (const blank of ["", " \t\u0085\u3000"]) {
+    transport.mockResolvedValueOnce(page([{ ...workReport, [field]: blank }]));
+    await expect(listTaskWorkReports(group.id, task.id)).rejects.toMatchObject({ status: 200, code: "invalid_response" });
+  }
+});
+
+it("preserves a nonblank unknown work report type and raw summary", async () => {
+  transport.mockResolvedValueOnce(page([workReport]));
+  await expect(listTaskWorkReports(group.id, task.id)).resolves.toEqual({ items: [workReport], next_cursor: "" });
 });
 
 it("posts only the frozen input allowlist with an idempotency key and HTTP 201", async () => {

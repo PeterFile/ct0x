@@ -109,6 +109,14 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     inputUntil.current = performance.now() + inputLifetime;
     if (pointer.current) pointer.current.moved = true;
   }
+  function onNavigateReference(id: string) {
+    if (!active || !historyRef.current?.clientHeight) return;
+    clearInput();
+    expectedTop.current = null; atTail.current = false;
+    // The browser moves to the fragment. A pending reset may finish before its scroll event.
+    saved.current = { id, offset: 0 };
+    recordReading();
+  }
   function onPointerDown(event: PointerEvent<HTMLElement>) {
     const history = historyRef.current, target = event.target;
     if (!active || !history?.clientHeight) return;
@@ -226,7 +234,7 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     if (!arrived && !page.pending) atTail.current = isTail(history);
   }, [active, items, page.pending, page.error, windowReset]);
 
-  return { historyRef, listRef, onScroll, onReadingIntent, onPointerDown, onPointerMove, onPointerEnd, onKeyDown,
+  return { historyRef, listRef, onScroll, onReadingIntent, onNavigateReference, onPointerDown, onPointerMove, onPointerEnd, onKeyDown,
     beforeOlder: () => beforePage("older"), beforeReset: () => beforePage("reset"),
     beginSend, confirmSend, windowReset };
 }

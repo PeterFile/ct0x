@@ -50,15 +50,30 @@ type Conversation struct {
 }
 
 type Message struct {
-	ID         string     `json:"id"`
-	GroupID    string     `json:"group_id"`
-	TopicID    string     `json:"topic_id"`
-	SenderID   string     `json:"sender_id"`
-	SourceID   string     `json:"source_id,omitempty"`
-	SourceKind string     `json:"source_kind,omitempty"`
-	Content    string     `json:"content"`
-	CreatedAt  time.Time  `json:"created_at"`
-	Deliveries []Delivery `json:"deliveries"`
+	ID         string             `json:"id"`
+	GroupID    string             `json:"group_id"`
+	TopicID    string             `json:"topic_id"`
+	SenderID   string             `json:"sender_id"`
+	SourceID   string             `json:"source_id,omitempty"`
+	SourceKind string             `json:"source_kind,omitempty"`
+	Content    string             `json:"content"`
+	CreatedAt  time.Time          `json:"created_at"`
+	Deliveries []Delivery         `json:"deliveries"`
+	Discussion *MessageDiscussion `json:"discussion,omitempty"`
+	// Read projection on the interrupted discussion head, not a publication receipt.
+	DiscussionClosureReason string `json:"discussion_closure_reason,omitempty"`
+}
+
+// MessageDiscussion is the read-only projection of a published handoff. The
+// invitation supplies the participants and expected reply for all three kinds.
+type MessageDiscussion struct {
+	Kind                      string `json:"kind"`
+	RootMessageID             string `json:"root_message_id"`
+	InvitationMessageID       string `json:"invitation_message_id"`
+	ParentInvitationMessageID string `json:"parent_invitation_message_id,omitempty"`
+	InviterID                 string `json:"inviter_id"`
+	AssigneeID                string `json:"assignee_id"`
+	ExpectedReply             string `json:"expected_reply"`
 }
 
 func (m Message) MarshalJSON() ([]byte, error) {

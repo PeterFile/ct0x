@@ -102,6 +102,15 @@ func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTask
 	if blocked {
 		return domain.TaskAttempt{}, fmt.Errorf("%w：任务依赖尚未全部接纳", ErrConflict)
 	}
+	if len(task.DependencyIDs) > 0 {
+		blocked, err := taskArtifactDependenciesBlockedInTx(ctx, tx, task.GroupID, task.ID)
+		if err != nil {
+			return domain.TaskAttempt{}, err
+		}
+		if blocked {
+			return domain.TaskAttempt{}, fmt.Errorf("%w：固定的成果依赖尚未由本地用户接纳", ErrConflict)
+		}
+	}
 	next, attempt, err := task.ActivateAttempt(domain.TaskAttempt{
 		ID: id, TaskID: task.ID, GroupID: task.GroupID, TaskRevision: task.Revision,
 		TurnID: turnID, CreatedAt: time.Now().UTC(),

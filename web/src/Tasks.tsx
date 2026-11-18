@@ -6,6 +6,7 @@ import { CoordinationSettings } from "./CoordinationSettings";
 import { ChatPolicySettings } from "./ChatPolicySettings";
 import { ChatAdmissionDetails } from "./ChatAdmissionDetails";
 import { TaskDispatch } from "./TaskDispatch";
+import { TaskWorkDetails } from "./TaskWorkDetails";
 import { useActiveRefresh } from "./useActiveRefresh";
 import { createTask, getTask, getTaskAttempt, getTaskSubmission, listTasks, registerTaskAttempt, reviewTask, submitTask } from "./task-api";
 import type { Task, TaskAttempt, TaskAttemptInput, TaskInput, TaskReview, TaskReviewInput, TaskSubmission, TaskSubmissionInput } from "./task-api";
@@ -44,6 +45,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
   const [selection, setSelection] = useState<{ id: string | null; version: number; background: boolean }>({ id: null, version: 0, background: false });
   const [detail, setDetail] = useState<{ task: Task | null; pending: boolean; error: string }>({ task: null, pending: false, error: "" });
+  const [workRefreshVersion, setWorkRefreshVersion] = useState(0);
   const [openedTasks, setOpenedTasks] = useState<string[]>([]);
   const [evidencePending, setEvidencePending] = useState<Record<string, boolean>>({});
   const reportEvidencePending = useCallback((id: string, pending: boolean) => {
@@ -144,6 +146,10 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
     } finally { posting.current = null; successfulReads.current.clear(); }
   }
 
+  const refreshDetails = () => {
+    select();
+    setWorkRefreshVersion(version => version + 1);
+  };
   const refreshAfterReceipt = (taskId: string) => {
     if (visible.current.active && visible.current.taskId === taskId) { load(); select(taskId); }
   };
@@ -167,7 +173,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
         {page.next ? <button type="button" disabled={page.pending} onClick={() => load(page.next)}>加载更多任务</button> : null}
       </div>
       {selection.id ? <section className="tasks-detail" aria-label="任务详情" aria-busy={detail.pending}>
-        <header className="tasks-toolbar"><h3>任务详情</h3><button type="button" onClick={() => select()}>刷新详情</button></header>
+        <header className="tasks-toolbar"><h3>任务详情</h3><button type="button" onClick={refreshDetails}>刷新详情</button></header>
         {detail.pending ? <p role="status">正在载入任务详情…</p> : null}
         {detail.error ? <div role="alert"><p>{detail.error}</p><button type="button" onClick={() => select()}>重试载入详情</button></div> : null}
         {selected ? <>
@@ -183,6 +189,7 @@ function TaskScope({ groupId, active }: { groupId: string; active: boolean }) {
             <dt>创建时间</dt><dd className="tasks-meta"><time dateTime={selected.created_at}>{selected.created_at}</time></dd>
           </dl>
         </> : null}
+        <TaskWorkDetails groupId={groupId} taskId={selection.id} active={active} refreshVersion={workRefreshVersion} />
         {/* Retain each task's drafts and immutable operation without reading hidden tasks. */}
         {openedTasks.map(id => <div key={id} hidden={id !== selection.id}>
           <TaskLifecycle groupId={groupId} taskId={id} task={active && selected?.id === id ? selected : null}

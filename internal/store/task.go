@@ -14,6 +14,7 @@ import (
 type CreateTaskInput struct {
 	GroupID, Title, Description, Acceptance, AssigneeID, IdempotencyKey string
 	DependencyIDs                                                       []string
+	ArtifactDependencies                                                []domain.TaskArtifactDependency
 	ActorID                                                             string `json:"-"` // Bound by trusted platform/session code.
 }
 
@@ -46,6 +47,14 @@ func createTaskInTx(ctx context.Context, tx *sql.Tx, input CreateTaskInput) (dom
 	deps = slices.Compact(deps)
 	scope := mutationScope{operation: "create_task", actorID: input.ActorID, groupID: input.GroupID, key: input.IdempotencyKey}
 	payload := mutationPayload(append([]string{input.GroupID, input.Title, input.Description, input.Acceptance, input.AssigneeID}, deps...)...)
+	var pins []domain.TaskArtifactDependency
+	if len(input.ArtifactDependencies) > 0 {
+		if input.ActorID != "user" {
+			return domain.Task{}, ErrMemberToolDenied
+		}
+		pins = canonicalTaskArtifactDependencies(input.ArtifactDependencies)
+		payload = taskArtifactDependencyPayload(payload, pins)
+	}
 	id, replay, err := reserveMutation(ctx, tx, scope, payload)
 	if err != nil {
 		return domain.Task{}, err
@@ -53,7 +62,20 @@ func createTaskInTx(ctx context.Context, tx *sql.Tx, input CreateTaskInput) (dom
 	if replay {
 		return taskInTx(ctx, tx, input.GroupID, id)
 	}
-	return insertTaskInTx(ctx, tx, input, id)
+	// Changed payloads must conflict even if their pins are invalid.
+	if err := validateTaskArtifactDependencies(deps, pins); err != nil {
+		return domain.Task{}, err
+	}
+	task, err := insertTaskInTx(ctx, tx, input, id)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	if len(pins) > 0 {
+		if err := insertTaskArtifactDependenciesInTx(ctx, tx, task, pins); err != nil {
+			return domain.Task{}, err
+		}
+	}
+	return task, nil
 }
 
 // The caller owns authorization, receipts, server-generated identity, and the transaction.
