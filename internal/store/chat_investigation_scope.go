@@ -126,37 +126,65 @@ func (s *Store) chatInvestigationSubmissionInTx(ctx context.Context, tx *sql.Tx,
 	if len(input.ArtifactVersions) != 0 || !memberToolTextValid(input.Summary, investigationSubmissionMaxBytes) {
 		return taskInvestigationEvidence{}, fmt.Errorf("%w：只读调查仅允许非空且最多%d字节的有效UTF-8文本，不允许附带成果版本", ErrInvalid, investigationSubmissionMaxBytes)
 	}
-	p, err := investigationSubmissionProvenanceInTx(ctx, tx, input)
+	p, work, err := investigationSubmissionProvenanceInTx(ctx, tx, input)
 	if err != nil {
 		return taskInvestigationEvidence{}, err
+	}
+	if work.d.DeliveryID != "" {
+		return s.investigationForFollowupInTx(ctx, tx, work, *input.MemberScope, input.AttemptID)
 	}
 	return s.investigationForProvenanceInTx(ctx, tx, *input.MemberScope, p, input.AttemptID)
 }
 
-func investigationSubmissionProvenanceInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (CoordinationRoleProvenance, error) {
+func investigationSubmissionProvenanceInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) (p CoordinationRoleProvenance, work taskWorkFacts, err error) {
 	if input.MemberScope == nil {
-		return CoordinationRoleProvenance{}, ErrMemberToolDenied
+		return p, work, ErrMemberToolDenied
 	}
 	member := *input.MemberScope
 	if err := coordinationDecideLiveInTx(ctx, tx, member); err != nil {
-		return CoordinationRoleProvenance{}, err
+		return p, work, err
 	}
-	p, err := coordinationClaimProvenanceInTx(ctx, tx, member)
+	work, err = lookupTaskWorkExecutionInTx(ctx, tx, member)
+	if err == nil {
+		if !work.d.SourceKind.IsOwnerContinuation() {
+			return p, work, ErrMemberToolDenied
+		}
+		p = taskWorkOwnerProvenance(work)
+	} else if errors.Is(err, ErrNotFound) {
+		p, err = coordinationClaimProvenanceInTx(ctx, tx, member)
+	}
 	if err != nil {
-		return CoordinationRoleProvenance{}, err
+		return p, work, err
 	}
 	if p.Kind != CoordinationRoleWorker || p.GroupID != input.GroupID || p.TaskID != input.TaskID || p.TaskRevision != input.ExpectedRevision || p.MemberID != input.ActorID {
-		return CoordinationRoleProvenance{}, ErrMemberToolDenied
+		return p, work, ErrMemberToolDenied
 	}
-	return p, nil
+	return p, work, nil
 }
 
 // Both submission entries recheck after the Task and any notice were written.
 // The bound worker must still own the exact resulting Task pointer.
 func (s *Store) checkInvestigationSubmissionWriteInTx(ctx context.Context, tx *sql.Tx, evidence taskInvestigationEvidence, input SubmitTaskInput, submissionID string) error {
-	p, err := investigationSubmissionProvenanceInTx(ctx, tx, input)
+	p, work, err := investigationSubmissionProvenanceInTx(ctx, tx, input)
 	if err != nil {
 		return err
+	}
+	if work.d.DeliveryID != "" {
+		attempt, err := taskWorkBoundAttemptInTx(ctx, tx, work.d, "")
+		if err != nil {
+			return err
+		}
+		if !s.taskWorkExecution.Load() || !evidence.matchesDispatch(work.v.r) || attempt.ID == "" || attempt.ID != input.AttemptID || attempt.TurnID != input.MemberScope.Claim.TurnID {
+			return ErrMemberToolDenied
+		}
+		task, err := taskInTx(ctx, tx, p.GroupID, p.TaskID)
+		if err != nil {
+			return err
+		}
+		if task.ActiveAttemptID != attempt.ID || (task.AssigneeID != "" && task.AssigneeID != p.MemberID) {
+			return ErrMemberToolDenied
+		}
+		return investigationToolError(s.checkTaskInvestigationReadyInTx(ctx, tx, evidence, submissionID, false))
 	}
 	role := CoordinationToolScope{Member: *input.MemberScope, Provenance: p, AttemptID: input.AttemptID}
 	v, view, err := coordinationAssignmentWorkerInTx(ctx, tx, role)
@@ -198,13 +226,21 @@ func (s *Store) checkTaskInvestigationReadyInTx(ctx context.Context, tx *sql.Tx,
 	if !s.investigationExecution.Load() {
 		return ErrTaskInvestigationNotReady
 	}
+	return checkTaskInvestigationAuthorizationInTx(ctx, tx, scope, submissionID, allowNoEligibleWorker)
+}
+
+// This is the durable half of the execution fence. It can explain a handback,
+// but by itself never authorizes investigation execution or tools.
+func checkTaskInvestigationAuthorizationInTx(ctx context.Context, tx *sql.Tx, scope taskInvestigationEvidence, submissionID string, allowNoEligibleWorker bool) error {
 	status := domain.TaskStatusOpen
 	if submissionID != "" {
 		status = domain.TaskStatusSubmitted
 	}
-	var coordinator, taskAssignee, mandateAssignee, messageID, sourceKind, sourceID string
+	c := domain.ChatCandidate{ThreadRef: scope.ThreadRef}
+	var coordinator, taskAssignee, mandateAssignee string
 	var dispatchPolicy int64
-	err := tx.QueryRowContext(ctx, `SELECT r.coordinator_member_id,r.policy_revision,coalesce(t.assignee_id,''),m.assignee_id,c.message_id,e.source_kind,e.source_id
+	err := tx.QueryRowContext(ctx, `SELECT r.coordinator_member_id,r.policy_revision,coalesce(t.assignee_id,''),m.assignee_id,
+	 c.id,c.message_id,c.member_id,c.turn_id,c.generation,e.source_kind,e.source_id
 	 FROM coordination_dispatch_requests r JOIN tasks t ON t.id=r.task_id AND t.group_id=r.group_id
 	 JOIN groups g ON g.id=r.group_id
 	 JOIN task_coordination tc ON tc.task_id=t.id AND tc.group_id=t.group_id AND tc.topic_id=r.topic_id
@@ -214,8 +250,10 @@ func (s *Store) checkTaskInvestigationReadyInTx(ctx context.Context, tx *sql.Tx,
 	 JOIN chat_assessments a ON a.decision_id=m.decision_id AND a.dispatch_request_id=r.id
 	 JOIN chat_candidates c ON c.id=a.candidate_id AND c.group_id=r.group_id AND c.topic_id=r.topic_id
 	  AND c.binding_revision=r.binding_revision AND c.dispatch_policy_revision=r.policy_revision
-	 JOIN chat_intake_executions e ON e.candidate_id=c.id AND e.turn_id=c.turn_id
-	 JOIN coordination_triggers origin ON origin.id=m.origin_trigger_id AND origin.message_id=c.message_id AND origin.group_id=r.group_id AND origin.topic_id=r.topic_id
+	 JOIN chat_intake_executions e ON e.candidate_id=c.id AND e.turn_id=c.turn_id AND e.purpose=?
+	  AND typeof(e.claim_digest)='blob' AND length(e.claim_digest)=32 AND e.source_kind IN ('local_user_chat','member')
+	 JOIN coordination_triggers origin ON origin.id=m.origin_trigger_id AND origin.message_id=c.message_id
+	  AND origin.group_id=r.group_id AND origin.topic_id=r.topic_id AND origin.message_sequence=c.generation
 	 JOIN chat_policies p ON p.group_id=c.group_id AND p.topic_id=c.topic_id AND p.revision=c.policy_revision
 	 JOIN chat_policy_revisions pr ON pr.group_id=p.group_id AND pr.topic_id=p.topic_id AND pr.revision=p.revision
 	 JOIN chat_policy_scopes ps ON ps.group_id=p.group_id AND ps.topic_id=p.topic_id AND ps.revision=p.revision
@@ -229,21 +267,29 @@ func (s *Store) checkTaskInvestigationReadyInTx(ctx context.Context, tx *sql.Tx,
 	 AND json_extract(a.receipt_json,'$.action')=? AND json_extract(a.receipt_json,'$.policy_revision') IS c.policy_revision
 	 AND json_extract(a.receipt_json,'$.authorization_message_id') IS cmd.message_id
 	 AND json_extract(a.receipt_json,'$.source_kind') IS e.source_kind AND json_extract(a.receipt_json,'$.source_id') IS e.source_id`,
-		scope.dispatchRequestID, scope.GroupID, scope.TaskID, status, submissionID, scope.TopicID, scope.MandateID, scope.TaskRevision,
-		scope.assessmentID, scope.PolicyRevision, scope.ConfigurationSourceID, scope.scopeJSON, domain.ChatActionReadOnlyInvestigation).Scan(
-		&coordinator, &dispatchPolicy, &taskAssignee, &mandateAssignee, &messageID, &sourceKind, &sourceID)
+		domain.ChatIntakePurpose, scope.dispatchRequestID, scope.GroupID, scope.TaskID, status, submissionID, scope.TopicID, scope.MandateID,
+		scope.TaskRevision, scope.assessmentID, scope.PolicyRevision, scope.ConfigurationSourceID, scope.scopeJSON, domain.ChatActionReadOnlyInvestigation).Scan(
+		&coordinator, &dispatchPolicy, &taskAssignee, &mandateAssignee, &c.ID, &c.MessageID, &c.MemberID, &c.TurnID, &c.Generation, &c.SourceKind, &c.SourceID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrTaskInvestigationNotReady
 	}
 	if err != nil {
 		return err
 	}
-	kind, id, err := messageSourceInTx(ctx, tx, messageID)
+	kind, id, err := messageSourceInTx(ctx, tx, c.MessageID)
 	if err != nil {
 		return err
 	}
-	if sourceID == "" || kind != sourceKind || id != sourceID {
+	if c.SourceID == "" || kind != c.SourceKind || id != c.SourceID {
 		return ErrTaskInvestigationNotReady
+	}
+	// A competing intake may have recorded a same-source limit after admission.
+	if err := chatDiscussionSourceGateInTx(ctx, tx, c, false); err != nil {
+		var limit *chatNonAdmission
+		if errors.As(err, &limit) || errors.Is(err, ErrMemberToolDenied) || errors.Is(err, ErrInvalid) {
+			return ErrTaskInvestigationNotReady
+		}
+		return err
 	}
 	if err := chatInvestigationVersionsInTx(ctx, tx, scope.GroupID, scope.ArtifactVersions); err != nil {
 		if errors.Is(err, ErrNotFound) {

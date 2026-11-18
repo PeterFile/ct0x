@@ -72,15 +72,18 @@ func (s *Store) ResolveCoordinationDelivery(ctx context.Context, groupID, delive
 	if !valid {
 		return out, ErrMemberToolDenied
 	}
-	actual, err := coordinationQueuedProvenanceInTx(ctx, tx, *p, sender)
+	work, err := lookupTaskWorkDeliveryInTx(ctx, tx, groupID, deliveryID)
+	if err == nil {
+		state, err = s.taskWorkOwnerRoleInTx(ctx, tx, work, "")
+	} else if errors.Is(err, ErrNotFound) {
+		var actual CoordinationRoleProvenance
+		actual, err = coordinationQueuedProvenanceInTx(ctx, tx, *p, sender)
+		if err == nil && actual.Kind != CoordinationRoleOrdinary {
+			state, err = coordinationRoleStateInTx(ctx, tx, MemberToolScope{}, actual)
+		}
+	}
 	if err != nil {
 		return out, err
-	}
-	if actual.Kind != CoordinationRoleOrdinary {
-		state, err = coordinationRoleStateInTx(ctx, tx, MemberToolScope{}, actual)
-		if err != nil {
-			return out, err
-		}
 	}
 	phase = "commit"
 	if err := tx.Commit(); err != nil {
@@ -172,14 +175,26 @@ func (s *Store) resolveCoordinationExecution(ctx context.Context, scope MemberTo
 	if expected.Kind != CoordinationRoleCoordinator && expected.Kind != CoordinationRoleWorker {
 		return out, ErrMemberToolDenied
 	}
-	p, err := coordinationExecutionProvenanceInTx(ctx, tx, scope, expected)
-	if err != nil {
-		return out, err
+	var state CoordinationRoleState
+	work, err := lookupTaskWorkExecutionInTx(ctx, tx, scope)
+	if err == nil {
+		if !work.d.SourceKind.IsOwnerContinuation() || expected != taskWorkOwnerProvenance(work) {
+			return out, ErrMemberToolDenied
+		}
+		if _, err := s.investigationProfileInTx(ctx, tx, expected, investigation); err != nil {
+			return out, err
+		}
+		state, err = s.taskWorkOwnerRoleInTx(ctx, tx, work, scope.Claim.TurnID)
+	} else if errors.Is(err, ErrNotFound) {
+		var p CoordinationRoleProvenance
+		p, err = coordinationExecutionProvenanceInTx(ctx, tx, scope, expected)
+		if err == nil {
+			_, err = s.investigationProfileInTx(ctx, tx, p, investigation)
+		}
+		if err == nil {
+			state, err = coordinationRoleStateInTx(ctx, tx, scope, p)
+		}
 	}
-	if _, err := s.investigationProfileInTx(ctx, tx, p, investigation); err != nil {
-		return out, err
-	}
-	state, err := coordinationRoleStateInTx(ctx, tx, scope, p)
 	if err != nil {
 		return out, err
 	}

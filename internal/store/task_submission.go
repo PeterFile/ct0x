@@ -49,6 +49,11 @@ func (s *Store) submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTask
 	if err != nil {
 		return domain.Submission{}, err
 	}
+	if noticeTopic == nil && turnID != "" {
+		if err := denyTaskWorkFallbackInTx(ctx, tx, turnID); err != nil {
+			return domain.Submission{}, err
+		}
+	}
 	scope := mutationScope{operation: "submit_task", actorID: input.ActorID, groupID: input.GroupID, key: input.IdempotencyKey}
 	id, replay, err := reserveMutation(ctx, tx, scope, taskSubmissionPayload(input))
 	if err != nil {
@@ -75,6 +80,10 @@ func (s *Store) submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTask
 		return domain.Submission{}, ErrMemberToolDenied
 	}
 	investigation, err := s.chatTextSubmissionInTx(ctx, tx, input)
+	if err != nil {
+		return domain.Submission{}, err
+	}
+	parent, err := taskWorkSubmissionParentInTx(ctx, tx, input, investigation)
 	if err != nil {
 		return domain.Submission{}, err
 	}
@@ -115,6 +124,9 @@ func (s *Store) submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTask
 	}
 	if investigation.TaskID != "" {
 		if err := s.checkInvestigationSubmissionWriteInTx(ctx, tx, investigation, input, submission.ID); err != nil {
+			return domain.Submission{}, err
+		}
+		if err := taskWorkChildrenSettledInTx(ctx, tx, parent); err != nil {
 			return domain.Submission{}, err
 		}
 	}

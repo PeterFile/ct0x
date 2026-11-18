@@ -72,6 +72,9 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 	if n != 1 {
 		return domain.Turn{}, queueError(action, ErrConflict)
 	}
+	if err := s.taskWorkClaimInTx(ctx, tx, t); err != nil {
+		return domain.Turn{}, queueError(action, err)
+	}
 	for _, key := range keys {
 		result, err := tx.ExecContext(ctx, `INSERT INTO resource_claims(resource_key,turn_id) VALUES(?,?) ON CONFLICT(resource_key) DO NOTHING`, key, t.ID)
 		if err != nil {

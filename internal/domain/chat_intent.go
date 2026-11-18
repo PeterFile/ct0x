@@ -8,6 +8,7 @@ const (
 	ChatActionReadOnlyInvestigation = "read_only_investigation"
 	ChatPreparationTopicSummary     = "topic_summary"
 	ChatIntakePurpose               = "chat_intake/v1"
+	ChatDispositionContinueWork     = "continue_work"
 )
 
 // ChatPolicyRequest is local-user configuration, not a member tool grant.
@@ -78,6 +79,10 @@ type ChatCandidate struct {
 	SourceID               string            `json:"source_id"`
 	SourceKind             string            `json:"source_kind"`
 	RepairSource           *ChatRepairSource `json:"repair_source,omitempty"`
+
+	// Advisory live same-topic hints, not a selection or proof of authority.
+	// MessageID is the source to quote and the original reply destination.
+	FollowupTaskIDs []string `json:"followup_task_ids,omitempty"`
 }
 
 // TaskWorkspaceScope records admission facts, not execution permission or a
@@ -111,21 +116,32 @@ type TaskWorkspaceGrant struct {
 // request_work requires an actual user source; prepare_work requires enabled
 // written preauthorization. discuss/clarify do not create tasks or dispatches.
 type ChatAssessment struct {
-	Disposition string                `json:"disposition"`
-	Action      string                `json:"action,omitempty"`
-	Title       string                `json:"title,omitempty"`
-	Description string                `json:"description,omitempty"`
-	Acceptance  string                `json:"acceptance,omitempty"`
-	Reason      string                `json:"reason"`
-	Question    string                `json:"question,omitempty"`
-	Repair      *ChatRepairAssessment `json:"repair,omitempty"`
+	Disposition string                  `json:"disposition"`
+	Action      string                  `json:"action,omitempty"`
+	Title       string                  `json:"title,omitempty"`
+	Description string                  `json:"description,omitempty"`
+	Acceptance  string                  `json:"acceptance,omitempty"`
+	Reason      string                  `json:"reason"`
+	Question    string                  `json:"question,omitempty"`
+	Repair      *ChatRepairAssessment   `json:"repair,omitempty"`
+	Followup    *ChatFollowupAssessment `json:"followup,omitempty"`
 
 	// Only for discuss: a verbatim restriction from the bound local-user message.
 	DiscussionOnlyExcerpt *string `json:"discussion_only_excerpt,omitempty"`
 }
 
+// ChatFollowupAssessment proposes context for existing work, not new authority.
+// TaskID, if specified, must occur in the source; Constraint must be a verbatim
+// excerpt. An empty TaskID asks the Store to resolve work in the source topic.
+type ChatFollowupAssessment struct {
+	TaskID     string `json:"task_id,omitempty"`
+	Constraint string `json:"constraint,omitempty"`
+}
+
 // ChatAssessmentReceipt preserves the real assessor and source separately from
-// local-user authority recorded by the legacy admission gate.
+// local-user authority recorded by the legacy admission gate. A source replay
+// can return a different CandidateID: it is not an evaluation of the caller's
+// candidate and must not schedule another discussion action.
 type ChatAssessmentReceipt struct {
 	ID          string `json:"id"`
 	CandidateID string `json:"candidate_id"`
@@ -157,6 +173,10 @@ type ChatAssessmentReceipt struct {
 	DiscussionOnly        bool   `json:"discussion_only,omitempty"`
 	DiscussionOnlyExcerpt string `json:"discussion_only_excerpt,omitempty"`
 
-	WorkspaceScope *TaskWorkspaceScope `json:"workspace_scope,omitempty"`
-	RepairLink     *ChatRepairLink     `json:"repair_link,omitempty"`
+	WorkspaceScope    *TaskWorkspaceScope `json:"workspace_scope,omitempty"`
+	RepairLink        *ChatRepairLink     `json:"repair_link,omitempty"`
+	WorkInputID       string              `json:"work_input_id,omitempty"`
+	WorkInputPending  bool                `json:"work_input_pending,omitempty"` // Recorded without a native wake by explicit dormant mode.
+	WorkDeliveryID    string              `json:"work_delivery_id,omitempty"`
+	WorkWakeMessageID string              `json:"work_wake_message_id,omitempty"`
 }

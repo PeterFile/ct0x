@@ -42,3 +42,40 @@ func (e *Engine) CaptureChatCandidate(ctx context.Context, scope store.MemberToo
 func (e *Engine) AssessChatIntent(ctx context.Context, scope store.MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string) (domain.ChatAssessmentReceipt, error) {
 	return e.store.ApplyChatAssessment(ctx, scope, candidateID, input, content, key)
 }
+
+// AssessChatIntentDormant records official input without native delivery. It is
+// for trusted callers explicitly choosing the attempt-only path.
+func (e *Engine) AssessChatIntentDormant(ctx context.Context, scope store.MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string) (domain.ChatAssessmentReceipt, error) {
+	return e.store.ApplyChatAssessmentDormant(ctx, scope, candidateID, input, content, key)
+}
+
+func (e *Engine) ListWorkInputsForMember(ctx context.Context, scope store.MemberToolScope) ([]domain.TaskWorkInput, error) {
+	return e.store.ListWorkInputsForMember(ctx, scope)
+}
+
+func (e *Engine) ListWorkInputHistoryForMember(ctx context.Context, scope store.MemberToolScope, options store.ListOptions) (store.Page[domain.TaskWorkInput], error) {
+	return e.store.ListWorkInputHistoryForMember(ctx, scope, options)
+}
+
+// GetWorkInputForMember reads one exact input handle under the current claim.
+func (e *Engine) GetWorkInputForMember(ctx context.Context, scope store.MemberToolScope, inputID string) (domain.TaskWorkInput, error) {
+	return e.store.GetWorkInputForMember(ctx, scope, inputID)
+}
+
+func (e *Engine) AcknowledgeWorkInput(ctx context.Context, scope store.MemberToolScope, inputID string) (domain.TaskWorkInput, error) {
+	return e.store.AcknowledgeWorkInput(ctx, scope, inputID)
+}
+
+// AcknowledgeWorkInputWithKey retries the exact confirmation under a live owner claim.
+func (e *Engine) AcknowledgeWorkInputWithKey(ctx context.Context, scope store.MemberToolScope, inputID, key string) (domain.TaskWorkInput, error) {
+	return e.store.AcknowledgeWorkInputWithKey(ctx, scope, inputID, key)
+}
+
+func (e *Engine) HandBackWorkInput(ctx context.Context, scope store.MemberToolScope, inputID, reason string) (domain.TaskWorkInput, error) {
+	return e.store.HandBackWorkInput(ctx, scope, inputID, reason)
+}
+
+// HandBackWorkInputWithKey retries the exact escalation, preserving its original notice.
+func (e *Engine) HandBackWorkInputWithKey(ctx context.Context, scope store.MemberToolScope, inputID, reason, key string) (domain.TaskWorkInput, error) {
+	return e.store.HandBackWorkInputWithKey(ctx, scope, inputID, reason, key)
+}

@@ -101,15 +101,22 @@ func requestWorkPayload(groupID string, request domain.RequestWorkRequest, key s
 }
 
 func admitWorkInTx(ctx context.Context, tx *sql.Tx, trigger domain.Trigger, request domain.RequestWorkRequest, decisionID string) error {
+	hasInputs, err := workInputSchemaInTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	query := "SELECT EXISTS(SELECT 1 FROM routing_decisions WHERE trigger_id=:trigger)"
+	if hasInputs {
+		query += " OR EXISTS(SELECT 1 FROM chat_followup_routes WHERE trigger_id=:trigger)"
+	}
 	var coordinated bool
-	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM routing_decisions WHERE trigger_id=?)", trigger.ID).Scan(&coordinated); err != nil {
+	if err := tx.QueryRowContext(ctx, query, sql.Named("trigger", trigger.ID)).Scan(&coordinated); err != nil {
 		return err
 	}
 	if coordinated {
 		return fmt.Errorf("%w：来源已获授权", ErrConflict)
 	}
 	var task domain.Task
-	var err error
 	if request.Mode == domain.RoutingDecisionCreateNew {
 		n := request.NewTask
 		task, err = insertTaskInTx(ctx, tx, CreateTaskInput{

@@ -20,6 +20,8 @@ func TaskLifecycleRoutes(local *platform.LocalUser) []Route {
 		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/reviews", a.listTaskReviews},
 		{http.MethodPost, "/api/v1/groups/{group}/tasks/{task}/reviews", noQuery(a.reviewTask)},
 		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/reviews/{review}", noQuery(a.getTaskReview)},
+		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/work-inputs", a.listTaskWorkInputs},
+		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/work-reports", a.listTaskWorkReports},
 	}
 }
 
@@ -101,6 +103,30 @@ func (a localAPI) listTaskReviews(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, err := a.local.ListTaskReviews(r.Context(), groupID, taskID, options)
+	writePage(w, page, scope, groupID, err)
+}
+
+func (a localAPI) listTaskWorkInputs(w http.ResponseWriter, r *http.Request) {
+	groupID, taskID := r.PathValue("group"), r.PathValue("task")
+	scope := "task_work_inputs:" + taskID
+	options, err := listOptions(r, scope, groupID)
+	if err != nil {
+		operationError(w, err)
+		return
+	}
+	page, err := a.local.ListTaskWorkInputs(r.Context(), groupID, taskID, options)
+	writePage(w, page, scope, groupID, err)
+}
+
+func (a localAPI) listTaskWorkReports(w http.ResponseWriter, r *http.Request) {
+	groupID, taskID := r.PathValue("group"), r.PathValue("task")
+	scope := "task_work_reports:" + taskID
+	options, err := listOptions(r, scope, groupID)
+	if err != nil {
+		operationError(w, err)
+		return
+	}
+	page, err := a.local.ListTaskWorkReports(r.Context(), groupID, taskID, options)
 	writePage(w, page, scope, groupID, err)
 }
 

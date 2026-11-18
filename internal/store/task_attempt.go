@@ -61,10 +61,24 @@ func taskActorInTx(ctx context.Context, tx *sql.Tx, groupID, actorID string, sco
 	return bound.Claim.TurnID, nil
 }
 
-func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTaskAttemptInput, authority *assignmentActivationAuthority) (domain.TaskAttempt, error) {
+// Only server-local role transactions can provide activation authority.
+type taskAttemptActivationAuthority interface {
+	authorizeTaskAttemptInTx(context.Context, *sql.Tx, ActivateTaskAttemptInput) error
+}
+
+func (a *assignmentActivationAuthority) authorizeTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTaskAttemptInput) error {
+	return coordinationActivateOwnershipInTx(ctx, tx, input, a)
+}
+
+func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTaskAttemptInput, authority taskAttemptActivationAuthority) (domain.TaskAttempt, error) {
 	turnID, err := taskActorInTx(ctx, tx, input.GroupID, input.ActorID, input.MemberScope)
 	if err != nil {
 		return domain.TaskAttempt{}, err
+	}
+	if authority == nil && turnID != "" {
+		if err := denyTaskWorkFallbackInTx(ctx, tx, turnID); err != nil {
+			return domain.TaskAttempt{}, err
+		}
 	}
 	scope := mutationScope{operation: "activate_task_attempt", actorID: input.ActorID, groupID: input.GroupID, key: input.IdempotencyKey}
 	// The original fences are semantic input; a new live scope cannot rebind a replay.
@@ -77,7 +91,12 @@ func activateTaskAttemptInTx(ctx context.Context, tx *sql.Tx, input ActivateTask
 		attempt, _, err := taskAttemptInTx(ctx, tx, input.GroupID, input.TaskID, id)
 		return attempt, err
 	}
-	if err := coordinationActivateOwnershipInTx(ctx, tx, input, authority); err != nil {
+	if authority == nil {
+		err = coordinationActivateOwnershipInTx(ctx, tx, input, nil)
+	} else {
+		err = authority.authorizeTaskAttemptInTx(ctx, tx, input)
+	}
+	if err != nil {
 		return domain.TaskAttempt{}, err
 	}
 	if input.ExpectedRevision < 1 {
