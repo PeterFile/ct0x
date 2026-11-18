@@ -169,6 +169,8 @@ func TestTaskWorkOtherTopicReference(t *testing.T) {
 		continuing         bool
 	}{
 		{"legacy-postposed-continue", "请帮我把 " + old.TaskID + " 接着做。", "followup_target_unavailable", false},
+		{"separate-prefix-continue", "另开一项工作继续任务 <" + old.TaskID + ">。", "followup_target_unavailable", false},
+		{"independent-and-continue", "另开一项工作整理议程并继续任务 <" + old.TaskID + ">。", "followup_target_unavailable", false},
 		{"independent", "另开一项工作整理议程，引用其它话题任务 <" + old.TaskID + "> 的结论。", "", false},
 		{"optional-citation", "另开一项工作整理议程，可以参考其它话题任务 " + old.TaskID + " 的结论。", "", false},
 		{"independent-framing", "另开一项独立工作整理会议议程（关联材料 " + old.TaskID + "）。", "", false},
@@ -190,14 +192,24 @@ func TestTaskWorkOtherTopicReference(t *testing.T) {
 			}
 			protected := make(map[string][][]any)
 			if tc.denial != "" {
-				for _, table := range []string{"tasks", "mandates", "coordination_dispatch_requests", "task_work_inputs", "task_work_deliveries", "task_attempts", "turns", "resource_claims"} {
+				for _, table := range []string{"tasks", "mandates", "routing_decisions", "coordination_dispatch_requests", "coordination_assignments", "task_work_inputs", "task_work_deliveries", "task_attempts", "turns", "resource_claims"} {
 					protected[table] = messageSequenceTableRows(t, f.s, table)
 				}
 			}
-			r, err := f.s.ApplyChatAssessment(ctx, scope, c.ID, proposal, "评估用户请求。", tc.name)
+			const note = "评估用户请求。"
+			r, err := f.s.ApplyChatAssessment(ctx, scope, c.ID, proposal, note, tc.name)
 			if tc.denial != "" {
 				chatAssertNotAdmitted(t, r, err, tc.denial)
 				messageSequencePreserved(t, f.s, protected)
+				notice, err := f.s.GetMessage(ctx, thread.GroupID, r.NoticeMessageID)
+				if err != nil || notice.TopicID != thread.TopicID || !strings.Contains(notice.Content, r.Question) || len(notice.Deliveries) != 0 {
+					t.Fatalf("expected a clarification without wakeups in the source topic: %+v %v", notice, err)
+				}
+				beforeReplay := messageSequenceSnapshot(t, f.s)
+				if again, err := f.s.ApplyChatAssessment(ctx, scope, c.ID, proposal, note, tc.name); err != nil || !reflect.DeepEqual(again, r) {
+					t.Fatalf("clarification replay diverged: %+v %v", again, err)
+				}
+				messageSequencePreserved(t, f.s, beforeReplay)
 			} else if err != nil || r.Outcome != "admitted" || r.TaskID == "" || r.TaskID == old.TaskID || r.DispatchRequestID == "" ||
 				!r.AuthorityEvidenceVerified || r.AuthorizationMessageID != m.ID {
 				t.Fatalf("contextual citation captured an independent request: %+v %v", r, err)

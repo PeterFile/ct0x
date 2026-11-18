@@ -229,10 +229,12 @@ func unresolvedWorkTaskReference(body, hint string, otherTopicByID map[string]bo
 				}
 			}
 		}
-		// Even without a matching row, an explicit target is not new work.
+		// Unknown explicit targets are not new work. A known cross-topic
+		// continuation target also overrides separate-work framing.
 		for _, pattern := range []*regexp.Regexp{labeledWorkTaskID, markedWorkTaskID, continuedWorkID} {
 			for _, match := range pattern.FindAllStringSubmatchIndex(clause, -1) {
-				if _, found := otherTopicByID[clause[match[2]:match[3]]]; !found {
+				otherTopic, found := otherTopicByID[clause[match[2]:match[3]]]
+				if !found || (pattern == continuedWorkID && otherTopic) {
 					return true
 				}
 			}
