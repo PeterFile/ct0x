@@ -141,6 +141,164 @@ it("repair: never relaxes legacy platform, Agent or empty-message authority with
   ]) await rejectRepair(receipt);
 });
 
+const investigationScope = { objective: "  核对讨论中未决事项  ", allow_topic_messages: false,
+  artifact_versions: [{ artifact_id: "成果 /+?雪", version_id: "准确版本 /+?旧" }, { artifact_id: "成果 /+?雪", version_id: "另一个版本" }],
+  max_delegations: 4 };
+const topicInvestigation = { ...investigationScope, allow_topic_messages: true, artifact_versions: null, max_delegations: 0 };
+const investigationAdmission = { ...chatAdmission, action: "read_only_investigation", disposition: "prepare_work",
+  authority: "written_preauthorization", authorization_message_id: "policy-rule", purpose: "chat_intake/v1", outcome: "admitted",
+  source_kind: "member", source_id: "member-command", source_sender_id: "member-1", authority_evidence_verified: true };
+
+it("reads optional investigation scope and capability observations separately without upgrading an old reply", async () => {
+  const replies = [policy, { ...policy, investigation: null, investigation_supported: true, investigation_execution_enabled: false },
+    { ...policy, enabled: false, investigation: topicInvestigation },
+    { ...policy, investigation: investigationScope, investigation_supported: false, investigation_execution_enabled: true },
+    { ...policy, investigation: { ...investigationScope, objective: "字".repeat(85) + "x",
+      artifact_versions: Array.from({ length: 16 }, (_, n) => ({ artifact_id: "雪".repeat(42) + "xy",
+        version_id: "版".repeat(42) + String(n).padStart(2, "0") })) } }];
+  const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
+  for (const reply of replies) {
+    transport.mockResolvedValueOnce(json(reply));
+    await expect(getChatPolicy(group.id)).resolves.toEqual(reply);
+  }
+});
+it("rejects malformed investigation scope and capability fields in policy reads", async () => {
+  const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
+  for (const change of [
+    { investigation_supported: "true" }, { investigation_execution_enabled: null },
+    { configuration_source_id: "" }, { revision: 0 }, { investigation: true },
+    ...[
+      { objective: " \t\u3000" }, { objective: "目标\0" }, { objective: "字".repeat(86) }, { objective: "\ud800" },
+      { allow_topic_messages: 1 }, { artifact_versions: undefined, allow_topic_messages: true }, { artifact_versions: null },
+      { artifact_versions: [] }, { max_delegations: -1 }, { max_delegations: 5 }, { max_delegations: 1.5 }, { path: "/unapproved" },
+      { artifact_versions: Array.from({ length: 17 }, (_, n) => ({ artifact_id: "成果", version_id: String(n) })) },
+      { artifact_versions: [...investigationScope.artifact_versions, investigationScope.artifact_versions[0]] },
+      ...[{ version_id: " " }, { version_id: "雪".repeat(43) }, { artifact_id: "\tartifact" }, { artifact_id: "a\nb" },
+        { version_id: "a\0b" }, { version_id: undefined, head: true }, { group_id: "other-group" }].map(ref =>
+        ({ artifact_versions: [{ ...investigationScope.artifact_versions[0], ...ref }] })),
+    ].map(scope => ({ investigation: { ...investigationScope, ...scope } })),
+  ]) {
+    transport.mockResolvedValueOnce(json({ ...policy, investigation: investigationScope, ...change }));
+    await expect(getChatPolicy(group.id), JSON.stringify(change)).rejects.toMatchObject({ code: "invalid_response" });
+  }
+  const raw = JSON.stringify({ ...policy, investigation: investigationScope });
+  for (const ambiguous of [raw.replace('"version_id":', String.raw`"version_\u0069d":"other","version_id":`),
+    raw.replace('"max_delegations":4', '"max_delegations":4.0000000000000001')]) {
+    transport.mockResolvedValueOnce(new Response(ambiguous, { status: 200 }));
+    await expect(getChatPolicy(group.id)).rejects.toMatchObject({ code: "invalid_response" });
+  }
+});
+it("PUT sends only the owned fields and requires the exact investigation scope on its receipt", async () => {
+  const actual = { ...policy, investigation: investigationScope, investigation_supported: true, investigation_execution_enabled: false };
+  const command = { ...input, investigation: investigationScope };
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(json(actual)); vi.stubGlobal("fetch", transport);
+  const withClaims = { ...command, investigation_supported: true, investigation_execution_enabled: true,
+    source_id: "raw-chat-source", configuration_source_id: "raw-config-source", authorized_by: "user", outcome: "admitted" };
+  await expect(setChatPolicy(group.id, withClaims, "investigation-opt-in")).resolves.toEqual(actual);
+  const [url, init] = transport.mock.calls[0];
+  expect(url).toBe(`/api/v1/groups/${group.id}/coordination/chat-policy`);
+  expect(init?.method).toBe("PUT"); expect(new Headers(init?.headers).get("Idempotency-Key")).toBe("investigation-opt-in");
+  expect(JSON.parse(String(init?.body))).toEqual(command);
+  for (const investigation of [undefined, null, { ...investigationScope, objective: investigationScope.objective.trim() },
+    { ...investigationScope, allow_topic_messages: true }, { ...investigationScope, max_delegations: 3 },
+    { ...investigationScope, artifact_versions: investigationScope.artifact_versions.slice().reverse() },
+    { ...investigationScope, artifact_versions: [{ ...investigationScope.artifact_versions[0], version_id: "foreign" }] }]) {
+    transport.mockResolvedValueOnce(json({ ...actual, investigation }));
+    const error = await setChatPolicy(group.id, command, "investigation-opt-in").catch(error => error);
+    expect(error).toMatchObject({ code: "invalid_response" }); expect(isChatPolicyDefinitiveRejection(error)).toBe(false);
+  }
+});
+it("reads the bounded fbe95f8 combined witness on GET and on a matching PUT receipt", async () => {
+  // B uses Go json.Marshal for both the scope inside the rule and the outer WriteJSON body.
+  const goJSON = (value: unknown) => JSON.stringify(value).replace(/[<>&\u2028\u2029]/gu,
+    char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  const investigation = { objective: "<".repeat(256), allow_topic_messages: false,
+    artifact_versions: Array.from({ length: 16 }, (_, n) => ({ artifact_id: "<".repeat(128),
+      version_id: "<".repeat(124) + n.toString(2).padStart(4, "0").replace(/[01]/g, bit => bit === "0" ? "<" : ">") })),
+    max_delegations: 4 };
+  const preauthorization_text = "本机用户已配置本群、本话题聊天准入策略：启用=false；允许纯文本交付，以及真实用户明确请求且已有读写目录授权的目录工作；本版总准入额度=100。"
+    + "\n预授权范围 topic_summary：仅依据本群本话题已有消息准备纯文本摘要；目标与验收由服务端固定。不得改为其他目标、引用Artifact版本、读写文件或执行外部动作。"
+    + "\n预授权范围 read_only_investigation：只读调查并交付纯文本；只允许以下明确配置的资料，不授予文件、进程或网络权限。\n" + goJSON(investigation);
+  const grants = { enabled: false, allow_preparation: true, preparation_scope_kind: "topic_summary" as const,
+    allow_workspace_changes: true, max_admissions: 100, investigation };
+  const actual = { ...policy, ...grants, preauthorization_text, preauthorization_message_id: "normative-command-message-id",
+    preparation_supported: true, workspace_changes_supported: true, investigation_supported: true, investigation_execution_enabled: false };
+  const raw = goJSON(actual) + "\n";
+  expect(new TextEncoder().encode(preauthorization_text).length).toBe(27334);
+  expect(raw).toContain(String.raw`"investigation":{"objective":"\u003c`);
+  expect(raw).toContain(String.raw`\"objective\":\"\\u003c`);
+  const transport = vi.fn<typeof fetch>().mockImplementation(async () =>
+    new Response(raw, { status: 200, headers: { "Content-Type": "application/json; charset=utf-8" } }));
+  vi.stubGlobal("fetch", transport);
+  await expect(getChatPolicy(group.id)).resolves.toEqual(actual);
+  await expect(setChatPolicy(group.id, { ...input, ...grants }, "combined-exact-scope")).resolves.toEqual(actual);
+});
+it("limits combined preauthorization text to 32 KiB and keeps the 8192-byte limit for other shapes", async () => {
+  const canonical = { ...policy, allow_preparation: true, preparation_scope_kind: "topic_summary", preparation_supported: true,
+    preauthorization_message_id: "server-rule-id" };
+  const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
+  for (const [shape, max] of [
+    [{ ...canonical, investigation: topicInvestigation }, 32 * 1024],
+    [canonical, 8192],
+    [{ ...canonical, preparation_scope_kind: "", preparation_supported: false, investigation: topicInvestigation }, 8192],
+  ] as const) {
+    const preauthorization_text = "字".repeat(Math.floor(max / 3)) + "x".repeat(max % 3);
+    transport.mockResolvedValueOnce(json({ ...shape, preauthorization_text }));
+    await expect(getChatPolicy(group.id)).resolves.toMatchObject({ preauthorization_text });
+    transport.mockResolvedValueOnce(json({ ...shape, preauthorization_text: preauthorization_text + "x" }));
+    await expect(getChatPolicy(group.id)).rejects.toMatchObject({ code: "invalid_response" });
+  }
+});
+it("accepts Go's nil version list for topic-only scope and omits absent scope on a legacy-compatible save", async () => {
+  const staged = { ...policy, investigation: topicInvestigation };
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(json(staged)).mockResolvedValueOnce(json({ ...policy, investigation: null }))
+    .mockResolvedValueOnce(json(staged)); vi.stubGlobal("fetch", transport);
+  await expect(setChatPolicy(group.id, { ...input, investigation: { ...topicInvestigation, artifact_versions: [] } }, "topic-only")).resolves.toEqual(staged);
+  const off = { ...input, investigation: null };
+  await expect(setChatPolicy(group.id, off, "investigation-off")).resolves.toEqual({ ...policy, investigation: null });
+  expect(transport.mock.calls[1][1]?.body).toBe(JSON.stringify(input));
+  await expect(setChatPolicy(group.id, input, "legacy-off")).rejects.toMatchObject({ code: "invalid_response" });
+});
+it("rejects invalid investigation input before fetch", async () => {
+  const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
+  for (const investigation of [{ ...investigationScope, objective: "字".repeat(86) }, { ...investigationScope, artifact_versions: [] },
+    { ...investigationScope, artifact_versions: Array(1) as typeof investigationScope.artifact_versions },
+    { ...investigationScope, artifact_versions: [{ ...investigationScope.artifact_versions[0], current: true }] }]) {
+    const command = { ...input, investigation };
+    await expect(setChatPolicy(group.id, command, "invalid-investigation")).rejects.toMatchObject({ code: "invalid_input" });
+  }
+  expect(transport).not.toHaveBeenCalled();
+});
+it("reads verified investigation preparation from a member or local chat without inventing scope fields", async () => {
+  const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
+  for (const receipt of [investigationAdmission, { ...investigationAdmission, topic_id: "话题 /+? ",
+    source_kind: "local_user_chat", source_id: "chat-command", source_sender_id: "user", created_at: "2028-02-29T00:00:00.123456789Z" }]) {
+    transport.mockResolvedValueOnce(json(receipt)); await expect(getChatAdmission(group.id, task.id)).resolves.toEqual(receipt);
+  }
+});
+it.each(["2026-02-30T00:00:00Z", "2026-11-17T24:00:00Z"])("rejects normalized calendar timestamp %s for investigation only", async created_at => {
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(json({ ...investigationAdmission, created_at }));
+  vi.stubGlobal("fetch", transport);
+  await expect(getChatAdmission(group.id, task.id)).rejects.toMatchObject({ code: "invalid_response" });
+  for (const legacy of [chatAdmission, workspaceAdmission]) {
+    const receipt = { ...legacy, created_at };
+    transport.mockResolvedValueOnce(json(receipt));
+    await expect(getChatAdmission(group.id, task.id)).resolves.toEqual(receipt);
+  }
+});
+it("requires exact task/group and genuine written preauthorization for investigation admission", async () => {
+  const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
+  for (const change of [{ task_id: "other-task" }, { group_id: "other-group" }, { disposition: "request_work" },
+    { authority: "explicit_request" }, { authorization_message_id: "" }, { authorization_message_id: investigationAdmission.message_id },
+    { authority_evidence_verified: undefined }, { authority_evidence_verified: false }, { outcome: undefined }, { purpose: "" },
+    { source_kind: "unknown", source_id: "" }, { source_kind: "platform" }, { source_kind: "local_user_policy", source_sender_id: "user" },
+    { source_kind: "local_user_chat" }, { source_sender_id: "user" }, { source_id: "" },
+    { workspace_scope: workspaceScope }, { repair_link: repairLink }, { investigation_scope: investigationScope }]) {
+    transport.mockResolvedValueOnce(json({ ...investigationAdmission, ...change }));
+    await expect(getChatAdmission(group.id, task.id), JSON.stringify(change)).rejects.toMatchObject({ code: "invalid_response" });
+  }
+});
+
 it("reads supported default-false workspace policy separately from an old instance", async () => {
   const actual = { ...policy, workspace_changes_supported: true };
   vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValueOnce(json(actual)).mockResolvedValueOnce(json(policy)));
