@@ -147,13 +147,21 @@ func WriteError(w http.ResponseWriter, status int, code, message string) {
 }
 
 func WriteJSON(w http.ResponseWriter, status int, value any) {
-	body, err := json.Marshal(value)
-	if err != nil {
+	writeJSON(w, status, value)
+}
+
+// Report whether the original JSON was accepted by the response writer, not
+// whether it reached the client or whether a command committed.
+func writeJSON(w http.ResponseWriter, status int, value any) bool {
+	body, encodeErr := json.Marshal(value)
+	if encodeErr != nil {
 		status = http.StatusInternalServerError
 		body = []byte(`{"error":{"code":"internal_error","message":"响应编码失败"}}`)
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
-	_, _ = w.Write(append(body, '\n'))
+	body = append(body, '\n')
+	n, err := w.Write(body)
+	return encodeErr == nil && err == nil && n == len(body)
 }
