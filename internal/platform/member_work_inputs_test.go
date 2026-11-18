@@ -124,6 +124,38 @@ func assertInvalidWorkMCPUnicode(t *testing.T, f *roleRuntimeFixture, token, id,
 	}
 }
 
+func assertOpaqueWorkIDBoundary(t *testing.T, f *roleRuntimeFixture, p *workInputProbe, token, op, argsFormat string, forwardedID func(workInputCall) string) {
+	t.Helper()
+	t.Run("opaque ID whitespace boundary", func(t *testing.T) {
+		maxID := strings.Repeat("🙂", 64)
+		// Same cases as the Pi fixture. The first ID is deliberately not NFC.
+		for i, tc := range []struct {
+			id    string
+			valid bool
+		}{
+			{"\ufeffe\u0301\u3000🙂\ufeff", true}, {"\ufeff", true}, {maxID, true},
+			{"\u0085handle", false}, {"handle\u0085", false}, {"\u3000handle", false}, {"handle\u2003", false}, {maxID + "x", false},
+		} {
+			encoded, err := json.Marshal(tc.id)
+			roleOK(t, err)
+			args := fmt.Sprintf(argsFormat, encoded)
+			key := fmt.Sprintf("opaque-id-%d", i)
+			before := len(p.calls)
+			native := f.http(t, token, op, args, key)
+			params := fmt.Sprintf(`{"name":%q,"arguments":%s}`, op, args)
+			mcp := memberMCPRoleText(t, memberMCPRoleHTTP(t, f, token, fmt.Sprintf("%q", key), "tools/call", params), !tc.valid)
+			calls := p.calls[before:]
+			if tc.valid {
+				if native.Code != 201 || len(calls) != 2 || forwardedID(calls[0]) != tc.id || forwardedID(calls[1]) != tc.id {
+					t.Fatalf("%s changed or rejected opaque ID %q: %d, %s", op, tc.id, native.Code, mcp)
+				}
+			} else if native.Code != 400 || !strings.Contains(mcp, `"code":"invalid_input"`) || len(calls) != 0 {
+				t.Fatalf("%s did not reject invalid opaque ID %q: %d, %s", op, tc.id, native.Code, mcp)
+			}
+		}
+	})
+}
+
 func TestWorkInputsRealWorkerBindingNativeAndMCP(t *testing.T) {
 	for _, withAck := range []bool{false, true} {
 		t.Run(fmt.Sprintf("ack=%v", withAck), func(t *testing.T) {
@@ -279,6 +311,7 @@ func TestWorkInputsRealWorkerBindingNativeAndMCP(t *testing.T) {
 								t.Fatal("malformed request bound its id or exact valid Unicode was not forwarded")
 							}
 						})
+						assertOpaqueWorkIDBoundary(t, f, p, token, "ack_work_input", `{"input_id":%s}`, func(call workInputCall) string { return call.inputID })
 					}
 					return roleNotStarted()
 				}), nil
@@ -489,6 +522,8 @@ func TestWorkContinuationUsesCapturedIntakeCandidate(t *testing.T) {
 			t.Fatal("transports did not forward exact byte-limit text to B")
 		}
 	})
+	assertOpaqueWorkIDBoundary(t, f, p, token, "send_message", strings.Replace(body, `"reference-only"`, "%s", 1),
+		func(call workInputCall) string { return call.proposal.TaskID })
 	t.Run("empty followup replay", func(t *testing.T) {
 		const base = `{"content":" 记录续办\n","intent_assessment":{"disposition":"continue_work","reason":" 依原要求\n"%s}}`
 		for _, taskID := range []string{"", "reference-only"} {

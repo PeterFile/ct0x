@@ -190,8 +190,13 @@ function validWorkInputText(value: string, limit: number): boolean {
   return utf8TextWithinBytes(value, limit) && /\P{White_Space}/u.test(value) && !value.includes("\u0000");
 }
 
+function validOpaqueIDShape(value: string): boolean {
+  return value !== "" && utf8TextWithinBytes(value, 256) && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+
 function validWorkInputID(value: string): boolean {
-  return value !== "" && value.trim() === value && utf8TextWithinBytes(value, 256) && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+  // Match Go's TrimSpace at the boundaries without rewriting the ID.
+  return validOpaqueIDShape(value) && !/^\p{White_Space}|\p{White_Space}$/u.test(value);
 }
 
 export default function piBridge(pi: ExtensionAPI) {
@@ -221,7 +226,7 @@ export default function piBridge(pi: ExtensionAPI) {
                 const assessment = message.intent_assessment!;
                 if (Object.hasOwn(assessment, "repair")) {
                   const id = assessment.repair!.review_id;
-                  valid = valid && assessment.disposition === "request_work" && validWorkInputID(id);
+                  valid = valid && assessment.disposition === "request_work" && id.trim() === id && validOpaqueIDShape(id);
                 }
                 if (assessment.disposition === "continue_work") {
                   const { task_id: reference, constraint = "" } = assessment.followup ?? {};

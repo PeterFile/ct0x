@@ -254,6 +254,41 @@ test("work input tools send only handles and preserve write identity; untrusted 
   assert.equal(requests.length, 5);
 });
 
+test("opaque ID whitespace boundary", async t => {
+  const receipt = { message_id: "notice", created_at: "2026-11-18T00:00:00Z", delivery_count: 0, content_omitted: true };
+  const { tools, requests } = await toolsFor(t, (_, response, body) => {
+    const { input_id } = JSON.parse(body);
+    json(response, input_id === undefined ? receipt : { input_id }, 201);
+  }, { continue_work: true });
+  const maxID = "🙂".repeat(64);
+  // Same cases as the Go HTTP/MCP fixtures. The first ID is deliberately not NFC.
+  const cases = [
+    ["\ufeffe\u0301\u3000🙂\ufeff", true], ["\ufeff", true], [maxID, true],
+    ["\u0085handle", false], ["handle\u0085", false], ["\u3000handle", false], ["handle\u2003", false], [maxID + "x", false],
+  ];
+  for (const [name, payload] of [
+    ["ack_work_input", input_id => ({ input_id })],
+    ["hand_back_work_input", input_id => ({ input_id, reason: "fixture" })],
+    ["send_message", task_id => ({ content: "fixture", intent_assessment: {
+      disposition: "continue_work", reason: "fixture", followup: { task_id },
+    } })],
+  ]) {
+    for (const [i, [id, valid]] of cases.entries()) {
+      const args = payload(id);
+      const before = requests.length;
+      const result = execute(tools.get(name), args, undefined, `opaque-id-${i}`);
+      if (valid) {
+        await result;
+        assert.equal(requests.length, before + 1);
+        assert.deepEqual(requests[before].body, Buffer.from(JSON.stringify(args)));
+      } else {
+        await assert.rejects(result, error => safeFailure(error, /未发送/));
+        assert.equal(requests.length, before);
+      }
+    }
+  }
+});
+
 test("oversized work input reports an unavailable complete read, not pagination", async t => {
   const { tools, requests } = await toolsFor(t, (_, response) => json(response, { error: {
     code: "tool_result_too_large", message: "untrusted body",
