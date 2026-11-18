@@ -453,7 +453,7 @@ func TestNativeSessionRuntimeFirstReceiptBetweenFailureAndApply(t *testing.T) {
 func rejectNativeFenceInvocation(t *testing.T, run *memberToolRuntimeRun, token, configPath *string) {
 	t.Helper()
 	run.nativeSession.factory = func(config provider.NativeMemberToolConfig, _ []string, _ *provider.NativeSessionReference, _ json.RawMessage) (provider.Executor, error) {
-		_, *token = memberToolRuntimeConfigWithDiscussion(t, config.Path, run.intake)
+		_, *token = memberToolRuntimeConfigWithDiscussion(t, config.Path, run.intakeSchema.piDiscussionExcerpt)
 		if configPath != nil {
 			*configPath = config.Path
 		}
