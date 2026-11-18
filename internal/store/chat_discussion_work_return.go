@@ -12,14 +12,37 @@ import (
 	"agentworkspace/internal/domain"
 )
 
+var chatDiscussionWorkReturnVersion = slices.Index(migrations, chatDiscussionWorkReturnSchema) + 1
+
+// A missing registration is legacy only if the return footprint is absent.
+// Triggers on other tables can survive a dropped return table. With a marker,
+// require the real table and its typed lookup keys without reading any returns.
 func chatDiscussionWorkReturnInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
-	version := slices.Index(migrations, chatDiscussionWorkReturnSchema) + 1
-	if version == 0 {
-		return false, nil
+	var state int
+	err := tx.QueryRowContext(ctx, `SELECT CASE
+	 WHEN EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?1) THEN
+	   CASE WHEN EXISTS(SELECT 1 FROM pragma_table_list('chat_discussion_work_returns')
+	          WHERE "schema"='main' AND type='table' AND wr=1 AND strict=1 AND ncol=7)
+	     AND (SELECT count(*)=7 FROM pragma_table_xinfo('chat_discussion_work_returns','main')
+	          WHERE type='TEXT' AND hidden=0 AND (name,pk,"notnull") IN (
+	           ('origin_message_id',1,1), ('group_id',0,1), ('topic_id',0,1), ('invitation_message_id',0,1),
+	           ('handback_id',0,1), ('message_id',0,1), ('delivery_id',0,0)))
+	     AND (SELECT count(DISTINCT key_name) FROM (
+	            SELECT min(c.name) AS key_name FROM pragma_index_list('chat_discussion_work_returns','main') i
+	            JOIN pragma_index_info(i.name,'main') c WHERE i.origin='u' GROUP BY i.name HAVING count(*)=1
+	          ) WHERE key_name IN ('invitation_message_id','handback_id','message_id','delivery_id'))=4
+	   THEN 1 ELSE -1 END
+	 WHEN (?1>0 AND EXISTS(SELECT 1 FROM main.schema_migrations WHERE version>?1))
+	   OR EXISTS(SELECT 1 FROM main.sqlite_schema WHERE name='chat_discussion_work_returns' COLLATE NOCASE
+	      OR (type='trigger' AND lower(name) GLOB 'chat_discussion_work_return[s_]*')) THEN -1
+	 ELSE 0 END`, chatDiscussionWorkReturnVersion).Scan(&state)
+	if err != nil {
+		return false, err
 	}
-	var installed bool
-	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?)`, version).Scan(&installed)
-	return installed, err
+	if state == -1 {
+		return false, fmt.Errorf("%w：讨论工作回传迁移记录与数据库结构不一致", ErrConflict)
+	}
+	return state == 1, nil
 }
 
 // chatDiscussionWorkReturnInTx is called only from HandbackWork's fenced

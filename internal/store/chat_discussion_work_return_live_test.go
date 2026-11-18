@@ -290,3 +290,76 @@ func TestChatDiscussionWorkReturnRejectsReplySource(t *testing.T) {
 		assertNoWorkReturn(t, s, f.owner, ErrMemberToolDenied) // Even the exact B replay must fail closed.
 	})
 }
+
+func TestChatDiscussionWorkReturnSchemaGuard(t *testing.T) {
+	const dropMarker = `DELETE FROM main.schema_migrations WHERE version=31`
+	const dropTable = `DROP TABLE main.chat_discussion_work_returns`
+	damageLiveLedger := func(t *testing.T, s *Store) {
+		t.Helper()
+		messageSequenceLedger(t, s, 31)
+		// Damage only the registration on the already open DB. Reopening via
+		// Open would run migrations and exercise a different failure path.
+		coordinationDecideExec(t, s, dropMarker)
+		messageSequenceLedger(t, s, 30)
+	}
+	checkHandback := func(t *testing.T, f workReturnFixture) {
+		t.Helper()
+		if h, err := f.s.HandbackWork(ctx, f.owner, workReturnInput, workReturnKey); h != (domain.TaskWorkHandback{}) ||
+			!errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
+			t.Errorf("schema damage acknowledged a Handback or returned the wrong error: handback=%q notice=%q err=%v", h.ID, h.NoticeMessageID, err)
+		}
+	}
+	checkResolve := func(t *testing.T, s *Store, groupID, deliveryID string, want error) {
+		t.Helper()
+		if got, err := s.ResolveChatDiscussionWorkReturnDelivery(ctx, groupID, deliveryID); got != (domain.ChatDiscussionWorkReturnReceipt{}) ||
+			!errors.Is(err, want) || (want != ErrNotFound && errors.Is(err, ErrNotFound)) {
+			t.Errorf("wrong return classification: %+v %v; want %v", got, err, want)
+		}
+	}
+
+	t.Run("new-handback-without-marker", func(t *testing.T) {
+		f := setupWorkReturn(t)
+		damageLiveLedger(t, f.s)
+		before := coordinationDecideSnapshot(t, f.s)
+		checkHandback(t, f)
+		coordinationDecidePreserved(t, f.s, before) // Includes the B notice/key and any A publication or wake.
+	})
+	t.Run("committed-return-without-marker", func(t *testing.T) {
+		f := setupWorkReturn(t)
+		_, r := checkWorkReturnWake(t, f)
+		checkResolve(t, f.s, f.groupID, "unknown-delivery", ErrNotFound)
+		damageLiveLedger(t, f.s)
+		before := coordinationDecideSnapshot(t, f.s)
+		checkResolve(t, f.s, r.GroupID, r.DeliveryID, ErrConflict)
+		checkHandback(t, f) // The exact replay must not redeliver or acknowledge the damage.
+		coordinationDecidePreserved(t, f.s, before)
+	})
+
+	for _, tc := range []struct{ name, damage string }{
+		{"marker-without-table", dropTable},
+		{"retained-delivery-triggers", dropTable + "; " + dropMarker + `;
+		 DROP TRIGGER chat_discussion_work_returns_seal;
+		 DROP TRIGGER chat_discussion_work_returns_no_command;
+		 DROP TRIGGER chat_discussion_work_returns_no_reply_insert;
+		 DROP TRIGGER chat_discussion_work_returns_no_reply_update;
+		 DROP TRIGGER chat_discussion_work_returns_no_authority`},
+		{"view-for-table", dropTable + `; CREATE VIEW chat_discussion_work_returns AS
+		 SELECT id AS handback_id,group_id,message_id,id AS delivery_id FROM deliveries WHERE 0`},
+		{"wrong-table", dropTable + `; CREATE TABLE chat_discussion_work_returns AS
+		 SELECT id AS handback_id,group_id,message_id,id AS delivery_id FROM deliveries WHERE 0`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setupMessages(t)
+			coordinationDecideExec(t, f.s, tc.damage)
+			checkResolve(t, f.s, f.groupID, "unknown-delivery", ErrConflict)
+		})
+	}
+	t.Run("sqlite-execution-error", func(t *testing.T) {
+		f := setupMessages(t)
+		coordinationDecideExec(t, f.s, `DROP TABLE main.schema_migrations`)
+		if got, err := f.s.ResolveChatDiscussionWorkReturnDelivery(ctx, f.groupID, "unknown-delivery"); got != (domain.ChatDiscussionWorkReturnReceipt{}) ||
+			err == nil || errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
+			t.Fatalf("SQLite error was lost or reclassified as a schema mismatch: %+v %v", got, err)
+		}
+	})
+}
