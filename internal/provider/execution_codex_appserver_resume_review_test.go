@@ -19,6 +19,8 @@ func TestCodexSessionReviewCaptureContradictionsStayUnknown(t *testing.T) {
 		"capture-budget-users", "capture-questions-text-drift", "capture-plan-missing-observed", "capture-plan-kind-drift",
 		"capture-partial-multi-user", "capture-partial-text-drift", "capture-late-external-safe-prefix",
 		"capture-deep-active", "capture-deep-idle", "capture-deep-external",
+		"capture-mcp-arguments-drift", "capture-mcp-result-drift", "capture-mcp-arguments-drift-no-result", "capture-mcp-server-drift",
+		"capture-late-active", "capture-late-unknown-status",
 	} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("AW_SESSION_MODE", mode)
@@ -83,7 +85,7 @@ func TestCodexSessionReviewCaptureContradictionsStayUnknown(t *testing.T) {
 }
 
 func TestCodexSessionReviewOptionalCaptureUnavailableStillSucceeds(t *testing.T) {
-	for _, mode := range []string{"capture-error", "capture-unsupported-anchor", "capture-questions-no-drift", "capture-plan-complete", "capture-partial-missing-observed"} {
+	for _, mode := range []string{"capture-error", "capture-unsupported-anchor", "capture-questions-no-drift", "capture-plan-complete", "capture-partial-missing-observed", "capture-mcp-missing-result"} {
 		t.Run(mode, func(t *testing.T) {
 			t.Setenv("AW_SESSION_MODE", mode)
 			selected, config, request := appServerSessionFixture(t)
@@ -98,6 +100,63 @@ func TestCodexSessionReviewOptionalCaptureUnavailableStillSucceeds(t *testing.T)
 			}
 			if r.Outcome != OutcomeSucceeded || r.Terminal != OutcomeSucceeded || !r.OutputComplete || !r.DirectChildReaped || r.ExitCode != 0 || r.NativeRef == nil || r.NativeRef.Codex != nil || string(r.NativeRef.Binding) != string(binding) {
 				t.Fatal("optional anchor unavailability erased real success or invented a resumable reference")
+			}
+		})
+	}
+}
+
+func TestCodexSessionReviewCaptureMatchingEvidenceKeepsReference(t *testing.T) {
+	for _, mode := range []string{"capture-mcp-equivalent-json", "capture-late-idle"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("AW_SESSION_MODE", mode)
+			selected, config, request := appServerSessionFixture(t)
+			executor, err := NewCodexAppServerSessionExecutor(selected, config, []string{"read_channel"}, CodexAppServerSessionOptions{}, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := executor.Execute(context.Background(), request, nil)
+			assertCodexCaptureFixture(t, request.CWD, mode)
+			if r.Outcome != OutcomeSucceeded || r.NativeRef == nil || r.NativeRef.Codex == nil {
+				t.Fatal("equivalent post-terminal evidence blocked capture")
+			}
+		})
+	}
+}
+
+func TestCodexSessionReviewCaptureVerifiedPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		mode string
+		want Outcome
+	}{
+		{"capture-prefix-extra-plan", OutcomeUnknown},
+		{"capture-prefix-questions-text-drift", OutcomeUnknown},
+		{"capture-prefix-questions-only", OutcomeSucceeded},
+		{"capture-prefix-partial-only", OutcomeSucceeded},
+		{"capture-prefix-missing-result", OutcomeSucceeded},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			selected, config, request := appServerSessionFixture(t)
+			binding := json.RawMessage(`{"purpose":"generic"}`)
+			options := CodexAppServerSessionOptions{Binding: binding}
+			executor, err := NewCodexAppServerSessionExecutor(selected, config, []string{"read_channel"}, options, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := executor.Execute(context.Background(), request, nil)
+			if first.Outcome != OutcomeSucceeded || first.NativeRef == nil || first.NativeRef.Codex == nil || first.NativeRef.Codex.HistoryTurns != 1 || first.NativeRef.Codex.HistoryItems != 3 {
+				t.Fatal("fresh fixture did not capture the expected three-item prefix")
+			}
+			t.Setenv("AW_SESSION_MODE", tc.mode)
+			options.Resume = first.NativeRef
+			executor, err = NewCodexAppServerSessionExecutor(selected, config, []string{"read_channel"}, options, 5*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.RunID, request.Prompt = "prefix-review", "second independently authorized input"
+			r := executor.Execute(context.Background(), request, nil)
+			assertSessionReviewClientStarts(t, request.CWD, request.Prompt, 1)
+			if r.Outcome != tc.want || !r.Accepted || r.Terminal != OutcomeSucceeded || !r.OutputComplete || !r.DirectChildReaped || r.ExitCode != 0 || r.NativeRef == nil || r.NativeRef.Codex != nil || string(r.NativeRef.Binding) != string(binding) {
+				t.Fatalf("capture of verified prefix: want %s without native reference; outcome=%s accepted=%v terminal=%s reaped=%v outputComplete=%v exit=%d", tc.want, r.Outcome, r.Accepted, r.Terminal, r.DirectChildReaped, r.OutputComplete, r.ExitCode)
 			}
 		})
 	}

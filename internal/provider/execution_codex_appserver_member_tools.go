@@ -390,5 +390,13 @@ func (p *codexAppServerProtocol) memberItem(raw json.RawMessage, completed bool)
 			return item, false
 		}
 	}
+	if p.session != nil && !previous.completed {
+		// Fingerprint the completion notification, not the later terminal or
+		// history copy. Neither tool payload survives in per-item state.
+		item.mcp = &codexSessionMCPContent{
+			arguments: codexSessionHashField(fields["arguments"]),
+			result:    codexSessionHashField(fields["result"]),
+		}
+	}
 	return item, true
 }

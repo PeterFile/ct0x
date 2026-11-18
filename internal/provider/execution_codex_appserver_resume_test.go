@@ -266,6 +266,9 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	_ = json.Unmarshal(params["input"], &currentInput)
 	user := map[string]any{"id": "user-" + turnID, "type": "userMessage", "content": currentInput}
 	call := map[string]any{"id": "mcp-" + turnID, "type": "mcpToolCall", "server": server, "tool": "read_channel", "status": "inProgress", "arguments": map[string]any{"limit": 1}, "result": nil, "error": nil}
+	if mode == "capture-mcp-equivalent-json" {
+		call["arguments"] = json.RawMessage(`{"nested":{"b":[true],"a":3},"limit":1}`)
+	}
 	notify("item/started", map[string]any{"threadId": threadID, "turnId": turnID, "item": call})
 	call["status"], call["result"] = "completed", map[string]any{"content": []any{map[string]any{"type": "text", "text": "synthetic historical text"}}, "_meta": nil, "structuredContent": nil}
 	if mode != "pending-tool" {
@@ -306,6 +309,37 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 	last := history[len(history)-1].(map[string]any)
 	argumentsNesting := 0
 	switch mode {
+	case "capture-mcp-arguments-drift", "capture-mcp-arguments-drift-no-result":
+		call["arguments"] = map[string]any{"limit": 2}
+		if mode == "capture-mcp-arguments-drift-no-result" {
+			delete(call, "result")
+		}
+	case "capture-mcp-result-drift":
+		call["result"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"] = "different result after terminal"
+	case "capture-mcp-missing-result":
+		delete(call, "result")
+	case "capture-mcp-server-drift":
+		call["server"] = "different-server"
+	case "capture-mcp-equivalent-json":
+		call["arguments"] = map[string]any{"limit": 1, "nested": map[string]any{"a": 3, "b": []any{true}}}
+		call["result"] = json.RawMessage(`{"content":[{"type":"text","text":"synthetic historical text"}],"structuredContent":null,"_meta":null}`)
+	case "capture-prefix-extra-plan", "capture-prefix-questions-text-drift", "capture-prefix-questions-only", "capture-prefix-partial-only", "capture-prefix-missing-result":
+		old := history[0].(map[string]any)
+		items := old["items"].([]any)
+		oldAnswer := items[len(items)-1].(map[string]any)
+		switch mode {
+		case "capture-prefix-extra-plan":
+			old["items"] = append(items, map[string]any{"id": "new-old-plan", "type": "plan", "text": "not in verified history"})
+		case "capture-prefix-partial-only":
+			old["itemsView"], old["items"] = "summary", []any{oldAnswer}
+		case "capture-prefix-missing-result":
+			delete(items[1].(map[string]any), "result")
+		default:
+			oldAnswer["questions"] = []any{}
+			if mode == "capture-prefix-questions-text-drift" {
+				oldAnswer["text"] = "different verified old answer"
+			}
+		}
 	case "capture-budget-users":
 		last["items"] = []any{}
 		for i := 0; i <= codexSessionHistoryItemLimit; i++ {
@@ -414,6 +448,18 @@ func TestCodexAppServerSessionProcessHelper(t *testing.T) {
 		"arguments_nesting": argumentsNesting, "command_index": commandIndex,
 	}), 0600)
 	respond(capture, captureResult)
+	var lateStatus map[string]any
+	switch mode {
+	case "capture-late-active":
+		lateStatus = map[string]any{"type": "active", "activeFlags": []any{}}
+	case "capture-late-unknown-status":
+		lateStatus = map[string]any{"type": "futureStatus"}
+	case "capture-late-idle":
+		lateStatus = map[string]any{"type": "idle"}
+	}
+	if lateStatus != nil {
+		notify("thread/status/changed", map[string]any{"threadId": threadID, "status": lateStatus})
+	}
 	_, _ = io.Copy(io.Discard, input)
 	_ = os.WriteFile("eof-"+pid, nil, 0600)
 	if mode == "nonzero-exit" {

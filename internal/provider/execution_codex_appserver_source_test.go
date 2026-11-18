@@ -114,10 +114,10 @@ func TestCodexSession166ThreadHistorySource(t *testing.T) {
 			p.awaiting = 8
 			receiveCodex166SourceFrame(t, p, `{"id":8,"result":`+strings.Replace(history, `"vscode"`, `"`+source+`"`, 1)+`}`)
 			if source == "vscode" {
-				if p.damaged || p.awaiting != 5 || !p.session.priorTurnIDs["synthetic-turn"] {
+				if _, verified := p.session.priorTurns["synthetic-turn"]; p.damaged || p.awaiting != 5 || !verified {
 					t.Fatal("matching resume history did not enable turn/start")
 				}
-			} else if !p.damaged || p.awaiting != 0 || len(p.session.priorTurnIDs) != 0 {
+			} else if !p.damaged || p.awaiting != 0 || len(p.session.priorTurns) != 0 {
 				t.Fatal("resume with a mismatched source advanced past the history gate")
 			}
 		})
