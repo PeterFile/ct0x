@@ -9,8 +9,8 @@ import (
 	"agentworkspace/internal/domain"
 )
 
-// HandbackWork records a bounded escalation to the current bound coordinator.
-// It is intentionally a notice, not a decision, new assignment or Turn.
+// HandbackWork records a non-waking notice to the bound coordinator. A proved
+// original discussion may receive a separate return in the same transaction.
 func (s *Store) HandbackWork(ctx context.Context, scope MemberToolScope, input domain.HandbackWorkInput, key string) (domain.TaskWorkHandback, error) {
 	if !memberToolKeyValid(key) || !memberToolTextValid(input.Summary, domain.MaxWorkReportBytes) {
 		return domain.TaskWorkHandback{}, ErrInvalid
@@ -23,7 +23,9 @@ func (s *Store) HandbackWork(ctx context.Context, scope MemberToolScope, input d
 		p, coordinator := taskWorkParent(f), f.v.r.CoordinatorMemberID
 		mutation := mutationScope{operation: "handback_work", groupID: p.GroupID, actorID: p.OwnerMemberID, key: key}
 		payload := mutationPayload(p.AssignmentID, f.turnID, attempt, input.Summary)
+		var replayed bool
 		id, err := taskWorkMutationInTx(ctx, tx, mutation, payload, func(id string, replay bool) error {
+			replayed = replay
 			if replay {
 				return nil
 			}
@@ -61,7 +63,8 @@ func (s *Store) HandbackWork(ctx context.Context, scope MemberToolScope, input d
  AND NOT EXISTS(SELECT 1 FROM task_work_deliveries WHERE message_id=m.id)
  FROM task_work_handbacks p JOIN coordination_assignment_dispatch origin ON origin.assignment_id=p.assignment_id
  JOIN messages m ON (m.id,m.group_id,m.topic_id)=(p.notice_message_id,p.group_id,p.topic_id)
- WHERE p.group_id=? AND p.id=?`, taskWorkHandbackBody(id, p.TaskID, coordinator, input.Summary), p.GroupID, id).Scan(append(taskWorkParentDest(&o.TaskWorkParent),
+ WHERE p.group_id=? AND p.id=? AND EXISTS(`+taskWorkSavedOwnerOrigin+` AND r.coordinator_member_id=p.coordinator_member_id)`,
+			taskWorkHandbackBody(id, p.TaskID, coordinator, input.Summary), p.GroupID, id).Scan(append(taskWorkParentDest(&o.TaskWorkParent),
 			&o.ID, &o.AuthorTurnID, &o.AuthorAttemptID, &o.CoordinatorID, &o.Summary, &o.NoticeMessageID, &stamp, &valid)...)
 		if err != nil {
 			return out, err
@@ -71,6 +74,12 @@ func (s *Store) HandbackWork(ctx context.Context, scope MemberToolScope, input d
 			return out, ErrConflict
 		}
 		o.CreatedAt, err = time.Parse(timestampLayout, stamp)
+		if err != nil {
+			return out, err
+		}
+		// Pass the persisted receipt and the actual lookup result. A legacy
+		// replay must not publish a return, and a callback error rolls back B.
+		_, err = chatDiscussionWorkReturnInTx(ctx, tx, scope, out, replayed)
 		return out, err
 	})
 }
