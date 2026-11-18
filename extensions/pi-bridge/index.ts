@@ -31,13 +31,16 @@ function sendMessageParameters(continueWork: boolean, discussionOnly = false, in
   const disposition = Type.Union([
     Type.Literal("discuss"), Type.Literal("clarify"), Type.Literal("request_work"), Type.Literal("prepare_work"),
     ...(continueWork ? [Type.Literal("continue_work")] : []),
-  ], { description: "仅受信chat_intake/v1解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。prepare_work仅限受支持的topic_summary。" +
-    (continueWork ? `continue_work仅用于当前本机用户的明确续办请求；续办理由不得为空白，最多 ${workInputBytes.reason} UTF-8 字节。` : "") });
+  ], { description: "仅受信chat_intake/v1解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。" +
+    (discussionOnly ? "原文明确仅讨论时优先选discuss，逐字保留discussion_only_excerpt，不新建或续办工作。" : "") +
+    (continueWork ? `continue_work仅用于当前本机用户明确要求在原授权内续办；有明确Task编号就用followup.task_id引用原文。不填action或新任务字段。续办理由不得为空白，最多 ${workInputBytes.reason} UTF-8 字节。` : "") +
+    (investigation ? "prepare_work按已签发的action分流：text_submission仅用于受支持的topic_summary；read_only_investigation仅用于获准范围内明确的新调查，不用于续办。" :
+      "prepare_work仅限受支持的topic_summary。") });
   const assessment = Type.Object({
     disposition,
     action: Type.Optional(Type.Union([Type.Literal("text_submission"), Type.Literal("workspace_change"),
       ...(investigation ? [Type.Literal(INVESTIGATION_ASSESSMENT_ACTION)] : []),
-    ], { description: investigation ? "仅为语义建议；只读调查使用 prepare_work 和 reason，目标和资料由服务器绑定。模型不能授予权限。" :
+    ], { description: investigation ? "仅当本轮已签发该动作、chat_candidate.policy 提供获准调查范围，且绑定的单收件人本机用户原文明确要求另开范围内的调查时，使用 prepare_work、action=read_only_investigation 和 reason。目标、资料和验收由服务器绑定；模型不能授予权限。" :
       "结合可信来源和上下文提出文本交付或目录文件修改；只是一项语义建议，当前 Policy、目录授权和 Task 范围由服务器核定，模型不能授予 IO 权限。" })),
     ...chatAssessmentFields,
     ...(discussionOnly ? { discussion_only_excerpt: Type.Optional(Type.String({ minLength: 1, maxLength: discussionOnlyExcerptBytes,

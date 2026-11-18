@@ -41,6 +41,11 @@ func (p *Preparer) InspectRoleReadiness(ctx context.Context, pending store.Pendi
 	if provenance.Kind == store.CoordinationRoleOrdinary {
 		return roleInspectionResult(ctx, result, nil)
 	}
+	if provenance.SourceKind != "" {
+		result.MaxContextBytes = p.roleMaxContextBytes
+		_, err := p.planFreshTaskWork(ctx, input, false)
+		return roleInspectionResult(ctx, result, err)
+	}
 	result.HistoryLimit, result.MaxContextBytes = p.roleHistoryLimit, p.roleMaxContextBytes
 	plan, err := p.planCoordinationRole(ctx, input.state, input.group, input.member, input.conversation, input.trigger)
 	if ctx.Err() != nil {
