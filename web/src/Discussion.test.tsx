@@ -98,6 +98,7 @@ const reply = { ...invitation, id: "reply-1", sender_id: helper.id, source_id: "
   discussion: { ...invitation.discussion, kind: "reply" as const }, deliveries: [] };
 const resolution = { ...invitation, id: "resolve-1", source_id: "resolve-command", content: "综合以上意见，这是本次讨论的结论",
   discussion: { ...invitation.discussion, kind: "resolve" as const }, deliveries: [] };
+const discussionWork = { task_id: "task-actual", mandate_id: "mandate-hidden", dispatch_request_id: "dispatch-hidden" };
 
 it("links persisted invitation, return and resolution in the existing timeline without annotating legacy prose", async () => {
   const legacy = { ...message, deliveries: [], content: `@${member.name} 请邀请并答复这个问题。`, discussion: null };
@@ -161,6 +162,63 @@ it("shows the interrupted reply on its row when the existing newest-page poll su
   }
 });
 
+it("shows proved work alongside failed delivery and adds only a separately proved Assignment after exact refresh", async () => {
+  const label = "已转为正式工作";
+  const worker = { ...member, id: "actual-worker", name: "开发执行员" };
+  const foreign = { ...worker, group_id: other.id, name: "外群执行成员" };
+  const legacy = { ...message, id: "legacy", deliveries: [], content: "可以开始，但没有关联证据。", discussion_work: discussionWork };
+  const queued = { ...invitation.deliveries[0], state: "queued" };
+  const failed = { ...invitation, deliveries: [{ ...queued, state: "failed", error: "执行未启动" }] };
+  const flush = (ms = 0) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+  vi.useFakeTimers();
+  try {
+    reads.mockResolvedValueOnce(page([{ ...invitation, deliveries: [queued] }, question, legacy]));
+    const view = (roster: typeof member[]) => <main aria-label="讨论"><Discussion groupId={group.id} members={{ [group.id]: roster }} /></main>;
+    const { rerender } = render(view([member, helper, worker, foreign]));
+    await flush();
+    const card = within(article(invitation.id));
+    expect(card.getByText(invitation.content)).toBeVisible();
+    expect(panel().queryByText(label)).not.toBeInTheDocument();
+
+    change("保留这份讨论草稿");
+    reads.mockResolvedValueOnce(page([{ ...failed, discussion_work: discussionWork }, question, legacy]));
+    await flush(5000);
+    expect(card.getByText(label)).toBeVisible();
+    expect(card.getByText(discussionWork.task_id, { selector: "code" })).toBeVisible();
+    expect(card.getByText(/投递详情.*投递失败 1/)).toBeVisible();
+    expect(panel().getAllByText(label)).toHaveLength(1);
+    expect(card.queryByText(/分配 ID/)).not.toBeInTheDocument();
+    expect(card.queryByText(worker.name)).not.toBeInTheDocument();
+    expect(details).not.toHaveBeenCalled();
+
+    details.mockResolvedValueOnce(json({ ...failed, discussion_work: { ...discussionWork,
+      assignment_id: "assignment-actual", worker_member_id: worker.id, claim_digest: "private-claim-digest" } }));
+    fireEvent.click(card.getByRole("button", { name: `刷新消息 ${invitation.id} 讨论状态` }));
+    await flush();
+    const status = card.getByText(label).closest("p")!;
+    expect(status).toHaveTextContent(`任务 ID：task-actual · 分配 ID：assignment-actual（${worker.name}）`);
+    expect(status.querySelector("button, a")).toBeNull();
+    expect(status).not.toHaveTextContent(/已启动|已提交|已验收|报告/);
+    expect(article(invitation.id)).not.toHaveTextContent(/CLI已接收|已中断|mandate-hidden|dispatch-hidden|private-claim-digest|外群执行成员/);
+    expect(card.getByText(/投递详情.*投递失败 1/)).toBeVisible();
+    expect(content()).toHaveValue("保留这份讨论草稿");
+    expect(card.getByRole("button", { name: `转为任务，消息 ${invitation.id}` })).toBeVisible();
+    for (const roster of [[member, helper, foreign], [member, helper, { ...worker, name: " " }]]) {
+      rerender(view(roster));
+      expect(status).toHaveTextContent(`分配 ID：assignment-actual · 执行成员 ID：${worker.id}`);
+      expect(within(status).getByText(worker.id, { selector: "code", exact: true })).toBeVisible();
+      expect(status).not.toHaveTextContent(worker.name);
+      expect(status).not.toHaveTextContent(helper.id);
+      expect(card.getByText("邀请协作").closest("summary")).toHaveTextContent(helper.name);
+    }
+    const url = `/api/v1/groups/${group.id}/messages`;
+    expect(vi.mocked(fetch).mock.calls.map(([path]) => path)).toEqual([`${url}?limit=50`, `${url}?limit=50`, `${url}/${invitation.id}`]);
+    expect(writes).not.toHaveBeenCalled();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
 it("refreshes an older accepted handoff in place without starting another polling path", async () => {
   const latest = Array.from({ length: 50 }, (_, index) => ({ ...message, id: `newest-${index}`, deliveries: [],
     created_at: "2026-10-30T12:01:00Z" }));
@@ -212,7 +270,7 @@ it("keeps unloaded relation IDs, but does not assert provenance from contradicto
   const wrongTopic = { ...reply, id: "wrong-topic", discussion: { ...reply.discussion,
     root_message_id: otherTopic.id, invitation_message_id: "not-loaded" } };
   const policy = { ...question, id: "policy-row", source_kind: "local_user_policy", content: "不是用户问题" };
-  const fromPolicy = { ...invitation, id: "from-policy", discussion: { ...invitation.discussion,
+  const fromPolicy = { ...invitation, id: "from-policy", discussion_work: discussionWork, discussion: { ...invitation.discussion,
     invitation_message_id: "from-policy", root_message_id: policy.id },
     deliveries: [{ ...invitation.deliveries[0], message_id: "from-policy" }] };
   const wrongRecipient = { ...reply, id: "wrong-recipient", discussion: { ...reply.discussion, inviter_id: "other-inviter" } };
@@ -235,6 +293,7 @@ it("keeps unloaded relation IDs, but does not assert provenance from contradicto
   for (const row of mismatches) {
     expect(article(row.id).querySelectorAll("summary")).toHaveLength(1);
     expect(within(article(row.id)).queryByRole("button", { name: /讨论状态/ })).not.toBeInTheDocument();
+    expect(within(article(row.id)).queryByText("已转为正式工作")).not.toBeInTheDocument();
     expect(within(article(row.id)).getByText(row.content)).toBeVisible();
   }
   expect(fetch).toHaveBeenCalledTimes(1);

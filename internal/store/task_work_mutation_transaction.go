@@ -7,7 +7,7 @@ import (
 )
 
 // ErrTaskWorkMutationUnknown marks an unconfirmed outcome for work input
-// acknowledgement, work input return, or ReportWork. Check it before business
+// effects or task-work delegation, report, and handback. Check it before business
 // categories: the preserved cause may still match ErrConflict or ErrMemberToolDenied.
 var ErrTaskWorkMutationUnknown = errors.New("任务工作事务结果未确认；请保留原幂等键和原请求内容用于对账")
 
@@ -50,8 +50,8 @@ func taskWorkMutationFailure(action, phase string, cause, rollback error) error 
 	return e
 }
 
-// Use only for work input effects and ReportWork. The scope fence is itself
-// a write, so beginMemberToolTx would hide its rollback status on failure.
+// The scope fence is itself a write, so beginMemberToolTx would hide its
+// rollback status on failure.
 func taskWorkMutationTx[T any](ctx context.Context, s *Store, scope MemberToolScope, action string, run func(*sql.Tx) (T, error)) (zero T, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -77,4 +77,19 @@ func taskWorkMutationTx[T any](ctx context.Context, s *Store, scope MemberToolSc
 		return zero, err
 	}
 	return out, nil
+}
+
+// B3 writers share the v30 schema guard and final live-scope check. Work input
+// effects still perform their own schema and receipt checks in their callback.
+func taskWorkB3MutationTx[T any](ctx context.Context, s *Store, scope MemberToolScope, action string, run func(*sql.Tx) (T, error)) (T, error) {
+	return taskWorkMutationTx(ctx, s, scope, action, func(tx *sql.Tx) (zero T, err error) {
+		if err := requireTaskWorkReportsInTx(ctx, tx); err != nil {
+			return zero, coordinationRoleRelationError(err)
+		}
+		out, err := run(tx)
+		if err != nil {
+			return zero, err
+		}
+		return out, coordinationDecideLiveInTx(ctx, tx, scope)
+	})
 }

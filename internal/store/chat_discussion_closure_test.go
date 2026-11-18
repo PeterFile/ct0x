@@ -243,9 +243,9 @@ func TestChatDiscussionClosureRequiresCanonicalBoundTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
-	closures, err := chatDiscussionClosuresInTx(ctx, tx, f.groupID, origin.ID, invite.Message.ID, other.MessageID)
-	if err != nil || !reflect.DeepEqual(closures, map[string]string{invite.Message.ID: reason}) {
-		t.Fatalf("bounded batch did not isolate the interrupted head: %v, %v", closures, err)
+	states, err := chatDiscussionEvidenceInTx(ctx, tx, f.groupID, origin.ID, invite.Message.ID, other.MessageID)
+	if err != nil || !reflect.DeepEqual(states, map[string]chatDiscussionEvidence{invite.Message.ID: {closureReason: reason}}) {
+		t.Fatalf("bounded batch did not isolate the interrupted head: %v, %v", states, err)
 	}
 }
 
