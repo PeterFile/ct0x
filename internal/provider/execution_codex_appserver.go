@@ -220,8 +220,13 @@ func (e codexAppServerExecutor) execute(ctx context.Context, request ExecuteRequ
 			return false
 		}
 	}
+	var session *codexAppServerSession
+	if member != nil {
+		session = member.native
+	}
 	protocol := codexAppServerProtocol{
-		ctx: ctx, cancel: cancel, request: request, receipt: &r, delivery: delivery, member: member,
+		session: session,
+		ctx:     ctx, cancel: cancel, request: request, receipt: &r, delivery: delivery, member: member,
 		items: make(map[string]codexAppServerItem), requests: make(map[string]bool),
 		send: func(id int, method string, params any) bool {
 			message := codexRPCMessage{Method: &method}
@@ -295,7 +300,7 @@ func (e codexAppServerExecutor) execute(ctx context.Context, request ExecuteRequ
 				if stopping && !inputClosed {
 					protocol.interrupt()
 				}
-				if r.Terminal != "" {
+				if r.Terminal != "" && protocol.awaiting != 9 {
 					// Native stdio shutdown can take over a second even without a
 					// turn. Do not substitute a kill for a successful normal exit.
 					beginExit(5 * time.Second)
@@ -366,6 +371,9 @@ func (e codexAppServerExecutor) execute(ctx context.Context, request ExecuteRequ
 	}
 	if r.DeliveryFailed {
 		r.Reason = "执行事件保存失败，交付与执行结果未知"
+	}
+	if session != nil && r.Outcome == OutcomeSucceeded && r.DirectChildReaped && session.pending != nil {
+		r.NativeRef = cloneNativeSessionReference(session.pending)
 	}
 	return r
 }
