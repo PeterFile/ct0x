@@ -38,6 +38,13 @@ func chatDiscussionGateInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSco
 		if !active {
 			return ErrMemberToolDenied
 		}
+		limits, err := currentChatDiscussionPolicyInTx(ctx, tx, candidate.ThreadRef)
+		if err != nil {
+			return err
+		}
+		if limits.MaxInviteHops == 0 {
+			return ErrMemberToolDenied // Only fresh legacy directed sends are blocked.
+		}
 	}
 	return chatDiscussionMessageSlotInTx(ctx, tx, scope.Claim.TurnID, directed)
 }

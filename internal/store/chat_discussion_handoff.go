@@ -10,11 +10,7 @@ import (
 	"agentworkspace/internal/domain"
 )
 
-const (
-	defaultDiscussionInviteHops          = 2
-	defaultDiscussionTargetedWakes       = 4
-	chatDiscussionExpectedReplyJSONBytes = 1024
-)
+const chatDiscussionExpectedReplyJSONBytes = 1024
 
 // ApplyChatDiscussion publishes an assessed handoff step using only the bound
 // intake and the current position in the path. It never creates a member or
@@ -106,7 +102,12 @@ func applyChatDiscussionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSc
 		if origin != a.messageID {
 			return r, ErrMemberToolDenied
 		}
-		chain = newChatDiscussionChain(thread, origin, scope.MemberID, defaultDiscussionInviteHops, defaultDiscussionTargetedWakes)
+		limits, err := currentChatDiscussionPolicyInTx(ctx, tx, thread)
+		if err != nil {
+			return r, err
+		}
+		// Later steps use the persisted caps, not edits to the topic policy.
+		chain = newChatDiscussionChain(thread, origin, scope.MemberID, limits.MaxInviteHops, limits.MaxTargetedWakes)
 	}
 	var newMember bool
 	if create != nil {
