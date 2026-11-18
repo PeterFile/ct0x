@@ -93,7 +93,7 @@ func TestCodexSessionToolsProfileMatchesStoreAlgorithm(t *testing.T) {
 
 func codexSessionHistoryFixture() (*codexAppServerProtocol, map[string]any) {
 	p := &codexAppServerProtocol{request: ExecuteRequest{CWD: "/synthetic/cwd"}, threadID: "thread",
-		session: &codexAppServerSession{provider: "synthetic"}, member: &codexAppServerMemberSession{names: []string{"read_channel"}}}
+		session: &codexAppServerSession{provider: "synthetic", source: "appServer"}, member: &codexAppServerMemberSession{names: []string{"read_channel"}}}
 	items := []any{
 		map[string]any{"id": "user", "type": "userMessage", "content": []any{map[string]any{"type": "text", "text": "actual user text", "text_elements": []any{}}}},
 		map[string]any{"id": "tool", "type": "mcpToolCall", "server": "run-server", "tool": "read_channel", "status": "completed", "arguments": map[string]any{"limit": 1}, "result": map[string]any{"content": []any{map[string]any{"type": "text", "text": "actual tool text"}}, "_meta": nil, "structuredContent": nil}, "error": nil, "durationMs": 10},

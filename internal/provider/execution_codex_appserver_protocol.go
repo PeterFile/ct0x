@@ -900,6 +900,7 @@ type codexAppServerSession struct {
 	provider     string
 	providerSet  bool // The first config/read explicitly selected the provider.
 	effort       string
+	source       string // Thread.source bound by this invocation's start/resume response.
 	binding      json.RawMessage
 	resume       *CodexNativeSessionReference
 	pending      *NativeSessionReference
@@ -961,13 +962,21 @@ func (s *codexAppServerSession) threadResponse(raw json.RawMessage, request Exec
 		valid = valid && effortOK
 	}
 	thread, threadErr := codexRPCObject(fields["thread"], "cliVersion", "source", "cwd", "modelProvider")
+	// rust-v0.166.0's CLI app-server entrypoint passes SessionSource::VSCode
+	// even over stdio. Keep the previously admitted AppServer variant, but
+	// do not treat the labels as interchangeable within a connection.
+	source, _ := codexAppServerString(thread, "source")
 	var cwd string
-	return err == nil && threadErr == nil && valid && provider == s.provider && effort == s.effort &&
-		string(fields["approvalsReviewer"]) == `"user"` && codexSessionIdle(fields["thread"], "status") &&
-		string(thread["cliVersion"]) == `"0.166.0"` && string(thread["source"]) == `"appServer"` &&
-		json.Unmarshal(thread["cwd"], &cwd) == nil && cwd == request.CWD &&
-		string(thread["modelProvider"]) == string(mustCodexAppServerJSON(s.provider)) &&
-		(s.resume == nil || threadID == s.resume.NativeThreadID)
+	if err != nil || threadErr != nil || !valid || provider != s.provider || effort != s.effort ||
+		string(fields["approvalsReviewer"]) != `"user"` || !codexSessionIdle(fields["thread"], "status") ||
+		string(thread["cliVersion"]) != `"0.166.0"` || (source != "appServer" && source != "vscode") ||
+		json.Unmarshal(thread["cwd"], &cwd) != nil || cwd != request.CWD ||
+		string(thread["modelProvider"]) != string(mustCodexAppServerJSON(s.provider)) ||
+		(s.resume != nil && threadID != s.resume.NativeThreadID) {
+		return false
+	}
+	s.source = source
+	return true
 }
 
 // This is a public-history anchor, not a CAS over hidden native settings or
@@ -1027,7 +1036,8 @@ func (p *codexAppServerProtocol) sessionHistoryEvidence(raw json.RawMessage, cap
 // budgets fence an uninspectable capture rather than making it binding-only success.
 func (p *codexAppServerProtocol) inspectSessionHistory(thread map[string]any, capture bool) bool {
 	if thread["id"] != p.threadID || thread["ephemeral"] != false || thread["parentThreadId"] != nil || thread["forkedFromId"] != nil ||
-		thread["cliVersion"] != "0.166.0" || thread["source"] != "appServer" || thread["cwd"] != p.request.CWD || thread["modelProvider"] != p.session.provider {
+		thread["cliVersion"] != "0.166.0" || p.session.source == "" || thread["source"] != p.session.source ||
+		thread["cwd"] != p.request.CWD || thread["modelProvider"] != p.session.provider {
 		return false
 	}
 	// Active is a native projection, not proof of newly spawned work. It still
