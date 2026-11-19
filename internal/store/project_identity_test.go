@@ -229,7 +229,12 @@ func TestProjectIdentityExplicitChannel(t *testing.T) {
 	stamp := g.CreatedAt.Format(timestampLayout)
 	coordinatorMustCommit(t, s,
 		coordinatorSQL{insert, []any{channelID, first.ProjectID, groupID, stamp}},
-		coordinatorSQL{`INSERT INTO groups(id, name, created_at) VALUES(?,'legacy',?)`, []any{groupID, stamp}})
+		coordinatorSQL{`INSERT INTO groups(id, name, created_at) VALUES(?,'legacy',?)`, []any{groupID, stamp}},
+		coordinatorSQL{`UPDATE groups SET name='renamed' WHERE id=?`, []any{groupID}})
+	var name string
+	if err := s.db.QueryRow(`SELECT name FROM groups WHERE id=?`, groupID).Scan(&name); err != nil || name != "renamed" {
+		t.Fatalf("Group metadata update did not persist: %q, %v", name, err)
+	}
 	got := projectIdentityLocation(t, s, groupID)
 	if got != (GroupOwnership{WorkspaceID: first.WorkspaceID, ProjectID: first.ProjectID, ChannelID: channelID, GroupID: groupID}) {
 		t.Fatalf("explicit Channel was replaced or ignored: %+v", got)
@@ -281,16 +286,61 @@ func TestProjectIdentityImmutable(t *testing.T) {
 		{`INSERT OR REPLACE INTO channels(id, project_id, legacy_group_id, name, created_at)
 			SELECT 'new-channel', ?, legacy_group_id, name, created_at FROM channels WHERE id=?`, []any{b.ProjectID, a.ChannelID}},
 		{`DELETE FROM channels WHERE id=?`, []any{a.ChannelID}},
-		{`UPDATE groups SET id='new-group' WHERE id=?`, []any{a.GroupID}},
-		{`DELETE FROM groups WHERE id=?`, []any{a.GroupID}},
-		{`INSERT OR REPLACE INTO groups(id, name, created_at)
-			SELECT id, 'replacement', created_at FROM groups WHERE id=?`, []any{a.GroupID}},
-		{`INSERT OR REPLACE INTO groups(rowid, id, name, created_at)
-			SELECT rowid, 'new-group', 'replacement', created_at FROM groups WHERE id=?`, []any{a.GroupID}},
 	} {
 		if _, err := s.db.Exec(attempt.query, attempt.args...); err == nil {
 			t.Fatalf("immutable identity accepted %s", attempt.query)
 		}
+	}
+	messageSequencePreserved(t, s, before)
+	dispatchAssertFK(t, s)
+}
+
+func TestProjectIdentityDeferredConstraints(t *testing.T) {
+	s, _ := openTestStore(t)
+	g := group(t, s)
+	const projectID = "explicit-project"
+	stamp := g.CreatedAt.Format(timestampLayout)
+	coordinationDecideExec(t, s, `INSERT INTO projects(id, workspace_id, name, created_at)
+		SELECT ?, id, 'project', ? FROM workspaces WHERE is_default=1`, projectID, stamp)
+	const channel = `INSERT INTO channels(id, project_id, legacy_group_id, name, created_at) VALUES(?,?,?,'channel',?)`
+	before := messageSequenceSnapshot(t, s)
+	for _, tc := range []struct {
+		name, query string
+		args        []any
+	}{
+		{"update Group ID", `UPDATE groups SET id='new-group' WHERE id=?`, []any{g.ID}},
+		{"update Group rowid", `UPDATE groups SET _rowid_=_rowid_+1 WHERE id=?`, []any{g.ID}},
+		{"delete Group", `DELETE FROM groups WHERE id=?`, []any{g.ID}},
+		{"replace Group by ID", `INSERT OR REPLACE INTO groups(id, name, created_at)
+			SELECT id, 'replacement', created_at FROM groups WHERE id=?`, []any{g.ID}},
+		{"replace Group by rowid", `INSERT OR REPLACE INTO groups(rowid, id, name, created_at)
+			SELECT rowid, 'new-group', 'replacement', created_at FROM groups WHERE id=?`, []any{g.ID}},
+		{"insert Group with sentinel rowid", `INSERT INTO groups(rowid, id, name, created_at)
+			VALUES(-1,'new-group','group',?)`, []any{stamp}},
+		{"Project ID as Channel ID", channel, []any{projectID, projectID, "new-group", stamp}},
+		{"Project ID as Group ID", channel, []any{"new-channel", projectID, projectID, stamp}},
+		{"Channel ID as Group ID", channel, []any{"new-group", projectID, "new-group", stamp}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tx, err := s.db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback()
+			var fk int
+			if err := tx.QueryRow(`PRAGMA foreign_keys`).Scan(&fk); err != nil || fk != 1 {
+				t.Fatalf("expected foreign_keys=ON, got %d: %v", fk, err)
+			}
+			if _, err := tx.Exec(`PRAGMA defer_foreign_keys=ON; PRAGMA recursive_triggers=OFF`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(tc.query, tc.args...); err == nil {
+				t.Fatal("invalid identity write was not rejected at statement time")
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("rejected write left an invalid transaction: %v", err)
+			}
+		})
 	}
 	messageSequencePreserved(t, s, before)
 	dispatchAssertFK(t, s)
@@ -301,7 +351,7 @@ func TestProjectIdentityMissingChainFailsClosed(t *testing.T) {
 	g, other := group(t, s), group(t, s)
 	location := projectIdentityLocation(t, s, other.ID)
 	// Simulate out-of-band damage, not a supported write path.
-	coordinationDecideExec(t, s, "PRAGMA foreign_keys=OFF; DROP TRIGGER projects_no_delete")
+	coordinationDecideExec(t, s, "PRAGMA foreign_keys=OFF; DROP TRIGGER groups_no_delete; DROP TRIGGER projects_no_delete")
 	coordinationDecideExec(t, s, "DELETE FROM groups WHERE id=?", g.ID)
 	coordinationDecideExec(t, s, "DELETE FROM projects WHERE id=?", location.ProjectID)
 	coordinationDecideExec(t, s, "PRAGMA foreign_keys=ON")

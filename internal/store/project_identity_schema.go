@@ -28,8 +28,9 @@ CREATE TABLE channels (
     description TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     CHECK(id <> legacy_group_id),
-    -- Allow an explicit Channel before its Group in one transaction. RESTRICT
-    -- also blocks REPLACE's implicit delete of a mapped Group.
+    CHECK(id <> project_id),
+    CHECK(project_id <> legacy_group_id),
+    -- Allow an explicit Channel before its Group in one transaction.
     FOREIGN KEY(legacy_group_id) REFERENCES groups(id)
         ON DELETE RESTRICT ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED
 ) WITHOUT ROWID;
@@ -73,8 +74,23 @@ BEGIN SELECT RAISE(ABORT, '频道归属不可修改'); END;
 CREATE TRIGGER channels_no_delete BEFORE DELETE ON channels
 BEGIN SELECT RAISE(ABORT, '频道不可删除'); END;
 
+-- Keep Group identity fixed even with deferred foreign keys. REPLACE can
+-- skip DELETE triggers, so check both unique keys before inserting.
+CREATE TRIGGER groups_no_replace BEFORE INSERT ON groups
+WHEN EXISTS(SELECT 1 FROM groups WHERE id=NEW.id)
+    OR (NEW.rowid > 0 AND EXISTS(SELECT 1 FROM groups WHERE rowid=NEW.rowid))
+BEGIN SELECT RAISE(ABORT, '群组身份不可替换'); END;
+CREATE TRIGGER groups_no_rebind BEFORE UPDATE ON groups
+WHEN NEW.id IS NOT OLD.id OR NEW.rowid IS NOT OLD.rowid
+BEGIN SELECT RAISE(ABORT, '群组身份不可修改'); END;
+CREATE TRIGGER groups_no_delete BEFORE DELETE ON groups
+BEGIN SELECT RAISE(ABORT, '群组不可删除'); END;
+
 CREATE TRIGGER groups_project_identity_insert AFTER INSERT ON groups
 BEGIN
+    -- Before INSERT, an omitted rowid is undefined (-1 in this SQLite).
+    -- Check the assigned rowid here; legacy auto-generated rowids are positive.
+    SELECT RAISE(ABORT, '群组行号必须为正数') WHERE NEW.rowid <= 0;
     INSERT INTO projects(id, workspace_id, name, description, created_at, legacy_origin_group_id)
         SELECT lower(hex(randomblob(16))), (SELECT id FROM workspaces WHERE is_default=1),
             NEW.name, NEW.description, NEW.created_at, NEW.id
