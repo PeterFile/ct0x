@@ -60,7 +60,7 @@ const (
 	// #200 used the same parser and tool contracts, with older descriptions.
 	piInvestigationBridgeEntry200SHA = "39d5528abee0b6b39d0088d265dbe4d51c9c00eb9f43fe1d4d6be9d2383a7a82"
 	piDiscussionRelayBridgeEntrySHA  = "a9178ae8ad54ea8ce834c9594dbbf407222be70f60ccb35d45506cb7f9855737"
-	piDiscussionRelayBridgeImplSHA   = "2808281eacb441a5b2c76f090f25f06f9cc1f040b649b3269686e59a445f2717"
+	piDiscussionRelayBridgeImplSHA   = "17c987936c185fd11ea8c5c26855aa15c9707d393fac1152c1bbb2d1eaa035d4"
 )
 
 // PiNativeSessionBridgeSupported qualifies only the actual trusted native release

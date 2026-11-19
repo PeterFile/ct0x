@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"unicode"
@@ -162,7 +163,10 @@ func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Req
 		assessment.ChatAssessment.DiscussionOnlyExcerpt = &assessment.DiscussionOnlyExcerpt.value
 	}
 	receipt, err := a.tools.AssessChatIntent(r.Context(), token, assessment.ChatAssessment, content.value, key)
-	if err != nil {
+	switch {
+	case errors.Is(err, store.ErrTaskWorkMutationUnknown):
+		taskWorkWriteError(w, "send_message", err)
+	case err != nil:
 		memberToolError(w, err)
 	}
 	return receipt, err == nil

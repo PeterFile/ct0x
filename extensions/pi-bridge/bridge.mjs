@@ -164,6 +164,14 @@ function validRoleReceiptWire(text, count = 4) {
   return field.lastIndex === wire.length;
 }
 
+/** @param {string} text */
+function validRejectionWire(text) {
+  // A definite rejection requires the server's single, unambiguous error envelope.
+  // JSON.parse alone collapses duplicate keys, including escaped spellings.
+  const match = /^\s*\{\s*("(?:[^"\\]|\\.)*")\s*:\s*(\{[\s\S]*\})\s*\}\s*$/.exec(text);
+  return match !== null && JSON.parse(match[1]) === "error" && validRoleReceiptWire(match[2], 2);
+}
+
 /** @param {unknown} value @param {string} token @param {boolean} roleWrite @param {string} toolName */
 function serverError(value, token, roleWrite, toolName) {
   if (!isRecord(value) || !isRecord(value.error) || typeof value.error.code !== "string") return undefined;
@@ -230,6 +238,10 @@ function validWriteReceipt(toolName, status, value, requestValue) {
   if (toolName !== "send_message" && toolName !== "create_member") return true;
   if (!isRecord(value)) return false;
   if (toolName === "send_message") {
+    // Relay receipts must name an ID usable by read_history (Go TrimSpace semantics).
+    const id = value.message_id;
+    if (requestValue !== undefined && (typeof id !== "string" || !validUnicode(id) ||
+        !/\P{White_Space}/u.test(id) || id.includes("\0") || Buffer.byteLength(id) > 256)) return false;
     return status === 201 && typeof value.message_id === "string" && value.message_id.length > 0 &&
       validReceiptTime(value.created_at) &&
       typeof value.delivery_count === "number" && Number.isSafeInteger(value.delivery_count) &&
@@ -377,6 +389,7 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
                 (toolName === "read_work_inputs" && status === 413 && code === "tool_result_too_large") ||
                 (toolName !== "decide_dispatch" && ((status === 404 && code === "not_found") || (status === 409 && code === "conflict"))) ||
                 (!roleWrite && status === 409 && code === "member_capacity"));
+            if (rejected && !validRejectionWire(result.text)) return fail(invalidResponse);
             const suffix = rejected || code === "request_canceled" || code === "deadline_exceeded" ? "" : ` ${unknown}`;
             return fail(message ? message + suffix : invalidResponse, rejected ? "rejected" : "unknown");
           }

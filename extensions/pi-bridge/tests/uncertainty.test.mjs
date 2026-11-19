@@ -127,7 +127,31 @@ test("relay receipt counts depend on the action without narrowing generic sends"
   }
 });
 
+test("relay success requires a history-readable message ID", async t => {
+  const params = { content: "请核对。", discussion: { kind: "invite", recipient_id: "peer" } };
+  let messageID;
+  const server = await clientFor(t, (request, response) => {
+    if (request.url.endsWith("/send_message")) json(response, { ...message, message_id: messageID, delivery_count: 1 }, 201);
+    else success(request, response);
+  });
+  messageID = "🙂".repeat(64); // Exactly 256 UTF-8 bytes.
+  assert.equal((await server.invoke("send_message", params, "boundary")).json.message_id, messageID);
+  for (messageID of ["\ud800", "has\0nul", "🙂".repeat(64) + "x", " \u0085"]) {
+    const fx = { ...server, invoke: createClient(server.config) };
+    const original = await unknown(fx.invoke("send_message", params, "original"));
+    await latched(fx, original, "send_message", params);
+  }
+});
+
 const unknownCases = [
+  ...[
+    ["duplicate code", '{"error":{"code":"invalid_input","code":"invalid_input","message":"fixture"}}'],
+    ["conflicting escaped code", '{"error":{"code":"request_canceled","c\\u006fde":"invalid_input","message":"fixture"}}'],
+    ["conflicting error envelope", '{"error":{"code":"request_canceled"},"err\\u006fr":{"code":"invalid_input","message":"fixture"}}'],
+  ].map(([name, wire]) => [name, (_, response) => {
+    response.writeHead(400, { "Content-Type": "application/json" });
+    response.end(wire);
+  }]),
   ["partial receipt disconnect", (request, response) => {
     response.writeHead(201, { "Content-Type": "application/json", "Content-Length": 100 });
     response.write('{"message_id":"');
