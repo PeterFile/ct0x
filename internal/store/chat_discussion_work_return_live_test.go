@@ -429,6 +429,15 @@ func TestChatDiscussionWorkReturnRejectsReplySource(t *testing.T) {
 }
 
 func TestChatDiscussionWorkReturnSchemaGuard(t *testing.T) {
+	// This serial matrix opens v31 so later migrations cannot affect the ledger cases.
+	const fixtureVersion = 31
+	original := migrations
+	if len(original) < fixtureVersion || original[fixtureVersion-1] != chatDiscussionWorkReturnSchema {
+		t.Fatal("schema guard fixture requires the work-return migration at v31")
+	}
+	defer func() { migrations = original }()
+	migrations = original[:fixtureVersion]
+
 	const dropMarker = `DELETE FROM main.schema_migrations WHERE version=31`
 	const dropTable = `DROP TABLE main.chat_discussion_work_returns`
 	damageLiveLedger := func(t *testing.T, s *Store) {
