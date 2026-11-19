@@ -94,14 +94,14 @@ function useAnswerChecks(groupId: string | undefined, refreshVersion: number) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     function stop() { wave?.abort(); clearTimeout(timer); }
     function eligible() {
-      // Memory-only history can exceed the journal limit. Give skipped records
-      // priority in the next wave rather than always revisiting the newest.
+      // Memory-only history can exceed the journal limit. Check the least
+      // recently visited first so interrupted waves still make progress.
       return [...interactions].reverse().filter(([, { reference, write }]) => inGroup(groupId, reference)
         && (write?.kind === "uncertain" || (write?.kind === "saved" && !write.handling)))
         .sort(([, a], [, b]) => (lastStatusCheck.get(a.reference) ?? 0) - (lastStatusCheck.get(b.reference) ?? 0))
-        .slice(0, journalLimit).map(([key]) => key);
+        .map(([key]) => key);
     }
-    function start(keys = eligible(), immediate = keys.length) {
+    function start(keys = eligible(), immediate = journalLimit) {
       stop();
       if (!keys.length || !visible()) return;
       const controller = new AbortController();
@@ -128,18 +128,18 @@ function useAnswerChecks(groupId: string | undefined, refreshVersion: number) {
           if (!watching()) return;
           await checkBatch(firstPass.slice(i, i + statusBatch));
         }
-        // Keep one batch per backoff step, adding steps only if needed to
-        // give everybody in the bounded queue a turn (at most eight batches).
+        // Size the round limit once from the initial backoff queue. Repeats
+        // go behind deferred records and cannot extend this wave.
         poll(0, Math.max(statusBackoff.length, Math.ceil(queue.length / statusBatch)));
       }
       void reconcile();
     }
-    // Mount/manual/visibility reconcile bounded history once. A write checks
-    // its own status promptly without dropping the rest from the poll queue.
+    // A write checks its own status promptly without dropping the rest
+    // from the backoff queue.
     function afterWrite(reference: DecisionReference) {
       if (!inGroup(groupId, reference)) return;
       const key = decisionKey(reference);
-      start([key, ...eligible().filter(other => other !== key)].slice(0, journalLimit), statusBatch);
+      start([key, ...eligible().filter(other => other !== key)], statusBatch);
     }
     const visibility = () => start();
     checkOnWrite.add(afterWrite);

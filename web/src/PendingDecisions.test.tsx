@@ -580,6 +580,67 @@ it.each(["visibility", "write"] as const)("rotates bounded status reads across f
   expect(totalReads()).toBe(stopped);
 });
 
+it("gives all 33 unresolved attempts a turn without expanding the eager pass", async () => {
+  vi.useFakeTimers();
+  setVisibility("hidden");
+  const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+  const items = Array.from({ length: 33 }, (_, i) => taskQuestion(`poll-overflow-${i}`, 1, ""));
+  const paths = items.map(statusPath);
+  const reads: string[] = [];
+  let inFlight = 0, peak = 0;
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input);
+    if (path === `${pendingPath}?limit=50`) return page(items);
+    if (init?.method === "POST") return json({}, 502);
+    if (init?.method !== "GET" || !paths.includes(path)) return absent();
+    reads.push(path);
+    peak = Math.max(peak, ++inFlight);
+    await new Promise<void>(resolve => setTimeout(resolve, 100));
+    inFlight--;
+    return absent();
+  });
+  render(<PendingDecisions active />);
+  await tick(0);
+  const cards = screen.getAllByRole("article");
+  function submit(card: HTMLElement) {
+    const form = within(card);
+    fireEvent.click(form.getByRole("radio", { name: "纳入周末" }));
+    fireEvent.click(form.getByRole("button", { name: "提交答复" }));
+  }
+  for (const card of cards.slice(0, -1)) submit(card);
+  await tick(0);
+  expect(reads).toHaveLength(0);
+
+  // The last write is memory-only and wakes checks without a visibility event.
+  setVisibility("visible");
+  submit(cards.at(-1)!);
+  await tick(1000);
+  expect(screen.getAllByRole("alert")).toHaveLength(33);
+  expect(reads).toHaveLength(4);
+  expect(reads[0]).toBe(paths.at(-1));
+  await tick(180000);
+  expect(new Set(reads)).toEqual(new Set(paths));
+  const stopped = reads.length;
+  await tick(180000);
+  expect(reads).toHaveLength(stopped);
+
+  act(() => { document.dispatchEvent(new Event("visibilitychange")); });
+  await tick(1000);
+  const eager = reads.slice(stopped);
+  expect(eager).toHaveLength(32);
+  const skipped = paths.filter(path => !eager.includes(path));
+  expect(skipped).toHaveLength(1);
+
+  // Interrupt before backoff: the skipped record is now least recently checked.
+  const restarted = reads.length;
+  fireEvent.click(screen.getByRole("button", { name: "刷新待决事项" }));
+  await tick(1000);
+  expect(reads[restarted]).toBe(skipped[0]);
+  await tick(2000);
+  expect(new Set(reads.slice(restarted))).toEqual(new Set(paths));
+  expect(peak).toBe(4);
+});
+
 it("keeps a migration-absent decision inbox optional alongside the real review inbox", async () => {
   const reads = vi.fn<typeof fetch>().mockResolvedValueOnce(json({ error: { code: "decision_answers_unavailable" } }, 503))
     .mockResolvedValueOnce(page());
