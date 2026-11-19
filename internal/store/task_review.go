@@ -70,6 +70,11 @@ func reviewTaskInTx(ctx context.Context, tx *sql.Tx, input ReviewTaskInput) (dom
 		task.CurrentSubmissionID != submission.ID || task.ActiveAttemptID != submission.AttemptID {
 		return domain.ReviewDecision{}, fmt.Errorf("%w：任务状态、版本或当前提交已改变", ErrConflict)
 	}
+	if input.Outcome == domain.ReviewOutcomeAccepted && len(task.DependencyIDs) != 0 {
+		if err := requireFreshTaskPinsInTx(ctx, tx, task.GroupID, task.ID); err != nil {
+			return domain.ReviewDecision{}, err
+		}
+	}
 	next, decision, err := task.Review(submission, domain.ReviewDecision{
 		ID: id, SubmissionID: submission.ID, TaskID: submission.TaskID, GroupID: submission.GroupID,
 		TaskRevision: submission.TaskRevision, Outcome: input.Outcome, ReviewedBy: "user", Reason: input.Reason,

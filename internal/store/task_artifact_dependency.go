@@ -82,6 +82,13 @@ func insertTaskArtifactDependenciesInTx(ctx context.Context, tx *sql.Tx, task do
 		if !eligible {
 			return fmt.Errorf("%w：成果依赖必须引用待评审或已由本地用户接纳的提交", ErrInvalid)
 		}
+		stale, err := taskImpactRefStaleInTx(ctx, tx, task.GroupID, domain.TaskImpactStaleSubmission, pin.SubmissionID)
+		if err != nil {
+			return err
+		}
+		if stale {
+			return errTaskImpactPinStale
+		}
 		var saved string
 		if err := tx.QueryRowContext(ctx, `INSERT INTO task_artifact_dependencies
 		 (group_id,task_id,dependency_id,submission_id,dependency_revision,artifact_id,version_id,ready_when)
@@ -176,9 +183,17 @@ func taskArtifactDependenciesBlockedInTx(ctx context.Context, tx *sql.Tx, groupI
 		return false, err
 	}
 	var blocked bool
+	impact, err := taskImpactSchemaInTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	stale := ""
+	if impact {
+		stale = " OR " + taskImpactStalePin
+	}
 	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM task_artifact_dependencies pin
-	 WHERE pin.group_id=? AND pin.task_id=? AND NOT EXISTS(SELECT 1 FROM task_review_decisions r
+	 WHERE pin.group_id=? AND pin.task_id=? AND (NOT EXISTS(SELECT 1 FROM task_review_decisions r
 	 WHERE r.submission_id=pin.submission_id AND r.group_id=pin.group_id AND r.task_id=pin.dependency_id
-	 AND r.task_revision=pin.dependency_revision AND r.outcome='accepted' AND r.reviewed_by='user' AND pin.ready_when='accepted'))`, groupID, taskID).Scan(&blocked)
+	 AND r.task_revision=pin.dependency_revision AND r.outcome='accepted' AND r.reviewed_by='user' AND pin.ready_when='accepted')`+stale+`))`, groupID, taskID).Scan(&blocked)
 	return blocked, err
 }

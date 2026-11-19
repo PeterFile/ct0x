@@ -149,10 +149,7 @@ func (s *Store) RequestTurnCancel(ctx context.Context, groupID, turnID string) (
 		return domain.Turn{}, queueError(action, err)
 	}
 	if activeTurn(turn.State) && turn.CancelRequestedAt == nil {
-		now := time.Now().UTC().Format(timestampLayout)
-		turn, err = scanTurn(tx.QueryRowContext(ctx, `UPDATE turns SET cancel_requested_at=?,updated_at=?,
-		 state=CASE WHEN state IN ('starting','running') THEN 'cancel_requested' ELSE state END
-		 WHERE group_id=? AND id=? AND `+activeTurnPredicate+` RETURNING `+turnColumns, now, now, groupID, turnID))
+		turn, err = requestActiveTurnCancelInTx(ctx, tx, groupID, turnID, time.Now().UTC())
 		if err != nil {
 			return domain.Turn{}, queueError(action, err)
 		}
@@ -161,4 +158,13 @@ func (s *Store) RequestTurnCancel(ctx context.Context, groupID, turnID string) (
 		return domain.Turn{}, queueError(action, err)
 	}
 	return turn, nil
+}
+
+// Callers must prove eligibility while holding the Store write transaction.
+// The scheduler observes the same cancellation flag regardless of its source.
+func requestActiveTurnCancelInTx(ctx context.Context, tx *sql.Tx, groupID, turnID string, requestedAt time.Time) (domain.Turn, error) {
+	stamp := requestedAt.Format(timestampLayout)
+	return scanTurn(tx.QueryRowContext(ctx, `UPDATE turns SET cancel_requested_at=?,updated_at=?,
+	 state=CASE WHEN state IN ('starting','running') THEN 'cancel_requested' ELSE state END
+	 WHERE group_id=? AND id=? AND cancel_requested_at IS NULL AND `+activeTurnPredicate+` RETURNING `+turnColumns, stamp, stamp, groupID, turnID))
 }
