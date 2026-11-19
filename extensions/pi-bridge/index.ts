@@ -27,7 +27,13 @@ const chatAssessmentFields = {
   }, { additionalProperties: false })),
 };
 
-function sendMessageParameters(continueWork: boolean, discussionOnly = false, investigation = false) {
+const discussionAction = Type.Object({
+  kind: Type.Union([Type.Literal("invite"), Type.Literal("reply"), Type.Literal("resolve")]),
+  recipient_id: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "仅 invite 必填；选择 list_members 返回的一个现有同群成员 ID。" })),
+  expected_reply: Type.Optional(Type.String({ maxLength: 4096, description: "仅 invite 可填；省略时以邀请正文为准。" })),
+}, { additionalProperties: false, description: "仅用于已保存讨论评估后的接力；不得与 recipient_ids 或 intent_assessment 同传。reply 与 resolve 不带 recipient_id 或 expected_reply。" });
+
+function sendMessageParameters(continueWork: boolean, discussionOnly = false, investigation = false, relay = false) {
   const disposition = Type.Union([
     Type.Literal("discuss"), Type.Literal("clarify"), Type.Literal("request_work"), Type.Literal("prepare_work"),
     ...(continueWork ? [Type.Literal("continue_work")] : []),
@@ -56,6 +62,7 @@ function sendMessageParameters(continueWork: boolean, discussionOnly = false, in
     content: Type.String({ description: "消息正文。" + (continueWork ? `续办正文不得为空白，最多 ${workInputBytes.content} UTF-8 字节。` : "") }),
     recipient_ids: Type.Optional(Type.Array(Type.String(), { description: "接收成员标识；省略或空数组表示公开消息，不创建投递、不唤醒成员；仅显式列出的成员会进入投递队列。" })),
     intent_assessment: Type.Optional(assessment),
+    ...(relay ? { discussion: Type.Optional(discussionAction) } : {}),
   }, { additionalProperties: false });
 }
 
@@ -224,8 +231,18 @@ function validWorkInputID(value: string): boolean {
   return validOpaqueIDShape(value) && !/^\p{White_Space}|\p{White_Space}$/u.test(value);
 }
 
+function validDiscussion(message: { content: string; discussion?: Static<typeof discussionAction> }): boolean {
+  const action = message.discussion;
+  if (!action || Object.hasOwn(message, "recipient_ids") || Object.hasOwn(message, "intent_assessment") ||
+      !validNonBlankText(message.content, 16384)) return false;
+  return action.kind === "invite" ?
+    typeof action.recipient_id === "string" && validOpaqueIDShape(action.recipient_id) &&
+      (action.expected_reply === undefined || action.expected_reply === "" || validNonBlankText(action.expected_reply, 4096)) :
+    !Object.hasOwn(action, "recipient_id") && !Object.hasOwn(action, "expected_reply");
+}
+
 export default function piBridge(pi: ExtensionAPI) {
-  const { invoke, continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools } = openBridge(
+  const { invoke, continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools, discussionRelay } = openBridge(
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG,
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256,
   );
@@ -237,19 +254,27 @@ export default function piBridge(pi: ExtensionAPI) {
   }
   for (const tool of investigationTools ? [...investigationReads, ...tools] : tools) {
     if (investigationTools && !investigationTools.includes(tool.name)) continue;
-    let parameters = tool.name === "send_message" && (continueWork || discussionOnlyExcerpt || investigationIntake) ?
-      sendMessageParameters(continueWork, discussionOnlyExcerpt, investigationIntake) : tool.parameters;
+    let parameters = tool.name === "send_message" && (continueWork || discussionOnlyExcerpt || investigationIntake || discussionRelay) ?
+      sendMessageParameters(continueWork, discussionOnlyExcerpt, investigationIntake, discussionRelay) : tool.parameters;
     if (investigationTools && tool.name === "submit_result") parameters = investigationResult;
+    const description = discussionRelay && tool.name === "send_message" ?
+      "在绑定频道保存消息，不代表投递确认。单独保存 intent_assessment 后可用 discussion 接力，不传 recipient_ids。仅 invite 选择一个成员；reply 由服务器返回给上一位，resolve 只公开收束。not_admitted 不是执行成功。" :
+      discussionRelay && tool.name === "read_channel" ? tool.description + " 可能返回 discussion_context；按消息 ID 用 read_history 查阅正文。" : tool.description;
     pi.registerTool<typeof parameters>({
       ...tool,
+      description,
       parameters,
-      ...(tool.name === "send_message" && discussionOnlyExcerpt ? {
+      ...(tool.name === "send_message" ? {
         prepareArguments(args: unknown) {
-          // Pi can drop optional nulls and coerce types. Do not let that erase
-          // an excerpt, change its value or mask the presence of recipient_ids.
-          const message = args as { intent_assessment?: Record<string, unknown> } | null;
+          // Check relay fields before Pi can drop optional nulls or coerce
+          // types into an unrelated send or a different handoff.
+          const message = args as { content: string; discussion?: Static<typeof discussionAction>; intent_assessment?: Record<string, unknown> } | null;
+          if (message && Object.hasOwn(message, "discussion") &&
+              (!discussionRelay || !Value.Check(parameters, args) || !validDiscussion(message))) {
+            throw new Error("成员工具参数无效，未发送请求。");
+          }
           const assessment = message?.intent_assessment;
-          if (message && assessment && Object.hasOwn(assessment, "discussion_only_excerpt") &&
+          if (discussionOnlyExcerpt && message && assessment && Object.hasOwn(assessment, "discussion_only_excerpt") &&
               (typeof assessment.discussion_only_excerpt !== "string" || Object.hasOwn(message, "recipient_ids"))) {
             throw new Error("成员工具参数无效，未发送请求。");
           }
@@ -268,11 +293,13 @@ export default function piBridge(pi: ExtensionAPI) {
             payload = JSON.parse(encoded);
             valid = Value.Check(parameters, payload);
             if (valid && tool.name === "send_message") {
-              const message = payload as { content: string; recipient_ids?: string[]; intent_assessment?: {
+              const message = payload as { content: string; discussion?: Static<typeof discussionAction>; recipient_ids?: string[]; intent_assessment?: {
                 disposition: string; reason: string; action?: string; discussion_only_excerpt?: string;
                 repair?: { review_id: string }; followup?: { task_id?: string; constraint?: string };
               } };
-              if (Object.hasOwn(message, "intent_assessment")) {
+              if (Object.hasOwn(message, "discussion")) {
+                valid = discussionRelay && validDiscussion(message);
+              } else if (Object.hasOwn(message, "intent_assessment")) {
                 valid = !Object.hasOwn(message, "recipient_ids");
                 const assessment = message.intent_assessment!;
                 if (Object.hasOwn(assessment, "discussion_only_excerpt")) {

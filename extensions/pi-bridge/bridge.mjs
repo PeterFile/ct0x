@@ -57,7 +57,7 @@ function endpointURL(value) {
  * selects the bound profile; it covers exactly the bytes this bridge consumes.
  * @param {string | undefined} path
  * @param {string} [expectedSHA256]
- * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[] }}
+ * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[], discussionRelay: boolean }}
  */
 export function openBridge(path, expectedSHA256) {
   let fd;
@@ -86,11 +86,13 @@ export function openBridge(path, expectedSHA256) {
     if (!isRecord(config)) throw new Error(CONFIG_ERROR);
     const continueWork = Object.hasOwn(config, "continue_work");
     const discussionOnlyExcerpt = Object.hasOwn(config, "discussion_only_excerpt");
+    const discussionRelay = Object.hasOwn(config, "discussion_relay");
     const investigationIntake = Object.hasOwn(config, "intake_assessment_action");
     const strict = Object.hasOwn(config, "investigation_tools");
     if (!Object.hasOwn(config, "endpoint") || !Object.hasOwn(config, "token") ||
-        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) + Number(strict) ||
+        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) + Number(strict) + Number(discussionRelay) ||
         (continueWork && config.continue_work !== true) || (discussionOnlyExcerpt && config.discussion_only_excerpt !== true) ||
+        (discussionRelay && (expectedSHA256 === undefined || config.discussion_relay !== true)) ||
         (investigationIntake && config.intake_assessment_action !== INVESTIGATION_ASSESSMENT_ACTION) ||
         typeof config.token !== "string" || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token)) {
       throw new Error(CONFIG_ERROR);
@@ -99,7 +101,7 @@ export function openBridge(path, expectedSHA256) {
     let investigationTools;
     if (strict) {
       const names = config.investigation_tools;
-      if (expectedSHA256 === undefined || continueWork || discussionOnlyExcerpt || investigationIntake || !Array.isArray(names)) throw new Error(CONFIG_ERROR);
+      if (expectedSHA256 === undefined || continueWork || discussionOnlyExcerpt || investigationIntake || discussionRelay || !Array.isArray(names)) throw new Error(CONFIG_ERROR);
       const reads = [INVESTIGATION_CHANNEL, INVESTIGATION_ARTIFACT].filter(name => names.includes(name));
       if (!reads.length || names.length !== reads.length + 1 || !reads.every((name, i) => names[i] === name) ||
           !["decide_dispatch", "submit_result"].includes(names.at(-1))) throw new Error(CONFIG_ERROR);
@@ -116,7 +118,7 @@ export function openBridge(path, expectedSHA256) {
         }
         return requestTool(endpoint, token, writes, toolName, params, toolCallId, signal);
       },
-      continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools,
+      continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools, discussionRelay,
     };
   } catch {
     throw new Error(CONFIG_ERROR);

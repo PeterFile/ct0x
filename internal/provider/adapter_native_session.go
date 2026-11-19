@@ -59,6 +59,8 @@ const (
 	piInvestigationBridgeImplSHA  = "c6e571fbeed7b6f78ea1a8b7b044babca691923297d1803a3aaaeb5b6c6eeb2b"
 	// #200 used the same parser and tool contracts, with older descriptions.
 	piInvestigationBridgeEntry200SHA = "39d5528abee0b6b39d0088d265dbe4d51c9c00eb9f43fe1d4d6be9d2383a7a82"
+	piDiscussionRelayBridgeEntrySHA  = "d7e385bbc459818bc05e86f78d6c4ab34b4bc6c8b4ca22a51d6e8ec47fed4271"
+	piDiscussionRelayBridgeImplSHA   = "633e45e80a296d234d8f142dd0c197a6077e133216daaaac050280aa272f31c6"
 )
 
 // PiNativeSessionBridgeSupported qualifies only the actual trusted native release
@@ -81,10 +83,23 @@ func PiInvestigationBridgeSupported(extensionPath string) bool {
 // PiCombinedIntakeBridgeSupported requires the pair whose tool descriptions
 // distinguish investigation from fresh Task Work continuation.
 func PiCombinedIntakeBridgeSupported(extensionPath string) bool {
-	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA) != ""
+	return PiDiscussionRelayBridgeSupported(extensionPath) || qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA) != ""
+}
+
+// PiDiscussionRelayBridgeSupported qualifies the installed relay-aware pair,
+// not the per-turn permission to use it.
+func PiDiscussionRelayBridgeSupported(extensionPath string) bool {
+	return qualifyPiDiscussionRelayBridge(extensionPath) != ""
+}
+
+func qualifyPiDiscussionRelayBridge(extensionPath string) string {
+	return qualifyPiBridgePair(extensionPath, piDiscussionRelayBridgeImplSHA, piDiscussionRelayBridgeEntrySHA)
 }
 
 func qualifyPiInvestigationBridge(extensionPath string) string {
+	if entry := qualifyPiDiscussionRelayBridge(extensionPath); entry != "" {
+		return entry
+	}
 	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA, piInvestigationBridgeEntry200SHA)
 }
 
@@ -187,7 +202,8 @@ func (a nativeSessionMemberToolAdapter) NewExecutor(selected Provider, timeout t
 	}
 	if a.pi != nil {
 		path := filepath.Clean(a.configPath)
-		if !piMemberToolConfigMatches(path, a.configSHA256, false) {
+		config, err := readPiMemberToolConfig(path, false)
+		if err != nil || config.digest != a.configSHA256 || config.discussionRelay {
 			return nil, errPiMemberToolConfiguration
 		}
 		native, err := NewPiSessionExecutor(selected, bridge, path, a.toolNames, *a.pi, timeout)
@@ -215,6 +231,7 @@ type piDigestBoundExecutor struct {
 	piExecutor
 	configuredBridge    string
 	investigationBridge bool
+	discussionRelay     bool
 }
 
 func (e piDigestBoundExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error) ExecutionReceipt {
@@ -222,7 +239,9 @@ func (e piDigestBoundExecutor) Execute(ctx context.Context, request ExecuteReque
 	// selected CLI/loader, its environment and the trusted extension ancestry
 	// must still be stable through load; this is not a same-UID code sandbox.
 	qualify := qualifyPiNativeBridge
-	if e.investigationBridge {
+	if e.discussionRelay {
+		qualify = qualifyPiDiscussionRelayBridge
+	} else if e.investigationBridge {
 		qualify = qualifyPiInvestigationBridge
 	}
 	if qualify(e.configuredBridge) != e.memberTools.extensionPath {

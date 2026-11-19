@@ -124,7 +124,10 @@ func memberToolSendAssessmentFields(body []byte) (continuation, excerpt bool) {
 
 func sendMessageNeedsScalars(body []byte) bool {
 	continuation, excerpt := memberToolSendAssessmentFields(body)
-	return continuation || excerpt
+	var probe struct {
+		Discussion json.RawMessage `json:"discussion"`
+	}
+	return continuation || excerpt || json.Unmarshal(body, &probe) == nil && probe.Discussion != nil
 }
 
 func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Request, token string, raw json.RawMessage, content memberToolField[string], key string) (domain.ChatAssessmentReceipt, bool) {

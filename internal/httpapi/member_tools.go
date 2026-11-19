@@ -203,13 +203,27 @@ func (a memberToolAPI) readChannel(w http.ResponseWriter, r *http.Request, token
 		memberToolError(w, err)
 		return
 	}
-	writeMemberToolPage(w, page, scope, candidate)
+	if candidate == nil {
+		writeMemberToolPage(w, page, scope)
+		return
+	}
+	discussion, err := a.tools.ReadDiscussionContext(r.Context(), token)
+	if errors.Is(err, store.ErrChatDiscussionContextTooLarge) {
+		WriteError(w, http.StatusRequestEntityTooLarge, "tool_result_too_large", err.Error())
+		return
+	}
+	if err != nil {
+		memberToolError(w, err)
+		return
+	}
+	writeMemberToolPage(w, page, scope, memberToolChannelContext{candidate, projectMemberDiscussion(discussion)})
 }
 
 type memberToolSendInput struct {
 	Content      memberToolField[string]                    `json:"content"`
 	RecipientIDs memberToolField[[]memberToolField[string]] `json:"recipient_ids"`
 	Assessment   memberToolField[json.RawMessage]           `json:"intent_assessment"`
+	Discussion   memberToolField[memberDiscussionFields]    `json:"discussion"`
 }
 
 func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token string) {
@@ -223,6 +237,10 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 	}
 	var input memberToolSendInput
 	if !decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: &input, required: sendMessageNeedsScalars}) {
+		return
+	}
+	if input.Discussion.present && (input.RecipientIDs.present || input.Assessment.present) {
+		memberToolError(w, store.ErrInvalid)
 		return
 	}
 	if input.Assessment.present {
@@ -247,14 +265,30 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 		}{receipt.NoticeMessageID, receipt.CreatedAt, 0, true, assessmentReceipt})
 		return
 	}
-	var recipients []string
-	if input.RecipientIDs.present {
-		recipients = make([]string, len(input.RecipientIDs.value))
-		for i, id := range input.RecipientIDs.value {
-			recipients[i] = id.value
+	var message domain.Message
+	var err error
+	if input.Discussion.present {
+		action, valid := input.Discussion.value.action()
+		if !input.Content.present || !valid {
+			memberToolError(w, store.ErrInvalid)
+			return
 		}
+		receipt, sendErr := a.tools.SendDiscussion(r.Context(), token, action, input.Content.value, key)
+		if errors.Is(sendErr, store.ErrChatDiscussionContextTooLarge) {
+			WriteError(w, http.StatusBadRequest, "invalid_input", sendErr.Error())
+			return
+		}
+		message, err = receipt.Message, sendErr
+	} else {
+		var recipients []string
+		if input.RecipientIDs.present {
+			recipients = make([]string, len(input.RecipientIDs.value))
+			for i, id := range input.RecipientIDs.value {
+				recipients[i] = id.value
+			}
+		}
+		message, err = a.tools.SendMessage(r.Context(), token, platform.MemberMessageInput{Content: input.Content.value, RecipientIDs: recipients}, key)
 	}
-	message, err := a.tools.SendMessage(r.Context(), token, platform.MemberMessageInput{Content: input.Content.value, RecipientIDs: recipients}, key)
 	if err != nil {
 		memberToolError(w, err)
 		return
@@ -314,20 +348,25 @@ type memberToolPageBuffer struct {
 func (b *memberToolPageBuffer) Header() http.Header    { return b.header }
 func (b *memberToolPageBuffer) WriteHeader(status int) { b.status = status }
 
-func writeMemberToolPage[T any](w http.ResponseWriter, page store.Page[T], scope string, candidates ...*domain.ChatCandidate) {
+type memberToolChannelContext struct {
+	ChatCandidate     *domain.ChatCandidate    `json:"chat_candidate"`
+	DiscussionContext *memberDiscussionContext `json:"discussion_context,omitempty"`
+}
+
+func writeMemberToolPage[T any](w http.ResponseWriter, page store.Page[T], scope string, channel ...memberToolChannelContext) {
 	buffer := memberToolPageBuffer{header: make(http.Header)}
 	writePage(&buffer, page, scope, "", nil)
-	if len(candidates) == 1 && candidates[0] != nil && buffer.Len() <= memberToolJSONBytes {
+	if len(channel) == 1 && buffer.status == http.StatusOK && buffer.Len() <= memberToolJSONBytes {
 		var result struct {
-			Items         []T                   `json:"items"`
-			NextCursor    string                `json:"next_cursor"`
-			ChatCandidate *domain.ChatCandidate `json:"chat_candidate"`
+			Items      []T    `json:"items"`
+			NextCursor string `json:"next_cursor"`
+			memberToolChannelContext
 		}
 		if err := json.Unmarshal(buffer.Bytes(), &result); err != nil {
 			operationError(w, err)
 			return
 		}
-		result.ChatCandidate = candidates[0]
+		result.memberToolChannelContext = channel[0]
 		buffer.Reset()
 		WriteJSON(&buffer, http.StatusOK, result)
 	}
