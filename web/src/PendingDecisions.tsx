@@ -64,9 +64,13 @@ async function confirmAnswer(expected: Write, record: DecisionJournalEntry, view
   return true;
 }
 
+const lastStatusCheck = new WeakMap<DecisionReference, number>();
+let statusSequence = 0;
+
 async function checkAnswer(key: string, signal: AbortSignal) {
   const entry = interactions.get(key), write = entry?.write;
   if (!entry || !write || (write.kind !== "uncertain" && write.kind !== "saved") || (write.kind === "saved" && write.handling)) return false;
+  lastStatusCheck.set(entry.reference, ++statusSequence);
   try {
     const answer = await readDecisionAnswer(write.record, signal, write.kind === "saved" ? write.receipt : undefined);
     if (signal.aborted || !visible() || interactions.get(key)?.write !== write) return false;
@@ -89,37 +93,53 @@ function useAnswerChecks(groupId: string | undefined, refreshVersion: number) {
     let wave: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
     function stop() { wave?.abort(); clearTimeout(timer); }
-    function recent() {
+    function eligible() {
+      // Memory-only history can exceed the journal limit. Give skipped records
+      // priority in the next wave rather than always revisiting the newest.
       return [...interactions].reverse().filter(([, { reference, write }]) => inGroup(groupId, reference)
-        && (write?.kind === "uncertain" || (write?.kind === "saved" && !write.handling))).slice(0, journalLimit).map(([key]) => key);
+        && (write?.kind === "uncertain" || (write?.kind === "saved" && !write.handling)))
+        .sort(([, a], [, b]) => (lastStatusCheck.get(a.reference) ?? 0) - (lastStatusCheck.get(b.reference) ?? 0))
+        .slice(0, journalLimit).map(([key]) => key);
     }
-    function start(keys = recent()) {
+    function start(keys = eligible(), immediate = keys.length) {
       stop();
       if (!keys.length || !visible()) return;
       const controller = new AbortController();
       wave = controller;
       const { signal } = controller;
-      async function round(keys: string[], attempt: number) {
-        const remaining: string[] = [];
-        for (let i = 0; i < keys.length; i += statusBatch) {
-          if (signal.aborted || !visible()) return;
-          const batch = keys.slice(i, i + statusBatch);
-          const repeat = await Promise.all(batch.map(key => checkAnswer(key, signal)));
-          for (const [index, key] of batch.entries()) if (repeat[index]) remaining.push(key);
-        }
-        const delay = statusBackoff[attempt];
-        if (!signal.aborted && remaining.length && delay !== undefined && visible()) {
-          timer = setTimeout(() => void round(remaining.slice(0, statusBatch), attempt + 1), delay);
-        }
+      const watching = () => !signal.aborted && visible();
+      const firstPass = keys.slice(0, immediate);
+      const queue = keys.slice(immediate);
+      async function checkBatch(batch: string[]) {
+        const repeat = await Promise.all(batch.map(key => checkAnswer(key, signal)));
+        queue.push(...batch.filter((_, index) => repeat[index]));
       }
-      void round(keys, 0);
+      function poll(round: number, limit: number) {
+        if (!watching() || !queue.length || round >= limit) return;
+        const delay = statusBackoff[Math.min(round, statusBackoff.length - 1)];
+        timer = setTimeout(async () => {
+          if (!watching()) return;
+          await checkBatch(queue.splice(0, statusBatch));
+          poll(round + 1, limit);
+        }, delay);
+      }
+      async function reconcile() {
+        for (let i = 0; i < firstPass.length; i += statusBatch) {
+          if (!watching()) return;
+          await checkBatch(firstPass.slice(i, i + statusBatch));
+        }
+        // Keep one batch per backoff step, adding steps only if needed to
+        // give everybody in the bounded queue a turn (at most eight batches).
+        poll(0, Math.max(statusBackoff.length, Math.ceil(queue.length / statusBatch)));
+      }
+      void reconcile();
     }
-    // Mount/manual/visibility can reconcile the bounded local history once;
-    // active polling uses only one small batch, never one timer per receipt.
+    // Mount/manual/visibility reconcile bounded history once. A write checks
+    // its own status promptly without dropping the rest from the poll queue.
     function afterWrite(reference: DecisionReference) {
       if (!inGroup(groupId, reference)) return;
       const key = decisionKey(reference);
-      start([key, ...recent().filter(other => other !== key)].slice(0, statusBatch));
+      start([key, ...eligible().filter(other => other !== key)].slice(0, journalLimit), statusBatch);
     }
     const visibility = () => start();
     checkOnWrite.add(afterWrite);

@@ -205,9 +205,25 @@ export async function prepareDecisionAnswer(item: PendingDecision, selection: De
   const attempt: DecisionAttempt = { ref, scope, key, digest: await answerDigest(ref, scope, key, body, text) };
   return {
     attempt,
-    post: async () => Object.freeze(await request(`${path}${answerPath(ref)}`, {
-      method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body,
-    }, (value): value is DecisionReceipt => matchesReference(value, ref) && value.option_index === option_index && value.text === text)),
+    post: async () => {
+      const controller = new AbortController();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          // Stop waiting locally; the server may already have saved this answer.
+          reject(new ApiError("等待服务响应超时，请核对保存状态。", 0, "transport_timeout"));
+          controller.abort();
+        }, 10000);
+      });
+      try {
+        const response = request(`${path}${answerPath(ref)}`, {
+          method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body, signal: controller.signal,
+        }, (value): value is DecisionReceipt => matchesReference(value, ref) && value.option_index === option_index && value.text === text);
+        return Object.freeze(await Promise.race([response, deadline]));
+      } finally {
+        clearTimeout(timer);
+      }
+    },
   };
 }
 

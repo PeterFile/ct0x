@@ -340,40 +340,84 @@ it("retries a recovered attempt only on explicit matching input after checking e
   expect(reads.mock.invocationCallOrder.slice(priorReads).some(call => call < post.mock.invocationCallOrder[1])).toBe(true);
 });
 
-it("answers a strictly newer version without resolving the older unknown", async () => {
+it.each(["same", "newer"] as const)("leaves a hanging POST uncertain and lets the %s version proceed", async version => {
+  vi.useFakeTimers();
+  const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
   const older = taskQuestion("unknown-version", 2, "alerts"), newer = { ...older, version: 3 };
-  const post = vi.fn<typeof fetch>().mockResolvedValueOnce(json({}, 502))
-    .mockResolvedValueOnce(json(receiptFor(newer, newer.choices[1], 2)));
+  const target = version === "newer" ? newer : older;
+  const hanging = deferred<Response>(); // Never settles, even when the client aborts.
+  const post = vi.fn<typeof fetch>().mockReturnValueOnce(hanging.promise)
+    .mockResolvedValueOnce(json(receiptFor(target, target.choices[1], 2)));
+  const reads = vi.fn<typeof fetch>(async () => absent());
   let current = older;
   vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
     if (String(input) === `${pendingPath}?limit=50`) return Promise.resolve(page([current]));
     if (init?.method === "POST") return post(input, init);
+    if (String(input) === statusPath(older)) return reads(input, init);
     return Promise.resolve(absent());
   });
   render(<PendingDecisions active />);
-  await screen.findByRole("article", { name: fallback });
-  const select = () => fireEvent.click(formFor(fallback).getByRole("radio", { name: "纳入周末" }));
+  await tick(0);
+  const choice = () => formFor(fallback).getByRole("radio", { name: "纳入周末" });
   const submit = () => formFor(fallback).getByRole("button", { name: "提交答复" });
-  select(); fireEvent.click(submit());
-  expect(await screen.findByRole("alert")).toHaveTextContent("答复结果未确认");
-  expect(submit()).toBeDisabled();
-  current = newer;
-  fireEvent.click(screen.getByRole("button", { name: "刷新待决事项" }));
-  await screen.findByText(`决定版本 ${newer.version}`);
-  expect(submit()).toBeDisabled(); // A new version requires a fresh selection.
-  const history = within(screen.getByRole("region", { name: "尚未确认的答复" }));
-  expect(history.getByText(`决定版本 ${older.version}`, { exact: false }))
-    .toHaveTextContent(`事项 ${older.id} · 决定版本 ${older.version}`);
-  expect(history.queryByRole("button", { name: "重试同一次答复" })).not.toBeInTheDocument();
+  fireEvent.click(choice()); fireEvent.click(submit());
+  await tick(0);
   expect(post).toHaveBeenCalledTimes(1);
-  select(); expect(submit()).toBeEnabled(); fireEvent.click(submit());
-  expect(await screen.findByText("答复已保存")).toBeVisible();
-  expect(history.getByRole("alert")).toHaveTextContent("答复结果未确认");
+  const [firstPath, first] = post.mock.calls[0];
+  const key = new Headers(first?.headers).get("Idempotency-Key")!;
+  expect(firstPath).toBe(answerPath(older));
+  expect(key).toBeTruthy();
+  if (version === "newer") {
+    current = newer;
+    fireEvent.click(screen.getByRole("button", { name: "刷新待决事项" }));
+    await tick(0);
+    expect(formFor(fallback).getByText(`决定版本 ${newer.version}`)).toBeVisible();
+  }
+
+  await tick(9999);
+  expect(first?.signal?.aborted).toBe(false);
+  expect(choice()).toBeDisabled();
+  expect(reads).not.toHaveBeenCalled();
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  await tick(1);
+  expect(first?.signal?.aborted).toBe(true);
+  expect(screen.getByRole("alert")).toHaveTextContent("答复结果未确认");
+  expect(screen.queryByText("答复已保存")).not.toBeInTheDocument();
+  expect(storedValues()).toContain(key);
+  expect(post).toHaveBeenCalledTimes(1);
+  expect(reads).toHaveBeenCalledTimes(1);
+  expect(reads).toHaveBeenCalledWith(statusPath(older), expect.objectContaining({ method: "GET", cache: "no-store", redirect: "error" }));
+
+  if (version === "newer") {
+    const history = within(screen.getByRole("region", { name: "尚未确认的答复" }));
+    expect(history.getByText(`决定版本 ${older.version}`, { exact: false }))
+      .toHaveTextContent(`事项 ${older.id} · 决定版本 ${older.version}`);
+    expect(history.queryByRole("button", { name: "重试同一次答复" })).not.toBeInTheDocument();
+    expect(choice()).toBeEnabled();
+    expect(submit()).toBeDisabled(); // A new version requires a fresh selection.
+    fireEvent.click(choice());
+    expect(submit()).toBeEnabled();
+    fireEvent.click(submit());
+  } else {
+    expect(submit()).toBeDisabled();
+    fireEvent.click(formFor(fallback).getByRole("button", { name: "重试同一次答复" }));
+  }
+  await tick(0);
+  expect(screen.getByText("答复已保存")).toBeVisible();
   expect(post).toHaveBeenCalledTimes(2);
-  const [[, first], [path, next]] = post.mock.calls;
-  expect(path).toBe(answerPath(newer));
-  expect(JSON.parse(String(next?.body))).toEqual({ group_id: newer.group_id, topic_id: newer.topic_id, version: newer.version, option_index: 2 });
-  expect(new Headers(next?.headers).get("Idempotency-Key")).not.toBe(new Headers(first?.headers).get("Idempotency-Key"));
+  const [path, next] = post.mock.calls[1];
+  const nextKey = new Headers(next?.headers).get("Idempotency-Key");
+  expect(path).toBe(answerPath(target));
+  expect(next?.signal?.aborted).toBe(false);
+  if (version === "newer") {
+    expect(screen.getByRole("alert")).toHaveTextContent("答复结果未确认");
+    expect(JSON.parse(String(next?.body))).toEqual({ group_id: newer.group_id, topic_id: newer.topic_id, version: newer.version, option_index: 2 });
+    expect(nextKey).not.toBe(key);
+  } else {
+    expect(next?.body).toBe(first?.body);
+    expect(nextKey).toBe(key);
+    expect(reads.mock.invocationCallOrder[1]).toBeLessThan(post.mock.invocationCallOrder[1]);
+  }
 });
 
 it.each(["disabled", "at quota"])("sends and explicitly replays the same answer when sessionStorage is %s", async storage => {
@@ -473,6 +517,67 @@ it.each(["handled", "uncertain", "hidden", "budget"] as const)("checks for exact
     expect(screen.getByText("负责人已处理")).toBeVisible();
     expect(reads).toHaveBeenCalledTimes(stopped + 1);
   }
+});
+
+it.each(["visibility", "write"] as const)("rotates bounded status reads across five records after %s", async trigger => {
+  vi.useFakeTimers();
+  setVisibility("hidden");
+  const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+  const items = Array.from({ length: 5 }, (_, i) => ({ ...taskQuestion(`poll-${i}`, 1, ""), group_name: `告警 ${i}` }));
+  const receipts = items.map(item => receiptFor(item, item.choices[1], 2));
+  const posts = vi.fn<typeof fetch>(async input => {
+    const index = items.findIndex(item => answerPath(item) === String(input));
+    if (index < 0) throw new Error(`Unexpected write: ${String(input)}`);
+    return index === 0 ? json({}, 502) : json(receipts[index]);
+  });
+  const visits = new Map<string, number>();
+  let inFlight = 0, peak = 0, acknowledged = false;
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+    const path = String(input);
+    if (path === `${pendingPath}?limit=50`) return page(items);
+    if (init?.method === "POST") return posts(input, init);
+    const index = items.findIndex(item => statusPath(item) === path);
+    if (index < 0 || init?.method !== "GET") return absent();
+    visits.set(path, (visits.get(path) ?? 0) + 1);
+    peak = Math.max(peak, ++inFlight);
+    await new Promise<void>(resolve => setTimeout(resolve, 100));
+    inFlight--;
+    if (index === 0 && !acknowledged) return absent();
+    return json({ receipt: receipts[index], handling: index === 0 ? handling : null });
+  });
+  render(<PendingDecisions active />);
+  await tick(0);
+  for (const item of items) {
+    if (trigger === "write" && item === items.at(-1)) setVisibility("visible");
+    const card = formFor(`项目未确认 · ${item.group_name} · 周末样本验证`);
+    fireEvent.click(card.getByRole("radio", { name: "纳入周末" }));
+    fireEvent.click(card.getByRole("button", { name: "提交答复" }));
+    await tick(0);
+  }
+  if (trigger === "visibility") {
+    expect(visits.size).toBe(0);
+    setVisibility("visible");
+    act(() => { document.dispatchEvent(new Event("visibilitychange")); });
+  }
+  await tick(1000);
+  const initial = trigger === "visibility" ? items.length : 4;
+  expect(visits.size).toBe(initial);
+  expect(screen.getByRole("alert")).toHaveTextContent("答复结果未确认");
+  expect(screen.queryByText("负责人已处理")).not.toBeInTheDocument();
+
+  acknowledged = true; // The other four remain unhandled for the whole wave.
+  await tick(120000);
+  expect(visits.get(statusPath(items[0]))).toBe(trigger === "visibility" ? 2 : 1);
+  for (const item of items.slice(1)) expect(visits.get(statusPath(item))).toBeGreaterThan(1);
+  expect(screen.getByText(receipts[0].id)).toBeVisible();
+  expect(screen.getByText("负责人已处理")).toBeVisible();
+  expect(posts).toHaveBeenCalledTimes(items.length);
+  expect(peak).toBe(4);
+  const totalReads = () => [...visits.values()].reduce((sum, count) => sum + count, 0);
+  const stopped = totalReads();
+  expect(stopped).toBeLessThanOrEqual(initial + 6 * 4);
+  await tick(120000);
+  expect(totalReads()).toBe(stopped);
 });
 
 it("keeps a migration-absent decision inbox optional alongside the real review inbox", async () => {
