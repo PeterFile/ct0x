@@ -11,9 +11,10 @@ import (
 
 // PreparedExecution contains trusted configuration only; preparation never starts execution.
 type PreparedExecution struct {
-	Executor     provider.Executor
-	Request      provider.ExecuteRequest
-	ResourceKeys []string
+	Executor            provider.Executor
+	Request             provider.ExecuteRequest
+	ResourceKeys        []string
+	PreparedThreadState *store.PreparedThreadState // Checked during the existing claim, before any launch.
 }
 
 type PrepareFunc func(context.Context, store.PendingDelivery) (PreparedExecution, error)

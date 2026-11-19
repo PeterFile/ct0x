@@ -41,7 +41,11 @@ func memberHistoryModeInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScop
 	return effectiveHistory, nil
 }
 
-const qualifiedMessageColumns = "m.id, m.group_id, m.topic_id, m.sender_id, m.content, m.created_at"
+const (
+	qualifiedMessageColumns  = "m.id, m.group_id, m.topic_id, m.sender_id, m.content, m.created_at"
+	notCorrectionCommandSQL  = `NOT EXISTS(SELECT 1 FROM main.thread_corrections cmd WHERE cmd.command_message_id=m.id)`
+	effectiveHistoryTopicSQL = `coalesce((` + latestEffectiveTopicSQL + `),m.topic_id)`
+)
 
 // Only an already authorized ordinary scope may opt into effective membership.
 // Apply the cursor and limit to key-only candidates before reading full rows.
@@ -51,6 +55,11 @@ func scopedThreadMessagesInTx(ctx context.Context, tx *sql.Tx, group, topic stri
 	if err != nil {
 		return nil, err
 	}
+	return queryScopedThreadMessagesInTx(ctx, tx, group, topic, mode, installed, before, like, limit)
+}
+
+// The caller has already verified correction installation in this snapshot.
+func queryScopedThreadMessagesInTx(ctx context.Context, tx *sql.Tx, group, topic string, mode historyScopeMode, correctionsInstalled bool, before *Cursor, like string, limit int) (*sql.Rows, error) {
 	const orderLimit = ` ORDER BY m.created_at DESC,m.id DESC LIMIT ?`
 	cursor := ""
 	var filters []any
@@ -65,15 +74,15 @@ func scopedThreadMessagesInTx(ctx context.Context, tx *sql.Tx, group, topic stri
 	filters = append(filters, limit)
 	from := ` FROM main.messages m WHERE m.group_id=? AND m.topic_id=?`
 	args := append([]any{group, topic}, filters...)
-	if !installed {
+	if !correctionsInstalled {
 		return tx.QueryContext(ctx, `SELECT `+qualifiedMessageColumns+from+cursor+orderLimit, args...)
 	}
 	// Correction commands are visible in the group timeline, never model context.
-	from += ` AND NOT EXISTS(SELECT 1 FROM main.thread_corrections cmd WHERE cmd.command_message_id=m.id)`
+	from += ` AND ` + notCorrectionCommandSQL
 	if mode == storageHistory {
 		return tx.QueryContext(ctx, `SELECT `+qualifiedMessageColumns+from+cursor+orderLimit, args...)
 	}
-	from += ` AND coalesce((` + latestEffectiveTopicSQL + `),m.topic_id)=m.topic_id`
+	from += ` AND ` + effectiveHistoryTopicSQL + `=m.topic_id`
 	// The outgoing branch uses the raw topic cursor index. The incoming branch
 	// starts with the indexed destination and accepts only the latest move. The
 	// branches are disjoint and each contributes at most one page of row keys.
