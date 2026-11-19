@@ -191,6 +191,49 @@ func TestThreadRoutingTaskLinkAndScopedHistory(t *testing.T) {
 	threadCounts(t, f.s, map[string]int{"thread_routing_topics": 2, "thread_routing_links": 2, "deliveries": 1, "tasks": 1, "mandates": 1})
 }
 
+func TestThreadRoutingReplyClassificationBudget(t *testing.T) {
+	enableThreadRoutingFixture(t)
+	f := setupMessages(t)
+	quoted, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, ActorID: f.a, TopicID: "previous", Content: "Previous result."}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const prefix = "补充细节："
+	atLimit := prefix + strings.Repeat("x", maxThreadTextBytes-len(prefix))
+	pastLimit := atLimit + "x"
+	lateMarker := atLimit + "\n引用仅作对照。"
+	for _, tc := range []struct {
+		name, body, reply, topic, wantTopic, wantRecipient string
+		recipients                                         []string
+	}{
+		{"at_limit", atLimit, quoted.ID, "", quoted.TopicID, f.a, nil},
+		{"one_byte_over", pastLimit, quoted.ID, "", "", f.b, nil},
+		{"comparison_beyond_limit", lateMarker, quoted.ID, "", "", f.b, nil},
+		{"explicit_topic", lateMarker, quoted.ID, quoted.TopicID, quoted.TopicID, f.b, nil},
+		{"explicit_recipient", lateMarker, quoted.ID, "", "", f.a, []string{f.a}},
+		{"public_only", lateMarker, quoted.ID, "", "", "", []string{}},
+		{"without_quote", lateMarker, "", "", "", f.a, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := postThreadMessage(t, f.s, MessageRequest{
+				GroupID: f.groupID, ActorID: "user", Content: tc.body, TopicID: tc.topic, TopicIDExplicit: tc.topic != "",
+				RecipientIDs: tc.recipients, IdempotencyKey: tc.name, ThreadLinks: domain.ThreadLinks{ReplyToMessageID: tc.reply},
+			})
+			if m.TopicID != tc.wantTopic || m.ReplyToMessageID != tc.reply || m.Content != tc.body {
+				t.Errorf("topic=%q (want %q), reply=%q (want %q), body preserved=%t", m.TopicID, tc.wantTopic, m.ReplyToMessageID, tc.reply, m.Content == tc.body)
+			}
+			if (tc.wantRecipient == "" && len(m.Deliveries) != 0) ||
+				(tc.wantRecipient != "" && (len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != tc.wantRecipient)) {
+				t.Errorf("deliveries=%+v, want recipient %q", m.Deliveries, tc.wantRecipient)
+			}
+			stored, err := f.s.GetMessage(ctx, f.groupID, m.ID)
+			if err != nil || stored.Content != tc.body || stored.ReplyToMessageID != tc.reply {
+				t.Errorf("stored reply or body changed, reply=%q, body preserved=%t, err=%v", stored.ReplyToMessageID, stored.Content == tc.body, err)
+			}
+		})
+	}
+}
+
 func TestThreadRoutingLegacyFallbackAndDamagedSchema(t *testing.T) {
 	original := migrations
 	t.Cleanup(func() { migrations = original })

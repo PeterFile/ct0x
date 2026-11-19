@@ -16,7 +16,7 @@ type localThreadRoute struct {
 	topic, recipient, replyTopic string
 	newTitle, newIssue           string
 	correction                   *domain.ThreadCorrection
-	comparisonAuthor             string // Excluded from fallback, not from independent routing.
+	comparisonAuthor             string // Reference-only author excluded from fallback.
 }
 
 func threadRoutingInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
@@ -92,7 +92,7 @@ func publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 		r.RecipientIDs, recipients = nil, nil
 	}
 	// Compose A's single dispatch decision here: an E recipient is a suggestion
-	// for omitted recipients only. Fallback cannot wake a comparison author.
+	// for omitted recipients only. Fallback cannot wake a reference-only author.
 	if route.correction == nil && normalPost && r.RecipientIDs == nil {
 		if route.recipient == "" {
 			if err := activeDefaultRecipientInTx(ctx, tx, r.GroupID, route.comparisonAuthor, &route.recipient); err != nil {
@@ -213,8 +213,11 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 		route.topic = ""
 		return route, err
 	}
+	// Unclassified long text may contain a comparison cue outside the budget.
+	// Keep the verified quote, but do not use it as routing evidence.
+	referenceOnly := r.ReplyToMessageID != "" && len(r.Content) > maxThreadTextBytes
 	if !infer || r.TopicID != "" || r.TopicIDExplicit {
-		if replyAuthor != "" && threadComparisonReply(r.Content) {
+		if referenceOnly || (replyAuthor != "" && threadComparisonReply(r.Content)) {
 			route.comparisonAuthor = replyAuthor
 		} else if replyEffectiveTopic == route.topic {
 			route.recipient = replyAuthor
@@ -230,9 +233,8 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 	if taskTopic.Valid {
 		evidence.confirm(taskTopic.String)
 	}
-	// Comparison references never select the quoted topic or author, even
-	// when we cannot resolve the explicitly stated current subject.
-	if text.comparison {
+	referenceOnly = referenceOnly || text.comparison
+	if referenceOnly {
 		route.comparisonAuthor = replyAuthor
 	} else if r.ReplyToMessageID != "" {
 		evidence.confirm(replyEffectiveTopic)
@@ -249,7 +251,7 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 		return route, nil
 	}
 	switch {
-	case !text.comparison && replyAuthor != "" && replyEffectiveTopic == route.topic:
+	case !referenceOnly && replyAuthor != "" && replyEffectiveTopic == route.topic:
 		route.recipient = replyAuthor
 	case taskTopic.Valid && taskTopic.String == route.topic && taskOwner != "":
 		route.recipient = taskOwner
