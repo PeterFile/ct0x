@@ -199,11 +199,90 @@ func TestThreadRoutingColdIssueName(t *testing.T) {
 		if m := post("当前讨论导出 BUG，EX-421"); m.TopicID != "" {
 			t.Fatalf("contradictory exact title and issue escaped main: %+v", m)
 		}
+		if m := post("当前讨论导出 BUG EX-421"); m.TopicID != root.TopicID {
+			t.Fatalf("contained title must not contradict the longest complete title: got %q want %q", m.TopicID, root.TopicID)
+		}
+		for _, content := range []string{
+			"导出 BUG EX-421 和导出 BUG 都要跟进。",
+			"导出 BUG 和导出 BUG EX-421 都要跟进。",
+			"导出 BUG，EX-421，引用仅作对照。",
+		} {
+			if m := post(content); m.TopicID != "" {
+				t.Errorf("independent mention of the shorter title escaped main: %q → %q", content, m.TopicID)
+			}
+		}
 	})
 	generic := post("New topic: incident OPS-62")
 	if generic.TopicID == "" || post("Follow up on incident").TopicID != "" || post("New topic: incident report").TopicID != "" {
 		t.Fatalf("generic words created or selected a thread without an issue: %+v", generic)
 	}
+}
+
+func TestThreadRoutingComparisonDoesNotWakeQuotedAuthor(t *testing.T) {
+	a := openMessageAPI(t, "")
+	requireThreadRoutingFixture(t, a)
+	group := newGroup(t, a, "comparison")
+	path := "/api/v1/groups/" + group.ID
+	newMember := func(name string) string {
+		t.Helper()
+		return decoded[domain.Member](t, a.request("POST", path+"/members", `{"name":"`+name+`","role":"role"}`), 201).ID
+	}
+	post := func(t *testing.T, content, reply string, recipients []string) domain.Message {
+		t.Helper()
+		input := map[string]any{"content": content}
+		if reply != "" {
+			input["reply_to_message_id"] = reply
+		}
+		if recipients != nil {
+			input["recipient_ids"] = recipients
+		}
+		body, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decoded[domain.Message](t, a.request("POST", path+"/messages", string(body)), 201)
+	}
+	quotedAuthor := newMember("quoted author")
+	quotedTopic := post(t, "新话题：EX-421 导出错误", "", []string{})
+	if quotedTopic.TopicID == "" {
+		t.Fatal("missing comparison topic fixture")
+	}
+	quoted, err := a.db.CreateMessage(t.Context(), store.MessageRequest{
+		GroupID: group.ID, TopicID: quotedTopic.TopicID, ActorID: quotedAuthor, Content: "旧导出故障。",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(t *testing.T, content, topic, recipient string, explicit []string) {
+		t.Helper()
+		m := post(t, content, quoted.ID, explicit)
+		if m.Content != content || m.TopicID != topic || m.ReplyToMessageID != quoted.ID {
+			t.Errorf("comparison changed scope or raw reference: %+v, want topic %q", m, topic)
+		}
+		if (recipient == "" && len(m.Deliveries) != 0) ||
+			(recipient != "" && (len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != recipient)) {
+			t.Errorf("comparison got deliveries %+v, want recipient %q", m.Deliveries, recipient)
+		}
+	}
+	t.Run("only_quoted_author", func(t *testing.T) {
+		check(t, "当前讨论支付网关故障，引用仅作对照。", "", "", nil)
+	})
+	fallback := newMember("eligible fallback")
+	t.Run("earliest_quoted_author", func(t *testing.T) {
+		check(t, "当前讨论支付网关故障，引用仅作对照。", "", fallback, nil)
+		check(t, "引用仅作对照。", "", fallback, nil)
+	})
+	t.Run("same_clause", func(t *testing.T) {
+		current := post(t, "新议题：支付网关故障", "", []string{quotedAuthor})
+		if current.TopicID == "" || current.TopicID == quotedTopic.TopicID {
+			t.Fatalf("missing independent current topic: %+v", current)
+		}
+		check(t, "当前讨论支付网关故障（EX-421仅作对照）", current.TopicID, quotedAuthor, nil)
+		check(t, "当前讨论支付网关故障 (EX-421, 仅供参考)。", current.TopicID, "", []string{})
+		check(t, "当前讨论支付网关故障 EX-421仅作对照", "", fallback, nil)
+		check(t, "当前讨论支付网关故障（EX-421，仅作对照", "", fallback, nil)
+		check(t, "当前讨论账单入账故障（EX-421仅作对照）", "", quotedAuthor, []string{quotedAuthor})
+	})
 }
 
 func TestThreadRoutingEvidenceAndRecipients(t *testing.T) {
