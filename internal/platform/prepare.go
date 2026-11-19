@@ -210,6 +210,9 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	}
 	group, member, conversation, trigger, state := input.group, input.member, input.conversation, input.trigger, input.state
 	d := pending.Delivery
+	if input.discussionReturn != nil {
+		return p.prepareDiscussionWorkReturn(ctx, input)
+	}
 	if state.Provenance.SourceKind != "" {
 		return p.prepareFreshTaskWork(ctx, input)
 	}
@@ -328,12 +331,13 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 }
 
 type preparationInput struct {
-	group        domain.Group
-	member       domain.Member
-	conversation domain.Conversation
-	trigger      domain.Message
-	state        store.CoordinationRoleState
-	typedWork    *domain.TaskWorkDelivery // Validated report/delegation peek, never a claim.
+	group            domain.Group
+	member           domain.Member
+	conversation     domain.Conversation
+	trigger          domain.Message
+	state            store.CoordinationRoleState
+	typedWork        *domain.TaskWorkDelivery // Validated report/delegation peek, never a claim.
+	discussionReturn *domain.ChatDiscussionWorkReturnReceipt
 }
 
 // Keep the authority read order and checks shared by both trusted entry points.
@@ -386,20 +390,31 @@ func (p *Preparer) loadPreparationInput(ctx context.Context, pending store.Pendi
 	if !found {
 		return empty, errPrepareBinding
 	}
-	state, err := p.store.ResolveCoordinationDelivery(ctx, group.ID, d.ID)
-	input := preparationInput{group: group, member: member, conversation: conversation, trigger: trigger, state: state}
-	// The B owner-role resolver returns reports but denies delegates. Probe
-	// only those paths; a joined Store/rollback failure is not a plain denial.
-	if (err == nil && state.Provenance.SourceKind == domain.TaskWorkSourceReport) || errors.Unwrap(err) == store.ErrMemberToolDenied {
-		return p.resolveQueuedTaskWork(ctx, input, d.ID, err)
+	input := preparationInput{group: group, member: member, conversation: conversation, trigger: trigger}
+	input.discussionReturn, err = p.queuedDiscussionWorkReturn(ctx, input, pending)
+	if err != nil {
+		return empty, err
+	}
+	if receipt := input.discussionReturn; receipt != nil {
+		input.state, err = p.store.ResolveCoordinationDiscussionWorkReturnDelivery(ctx, group.ID, d.ID, *receipt)
+		if err == nil && input.state.Provenance.Kind != store.CoordinationRoleOrdinary {
+			return empty, errPrepareBinding
+		}
+	} else {
+		input.state, err = p.store.ResolveCoordinationDelivery(ctx, group.ID, d.ID)
+		if (err == nil && input.state.Provenance.SourceKind == domain.TaskWorkSourceReport) || errors.Unwrap(err) == store.ErrMemberToolDenied {
+			// The B owner-role resolver returns reports but denies delegates. Probe
+			// only those paths; a joined Store/rollback failure is not a plain denial.
+			return p.resolveQueuedTaskWork(ctx, input, d.ID, err)
+		}
 	}
 	if err != nil {
 		return empty, preparationResolutionError(ctx, err)
 	}
-	if err := validatePreparationRole(state, group, member, conversation, trigger, d); err != nil {
+	if err := validatePreparationRole(input.state, group, member, conversation, trigger, d); err != nil {
 		return empty, err
 	}
-	if err := p.checkRepairPreparationReady(ctx, state, trigger); err != nil {
+	if err := p.checkRepairPreparationReady(ctx, input.state, trigger); err != nil {
 		return empty, err
 	}
 	return input, nil
@@ -426,8 +441,7 @@ func (p *Preparer) buildContext(group domain.Group, member domain.Member, conver
 }
 
 func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Member, conversation domain.Conversation,
-	trigger domain.Message, history []domain.Message, useMemberTools, nativeText bool, intakeSchema memberToolIntakeSchema, repairs ...*domain.ChatRepairSource) ([]byte, error) {
-	investigationIntake := intakeSchema.investigation
+	trigger domain.Message, history []domain.Message, useMemberTools, nativeText bool, schema memberToolIntakeSchema, repairs ...*domain.ChatRepairSource) ([]byte, error) {
 	metadata := struct {
 		Group        domain.Group        `json:"group"`
 		Conversation domain.Conversation `json:"conversation"`
@@ -482,13 +496,13 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 			tools := p.memberTools.tools
 			continueWork := tools.continueWorkEnabled()
 			summaryPreparation := "prepare_work仅在policy.preparation_supported=true且preparation_scope_kind=topic_summary时使用；只填action=text_submission和reason，不填title/description/acceptance。服务端固定本话题摘要目标/验收，不能另选工作或将旧任意文本规则当宽授权。"
-			if investigationIntake {
+			if schema.investigation {
 				summaryPreparation = "仅对 action=text_submission 的摘要分支：" + summaryPreparation
 			} else if !continueWork {
 				summaryPreparation += "否则只讨论/澄清。"
 			}
 			discussion := "评估持久化后仍可公开讨论/提案。仅真实用户聊天触发的discuss轮可按list_members返回的实际同群成员ID邀请一个同伴一次；随后成员轮只公开回应，不能递归邀请。每轮额外公开消息最多一条，邀请最多一条；不按姓名猜ID。该讨论路径不授用户权限。"
-			if intakeSchema.piDiscussionRelaySource != "" {
+			if schema.piDiscussionRelaySource != "" {
 				discussion = "普通讨论不需要 Task，不授予工作权限。先用 read_channel 查看可选 discussion_context；按原始、到达及邀请消息 ID 用 read_history 获取所需正文。先用独立的 intent_assessment 保存 discuss 评估，不带 discussion 或 recipient_ids。然后用 send_message 的 content 和 discussion 接力，省略 intent_assessment 和 recipient_ids。"
 			}
 			in.Permissions = []string{
@@ -503,7 +517,7 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 				"根据工具outcome区分admitted、not_admitted、discuss、clarify；not_admitted的reason_code/question和原话题说明是持久事实，不能自动加额度、换key重复准入或用模型最终文字改称成功。真正HTTP结果未知时保留原key对账，不自动重试业务操作。",
 				"intake本轮不授予文件IO、Artifact发布或外部动作权限；语义评估登记Task不等于工作成员获准执行。CWD不是主机读取沙箱。Task/分派持久化不等于执行成功，具体Submission不等于用户接纳或Review；最终文字必须有效UTF-8且最多65536字节。",
 			}
-			if intakeSchema.piDiscussionRelaySource != "" {
+			if schema.piDiscussionRelaySource != "" {
 				in.Permissions = append(in.Permissions,
 					"新接力只能从绑定的真实本机用户聊天开始。已有接力仅由当前负责人在 incoming_message_id 与 head_message_id 一致且 closed=false 时推进。invite 需用 list_members 中一个现有同群成员 ID 填 recipient_id，可补充 expected_reply；省略时以邀请正文为准。",
 					"受邀者在额度内可再请一位同伴或用 reply 回答；收到下游答复后只向上一位回复。发起人没有待答邀请时用 resolve 公开收束且不唤醒成员。reply 和 resolve 不带 recipient_id 或 expected_reply，返回路径由服务端绑定。没有接力时可普通公开回复；工具结果未知时保留原调用标识，不换键重试。")
@@ -520,9 +534,13 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 					"若本轮工具实际提供 continue_work，且绑定的本机用户原文明确要求在原授权内续办"+scope+"，用 continue_work 和 reason，不填 action 或新任务字段。followup.task_id 只引用本条原文中的正式任务编号，constraint 只能是本条原文的连续逐字摘录。省略编号时由服务端判定能否唯一确定原任务；候选提示不构成授权。不得把文件或外部动作要求改称纯文本。",
 					"continued 仅表示已记录原任务输入，不代表已启动、处理、提交或接纳；not_admitted 以 reason_code/question 与原话题通知为准。已排队、缺少执行条件或上轮未结算时，不另建 Task、不改走通用执行、不代原负责人执行。")
 			}
-			if investigationIntake {
+			if schema.investigation {
+				source := "绑定的单收件人本机用户原文明确要求在该范围内另开调查时"
+				if schema.invitation != nil {
+					source = "本轮收到的正式讨论邀请适用原讨论的本机用户预授权范围，且确实需要在该范围另开调查时；邀请、同伴转述或赞同本身不构成授权"
+				}
 				in.Permissions = append(in.Permissions,
-					"仅当本轮工具实际签发 action=read_only_investigation，且 read_channel 返回的 chat_candidate.policy 启用并提供 investigation 范围，绑定的单收件人本机用户原文明确要求在该范围内另开调查时，才用 prepare_work、action=read_only_investigation 和 reason；目标、材料和验收由服务端固定。仅讨论或续办已有任务都不走此分支。",
+					"仅当本轮工具实际签发 action=read_only_investigation，且 read_channel 返回的 chat_candidate.policy 启用并提供 investigation 范围，"+source+"，才用 prepare_work、action=read_only_investigation 和 reason；目标、材料和验收由服务端固定。仅讨论或续办已有任务都不走此分支。",
 					"只讨论、续办、新调查是不同评估，不混用字段。若所需动作未签发、授权范围不可确认或意图不清，只讨论或用 clarify 问一个问题；不要换成别的准入动作。是否准入由服务端核验，不凭文本、历史或工具可见性推断授权。")
 			}
 		}
