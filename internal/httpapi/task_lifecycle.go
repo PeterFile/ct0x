@@ -11,6 +11,7 @@ import (
 func TaskLifecycleRoutes(local *platform.LocalUser) []Route {
 	a := localAPI{local}
 	return []Route{
+		{http.MethodGet, "/api/v1/me/pending-reviews", a.listPendingReviews},
 		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/attempts", a.listTaskAttempts},
 		{http.MethodPost, "/api/v1/groups/{group}/tasks/{task}/attempts", noQuery(a.activateTaskAttempt)},
 		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/attempts/{attempt}", noQuery(a.getTaskAttempt)},
@@ -77,6 +78,17 @@ func (a localAPI) listTaskSubmissions(w http.ResponseWriter, r *http.Request) {
 	}
 	page, err := a.local.ListTaskSubmissions(r.Context(), groupID, taskID, options)
 	writePage(w, page, scope, groupID, err)
+}
+
+func (a localAPI) listPendingReviews(w http.ResponseWriter, r *http.Request) {
+	const scope = "pending_reviews"
+	options, err := listOptions(r, scope, "")
+	if err != nil {
+		operationError(w, err)
+		return
+	}
+	page, err := a.local.ListPendingReviews(r.Context(), options)
+	writePage(w, page, scope, "", err)
 }
 
 func (a localAPI) reviewTask(w http.ResponseWriter, r *http.Request) {
