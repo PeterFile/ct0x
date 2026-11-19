@@ -3,6 +3,7 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -242,5 +243,150 @@ func TestAgentRunStorePublicationChecksGroupTopicAndSender(t *testing.T) {
 	view, err := f.s.GetAgentRun(ctx, turn.GroupID, claim.TurnID, ListOptions{})
 	if err != nil || len(view.Timeline.Items) != 1 || view.Timeline.Items[0].Kind != "trigger_message" || view.AcceptedAt != nil || view.Receipt != nil {
 		t.Fatalf("unrelated message or queued execution leaked into exact Turn: %+v, %v", view, err)
+	}
+}
+
+func TestAgentRunStoreToolEvidenceStaysOnExactRun(t *testing.T) {
+	f, request, decision, scope := assignmentPending(t)
+	s := f.s
+	type evidence struct {
+		scope                    CoordinationToolScope
+		submissionID, decisionID string
+	}
+	record := func(scope CoordinationToolScope, decision domain.DecisionReceipt) evidence {
+		t.Helper()
+		claim := scope.Member.Claim
+		activation := taskAttemptInput(createTestTask(t, s, claim.GroupID))
+		activation.ActorID, activation.MemberScope = scope.Member.MemberID, &scope.Member
+		attempt, err := s.ActivateTaskAttempt(ctx, activation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := taskSubmissionInput(attempt)
+		input.ActorID, input.MemberScope, input.IdempotencyKey = scope.Member.MemberID, &scope.Member, "run-log-"+attempt.ID
+		sub, err := s.SubmitTask(ctx, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Release the member and fixture resource without removing the committed evidence.
+		if turn, err := s.ApplyTurnReceipt(ctx, claim, queueReceipt(provider.OutcomeSucceeded)); err != nil || turn.State != domain.TurnStateSucceeded {
+			t.Fatalf("settle fixture Turn %s: %+v, %v", claim.TurnID, turn, err)
+		}
+		return evidence{scope, sub.ID, decision.Decision.ID}
+	}
+	target := record(scope, decision)
+	compete := func(groupID, coordinator, worker string) evidence {
+		t.Helper()
+		_, decision, scope := assignmentNew(t, s, groupID, coordinator, worker, request.TopicID, "Competing work", "Verifiable result", "")
+		return record(scope, decision)
+	}
+	sameMember := compete(request.GroupID, f.coord, f.worker)
+	otherMember := member(t, s, request.GroupID).ID
+	if _, err := s.SetCoordinator(ctx, request.GroupID, otherMember, request.BindingRevision, "run-log-other-coordinator"); err != nil {
+		t.Fatal(err)
+	}
+	otherCoordinator := compete(request.GroupID, otherMember, f.worker)
+	foreignGroup, foreignMember, foreignWorker := dispatchConfiguredGroup(t, s)
+	foreign := compete(foreignGroup, foreignMember, foreignWorker)
+
+	// A user Attempt may reference the same Turn under the schema, but its submission is not the member's evidence.
+	manual, err := s.ActivateTaskAttempt(ctx, taskAttemptInput(createTestTask(t, s, request.GroupID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	coordinationDecideExec(t, s, "DROP TRIGGER task_attempts_no_update")
+	coordinationDecideExec(t, s, "UPDATE task_attempts SET turn_id=? WHERE id=?", scope.Member.Claim.TurnID, manual.ID)
+	if _, err := s.SubmitTask(ctx, taskSubmissionInput(manual)); err != nil {
+		t.Fatal(err)
+	}
+
+	check := func(run evidence) {
+		t.Helper()
+		claim := run.scope.Member.Claim
+		view, err := s.GetAgentRun(ctx, claim.GroupID, claim.TurnID, ListOptions{})
+		if err != nil || view.Run.RunID != claim.TurnID || view.Run.GroupID != claim.GroupID ||
+			view.Run.MemberID != run.scope.Member.MemberID || view.Timeline.NextCursor != nil {
+			t.Fatalf("read exact Run %s: %+v, %v", claim.TurnID, view, err)
+		}
+		want := []string{runMessagePrefix + run.scope.Provenance.MessageID, runSubmissionPrefix + run.submissionID}
+		if run.decisionID != "" {
+			want = append(want, runDecisionPrefix+run.decisionID)
+		}
+		got := make([]string, 0, len(view.Timeline.Items))
+		for _, entry := range view.Timeline.Items {
+			got = append(got, entry.ID)
+		}
+		slices.Sort(got)
+		slices.Sort(want)
+		if !slices.Equal(got, want) {
+			t.Fatalf("Run %s evidence IDs = %v; want %v", claim.TurnID, got, want)
+		}
+	}
+	for _, run := range []evidence{target, sameMember, otherCoordinator, foreign} {
+		check(run)
+	}
+	if _, err := s.GetAgentRun(ctx, foreignGroup, scope.Member.Claim.TurnID, ListOptions{}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("target Turn selected from another group: %v", err)
+	}
+
+	// Damage only the frozen request coordinator. The genuine decision still names this Turn and delivery.
+	coordinationDecideExec(t, s, "DROP TRIGGER coordination_dispatch_requests_no_update")
+	coordinationDecideExec(t, s, "UPDATE coordination_dispatch_requests SET coordinator_member_id=? WHERE id=?", otherMember, request.ID)
+	dispatchAssertFK(t, s)
+	target.decisionID = ""
+	check(target)
+}
+
+func TestAgentRunStoreTimelinePaginatesEqualTimestamps(t *testing.T) {
+	f, scope, _, _, input := taskSubmissionAgent(t)
+	s, claim := f.s, scope.Claim
+	sub, err := s.SubmitTask(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var triggerID string
+	if err := s.db.QueryRow("SELECT message_id FROM deliveries WHERE group_id=? AND turn_id=?", claim.GroupID, claim.TurnID).Scan(&triggerID); err != nil {
+		t.Fatal(err)
+	}
+	messageIDs := []string{triggerID}
+	for _, key := range []string{"run-log-tie-1", "run-log-tie-2", "run-log-tie-3"} {
+		msg, err := s.SendMessageForTool(ctx, scope, MemberToolMessageInput{Content: "Tied publication"}, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		messageIDs = append(messageIDs, msg.ID)
+	}
+
+	// Tie the messages' display timestamps to the immutable submission, without changing provenance.
+	stamp := sub.CreatedAt.Format(timestampLayout)
+	want := []string{runSubmissionPrefix + sub.ID}
+	for _, id := range messageIDs {
+		coordinationDecideExec(t, s, "UPDATE messages SET created_at=? WHERE group_id=? AND id=?", stamp, claim.GroupID, id)
+		want = append(want, runMessagePrefix+id)
+	}
+	slices.Sort(want)
+	slices.Reverse(want)
+
+	seen := make(map[string]bool, len(want))
+	options := ListOptions{Limit: 1}
+	for i, id := range want {
+		view, err := s.GetAgentRun(ctx, claim.GroupID, claim.TurnID, options)
+		page := view.Timeline
+		if err != nil || len(page.Items) != 1 {
+			t.Fatalf("page %d: want one event (%s), got %+v, %v", i+1, id, page, err)
+		}
+		entry, next := page.Items[0], page.NextCursor
+		if entry.ID != id || !entry.CreatedAt.Equal(sub.CreatedAt) || seen[entry.ID] {
+			t.Fatalf("page %d: want distinct event %s at %s, got %+v", i+1, id, stamp, entry)
+		}
+		seen[entry.ID] = true
+		if i+1 < len(want) {
+			if next == nil || next.ID != id || !next.CreatedAt.Equal(sub.CreatedAt) {
+				t.Fatalf("page %d: cursor = %+v; want %s at %s", i+1, next, id, stamp)
+			}
+		} else if next != nil {
+			t.Fatalf("unexpected cursor after the last event: %+v", next)
+		}
+		options.Before = next
 	}
 }
