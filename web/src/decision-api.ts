@@ -19,6 +19,8 @@ export type DecisionReceipt = Readonly<{
   task_id: string; task_revision: number; option_index?: number; text: string;
   reply_message_id: string; wake_delivery_id: string; wake_message_id: string; created_at: string;
 }>;
+export type DecisionHandling = Readonly<{ turn_id: string; attempt_id: string; consumed_at: string }>;
+type DecisionAnswerView = Readonly<{ receipt: DecisionReceipt; handling: DecisionHandling | null }>;
 type DecisionPage = { items: PendingDecision[]; next_cursor: string };
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -126,13 +128,28 @@ export function prepareDecisionAnswer(item: PendingDecision, selection: Decision
   const base = { group_id, topic_id, version };
   const body = JSON.stringify(option_index === undefined ? { ...base, text } : { ...base, option_index });
   const scope = groupId === undefined ? "/api/v1/me" : `/api/v1/groups/${encodeURIComponent(groupId)}`;
-  const path = `${scope}/decisions/${encodeURIComponent(requestId)}/answer`;
-  // Snapshot the envelope and receipt binding once. A caller can only replay it as-is.
-  return async () => Object.freeze(await request(path, {
-    method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body,
-  }, (value): value is DecisionReceipt => record(value)
+  const answerPath = `/decisions/${encodeURIComponent(requestId)}/answer`;
+  const query = new URLSearchParams({ group_id, topic_id, version: String(version) });
+  const matchesAnswer = (value: unknown): value is DecisionReceipt => record(value)
     && value.request_id === requestId && value.group_id === group_id && value.topic_id === topic_id && value.version === version
     && value.actor_id === recipient_id && value.task_id === taskId && value.task_revision === taskRevision
     && value.option_index === option_index && value.text === text && timestamp(value.created_at)
-    && [value.id, value.reply_message_id, value.wake_delivery_id, value.wake_message_id].every(id)));
+    && [value.id, value.reply_message_id, value.wake_delivery_id, value.wake_message_id].every(id);
+  // Snapshot the envelope and receipt binding once. Status is a separate, local-user GET for either write alias.
+  return {
+    post: async () => Object.freeze(await request(`${scope}${answerPath}`, {
+      method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body,
+    }, matchesAnswer)),
+    status: (signal: AbortSignal, saved?: DecisionReceipt) => request(`/api/v1/me${answerPath}?${query}`, { method: "GET", signal },
+      (value): value is DecisionAnswerView => {
+        if (!record(value)) return false;
+        const { receipt, handling } = value;
+        if (!matchesAnswer(receipt)) return false;
+        // In addition to the answer binding, require the same immutable receipt and wake, if already known.
+        if (saved && (receipt.id !== saved.id || receipt.reply_message_id !== saved.reply_message_id
+          || receipt.wake_delivery_id !== saved.wake_delivery_id || receipt.wake_message_id !== saved.wake_message_id
+          || receipt.created_at !== saved.created_at)) return false;
+        return handling === null || (record(handling) && id(handling.turn_id) && id(handling.attempt_id) && timestamp(handling.consumed_at));
+      }),
+  };
 }

@@ -1,12 +1,14 @@
 import * as ReactDOMClient from "react-dom/client";
 import { act, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { PendingDecision } from "../decision-api";
 import { deferred, group, json, other, page } from "../test/groups";
 import { member } from "../test/members";
 import { message } from "../test/messages";
 import { task } from "../test/tasks";
 
 const transport = vi.fn<typeof fetch>();
+const decisionsPath = "/api/v1/me/pending-decisions?limit=50";
 const writes = () => transport.mock.calls.filter(([, init]) => init?.method === "POST");
 const identity = ([url, init]: Parameters<typeof fetch>) => ({ url, body: init?.body,
   key: new Headers(init?.headers).get("Idempotency-Key") });
@@ -32,6 +34,7 @@ beforeEach(() => {
   resize = value => act(() => { mobile = value; events.dispatchEvent(new Event("change")); });
   transport.mockReset().mockImplementation(async input => {
     const url = String(input);
+    if (url === decisionsPath) return json({ error: { code: "not_found" } }, 404);
     if (url.includes("/members")) return page(url.includes(other.id) ? [] : [member]);
     if (/\/tasks\//.test(url)) return json(task);
     if (url.includes("/messages") || url.includes("/tasks") || url.includes("/history") || url.startsWith("/api/v1/providers")) return page();
@@ -194,8 +197,11 @@ describe("global pending reviews in the production entry", () => {
     expect(rail("群组列表")).not.toHaveAttribute("aria-current");
     expect(screen.getByRole("main", { name: "待我决定" })).toHaveFocus();
     expect(screen.getByRole("link", { name: "跳至待我决定" })).toHaveAttribute("href", "#im-pending-reviews");
-    expect(inbox().getByRole("status")).toHaveTextContent("正在载入待验收事项");
+    expect(inbox().getByText("正在载入待验收事项…")).toHaveAttribute("role", "status");
     await act(async () => loading.resolve());
+    expect(await inbox().findByText("待决答复暂不可用。")).toBeVisible();
+    expect(inbox().queryByText("没有待决事项。")).not.toBeInTheDocument();
+    expect(inbox().queryByRole("alert")).not.toBeInTheDocument();
     fireEvent.click(inbox().getByRole("button", { name: "加载更多待验收事项" }));
     await inbox().findByText(secondReview.submission.summary);
     expect(card(secondReview).getByText(`来源群组：${other.name}`)).toBeVisible();
@@ -221,7 +227,7 @@ describe("global pending reviews in the production entry", () => {
     expect(JSON.parse(String(writes()[0][1]?.body))).toEqual({ expected_revision: 8,
       submission_id: secondReview.submission.id, outcome: "rejected", reason: raw });
     await act(async () => saved.resolve(json(reviewReceipt(secondReview, "rejected", raw), 201)));
-    expect(inbox().getByRole("status")).toHaveTextContent("已保存：拒收");
+    expect(inbox().getByText(/已保存：拒收/)).toHaveAttribute("role", "status");
     expect(inbox().getByText("review-saved")).toBeInTheDocument();
     expect(card(firstReview).getByRole("button", { name: "接纳" })).toBeEnabled();
     expect(inbox().queryByText(secondReview.submission.summary)).not.toBeInTheDocument();
@@ -325,6 +331,131 @@ describe("global pending reviews in the production entry", () => {
     expect(await inbox().findByText("没有待验收事项。")).toBeVisible();
     expect(writes()).toHaveLength(1);
   });
+});
+
+it("answers the exact project Task from the real inbox and the original chat, keeping saved and handled separate", async () => {
+  const network = transport.getMockImplementation()!;
+  const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  const question = (source: typeof group, suffix: string, topic_id: string, version: number, title = task.title) => ({
+    id: `decision/${suffix}`, group_id: source.id, group_name: source.name, topic_id, version,
+    kind: "decision", relay: "task_owner", recipient_id: "user",
+    task: { task_id: `task-${suffix}`, task_title: title, task_revision: 5, assignment_id: `assignment-${suffix}`,
+      mandate_id: `mandate-${suffix}`, authority_generation: 2, owner_member_id: `owner-${suffix}`, origin_trigger_id: `trigger-${suffix}` },
+    source_message_id: `message-${suffix}`, source_sequence: 3, author_member_id: `owner-${suffix}`, author_turn_id: `origin-${suffix}`,
+    facts: "工作日数据已核对。", question: "是否纳入周末？", recommendation: "先交工作日结果。",
+    choices: ["仅工作日", "纳入周末"], created_at: task.created_at, updated_at: task.created_at,
+  } satisfies PendingDecision);
+  const foreign = question(group, "foreign", "", 3), chosen = question(other, "chosen", "topic/alerts +", 7);
+  const local = question(other, "local", "", 9, "复核说明");
+  const receiptFor = (item: typeof chosen, text: string, option_index?: number) => ({
+    id: `answer-${item.id}`, request_id: item.id, group_id: item.group_id, topic_id: item.topic_id, version: item.version,
+    actor_id: "user", task_id: item.task.task_id, task_revision: item.task.task_revision, text, option_index,
+    reply_message_id: `reply-${item.id}`, wake_delivery_id: `delivery-${item.id}`, wake_message_id: `wake-${item.id}`, created_at: task.created_at,
+  });
+  const text = "  保留答复原文。  ";
+  const receipt = receiptFor(chosen, "纳入周末", 2), localReceipt = receiptFor(local, text);
+  const handling = { turn_id: "continuation-turn", attempt_id: "continuation-attempt", consumed_at: "2026-10-30T12:01:00Z" };
+  let view: { receipt: typeof receipt; handling: typeof handling | null } = {
+    receipt: { ...receipt, wake_delivery_id: "different-wake" }, handling,
+  };
+  const globalPost = "/api/v1/me/decisions/decision%2Fchosen/answer";
+  const groupPost = `/api/v1/groups/${other.id}/decisions/decision%2Flocal/answer`;
+  const globalStatus = `${globalPost}?group_id=${other.id}&topic_id=topic%2Falerts+%2B&version=7`;
+  const localStatus = `/api/v1/me/decisions/decision%2Flocal/answer?group_id=${other.id}&topic_id=&version=9`;
+  const wrongStatus = deferred<void>(), unknownWrite = deferred<void>();
+  const announcement = { ...message, group_id: other.id, topic_id: chosen.topic_id, content: "已收到相关答复。", deliveries: [] };
+  let pending = [foreign, chosen, local], localSaved = false;
+  transport.mockImplementation((input, init) => {
+    const url = String(input);
+    if (url === decisionsPath) return Promise.resolve(page(pending));
+    if (url === inboxPath) return Promise.resolve(page([firstReview]));
+    if (url === globalPost && init?.method === "POST") return Promise.resolve(json(receipt));
+    if (url === groupPost && init?.method === "POST") {
+      return unknownWrite.promise.then(() => json({ error: { code: "decision_answer_unknown" } }, 503));
+    }
+    if (url === globalStatus && init?.method === "GET") {
+      const snapshot = view;
+      return wrongStatus.promise.then(() => json(snapshot));
+    }
+    if (url === localStatus && init?.method === "GET") return Promise.resolve(localSaved
+      ? json({ receipt: localReceipt, handling: null }) : json({ error: { code: "not_found" } }, 404));
+    for (const [source, project_id, name] of [[group, "payments", "支付项目"], [other, "settlement", "结算项目"]] as const) {
+      if (url === `/api/v1/groups/${source.id}/identity`) return Promise.resolve(json({
+        group_id: source.id, project_id, workspace_id: "workspace", channel_id: `channel-${source.id}`,
+      }));
+      if (url === `/api/v1/projects/${project_id}`) return Promise.resolve(json({ id: project_id, name }));
+    }
+    if (url.startsWith(`/api/v1/groups/${other.id}/messages?`)) return Promise.resolve(page([announcement]));
+    return network(input, init);
+  });
+  const chat = () => within(screen.getByRole("main", { name: "讨论" }));
+  const listReads = () => transport.mock.calls.filter(([url]) => url === decisionsPath).length;
+  const chosenName = `结算项目 · ${other.name} · ${task.title}`, foreignName = `支付项目 · ${group.name} · ${task.title}`;
+  const localName = `结算项目 · ${other.name} · ${local.task.task_title}`;
+  const receiptRow = (area: ReturnType<typeof within>, id: string) => within(area.getByText(id).closest("li")!);
+  function returnToTab() {
+    visibility.mockReturnValue("hidden"); fireEvent(document, new Event("visibilitychange"));
+    visibility.mockReturnValue("visible"); fireEvent(document, new Event("visibilitychange"));
+  }
+
+  await start(); expect(listReads()).toBe(0);
+  fireEvent.click(rail("待我决定"));
+  expect(inbox().getAllByRole("heading", { name: "待我决定" })).toHaveLength(1);
+  expect(await inbox().findByText(firstReview.submission.summary)).toBeVisible();
+  const target = within(await inbox().findByRole("article", { name: chosenName }));
+  expect(inbox().getByRole("article", { name: foreignName })).toBeVisible();
+  fireEvent.click(target.getByText("来源与版本标识", { selector: "summary" }));
+  for (const id of ["settlement", other.id, chosen.task.task_id]) expect(target.getByText(id)).toBeVisible();
+  change(within(inbox().getByRole("article", { name: localName })).getByRole("textbox"), text);
+  fireEvent.click(target.getByRole("radio", { name: "纳入周末" }));
+  fireEvent.click(target.getByRole("button", { name: "提交答复" }));
+  expect(writes()).toHaveLength(1);
+  expect(identity(writes()[0])).toMatchObject({ url: globalPost, key: expect.any(String) });
+  expect(JSON.parse(String(writes()[0][1]?.body))).toEqual({ group_id: other.id, topic_id: chosen.topic_id, version: 7, option_index: 2 });
+  expect(transport.mock.calls.some(([url]) => /\/(messages|tasks)(?:\/|\?)/.test(String(url)))).toBe(false);
+  await inbox().findByText(receipt.id);
+  expect(receiptRow(inbox(), receipt.id).getByText("答复已保存")).toBeVisible();
+  await act(async () => wrongStatus.resolve());
+  expect(transport.mock.calls.find(([url]) => url === globalStatus)?.[1]).toMatchObject({ method: "GET", cache: "no-store", redirect: "error" });
+  expect(inbox().queryByText("负责人已处理")).not.toBeInTheDocument();
+  view = { receipt, handling: null };
+  pending = [foreign, local];
+  fireEvent.click(inbox().getByRole("button", { name: "刷新待决事项" }));
+  await inbox().findByText("尚未确认负责人处理。");
+  expect(writes()).toHaveLength(1);
+
+  const readCount = listReads();
+  selectGroup(other.name);
+  await chat().findByText(announcement.content);
+  const summary = chat().getByText("本群待决事项", { selector: "summary" });
+  expect(summary.closest("details")).not.toHaveAttribute("open");
+  expect(listReads()).toBe(readCount);
+  fireEvent.click(summary);
+  const grouped = within(await chat().findByRole("region", { name: "待决事项" }));
+  const localCard = within(await grouped.findByRole("article", { name: localName }));
+  expect(grouped.queryByRole("article", { name: foreignName })).not.toBeInTheDocument();
+  expect(localCard.getByRole("textbox")).toHaveValue(text);
+  expect(receiptRow(grouped, receipt.id).getByText("答复已保存")).toBeVisible();
+  expect(grouped.queryByText("负责人已处理")).not.toBeInTheDocument();
+  expect(writes()).toHaveLength(1);
+  view = { receipt, handling }; returnToTab();
+  expect(await receiptRow(grouped, receipt.id).findByText("负责人已处理")).toBeVisible();
+
+  fireEvent.click(localCard.getByRole("button", { name: "提交答复" }));
+  expect(writes()).toHaveLength(2);
+  expect(identity(writes()[1])).toMatchObject({ url: groupPost, key: expect.any(String) });
+  expect(JSON.parse(String(writes()[1][1]?.body))).toEqual({ group_id: other.id, topic_id: "", version: 9, text });
+  pending = [foreign];
+  fireEvent.click(rail("待我决定"));
+  await act(async () => unknownWrite.resolve());
+  expect(await inbox().findByText(/答复结果未确认/)).toBeVisible();
+  expect(inbox().queryByText(localReceipt.id)).not.toBeInTheDocument();
+  localSaved = true; returnToTab();
+  await inbox().findByText(localReceipt.id);
+  expect(receiptRow(inbox(), localReceipt.id).getByText("答复已保存")).toBeVisible();
+  expect(receiptRow(inbox(), localReceipt.id).queryByText("负责人已处理")).not.toBeInTheDocument();
+  expect(receiptRow(inbox(), receipt.id).getByText("负责人已处理")).toBeVisible();
+  expect(writes()).toHaveLength(2);
 });
 
 describe("real Openbot rail interactions", () => {
