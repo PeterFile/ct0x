@@ -25,8 +25,12 @@ import (
 
 // Platform CI shards by top-level test name. Spread these independent SQLite
 // scenarios across test entries so one shard does not run all of them.
-func TestFreshTaskWorkB29NativeWire(t *testing.T) {
-	testFreshTaskWorkB29NativeWire(t, "confirmed", "context-after-handback")
+func TestFreshTaskWorkB29NativeWireConfirmedInput(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "confirmed")
+}
+
+func TestFreshTaskWorkB29NativeWireContextAfterHandback(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "context-after-handback")
 }
 
 func TestFreshTaskWorkB29NativeWireUncertaintyAndCancellation(t *testing.T) {
@@ -41,7 +45,7 @@ func TestFreshTaskWorkB29NativeWireWorkspaceAndConfig(t *testing.T) {
 	testFreshTaskWorkB29NativeWire(t, "replaced-original-cwd", "workspace-before-gate", "late-config")
 }
 
-func TestFreshTaskWorkB29NativeWireLaunchGatePolicyBeforeAdmission(t *testing.T) {
+func TestFreshTaskWorkB29NativeWireLaunchGateRejectsPreAdmissionPolicyChanges(t *testing.T) {
 	testFreshTaskWorkB29NativeWire(t, "late-policy", "policy-before-gate")
 }
 
