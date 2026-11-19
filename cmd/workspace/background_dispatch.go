@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,8 +10,8 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"agentworkspace/internal/httpapi"
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
@@ -74,12 +72,10 @@ func readBackgroundDispatchApproval(path, providerID string) (a backgroundDispat
 		return a, errBackgroundApproval
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
-	if err != nil || len(data) > maxBytes || !utf8.Valid(data) || !json.Valid(data) {
+	if err != nil || len(data) > maxBytes || !httpapi.DecodeStrictJSONObject(data, &a) {
 		return a, errBackgroundApproval
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&a) != nil || a.ProviderID != providerID || !backgroundApprovalText(a.Model, 256) || strings.HasPrefix(a.Model, "-") ||
+	if a.ProviderID != providerID || !provider.IsExactPiModel(a.Model) ||
 		a.MaxActiveMembers < 1 || a.MaxActiveMembers > 200 || a.ApprovalExpires.IsZero() ||
 		!backgroundApprovalText(a.Preset.ID, 128) || !backgroundApprovalText(a.Preset.Name, 128) || !backgroundApprovalText(a.Preset.Role, 512) {
 		return a, errBackgroundApproval
