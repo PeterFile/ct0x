@@ -81,7 +81,7 @@ jobs:
           tree=$(git rev-parse HEAD^{tree})
           go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/platform | tee "$RUNNER_TEMP/platform-list.json"
           pattern=$(python3 .github/scripts/verify-store-shard.py select --profile platform "$PLATFORM_SLOT" "$package" "$RUNNER_TEMP/platform-list.json")
-          go test -count=1 -race -json -timeout 12m -run "$pattern" ./internal/platform | tee "$RUNNER_TEMP/platform-run.json"
+          go test -count=1 -race -json -run "$pattern" ./internal/platform | tee "$RUNNER_TEMP/platform-run.json"
           python3 .github/scripts/verify-store-shard.py verify --profile platform "$PLATFORM_SLOT" "$package" "$RUNNER_TEMP/platform-list.json" "$RUNNER_TEMP/platform-run.json" \
             --run-id "$GITHUB_RUN_ID" --sha "$sha" --tree "$tree" > "$RUNNER_TEMP/platform-summary.json"
       - uses: actions/upload-artifact@v7
