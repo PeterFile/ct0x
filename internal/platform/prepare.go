@@ -224,27 +224,28 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	if err != nil {
 		return empty, preparationReadError(ctx, err)
 	}
-	backgroundReason := backgroundDiscussionReason(backgroundKind)
-	selection, useMemberTools := p.memberToolAdapter(selected)
-	if backgroundReason != "" {
-		if member.Workspace != "" {
-			return empty, scheduler.ErrNotReady
-		}
-		// The A1 plain-text profile has no platform tool, work, external
-		// workspace or resume authority, even when those runtimes are installed.
-		useMemberTools = false
-	}
+	var backgroundProfile store.BackgroundDispatchProfile
+	var selection provider.AdapterSelection
+	var useMemberTools bool
 	var executor provider.Executor
-	if useMemberTools {
-		if _, _, err := p.sampleMemberToolMember(member, p.memberTools.operations); err != nil {
+	if backgroundKind != "" {
+		backgroundProfile = store.BackgroundDispatchProfile{ProviderID: member.ProviderID, Model: member.Model}
+		if member.Workspace != "" || !p.store.BackgroundDispatchProfileReady(backgroundProfile) ||
+			!p.SupportsBackgroundDiscussionAdapter(backgroundProfile) {
 			return empty, scheduler.ErrNotReady
 		}
+		// Build only the verified Pi one-shot transport. Do not fall back to
+		// the ordinary executor, native resume, or any member tool factory.
+		executor, err = provider.NewPiExecutor(selected.Path, p.executionTimeout)
+	} else if selection, useMemberTools = p.memberToolAdapter(selected); useMemberTools {
+		_, _, err = p.sampleMemberToolMember(member, p.memberTools.operations)
 	} else {
 		executor, err = provider.NewExecutor(selected, p.executionTimeout)
-		if err != nil {
-			return empty, scheduler.ErrNotReady
-		}
 	}
+	if err != nil {
+		return empty, scheduler.ErrNotReady
+	}
+	backgroundReason := backgroundDiscussionReason(backgroundKind)
 	history, err := p.store.ListPreparationHistory(ctx, group.ID, trigger.ID, p.historyLimit)
 	if err != nil {
 		return empty, preparationReadError(ctx, err)
@@ -331,7 +332,16 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			}
 		}
 	}
-	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{workspace.key}, Request: request}, nil
+	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{workspace.key}, Request: request, BackgroundProfile: backgroundProfile}, nil
+}
+
+// SupportsBackgroundDiscussionAdapter checks only the trusted one-shot runtime
+// contract and executable path, not model readiness or approval. Composition
+// intersects this with its own approved and actually ready provider/model pairs.
+// Pi's plain adapter disables tools; read-only is not equivalent to tool-free.
+func (p *Preparer) SupportsBackgroundDiscussionAdapter(profile store.BackgroundDispatchProfile) bool {
+	selected := p.providers[profile.ProviderID]
+	return selected.Name == provider.Pi && provider.ValidateExecutor(selected, p.executionTimeout) == nil
 }
 
 type preparationInput struct {

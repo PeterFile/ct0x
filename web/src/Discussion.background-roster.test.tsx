@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { group, json, page } from "./test/groups";
+import { Members } from "./Members";
+import { refreshBackgroundRoster } from "./background-roster-refresh";
+import { group, json, other, page } from "./test/groups";
 import { member } from "./test/members";
 import { message } from "./test/messages";
 
@@ -48,4 +50,78 @@ it("refreshes the actual roster from the existing chat feed after a platform joi
   expect(within(members).getAllByRole("listitem")).toHaveLength(1);
   await flush(10000);
   expect(roster).toHaveBeenCalledTimes(2);
+});
+
+it("observes a join in the mobile roster without reopening the chat", async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal("matchMedia", (media: string) => ({ media, matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+  let joined = false;
+  const joinedMember = { ...member, name: "新成员", creator_id: "system" };
+  const notice = { ...message, id: "join-mobile", sender_id: "platformnotice", source_kind: "platform",
+    source_id: `group_background_join:${joinedMember.id}`, deliveries: [] };
+  const roster = vi.fn(async () => page(joined ? [joinedMember] : []));
+  const messages = vi.fn(async () => page(joined ? [notice] : []));
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+    const route = String(input);
+    if (route.startsWith("/api/v1/groups?")) return page([group]);
+    if (route.startsWith("/api/v1/providers?")) return page();
+    if (route.includes("/members?")) return roster();
+    if (route.includes("/messages?")) return messages();
+    throw new Error(`Unexpected test route ${route}`);
+  });
+  render(<App />);
+  await flush();
+  fireEvent.click(screen.getByRole("button", { name: group.name }));
+  await flush();
+  fireEvent.change(screen.getByRole("textbox", { name: "消息内容" }), { target: { value: "未发送草稿" } });
+  fireEvent.click(screen.getByRole("button", { name: "成员" }));
+  await flush();
+  const members = screen.getByRole("list", { name: "成员列表" });
+  expect(roster).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole("main", { name: "讨论" })).toBeNull();
+  joined = true;
+  await flush(5000);
+  expect(within(members).getByRole("button", { name: joinedMember.name })).toBeVisible();
+  await flush(5000);
+  expect(roster).toHaveBeenCalledTimes(2);
+  fireEvent.click(screen.getByRole("button", { name: "返回聊天" }));
+  expect(screen.getByRole("textbox", { name: "消息内容" })).toHaveValue("未发送草稿");
+  fireEvent.click(screen.getByRole("button", { name: "返回群组" }));
+  const reads = messages.mock.calls.length;
+  await flush(10000);
+  expect(messages).toHaveBeenCalledTimes(reads);
+});
+
+it("retries a join refresh without losing the selected member on an older loaded page", async () => {
+  vi.useFakeTimers();
+  const older = { ...member, id: "old-member", name: "早期成员" };
+  const joined = { ...member, id: "new-member", name: "刚加入的成员" };
+  const roster = vi.fn()
+    .mockResolvedValueOnce(page([member], "older-page"))
+    .mockResolvedValueOnce(page([older], "even-older-page"))
+    .mockResolvedValueOnce(json({}, 503))
+    .mockResolvedValue(page([joined, member], "from-refreshed-page"));
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+    const route = String(input);
+    if (route.includes("/members?")) return roster(route);
+    throw new Error(`Unexpected test route ${route}`);
+  });
+  const onMembers = vi.fn();
+  render(<Members groupId={group.id} onMembers={onMembers} catalogueActive={false} />);
+  await flush();
+  fireEvent.click(screen.getByRole("button", { name: "加载更多成员" }));
+  await flush();
+  fireEvent.click(screen.getByRole("button", { name: older.name }));
+  act(() => refreshBackgroundRoster(other.id));
+  expect(roster).toHaveBeenCalledTimes(2);
+  act(() => refreshBackgroundRoster(group.id));
+  await flush();
+  expect(screen.getByRole("button", { name: older.name, pressed: true })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "重试载入成员" }));
+  await flush();
+  expect(screen.getByRole("button", { name: joined.name })).toBeVisible();
+  expect(screen.getByRole("button", { name: older.name, pressed: true })).toBeVisible();
+  expect(within(screen.getByRole("region", { name: "成员详情" })).getByRole("heading", { name: older.name })).toBeVisible();
+  expect(onMembers).toHaveBeenLastCalledWith(group.id, [joined, member, older]);
+  expect(roster.mock.calls[3][0]).toBe(`/api/v1/groups/${group.id}/members?limit=50`);
 });

@@ -23,7 +23,7 @@ function merge(previous: Feed, incoming: Message[], version: number, reset = fal
 const timeKey = (value: string) => value.replace(/(?:\.(\d+))?Z$/, (_match, fraction?: string) => `.${(fraction ?? "").padEnd(9, "0")}Z`);
 const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 
-export function useMessageFeed(groupId: string, active: boolean) {
+export function useMessageFeed(groupId: string, active: boolean, pollDetails = true) {
   const [feed, setFeed] = useState<Feed>({ entries: new Map(), floor: 0 });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
   const [pollError, setPollError] = useState("");
@@ -125,7 +125,9 @@ export function useMessageFeed(groupId: string, active: boolean) {
         } catch (error) {
           if (read.valid() && window === windowVersion.current) setPollError(errorText(error));
         } finally { read.close(); }
-        if (stopped || window !== windowVersion.current || pageBusy.current) return;
+        // A visible roster needs latest-page join events, not hidden chat's
+        // per-delivery detail requests.
+        if (!pollDetails || stopped || window !== windowVersion.current || pageBusy.current) return;
         const pending = new Set(loaded.current.filter(message => hasPending(message) && !terminal.has(message.id)).map(message => message.id));
         detailQueue.current = detailQueue.current.filter(id => pending.has(id));
         const queued = new Set(detailQueue.current);
@@ -143,7 +145,7 @@ export function useMessageFeed(groupId: string, active: boolean) {
     }
     timer = setTimeout(() => void cycle(), 5000);
     return () => { stopped = true; clearTimeout(timer); };
-  }, [active, groupId, beginRead, refreshDetail]);
+  }, [active, groupId, beginRead, refreshDetail, pollDetails]);
   return { items, page, pollError, details, loadPage, refreshDetail, beginSend, confirm, preserveReference,
     retry: () => loadPage(lastRequest.current.before, lastRequest.current.reset) };
 }

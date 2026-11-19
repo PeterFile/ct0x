@@ -80,7 +80,7 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
   const selectedProvider = !catalogue.pending && !catalogue.error
     ? catalogue.items.find(provider => provider.id === selected?.provider_id) : undefined;
   const [draft, setDraft] = useState(emptyDraft);
-  const [request, setRequest] = useState({ before: "", version: 0, joinRefresh: false });
+  const [request, setRequest] = useState({ before: "", version: 0 });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
   const [mutation, setMutation] = useState({ pending: false, error: "", uncertain: false });
   const confirmed = useRef<{ member: Member; afterRead: number }[]>([]);
@@ -88,11 +88,10 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
   const operation = useRef<{ key: string; input: MemberInput } | null>(null);
   const posting = useRef<AbortController | null>(null);
   const mounted = useRef(false);
-  const load = (before = "") => setRequest(previous => ({ before, version: previous.version + 1, joinRefresh: false }));
+  const load = (before = "") => setRequest(previous => ({ before, version: previous.version + 1 }));
   useEffect(() => {
     if (!active) return;
-    return onBackgroundRosterRefresh(groupId, () =>
-      setRequest(previous => ({ before: "", version: previous.version + 1, joinRefresh: true })));
+    return onBackgroundRosterRefresh(groupId, () => load());
   }, [active, groupId]);
   useEffect(() => {
     mounted.current = true;
@@ -111,10 +110,10 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
       const protectedMembers = confirmed.current.map(receipt => receipt.member);
       setItems(previous => {
         const updates = new Map(result.items.map(member => [member.id, member]));
-        // A confirmed join adds to the roster; keep already-loaded recipients
-        // available while renewing its first page through the existing read.
-        const retained = request.before || request.joinRefresh ? previous.map(member => updates.get(member.id) ?? member) : [];
-        const observed = request.joinRefresh ? [...result.items, ...retained] : [...retained, ...result.items];
+        // A first-page refresh (including retries) does not replace loaded
+        // older pages unless the response covers the entire roster.
+        const retained = request.before || result.next_cursor ? previous.map(member => updates.get(member.id) ?? member) : [];
+        const observed = request.before ? [...retained, ...result.items] : [...result.items, ...retained];
         return unique([...protectedMembers, ...observed]);
       });
       setPage({ pending: false, error: "", next: result.next_cursor });

@@ -33,29 +33,32 @@ function shortTime(value: string) {
 
 export type RecipientSelection = { groupId: string; memberId: string; version: number };
 
-export function Discussion({ groupId, members, recipientSelection }: {
-  groupId?: string; members: Record<string, Member[]>; recipientSelection?: RecipientSelection;
+export function Discussion({ groupId, rosterGroupId, members, recipientSelection }: {
+  groupId?: string; rosterGroupId?: string; members: Record<string, Member[]>; recipientSelection?: RecipientSelection;
 }) {
   const [visited, setVisited] = useState<string[]>([]);
+  const feedGroupId = groupId ?? rosterGroupId;
   useEffect(() => {
-    if (groupId) setVisited(previous => previous.includes(groupId) ? previous : [...previous, groupId]);
-  }, [groupId]);
+    if (feedGroupId) setVisited(previous => previous.includes(feedGroupId) ? previous : [...previous, feedGroupId]);
+  }, [feedGroupId]);
   return <>
     {!groupId ? <p className="empty-panel">请先选择群组，再查看讨论和发送消息。</p> : null}
     {visited.map(id => <div key={id} className="discussion-scope" hidden={id !== groupId}>
-      <DiscussionScope groupId={id} active={id === groupId} members={members[id] ?? emptyMembers} recipientSelection={recipientSelection} />
+      <DiscussionScope groupId={id} active={id === groupId} observeRoster={id === rosterGroupId}
+        members={members[id] ?? emptyMembers} recipientSelection={recipientSelection} />
     </div>)}
   </>;
 }
-function DiscussionScope({ groupId, active, members, recipientSelection }: {
-  groupId: string; active: boolean; members: Member[]; recipientSelection?: RecipientSelection;
+function DiscussionScope({ groupId, active, observeRoster, members, recipientSelection }: {
+  groupId: string; active: boolean; observeRoster: boolean; members: Member[]; recipientSelection?: RecipientSelection;
 }) {
-  const formId = useId(), feed = useMessageFeed(groupId, active);
+  const observeFeed = active || observeRoster;
+  const formId = useId(), feed = useMessageFeed(groupId, observeFeed, active);
   const scroll = useMessageScroll(active, feed.items, feed.page);
   const loaded = useMemo(() => new Map(feed.items.map(message => [message.id, message])), [feed.items]);
   const seenJoins = useRef(new Set<string>());
   useEffect(() => {
-    if (!active) return;
+    if (!observeFeed) return;
     let joined = false;
     for (const message of feed.items) {
       if (message.group_id !== groupId || !backgroundJoin(message) || seenJoins.current.has(message.id)) continue;
@@ -63,7 +66,7 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
       joined = true;
     }
     if (joined) refreshBackgroundRoster(groupId);
-  }, [active, feed.items, groupId]);
+  }, [observeFeed, feed.items, groupId]);
   const [content, setContent] = useState("");
   const [route, setRoute] = useState("default"), [recipients, setRecipients] = useState<string[]>([]);
   const [mention, setMention] = useState<{ start: number; end: number; query: string } | null>(null);

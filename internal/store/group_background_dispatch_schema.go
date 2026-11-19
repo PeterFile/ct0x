@@ -21,6 +21,8 @@ CREATE TABLE group_background_intents (
         (delivery_id IS NOT NULL AND recipient_id IS NOT NULL AND route_kind IS NOT NULL AND completed_at IS NOT NULL))
 );
 CREATE INDEX group_background_pending ON group_background_intents(sequence) WHERE delivery_id IS NULL;
+CREATE INDEX group_background_pending_topic ON group_background_intents(group_id,topic_id,sequence) WHERE delivery_id IS NULL;
+CREATE INDEX group_background_queued_topic ON deliveries(group_id,topic_id,message_id) WHERE state='queued' AND turn_id='';
 CREATE INDEX group_background_active_profiles ON members(group_id,workspace,provider_id,model,created_at,id) WHERE status='active';
 CREATE TABLE group_background_joins (
     member_id TEXT PRIMARY KEY NOT NULL,

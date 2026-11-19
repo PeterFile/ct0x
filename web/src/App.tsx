@@ -122,7 +122,9 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
           </div> : null}
         </div>
         <div className="discussion-content">
-          <Discussion groupId={chatVisible ? selected?.id : undefined} members={members} recipientSelection={recipientSelection} />
+          <Discussion groupId={chatVisible ? selected?.id : undefined}
+            rosterGroupId={contextVisible && context === "members" ? selected?.id : undefined}
+            members={members} recipientSelection={recipientSelection} />
         </div>
       </main>,
 

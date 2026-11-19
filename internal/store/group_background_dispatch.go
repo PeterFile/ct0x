@@ -15,8 +15,8 @@ import (
 	"agentworkspace/internal/domain"
 )
 
-// BackgroundDispatchProfile is an exact, approved, ready fresh-text runtime.
-// The composition owner samples readiness outside Store; these are not preferences.
+// BackgroundDispatchProfile identifies an exact provider/model pair. Only trusted
+// composition can supply its approval and current tool-free runtime readiness.
 type BackgroundDispatchProfile struct{ ProviderID, Model string }
 
 // BackgroundDispatchTemplate is a trusted configuration identity, not another
@@ -37,21 +37,30 @@ type groupBackgroundDispatch struct {
 	installed bool
 	enabled   atomic.Bool
 	pass      sync.Mutex
+	readyMu   sync.RWMutex
+	ready     *backgroundReadySnapshot
 	// These only bound/rotate observations. They are not consumption checkpoints.
 	after, through int64
+}
+
+type backgroundReadySnapshot struct {
+	profiles map[BackgroundDispatchProfile]bool
+	expires  time.Time
 }
 
 const (
 	groupBackgroundPassLimit = 16
 	groupBackgroundMaxConfig = 200
 	groupBackgroundNotice    = "platformnotice"
+	backgroundReadyLifetime  = 30 * time.Second
 )
 
 const groupBackgroundSchemaExists = `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='group_background_bindings')`
 
 // EnableGroupBackgroundDispatch is startup wiring for the same Store used by
 // trusted LocalUser and the scheduler. It does not bind legacy groups or probe
-// availability. Omitting this call on restart disables new intents and passes.
+// availability. Omitting this call disables new bindings and passes, not the
+// obligation to save pending intents for already bound groups.
 func (s *Store) EnableGroupBackgroundDispatch(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -82,18 +91,34 @@ func groupBackgroundOneRow(result sql.Result, err error) error {
 	return nil
 }
 
-// RunGroupBackgroundDispatch is a bounded synchronous scheduler pass, not an
-// executor. It observes an immutable configuration snapshot supplied by its caller.
+// RunGroupBackgroundDispatch replaces the process-local approval/readiness
+// snapshot even with no unrouted intents. Trusted composition must deliver a
+// freshly qualified snapshot every scheduler cycle (empty on loss of evidence).
+// An omitted pass cannot sustain readiness beyond backgroundReadyLifetime.
 func (s *Store) RunGroupBackgroundDispatch(ctx context.Context, options BackgroundDispatchOptions) error {
 	const action = "群组后台调度失败"
 	if !s.background.enabled.Load() {
 		return nil
 	}
-	ready, err := validateBackgroundDispatch(options)
+	sampled := time.Now()
+	profilesReady, err := validateBackgroundDispatch(options)
+	if err == nil {
+		err = ctx.Err()
+	}
+	var ready *backgroundReadySnapshot
+	if err == nil && len(profilesReady) != 0 {
+		ready = &backgroundReadySnapshot{profiles: profilesReady, expires: sampled.Add(backgroundReadyLifetime)}
+	}
+	// Publication is independent of the routing lock: revocation is not lost
+	// if a pass is busy. The claim transaction pins the current snapshot only
+	// for its short final admission/commit, never for external execution.
+	s.background.readyMu.Lock()
+	s.background.ready = ready
+	s.background.readyMu.Unlock()
 	if err != nil {
 		return storeError(action, err)
 	}
-	if len(ready) == 0 || !s.background.pass.TryLock() {
+	if ready == nil || !s.background.pass.TryLock() {
 		return nil
 	}
 	defer s.background.pass.Unlock()
@@ -180,12 +205,17 @@ func (s *Store) pendingGroupBackgroundIntents(ctx context.Context, after, throug
 	return entries, rows.Err()
 }
 
-func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, options BackgroundDispatchOptions, ready map[BackgroundDispatchProfile]bool, profiles string) error {
+func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, options BackgroundDispatchOptions, ready *backgroundReadySnapshot, profiles string) error {
 	tx, err := s.db.BeginTx(ctx, nil) // The Store DSN serializes writers before reads.
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	s.background.readyMu.RLock()
+	defer s.background.readyMu.RUnlock()
+	if s.background.ready != ready || !time.Now().Before(ready.expires) {
+		return nil // Do not route using a replaced or expired observation.
+	}
 	var m MessageRequest
 	var messageID string
 	var payload []byte
@@ -198,7 +228,10 @@ func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, 
 	 JOIN message_command_sources s ON (s.id,s.message_id)=(i.source_id,i.message_id)
 	 LEFT JOIN group_background_bindings b ON b.group_id=i.group_id
 	 LEFT JOIN message_log l ON l.sequence=i.sequence
-	 WHERE i.sequence=? AND i.delivery_id IS NULL`, sequence).Scan(&messageID, &m.GroupID, &m.TopicID, &m.Content, &payload, &valid)
+	 WHERE i.sequence=? AND i.delivery_id IS NULL
+	 AND NOT EXISTS(SELECT 1 FROM group_background_intents earlier WHERE earlier.group_id=i.group_id
+	     AND earlier.topic_id=i.topic_id AND earlier.sequence<i.sequence AND earlier.delivery_id IS NULL)`, sequence).
+		Scan(&messageID, &m.GroupID, &m.TopicID, &m.Content, &payload, &valid)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil // Another pass completed it, or there is no matching authority.
 	}
@@ -222,7 +255,7 @@ func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, 
 		if active >= options.MaxActiveMembers {
 			return nil
 		}
-		template, route, err := backgroundJoinTemplate(ctx, tx, m.GroupID, options, ready)
+		template, route, err := backgroundJoinTemplate(ctx, tx, m.GroupID, options, ready.profiles)
 		if err != nil || template == nil {
 			return err
 		}
@@ -297,16 +330,15 @@ func joinBackgroundMember(ctx context.Context, tx *sql.Tx, groupID, topicID, ori
 	return member, err
 }
 
-// BackgroundDiscussionKind distinguishes a background-routed delivery or an
-// automatically joined member's ordinary delivery from other existing traffic.
-// It remains available after a disabled restart and conveys no authority.
+// BackgroundDiscussionKind marks only a delivery routed by an A1 intent.
+// Join provenance is independent. This marker remains readable after restart
+// and does not convey approval or runtime readiness.
 func (s *Store) BackgroundDiscussionKind(ctx context.Context, groupID, deliveryID string) (string, error) {
 	if !s.background.installed {
 		return "", nil
 	}
 	var kind string
-	err := s.db.QueryRowContext(ctx, `SELECT coalesce(j.kind,i.route_kind,'') FROM deliveries d
-	 LEFT JOIN group_background_joins j ON j.member_id=d.recipient_id AND j.group_id=d.group_id
+	err := s.db.QueryRowContext(ctx, `SELECT coalesce(i.route_kind,'') FROM deliveries d
 	 LEFT JOIN group_background_intents i ON i.delivery_id=d.id AND i.group_id=d.group_id
 	 WHERE d.id=? AND d.group_id=?`, deliveryID, groupID).Scan(&kind)
 	return kind, storeError("读取后台讨论路由失败", err)

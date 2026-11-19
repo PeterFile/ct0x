@@ -33,10 +33,14 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 	t := domain.Turn{ID: rand.Text(), GroupID: input.GroupID, DeliveryID: input.DeliveryID, ClaimToken: rand.Text(), State: domain.TurnStateStarting}
 	// The first statement is a conditional write, even with a deferred transaction.
 	// Reserving the binding before reads prevents competing read-to-write upgrades.
-	err = tx.QueryRowContext(ctx, `UPDATE deliveries SET turn_id=?
+	query := `UPDATE deliveries AS d SET turn_id=?
 	 WHERE id=? AND group_id=? AND state='queued' AND turn_id=''
-	 AND EXISTS(SELECT 1 FROM members WHERE id=deliveries.recipient_id AND group_id=deliveries.group_id AND status='active')
-	 RETURNING conversation_id,recipient_id`, t.ID, input.DeliveryID, input.GroupID).Scan(&t.ConversationID, &t.MemberID)
+	 AND EXISTS(SELECT 1 FROM members WHERE id=d.recipient_id AND group_id=d.group_id AND status='active')`
+	if s.background.installed {
+		query += " AND NOT " + groupBackgroundEarlierSQL
+	}
+	err = tx.QueryRowContext(ctx, query+" RETURNING conversation_id,recipient_id", t.ID, input.DeliveryID, input.GroupID).
+		Scan(&t.ConversationID, &t.MemberID)
 	if errors.Is(err, sql.ErrNoRows) {
 		var found int
 		err = tx.QueryRowContext(ctx, `SELECT 1 FROM deliveries d JOIN members m ON m.id=d.recipient_id AND m.group_id=d.group_id
@@ -47,6 +51,13 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 	}
 	if err != nil {
 		return domain.Turn{}, queueError(action, err)
+	}
+	var background bool
+	if s.background.installed {
+		background, err = backgroundClaimProfileInTx(ctx, tx, input)
+		if err != nil {
+			return domain.Turn{}, queueError(action, err)
+		}
 	}
 	var active, occupied int
 	err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(max(conversation_id=? OR member_id=?),0)
@@ -85,6 +96,15 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 			return domain.Turn{}, queueError(action, err)
 		}
 		if n != 1 {
+			return domain.Turn{}, queueError(action, ErrTurnBusy)
+		}
+	}
+	if background {
+		// The durable claim is launch admission. Linearize it against snapshot
+		// replacement; on loss of readiness the whole transaction rolls back.
+		s.background.readyMu.RLock()
+		defer s.background.readyMu.RUnlock()
+		if !s.background.profileReadyLocked(input.BackgroundProfile) {
 			return domain.Turn{}, queueError(action, ErrTurnBusy)
 		}
 	}

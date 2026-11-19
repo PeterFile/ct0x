@@ -288,10 +288,10 @@ func TestGroupBackgroundDispatchRestartCapacityAndFairness(t *testing.T) {
 	}
 	disabled := newBackgroundFixture(t, f.path, false)
 	disabled.pass(t, cfg)
-	if m := disabled.post(t, bound.ID, "while-disabled", msg); len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != blocker.ID {
-		t.Fatalf("fresh message while disabled did not use legacy route: %+v", m)
+	if m := disabled.post(t, bound.ID, "while-disabled", msg); len(m.Deliveries) != 0 {
+		t.Fatalf("bound message while disabled must wait: %+v", m)
 	}
-	disabled.assertCount(t, backlog+1, `SELECT count(*) FROM group_background_intents WHERE delivery_id IS NULL`)
+	disabled.assertCount(t, backlog+2, `SELECT count(*) FROM group_background_intents WHERE delivery_id IS NULL`)
 	if err := disabled.db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -309,16 +309,18 @@ func TestGroupBackgroundDispatchRestartCapacityAndFairness(t *testing.T) {
 		}
 	}
 	on.assertCount(t, 1, `SELECT count(*) FROM group_background_intents WHERE delivery_id IS NOT NULL AND group_id=?`, other.ID)
-	on.assertCount(t, backlog, `SELECT count(*) FROM group_background_intents WHERE delivery_id IS NULL AND group_id=?`, bound.ID)
+	on.assertCount(t, backlog+1, `SELECT count(*) FROM group_background_intents WHERE delivery_id IS NULL AND group_id=?`, bound.ID)
 	on.exec(t, `UPDATE members SET status='left' WHERE id=?`, blocker.ID)
 	denied := cfg
 	denied.Create = nil
 	on.pass(t, denied)
-	on.assertCount(t, backlog, `SELECT count(*) FROM group_background_intents WHERE delivery_id IS NULL AND group_id=?`, bound.ID)
-	for range 3 {
+	on.assertCount(t, backlog+1, `SELECT count(*) FROM group_background_intents WHERE delivery_id IS NULL AND group_id=?`, bound.ID)
+	// A sweep that already passed the blocked topic head must wrap before
+	// retrying it. Two full bounded sweeps suffice for this backlog.
+	for range 6 {
 		on.pass(t, cfg)
 	}
-	on.assertCount(t, backlog, `SELECT count(*) FROM group_background_intents WHERE delivery_id IS NOT NULL AND group_id=?`, bound.ID)
+	on.assertCount(t, backlog+1, `SELECT count(*) FROM group_background_intents WHERE delivery_id IS NOT NULL AND group_id=?`, bound.ID)
 	on.assertCount(t, 1, `SELECT count(*) FROM group_background_joins WHERE group_id=?`, bound.ID)
 	on.assertCount(t, 0, `SELECT count(*) FROM group_background_bindings WHERE group_id=?`, legacy.ID)
 	if err := on.db.Close(); err != nil {
@@ -416,7 +418,8 @@ func TestGroupBackgroundDispatchPrepareScope(t *testing.T) {
 		strings.Contains(prompt, "OTHER_TOPIC") || strings.Contains(prompt, "OTHER_GROUP") || strings.Contains(prompt, "intent_assessment") {
 		t.Fatalf("unexpected discussion preparation: %s, %v", prompt, err)
 	}
-	turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: g.ID, DeliveryID: queued.Items[0].Delivery.ID, MaxActive: 1, ResourceKeys: prepared.ResourceKeys})
+	turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: g.ID, DeliveryID: queued.Items[0].Delivery.ID,
+		MaxActive: 1, ResourceKeys: prepared.ResourceKeys, BackgroundProfile: prepared.BackgroundProfile})
 	if err != nil || turn.MemberID != queued.Items[0].Delivery.RecipientID {
 		t.Fatalf("existing scheduler claim rejected original delivery: %+v, %v", turn, err)
 	}

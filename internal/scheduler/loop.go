@@ -206,6 +206,7 @@ func (r *loop) scan(lane int, budget *int) (domain.Turn, PreparedExecution, bool
 		}
 		turn, err := r.store.ClaimTurn(r.ctx, store.ClaimTurnInput{
 			GroupID: pending.GroupID, DeliveryID: d.ID, ResourceKeys: prepared.ResourceKeys, MaxActive: r.options.MaxActive,
+			BackgroundProfile: prepared.BackgroundProfile,
 		})
 		if errors.Is(err, store.ErrTurnBusy) || errors.Is(err, store.ErrNotFound) {
 			continue

@@ -48,7 +48,9 @@ func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, re
 	}
 	var deferred bool
 	if routeDefault && r.RecipientIDs == nil {
-		if s.background.enabled.Load() {
+		// An existing binding survives disabled startup. Only legacy groups
+		// can use the legacy default route; the bound request can safely wait.
+		if s.background.installed {
 			err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_background_bindings WHERE group_id=?)`, r.GroupID).Scan(&deferred)
 			if err != nil {
 				return domain.Message{}, storeError("读取群组后台绑定失败", err)
