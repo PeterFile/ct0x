@@ -177,7 +177,8 @@ func ownerNativeStop(t *testing.T, emit func(provider.Event) error, req provider
 func ownerNativeKey(op, call string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(op+call))) }
 
 func TestPiInvestigationOwnerNativeSQLiteRoundTrip(t *testing.T) {
-	t.Parallel()
+	// Do not overlap this round trip with the SQLite-heavy race fixtures;
+	// keep the production HTTP deadline on its scoped tool calls.
 	f := newBoundWorkReportFixture(t)
 	ownerNativeRows(t, f, 1, `SELECT count(*) FROM schema_migrations WHERE version=30 AND NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version>30)`)
 	assets, approved, foreign := ownerFixtureMaterials(t, f)
@@ -201,13 +202,6 @@ func TestPiInvestigationOwnerNativeSQLiteRoundTrip(t *testing.T) {
 		func(_ context.Context, _ provider.PiFreshInvestigationBinding, c investigationNativeConfig) provider.Executor {
 			tokens = append(tokens, c.Token)
 			return roleNative(func(run context.Context, req provider.ExecuteRequest, emit func(provider.Event) error) provider.ExecutionReceipt {
-				// Use the scheduler's watchdog for these in-process calls, not
-				// the outer HTTP deadline. The real handlers still recheck live
-				// authorization in SQLite before and after artifact I/O.
-				guardedHandler := f.handler
-				f.mountMemberToolHandlers(run)
-				defer func() { f.handler = guardedHandler }()
-
 				nativeCalls++
 				ops, err := f.runtime.Tools().TransportOperations(run, c.Token)
 				roleOK(t, err)
