@@ -80,7 +80,7 @@ func TestProjectChannelOwnershipForToolRequiresWorkspace(t *testing.T) {
 	}
 }
 
-func TestProjectChannelReadsIgnoreDanglingGroup(t *testing.T) {
+func TestProjectChannelReadsFailClosedOnDanglingGroup(t *testing.T) {
 	s, _ := openTestStore(t)
 	project, err := s.CreateProject(ctx, CreateProjectInput{Name: "测试项目"})
 	if err != nil {
@@ -91,13 +91,18 @@ func TestProjectChannelReadsIgnoreDanglingGroup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	healthy, err := s.CreateChannel(ctx, CreateChannelInput{ProjectID: project.ID, Name: "讨论"})
-	if err != nil {
+	if _, err := s.CreateChannel(ctx, CreateChannelInput{ProjectID: project.ID, Name: "讨论"}); err != nil {
 		t.Fatal(err)
 	}
-	// Leave the Channel and its receipt intact, simulating out-of-band damage.
+	// Verify the guard, then bypass it only here to leave the Channel and its
+	// receipt intact while simulating out-of-band damage.
+	const deleteGroup = "DELETE FROM groups WHERE id = ?"
 	coordinationDecideExec(t, s, "PRAGMA foreign_keys=OFF")
-	coordinationDecideExec(t, s, "DELETE FROM groups WHERE id = ?", dangling.GroupID)
+	if _, err := s.db.ExecContext(ctx, deleteGroup, dangling.GroupID); err == nil {
+		t.Fatal("groups_no_delete allowed deletion")
+	}
+	coordinationDecideExec(t, s, "DROP TRIGGER groups_no_delete")
+	coordinationDecideExec(t, s, deleteGroup, dangling.GroupID)
 	coordinationDecideExec(t, s, "PRAGMA foreign_keys=ON")
 	t.Run("detail", func(t *testing.T) {
 		got, err := s.GetChannel(ctx, project.ID, dangling.ID)
@@ -107,8 +112,8 @@ func TestProjectChannelReadsIgnoreDanglingGroup(t *testing.T) {
 	})
 	t.Run("list", func(t *testing.T) {
 		got, err := s.ListChannels(ctx, project.ID, ListOptions{Limit: 1})
-		if err != nil || len(got.Items) != 1 || got.Items[0] != healthy || got.NextCursor != nil {
-			t.Fatalf("list must page only over intact channels: %+v, %v", got, err)
+		if !errors.Is(err, ErrNotFound) || got.Items != nil || got.NextCursor != nil {
+			t.Fatalf("list must reject a page with a dangling channel: %+v, %v", got, err)
 		}
 	})
 	t.Run("replay", func(t *testing.T) {
@@ -122,11 +127,12 @@ func TestProjectChannelReadsIgnoreDanglingGroup(t *testing.T) {
 func TestProjectChannelPagePlan(t *testing.T) {
 	s, _ := openTestStore(t)
 	for _, tc := range []struct {
-		name   string
-		before *Cursor
+		name      string
+		before    *Cursor
+		seekRange string
 	}{
-		{"head", nil},
-		{"before", &Cursor{CreatedAt: time.Unix(0, 0), ID: "cursor"}},
+		{"head", nil, "(project_id=?)"},
+		{"before", &Cursor{CreatedAt: time.Unix(0, 0), ID: "cursor"}, "(project_id=? AND (created_at,id)<(?,?))"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			query, args := channelPageQuery("project", tc.before, 51)
@@ -148,11 +154,28 @@ func TestProjectChannelPagePlan(t *testing.T) {
 				t.Fatal(err)
 			}
 			if len(plan) != 2 || !strings.HasPrefix(plan[0], "SEARCH c ") ||
-				!strings.Contains(plan[0], "channels_project_created_id (project_id=?") ||
-				!strings.HasPrefix(plan[1], "SEARCH g ") || !strings.HasSuffix(plan[1], " (id=?)") {
-				t.Fatalf("want project index followed by a Group PK lookup, without scans or sorting: %q", plan)
+				!strings.HasSuffix(plan[0], " channels_project_created_id "+tc.seekRange) ||
+				!strings.HasPrefix(plan[1], "SEARCH g ") || !strings.HasSuffix(strings.TrimSuffix(plan[1], " LEFT-JOIN"), " (id=?)") {
+				t.Fatalf("want project index range %s followed by a Group PK lookup, without scans or sorting: %q", tc.seekRange, plan)
 			}
 		})
+	}
+}
+
+func TestProjectDirectoryProbeRequiresDefaultWorkspaceWithoutKey(t *testing.T) {
+	s, _ := openTestStore(t)
+	dir := t.TempDir()
+	coordinationDecideExec(t, s, "PRAGMA foreign_keys=OFF; DROP TRIGGER workspaces_no_delete")
+	coordinationDecideExec(t, s, "DELETE FROM workspaces WHERE is_default = 1")
+	coordinationDecideExec(t, s, "PRAGMA foreign_keys=ON")
+
+	input := CreateProjectInput{Name: "目录项目", Directory: &dir}
+	got, err := s.createProject(ctx, input, func(string) (os.FileInfo, error) {
+		t.Error("directory probe ran without a default Workspace")
+		return nil, os.ErrNotExist
+	})
+	if !errors.Is(err, ErrNotFound) || got != (ProjectView{}) {
+		t.Fatalf("missing workspace: %+v, %v", got, err)
 	}
 }
 

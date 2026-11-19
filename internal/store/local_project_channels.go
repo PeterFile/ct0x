@@ -23,9 +23,9 @@ type CreateChannelInput struct {
 }
 
 // Keep channels as the outer loop for index-ordered project paging. Each
-// candidate checks for its actual Group by primary key, not by scanning groups.
+// candidate counts toward LIMIT even if its primary-key Group lookup misses.
 const channelViewSelect = `SELECT c.id, c.project_id, g.id, c.name, c.description, c.created_at
- FROM channels c CROSS JOIN groups g ON g.id = c.legacy_group_id
+ FROM channels c LEFT JOIN groups g ON g.id = c.legacy_group_id
  WHERE c.project_id = ?`
 
 // CreateChannel is a trusted local-user command. The channel, legacy group,
@@ -125,13 +125,18 @@ func channelPageQuery(projectID string, before *Cursor, limit int) (string, []an
 func scanChannelView(row scanner) (ChannelView, error) {
 	var c ChannelView
 	var stamp string
-	if err := row.Scan(&c.ID, &c.ProjectID, &c.GroupID, &c.Name, &c.Description, &stamp); err != nil {
+	var groupID sql.NullString
+	if err := row.Scan(&c.ID, &c.ProjectID, &groupID, &c.Name, &c.Description, &stamp); err != nil {
 		return ChannelView{}, err
+	}
+	if !groupID.Valid {
+		return ChannelView{}, sql.ErrNoRows
 	}
 	createdAt, err := time.Parse(timestampLayout, stamp)
 	if err != nil {
 		return ChannelView{}, err
 	}
+	c.GroupID = groupID.String
 	c.CreatedAt = createdAt
 	return c, nil
 }

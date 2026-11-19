@@ -54,7 +54,7 @@ func (s *Store) createProject(ctx context.Context, input CreateProjectInput, sta
 		fields = append(fields, directory)
 	}
 	payload := mutationPayload(fields...)
-	if hasDirectory && scope.key != "" {
+	if hasDirectory {
 		project, err := s.lookupProjectReplay(ctx, scope, payload)
 		if err != nil {
 			return ProjectView{}, storeError(action, err)
@@ -117,7 +117,8 @@ func (s *Store) createProject(ctx context.Context, input CreateProjectInput, sta
 	return project, nil
 }
 
-// lookupProjectReplay closes the scoped receipt check before any directory probe.
+// lookupProjectReplay checks the default Workspace and any receipt in a short
+// transaction before any directory probe.
 func (s *Store) lookupProjectReplay(ctx context.Context, scope mutationScope, payload []byte) (*ProjectView, error) {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
