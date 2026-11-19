@@ -342,8 +342,12 @@ func (s *Store) readDecisionAnswer(ctx context.Context, thread domain.ThreadRef,
 		return zero, decisionRequestError(action, err)
 	}
 	view := domain.DecisionAnswerView{Receipt: receipt}
-	if includeHandling && receipt.TaskID != "" {
-		view.Handling, err = decisionAnswerHandlingInTx(ctx, tx, receipt)
+	if includeHandling {
+		if receipt.TaskID != "" {
+			view.Handling, err = decisionAnswerHandlingInTx(ctx, tx, receipt)
+		} else {
+			view.Handling, err = decisionThreadAnswerHandlingInTx(ctx, tx, receipt)
+		}
 		if err != nil {
 			return zero, decisionRequestError(action, err)
 		}
@@ -354,9 +358,9 @@ func (s *Store) readDecisionAnswer(ctx context.Context, thread domain.ThreadRef,
 	return view, nil
 }
 
-func decisionAnswerHandlingInTx(ctx context.Context, tx *sql.Tx, receipt domain.DecisionAnswerReceipt) (*domain.TaskWorkInputConsumption, error) {
+func decisionAnswerHandlingInTx(ctx context.Context, tx *sql.Tx, receipt domain.DecisionAnswerReceipt) (*domain.DecisionAnswerHandling, error) {
 	// Check the durable continuation identity, not current execution authority.
-	var handling domain.TaskWorkInputConsumption
+	var handling domain.DecisionAnswerHandling
 	var stamp string
 	var bound bool
 	err := tx.QueryRowContext(ctx, `SELECT c.turn_id,c.attempt_id,c.consumed_at, `+decisionAnswerHandlingMatch+decisionAnswerEvidence+

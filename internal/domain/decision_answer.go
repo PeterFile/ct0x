@@ -29,9 +29,17 @@ type DecisionAnswerReceipt struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// DecisionAnswerView separates the immutable saved receipt from explicit owner
-// handling. Without a persisted acknowledgement, Handling is nil.
+// DecisionAnswerView separates the immutable saved receipt from explicit
+// handling by the recipient. Without a persisted acknowledgement, Handling is nil.
 type DecisionAnswerView struct {
-	Receipt  DecisionAnswerReceipt     `json:"receipt"`
-	Handling *TaskWorkInputConsumption `json:"handling"`
+	Receipt  DecisionAnswerReceipt   `json:"receipt"`
+	Handling *DecisionAnswerHandling `json:"handling"`
+}
+
+// DecisionAnswerHandling identifies the Turn that acknowledged the answer.
+// An Attempt exists only for the Task route.
+type DecisionAnswerHandling struct {
+	TurnID     string    `json:"turn_id"`
+	AttemptID  string    `json:"attempt_id,omitempty"`
+	ConsumedAt time.Time `json:"consumed_at"`
 }

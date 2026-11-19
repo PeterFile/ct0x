@@ -54,23 +54,27 @@ func (s *Store) threadDecisionPendingFilter(ctx context.Context, lane string) (s
 	 AND (r.expires_at IS NULL OR r.expires_at>?))`, []any{time.Now().UTC().Format(timestampLayout)}, nil
 }
 
-// Used by both answer readback and launch. A historical receipt by itself
-// never permits a wake: the original version/source/asker must still match.
+const decisionThreadWakeRelations = ` FROM decision_thread_answers ans
+ JOIN decision_thread_answerable r ON (r.request_id,r.version)=(ans.request_id,ans.version)
+ JOIN deliveries d ON (d.id,d.message_id,d.group_id,d.topic_id,d.conversation_id,d.recipient_id)=
+    (ans.delivery_id,ans.reply_message_id,r.group_id,r.topic_id,r.conversation_id,r.asker_id)`
+
+const decisionThreadWakeExclusive = `NOT EXISTS(SELECT 1 FROM turns extra WHERE extra.delivery_id=d.id AND extra.id<>d.turn_id)
+ AND NOT EXISTS(SELECT 1 FROM deliveries extra WHERE extra.message_id=d.message_id AND extra.id<>d.id)
+ AND NOT EXISTS(SELECT 1 FROM message_command_sources WHERE message_id=d.message_id)
+ AND NOT EXISTS(SELECT 1 FROM coordination_triggers WHERE message_id=d.message_id)`
+
+// A historical receipt by itself never permits launch or acknowledgement:
+// the original version, source and asker must still match.
 func decisionThreadWakeInTx(ctx context.Context, tx *sql.Tx, groupID, deliveryID string) (wake ThreadDecisionWake, state domain.DeliveryState, turnID string, err error) {
 	var requestID, topicID string
 	var version int64
 	err = tx.QueryRowContext(ctx, `SELECT r.request_id,r.topic_id,r.version,r.asker_id,r.asker_turn_id,r.conversation_id,
-	 r.source_message_id,r.notice_message_id,r.question,d.state,d.turn_id
-	 FROM decision_thread_answers ans JOIN decision_thread_answerable r ON (r.request_id,r.version)=(ans.request_id,ans.version)
-	 JOIN deliveries d ON (d.id,d.message_id,d.group_id,d.topic_id,d.conversation_id,d.recipient_id)=
-	    (ans.delivery_id,ans.reply_message_id,r.group_id,r.topic_id,r.conversation_id,r.asker_id)
+	 r.source_message_id,r.notice_message_id,r.question,d.state,d.turn_id`+decisionThreadWakeRelations+`
 	 WHERE (r.group_id,d.id)=(?,?) AND (r.expires_at IS NULL OR r.expires_at>?)
 	 AND (d.turn_id='' OR EXISTS(SELECT 1 FROM turns t WHERE (t.id,t.delivery_id,t.group_id,t.conversation_id,t.member_id)=
 	    (d.turn_id,d.id,d.group_id,d.conversation_id,d.recipient_id)))
-	 AND NOT EXISTS(SELECT 1 FROM turns t WHERE t.delivery_id=d.id AND t.id<>d.turn_id)
-	 AND NOT EXISTS(SELECT 1 FROM deliveries extra WHERE extra.message_id=d.message_id AND extra.id<>d.id)
-	 AND NOT EXISTS(SELECT 1 FROM message_command_sources WHERE message_id=d.message_id)
-	 AND NOT EXISTS(SELECT 1 FROM coordination_triggers WHERE message_id=d.message_id)`,
+	 AND `+decisionThreadWakeExclusive,
 		groupID, deliveryID, time.Now().UTC().Format(timestampLayout)).Scan(&requestID, &topicID, &version, &wake.AskerID,
 		&wake.AskerTurnID, &wake.ConversationID, &wake.SourceMessageID, &wake.NoticeMessageID, &wake.Question, &state, &turnID)
 	if err == nil {

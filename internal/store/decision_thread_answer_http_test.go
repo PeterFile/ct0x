@@ -11,9 +11,11 @@ import (
 	"sync"
 	"testing"
 
+	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/httpapi"
 	"agentworkspace/internal/platform"
+	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
 )
 
@@ -160,5 +162,40 @@ func TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead(t *testing.T) {
 		if w.Code != http.StatusNotFound {
 			t.Fatalf("historical receipt escaped its scope: %d %s", w.Code, w.Body)
 		}
+	}
+}
+
+func TestThreadDecisionAcknowledgementHTTPProjection(t *testing.T) {
+	ctx := context.Background()
+	db, _, q, _ := store.ThreadDecisionHTTPFixture(t)
+	engine := coordination.New(db)
+	a, err := engine.AnswerDecisionRequest(ctx, q.ThreadRef, q.ID, domain.DecisionAnswerInput{Version: q.Version, OptionIndex: 1}, "local-answer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn, err := db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: a.GroupID, DeliveryID: a.WakeDeliveryID, ThreadDecisionAnswerID: a.ID, MaxActive: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	if err := db.RecordTurnEvent(ctx, claim, provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: "fixture-session"}); err != nil {
+		t.Fatal(err)
+	}
+	query := url.Values{"group_id": {q.GroupID}, "topic_id": {q.TopicID}, "version": {strconv.FormatInt(q.Version, 10)}}
+	path := "/api/v1/me/decisions/" + q.ID + "/answer?" + query.Encode()
+	h := threadDecisionHTTP(t, db)
+	before := threadDecisionRequest(h, http.MethodGet, path, nil, "")
+	if before.Code != http.StatusOK || !bytes.Contains(before.Body.Bytes(), []byte(`"handling":null`)) {
+		t.Fatalf("acceptance alone changed the read view: %d %s", before.Code, before.Body)
+	}
+	ack, err := engine.AcknowledgeThreadDecision(ctx, claim, a.ID, "typed-ack")
+	if err != nil || ack.Handling == nil || ack.Handling.TurnID != turn.ID {
+		t.Fatalf("Engine did not delegate the explicit acknowledgement: %+v %v", ack, err)
+	}
+	w := threadDecisionRequest(h, http.MethodGet, path, nil, "")
+	want, err := json.Marshal(ack)
+	if err != nil || w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store" ||
+		!bytes.Equal(bytes.TrimSpace(w.Body.Bytes()), want) || bytes.Contains(w.Body.Bytes(), []byte(`"attempt_id"`)) {
+		t.Fatalf("unexpected Thread handling wire: %d %s; expected %s (%v)", w.Code, w.Body, want, err)
 	}
 }

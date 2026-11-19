@@ -32,7 +32,10 @@ func (s *Store) threadDecisionExecutionReady(ctx context.Context, q threadDecisi
 	if !s.threadDecisionExecution.Load() {
 		return false, nil
 	}
-	return decisionThreadAnswerInstalled(ctx, q)
+	var installed bool
+	err := q.QueryRowContext(ctx, `SELECT count(*)=2 FROM main.sqlite_schema WHERE type='table'
+	 AND name IN ('decision_thread_answers','decision_thread_answer_consumptions')`).Scan(&installed)
+	return installed, err
 }
 
 func (s *Store) answerableDecisionSQL(ctx context.Context, tx *sql.Tx, taskOnly string) (string, error) {

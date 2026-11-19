@@ -58,8 +58,40 @@ CREATE TABLE decision_thread_answers (
     reply_message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) CHECK(instr(reply_message_id,'` + threadDecisionAnswerPrefix + `')=1),
     delivery_id TEXT NOT NULL UNIQUE REFERENCES deliveries(id) CHECK(instr(delivery_id,'` + threadDecisionAnswerPrefix + `')=1),
     created_at TEXT NOT NULL CHECK(length(created_at)=30),
+    UNIQUE(id,delivery_id),
     FOREIGN KEY(request_id,version) REFERENCES decision_request_versions(request_id,version)
 ) STRICT, WITHOUT ROWID;
+
+CREATE UNIQUE INDEX turns_thread_decision_delivery_identity ON turns(id,delivery_id);
+CREATE TABLE decision_thread_answer_consumptions (
+    answer_id TEXT PRIMARY KEY NOT NULL,
+    delivery_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL UNIQUE,
+    call_key TEXT NOT NULL CHECK(length(CAST(call_key AS BLOB)) BETWEEN 1 AND 128
+        AND instr(call_key,char(0))=0 AND call_key NOT GLOB '*[^!-~]*' AND instr(call_key,',')=0),
+    consumed_at TEXT NOT NULL CHECK(length(consumed_at)=30),
+    FOREIGN KEY(answer_id,delivery_id) REFERENCES decision_thread_answers(id,delivery_id),
+    FOREIGN KEY(turn_id,delivery_id) REFERENCES turns(id,delivery_id)
+) STRICT, WITHOUT ROWID;
+
+CREATE TRIGGER decision_thread_answer_consumptions_insert BEFORE INSERT ON decision_thread_answer_consumptions
+BEGIN
+    SELECT RAISE(ABORT,'话题答复处理回执不可替换') WHERE EXISTS(SELECT 1 FROM decision_thread_answer_consumptions
+        WHERE answer_id=NEW.answer_id OR turn_id=NEW.turn_id);
+    SELECT RAISE(ABORT,'话题答复处理回执与当前认领不匹配') WHERE NOT EXISTS(
+        SELECT 1` + decisionThreadWakeRelations + `
+        JOIN turns t ON (t.id,t.delivery_id,t.group_id,t.conversation_id,t.member_id)=
+            (d.turn_id,d.id,d.group_id,d.conversation_id,d.recipient_id)
+        WHERE (ans.id,d.id,t.id)=(NEW.answer_id,NEW.delivery_id,NEW.turn_id)
+        AND t.id<>r.asker_turn_id AND d.state='accepted' AND ` + decisionThreadAcceptedTurn + `
+        AND NEW.consumed_at>=ans.created_at AND NEW.consumed_at>=t.accepted_at
+        AND (r.expires_at IS NULL OR r.expires_at>NEW.consumed_at)
+        AND ` + decisionThreadWakeExclusive + `);
+END;
+CREATE TRIGGER decision_thread_answer_consumptions_no_update BEFORE UPDATE ON decision_thread_answer_consumptions
+BEGIN SELECT RAISE(ABORT,'话题答复处理回执不可修改'); END;
+CREATE TRIGGER decision_thread_answer_consumptions_no_delete BEFORE DELETE ON decision_thread_answer_consumptions
+BEGIN SELECT RAISE(ABORT,'话题答复处理回执不可删除'); END;
 
 CREATE TRIGGER decision_thread_answers_insert BEFORE INSERT ON decision_thread_answers
 BEGIN
