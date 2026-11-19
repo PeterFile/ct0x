@@ -51,6 +51,7 @@ func assertDecisionAnswerView(t *testing.T, s *Store, a domain.DecisionAnswerRec
 }
 
 func TestDecisionAnswerOneWakeAndExplicitOwnerAckAfterReopen(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	f.input.Title = "周末样本验证"
 	s := f.s
@@ -386,6 +387,7 @@ func TestDecisionAnswerOneWakeAndExplicitOwnerAckAfterReopen(t *testing.T) {
 }
 
 func TestDecisionAnswerVersionAndRevocationFence(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	s := f.s
 	installDecisionAnswerFixture(t, s)
@@ -503,6 +505,7 @@ func TestDecisionAnswerVersionAndRevocationFence(t *testing.T) {
 }
 
 func TestDecisionAnswerWithdrawalAfterClaimFencesLaunchAndAck(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	s := f.s
 	installDecisionAnswerFixture(t, s)
@@ -626,6 +629,7 @@ func TestDecisionAnswerWithdrawalAfterClaimFencesLaunchAndAck(t *testing.T) {
 }
 
 func TestDecisionAnswerDoesNotTreatClarificationAsGenericChat(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	installDecisionAnswerFixture(t, f.s)
 	input, details := decisionClarificationInput()
