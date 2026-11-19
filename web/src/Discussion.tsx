@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { ApiError, isDefinitiveRejection, sendMessage } from "./api";
 import type { Delivery, Member, Message, MessageDiscussionWork, MessageInput } from "./api";
 import { messageAuthor, messageSourceLabel } from "./message-source";
+import { refreshBackgroundRoster } from "./background-roster-refresh";
 import { RequestWork } from "./RequestWork";
 import type { RequestWorkHandle } from "./RequestWork";
 import { useMessageFeed } from "./useMessageFeed";
@@ -52,6 +53,17 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
   const formId = useId(), feed = useMessageFeed(groupId, active);
   const scroll = useMessageScroll(active, feed.items, feed.page);
   const loaded = useMemo(() => new Map(feed.items.map(message => [message.id, message])), [feed.items]);
+  const seenJoins = useRef(new Set<string>());
+  useEffect(() => {
+    if (!active) return;
+    let joined = false;
+    for (const message of feed.items) {
+      if (message.group_id !== groupId || !backgroundJoin(message) || seenJoins.current.has(message.id)) continue;
+      seenJoins.current.add(message.id);
+      joined = true;
+    }
+    if (joined) refreshBackgroundRoster(groupId);
+  }, [active, feed.items, groupId]);
   const [content, setContent] = useState("");
   const [route, setRoute] = useState("default"), [recipients, setRecipients] = useState<string[]>([]);
   const [mention, setMention] = useState<{ start: number; end: number; query: string } | null>(null);
@@ -174,8 +186,8 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
             work={message.discussion_work} members={membersById} scopeId={formId}
             onNavigateReference={id => { scroll.onNavigateReference(id); feed.preserveReference(id); }} /> : null}
           <div className="message-actions">
-            <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
-              onClick={event => requestWork.current?.open(message, event.currentTarget)}>转为任务</button>
+            {!backgroundJoin(message) ? <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
+              onClick={event => requestWork.current?.open(message, event.currentTarget)}>转为任务</button> : null}
             {refreshDiscussion ? refresh : null}
             <details className="message-details">
               <summary className={message.deliveries.some(delivery => !["queued", "accepted"].includes(delivery.state) || Boolean(delivery.error)) ? "delivery-warning" : undefined}>
@@ -266,6 +278,10 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
     </form>
     </section>
   </div>;
+}
+
+function backgroundJoin(message: Message) {
+  return message.source_kind === "platform" && message.source_id?.startsWith("group_background_join:");
 }
 
 const discussionLabels = { invite: "邀请协作", reply: "回送答复", resolve: "讨论总结" };

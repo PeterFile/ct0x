@@ -6,6 +6,7 @@ import { CreationDisclosure } from "./CreationDisclosure";
 import { MemberAvatar } from "./MemberAvatar";
 import { MemberAdapterDetails } from "./MemberAdapterDetails";
 import { WorkspaceGrantSettings } from "./WorkspaceGrantSettings";
+import { onBackgroundRosterRefresh } from "./background-roster-refresh";
 
 function unique<T extends { id: string }>(items: T[]) {
   const seen = new Set<string>();
@@ -79,7 +80,7 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
   const selectedProvider = !catalogue.pending && !catalogue.error
     ? catalogue.items.find(provider => provider.id === selected?.provider_id) : undefined;
   const [draft, setDraft] = useState(emptyDraft);
-  const [request, setRequest] = useState({ before: "", version: 0 });
+  const [request, setRequest] = useState({ before: "", version: 0, joinRefresh: false });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
   const [mutation, setMutation] = useState({ pending: false, error: "", uncertain: false });
   const confirmed = useRef<{ member: Member; afterRead: number }[]>([]);
@@ -87,7 +88,12 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
   const operation = useRef<{ key: string; input: MemberInput } | null>(null);
   const posting = useRef<AbortController | null>(null);
   const mounted = useRef(false);
-  const load = (before = "") => setRequest(previous => ({ before, version: previous.version + 1 }));
+  const load = (before = "") => setRequest(previous => ({ before, version: previous.version + 1, joinRefresh: false }));
+  useEffect(() => {
+    if (!active) return;
+    return onBackgroundRosterRefresh(groupId, () =>
+      setRequest(previous => ({ before: "", version: previous.version + 1, joinRefresh: true })));
+  }, [active, groupId]);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; posting.current?.abort(); };
@@ -105,8 +111,11 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
       const protectedMembers = confirmed.current.map(receipt => receipt.member);
       setItems(previous => {
         const updates = new Map(result.items.map(member => [member.id, member]));
-        const retained = request.before ? previous.map(member => updates.get(member.id) ?? member) : [];
-        return unique([...protectedMembers, ...retained, ...result.items]);
+        // A confirmed join adds to the roster; keep already-loaded recipients
+        // available while renewing its first page through the existing read.
+        const retained = request.before || request.joinRefresh ? previous.map(member => updates.get(member.id) ?? member) : [];
+        const observed = request.joinRefresh ? [...result.items, ...retained] : [...retained, ...result.items];
+        return unique([...protectedMembers, ...observed]);
       });
       setPage({ pending: false, error: "", next: result.next_cursor });
     }, error => {

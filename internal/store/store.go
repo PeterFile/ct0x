@@ -35,6 +35,7 @@ type Store struct {
 	db                     *sql.DB
 	investigationExecution atomic.Bool
 	taskWorkExecution      atomic.Bool
+	background             groupBackgroundDispatch
 }
 
 type CreateGroupInput struct {
@@ -84,12 +85,28 @@ func Open(path string) (*Store, error) {
 	if err := migrate(db); err != nil {
 		return nil, storeError("初始化数据库失败", errors.Join(err, db.Close()))
 	}
-	return &Store{db: db}, nil
+	s := &Store{db: db}
+	if err := db.QueryRow("SELECT " + groupBackgroundSchemaExists).Scan(&s.background.installed); err != nil {
+		return nil, storeError("读取群组后台调度迁移状态失败", errors.Join(err, db.Close()))
+	}
+	return s, nil
 }
 
 func (s *Store) Close() error { return storeError("关闭数据库失败", s.db.Close()) }
 
 func (s *Store) CreateGroup(ctx context.Context, input CreateGroupInput) (domain.Group, error) {
+	return s.createGroup(ctx, input, false)
+}
+
+// CreateLocalUserGroup is only exposed through the trusted local-human entry.
+func (s *Store) CreateLocalUserGroup(ctx context.Context, input CreateGroupInput) (domain.Group, error) {
+	if input.ActorID != "user" {
+		return domain.Group{}, ErrMemberToolDenied
+	}
+	return s.createGroup(ctx, input, s.background.enabled.Load())
+}
+
+func (s *Store) createGroup(ctx context.Context, input CreateGroupInput, bindBackground bool) (domain.Group, error) {
 	scope := mutationScope{operation: "create_group", actorID: input.ActorID, key: input.IdempotencyKey}
 	tx, id, replay, err := s.beginMutation(ctx, scope, mutationPayload(input.Name, input.Description))
 	if err != nil {
@@ -109,6 +126,11 @@ func (s *Store) CreateGroup(ctx context.Context, input CreateGroupInput) (domain
 	}
 	if err != nil {
 		return domain.Group{}, storeError("创建群组失败", err)
+	}
+	if !replay && bindBackground {
+		if err := coordinationDispatchWrite(ctx, tx, "INSERT INTO group_background_bindings(group_id) VALUES(?)", g.ID); err != nil {
+			return domain.Group{}, storeError("绑定群组后台调度失败", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Group{}, storeError("保存群组失败", err)

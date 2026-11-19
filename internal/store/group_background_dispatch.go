@@ -1,0 +1,313 @@
+package store
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"agentworkspace/internal/domain"
+)
+
+// BackgroundDispatchProfile is an exact, approved, ready fresh-text runtime.
+// The composition owner samples readiness outside Store; these are not preferences.
+type BackgroundDispatchProfile struct{ ProviderID, Model string }
+
+// BackgroundDispatchTemplate is a trusted configuration identity, not another
+// group's member ID. Templates carry no session, workspace, or grants.
+type BackgroundDispatchTemplate struct {
+	ID, Name, Role string
+	Profile        BackgroundDispatchProfile
+}
+
+type BackgroundDispatchOptions struct {
+	MaxActiveMembers int // 1..200. A full group can still reuse a suitable member.
+	ReadyProfiles    []BackgroundDispatchProfile
+	Presets          []BackgroundDispatchTemplate // First suitable, in configured order.
+	Create           *BackgroundDispatchTemplate  // Nil forbids auto-creation.
+}
+
+type groupBackgroundDispatch struct {
+	installed bool
+	enabled   atomic.Bool
+	pass      sync.Mutex
+	// These only bound/rotate observations. They are not consumption checkpoints.
+	after, through int64
+}
+
+const (
+	groupBackgroundPassLimit = 16
+	groupBackgroundMaxConfig = 200
+	groupBackgroundNotice    = "platformnotice"
+)
+
+const groupBackgroundSchemaExists = `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='group_background_bindings')`
+
+// EnableGroupBackgroundDispatch is startup wiring for the same Store used by
+// trusted LocalUser and the scheduler. It does not bind legacy groups or probe
+// availability. Omitting this call on restart disables new intents and passes.
+func (s *Store) EnableGroupBackgroundDispatch(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !s.background.installed {
+		return fmt.Errorf("%w：未安装群组后台调度迁移", ErrInvalid)
+	}
+	s.background.enabled.Store(true)
+	return nil
+}
+
+func recordGroupBackgroundIntent(ctx context.Context, tx *sql.Tx, m domain.Message) error {
+	result, err := tx.ExecContext(ctx, `INSERT INTO group_background_intents(sequence,message_id,source_id,group_id,topic_id)
+	 SELECT sequence,message_id,?,group_id,topic_id FROM message_log WHERE message_id=? AND group_id=? AND topic_id=?`,
+		m.SourceID, m.ID, m.GroupID, m.TopicID)
+	return groupBackgroundOneRow(result, err)
+}
+
+func groupBackgroundOneRow(result sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	if n, err := result.RowsAffected(); err != nil {
+		return err
+	} else if n != 1 {
+		return ErrConflict
+	}
+	return nil
+}
+
+// RunGroupBackgroundDispatch is a bounded synchronous scheduler pass, not an
+// executor. It observes an immutable configuration snapshot supplied by its caller.
+func (s *Store) RunGroupBackgroundDispatch(ctx context.Context, options BackgroundDispatchOptions) error {
+	const action = "群组后台调度失败"
+	if !s.background.enabled.Load() {
+		return nil
+	}
+	ready, err := validateBackgroundDispatch(options)
+	if err != nil {
+		return storeError(action, err)
+	}
+	if len(ready) == 0 || !s.background.pass.TryLock() {
+		return nil
+	}
+	defer s.background.pass.Unlock()
+	// The SQL candidate lookup does an indexed top-1 per approved profile.
+	profiles, err := json.Marshal(options.ReadyProfiles)
+	if err != nil {
+		return storeError(action, err)
+	}
+	if s.background.through == 0 {
+		err := s.db.QueryRowContext(ctx, `SELECT coalesce(max(sequence),0) FROM group_background_intents WHERE delivery_id IS NULL`).Scan(&s.background.through)
+		if err != nil || s.background.through == 0 {
+			return storeError(action, err)
+		}
+	}
+	entries, err := s.pendingGroupBackgroundIntents(ctx, s.background.after, s.background.through)
+	if err != nil {
+		return storeError(action, err)
+	}
+	var failures error
+	for _, sequence := range entries[:min(len(entries), groupBackgroundPassLimit)] {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(failures, err)
+		}
+		if err := s.routeGroupBackgroundIntent(ctx, sequence, options, ready, string(profiles)); err != nil {
+			failures = errors.Join(failures, storeError(action, err))
+		}
+		s.background.after = sequence
+	}
+	// A finite sweep wraps even when new arrivals keep extending the queue.
+	if len(entries) <= groupBackgroundPassLimit {
+		s.background.after, s.background.through = 0, 0
+	}
+	return failures
+}
+
+func validateBackgroundDispatch(options BackgroundDispatchOptions) (map[BackgroundDispatchProfile]bool, error) {
+	invalid := fmt.Errorf("%w：群组后台调度配置无效", ErrInvalid)
+	if options.MaxActiveMembers < 1 || options.MaxActiveMembers > groupBackgroundMaxConfig ||
+		len(options.ReadyProfiles) > groupBackgroundMaxConfig || len(options.Presets) > groupBackgroundMaxConfig {
+		return nil, invalid
+	}
+	validProfile := func(p BackgroundDispatchProfile) bool {
+		return len(p.ProviderID) <= 256 && len(p.Model) <= 256 && validTriggerID(p.ProviderID) && validTriggerID(p.Model)
+	}
+	ready := make(map[BackgroundDispatchProfile]bool, len(options.ReadyProfiles))
+	for _, p := range options.ReadyProfiles {
+		if !validProfile(p) || ready[p] {
+			return nil, invalid
+		}
+		ready[p] = true
+	}
+	validTemplate := func(t BackgroundDispatchTemplate) bool {
+		return len(t.ID) <= 128 && len(t.Name) <= 128 && len(t.Role) <= 512 && validTriggerID(t.ID) &&
+			validTriggerID(t.Name) && validTriggerID(t.Role) && validProfile(t.Profile)
+	}
+	presets := make(map[string]bool, len(options.Presets))
+	for _, preset := range options.Presets {
+		if !validTemplate(preset) || presets[preset.ID] {
+			return nil, invalid
+		}
+		presets[preset.ID] = true
+	}
+	if options.Create != nil && !validTemplate(*options.Create) {
+		return nil, invalid
+	}
+	return ready, nil
+}
+
+func (s *Store) pendingGroupBackgroundIntents(ctx context.Context, after, through int64) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT sequence FROM group_background_intents
+	 WHERE delivery_id IS NULL AND sequence>? AND sequence<=? ORDER BY sequence LIMIT ?`, after, through, groupBackgroundPassLimit+1)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	entries := make([]int64, 0, groupBackgroundPassLimit+1)
+	for rows.Next() {
+		var sequence int64
+		if err := rows.Scan(&sequence); err != nil {
+			return nil, err
+		}
+		entries = append(entries, sequence)
+	}
+	return entries, rows.Err()
+}
+
+func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, options BackgroundDispatchOptions, ready map[BackgroundDispatchProfile]bool, profiles string) error {
+	tx, err := s.db.BeginTx(ctx, nil) // The Store DSN serializes writers before reads.
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var m MessageRequest
+	var messageID string
+	var payload []byte
+	var valid bool
+	err = tx.QueryRowContext(ctx, `SELECT i.message_id,i.group_id,i.topic_id,m.content,s.payload,
+	 coalesce(m.sender_id='user' AND s.kind='local_user_chat' AND s.turn_id IS NULL AND s.claim_digest IS NULL
+	     AND b.group_id IS NOT NULL AND l.message_id=i.message_id AND l.group_id=i.group_id AND l.topic_id=i.topic_id
+	     AND NOT EXISTS(SELECT 1 FROM deliveries WHERE message_id=i.message_id),0)
+	 FROM group_background_intents i JOIN messages m ON (m.id,m.group_id,m.topic_id)=(i.message_id,i.group_id,i.topic_id)
+	 JOIN message_command_sources s ON (s.id,s.message_id)=(i.source_id,i.message_id)
+	 LEFT JOIN group_background_bindings b ON b.group_id=i.group_id
+	 LEFT JOIN message_log l ON l.sequence=i.sequence
+	 WHERE i.sequence=? AND i.delivery_id IS NULL`, sequence).Scan(&messageID, &m.GroupID, &m.TopicID, &m.Content, &payload, &valid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // Another pass completed it, or there is no matching authority.
+	}
+	if err != nil {
+		return err
+	}
+	if !valid || !bytes.Equal(payload, m.payload()) { // Exact omitted-recipient source; topic is opaque.
+		return ErrMemberToolDenied
+	}
+	member, err := existingBackgroundMember(ctx, tx, m.GroupID, profiles)
+	if err != nil {
+		return err
+	}
+	kind, now := "existing", time.Now().UTC()
+	if member == "" {
+		var active int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM
+		 (SELECT 1 FROM members WHERE group_id=? AND status='active' LIMIT ?)`, m.GroupID, options.MaxActiveMembers).Scan(&active); err != nil {
+			return err
+		}
+		if active >= options.MaxActiveMembers {
+			return nil
+		}
+		template, route, err := backgroundJoinTemplate(ctx, tx, m.GroupID, options, ready)
+		if err != nil || template == nil {
+			return err
+		}
+		kind = route
+		member, err = joinBackgroundMember(ctx, tx, m.GroupID, m.TopicID, messageID, *template, kind, now)
+		if err != nil {
+			return err
+		}
+	}
+	c, err := conversationInTx(ctx, tx, m.GroupID, member, m.TopicID)
+	if err != nil {
+		return err
+	}
+	delivery, stamp := rand.Text(), now.Format(timestampLayout)
+	if err := coordinationDispatchWrite(ctx, tx, `INSERT INTO deliveries(id,message_id,conversation_id,recipient_id,group_id,topic_id,created_at)
+	 VALUES(?,?,?,?,?,?,?)`, delivery, messageID, c.ID, member, m.GroupID, m.TopicID, stamp); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `UPDATE group_background_intents SET delivery_id=?,recipient_id=?,route_kind=?,completed_at=?
+	 WHERE sequence=? AND delivery_id IS NULL`, delivery, member, kind, stamp, sequence)
+	if err := groupBackgroundOneRow(result, err); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func existingBackgroundMember(ctx context.Context, tx *sql.Tx, groupID, profiles string) (string, error) {
+	var id string
+	err := tx.QueryRowContext(ctx, `SELECT id FROM members WHERE id IN (
+	 SELECT (SELECT w.id FROM members w WHERE w.group_id=? AND w.status='active' AND w.workspace=''
+	     AND w.provider_id=json_extract(p.value,'$.ProviderID') AND w.model=json_extract(p.value,'$.Model')
+	     ORDER BY w.created_at,w.id LIMIT 1) FROM json_each(?) p
+	 ) ORDER BY created_at,id LIMIT 1`, groupID, profiles).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+	return id, err
+}
+
+func backgroundJoinTemplate(ctx context.Context, tx *sql.Tx, groupID string, options BackgroundDispatchOptions, ready map[BackgroundDispatchProfile]bool) (*BackgroundDispatchTemplate, string, error) {
+	for i, p := range options.Presets {
+		if !ready[p.Profile] {
+			continue
+		}
+		var used bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_background_joins WHERE group_id=? AND kind='preset' AND template_id=?)`, groupID, p.ID).Scan(&used); err != nil {
+			return nil, "", err
+		}
+		if !used {
+			return &options.Presets[i], "preset", nil
+		}
+	}
+	if options.Create != nil && ready[options.Create.Profile] {
+		return options.Create, "create", nil
+	}
+	return nil, "", nil
+}
+
+func joinBackgroundMember(ctx context.Context, tx *sql.Tx, groupID, topicID, originID string, t BackgroundDispatchTemplate, kind string, now time.Time) (string, error) {
+	member, event := rand.Text(), rand.Text()
+	if err := coordinationDispatchWrite(ctx, tx, `INSERT INTO members(`+memberColumns+`) VALUES(?,?,?,?,?,?,'system','user','active','',?)`,
+		member, groupID, t.Name, t.Role, t.Profile.ProviderID, t.Profile.Model, now.Format(timestampLayout)); err != nil {
+		return "", err
+	}
+	content := fmt.Sprintf("%s 已加入群组，参与当前话题的讨论。", t.Name)
+	if err := insertMessageRow(ctx, tx, domain.Message{ID: event, GroupID: groupID, TopicID: topicID,
+		SenderID: groupBackgroundNotice, Content: content, CreatedAt: now}); err != nil {
+		return "", err
+	}
+	err := coordinationDispatchWrite(ctx, tx, `INSERT INTO group_background_joins(member_id,group_id,topic_id,origin_message_id,notice_message_id,kind,template_id,provider_id,model)
+	 VALUES(?,?,?,?,?,?,?,?,?)`, member, groupID, topicID, originID, event, kind, t.ID, t.Profile.ProviderID, t.Profile.Model)
+	return member, err
+}
+
+// BackgroundDiscussionKind distinguishes a background-routed delivery or an
+// automatically joined member's ordinary delivery from other existing traffic.
+// It remains available after a disabled restart and conveys no authority.
+func (s *Store) BackgroundDiscussionKind(ctx context.Context, groupID, deliveryID string) (string, error) {
+	if !s.background.installed {
+		return "", nil
+	}
+	var kind string
+	err := s.db.QueryRowContext(ctx, `SELECT coalesce(j.kind,i.route_kind,'') FROM deliveries d
+	 LEFT JOIN group_background_joins j ON j.member_id=d.recipient_id AND j.group_id=d.group_id
+	 LEFT JOIN group_background_intents i ON i.delivery_id=d.id AND i.group_id=d.group_id
+	 WHERE d.id=? AND d.group_id=?`, deliveryID, groupID).Scan(&kind)
+	return kind, storeError("读取后台讨论路由失败", err)
+}

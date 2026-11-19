@@ -10,9 +10,17 @@ import (
 	"agentworkspace/internal/domain"
 )
 
-// CreateLocalUserMessage is a trusted command seam, not a member operation.
-// Only a new command creates proof; replaying legacy data never upgrades it.
+// CreateLocalUserMessage is a trusted command with already resolved recipients.
+// Only PostLocalUserMessage resolves the ordinary Web/local-human default route.
 func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, recipients []string) (domain.Message, error) {
+	return s.createLocalUserMessage(ctx, r, recipients, false)
+}
+
+func (s *Store) PostLocalUserMessage(ctx context.Context, r MessageRequest) (domain.Message, error) {
+	return s.createLocalUserMessage(ctx, r, r.RecipientIDs, true)
+}
+
+func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, recipients []string, routeDefault bool) (domain.Message, error) {
 	if r.ActorID != "user" {
 		return domain.Message{}, ErrMemberToolDenied
 	}
@@ -24,20 +32,51 @@ func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, re
 	if err := requireMessageActor(ctx, tx, r.GroupID, "user"); err != nil {
 		return domain.Message{}, storeError("验证用户消息失败", err)
 	}
-	_, replay, err := lookupMutation(ctx, tx, r.scope(), r.payload())
+	id, replay, err := lookupMutation(ctx, tx, r.scope(), r.payload())
 	if err != nil {
 		return domain.Message{}, storeError("读取用户消息回执失败", err)
+	}
+	if replay { // Never add provenance, deliveries or a new intent on replay.
+		message, err := messageReceiptInTx(ctx, tx, r.GroupID, id)
+		if err != nil {
+			return domain.Message{}, storeError("读取用户消息回执失败", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return domain.Message{}, storeError("读取用户消息回执失败", err)
+		}
+		return message, nil
+	}
+	var deferred bool
+	if routeDefault && r.RecipientIDs == nil {
+		if s.background.enabled.Load() {
+			err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_background_bindings WHERE group_id=?)`, r.GroupID).Scan(&deferred)
+			if err != nil {
+				return domain.Message{}, storeError("读取群组后台绑定失败", err)
+			}
+		}
+		if !deferred {
+			id, err := earliestActiveMemberID(ctx, tx, r.GroupID)
+			if err != nil {
+				return domain.Message{}, storeError("读取消息默认接收者失败", err)
+			}
+			if id != "" {
+				recipients = []string{id}
+			}
+		}
 	}
 	message, err := createMessageInTx(ctx, tx, r, recipients)
 	if err != nil {
 		return domain.Message{}, storeError("创建用户消息失败", err)
 	}
-	if !replay {
-		sourceID, err := messageCommandSourceInTx(ctx, tx, message.ID, "local_user_chat", r.payload(), r.IdempotencyKey, nil)
-		if err != nil {
-			return domain.Message{}, storeError("记录用户命令来源失败", err)
+	sourceID, err := messageCommandSourceInTx(ctx, tx, message.ID, "local_user_chat", r.payload(), r.IdempotencyKey, nil)
+	if err != nil {
+		return domain.Message{}, storeError("记录用户命令来源失败", err)
+	}
+	message.SourceID, message.SourceKind = sourceID, "local_user_chat"
+	if deferred {
+		if err := recordGroupBackgroundIntent(ctx, tx, message); err != nil {
+			return domain.Message{}, storeError("保存后台调度意图失败", err)
 		}
-		message.SourceID, message.SourceKind = sourceID, "local_user_chat"
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Message{}, storeError("保存用户消息失败", err)
@@ -75,13 +114,13 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 	if len(messages) == 0 {
 		return nil
 	}
-	var available, hasReviewNotices, hasWorkspaceNotices, hasTaskWork, hasWorkInputs, hasWorkReports bool
+	var available, hasReviewNotices, hasWorkspaceNotices, hasTaskWork, hasWorkInputs, hasWorkReports, hasGroupBackground bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=17),
 	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=18),
 	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=21),
 	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='task_work_deliveries'),
-	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),`+workInputSchemaExists, taskWorkReportVersion, taskWorkInputVersion).
-		Scan(&available, &hasReviewNotices, &hasWorkspaceNotices, &hasTaskWork, &hasWorkReports, &hasWorkInputs); err != nil {
+	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),`+workInputSchemaExists+","+groupBackgroundSchemaExists, taskWorkReportVersion, taskWorkInputVersion).
+		Scan(&available, &hasReviewNotices, &hasWorkspaceNotices, &hasTaskWork, &hasWorkReports, &hasWorkInputs, &hasGroupBackground); err != nil {
 		return err
 	}
 	if !available && !hasWorkspaceNotices {
@@ -126,14 +165,21 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 		returnSource = "CASE WHEN handback.input_id IS NOT NULL THEN 'work_input_return:'||handback.input_id END,"
 		returnJoin = " LEFT JOIN task_work_input_returns handback ON handback.notice_message_id=m.id AND handback.member_id=m.sender_id"
 	}
+	joinKind, joinSource, joinNotice := "", "", ""
+	if hasGroupBackground {
+		joinKind = "CASE WHEN j.member_id IS NOT NULL THEN 'platform' END,"
+		joinSource = "CASE WHEN j.member_id IS NOT NULL THEN 'group_background_join:'||j.member_id END,"
+		joinNotice = ` LEFT JOIN group_background_joins j ON j.notice_message_id=m.id AND j.group_id=m.group_id
+		 AND j.topic_id=m.topic_id AND m.sender_id='platformnotice'`
+	}
 	query := `SELECT m.id,
-	 coalesce(` + workKind + returnKind + reviewKind + workspaceKind + `s.kind,CASE WHEN d.request_id IS NOT NULL OR a.assignment_id IS NOT NULL OR n.id IS NOT NULL OR sn.submission_id IS NOT NULL THEN 'platform' WHEN t.id IS NOT NULL THEN 'member' ELSE 'unknown' END),
-	 coalesce(` + workSource + returnSource + reviewSource + workspaceSource + `s.id,CASE WHEN d.request_id IS NOT NULL THEN 'dispatch:'||d.request_id WHEN a.assignment_id IS NOT NULL THEN 'assignment:'||a.assignment_id WHEN n.id IS NOT NULL THEN 'assessment:'||n.id WHEN sn.submission_id IS NOT NULL THEN 'submission:'||sn.submission_id WHEN t.id IS NOT NULL THEN 'turn:'||t.id ELSE '' END)
+	 coalesce(` + workKind + returnKind + reviewKind + workspaceKind + joinKind + `s.kind,CASE WHEN d.request_id IS NOT NULL OR a.assignment_id IS NOT NULL OR n.id IS NOT NULL OR sn.submission_id IS NOT NULL THEN 'platform' WHEN t.id IS NOT NULL THEN 'member' ELSE 'unknown' END),
+	 coalesce(` + workSource + returnSource + reviewSource + workspaceSource + joinSource + `s.id,CASE WHEN d.request_id IS NOT NULL THEN 'dispatch:'||d.request_id WHEN a.assignment_id IS NOT NULL THEN 'assignment:'||a.assignment_id WHEN n.id IS NOT NULL THEN 'assessment:'||n.id WHEN sn.submission_id IS NOT NULL THEN 'submission:'||sn.submission_id WHEN t.id IS NOT NULL THEN 'turn:'||t.id ELSE '' END)
 	 FROM messages m LEFT JOIN message_command_sources s ON s.message_id=m.id
 	 LEFT JOIN coordination_dispatch_state d ON d.message_id=m.id
 	 LEFT JOIN coordination_assignment_dispatch a ON a.message_id=m.id
 	 LEFT JOIN chat_assessments n ON n.notice_message_id=m.id
-	 LEFT JOIN chat_submission_notices sn ON sn.message_id=m.id` + reviewJoin + workspaceJoin + workJoin + returnJoin + `
+	 LEFT JOIN chat_submission_notices sn ON sn.message_id=m.id` + reviewJoin + workspaceJoin + workJoin + returnJoin + joinNotice + `
 	 LEFT JOIN turns t ON t.reply_message_id=m.id AND t.reply_message_id<>''
 	 WHERE m.id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(messages)), ",") + ")"
 	rows, err := tx.QueryContext(ctx, query, args...)
