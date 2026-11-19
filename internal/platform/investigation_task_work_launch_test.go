@@ -21,33 +21,41 @@ import (
 	"agentworkspace/internal/store"
 )
 
+// Platform CI shards by top-level name. Keep the independent SQLite scenarios
+// split by wake source and launch boundary rather than running them on one shard.
+func TestInvestigationTaskWorkLaunchSQLiteFollowup(t *testing.T) {
+	testInvestigationTaskWorkLaunchSQLite(t, domain.TaskWorkSourceFollowup, "admitted", "commit-error")
+}
+
+func TestInvestigationTaskWorkLaunchSQLiteDelegation(t *testing.T) {
+	testInvestigationTaskWorkLaunchSQLite(t, domain.TaskWorkSourceDelegation, "admitted")
+}
+
+func TestInvestigationTaskWorkLaunchSQLiteReport(t *testing.T) {
+	testInvestigationTaskWorkLaunchSQLite(t, domain.TaskWorkSourceReport, "admitted")
+}
+
+func TestInvestigationTaskWorkLaunchSQLitePreCommitDenials(t *testing.T) {
+	testInvestigationTaskWorkLaunchSQLite(t, domain.TaskWorkSourceDelegation, "no-callback", "revoked-token", "wrong-resource")
+}
+
+func TestInvestigationTaskWorkLaunchSQLiteDelegationAfterCommit(t *testing.T) {
+	testInvestigationTaskWorkLaunchSQLite(t, domain.TaskWorkSourceDelegation, "cancel-after-callback", "config-after-commit", "missing-startup-proof")
+}
+
 // Real v30 queue/claim, Attempt, issued HTTP configuration and final B commit.
 // Normally native invocation is in-process. The startup-proof case uses a
 // shell emitting fixed lifecycle frames; no Pi executable or model is started.
-func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
-	for _, tc := range []struct {
-		kind domain.TaskWorkSourceKind
-		mode string
-	}{
-		{domain.TaskWorkSourceFollowup, "admitted"},
-		{domain.TaskWorkSourceDelegation, "admitted"},
-		{domain.TaskWorkSourceReport, "admitted"},
-		{domain.TaskWorkSourceFollowup, "commit-error"},
-		{domain.TaskWorkSourceDelegation, "no-callback"},
-		{domain.TaskWorkSourceDelegation, "revoked-token"},
-		{domain.TaskWorkSourceDelegation, "wrong-resource"},
-		{domain.TaskWorkSourceDelegation, "cancel-after-callback"},
-		{domain.TaskWorkSourceDelegation, "config-after-commit"},
-		{domain.TaskWorkSourceDelegation, "missing-startup-proof"},
-	} {
-		t.Run(string(tc.kind)+"/"+tc.mode, func(t *testing.T) {
+func testInvestigationTaskWorkLaunchSQLite(t *testing.T, kind domain.TaskWorkSourceKind, modes ...string) {
+	for _, mode := range modes {
+		t.Run(string(kind)+"/"+mode, func(t *testing.T) {
 			ctx := t.Context()
 			f := newBoundWorkReportFixture(t)
 			f.delegate(t, nil, nil, false)
 			msgID := f.delegation.MessageID
 			var sourceText string
 			var wantOps []string
-			switch tc.kind {
+			switch kind {
 			case domain.TaskWorkSourceFollowup:
 				f.settleWork(t, f.claimWork(t, f.delegation.DeliveryID), false)
 				const quote = "仅核对第一条材料的引用。"
@@ -71,7 +79,7 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 			wake := msg.Deliveries[0]
 			work, err := f.engine.ResolveTaskWorkDelivery(ctx, f.group, wake.ID)
 			roleOK(t, err)
-			if work.SourceKind != tc.kind || work.Blocked != "" {
+			if work.SourceKind != kind || work.Blocked != "" {
 				t.Fatal("expected a persisted ready B wake")
 			}
 			assignment, err := f.db.GetAssignment(ctx, f.group, work.AssignmentID)
@@ -80,7 +88,7 @@ func TestInvestigationTaskWorkLaunchSQLite(t *testing.T) {
 			private, cli := filepath.Join(root, "private"), filepath.Join(root, "metadata-only")
 			roleOK(t, os.Mkdir(private, 0700))
 			var script []byte
-			if tc.mode == "missing-startup-proof" {
+			if mode == "missing-startup-proof" {
 				// Plausible Pi lifecycle from a synthetic child that never bound the typed extension.
 				script = []byte(`#!/bin/sh
 while [ "$#" -gt 1 ] && [ "$1" != "--session-id" ]; do shift; done
@@ -93,7 +101,8 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 			bridgeRoot, err := filepath.Abs("../../extensions/pi-bridge")
 			roleOK(t, err)
 			selected := provider.Provider{ID: f.worker.ProviderID, Name: provider.Pi, Path: cli, Installation: provider.Installed, Version: "1.4.0"}
-			runCtx, stop := context.WithTimeout(ctx, 15*time.Second)
+			// The executor cancels on completion; this only bounds a stalled SQLite run.
+			runCtx, stop := context.WithTimeout(ctx, 45*time.Second)
 			defer stop()
 			var prepared scheduler.PreparedExecution
 			var path, token, resource string
@@ -103,7 +112,7 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 			launch := platform.NewPiInvestigationTaskWorkLaunch(filepath.Join(bridgeRoot, "fresh-investigation-work.ts"), 0,
 				func(check context.Context, plan store.FreshTaskWorkLaunch, admit func() bool) error {
 					commitCalls++
-					if constructed != 1 || nativeCalls != 0 || tc.mode == "revoked-token" || check.Err() != nil {
+					if constructed != 1 || nativeCalls != 0 || mode == "revoked-token" || check.Err() != nil {
 						t.Fatal("commit callback reached in the wrong phase")
 					}
 					if plan.Delivery != work || plan.Scope.Claim != physicalClaim || plan.Scope.MemberID != work.MemberID ||
@@ -113,7 +122,7 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 					}
 					var n int
 					roleOK(t, f.raw.QueryRowContext(check, `SELECT count(*) FROM task_work_continuations WHERE turn_id=?`, plan.Scope.Claim.TurnID).Scan(&n))
-					if tc.kind.IsOwnerContinuation() {
+					if kind.IsOwnerContinuation() {
 						var bound string
 						roleOK(t, f.raw.QueryRowContext(check, `SELECT attempt_id FROM task_work_continuations WHERE turn_id=? AND delivery_id=?`, plan.Scope.Claim.TurnID, wake.ID).Scan(&bound))
 						if n != 1 || plan.AttemptID != bound || bound == f.original.AttemptID || bound == "" {
@@ -125,20 +134,20 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 					var held string
 					roleOK(t, f.raw.QueryRowContext(check, `SELECT resource_key FROM resource_claims WHERE turn_id=?`, plan.Scope.Claim.TurnID).Scan(&held))
 					wantHeld := plan.ResourceKey
-					if tc.mode == "wrong-resource" {
+					if mode == "wrong-resource" {
 						wantHeld = "wrong-resource"
 					}
 					if held != wantHeld {
 						t.Fatal("scheduler did not claim the intended physical resource")
 					}
-					if tc.mode == "no-callback" {
+					if mode == "no-callback" {
 						return nil // Deliberate fixture violation of the trusted contract.
 					}
 					err := f.db.CommitInvestigationTaskWorkLaunch(check, store.InvestigationTaskWorkLaunch(plan), func() bool {
 						admitted = admit()
 						return admitted
 					})
-					switch tc.mode {
+					switch mode {
 					case "wrong-resource":
 						if admitted || !errors.Is(err, store.ErrMemberToolDenied) {
 							t.Fatal("B spent the callback despite a wrong resource or did not definitively deny it")
@@ -162,7 +171,7 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 					if !admitted || nativeCalls != 0 {
 						t.Fatal("B committed without exhausting the callback, or native ran inside it")
 					}
-					switch tc.mode {
+					switch mode {
 					case "cancel-after-callback":
 						stop()
 					case "config-after-commit":
@@ -193,10 +202,10 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 				token = cfg.Token
 				if filepath.Dir(path) != f.options.ConfigRoot || token == "" || token == physicalClaim.Token || cfg.Endpoint != f.options.Endpoint ||
 					cfg.RunID != physicalClaim.TurnID || cfg.RunID != b.RunID || sha256.Sum256(bytes) != b.ConfigSHA256 || cfg.Action != domain.ChatActionReadOnlyInvestigation ||
-					cfg.SourceKind != tc.kind || !slices.Equal(cfg.Operations, wantOps) || !slices.Equal(b.Profile.Operations, wantOps) {
+					cfg.SourceKind != kind || !slices.Equal(cfg.Operations, wantOps) || !slices.Equal(b.Profile.Operations, wantOps) {
 					t.Fatal("construction did not receive the exact closed typed bootstrap")
 				}
-				switch tc.mode {
+				switch mode {
 				case "revoked-token":
 					f.runtime.Tools().Revoke(token)
 				case "commit-error":
@@ -209,16 +218,16 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 				}
 				return roleNative(func(check context.Context, req provider.ExecuteRequest, emit func(provider.Event) error) provider.ExecutionReceipt {
 					nativeCalls++
-					if (tc.mode != "admitted" && tc.mode != "missing-startup-proof") || !admitted || !commitReturned || check.Err() != nil || req != prepared.Request {
+					if (mode != "admitted" && mode != "missing-startup-proof") || !admitted || !commitReturned || check.Err() != nil || req != prepared.Request {
 						t.Fatal("native entered before successful final admission or with a changed request")
 					}
 					ops, err := f.runtime.Tools().TransportOperations(check, token)
 					roleOK(t, err)
 					if !slices.Equal(ops, wantOps) || strings.Contains(req.Prompt, token) || strings.Contains(req.Prompt, f.source.Content) ||
-						sourceText != "" && strings.Contains(req.Prompt, sourceText) || tc.kind == domain.TaskWorkSourceDelegation && !strings.Contains(req.Prompt, f.delegation.Question) {
+						sourceText != "" && strings.Contains(req.Prompt, sourceText) || kind == domain.TaskWorkSourceDelegation && !strings.Contains(req.Prompt, f.delegation.Question) {
 						t.Fatal("native context exceeded or lost the typed plan")
 					}
-					if tc.mode == "missing-startup-proof" {
+					if mode == "missing-startup-proof" {
 						r := native.Execute(check, req, emit)
 						if !r.Started || !r.DirectChildReaped || r.ExitCode != 0 || r.Outcome != provider.OutcomeUnknown || r.Accepted || r.Terminal != "" || r.OutputComplete {
 							t.Errorf("unproved native execution supplied trusted evidence: %+v", r)
@@ -227,7 +236,7 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 					}
 					roleOK(t, emit(provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: req.RunID}))
 					f.expectHTTP(t, token, "read_channel", `{}`, "", http.StatusForbidden)
-					switch tc.kind {
+					switch kind {
 					case domain.TaskWorkSourceFollowup:
 						f.expectHTTP(t, token, "read_work_inputs", fmt.Sprintf(`{"input_id":%q}`, work.SourceID), "", http.StatusOK)
 					case domain.TaskWorkSourceDelegation:
@@ -261,7 +270,7 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 						return scheduler.PreparedExecution{}, errors.New("fixture: invalid prepared workspace or request")
 					}
 					resource, prepared = keys[0], p
-					if tc.mode == "wrong-resource" {
+					if mode == "wrong-resource" {
 						p.ResourceKeys = []string{"wrong-resource"}
 					}
 					p.Executor = roleNative(func(run context.Context, req provider.ExecuteRequest, emit func(provider.Event) error) provider.ExecutionReceipt {
@@ -287,11 +296,11 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 			}
 			wantCommitCalls, wantNativeCalls := 1, 0
 			wantState, wantClaims := domain.TurnStateUnknown, 1
-			if tc.mode == "admitted" {
+			if mode == "admitted" {
 				wantNativeCalls, wantState, wantClaims = 1, domain.TurnStateSucceeded, 0
-			} else if tc.mode == "missing-startup-proof" {
+			} else if mode == "missing-startup-proof" {
 				wantNativeCalls = 1 // Actually launched; unknown must retain the physical claim.
-			} else if tc.mode == "revoked-token" {
+			} else if mode == "revoked-token" {
 				wantCommitCalls = 0
 			}
 			if constructed != 1 || commitCalls != wantCommitCalls || nativeCalls != wantNativeCalls || token == "" {

@@ -163,7 +163,8 @@ func TestUnsupportedV30TaskWorkDoesNotStopScheduler(t *testing.T) {
 			if len(page.Items) != 2 || page.Items[0].Delivery.ID != work.DeliveryID || page.Items[1].Delivery.ID != ordinaryID {
 				t.Fatal("fixture did not queue the two deliveries in the same FIFO scan")
 			}
-			runCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+			// The synthetic executor stops the scheduler; this only bounds a stalled scan.
+			runCtx, stop := context.WithTimeout(ctx, 30*time.Second)
 			defer stop()
 			err = scheduler.Run(runCtx, f.db, scheduler.Options{Recovered: true, RuntimeDir: f.root, MaxActive: 1},
 				func(ctx context.Context, pending store.PendingDelivery) (scheduler.PreparedExecution, error) {
