@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { prepareDecisionAnswer } from "./decision-api";
+import type { PendingDecision } from "./decision-api";
+import { journalDecisionAttempt, loadDecisionJournal } from "./decision-journal";
 import { PendingReviews } from "./PendingReviews";
 import { deferred, json, page } from "./test/groups";
 
@@ -15,7 +18,7 @@ const taskQuestion = (source: string, version: number, topic_id: string) => ({
   facts: "工作日样本已核对。", question: "是否纳入周末样本？", recommendation: "先交工作日结果。",
   choices: ["仅工作日", "纳入周末"], authorization: { scope: "只读取现有周末样本。", impact: "需额外核对两批数据。" },
   created_at: timestamp, updated_at: timestamp,
-});
+} satisfies PendingDecision);
 const receiptFor = (item: ReturnType<typeof taskQuestion>, text: string, option_index?: number) => ({
   id: `answer-${item.id}`, request_id: item.id, group_id: item.group_id, topic_id: item.topic_id, version: item.version,
   actor_id: "user", task_id: item.task.task_id, task_revision: item.task.task_revision, text, option_index,
@@ -585,14 +588,23 @@ it("gives all 33 unresolved attempts a turn without expanding the eager pass", a
   setVisibility("hidden");
   const tick = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
   const items = Array.from({ length: 33 }, (_, i) => taskQuestion(`poll-overflow-${i}`, 1, ""));
+  const journaled = items.slice(0, -1), overflow = items.at(-1)!;
+  // Restore the first 32 attempts from the journal; only the overflow needs a form.
+  for (const item of journaled) {
+    const { attempt } = await prepareDecisionAnswer(item, { option_index: 2 }, randomUUID());
+    expect(journalDecisionAttempt(attempt)).not.toBeNull();
+  }
   const paths = items.map(statusPath);
-  const reads: string[] = [];
+  const reads: string[] = [], posts: [string, RequestInit][] = [];
   let inFlight = 0, peak = 0;
   vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     const path = String(input);
-    if (path === `${pendingPath}?limit=50`) return page(items);
-    if (init?.method === "POST") return json({}, 502);
-    if (init?.method !== "GET" || !paths.includes(path)) return absent();
+    if (init?.method === "POST") {
+      posts.push([path, init]);
+      return json({}, 502);
+    }
+    if (path === `${pendingPath}?limit=50`) return page([overflow]);
+    if ((init?.method ?? "GET") !== "GET" || !path.split("?")[0].endsWith("/answer")) return absent();
     reads.push(path);
     peak = Math.max(peak, ++inFlight);
     await new Promise<void>(resolve => setTimeout(resolve, 100));
@@ -601,21 +613,18 @@ it("gives all 33 unresolved attempts a turn without expanding the eager pass", a
   });
   render(<PendingDecisions active />);
   await tick(0);
-  const cards = screen.getAllByRole("article");
-  function submit(card: HTMLElement) {
-    const form = within(card);
-    fireEvent.click(form.getByRole("radio", { name: "纳入周末" }));
-    fireEvent.click(form.getByRole("button", { name: "提交答复" }));
-  }
-  for (const card of cards.slice(0, -1)) submit(card);
-  await tick(0);
+  await tick(180000);
   expect(reads).toHaveLength(0);
+  expect(posts).toHaveLength(0);
 
   // The last write is memory-only and wakes checks without a visibility event.
   setVisibility("visible");
-  submit(cards.at(-1)!);
+  const card = formFor(fallback);
+  fireEvent.click(card.getByRole("radio", { name: "纳入周末" }));
+  fireEvent.click(card.getByRole("button", { name: "提交答复" }));
   await tick(1000);
   expect(screen.getAllByRole("alert")).toHaveLength(33);
+  expect(loadDecisionJournal()?.map(entry => entry.ref.request_id)).toEqual(journaled.map(item => item.id));
   expect(reads).toHaveLength(4);
   expect(reads[0]).toBe(paths.at(-1));
   await tick(180000);
@@ -639,6 +648,13 @@ it("gives all 33 unresolved attempts a turn without expanding the eager pass", a
   await tick(2000);
   expect(new Set(reads.slice(restarted))).toEqual(new Set(paths));
   expect(peak).toBe(4);
+  expect(posts).toHaveLength(1);
+  const [[path, init]] = posts;
+  expect(path).toBe(answerPath(overflow));
+  expect(JSON.parse(String(init.body))).toEqual({
+    group_id: overflow.group_id, topic_id: overflow.topic_id, version: overflow.version, option_index: 2,
+  });
+  expect(new Headers(init.headers).get("Idempotency-Key")).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 });
 
 it("keeps a migration-absent decision inbox optional alongside the real review inbox", async () => {
