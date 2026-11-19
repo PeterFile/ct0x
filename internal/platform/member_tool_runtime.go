@@ -295,11 +295,16 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	}
 	// Once invoked, only the adapter owns execution classification and evidence.
 	raw := native.Execute(ctx, nativeRequest, onEvent)
-	if session == nil {
+	decision := e.intakeSchema.threadDecision
+	if session == nil && decision == nil {
 		return raw
 	}
-	r.tools.Revoke(token)
+	r.tools.Revoke(token) // Drain authorized writes before reading their outcome.
 	token = ""
+	if decision != nil && decision.uncertain.Load() {
+		raw.Outcome = provider.OutcomeUnknown
+		raw.Reason = ErrThreadDecisionRequestUnknown.Error()
+	}
 	return session.receipt(ctx, e, claim, raw)
 }
 

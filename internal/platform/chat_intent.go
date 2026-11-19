@@ -46,9 +46,10 @@ func (s *MemberTools) ChatCandidate(ctx context.Context, token string) (*domain.
 }
 
 type memberToolIntakeSchema struct {
-	piDiscussionExcerpt bool // The paired Pi bridge can advertise this optional field.
-	investigation       bool // The exact opted-in Pi, fresh root only.
-	investigationBlobs  bool // The runtime owns a separate artifact reader.
+	piDiscussionExcerpt bool                       // The paired Pi bridge can advertise this optional field.
+	investigation       bool                       // The exact opted-in Pi, fresh root only.
+	investigationBlobs  bool                       // The runtime owns a separate artifact reader.
+	threadDecision      *threadDecisionIntakeGrant // Fresh, verified Codex intake only.
 }
 
 func (schema memberToolIntakeSchema) offersInvestigation(policy domain.ChatPolicy) bool {

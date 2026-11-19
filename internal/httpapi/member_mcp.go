@@ -113,8 +113,8 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		tools := make([]memberMCPTool, 0, len(profile.Operations))
 		for _, tool := range catalog {
 			if slices.Contains(profile.Operations, tool.Name) {
-				if tool.Name == "send_message" && (profile.ContinueWork || profile.DiscussionOnlyExcerpt || profile.InvestigationIntake) {
-					tool.InputSchema = memberMCPSendMessageSchema(profile.ContinueWork, profile.DiscussionOnlyExcerpt, profile.InvestigationIntake)
+				if tool.Name == "send_message" && (profile.ContinueWork || profile.DiscussionOnlyExcerpt || profile.InvestigationIntake || profile.ThreadDecision) {
+					tool.InputSchema = memberMCPSendMessageSchema(profile.ContinueWork, profile.DiscussionOnlyExcerpt, profile.InvestigationIntake, profile.ThreadDecision)
 				}
 				if tool.Name == "submit_result" && profile.InvestigationRole {
 					tool.Description = "提交当前调查的纯文本结论，不附成果版本；提交不代表接纳。未知结果先对账。"
@@ -144,12 +144,12 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			memberMCPError(w, 400, id, -32602, "工具名称和 arguments 对象无效")
 			return
 		}
-		continuation, excerpt := false, false
+		continuation, excerpt, decision := false, false, false
 		if name == "send_message" {
-			continuation, excerpt = memberToolSendAssessmentFields(arguments)
+			continuation, excerpt, decision = memberToolSendAssessmentFields(arguments)
 		}
 		reportWrite := reportTools && name == platform.ReportWorkOperation
-		if name == "ack_work_input" || name == "hand_back_work_input" || continuation || excerpt || reportWrite {
+		if name == "ack_work_input" || name == "hand_back_work_input" || continuation || excerpt || decision || reportWrite {
 			// Neither the derived key nor the fingerprint may alias replacement
 			// characters. Keep legacy send_message and opaque metadata unchanged.
 			if !validMemberToolJSONStrings(frame["id"]) {
@@ -180,7 +180,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				continue
 			}
 			fingerprintArgs := arguments
-			if continuation {
+			if continuation && !decision {
 				fingerprintArgs = memberMCPContinueWorkArguments(arguments)
 			}
 			key := memberMCPKey(token, id)

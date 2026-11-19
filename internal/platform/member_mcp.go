@@ -14,6 +14,7 @@ type MemberToolTransportProfile struct {
 	DiscussionOnlyExcerpt bool
 	InvestigationIntake   bool
 	InvestigationRole     bool
+	ThreadDecision        bool
 }
 
 func (s *MemberTools) TransportOperations(ctx context.Context, token string) ([]string, error) {
@@ -75,5 +76,5 @@ func (s *MemberTools) TransportProfile(ctx context.Context, token string) (Membe
 // check; native text binding and MCP discovery must use the same projection.
 func (s *MemberTools) textTransportProfile(entry memberToolRegistration) MemberToolTransportProfile {
 	return MemberToolTransportProfile{Operations: slices.Clone(entry.grants.Operations), ContinueWork: s.advertisesContinueWork(entry),
-		DiscussionOnlyExcerpt: s.isChatIntake(entry), InvestigationIntake: entry.investigationIntake()}
+		DiscussionOnlyExcerpt: s.isChatIntake(entry), InvestigationIntake: entry.investigationIntake(), ThreadDecision: s.offersThreadDecision(entry)}
 }

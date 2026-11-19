@@ -230,6 +230,10 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 			memberToolError(w, store.ErrInvalid)
 			return
 		}
+		if hasDecisionContext(input.Assessment.value) {
+			a.assessMemberThreadDecision(w, r, token, input.Assessment.value, input.Content.value, key)
+			return
+		}
 		receipt, ok := a.assessMemberChatIntent(w, r, token, input.Assessment.value, input.Content, key)
 		if !ok {
 			return
