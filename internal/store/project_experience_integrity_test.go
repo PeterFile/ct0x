@@ -32,13 +32,16 @@ func assertExperienceIntegrityFailure(t *testing.T, s *Store, groupID string) {
 }
 
 func TestProjectExperienceRetirementWitnessSurvivesDetailLoss(t *testing.T) {
+	if !projectExperienceInstalledOrCheckLegacy(t) {
+		return
+	}
 	for _, fault := range []struct{ name, guard, statement string }{
 		{"retirement removed", "project_experience_retirements_no_delete", `DELETE FROM project_experience_retirements WHERE experience_id=?`},
 		{"witness removed", "project_experience_retirement_witnesses_no_delete", `DELETE FROM project_experience_retirement_witnesses WHERE experience_id=?`},
 		{"retirement changed", "project_experience_retirements_no_update", `UPDATE project_experience_retirements SET replacement_version='mismatched' WHERE experience_id=?`},
 	} {
 		t.Run(fault.name, func(t *testing.T) {
-			s := projectExperienceStore(t)
+			s, _ := openTestStore(t)
 			g := group(t, s)
 			m := experienceStoreMessage(t, s, g.ID, "bug", "original decision")
 			choice := experienceStoreChoice(m, m.ID)
@@ -95,7 +98,10 @@ func TestProjectExperienceRetirementWitnessSurvivesDetailLoss(t *testing.T) {
 }
 
 func TestProjectExperienceRejectsChangedDOwnership(t *testing.T) {
-	s := projectExperienceStore(t)
+	if !projectExperienceInstalledOrCheckLegacy(t) {
+		return
+	}
+	s, _ := openTestStore(t)
 	g, other := group(t, s), group(t, s)
 	m := experienceStoreMessage(t, s, g.ID, "bug", "original decision")
 	choice := experienceStoreChoice(m, m.ID)
@@ -128,6 +134,9 @@ func TestProjectExperienceRejectsChangedDOwnership(t *testing.T) {
 }
 
 func TestProjectExperienceChecksIndependentSourceScopes(t *testing.T) {
+	if !projectExperienceInstalledOrCheckLegacy(t) {
+		return
+	}
 	const selectionGuard = "project_experiences_no_update"
 	const retirementGuard = "project_experience_retirements_no_update"
 	const witnessGuard = "project_experience_retirement_witnesses_no_update"
@@ -143,7 +152,7 @@ func TestProjectExperienceChecksIndependentSourceScopes(t *testing.T) {
 		 SET receipt=json_set(receipt,'$[1]',?2) WHERE experience_id=?1`, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := projectExperienceStore(t)
+			s, _ := openTestStore(t)
 			g, other, unrelated := group(t, s), group(t, s), group(t, s)
 			m := experienceStoreMessage(t, s, g.ID, "bug", "original decision")
 			foreign := experienceStoreMessage(t, s, other.ID, "bug", "foreign decision")
@@ -184,7 +193,10 @@ func TestProjectExperienceChecksIndependentSourceScopes(t *testing.T) {
 }
 
 func TestProjectExperienceRejectsOrphanRetirementEvidence(t *testing.T) {
-	s := projectExperienceStore(t)
+	if !projectExperienceInstalledOrCheckLegacy(t) {
+		return
+	}
+	s, _ := openTestStore(t)
 	g := group(t, s)
 	m := experienceStoreMessage(t, s, g.ID, "bug", "original decision")
 	choice := experienceStoreChoice(m, m.ID)
@@ -214,7 +226,10 @@ func TestProjectExperienceRejectsOrphanRetirementEvidence(t *testing.T) {
 }
 
 func TestProjectExperienceRequiresDGroupGuards(t *testing.T) {
-	s := projectExperienceStore(t)
+	if !projectExperienceInstalledOrCheckLegacy(t) {
+		return
+	}
+	s, _ := openTestStore(t)
 	g := group(t, s)
 	m := experienceStoreMessage(t, s, g.ID, "bug", "original decision")
 	choice := experienceStoreChoice(m, m.ID)

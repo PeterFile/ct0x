@@ -8,13 +8,40 @@ import (
 	"agentworkspace/internal/domain"
 )
 
-func projectExperienceStore(t *testing.T) *Store {
+// Installed-only fixtures cannot inject E3 damage on legacy schemas. In that
+// matrix each test exercises the real compatibility boundary instead.
+func projectExperienceInstalledOrCheckLegacy(t *testing.T) bool {
 	t.Helper()
-	if !slices.Contains(migrations, projectExperienceSchema) {
-		t.Skip("E3 test requires the release registry or the private D+E3 overlay")
+	if slices.Contains(migrations, projectExperienceSchema) {
+		return true
 	}
-	s, _ := openTestStore(t)
-	return s
+	t.Run("unregistered_schema", func(t *testing.T) {
+		s, _ := openTestStore(t)
+		g := group(t, s)
+		m := experienceStoreMessage(t, s, g.ID, "bug", "original CSV decision")
+		key := "unregistered-experience"
+		if got, err := s.SelectProjectExperience(ctx, g.ID, experienceStoreChoice(m, m.ID), key); got.ID != "" || !errors.Is(err, ErrProjectExperienceUnavailable) {
+			t.Fatalf("unregistered selection returned %+v, %v", got, err)
+		}
+		if got, err := s.RetireProjectExperience(ctx, g.ID, "absent-experience", RetireProjectExperienceInput{MessageID: m.ID}, key); got.ExperienceID != "" || !errors.Is(err, ErrProjectExperienceUnavailable) {
+			t.Fatalf("unregistered retirement returned %+v, %v", got, err)
+		}
+		q := ProjectExperienceQuery{Query: m.Content}
+		if page, err := s.SearchProjectExperiences(ctx, g.ID, q); err != nil || page.Items == nil || len(page.Items) != 0 || page.NextCursor != "" {
+			t.Fatalf("unregistered search was not an empty page: %+v, %v", page, err)
+		}
+		if _, err := s.SearchProjectExperiences(ctx, "absent-group", q); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("unregistered search bypassed Group validation: %v", err)
+		}
+		if got, err := s.GetMessage(ctx, g.ID, m.ID); err != nil || got.Content != m.Content || got.TopicID != m.TopicID || got.SourceID != m.SourceID {
+			t.Fatalf("unregistered experience changed source reads: %+v, %v", got, err)
+		}
+		var reserved bool
+		if err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM mutation_idempotency WHERE group_id=? AND idempotency_key=?)`, g.ID, key).Scan(&reserved); err != nil || reserved {
+			t.Fatalf("unavailable writes left a receipt: %v, %v", reserved, err)
+		}
+	})
+	return false
 }
 
 func experienceStoreMessage(t *testing.T, s *Store, groupID, topic, content string) domain.Message {
@@ -32,7 +59,10 @@ func experienceStoreChoice(m domain.Message, confirmation string) SelectProjectE
 }
 
 func TestProjectExperienceEvidenceRequiresExplicitCommandAndVerifiedSources(t *testing.T) {
-	s := projectExperienceStore(t)
+	if !projectExperienceInstalledOrCheckLegacy(t) {
+		return
+	}
+	s, _ := openTestStore(t)
 	g, foreign := group(t, s), group(t, s)
 	const topic = "bug"
 	earlier := experienceStoreMessage(t, s, g.ID, topic, "maybe approved")
@@ -126,7 +156,10 @@ func TestProjectExperienceEvidenceRequiresExplicitCommandAndVerifiedSources(t *t
 }
 
 func TestProjectExperienceSameProjectChannelIsolationAndDamagedInstall(t *testing.T) {
-	s := projectExperienceStore(t)
+	if !projectExperienceInstalledOrCheckLegacy(t) {
+		return
+	}
+	s, _ := openTestStore(t)
 	g := group(t, s)
 	const sibling = "other-group-under-the-same-project"
 	// Use D's explicit Group/Channel transaction to exercise a same-Project

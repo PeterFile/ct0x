@@ -18,7 +18,8 @@ func TestMemberProjectExperienceLookupRequiresCurrentEvidenceAuthority(t *testin
 	var installed bool
 	artifactsMust(t, f.raw.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='project_experiences' AND type='table')`).Scan(&installed))
 	if !installed {
-		t.Skip("E3 member lookup requires the D+E3 migrations")
+		t.Run("unregistered_schema", func(t *testing.T) { assertUnregisteredMemberExperience(t, f) })
+		return
 	}
 	ctx := context.Background()
 	local := NewLocalUser(f.db)
@@ -159,4 +160,47 @@ func TestMemberProjectExperienceLookupRequiresCurrentEvidenceAuthority(t *testin
 	checkDenied(token)
 	checkDenied(token) // Already cancelled.
 	t.Log("exact tuple and full blob read verified once per lookup; absent/corrupt original or replacement pins suppress the page; revocation and cancellation fences preserved")
+}
+
+func assertUnregisteredMemberExperience(t *testing.T, f *artifactsFixture) {
+	t.Helper()
+	ctx := context.Background()
+	local := NewLocalUser(f.db)
+	message, err := local.CreateMessage(ctx, f.groupID, MessageInput{
+		TopicID: "bound-topic", Content: "export incident", RecipientIDs: []string{},
+	}, "")
+	artifactsMust(t, err)
+	v := f.publish(t, PublishArtifactInput{Name: "report"}, "exact artifact bytes", "")
+	claim := memberCapabilityClaim(t, memberArtifactLocal(f), f.groupID)
+	tools := NewMemberTools(f.db)
+	token, err := tools.Issue(ctx, claim, MemberToolGrants{Operations: []string{"read_history"}})
+	artifactsMust(t, err)
+	q := ProjectExperienceQuery{Query: message.Content}
+	assertEmpty := func(token string) {
+		t.Helper()
+		if page, err := tools.LookupProjectExperiences(ctx, token, q); err != nil || page.Items == nil || len(page.Items) != 0 || page.NextCursor != "" {
+			t.Fatalf("unregistered member lookup was not an empty scoped page: %+v, %v", page, err)
+		}
+	}
+	assertEmpty(token)
+	if read, err := tools.ReadHistory(ctx, token, MemberHistoryReadInput{MessageID: message.ID}); err != nil || read.Content != message.Content {
+		t.Fatalf("lookup changed the bound history read: %+v, %v", read, err)
+	}
+	input := MemberArtifactReadInput{ArtifactID: v.ArtifactID, VersionID: v.ID}
+	_, err = tools.ReadArtifact(ctx, token, input)
+	requireCapabilityDenied(t, err)
+	tools.Revoke(token)
+	if page, err := tools.LookupProjectExperiences(ctx, token, q); !errors.Is(err, store.ErrMemberToolDenied) || len(page.Items) != 0 {
+		t.Fatalf("missing schema bypassed capability revocation: %+v, %v", page, err)
+	}
+
+	grant, err := NewMemberArtifactGrant(f.service)
+	artifactsMust(t, err)
+	token, err = tools.Issue(ctx, claim, MemberToolGrants{Operations: []string{"read_history", "read_artifact"}, Artifacts: grant})
+	artifactsMust(t, err)
+	defer tools.Revoke(token)
+	assertEmpty(token)
+	if read, err := tools.ReadArtifact(ctx, token, input); err != nil || read.VersionID != v.ID || read.Content != "exact artifact bytes" {
+		t.Fatalf("lookup changed an existing exact artifact grant: %+v, %v", read, err)
+	}
 }

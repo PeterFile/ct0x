@@ -20,9 +20,7 @@ import (
 
 func TestRunProjectExperienceAcceptedAndRetired(t *testing.T) {
 	f := newArtifactCmdFixture(t)
-	if !experienceSchemaInstalled(t, f.dir) {
-		t.Skip("E3 acceptance requires the D+E3 migrations")
-	}
+	installed := experienceSchemaInstalled(t, f.dir)
 	args := []string{"--listen", "127.0.0.1:0", "--data-dir", f.dir}
 	base, stop := startRunWithSearch(t, provider.Search{}, args...)
 	h := projectExperienceHTTP{base: base, client: experienceHTTPClient(t)}
@@ -33,7 +31,10 @@ func TestRunProjectExperienceAcceptedAndRetired(t *testing.T) {
 	original := experienceHTTPMessage(t, h, groupPath, topic, "切回旧导出器")
 	oldChoice := experienceHTTPSelection(original, "v2.8")
 	var old domain.ProjectExperience
-	oldReceipt := h.request(t, "POST", entry, oldChoice, "old", 201, &old)
+	var oldReceipt []byte
+	if installed {
+		oldReceipt = h.request(t, "POST", entry, oldChoice, "old", 201, &old)
+	}
 
 	fixMessage := experienceHTTPMessage(t, h, groupPath, topic, "导出 BUG 已提交 v2.9 修复，等待正式接纳")
 	fix := experienceHTTPSelection(fixMessage, "v2.9")
@@ -50,19 +51,46 @@ func TestRunProjectExperienceAcceptedAndRetired(t *testing.T) {
 		return submission
 	}
 	rejected := submit(1)
-	pin.SubmissionID, pin.ReviewID = rejected.ID, "no-such-review"
-	h.request(t, "POST", entry, fix, "fix", 404, nil)
+	if installed {
+		pin.SubmissionID, pin.ReviewID = rejected.ID, "no-such-review"
+		h.request(t, "POST", entry, fix, "fix", 404, nil)
+	}
 	var reject domain.ReviewDecision
 	h.request(t, "POST", taskPath+"/reviews", platform.TaskReviewInput{ExpectedRevision: 1, SubmissionID: rejected.ID,
 		Outcome: domain.ReviewOutcomeRejected, Reason: "需要补齐测试"}, "", 201, &reject)
-	pin.ReviewID = reject.ID
-	h.request(t, "POST", entry, fix, "fix", 404, nil)
+	if installed {
+		pin.ReviewID = reject.ID
+		h.request(t, "POST", entry, fix, "fix", 404, nil)
+	}
 
 	submission := submit(2)
 	var review domain.ReviewDecision
 	h.request(t, "POST", taskPath+"/reviews", platform.TaskReviewInput{ExpectedRevision: 2, SubmissionID: submission.ID,
 		Outcome: domain.ReviewOutcomeAccepted, Reason: "核对了固定的兼容修复成果"}, "", 201, &review)
 	pin.SubmissionID, pin.ReviewID = submission.ID, review.ID
+	if !installed {
+		t.Run("unregistered_schema", func(t *testing.T) {
+			var failure struct {
+				Error struct{ Code string }
+			}
+			h.request(t, "POST", entry, fix, "fix", 503, &failure)
+			if failure.Error.Code != "experience_unavailable" {
+				t.Fatalf("unregistered acceptance returned %q", failure.Error.Code)
+			}
+			var page platform.ProjectExperiencePage
+			h.request(t, "GET", entry+"?q="+url.QueryEscape("CSV-218"), nil, "", 200, &page)
+			if page.Items == nil || len(page.Items) != 0 || page.NextCursor != "" {
+				t.Fatalf("unregistered acceptance generated experience: %+v", page)
+			}
+			var got domain.ReviewDecision
+			h.request(t, "GET", taskPath+"/reviews/"+review.ID, nil, "", 200, &got)
+			data := h.request(t, "GET", artifactVersionURL(f.head)+"/content", nil, "", 200, nil)
+			if !reflect.DeepEqual(got, review) || string(data) != f.data[f.head.ID] {
+				t.Fatal("unavailable experience changed the accepted Review or exact version bytes")
+			}
+		})
+		return
+	}
 	otherPath := "/api/v1/groups/" + f.other.ID
 	foreign := experienceHTTPSelection(experienceHTTPMessage(t, h, otherPath, topic, fixMessage.Content), "v2.9")
 	foreign.ConfirmationMessageID, foreign.AcceptedOutcome = "", &pin
