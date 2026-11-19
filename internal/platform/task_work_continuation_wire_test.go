@@ -29,7 +29,7 @@ func TestFreshTaskWorkB29NativeWireConfirmedInput(t *testing.T) {
 	testFreshTaskWorkB29NativeWire(t, "confirmed")
 }
 
-func TestFreshTaskWorkB29NativeWireContextAfterHandback(t *testing.T) {
+func TestFreshTaskWorkB29NativeWireContextForReturnedInput(t *testing.T) {
 	testFreshTaskWorkB29NativeWire(t, "context-after-handback")
 }
 
@@ -49,7 +49,7 @@ func TestFreshTaskWorkB29NativeWireLaunchGateRejectsPreAdmissionPolicyChanges(t 
 	testFreshTaskWorkB29NativeWire(t, "late-policy", "policy-before-gate")
 }
 
-func TestFreshTaskWorkB29NativeWireLaunchGateFailedCommit(t *testing.T) {
+func TestFreshTaskWorkB29NativeWireRejectsFailedLaunchCommit(t *testing.T) {
 	testFreshTaskWorkB29NativeWire(t, "failed-launch-commit")
 }
 
