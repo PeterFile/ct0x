@@ -11,6 +11,38 @@ import (
 	"agentworkspace/internal/store"
 )
 
+// This is frozen when a separate fresh Pi launch registration is issued. The
+// approved tuple is independent of the one supplied later to the binder.
+type memberProjectExperienceAuthority struct {
+	eligible         bool
+	approvedArtifact domain.ArtifactVersionRef
+}
+
+// IssueFreshPiProjectExperience is for trusted fresh Pi launch composition only.
+// An artifact operation requires a separately approved exact version and the
+// existing blob grant. The caller must supply that approval independently of
+// any requested pin, lookup result, group membership or current-version pointer.
+// An empty approval issues lookup-only authority; ordinary startup uses this path.
+func (s *MemberTools) IssueFreshPiProjectExperience(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, approvedArtifact domain.ArtifactVersionRef) (string, error) {
+	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{}, memberProjectExperienceAuthority{eligible: true, approvedArtifact: approvedArtifact})
+}
+
+func (a memberProjectExperienceAuthority) permits(operations []string) bool {
+	if _, err := provider.PiProjectExperienceToolNames(operations); err != nil {
+		return false
+	}
+	if !slices.Contains(operations, provider.ReadArtifactTool) {
+		return a.approvedArtifact == (domain.ArtifactVersionRef{})
+	}
+	return validProjectExperiencePinID(a.approvedArtifact.ArtifactID) && validProjectExperiencePinID(a.approvedArtifact.VersionID)
+}
+
+func (s *MemberTools) projectExperiencePrelaunch(ctx context.Context, scope store.MemberToolScope) bool {
+	turn, err := s.db.GetTurn(ctx, scope.Claim.GroupID, scope.Claim.TurnID)
+	return err == nil && turn.ClaimToken == scope.Claim.Token && turn.MemberID == scope.MemberID &&
+		turn.ConversationID == scope.ConversationID && memberToolTurnPrelaunch(turn)
+}
+
 // The native projection narrows one existing bearer; it issues no operation
 // or blob grant. A zero artifact pin denotes lookup only. It is immutable
 // once attached and goes away with the existing registration.
@@ -20,43 +52,38 @@ type memberProjectExperienceTransport struct {
 }
 
 // BindPiProjectExperience consumes already issued authority for a fresh ordinary
-// turn. The exact pin must come from trusted composition, never from lookup,
-// group membership, a current-version pointer, or model arguments. Ordinary
-// startup has no source of such approval and always supplies a zero pin.
+// Pi turn. The supplied pin must match the issuance exactly, even for the first
+// bind. Ordinary startup has no artifact approval and always supplies a zero pin.
 func (s *MemberTools) BindPiProjectExperience(ctx context.Context, token string, claim store.TurnClaim, pin domain.ArtifactVersionRef) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := sha256.Sum256([]byte(token))
 	entry, found := s.capabilities[key]
-	if !found || entry.scope.Claim != claim || entry.projectExperience.bound || entry.role != (store.CoordinationToolScope{}) ||
-		(entry.purpose != "generic" && entry.purpose != domain.ChatIntakePurpose) || !slices.Contains(entry.grants.Operations, "read_history") {
+	authority := entry.projectExperienceAuthority
+	if !found || !authority.eligible || entry.scope.Claim != claim || entry.projectExperience.bound ||
+		entry.role != (store.CoordinationToolScope{}) || (entry.purpose != "generic" && entry.purpose != domain.ChatIntakePurpose) ||
+		pin != authority.approvedArtifact {
 		return store.ErrMemberToolDenied
 	}
-	if _, err := provider.PiProjectExperienceToolNames(entry.grants.Operations); err != nil {
-		return store.ErrMemberToolDenied
-	}
-	hasArtifact := slices.Contains(entry.grants.Operations, provider.ReadArtifactTool)
-	if hasArtifact != (pin != (domain.ArtifactVersionRef{})) {
-		return store.ErrMemberToolDenied
-	}
-	if hasArtifact {
-		grant := entry.grants.Artifacts
-		if grant == nil || grant.db != s.db || grant.open == nil || !validProjectExperiencePinID(pin.ArtifactID) || !validProjectExperiencePinID(pin.VersionID) {
-			return store.ErrMemberToolDenied
-		}
-		// Check that the exact tuple exists under this real claim in its group.
+	approved := authority.approvedArtifact
+	if approved != (domain.ArtifactVersionRef{}) {
+		// Check existence only after checking the independent approval. The
+		// issuance already verified the operation and the same-Store blob grant.
 		// This is not an I/O/read receipt; ReadArtifact will recheck the scope,
 		// tuple and actual blob independently on every call.
-		if _, _, err := s.db.ReadArtifactForTool(ctx, entry.scope, pin.ArtifactID, pin.VersionID); err != nil {
+		if _, _, err := s.db.ReadArtifactForTool(ctx, entry.scope, approved.ArtifactID, approved.VersionID); err != nil {
 			return store.ErrMemberToolDenied
 		}
 	} else if err := s.db.ValidateMemberTool(ctx, entry.scope); err != nil {
 		return err
 	}
+	if !s.projectExperiencePrelaunch(ctx, entry.scope) {
+		return store.ErrMemberToolDenied
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	entry.projectExperience = memberProjectExperienceTransport{bound: true, pin: pin}
+	entry.projectExperience = memberProjectExperienceTransport{bound: true, pin: approved}
 	s.capabilities[key] = entry
 	return nil
 }

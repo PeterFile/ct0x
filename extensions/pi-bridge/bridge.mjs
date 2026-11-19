@@ -125,7 +125,8 @@ export function openBridge(path, expectedSHA256) {
     /** @type {string[] | undefined} */
     let projectExperienceTools;
     if (projectExperience) {
-      if (expectedSHA256 === undefined || strict || !validProjectExperienceTools(config.project_experience_tools)) throw new Error(CONFIG_ERROR);
+      if (expectedSHA256 === undefined || strict || continueWork || investigationIntake ||
+          !validProjectExperienceTools(config.project_experience_tools)) throw new Error(CONFIG_ERROR);
       projectExperienceTools = [...config.project_experience_tools];
     }
     const endpoint = endpointURL(config.endpoint);

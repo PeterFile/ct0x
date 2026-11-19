@@ -13,10 +13,10 @@
 
 ## 发行与已知阻塞
 
-现有运行时先用持久 Turn claim 发证，再绑定本轮传输。私有配置中的 `project_experience_tools` 是**已有**发证的有序投影，不是授权。Go 和 Pi 均校验同一份 0600 配置的 SHA-256；Pi 的原生 `--tools` 与扩展注册使用同一精确名单。不修改历史原文或经验 Store，不增加授权表或迁移。
+现有运行时先用持久 Turn claim 发证，再绑定本轮传输。私有配置中的 `project_experience_tools` 是**已有**发证的有序投影，不是授权。Go 和 Pi 均校验同一份 0600 配置的 SHA-256，并拒绝同时出现 `continue_work`、`intake_assessment_action` 或 `investigation_tools` 的经验配置；保留 `discussion_only_excerpt`。Pi 的原生 `--tools` 与扩展注册使用同一精确名单。不修改历史原文或经验 Store，不增加授权表或迁移。
 
-可信进程内 `MemberTools.BindPiProjectExperience` 只能收窄已发行的普通轮次 bearer。非空成果 pin 同时要求 `read_history`、已有的 `read_artifact` 操作和同一 Store 的真实 `MemberArtifactGrant`，并在活跃 claim 的群组中核对该确切 tuple。绑定后不可改选版本。调用依然经过现有 `ReadArtifact` 的版本、blob 哈希和授权围栏；撤销 bearer 或持久 claim 失效后拒绝后续读取。pin 不改变 E3 对经验元数据的原有可见性规则，命中、评审记录、群组成员资格和用户下载均不授予字节读取权限。
+只有在签发时标为全新 Pi 经验轮、且 claim 仍未启动的 bearer 才可调用可信进程内 `MemberTools.BindPiProjectExperience` 完成绑定。若启用成果读取，`MemberTools.IssueFreshPiProjectExperience` 在签发时冻结独立批准的 `ArtifactVersionRef`，并要求已有的 `read_artifact` 操作和同一 Store 的真实 `MemberArtifactGrant`。在首次绑定前先比较 pin 与已签发的 tuple，再在 claim 群组中核对其存在性；绑定后不可改选。调用依然经过现有 `ReadArtifact` 的版本、blob 哈希和授权围栏；撤销 bearer 或持久 claim 失效后拒绝后续读取。pin 不改变 E3 对经验元数据的原有可见性规则，命中、评审记录、群组成员资格和用户下载均不授予字节读取权限。
 
-**普通启动没有成果批准/签发接缝。** 它只签发历史工具，始终绑定空成果 pin，不向模型注册 `read_artifact`。调查启动借用的 blob 服务有独立的正式调查范围，不能借给普通轮。受控测试在真实 SQLite claim 上分别使用已有 `MemberToolGrants`/`MemberArtifactGrant` 和测试批准的固定 tuple；这不是可供产品调用的授权入口。普通轮的完整原生接手验收仍需一个独立的可信批准和签发接缝；不能用 `read_history`、经验命中或当前成果指针补上。
+**普通启动没有成果批准来源。** 它只签发历史权限，始终绑定空成果 pin，不向模型注册 `read_artifact`。调查启动借用的 blob 服务有独立的正式调查范围，不能借给普通轮。受控测试在真实 SQLite claim 上签发一个独立批准的固定 tuple；不提供产品批准策略。普通轮的完整原生接手验收仍需可信批准来源接入此签发接缝；不能用 `read_history`、经验命中或当前成果指针补上。
 
 安装态测试依赖 #218 `372cc69e13345e82739a91552286f8b99772afb4` 的 `projectIdentitySchema` 先于 #214 `a091ea68ff93b61c47ba38ba404195148a5c78da` 的 `projectExperienceSchema`。公共登记和编号仍由 B 决定。本片基于 #214 的冻结 `MemberTools.LookupProjectExperiences`，不要求修改 E 或 D 的文件。

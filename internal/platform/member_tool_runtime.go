@@ -232,7 +232,11 @@ func (e *memberToolRuntimeRun) matchesTurn(turn domain.Turn) bool {
 }
 
 func (e *memberToolRuntimeRun) fresh(turn domain.Turn) bool {
-	return e.matchesTurn(turn) && turn.ClaimToken != "" && turn.State == domain.TurnStateStarting &&
+	return e.matchesTurn(turn) && memberToolTurnPrelaunch(turn)
+}
+
+func memberToolTurnPrelaunch(turn domain.Turn) bool {
+	return turn.ClaimToken != "" && turn.State == domain.TurnStateStarting &&
 		turn.NativeSessionID == "" && turn.AcceptedAt == nil && turn.CancelRequestedAt == nil &&
 		turn.CandidateText == "" && turn.CandidateTerminal == ""
 }
@@ -251,11 +255,21 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 		return unknown
 	}
 	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	freshPiExperience := e.projectExperienceBuilder != nil
+	if freshPiExperience && (e.nativeSession != nil || e.intakeBuilder != nil) {
+		return unknown
+	}
+	grants := MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers, ProviderID: e.binding.ProviderID, Model: e.binding.Model}
 	var token string
-	if e.intake {
-		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema)
-	} else {
-		token, err = r.tools.Issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers, ProviderID: e.binding.ProviderID, Model: e.binding.Model})
+	switch {
+	case e.intake:
+		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema, freshPiExperience)
+	case freshPiExperience:
+		// Ordinary startup issues history, not an artifact grant or an approved
+		// version. Never obtain either from the context or lookup results.
+		token, err = r.tools.IssueFreshPiProjectExperience(ctx, claim, grants, domain.ArtifactVersionRef{})
+	default:
+		token, err = r.tools.Issue(ctx, claim, grants)
 	}
 	if err != nil {
 		// Duplicate authority, stale generation and uncertain reads are not proof
@@ -271,9 +285,7 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 			config.cleanup()
 		}
 	}()
-	if e.projectExperienceBuilder != nil {
-		// Ordinary startup issues history, not an artifact grant or an approved
-		// version. Never obtain either from the context or lookup results.
+	if freshPiExperience {
 		if err := r.tools.BindPiProjectExperience(ctx, token, claim, domain.ArtifactVersionRef{}); err != nil {
 			return unknown
 		}

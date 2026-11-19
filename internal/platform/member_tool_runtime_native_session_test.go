@@ -312,8 +312,19 @@ func TestNativeSessionRuntimeResumeRestartRebindAndUnknownBarrier(t *testing.T) 
 		if call.resume == nil || call.resume.Pi == nil || call.resume.Pi.NativeSessionID != first.NativeSessionID || call.resume.Pi.SessionFile != first.NativeRef.Pi.SessionFile || call.token == firstCall.token || call.token == firstClaim.Token {
 			t.Fatal("restart did not select exact native source with a new token")
 		}
-		if _, err := f.opts.MemberTools.Tools().TransportOperations(context.Background(), firstCall.token); !errors.Is(err, store.ErrMemberToolDenied) {
+		ctx := t.Context()
+		tools := f.opts.MemberTools.Tools()
+		if _, err := tools.TransportOperations(ctx, firstCall.token); !errors.Is(err, store.ErrMemberToolDenied) {
 			t.Fatal("old process token regained authority after native resume")
+		}
+		// The new resume bearer is live and the claim has not launched yet.
+		_, err := tools.TransportOperations(ctx, call.token)
+		prepareRoleOK(t, err)
+		turn, err := f.s.GetTurn(ctx, call.binding.GroupID, call.binding.TurnID)
+		prepareRoleOK(t, err)
+		claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+		if err := tools.BindPiProjectExperience(ctx, call.token, claim, domain.ArtifactVersionRef{}); !errors.Is(err, store.ErrMemberToolDenied) {
+			t.Fatalf("the resume registration could add the fresh projection: %v", err)
 		}
 	}, provider.OutcomeSucceeded, true)
 	if decodeNativeFixtureBinding(t, second).ResumedFromTurnID != firstClaim.TurnID {

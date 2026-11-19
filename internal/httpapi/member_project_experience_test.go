@@ -110,7 +110,12 @@ func TestMemberProjectExperienceNativeAuthority(t *testing.T) {
 		}
 	}
 	before := f.counts(t)
-	deny(lookup, query) // Existing legacy grants alone don't opt into the native profile.
+	// Even a live, prelaunch legacy bearer cannot opt into the native profile.
+	deny(lookup, query)
+	mustDenyBind(f.claim, domain.ArtifactVersionRef{})
+	f.tools.Revoke(f.token)
+	f.token, err = f.tools.IssueFreshPiProjectExperience(ctx, f.claim, platform.MemberToolGrants{Operations: history}, domain.ArtifactVersionRef{})
+	artifactHTTPMust(t, err)
 	mustDenyBind(f.claim, pin)
 	artifactHTTPMust(t, f.tools.BindPiProjectExperience(ctx, f.token, f.claim, domain.ArtifactVersionRef{}))
 	page := decoded[platform.ProjectExperiencePage](t, f.request(t, lookup, query), 200)
@@ -126,13 +131,19 @@ func TestMemberProjectExperienceNativeAuthority(t *testing.T) {
 	deny(lookup, query)
 
 	ops := append(slices.Clone(history), artifact)
-	if token, err := f.tools.Issue(ctx, f.claim, platform.MemberToolGrants{Operations: ops}); token != "" || !errors.Is(err, store.ErrMemberToolDenied) {
-		t.Fatal("operation name without the borrowed grant issued material authority")
+	if token, err := f.tools.IssueFreshPiProjectExperience(ctx, f.claim, platform.MemberToolGrants{Operations: ops}, pin); token != "" || !errors.Is(err, store.ErrMemberToolDenied) {
+		t.Fatal("exact approval without the borrowed grant issued material authority")
 	}
-	f.token, err = f.tools.Issue(ctx, f.claim, platform.MemberToolGrants{Operations: ops, Artifacts: grant})
+	grants := platform.MemberToolGrants{Operations: ops, Artifacts: grant}
+	if token, err := f.tools.IssueFreshPiProjectExperience(ctx, f.claim, grants, domain.ArtifactVersionRef{}); token != "" || !errors.Is(err, store.ErrMemberToolDenied) {
+		t.Fatal("the group grant alone issued exact material authority")
+	}
+	f.token, err = f.tools.IssueFreshPiProjectExperience(ctx, f.claim, grants, pin)
 	artifactHTTPMust(t, err)
 	t.Cleanup(func() { f.tools.Revoke(f.token) })
 	deny(artifact, args(pin)) // Unprojected grant can't be used via the native read path.
+	// First bind: a same-group current version is not the independently issued tuple.
+	mustDenyBind(f.claim, head)
 	mustDenyBind(f.claim, domain.ArtifactVersionRef{})
 	mustDenyBind(f.claim, foreign)
 	wrongClaim := f.claim
@@ -210,4 +221,21 @@ func TestMemberProjectExperienceNativeAuthority(t *testing.T) {
 	f.tools.Revoke(f.token)
 	deny(artifact, args(pin))
 	deny(lookup, query)
+}
+
+func TestMemberProjectExperienceNativePrelaunch(t *testing.T) {
+	ctx := t.Context()
+	history := []string{"search_history", "read_history"}
+	f := newMemberToolHTTP(t, history...)
+	f.tools.Revoke(f.token)
+	token, err := f.tools.IssueFreshPiProjectExperience(ctx, f.claim, platform.MemberToolGrants{Operations: history}, domain.ArtifactVersionRef{})
+	artifactHTTPMust(t, err)
+	t.Cleanup(func() { f.tools.Revoke(token) })
+	// Launch evidence precedes acceptance; the general tool scope is still live.
+	artifactHTTPMust(t, f.db.RecordTurnEvent(ctx, f.claim, provider.Event{Kind: provider.SessionEvent, NativeSessionID: "pi-session"}))
+	_, err = f.tools.TransportOperations(ctx, token)
+	artifactHTTPMust(t, err)
+	if err := f.tools.BindPiProjectExperience(ctx, token, f.claim, domain.ArtifactVersionRef{}); !errors.Is(err, store.ErrMemberToolDenied) {
+		t.Fatalf("a launched bearer could add the fresh projection: %v", err)
+	}
 }

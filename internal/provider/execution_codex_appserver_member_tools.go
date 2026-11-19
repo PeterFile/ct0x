@@ -103,15 +103,15 @@ func readMemberToolConfigMode(path string, pi, strict, projectExperience bool) (
 			return memberToolConfig{}, errPiMemberToolConfiguration
 		}
 	} else {
-		// Optional schema hints are not authority. Codex discovers its schema
-		// through MCP, and never accepts the strict config or investigation hint.
-		if string(fields["continue_work"]) == "true" {
+		// Optional schema hints are not authority. Codex discovers through MCP.
+		// The fresh experience profile accepts only the discussion hint.
+		if !projectExperience && string(fields["continue_work"]) == "true" {
 			count++
 		}
 		if pi && string(fields["discussion_only_excerpt"]) == "true" {
 			count++
 		}
-		if pi && string(fields["intake_assessment_action"]) == `"read_only_investigation"` {
+		if pi && !projectExperience && string(fields["intake_assessment_action"]) == `"read_only_investigation"` {
 			count++
 		}
 	}

@@ -35,10 +35,12 @@ type memberToolRegistration struct {
 	candidate          *domain.ChatCandidate
 	purpose            string
 	intake             memberToolIntakeSchema
-	projectExperience  memberProjectExperienceTransport // Optional, one-time native projection before launch.
 	taskWork           *taskWorkToolBinding
 	workReport         *taskWorkReportBinding
 	investigationOwner *investigationWorkOwnerBinding
+
+	projectExperienceAuthority memberProjectExperienceAuthority // Frozen at issuance; absent on legacy and native-session paths.
+	projectExperience          memberProjectExperienceTransport // Optional, one-time native projection before launch.
 	// Frozen server capability facts are not grants or model-controlled input.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 	delegateCandidateIDs []string
@@ -67,24 +69,25 @@ func NewMemberTools(db *store.Store) *MemberTools {
 // Issue is called by the trusted runtime only AFTER ClaimTurn, never during preparation.
 // It refuses duplicate registrations rather than silently rotating a live capability.
 func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants) (string, error) {
-	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{})
+	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{}, memberProjectExperienceAuthority{})
 }
 
 // IssueChatIntake is a separate trusted runtime seam, never a tool/API input.
 // It freezes a restricted profile and persists the exact claim-bound purpose.
 func (s *MemberTools) IssueChatIntake(ctx context.Context, claim store.TurnClaim) (string, error) {
-	return s.issueChatIntake(ctx, claim, memberToolIntakeSchema{})
+	return s.issueChatIntake(ctx, claim, memberToolIntakeSchema{}, false)
 }
 
-func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema) (string, error) {
-	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema)
+func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema, freshPiExperience bool) (string, error) {
+	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema,
+		memberProjectExperienceAuthority{eligible: freshPiExperience})
 }
 
 func chatIntakeOperations() []string {
 	return []string{"list_members", "read_channel", "send_message", "search_history", "read_history"}
 }
 
-func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema) (string, error) {
+func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema, experience memberProjectExperienceAuthority) (string, error) {
 	grants.Operations = slices.Clone(grants.Operations)
 	if grants.Skills != nil {
 		// Freeze the source even if the caller overwrites its exported wrapper.
@@ -101,6 +104,10 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 	if !memberToolGrantsValid(grants) {
 		return "", store.ErrMemberToolDenied
 	}
+	if experience.eligible && (!experience.permits(grants.Operations) || schema.investigation ||
+		(purpose == domain.ChatIntakePurpose && s.continueWorkEnabled())) {
+		return "", store.ErrMemberToolDenied
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.capabilities) >= maxMemberToolRegistrations {
@@ -114,6 +121,9 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 	scope, err := s.db.BindMemberTool(ctx, claim)
 	if err != nil {
 		return "", err
+	}
+	if experience.eligible && !s.projectExperiencePrelaunch(ctx, scope) {
+		return "", store.ErrMemberToolDenied
 	}
 	token := rand.Text()
 	key := sha256.Sum256([]byte(token))
@@ -146,7 +156,8 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 		}
 		candidate = &captured
 	}
-	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate, purpose: purpose, intake: schema}
+	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate, purpose: purpose, intake: schema,
+		projectExperienceAuthority: experience}
 	return token, nil
 }
 

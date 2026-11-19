@@ -104,14 +104,23 @@ test("lookup and artifact projection require the exact digest and reject legacy 
     assert.equal(loaded.extensions.length, 0);
     assert.equal(loaded.errors.length, 1);
   }
+  const intake = ["list_members", "read_channel", "send_message", ...projection];
   for (const invalid of [{ project_experience_tools: [artifact] }, { project_experience_tools: [...projection, artifact, artifact] },
     { project_experience_tools: ["read_history", "search_history", lookup] }, { project_experience_tools: [...projection, investigation] },
-    { project_experience_tools: projection, investigation_tools: [investigation, "submit_result"] }]) {
+    { project_experience_tools: projection, investigation_tools: [investigation, "submit_result"] },
+    { project_experience_tools: intake, continue_work: true },
+    { project_experience_tools: intake, intake_assessment_action: "read_only_investigation" }]) {
     const path = await privateConfig(t, invalid);
     const loaded = await load(path, hash(await readFile(path)));
     assert.equal(loaded.extensions.length, 0);
     assert.equal(loaded.errors.length, 1);
   }
+  const discussionPath = await privateConfig(t, { project_experience_tools: intake, discussion_only_excerpt: true });
+  const discussion = await load(discussionPath, hash(await readFile(discussionPath)));
+  assert.deepEqual(discussion.errors, []);
+  const discussionTools = discussion.extensions[0].tools;
+  assert.deepEqual([...discussionTools.keys()], intake);
+  assert.ok(discussionTools.get("send_message").definition.parameters.properties.intent_assessment.properties.discussion_only_excerpt);
   const legacy = await load(await privateConfig(t));
   for (const name of [lookup, artifact, investigation]) assert.ok(!legacy.extensions[0].tools.has(name));
   const typedPath = await privateConfig(t, { investigation_tools: [investigation, "submit_result"] });

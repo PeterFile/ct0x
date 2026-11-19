@@ -20,9 +20,13 @@ for arg do
   prev=$arg
 done
 exit 0`)
-	writeProfile := func(names []string) NativeMemberToolConfig {
+	writeProfile := func(names []string, hints map[string]any) NativeMemberToolConfig {
 		t.Helper()
-		wire, err := json.Marshal(map[string]any{"endpoint": "http://127.0.0.1:7310/api/v1/member-tools", "token": "fixture-only-bearer", "project_experience_tools": names})
+		config := map[string]any{"endpoint": "http://127.0.0.1:7310/api/v1/member-tools", "token": "fixture-only-bearer", "project_experience_tools": names}
+		for name, value := range hints {
+			config[name] = value
+		}
+		wire, err := json.Marshal(config)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -54,12 +58,21 @@ exit 0`)
 		{"search_history", "read_history", lookup, ReadInvestigationArtifactTool},
 		{"read_channel", "search_history", "read_history", "submit_result", lookup},
 	} {
-		if exe, err := NewPiProjectExperienceExecutor(selected, entry, writeProfile(names), 0); exe != nil || err == nil {
+		if exe, err := NewPiProjectExperienceExecutor(selected, entry, writeProfile(names, nil), 0); exe != nil || err == nil {
 			t.Fatalf("invalid fresh tool profile was accepted: %v", names)
 		}
 	}
+	intake := []string{"list_members", "read_channel", "send_message", "search_history", "read_history", lookup}
+	for name, value := range map[string]any{"continue_work": true, "intake_assessment_action": "read_only_investigation"} {
+		if exe, err := NewPiProjectExperienceExecutor(selected, entry, writeProfile(intake, map[string]any{name: value}), 0); exe != nil || err == nil {
+			t.Fatalf("digest-matched experience profile accepted %s", name)
+		}
+	}
+	if exe, err := NewPiProjectExperienceExecutor(selected, entry, writeProfile(intake, map[string]any{"discussion_only_excerpt": true}), 0); exe == nil || err != nil {
+		t.Fatalf("experience profile rejected the discussion hint: %v", err)
+	}
 	approved := []string{"search_history", "read_history", lookup, artifact}
-	issued := writeProfile(approved)
+	issued := writeProfile(approved, nil)
 	badDigest := issued
 	badDigest.SHA256[0] ^= 1
 	if exe, err := NewPiProjectExperienceExecutor(selected, entry, badDigest, 0); exe != nil || err == nil {
@@ -79,7 +92,13 @@ exit 0`)
 	if got := exe.Execute(t.Context(), request, nil); !got.Started || !got.DirectChildReaped || got.ExitCode != 0 || got.NativeRef != nil {
 		t.Fatal("the offline child did not receive the exact fresh profile")
 	}
-	if err := os.WriteFile(filepath.Join(dir, "bridge.mjs"), []byte("// not the qualified parser"), 0600); err != nil {
+	impl := filepath.Join(dir, "bridge.mjs")
+	source, err := os.ReadFile(impl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Even a drift that preserves the new guard must not qualify.
+	if err := os.WriteFile(impl, append(source, '\n'), 0600); err != nil {
 		t.Fatal(err)
 	}
 	request.RunID = "changed"
