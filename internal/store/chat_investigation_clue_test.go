@@ -221,6 +221,35 @@ func TestChatInvestigationClueAdmissionFences(t *testing.T) {
 	}
 }
 
+func TestChatInvestigationClueStoredScopeUnicode(t *testing.T) {
+	f := chatSetup(t, "user", false)
+	s := f.s
+	policy := investigationPolicy(t, f, clueInvestigationConfig(t, `["�"]`), 1)
+	s.EnableInvestigationExecution()
+	investigationFinishTurn(t, f)
+	message := chatLocalMessage(t, s, MessageRequest{GroupID: f.groupID, TopicID: policy.TopicID,
+		ActorID: "user", Content: "线索：�", RecipientIDs: []string{f.a}}, []string{f.a})
+	investigationBindCandidate(t, &f, message.Deliveries[0])
+	r, err := s.ApplyChatAssessment(ctx, f.scope, f.candidate.ID, investigationProposal(), "建议调查。", "unicode-clue")
+	if err != nil || r.Outcome != "admitted" || r.TaskID == "" {
+		t.Fatalf("expected admission for an actual replacement character: %+v, %v", r, err)
+	}
+	if scope, err := s.GetTaskInvestigationScope(ctx, f.groupID, r.TaskID); err != nil || !reflect.DeepEqual(scope.ClueTerms, policy.Investigation.ClueTerms) {
+		t.Fatalf("admitted scope did not retain the exact term: %+v, %v", scope, err)
+	}
+
+	// Simulate malformed stored evidence; normal writes cannot replace an immutable scope.
+	coordinationDecideExec(t, s, `DROP TRIGGER chat_investigation_policy_update`)
+	coordinationDecideExec(t, s, `UPDATE chat_investigation_policy_revisions SET scope_json=replace(scope_json,?,?)
+	 WHERE (group_id,topic_id,revision)=(?,?,?)`, `["�"]`, `["\ud800"]`, policy.GroupID, policy.TopicID, policy.Revision)
+	if got, err := s.GetChatPolicy(ctx, policy.ThreadRef); err == nil {
+		t.Errorf("current policy read accepted malformed stored clue: %+v", got.Investigation)
+	}
+	if got, err := s.GetTaskInvestigationScope(ctx, f.groupID, r.TaskID); err == nil || errors.Is(err, ErrNotFound) {
+		t.Errorf("admitted scope read accepted or hid malformed stored clue: %+v, %v", got.ClueTerms, err)
+	}
+}
+
 func TestChatInvestigationCluePolicyRejectsInvalidTerms(t *testing.T) {
 	f := chatSetup(t, "user", false)
 	for _, terms := range []string{`[]`, `[""]`, `["　"]`, `["导出","导出"]`, `["a\u0000b"]`, `["a\nb"]`, `["a\rb"]`,

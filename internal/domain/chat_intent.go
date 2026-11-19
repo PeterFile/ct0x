@@ -1,10 +1,13 @@
 package domain
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 const (
@@ -51,8 +54,40 @@ func (terms *ChatInvestigationClueTerms) UnmarshalJSON(data []byte) error {
 	if phrases == nil {
 		return errors.New("只读调查线索词组必须为非空数组")
 	}
+	if !utf8.Valid(data) || !validClueTermEscapes(data) {
+		return errors.New("只读调查线索词组必须为有效的 Unicode 文本")
+	}
 	*terms = phrases
 	return nil
+}
+
+// In an already validated JSON string array, escapes can occur only inside
+// terms. Check them in the original bytes: decoded U+FFFD may be intentional.
+func validClueTermEscapes(data []byte) bool {
+	for {
+		i := bytes.IndexByte(data, '\\')
+		if i < 0 {
+			return true
+		}
+		escape := data[i+1]
+		data = data[i+2:]
+		if escape != 'u' {
+			continue
+		}
+		unit, _ := strconv.ParseUint(string(data[:4]), 16, 16) // JSON syntax guarantees four hex digits.
+		data = data[4:]
+		if unit < 0xd800 || unit > 0xdfff {
+			continue
+		}
+		if unit >= 0xdc00 || !bytes.HasPrefix(data, []byte(`\u`)) {
+			return false
+		}
+		low, _ := strconv.ParseUint(string(data[2:6]), 16, 16)
+		if low < 0xdc00 || low > 0xdfff {
+			return false
+		}
+		data = data[6:]
+	}
 }
 
 // MatchesClue checks literal containment only. A caller previewing a delivery
