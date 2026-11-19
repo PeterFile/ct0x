@@ -97,7 +97,8 @@ func validatePreparationRole(state store.CoordinationRoleState, group domain.Gro
 	switch p.Kind {
 	case store.CoordinationRoleOrdinary:
 		if p.RequestID != "" || p.TaskID != "" || p.TaskRevision != 0 || p.AssignmentID != "" ||
-			(state.Blocked != store.CoordinationReady && state.Blocked != store.CoordinationMemberInactive) {
+			(state.Blocked != store.CoordinationReady && state.Blocked != store.CoordinationMemberInactive &&
+				state.Blocked != store.CoordinationDiscussionWorkReturnHandlerRequired) {
 			return errPrepareBinding
 		}
 	case store.CoordinationRoleCoordinator, store.CoordinationRoleWorker:

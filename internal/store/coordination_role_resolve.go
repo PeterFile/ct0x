@@ -20,6 +20,8 @@ const (
 	CoordinationMemberInactive        CoordinationReadinessCode = "member_inactive"
 	CoordinationAlreadyDecided        CoordinationReadinessCode = "already_decided"
 	CoordinationAttemptConflict       CoordinationReadinessCode = "attempt_conflict"
+
+	CoordinationDiscussionWorkReturnHandlerRequired CoordinationReadinessCode = "discussion_work_return_handler_required"
 )
 
 // CoordinationRoleState is trusted process-local evidence, not a transport DTO.
@@ -123,10 +125,8 @@ func (s *Store) resolveCoordinationDelivery(ctx context.Context, groupID, delive
 			(expected != nil && *r != *expected) {
 			return out, &chatDiscussionWorkReturnReadError{ErrMemberToolDenied}
 		}
-		if expected == nil {
-			// Legacy Prepare only accepts this non-ready ordinary code. Hold
-			// the delivery with ErrNotReady without inventing a Work role.
-			state.Blocked = CoordinationMemberInactive
+		if expected == nil && state.Blocked == CoordinationReady {
+			state.Blocked = CoordinationDiscussionWorkReturnHandlerRequired
 		}
 	case expected != nil || !valid:
 		return out, ErrMemberToolDenied

@@ -90,7 +90,7 @@ func TestChatDiscussionWorkReturnQueueRouting(t *testing.T) {
 		DeliveryID: r.DeliveryID, MessageID: r.MessageID, ConversationID: r.ConversationID, MemberID: r.RecipientID, TopicID: r.TopicID},
 		ProviderID: "pi", Model: "model"}
 	held := want
-	held.Blocked = CoordinationMemberInactive // The legacy Prepare allowlist maps this code to ErrNotReady.
+	held.Blocked = CoordinationDiscussionWorkReturnHandlerRequired
 	if got, err := s.ResolveCoordinationDelivery(ctx, r.GroupID, r.DeliveryID); err != nil || got != held {
 		t.Fatalf("production resolver did not quietly hold the typed delivery: %+v %v", got, err)
 	}
@@ -130,6 +130,19 @@ func TestChatDiscussionWorkReturnQueueRouting(t *testing.T) {
 		t.Fatalf("typed read must not unlock the legacy resolver: %+v %v", got, err)
 	}
 	coordinationDecidePreserved(t, s, before)
+
+	t.Run("inactive-recipient", func(t *testing.T) {
+		coordinationDecideExec(t, s, `UPDATE members SET status='left' WHERE id=?`, r.RecipientID)
+		defer coordinationDecideExec(t, s, `UPDATE members SET status='active' WHERE id=?`, r.RecipientID)
+		inactive := want
+		inactive.Blocked = CoordinationMemberInactive
+		if got, err := s.ResolveCoordinationDelivery(ctx, r.GroupID, r.DeliveryID); err != nil || got != inactive {
+			t.Fatalf("generic route did not preserve recipient inactivity: %+v %v", got, err)
+		}
+		if got, err := s.ResolveCoordinationDiscussionWorkReturnDelivery(ctx, r.GroupID, r.DeliveryID, probe); err != nil || got != inactive {
+			t.Fatalf("exact receipt did not preserve recipient inactivity: %+v %v", got, err)
+		}
+	})
 
 	// This is a read seam, not a claim gate. Another claimant after the probe
 	// invalidates preparation, without retiring the historical publication.
@@ -416,6 +429,15 @@ func TestChatDiscussionWorkReturnRejectsReplySource(t *testing.T) {
 }
 
 func TestChatDiscussionWorkReturnSchemaGuard(t *testing.T) {
+	// This serial matrix opens v31 so later migrations cannot affect the ledger cases.
+	const fixtureVersion = 31
+	original := migrations
+	if len(original) < fixtureVersion || original[fixtureVersion-1] != chatDiscussionWorkReturnSchema {
+		t.Fatal("schema guard fixture requires the work-return migration at v31")
+	}
+	defer func() { migrations = original }()
+	migrations = original[:fixtureVersion]
+
 	const dropMarker = `DELETE FROM main.schema_migrations WHERE version=31`
 	const dropTable = `DROP TABLE main.chat_discussion_work_returns`
 	damageLiveLedger := func(t *testing.T, s *Store) {

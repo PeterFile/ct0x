@@ -242,7 +242,7 @@ func TestChatDiscussionWorkReturnPublishesAndReplaysAfterSupplement(t *testing.T
 		t.Fatalf("ordinary invitation resolved as work return: %v", err)
 	}
 	if role, err := s.ResolveCoordinationDelivery(ctx, f.groupID, r.DeliveryID); err != nil ||
-		role.Provenance.Kind != CoordinationRoleOrdinary || role.Blocked != CoordinationMemberInactive {
+		role.Provenance.Kind != CoordinationRoleOrdinary || role.Blocked != CoordinationDiscussionWorkReturnHandlerRequired {
 		t.Fatalf("legacy preparation must leave the typed return queued: %+v %v", role, err)
 	}
 	followup, candidate := discussionArrive(t, s, f.groupID, r.DeliveryID)
