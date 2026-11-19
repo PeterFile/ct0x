@@ -21,7 +21,7 @@ const threadStateSlotCount, threadStateContentBytes = 8, 1024
 var ErrThreadStateConflict = errors.New("话题状态、任务版本或来源已变更")
 
 // ThreadStateUpdate is an explicit local-user command, not a model operation.
-// Content is an exact excerpt of the confirmed source (the reason for invalidate).
+// Content is the complete, bounded text of the confirmed source.
 type ThreadStateUpdate struct {
 	ExpectedRevision               int64
 	Slot                           int
@@ -97,12 +97,12 @@ func setLocalThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.Threa
 	}
 	var sourceID string
 	var position int64
-	var excerpt bool
-	if err := tx.QueryRowContext(ctx, `SELECT s.id,l.sequence,instr(m.content,?)>0
+	var complete bool
+	if err := tx.QueryRowContext(ctx, `SELECT s.id,l.sequence,m.content=?
 	 FROM message_log l JOIN messages m ON (m.id,m.group_id,m.topic_id)=(l.message_id,l.group_id,l.topic_id)
-	 JOIN message_command_sources s ON s.message_id=m.id AND s.kind='local_user_chat'
+	 JOIN message_command_sources s ON s.message_id=m.id AND s.kind='local_user_chat' AND s.turn_id IS NULL AND s.claim_digest IS NULL
 	 WHERE l.message_id=? AND l.group_id=? AND l.topic_id=? AND m.sender_id='user'`,
-		update.Content, update.SourceMessage, scope.GroupID, scope.TopicID).Scan(&sourceID, &position, &excerpt); err != nil {
+		update.Content, update.SourceMessage, scope.GroupID, scope.TopicID).Scan(&sourceID, &position, &complete); err != nil {
 		return empty, err
 	}
 	mutation := mutationScope{operation: "set_thread_state", actorID: "user", groupID: scope.GroupID, key: key}
@@ -115,7 +115,7 @@ func setLocalThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.Threa
 		return empty, err
 	}
 	if replay {
-		if id != recordID || !excerpt {
+		if id != recordID || !complete {
 			return empty, errThreadStateIntegrity
 		}
 		snapshot, err := readThreadStateInTx(ctx, tx, scope, revision)
@@ -124,7 +124,7 @@ func setLocalThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.Threa
 		}
 		return snapshot, err
 	}
-	if !excerpt {
+	if !complete {
 		return empty, ErrInvalid
 	}
 	current, err := readThreadStateInTx(ctx, tx, scope, 0)
@@ -143,7 +143,9 @@ func setLocalThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.Threa
 		if !previous.Active {
 			last = previous.InvalidatedBy.Source.MessageLogPosition
 		}
-		if previous.Kind != update.Kind || position <= last || (previous.Active && previous.Kind == domain.ThreadStatePlan && update.Action == "set") {
+		// An occupied plan slot can only be retired, never reused: the
+		// original plan and retirement reason remain in the current handoff.
+		if previous.Kind != update.Kind || position <= last || (previous.Kind == domain.ThreadStatePlan && update.Action == "set") {
 			return empty, ErrThreadStateConflict
 		}
 		if previous.Active && update.Action == "invalidate" {

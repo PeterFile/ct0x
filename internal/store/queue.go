@@ -32,6 +32,7 @@ type ClaimTurnInput struct {
 	GroupID, DeliveryID string
 	ResourceKeys        []string // Complete canonical keys from trusted configuration, never model arguments.
 	MaxActive           int
+	PreparedThreadState *PreparedThreadState
 }
 
 // ListPendingDeliveries scans FIFO; callers must continue after resource conflicts.

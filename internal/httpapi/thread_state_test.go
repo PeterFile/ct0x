@@ -95,6 +95,10 @@ func TestThreadStateHandoffPrompt(t *testing.T) {
 	post(2, 1, "plan", "invalidate", stop)
 	decision := threadStateMessage(t, a, g.ID, topic, "保留 v2.9 修复")
 	post(3, 2, "confirmed_decision", "set", decision)
+	newPlan := threadStateMessage(t, a, g.ID, topic, "继续使用 v2.9 导出器")
+	w := a.request("PUT", endpoint, stateUpdate(4, 1, "plan", "set", newPlan.Content, newPlan.ID), "change-4")
+	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 409, "thread_state_conflict")
+	post(4, 3, "plan", "set", newPlan)
 	for _, tc := range []struct{ group, topic, secret string }{
 		{g.ID, "export+bug", "PRIVATE_OTHER_THREAD"}, {foreign.ID, topic, "PRIVATE_OTHER_GROUP"},
 	} {
@@ -153,10 +157,13 @@ func TestThreadStateHandoffPrompt(t *testing.T) {
 		}
 	}
 	st := pack.ThreadState
-	if st.Scope != (domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: g.ID, TopicID: topic}}) || st.Revision != 4 || len(st.Records) != 3 {
+	if st.Scope != (domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: g.ID, TopicID: topic}}) || st.Revision != 5 || len(st.Records) != 4 {
 		t.Fatalf("missing current durable state: %+v", st)
 	}
-	orig, disabled := st.Records[0], st.Records[1]
+	orig, disabled, replacement := st.Records[0], st.Records[1], st.Records[3]
+	if !replacement.Active || replacement.Content != newPlan.Content || replacement.Source.SourceID != newPlan.SourceID {
+		t.Fatalf("replacement plan missing from handoff: %+v", replacement)
+	}
 	if !orig.Active || orig.Revision != 1 || orig.Content != constraint || orig.Source.ConfirmedBy != "user" ||
 		orig.Source.SourceKind != "local_user_chat" || orig.Source.ConfirmedAt.IsZero() || orig.Source.MessageID != old.ID || orig.Source.SourceID != old.SourceID ||
 		disabled.Active || disabled.Revision != 3 || disabled.Content != oldPlan || disabled.Source.MessageID != plan.ID || disabled.Source.SourceID != plan.SourceID ||

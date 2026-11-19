@@ -14,8 +14,8 @@ const threadStateKey = `(group_id,topic_id,task_id,task_revision)=(:grp,:topic,:
 // left joins on evidence so missing evidence cannot silently erase a record.
 const threadStateSnapshotSQL = `WITH slots(slot) AS (VALUES(0),(1),(2),(3),(4),(5),(6),(7))
  SELECT r.slot,r.kind,r.revision,r.content,coalesce(r.invalidates_revision,0),
-    coalesce(s.message_id,''),r.source_id,r.source_position,r.confirmed_at,
-    coalesce(p.content,''),coalesce(ps.message_id,''),coalesce(p.source_id,''),coalesce(p.source_position,0),coalesce(p.confirmed_at,'')
+    coalesce(m.id,''),r.source_id,r.source_position,r.confirmed_at,
+    coalesce(p.content,''),coalesce(pm.id,''),coalesce(p.source_id,''),coalesce(p.source_position,0),coalesce(p.confirmed_at,'')
  FROM slots JOIN thread_state_revisions r ON (r.group_id,r.topic_id,r.task_id,r.task_revision,r.revision)=
  (:grp,:topic,:task,:task_revision,(SELECT revision FROM thread_state_revisions INDEXED BY thread_state_by_slot
     WHERE ` + threadStateKey + ` AND slot=slots.slot AND revision<=:revision ORDER BY revision DESC LIMIT 1))
@@ -24,18 +24,33 @@ const threadStateSnapshotSQL = `WITH slots(slot) AS (VALUES(0),(1),(2),(3),(4),(
     AND p.invalidates_revision IS NULL AND p.source_position<r.source_position
  LEFT JOIN message_log l ON (l.sequence,l.group_id,l.topic_id)=(r.source_position,r.group_id,r.topic_id)
  LEFT JOIN message_command_sources s ON s.id=r.source_id AND s.message_id=l.message_id AND s.kind='local_user_chat'
+    AND s.turn_id IS NULL AND s.claim_digest IS NULL
+ LEFT JOIN messages m ON (m.id,m.group_id,m.topic_id)=(s.message_id,r.group_id,r.topic_id)
+    AND m.sender_id='user' AND m.content=r.content
  LEFT JOIN message_log pl ON (pl.sequence,pl.group_id,pl.topic_id)=(p.source_position,p.group_id,p.topic_id)
  LEFT JOIN message_command_sources ps ON ps.id=p.source_id AND ps.message_id=pl.message_id AND ps.kind='local_user_chat'
+    AND ps.turn_id IS NULL AND ps.claim_digest IS NULL
+ LEFT JOIN messages pm ON (pm.id,pm.group_id,pm.topic_id)=(ps.message_id,p.group_id,p.topic_id)
+    AND pm.sender_id='user' AND pm.content=p.content
  ORDER BY slots.slot`
 
 func readThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.ThreadStateScope, revision int64) (domain.ThreadStateSnapshot, error) {
 	var empty domain.ThreadStateSnapshot
 	args := []any{sql.Named("grp", scope.GroupID), sql.Named("topic", scope.TopicID), sql.Named("task", scope.TaskID), sql.Named("task_revision", scope.TaskRevision)}
-	current := revision == 0
-	if current {
-		if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(revision),0) FROM thread_state_revisions WHERE `+threadStateKey, args...).Scan(&revision); err != nil {
-			return empty, err
-		}
+	// The positive, unique revisions must be 1..latest. Check even revisions
+	// hidden by a later slot update, using only this scope's revision range.
+	var latest, count int64
+	if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(revision),0), count(*) FROM thread_state_revisions WHERE `+threadStateKey, args...).Scan(&latest, &count); err != nil {
+		return empty, err
+	}
+	if latest != count {
+		return empty, errThreadStateIntegrity
+	}
+	if revision > latest {
+		return empty, sql.ErrNoRows
+	}
+	if revision == 0 {
+		revision = latest
 	}
 	out := domain.ThreadStateSnapshot{Scope: scope, Revision: revision, Records: []domain.ThreadStateRecord{}}
 	if revision == 0 {
@@ -75,10 +90,7 @@ func readThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.ThreadSta
 		return empty, err
 	}
 	if !found {
-		if current {
-			return empty, errThreadStateIntegrity
-		}
-		return empty, sql.ErrNoRows
+		return empty, errThreadStateIntegrity
 	}
 	return out, nil
 }
@@ -95,6 +107,7 @@ func confirmThreadStateSource(source *domain.ThreadStateSource, stamp string) bo
 // LoadThreadPreparation is a trusted peek after ordinary delivery binding.
 // This path cannot request Task state. The immutable trigger, state and recent
 // candidates are read in one transaction, with no inferred coverage bound.
+// An installed schema returns a snapshot at revision zero for empty state.
 func (s *Store) LoadThreadPreparation(ctx context.Context, thread domain.ThreadRef, triggerID string, limit int) ([]domain.Message, *domain.ThreadStateSnapshot, error) {
 	var state *domain.ThreadStateSnapshot
 	history, err := s.listPreparationHistory(ctx, thread.GroupID, triggerID, limit, func(tx *sql.Tx, trigger domain.Message) error {
@@ -143,6 +156,9 @@ func (s *Store) LoadAuthorizedTaskThreadState(ctx context.Context, bound Coordin
 	if err != nil {
 		return nil, storeError(action, err)
 	}
+	if state != nil && state.Revision == 0 {
+		return nil, nil
+	}
 	return state, nil
 }
 
@@ -164,7 +180,7 @@ func preparationThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.Th
 		return nil, err
 	}
 	state, err := readThreadStateInTx(ctx, tx, scope, 0)
-	if err != nil || state.Revision == 0 {
+	if err != nil {
 		return nil, err
 	}
 	return &state, nil

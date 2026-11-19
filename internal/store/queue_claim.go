@@ -48,6 +48,11 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 	if err != nil {
 		return domain.Turn{}, queueError(action, err)
 	}
+	if expected := input.PreparedThreadState; expected != nil {
+		if err := verifyPreparedThreadStateInTx(ctx, tx, t, expected); err != nil {
+			return domain.Turn{}, queueError(action, err)
+		}
+	}
 	var active, occupied int
 	err = tx.QueryRowContext(ctx, `SELECT count(*),coalesce(max(conversation_id=? OR member_id=?),0)
 	 FROM turns WHERE `+activeTurnPredicate, t.ConversationID, t.MemberID).Scan(&active, &occupied)

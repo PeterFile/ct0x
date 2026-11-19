@@ -78,7 +78,7 @@ type Input struct {
 
 var ErrInvalid = errors.New("上下文输入无效")
 
-// BudgetError reports the minimum packet including summary and overflow refs.
+// BudgetError reports the minimum mandatory packet size.
 type BudgetError struct {
 	Required int
 	Limit    int
@@ -107,10 +107,11 @@ type packet struct {
 // existence, authentication, or topic membership; callers must enforce those
 // boundaries.
 // Pending/history are copied and sorted by ascending sequence; other order is
-// preserved. Covered history alone is removed. The complete supplied summary,
-// responsibility, permissions, pending bodies, all uncovered history refs
-// and supplied durable Thread/Task state are mandatory. Remaining bytes buy
-// the newest contiguous history suffix.
+// preserved. Summary coverage still filters history. The supplied summary,
+// responsibility, permissions, pending bodies and durable state are mandatory.
+// Without durable state, all uncovered history refs are also mandatory (legacy
+// behavior). With state, only the newest contiguous refs that fit are retained.
+// Remaining bytes buy the newest contiguous history bodies.
 // MaxBytes counts every rendered byte, including JSON escaping and delimiters.
 func Build(in Input) ([]byte, error) {
 	if err := validate(in); err != nil {
@@ -128,9 +129,13 @@ func Build(in Input) ([]byte, error) {
 	order := func(ms []Message) { sort.Slice(ms, func(i, j int) bool { return ms[i].Sequence < ms[j].Sequence }) }
 	order(p.Pending)
 	order(history)
-	p.Overflow = make([]Source, len(history))
+	refs := make([]Source, len(history))
 	for n, m := range history {
-		p.Overflow[n] = m.Source
+		refs[n] = m.Source
+	}
+	p.Overflow = refs
+	if in.ThreadState != nil {
+		p.Overflow = refs[len(refs):]
 	}
 	minimal, err := json.Marshal(p)
 	if err != nil {
@@ -139,6 +144,22 @@ func Build(in Input) ([]byte, error) {
 	size := len(minimal)
 	if size > in.MaxBytes {
 		return nil, &BudgetError{Required: size, Limit: in.MaxBytes}
+	}
+	if in.ThreadState != nil {
+		first := len(refs)
+		for first > 0 {
+			ref, _ := json.Marshal(refs[first-1])
+			extra := len(ref)
+			if first < len(refs) {
+				extra++ // Comma between refs.
+			}
+			if size+extra > in.MaxBytes {
+				break
+			}
+			size += extra
+			first--
+		}
+		history, p.Overflow = history[first:], refs[first:]
 	}
 	cut := len(history)
 	for cut > 0 {

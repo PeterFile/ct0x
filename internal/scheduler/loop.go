@@ -206,7 +206,9 @@ func (r *loop) scan(lane int, budget *int) (domain.Turn, PreparedExecution, bool
 		}
 		turn, err := r.store.ClaimTurn(r.ctx, store.ClaimTurnInput{
 			GroupID: pending.GroupID, DeliveryID: d.ID, ResourceKeys: prepared.ResourceKeys, MaxActive: r.options.MaxActive,
+			PreparedThreadState: prepared.PreparedThreadState,
 		})
+		// A stale prepared snapshot is busy too: leave it queued and reprepare on a later scan.
 		if errors.Is(err, store.ErrTurnBusy) || errors.Is(err, store.ErrNotFound) {
 			continue
 		}

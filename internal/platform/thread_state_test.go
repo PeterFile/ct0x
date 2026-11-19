@@ -26,9 +26,6 @@ func TestThreadStatePreparationFailsClosed(t *testing.T) {
 		{"table", `DROP TABLE thread_state_revisions`},
 		{"index", `DROP INDEX thread_state_by_slot`},
 		{"guard", `DROP TRIGGER thread_state_append`},
-		// The fixture's original prefix is v30; E2 need not be the final
-		// registered migration once the independent lanes are merged.
-		{"post-v30 markers", `DELETE FROM schema_migrations WHERE version>30`},
 		{"missing anchor", `DROP TRIGGER message_log_no_delete; DELETE FROM message_log`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

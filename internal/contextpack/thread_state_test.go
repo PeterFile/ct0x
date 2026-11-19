@@ -18,14 +18,26 @@ func TestThreadStateIsMandatoryNotCoverage(t *testing.T) {
 			Source: domain.ThreadStateSource{MessageID: "old", MessageLogPosition: 840},
 		}}},
 	}
-	var budget *BudgetError
-	if _, err := Build(in); !errors.As(err, &budget) {
-		t.Fatalf("missing minimum budget: %v", err)
+	withoutHistory := in
+	withoutHistory.History, withoutHistory.MaxBytes = nil, 1<<20
+	floor, err := Build(withoutHistory)
+	if err != nil {
+		t.Fatal(err)
 	}
-	in.MaxBytes = budget.Required
+	var budget *BudgetError
+	in.MaxBytes = len(floor) - 1
+	if out, err := Build(in); out != nil || !errors.As(err, &budget) || budget.Required != len(floor) {
+		t.Errorf("history references incorrectly raise the mandatory floor: %q, %v", out, err)
+	}
+	in.MaxBytes = len(floor)
+	if data, err := Build(in); err != nil || string(data) != string(floor) {
+		t.Errorf("optional history prevented the state and trigger fitting: %s, %v", data, err)
+	}
+	ref, _ := json.Marshal(in.History[0].Source)
+	in.MaxBytes += len(ref)
 	data, err := Build(in)
-	if err != nil || len(data) != budget.Required {
-		t.Fatalf("incorrect required size: %d, %v", len(data), err)
+	if err != nil || len(data) != in.MaxBytes {
+		t.Fatalf("incorrect required size for one optional reference: %d, %v", len(data), err)
 	}
 	var got packet
 	if err := json.Unmarshal(data, &got); err != nil {
@@ -36,11 +48,6 @@ func TestThreadStateIsMandatoryNotCoverage(t *testing.T) {
 		len(got.Overflow) != 1 || got.Overflow[0].Sequence != 1 || got.Summary != nil {
 		t.Fatalf("state consumed or renumbered history: %s", data)
 	}
-	in.MaxBytes--
-	if out, err := Build(in); out != nil || !errors.As(err, &budget) {
-		t.Fatalf("state should not be trimmed: %q, %v", out, err)
-	}
-	in.MaxBytes++
 	for _, other := range []domain.ThreadStateScope{
 		{ThreadRef: domain.ThreadRef{GroupID: "other", TopicID: scope.TopicID}, TaskID: scope.TaskID, TaskRevision: scope.TaskRevision},
 		{ThreadRef: domain.ThreadRef{GroupID: scope.GroupID, TopicID: "other"}, TaskID: scope.TaskID, TaskRevision: scope.TaskRevision},

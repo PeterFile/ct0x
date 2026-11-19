@@ -136,6 +136,30 @@ func TestThreadStateCommandIsolationAndReplay(t *testing.T) {
 	}
 }
 
+func TestThreadStateConfirmationRequiresWholeMessage(t *testing.T) {
+	a := openMessageAPI(t, "")
+	if !threadStateInstalled(t, a) {
+		t.Skip("requires the candidate migration overlay")
+	}
+	g := newGroup(t, a, "whole message")
+	const topic = "bug"
+	url := threadStateURL(g.ID, topic)
+	for slot, text := range []string{"不要删除数据", " 引用别人的建议：‘删除数据’；我不同意。 "} {
+		m := threadStateMessage(t, a, g.ID, topic, text)
+		key := fmt.Sprintf("decision-%d", slot)
+		w := a.request("PUT", url, stateUpdate(slot, slot, "confirmed_decision", "set", "删除数据", m.ID), key)
+		if w.Code != 400 {
+			t.Errorf("fragment of %q was confirmed: %d %s", text, w.Code, w.Body)
+			return
+		}
+		got := decoded[domain.ThreadStateSnapshot](t, a.request("PUT", url,
+			stateUpdate(slot, slot, "confirmed_decision", "set", text, m.ID), key), 200)
+		if got.Revision != int64(slot+1) || got.Records[slot].Content != text {
+			t.Fatalf("confirmation discarded original context: %+v", got)
+		}
+	}
+}
+
 func TestThreadStateActualTaskBinding(t *testing.T) {
 	a := openMessageAPI(t, "")
 	if !threadStateInstalled(t, a) {

@@ -41,7 +41,8 @@ BEGIN
         SELECT 1 FROM message_log l JOIN messages m ON (m.id,m.group_id,m.topic_id)=(l.message_id,l.group_id,l.topic_id)
         JOIN message_command_sources s ON s.message_id=m.id
         WHERE l.sequence=NEW.source_position AND (l.group_id,l.topic_id)=(NEW.group_id,NEW.topic_id)
-        AND s.id=NEW.source_id AND s.kind='local_user_chat' AND m.sender_id='user' AND instr(m.content,NEW.content)>0);
+        AND s.id=NEW.source_id AND s.kind='local_user_chat' AND s.turn_id IS NULL AND s.claim_digest IS NULL
+        AND m.sender_id='user' AND m.content=NEW.content);
     SELECT RAISE(ABORT, '状态记录或失效来源不匹配') WHERE EXISTS(
         SELECT 1 FROM thread_state_revisions older WHERE (older.group_id,older.topic_id,older.task_id,older.task_revision,older.slot)=
             (NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision,NEW.slot)
@@ -49,7 +50,7 @@ BEGIN
             WHERE (group_id,topic_id,task_id,task_revision,slot)=(NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision,NEW.slot))
         AND (older.kind<>NEW.kind OR older.source_position>=NEW.source_position
             OR (NEW.invalidates_revision IS NOT NULL AND (older.revision<>NEW.invalidates_revision OR older.invalidates_revision IS NOT NULL))
-            OR (NEW.invalidates_revision IS NULL AND older.kind='plan' AND older.invalidates_revision IS NULL)));
+            OR (NEW.invalidates_revision IS NULL AND older.kind='plan')));
     SELECT RAISE(ABORT, '缺少被置为失效的状态') WHERE NEW.invalidates_revision IS NOT NULL AND NOT EXISTS(
         SELECT 1 FROM thread_state_revisions WHERE (group_id,topic_id,task_id,task_revision,revision,slot)=
         (NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision,NEW.invalidates_revision,NEW.slot));

@@ -318,7 +318,11 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			}
 		}
 	}
-	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{workspace.key}, Request: request}, nil
+	prepared := scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{workspace.key}, Request: request}
+	if threadState != nil {
+		prepared.PreparedThreadState = &store.PreparedThreadState{ThreadRef: threadState.Scope.ThreadRef, MessageID: trigger.ID, Revision: threadState.Revision}
+	}
+	return prepared, nil
 }
 
 type preparationInput struct {
@@ -527,7 +531,7 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 			}
 		}
 	}
-	if threadState != nil {
+	if threadState != nil && threadState.Revision != 0 {
 		attachOrdinaryThreadState(&in, trigger, threadState)
 	}
 	if err := appendPreparationMessages(&in, conversation.TopicID, trigger, history); err != nil {
