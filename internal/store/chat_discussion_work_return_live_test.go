@@ -9,6 +9,7 @@ import (
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
+	"modernc.org/sqlite"
 )
 
 func checkWorkReturnIntakeResource(t *testing.T, f workReturnFixture, held bool) {
@@ -51,6 +52,123 @@ func checkWorkReturnDelivery(t *testing.T, s *Store, r domain.ChatDiscussionWork
 		m.Deliveries[0].State != domain.DeliveryStateQueued || m.Deliveries[0].TurnID != "" {
 		t.Fatalf("return did not queue just the original root: %+v %v", m, err)
 	}
+}
+
+func TestChatDiscussionWorkReturnQueueRouting(t *testing.T) {
+	f := setupWorkReturn(t)
+	s := f.s
+	_, r := checkWorkReturnWake(t, f)
+	message, err := s.GetMessage(ctx, r.GroupID, r.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Matching visible text is not a typed marker, even in the same topic.
+	ordinary, err := s.CreateMessage(ctx, MessageRequest{GroupID: r.GroupID, TopicID: r.TopicID,
+		ActorID: r.SenderID, Content: message.Content}, []string{r.RecipientID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := ordinary.Deliveries[0]
+	page, err := s.ListPendingDeliveries(ctx, PendingOptions{Lane: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, pending := range page.Items {
+		if pending.GroupID == r.GroupID {
+			seen[pending.Delivery.ID] = true
+		}
+	}
+	if !seen[r.DeliveryID] || !seen[d.ID] {
+		t.Fatal("fixture did not expose both deliveries to production preparation")
+	}
+	before := coordinationDecideSnapshot(t, s)
+	if got, err := s.ResolveChatDiscussionWorkReturnDelivery(ctx, r.GroupID, d.ID); got != (domain.ChatDiscussionWorkReturnReceipt{}) || err != ErrNotFound {
+		t.Fatalf("ordinary delivery must have exact typed absence: %+v %v", got, err)
+	}
+	want := CoordinationRoleState{Provenance: CoordinationRoleProvenance{Kind: CoordinationRoleOrdinary, GroupID: r.GroupID,
+		DeliveryID: r.DeliveryID, MessageID: r.MessageID, ConversationID: r.ConversationID, MemberID: r.RecipientID, TopicID: r.TopicID},
+		ProviderID: "pi", Model: "model"}
+	held := want
+	held.Blocked = CoordinationMemberInactive // The legacy Prepare allowlist maps this code to ErrNotReady.
+	if got, err := s.ResolveCoordinationDelivery(ctx, r.GroupID, r.DeliveryID); err != nil || got != held {
+		t.Fatalf("production resolver did not quietly hold the typed delivery: %+v %v", got, err)
+	}
+	untyped := want
+	untyped.Provenance.DeliveryID, untyped.Provenance.MessageID = d.ID, d.MessageID
+	if got, err := s.ResolveCoordinationDelivery(ctx, r.GroupID, d.ID); err != nil || got != untyped {
+		t.Fatalf("unrelated ordinary work no longer prepares: %+v %v", got, err)
+	}
+	probe, err := s.ResolveChatDiscussionWorkReturnDelivery(ctx, r.GroupID, r.DeliveryID)
+	if err != nil || probe != r {
+		t.Fatalf("server probe: %+v %v", probe, err)
+	}
+	if got, err := s.ResolveCoordinationDiscussionWorkReturnDelivery(ctx, r.GroupID, r.DeliveryID, probe); err != nil || got != want {
+		t.Fatalf("exact receipt must return ready ordinary identity without Work provenance: %+v %v", got, err)
+	}
+	deny := func(t *testing.T, group, delivery string, receipt domain.ChatDiscussionWorkReturnReceipt) {
+		t.Helper()
+		if got, err := s.ResolveCoordinationDiscussionWorkReturnDelivery(ctx, group, delivery, receipt); got != (CoordinationRoleState{}) ||
+			!errors.Is(err, ErrMemberToolDenied) || errors.Is(err, ErrNotFound) {
+			t.Fatalf("failed typed reproof must never allow fallback: %+v %v", got, err)
+		}
+	}
+	for _, field := range reflect.VisibleFields(reflect.TypeOf(probe)) {
+		if field.Type.Kind() == reflect.String {
+			t.Run(field.Name, func(t *testing.T) {
+				bad := probe
+				v := reflect.ValueOf(&bad).Elem().FieldByIndex(field.Index)
+				v.SetString(v.String() + "-mismatch")
+				deny(t, r.GroupID, r.DeliveryID, bad)
+			})
+		}
+	}
+	deny(t, f.otherID, r.DeliveryID, probe)
+	deny(t, r.GroupID, d.ID, probe)
+	deny(t, r.GroupID, "missing", probe)
+	if got, err := s.ResolveCoordinationDelivery(ctx, r.GroupID, r.DeliveryID); err != nil || got != held {
+		t.Fatalf("typed read must not unlock the legacy resolver: %+v %v", got, err)
+	}
+	coordinationDecidePreserved(t, s, before)
+
+	// This is a read seam, not a claim gate. Another claimant after the probe
+	// invalidates preparation, without retiring the historical publication.
+	if _, err := s.ClaimTurn(ctx, ClaimTurnInput{GroupID: r.GroupID, DeliveryID: r.DeliveryID, MaxActive: 6}); err != nil {
+		t.Fatal(err)
+	}
+	before = coordinationDecideSnapshot(t, s)
+	deny(t, r.GroupID, r.DeliveryID, probe)
+	if got, err := s.ResolveChatDiscussionWorkReturnDelivery(ctx, r.GroupID, r.DeliveryID); err != nil || got != probe {
+		t.Fatalf("claim changed the historical receipt: %+v %v", got, err)
+	}
+	coordinationDecidePreserved(t, s, before)
+}
+
+func TestChatDiscussionWorkReturnDamagedDeliveryReference(t *testing.T) {
+	f := setupWorkReturn(t)
+	s := f.s
+	_, r := checkWorkReturnWake(t, f)
+	var ddl string
+	if err := s.db.QueryRow(`SELECT sql FROM main.sqlite_schema WHERE name='chat_discussion_work_returns_update'`).Scan(&ddl); err != nil {
+		t.Fatal(err)
+	}
+	coordinationDecideExec(t, s, `DROP TRIGGER chat_discussion_work_returns_update`)
+	coordinationDecideExec(t, s, `UPDATE chat_discussion_work_returns SET delivery_id=NULL WHERE handback_id=?`, r.HandbackID)
+	coordinationDecideExec(t, s, ddl) // Intact DDL; only the indexed message link still identifies the marker.
+	before := coordinationDecideSnapshot(t, s)
+	if got, err := s.ResolveChatDiscussionWorkReturnDelivery(ctx, r.GroupID, r.DeliveryID); got != (domain.ChatDiscussionWorkReturnReceipt{}) ||
+		!errors.Is(err, ErrMemberToolDenied) || errors.Is(err, ErrNotFound) {
+		t.Errorf("typed probe hid the damaged marker: %+v %v", got, err)
+	}
+	if got, err := s.ResolveCoordinationDelivery(ctx, r.GroupID, r.DeliveryID); got != (CoordinationRoleState{}) ||
+		!errors.Is(err, ErrMemberToolDenied) || errors.Is(err, ErrNotFound) || errors.Unwrap(err) == ErrMemberToolDenied {
+		t.Errorf("legacy route treated damaged evidence as absence or as an overridable delegation denial: %+v %v", got, err)
+	}
+	if got, err := s.ResolveCoordinationDiscussionWorkReturnDelivery(ctx, r.GroupID, r.DeliveryID, r); got != (CoordinationRoleState{}) ||
+		!errors.Is(err, ErrMemberToolDenied) || errors.Is(err, ErrNotFound) {
+		t.Errorf("stale exact receipt bypassed damaged persisted evidence: %+v %v", got, err)
+	}
+	coordinationDecidePreserved(t, s, before)
 }
 
 func assertNoWorkReturnDiscussionReply(t *testing.T, f workReturnFixture, scope MemberToolScope) {
@@ -418,12 +536,50 @@ func TestChatDiscussionWorkReturnSchemaGuard(t *testing.T) {
 			checkResolve(t, f.s, f.groupID, "unknown-delivery", ErrConflict)
 		})
 	}
+	for _, tc := range []struct{ name, damage string }{
+		{"ledger-gap", `DELETE FROM main.schema_migrations WHERE version=17`},
+		{"future-marker", `INSERT INTO main.schema_migrations(version) VALUES(32)`},
+		{"replaced-marker", `UPDATE main.schema_migrations SET version=32 WHERE version=17`},
+		{"missing-fk-parent", `DROP TABLE main.task_work_handbacks`},
+		{"missing-guard-dependency", `DROP TABLE main.chat_candidates`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setupMessages(t)
+			d := queueDelivery(t, f.s, f.groupID, f.a, "schema-guard")
+			// The full v31 DDL remains, including trigger bodies that use the missing tables.
+			coordinationDecideExec(t, f.s, tc.damage)
+			checkResolve(t, f.s, f.groupID, d.ID, ErrConflict)
+			if state, err := f.s.ResolveCoordinationDelivery(ctx, f.groupID, d.ID); state != (CoordinationRoleState{}) ||
+				!errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
+				t.Errorf("legacy resolver treated damaged schema as compatible: %+v %v", state, err)
+			}
+		})
+	}
+	t.Run("all-v31-evidence-erased-after-open", func(t *testing.T) {
+		f := setupWorkReturn(t)
+		_, r := checkWorkReturnWake(t, f)
+		for _, row := range messageSequenceRows(t, f.s.db, `SELECT name FROM main.sqlite_schema
+		 WHERE type='trigger' AND name GLOB 'chat_discussion_work_return[s_]*'`) {
+			coordinationDecideExec(t, f.s, "DROP TRIGGER main."+row[0].(string))
+		}
+		coordinationDecideExec(t, f.s, dropTable+"; "+dropMarker)
+		messageSequenceLedger(t, f.s, 30)
+		before := messageSequenceSnapshot(t, f.s)
+		checkResolve(t, f.s, r.GroupID, r.DeliveryID, ErrConflict)
+		if state, err := f.s.ResolveCoordinationDelivery(ctx, r.GroupID, r.DeliveryID); state != (CoordinationRoleState{}) ||
+			!errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
+			t.Errorf("erasing all v31 evidence made the existing wake ordinary: %+v %v", state, err)
+		}
+		checkHandback(t, f)
+		messageSequencePreserved(t, f.s, before)
+	})
 	t.Run("sqlite-execution-error", func(t *testing.T) {
 		f := setupMessages(t)
 		coordinationDecideExec(t, f.s, `DROP TABLE main.schema_migrations`)
+		var cause *sqlite.Error
 		if got, err := f.s.ResolveChatDiscussionWorkReturnDelivery(ctx, f.groupID, "unknown-delivery"); got != (domain.ChatDiscussionWorkReturnReceipt{}) ||
-			err == nil || errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) {
-			t.Fatalf("SQLite error was lost or reclassified as a schema mismatch: %+v %v", got, err)
+			!errors.As(err, &cause) || errors.Is(err, ErrConflict) || errors.Is(err, ErrNotFound) || strings.Contains(err.Error(), "no such table") {
+			t.Fatalf("SQLite error was lost, exposed or reclassified as a schema mismatch: %+v %v", got, err)
 		}
 	})
 }

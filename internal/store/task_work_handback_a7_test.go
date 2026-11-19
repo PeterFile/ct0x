@@ -163,8 +163,9 @@ func TestBHandbackA7(t *testing.T) {
 			d.State != domain.DeliveryStateQueued || d.TurnID != "" {
 			t.Fatalf("wrong queued wake: %+v", d)
 		}
-		if role, err := s.ResolveCoordinationDelivery(ctx, f.groupID, delivery); err != nil || role.Provenance.Kind != CoordinationRoleOrdinary {
-			t.Fatalf("discussion return acquired work authority: %+v %v", role, err)
+		if role, err := s.ResolveCoordinationDelivery(ctx, f.groupID, delivery); err != nil ||
+			role.Provenance.Kind != CoordinationRoleOrdinary || role.Blocked != CoordinationMemberInactive {
+			t.Fatalf("legacy preparation must not start the discussion return: %+v %v", role, err)
 		}
 		coordinationDecideExec(t, s, "UPDATE members SET status='left' WHERE id=?", f.a)
 		reopened.EnableTaskWorkExecution()

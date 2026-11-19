@@ -5,63 +5,19 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"slices"
-	"strings"
 	"time"
 
 	"agentworkspace/internal/domain"
 )
-
-var chatDiscussionWorkReturnVersion = slices.Index(migrations, chatDiscussionWorkReturnSchema) + 1
-
-var chatDiscussionWorkReturnDDL = func() string {
-	// In immutable v31, column-one CREATEs start statements and column-one
-	// comments separate them. SQLite stores only the statement, without ';'.
-	ddl := strings.Split(chatDiscussionWorkReturnSchema, "\nCREATE ")[1:]
-	for i, body := range ddl {
-		body, _, _ = strings.Cut(body, "\n--")
-		ddl[i] = "CREATE " + strings.TrimSuffix(strings.TrimSpace(body), ";")
-	}
-	encoded, _ := json.Marshal(ddl) // A slice of strings always marshals.
-	return string(encoded)
-}()
-
-// A missing registration is legacy only if the return footprint is absent.
-// With a marker, require the original table (including composite foreign
-// keys) and every v31 trigger body, including triggers on other tables.
-func chatDiscussionWorkReturnInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
-	var state int
-	err := tx.QueryRowContext(ctx, `WITH footprint AS (
-	 SELECT type,sql FROM main.sqlite_schema WHERE name='chat_discussion_work_returns' COLLATE NOCASE
-	 OR (type='trigger' AND lower(name) GLOB 'chat_discussion_work_return[s_]*')
-	)
-	SELECT CASE
-	 WHEN EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?1) THEN
-	   CASE WHEN EXISTS(
-	     SELECT value FROM json_each(?2)
-	     EXCEPT SELECT sql FROM footprint WHERE type IN ('table','trigger')
-	   ) THEN -1 ELSE 1 END
-	 WHEN (?1>0 AND EXISTS(SELECT 1 FROM main.schema_migrations WHERE version>?1))
-	   OR EXISTS(SELECT 1 FROM footprint) THEN -1
-	 ELSE 0 END`, chatDiscussionWorkReturnVersion, chatDiscussionWorkReturnDDL).Scan(&state)
-	if err != nil {
-		return false, err
-	}
-	if state == -1 {
-		return false, fmt.Errorf("%w：讨论工作回传迁移记录与数据库结构不一致", ErrConflict)
-	}
-	return state == 1, nil
-}
 
 // chatDiscussionWorkReturnInTx is called only from HandbackWork's fenced
 // owner transaction, after B has persisted and verified its own receipt.
 // Propagate errors to the caller's rollback. Do not replace B's receipt or
 // invoke this on a different transaction. replay is B's mutation lookup
 // result, not an input option: old receipts must never wake retroactively.
-func chatDiscussionWorkReturnInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, handback domain.TaskWorkHandback, replay bool) (*domain.ChatDiscussionWorkReturnReceipt, error) {
-	installed, err := chatDiscussionWorkReturnInstalledInTx(ctx, tx)
+func (s *Store) chatDiscussionWorkReturnInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, handback domain.TaskWorkHandback, replay bool) (*domain.ChatDiscussionWorkReturnReceipt, error) {
+	installed, err := s.chatDiscussionWorkReturnInstalledInTx(ctx, tx)
 	if err != nil || !installed {
 		return nil, err
 	}

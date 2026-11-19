@@ -241,8 +241,9 @@ func TestChatDiscussionWorkReturnPublishesAndReplaysAfterSupplement(t *testing.T
 	if _, err := s.ResolveChatDiscussionWorkReturnDelivery(ctx, f.groupID, f.invite.Event.DeliveryID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("ordinary invitation resolved as work return: %v", err)
 	}
-	if role, err := s.ResolveCoordinationDelivery(ctx, f.groupID, r.DeliveryID); err != nil || role.Provenance.Kind != CoordinationRoleOrdinary {
-		t.Fatalf("return got a Work role: %+v %v", role, err)
+	if role, err := s.ResolveCoordinationDelivery(ctx, f.groupID, r.DeliveryID); err != nil ||
+		role.Provenance.Kind != CoordinationRoleOrdinary || role.Blocked != CoordinationMemberInactive {
+		t.Fatalf("legacy preparation must leave the typed return queued: %+v %v", role, err)
 	}
 	followup, candidate := discussionArrive(t, s, f.groupID, r.DeliveryID)
 	if followup.MemberID != f.a || followup.TopicID != r.TopicID || followup.ConversationID != r.ConversationID {
@@ -367,7 +368,7 @@ func TestChatDiscussionWorkReturnRequiresPersistedScope(t *testing.T) {
 			bad := h
 			change(&bad)
 			r, err := workMemberTx(ctx, f.s, f.owner, "测试讨论工作回传", func(tx *sql.Tx) (*domain.ChatDiscussionWorkReturnReceipt, error) {
-				return chatDiscussionWorkReturnInTx(ctx, tx, f.owner, bad, false)
+				return f.s.chatDiscussionWorkReturnInTx(ctx, tx, f.owner, bad, false)
 			})
 			if !errors.Is(err, ErrMemberToolDenied) || r != nil {
 				t.Fatalf("unbound result published: %+v %v", r, err)
@@ -409,12 +410,17 @@ func TestChatDiscussionWorkReturnLegacyReplay(t *testing.T) {
 	f.settleIntake(t)
 	f.startWorker(t)
 	messageSequenceLedger(t, f.s, 30)
-	if got, err := f.s.ResolveChatDiscussionWorkReturnDelivery(ctx, f.groupID, f.invite.Event.DeliveryID); got != (domain.ChatDiscussionWorkReturnReceipt{}) || !errors.Is(err, ErrNotFound) {
+	migrations = all // The existing handle still has the schema it opened, not the global latest version.
+	d := queueDelivery(t, f.s, f.otherID, f.foreign, "旧版讨论")
+	if got, err := f.s.ResolveChatDiscussionWorkReturnDelivery(ctx, f.otherID, d.ID); got != (domain.ChatDiscussionWorkReturnReceipt{}) || err != ErrNotFound {
 		t.Fatalf("legacy v30 delivery must have no typed return: %+v %v", got, err)
+	}
+	if role, err := f.s.ResolveCoordinationDelivery(ctx, f.otherID, d.ID); err != nil ||
+		role.Provenance.Kind != CoordinationRoleOrdinary || role.Blocked != CoordinationReady {
+		t.Fatalf("legacy v30 ordinary delivery was blocked: %+v %v", role, err)
 	}
 	h := workReturnHandback(t, f.s, f.owner)
 
-	migrations = all
 	s := queueHandle(t, f.path, false)
 	s.EnableTaskWorkExecution()
 	before := messageSequenceSnapshot(t, s)
@@ -453,6 +459,10 @@ func TestChatDiscussionWorkReturnAtomicAndImmutable(t *testing.T) {
 	coordinationDecideExec(t, s, `DELETE FROM message_command_sources WHERE message_id=?`, r.OriginMessageID)
 	if got, err := s.ResolveChatDiscussionWorkReturnDelivery(ctx, r.GroupID, r.DeliveryID); !errors.Is(err, ErrMemberToolDenied) || got.MessageID != "" {
 		t.Fatalf("resolver fell through on lost source: %+v %v", got, err)
+	}
+	if got, err := s.ResolveCoordinationDelivery(ctx, r.GroupID, r.DeliveryID); got != (CoordinationRoleState{}) ||
+		!errors.Is(err, ErrMemberToolDenied) || errors.Is(err, ErrNotFound) {
+		t.Errorf("legacy resolver fell through on lost source: %+v %v", got, err)
 	}
 	assertNoWorkReturn(t, s, f.owner, ErrMemberToolDenied)
 }

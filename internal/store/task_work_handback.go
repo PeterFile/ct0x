@@ -79,7 +79,7 @@ func (s *Store) HandbackWork(ctx context.Context, scope MemberToolScope, input d
 		}
 		// Pass the persisted receipt and the actual lookup result. A legacy
 		// replay must not publish a return, and a callback error rolls back B.
-		_, err = chatDiscussionWorkReturnInTx(ctx, tx, scope, out, replayed)
+		_, err = s.chatDiscussionWorkReturnInTx(ctx, tx, scope, out, replayed)
 		return out, err
 	})
 }
