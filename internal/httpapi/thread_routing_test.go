@@ -46,6 +46,46 @@ func TestThreadRoutingNormalEntry(t *testing.T) {
 	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 409, "conflict")
 }
 
+func TestThreadRoutingOpeningFollowupClause(t *testing.T) {
+	a := openMessageAPI(t, "")
+	requireThreadRoutingFixture(t, a)
+	group := newGroup(t, a, "opening")
+	path := "/api/v1/groups/" + group.ID + "/messages"
+	post := func(content string) domain.Message {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{"content": content, "recipient_ids": []string{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decoded[domain.Message](t, a.request("POST", path, string(body)), 201)
+	}
+	const opening = "新议题：导出 BUG EX-421。跟进导出故障。"
+	export := post(opening)
+	if export.TopicID == "" || export.Content != opening || len(export.Deliveries) != 0 {
+		t.Fatalf("opening with action prose did not persist its subject as public only: %+v", export)
+	}
+	if followup := post("跟进那个导出 BUG"); followup.TopicID != export.TopicID {
+		t.Fatalf("named followup: topic=%q, want %q", followup.TopicID, export.TopicID)
+	}
+	other := post("新议题：数据库连接告警 OPS-61")
+	if other.TopicID == "" || other.TopicID == export.TopicID {
+		t.Fatalf("second fixture did not create a distinct topic: %+v", other)
+	}
+	for _, content := range []string{
+		"新议题：导出 BUG EX-421。跟进数据库连接告警。",
+		"新议题：索引切换计划。跟进数据库连接告警。",
+		"新议题：索引切换计划。跟进 OPS-61。",
+		"新议题：导出 BUG EX-421。跟进另一个单号 EX-422。",
+	} {
+		if got := post(content); got.TopicID != "" || len(got.Deliveries) != 0 {
+			t.Errorf("conflicting evidence escaped main: %q → %+v", content, got)
+		}
+	}
+	if got := post("新议题：导出 BUG EX-421。跟进导出 BUG。"); got.TopicID != export.TopicID {
+		t.Fatalf("agreeing named subject did not return to its topic: %+v", got)
+	}
+}
+
 func TestThreadRoutingColdIssueName(t *testing.T) {
 	a := openMessageAPI(t, "")
 	requireThreadRoutingFixture(t, a)

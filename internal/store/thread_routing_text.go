@@ -56,6 +56,8 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 	active := unquotedThreadText(body)
 	clauses := strings.FieldsFunc(active, func(r rune) bool { return strings.ContainsRune("\n。！；，;!,", r) })
 	var title, exact string
+	var openingFollowup bool
+	var aliases map[string]struct{}
 	for i, clause := range clauses {
 		clause = strings.TrimSpace(clause)
 		switch {
@@ -69,12 +71,25 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 				title = ""
 			}
 		case threadCurrent.MatchString(clause):
-			if route.current {
+			if route.current && title == "" {
 				route.conflict = true
 				return route, nil
 			}
 			route.current = true
-			exact = threadName(threadCurrent.ReplaceAllString(clause, ""))
+			subject := threadName(threadCurrent.ReplaceAllString(clause, ""))
+			if title == "" {
+				exact = subject
+			} else {
+				// An action prefix after a declared title is not a second
+				// subject unless the remaining text supplies evidence.
+				openingFollowup = true
+			}
+			if subject != "" && len(issueTokens(subject)) == 0 {
+				if aliases == nil {
+					aliases = make(map[string]struct{})
+				}
+				aliases[threadTitleKey(subject)] = struct{}{}
+			}
 		case threadComparison.MatchString(clause):
 			route.comparison = true
 			clauses[i] = ""
@@ -83,14 +98,10 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 	if route.comparison {
 		active = strings.Join(clauses, "\n")
 	}
-	var alias string
 	if title != "" {
 		exact = title
-	} else if exact != "" && len(issueTokens(exact)) == 0 {
-		// Only an explicit current subject can use a shortened name. In
-		// particular, an opening with a different issue must not reuse it.
-		alias = threadTitleKey(exact)
 	}
+	titleIssues := issueTokens(title)
 	if exact != "" {
 		var topic string
 		err := tx.QueryRowContext(ctx, `SELECT topic_id FROM main.thread_routing_topics
@@ -112,20 +123,28 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return route, err
 		}
+		if openingFollowup && (len(titleIssues) == 0 || titleIssues[0] != issues[0]) && (topic == "" || topic != route.topic) {
+			route.conflict = true
+		}
 		route.add(topic)
 	}
 	if active == "" {
 		return route, nil
 	}
-	names, complete, err := threadTitleEvidenceInTx(ctx, tx, group, active, alias)
+	names, complete, err := threadTitleEvidenceInTx(ctx, tx, group, active, aliases)
 	if err != nil {
 		return route, err
+	}
+	// A known name elsewhere in the message cannot replace an unmatched
+	// declared title. In an incomplete catalog it may be unsafe to decide.
+	if openingFollowup && (!complete || (!route.matched && names.matched)) {
+		route.conflict = true
 	}
 	route.add(names.topic)
 	route.conflict = route.conflict || names.conflict
 	if title != "" && !route.conflict && route.topic == "" && complete {
 		var issue string
-		if titleIssues := issueTokens(title); len(titleIssues) == 1 {
+		if len(titleIssues) == 1 {
 			issue = titleIssues[0]
 		}
 		route.newTitle, route.newIssue = title, issue
@@ -133,7 +152,7 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 	return route, nil
 }
 
-func threadTitleEvidenceInTx(ctx context.Context, tx *sql.Tx, group, active, alias string) (threadTopicEvidence, bool, error) {
+func threadTitleEvidenceInTx(ctx context.Context, tx *sql.Tx, group, active string, aliases map[string]struct{}) (threadTopicEvidence, bool, error) {
 	var evidence threadTopicEvidence
 	rows, err := tx.QueryContext(ctx, `SELECT topic_id,title_key,issue_id FROM main.thread_routing_topics
 	 WHERE group_id=? ORDER BY topic_id LIMIT ?`, group, maxThreadTitles+1)
@@ -152,8 +171,11 @@ func threadTitleEvidenceInTx(ctx context.Context, tx *sql.Tx, group, active, ali
 		if err := rows.Scan(&topic, &key, &issue); err != nil {
 			return evidence, false, err
 		}
-		if (!threadGeneric.MatchString(key) && hasThreadToken(text, key, isNonHanWord)) ||
-			(alias != "" && alias == threadIssueAlias(key, issue)) {
+		var aliasMatch bool
+		if len(aliases) != 0 {
+			_, aliasMatch = aliases[threadIssueAlias(key, issue)]
+		}
+		if aliasMatch || (!threadGeneric.MatchString(key) && hasThreadToken(text, key, isNonHanWord)) {
 			evidence.add(topic)
 		}
 	}
