@@ -377,7 +377,7 @@ func TestBoundWorkDelegationTransport(t *testing.T) {
 
 const testReportBody = `{"kind":"progress","summary":"Checked the notes"}`
 
-func TestBoundWorkReportReadTransport(t *testing.T) {
+func TestBoundWorkReportReadSelectsExactOwnerReport(t *testing.T) {
 	ctx := t.Context()
 	f := newBoundWorkReportFixture(t)
 	f.delegate(t, nil, nil, false)
@@ -613,7 +613,7 @@ func (f *boundWorkReportFixture) reportKey(t *testing.T, text string) string {
 	return key
 }
 
-func TestBoundWorkReportMCPUnknownReplay(t *testing.T) {
+func TestBoundWorkReportMCPUnknownWriteReplay(t *testing.T) {
 	ctx := t.Context()
 	f := newBoundWorkReportFixture(t)
 	f.delegate(t, nil, nil, false)
