@@ -36,6 +36,44 @@ func TestThreadStateMissingOwnMarker(t *testing.T) {
 	}
 }
 
+func TestThreadStateHeadMismatchFailsClosed(t *testing.T) {
+	for _, tc := range []struct{ name, guard, damage string }{
+		{"missing", "thread_state_head_no_delete", `DELETE FROM thread_state_heads`},
+		{"behind the revision log", "thread_state_head_update", `UPDATE thread_state_heads SET revision=1`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := t.Context()
+			s := requireThreadStateStoreFixture(t)
+			g := group(t, s)
+			scope := domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: g.ID, TopicID: "export"}}
+			m, err := s.CreateLocalUserMessage(ctx, MessageRequest{GroupID: g.ID, TopicID: scope.TopicID, ActorID: "user", Content: "confirm the export"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i, key := range []string{"first", "second"} {
+				_, err := s.SetLocalThreadState(ctx, scope, ThreadStateUpdate{ExpectedRevision: int64(i), Slot: i,
+					Kind: domain.ThreadStateGoal, Action: "set", Content: m.Content, SourceMessage: m.ID}, key)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := s.db.Exec(tc.damage); err == nil {
+				t.Fatal("unprotected durable head")
+			}
+			var ddl string
+			if err := s.db.QueryRow(`SELECT sql FROM sqlite_schema WHERE name=?`, tc.guard).Scan(&ddl); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.Exec(`DROP TRIGGER ` + tc.guard + `; ` + tc.damage + `; ` + ddl); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := s.GetLocalThreadState(ctx, scope, 0); !errors.Is(err, errThreadStateIntegrity) || got.Revision != 0 || got.Records != nil {
+				t.Fatalf("state returned despite %s head: %+v, %v", tc.name, got, err)
+			}
+		})
+	}
+}
+
 func TestThreadStateStoredEvidenceFailsClosed(t *testing.T) {
 	for _, tc := range []struct {
 		name, guard, damage string

@@ -37,13 +37,15 @@ const threadStateSnapshotSQL = `WITH slots(slot) AS (VALUES(0),(1),(2),(3),(4),(
 func readThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.ThreadStateScope, revision int64) (domain.ThreadStateSnapshot, error) {
 	var empty domain.ThreadStateSnapshot
 	args := []any{sql.Named("grp", scope.GroupID), sql.Named("topic", scope.TopicID), sql.Named("task", scope.TaskID), sql.Named("task_revision", scope.TaskRevision)}
-	// The positive, unique revisions must be 1..latest. Check even revisions
-	// hidden by a later slot update, using only this scope's revision range.
+	// The head independently records the committed tip, so a surviving
+	// contiguous prefix cannot look current (or empty). Count detects gaps.
+	var head sql.NullInt64
 	var latest, count int64
-	if err := tx.QueryRowContext(ctx, `SELECT coalesce(max(revision),0), count(*) FROM thread_state_revisions WHERE `+threadStateKey, args...).Scan(&latest, &count); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT (SELECT revision FROM thread_state_heads WHERE `+threadStateKey+`),
+	 coalesce(max(revision),0), count(*) FROM thread_state_revisions WHERE `+threadStateKey, args...).Scan(&head, &latest, &count); err != nil {
 		return empty, err
 	}
-	if latest != count {
+	if latest != count || head.Valid != (latest > 0) || head.Int64 != latest {
 		return empty, errThreadStateIntegrity
 	}
 	if revision > latest {

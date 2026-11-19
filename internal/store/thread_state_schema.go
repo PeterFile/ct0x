@@ -28,11 +28,34 @@ CREATE TABLE thread_state_revisions (
         REFERENCES thread_state_revisions(group_id, topic_id, task_id, task_revision, revision)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX thread_state_by_slot ON thread_state_revisions(group_id, topic_id, task_id, task_revision, slot, revision);
+-- The independent head survives a lost revision row. Never cascade deletion.
+CREATE TABLE thread_state_heads (
+    group_id TEXT NOT NULL,
+    topic_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    task_revision INTEGER NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision>0),
+    PRIMARY KEY(group_id, topic_id, task_id, task_revision),
+    FOREIGN KEY(group_id, topic_id, task_id, task_revision, revision)
+        REFERENCES thread_state_revisions(group_id, topic_id, task_id, task_revision, revision)
+) STRICT, WITHOUT ROWID;
+CREATE TRIGGER thread_state_head_insert BEFORE INSERT ON thread_state_heads
+WHEN NEW.revision<>1 OR EXISTS(SELECT 1 FROM thread_state_heads WHERE (group_id,topic_id,task_id,task_revision)=
+    (NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision))
+BEGIN SELECT RAISE(ABORT, '话题状态头不可替换'); END;
+CREATE TRIGGER thread_state_head_update BEFORE UPDATE ON thread_state_heads
+WHEN (NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision) IS NOT (OLD.group_id,OLD.topic_id,OLD.task_id,OLD.task_revision)
+    OR NEW.revision<>OLD.revision+1
+BEGIN SELECT RAISE(ABORT, '话题状态头必须按序前进且范围不可变'); END;
+CREATE TRIGGER thread_state_head_no_delete BEFORE DELETE ON thread_state_heads
+BEGIN SELECT RAISE(ABORT, '话题状态头不可删除'); END;
 CREATE TRIGGER thread_state_append BEFORE INSERT ON thread_state_revisions
 BEGIN
     -- This also prevents REPLACE, independently of recursive_triggers.
     SELECT RAISE(ABORT, '状态修订必须连续且不可替换') WHERE NEW.revision<>1+coalesce((
         SELECT max(revision) FROM thread_state_revisions WHERE (group_id,topic_id,task_id,task_revision)=
+        (NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision)),0) OR NEW.revision<>1+coalesce((
+        SELECT revision FROM thread_state_heads WHERE (group_id,topic_id,task_id,task_revision)=
         (NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision)),0);
     SELECT RAISE(ABORT, '状态任务与话题或版本不匹配') WHERE NEW.task_id<>'' AND NOT EXISTS(
         SELECT 1` + threadStateTaskRelation + `
@@ -55,6 +78,14 @@ BEGIN
         SELECT 1 FROM thread_state_revisions WHERE (group_id,topic_id,task_id,task_revision,revision,slot)=
         (NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision,NEW.invalidates_revision,NEW.slot));
 END;
+-- The revision, head and idempotency receipt commit in the same transaction.
+CREATE TRIGGER thread_state_advance_head AFTER INSERT ON thread_state_revisions
+BEGIN
+    INSERT INTO thread_state_heads(group_id,topic_id,task_id,task_revision,revision)
+        SELECT NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision,NEW.revision WHERE NEW.revision=1;
+    UPDATE thread_state_heads SET revision=NEW.revision WHERE NEW.revision>1 AND (group_id,topic_id,task_id,task_revision)=
+        (NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision);
+END;
 CREATE TRIGGER thread_state_no_update BEFORE UPDATE ON thread_state_revisions
 BEGIN SELECT RAISE(ABORT, '状态修订不可修改'); END;
 CREATE TRIGGER thread_state_no_delete BEFORE DELETE ON thread_state_revisions
@@ -74,16 +105,19 @@ func threadStateInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	var latest, found, valid int
 	var marked bool
 	err := tx.QueryRowContext(ctx, `SELECT (SELECT coalesce(max(version),0) FROM main.schema_migrations),
-	 EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?), count(*), count(CASE WHEN tbl_name='thread_state_revisions' AND (
+	 EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?), count(*), count(CASE WHEN (tbl_name='thread_state_revisions' AND (
 	 (name='thread_state_revisions' AND type='table') OR (name='thread_state_by_slot' AND type='index') OR
-	 (name IN ('thread_state_append','thread_state_no_update','thread_state_no_delete') AND type='trigger')) THEN 1 END)
+	 (name IN ('thread_state_append','thread_state_advance_head','thread_state_no_update','thread_state_no_delete') AND type='trigger')))
+	 OR (tbl_name='thread_state_heads' AND ((name='thread_state_heads' AND type='table') OR
+	 (name IN ('thread_state_head_insert','thread_state_head_update','thread_state_head_no_delete') AND type='trigger'))) THEN 1 END)
 	 FROM main.sqlite_schema WHERE name IN
-	 ('thread_state_revisions','thread_state_by_slot','thread_state_append','thread_state_no_update','thread_state_no_delete')`,
+	 ('thread_state_revisions','thread_state_by_slot','thread_state_append','thread_state_advance_head','thread_state_no_update','thread_state_no_delete',
+	  'thread_state_heads','thread_state_head_insert','thread_state_head_update','thread_state_head_no_delete')`,
 		threadStateSchemaVersion).Scan(&latest, &marked, &found, &valid)
 	if err != nil {
 		return false, err
 	}
-	if marked && valid == 5 {
+	if marked && valid == 10 {
 		return true, nil
 	}
 	if !marked && found == 0 && (threadStateSchemaVersion == 0 || latest < threadStateSchemaVersion) {
