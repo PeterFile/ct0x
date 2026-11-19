@@ -8,6 +8,8 @@ import { member } from "./test/members";
 import { message } from "./test/messages";
 
 const flush = (ms = 0) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+const batch = (minute: string) => Array.from({ length: 50 }, (_, i) => ({ ...message,
+  id: `batch-${minute}-${49 - i}`, created_at: `2026-10-30T12:${minute}:${String(49 - i).padStart(2, "0")}Z`, deliveries: [] }));
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 it("refreshes the actual roster from the existing chat feed after a platform join event", async () => {
@@ -52,14 +54,47 @@ it("refreshes the actual roster from the existing chat feed after a platform joi
   expect(roster).toHaveBeenCalledTimes(2);
 });
 
+it("refreshes once when a join is already outside the first successful latest page", async () => {
+  vi.useFakeTimers();
+  const firstLatest = deferred<Response>();
+  const joined = { ...member, name: "首次读页漏掉的成员", creator_id: "system" };
+  const notice = { ...message, id: "early-join", sender_id: "platformnotice", source_kind: "platform" as const,
+    source_id: `group_background_join:${joined.id}`, deliveries: [] };
+  let history = [message];
+  const latestPage = () => page(history.slice(0, 50), history.length > 50 ? "older-messages" : "");
+  const messages = vi.fn(async (_route: string) => latestPage()).mockReturnValueOnce(firstLatest.promise);
+  const roster = vi.fn(async () => page(history.includes(notice) ? [joined] : []));
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+    const route = String(input);
+    if (route.startsWith("/api/v1/groups?")) return page([group]);
+    if (route.startsWith("/api/v1/providers?")) return page();
+    if (route.includes("/members?")) return roster();
+    if (route.includes("/messages?")) return messages(route);
+    throw new Error(`Unexpected test route ${route}`);
+  });
+  render(<App />);
+  await flush();
+  fireEvent.click(screen.getByRole("button", { name: group.name }));
+  fireEvent.click(screen.getByRole("button", { name: "成员" }));
+  await flush();
+  const members = within(screen.getByRole("list", { name: "成员列表" }));
+  expect(roster).toHaveBeenCalledTimes(1);
+  expect(members.queryAllByRole("listitem")).toHaveLength(0);
+
+  history = [...batch("01"), notice, ...history];
+  await act(async () => firstLatest.resolve(latestPage()));
+  expect(members.getByRole("button", { name: joined.name })).toBeVisible();
+  await flush(15000);
+  expect(roster).toHaveBeenCalledTimes(2);
+  expect(messages.mock.calls.map(([route]) => route)).toEqual(Array(4).fill(`/api/v1/groups/${group.id}/messages?limit=50`));
+});
+
 it("refreshes the visible roster when a burst pushes a join out of the latest page", async () => {
   vi.useFakeTimers();
   const joined = { ...member, name: "跨页加入的成员", creator_id: "system" };
   const older = { ...message, id: "loaded-history", created_at: "2026-10-30T11:59:00Z", deliveries: [] };
   const notice = { ...message, id: "missed-join", sender_id: "platformnotice", source_kind: "platform" as const,
     source_id: `group_background_join:${joined.id}`, created_at: "2026-10-30T12:01:00Z", deliveries: [] };
-  const batch = (minute: string) => Array.from({ length: 50 }, (_, i) => ({ ...message,
-    id: `batch-${minute}-${49 - i}`, created_at: `2026-10-30T12:${minute}:${String(49 - i).padStart(2, "0")}Z`, deliveries: [] }));
   let history = [...batch("00"), older], latestCursor = "history-start";
   const roster = vi.fn(async () => page(history.includes(notice) ? [joined] : []));
   const messages = vi.fn(async (route: string) => route.endsWith("&before=history-start") ? page([older], "history-continuation")
@@ -80,7 +115,7 @@ it("refreshes the visible roster when a burst pushes a join out of the latest pa
   fireEvent.click(screen.getByRole("button", { name: "加载更早消息" }));
   fireEvent.change(screen.getByRole("textbox", { name: "消息内容" }), { target: { value: "未发送草稿" } });
   await flush(5000);
-  expect(roster).toHaveBeenCalledTimes(1);
+  expect(roster).toHaveBeenCalledTimes(2);
   const olderArticle = screen.getByRole("article", { name: `消息 ${older.id}` });
 
   history = [...batch("02"), notice, ...history];
@@ -92,7 +127,7 @@ it("refreshes the visible roster when a burst pushes a join out of the latest pa
   const members = within(screen.getByRole("list", { name: "成员列表" }));
   expect(members.getByRole("button", { name: joined.name })).toBeVisible();
   await flush(5000);
-  expect(roster).toHaveBeenCalledTimes(2);
+  expect(roster).toHaveBeenCalledTimes(3);
   fireEvent.click(screen.getByRole("button", { name: "加载更早消息" }));
   await flush();
   expect(messages.mock.calls.at(-1)?.[0]).toBe(`/api/v1/groups/${group.id}/messages?limit=50&before=history-continuation`);
@@ -177,4 +212,35 @@ it("defers and retries a join refresh without disturbing older roster pages", as
   fireEvent.click(screen.getByRole("button", { name: "加载更多成员" }));
   await flush();
   expect(roster.mock.calls[4][0]).toBe(`/api/v1/groups/${group.id}/members?limit=50&before=even-older-page`);
+});
+
+it.each(["old-continuation", ""])("fills a disjoint roster gap from the fresh cursor (old cursor: %j)", async oldCursor => {
+  vi.useFakeTimers();
+  const older = { ...member, id: "old-member", name: "早期成员" };
+  const gap = { ...member, id: "gap-member", name: "间隔中的新成员" };
+  const burst = Array.from({ length: 50 }, (_, i) => ({ ...member, id: `new-${i}`, name: `新成员 ${i}` }));
+  const firstRoute = `/api/v1/groups/${group.id}/members?limit=50`;
+  const roster = vi.fn(async (input: RequestInfo | URL) => String(input) === `${firstRoute}&before=after-burst`
+    ? page([gap, member, older], oldCursor) : page())
+    .mockResolvedValueOnce(page([member], "older-page"))
+    .mockResolvedValueOnce(page([older], oldCursor))
+    .mockResolvedValueOnce(page(burst, "after-burst"));
+  vi.stubGlobal("fetch", roster);
+  render(<Members groupId={group.id} catalogueActive={false} />);
+  await flush();
+  fireEvent.click(screen.getByRole("button", { name: "加载更多成员" }));
+  await flush();
+  fireEvent.click(screen.getByRole("button", { name: older.name }));
+
+  act(() => refreshBackgroundRoster(group.id));
+  await flush();
+  const members = within(screen.getByRole("list", { name: "成员列表" }));
+  expect(members.getByRole("button", { name: member.name })).toBeVisible();
+  expect(members.getByRole("button", { name: older.name, pressed: true })).toBeVisible();
+  expect(members.getByRole("button", { name: burst[0].name })).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "加载更多成员" }));
+  await flush();
+  expect(roster.mock.calls[3][0]).toBe(`${firstRoute}&before=after-burst`);
+  expect(members.getByRole("button", { name: gap.name })).toBeVisible();
+  expect(members.getByRole("button", { name: older.name, pressed: true })).toBeVisible();
 });

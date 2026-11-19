@@ -42,13 +42,11 @@ export function useMessageFeed(groupId: string, active: boolean, pollDetails = t
       close: () => controllers.current.delete(controller) };
   }, []);
   const observeLatest = useCallback((items: Message[], next: string, version: number) => {
-    const previous = latestHead.current;
-    if (previous?.groupId === groupId) {
-      if (previous.version > version) return;
-      // More history exists and the prior head is no longer visible. A join
-      // may have fallen between windows; there is no need to page that range.
-      if (next && !items.some(message => message.id === previous.id)) setLatestGap(version);
-    }
+    const previous = latestHead.current?.groupId === groupId ? latestHead.current : null;
+    if (previous && previous.version > version) return;
+    // Older history may hide a join if there is no prior head or it fell
+    // outside this window. Revalidate the roster without paging that range.
+    if (next && (!previous || !items.some(message => message.id === previous.id))) setLatestGap(version);
     latestHead.current = { groupId, id: items[0]?.id, version };
   }, [groupId]);
   const loadPage = useCallback(async (before = "", reset = true) => {

@@ -83,6 +83,7 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
   const [request, setRequest] = useState({ before: "", version: 0, background: false });
   const [page, setPage] = useState({ pending: true, error: "", next: "", loadedOlder: false });
   const readBusy = useRef(false), refreshQueued = useRef(false);
+  const firstPageIds = useRef(new Set<string>());
   const [mutation, setMutation] = useState({ pending: false, error: "", uncertain: false });
   const confirmed = useRef<{ member: Member; afterRead: number }[]>([]);
   const readSequence = useRef(0);
@@ -119,6 +120,8 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
     setPage(previous => ({ ...previous, pending: true, error: "" }));
     listMembers(groupId, request.before, controller.signal).then(result => {
       if (ignore) return;
+      const overlapsFirstPage = !request.before && result.items.some(member => firstPageIds.current.has(member.id));
+      if (!request.before) firstPageIds.current = new Set(result.items.map(member => member.id));
       // A receipt only outranks reads already started when it arrived.
       confirmed.current = confirmed.current.filter(receipt => receipt.afterRead >= read);
       const protectedMembers = confirmed.current.map(receipt => receipt.member);
@@ -131,8 +134,8 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
         return unique([...protectedMembers, ...observed]);
       });
       setPage(previous => {
-        // Background revalidation must not rewind the user's older-page cursor.
-        const keepCursor = request.background && previous.loadedOlder && Boolean(result.next_cursor);
+        // Retained rows alone do not prove continuity with the old cursor.
+        const keepCursor = request.background && previous.loadedOlder && overlapsFirstPage && Boolean(result.next_cursor);
         return { pending: false, error: "", next: keepCursor ? previous.next : result.next_cursor,
           loadedOlder: keepCursor || Boolean(request.before) };
       });
