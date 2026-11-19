@@ -28,7 +28,7 @@ func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, re
 	if err != nil {
 		return domain.Message{}, storeError("读取用户消息回执失败", err)
 	}
-	message, err := createMessageInTx(ctx, tx, r, recipients)
+	message, err := createMessageWithQuoteInTx(ctx, tx, r, recipients, true)
 	if err != nil {
 		return domain.Message{}, storeError("创建用户消息失败", err)
 	}

@@ -221,12 +221,17 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 		operationError(w, store.ErrInvalid)
 		return
 	}
-	var input memberToolSendInput
+	var input struct {
+		// Only the plain publication accepts a quote. The assessment codecs and
+		// MCP continuation fingerprint still operate on the original narrow DTO.
+		memberToolSendInput
+		QuoteID messageQuoteID `json:"reply_to_message_id"`
+	}
 	if !decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: &input, required: sendMessageNeedsScalars}) {
 		return
 	}
 	if input.Assessment.present {
-		if input.RecipientIDs.present {
+		if input.RecipientIDs.present || input.QuoteID != "" {
 			memberToolError(w, store.ErrInvalid)
 			return
 		}
@@ -254,7 +259,9 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 			recipients[i] = id.value
 		}
 	}
-	message, err := a.tools.SendMessage(r.Context(), token, platform.MemberMessageInput{Content: input.Content.value, RecipientIDs: recipients}, key)
+	message, err := a.tools.SendMessage(r.Context(), token, platform.MemberMessageInput{
+		Content: input.Content.value, RecipientIDs: recipients, ReplyToMessageID: string(input.QuoteID),
+	}, key)
 	if err != nil {
 		memberToolError(w, err)
 		return

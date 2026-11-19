@@ -117,6 +117,68 @@ it("retains the frozen selected-ID operation through hidden pending work, roster
   expect(JSON.parse(String(original.body))).toEqual({ content: "A 原始内容", recipient_ids: [twin.id] });
   view.rerender(scope(other.id)); expect(content()).toHaveValue("B 的草稿");
 });
+it("previews and cancels a quote without clearing text or @, then freezes the whole request on retry", async () => {
+  const original = { ...message, id: "old-scope", sender_id: twin.id, source_kind: "member", source_id: "turn:old", deliveries: [], content: "只看本季度" };
+  const reply_to = { message_id: original.id, group_id: group.id, topic_id: original.topic_id, sender_id: twin.id,
+    sender_name: twin.name, source_kind: "member", excerpt: original.content };
+  const pending = deferred<Response>();
+  writes.mockReturnValueOnce(pending.promise).mockResolvedValueOnce(json({ ...message, id: "reply",
+    content: `@${twin.name} 那去年同期呢？`, deliveries: [], reply_to }, 201));
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => init?.method === "POST" ? writes(input, init)
+    : Promise.resolve(page(String(input).includes(group.id) ? [original] : [])));
+  const view = render(scope());
+  const reply = await screen.findByRole("button", { name: `回复，消息 ${original.id}` });
+  change("@"); fireEvent.click(choice(twin.id));
+  const draft = `@${twin.name} 那去年同期呢？`;
+  change(draft);
+  fireEvent.click(reply);
+  const form = within(screen.getByRole("form", { name: "发送消息" }));
+  expect(form.getByText(/只看本季度/)).toBeVisible();
+  expect(form.getByText(twin.name)).toBeVisible();
+  expect(content()).toHaveFocus();
+  fireEvent.click(form.getByRole("button", { name: "取消引用" }));
+  expect(form.queryByText(/只看本季度/)).not.toBeInTheDocument();
+  expect(content()).toHaveValue(draft);
+  expect(chosen().getByText(new RegExp(twin.id))).toBeVisible();
+
+  fireEvent.click(reply); submit(); const saved = attempt();
+  expect(JSON.parse(String(saved.body))).toEqual({ content: draft, recipient_ids: [twin.id], reply_to_message_id: original.id });
+  view.rerender(scope(other.id)); await screen.findByText("尚无消息，可发送第一条讨论。");
+  change("别的群的草稿");
+  await act(async () => pending.resolve(json({}, 503)));
+  view.rerender(scope(group.id, []));
+  expect(form.getByRole("button", { name: "取消引用" })).toBeDisabled();
+  expect(reply).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "重试同一次发送" }));
+  await screen.findByText(/消息已持久化/);
+  expect(attempt(1)).toEqual(saved);
+  expect(form.queryByRole("button", { name: "取消引用" })).not.toBeInTheDocument();
+  expect(content()).toHaveValue("");
+  expect(within(screen.getByRole("article", { name: "消息 reply" })).getByRole("link", { name: /只看本季度/ })).toBeVisible();
+  view.rerender(scope(other.id)); expect(content()).toHaveValue("别的群的草稿");
+});
+
+it("resolves the original author's name only when replying to an unpaged member", async () => {
+  const original = { ...message, sender_id: departed.id, content: "以前的范围", deliveries: [] };
+  const read = vi.fn(async (url: RequestInfo | URL) => String(url).endsWith(`/members/${departed.id}`) ? json(departed) : page([original]));
+  vi.stubGlobal("fetch", (url: RequestInfo | URL, init?: RequestInit) => init?.method === "POST" ? writes(url, init) : read(url));
+  writes.mockResolvedValueOnce(json({ ...message, id: "new-message", content: "现在呢？", deliveries: [], reply_to: {
+    message_id: original.id, group_id: original.group_id, topic_id: original.topic_id,
+    sender_id: departed.id, sender_name: departed.name, source_kind: "unknown", excerpt: original.content,
+  } }, 201));
+  render(scope(group.id, []));
+  const action = await screen.findByRole("button", { name: `回复，消息 ${original.id}` });
+  expect(read).toHaveBeenCalledTimes(1);
+  fireEvent.click(action);
+  const form = within(screen.getByRole("form", { name: "发送消息" }));
+  expect(await form.findByText(departed.name)).toBeVisible();
+  expect(read.mock.calls.map(([url]) => String(url))).toEqual([
+    `/api/v1/groups/${group.id}/messages?limit=50`, `/api/v1/groups/${group.id}/members/${departed.id}`,
+  ]);
+  change("现在呢？"); submit(); await screen.findByText(/消息已持久化/);
+  expect(JSON.parse(String(attempt().body))).toEqual({ content: "现在呢？", reply_to_message_id: original.id });
+});
+
 it.each(["right click", "keyboard"])("selects a real member from the avatar menu by %s without changing message text", async method => {
   render(<App />); fireEvent.click(await screen.findByRole("button", { name: group.name }));
   await screen.findByText("尚无消息，可发送第一条讨论。"); change("保留正文");

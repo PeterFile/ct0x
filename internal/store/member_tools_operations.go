@@ -9,8 +9,9 @@ import (
 )
 
 type MemberToolMessageInput struct {
-	Content      string   `json:"content"`
-	RecipientIDs []string `json:"recipient_ids"`
+	Content          string   `json:"content"`
+	RecipientIDs     []string `json:"recipient_ids"`
+	ReplyToMessageID string   `json:"reply_to_message_id,omitempty"`
 }
 
 func (s *Store) ListMembersForTool(ctx context.Context, scope MemberToolScope, options ListOptions) (Page[domain.Member], error) {
@@ -119,6 +120,9 @@ func readCurrentChannelInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSco
 	if err := messageSourcesInTx(ctx, tx, page.Items); err != nil {
 		return Page[domain.Message]{}, err
 	}
+	if err := projectMessageQuotesInTx(ctx, tx, scope.Claim.GroupID, &scope.TopicID, page.Items); err != nil {
+		return Page[domain.Message]{}, err
+	}
 	return page, nil
 }
 
@@ -145,7 +149,8 @@ func (s *Store) sendMemberMessage(ctx context.Context, scope MemberToolScope, in
 	if !memberToolKeyValid(key) {
 		return domain.Message{}, ErrInvalid
 	}
-	r := MessageRequest{GroupID: scope.Claim.GroupID, TopicID: scope.TopicID, ActorID: scope.MemberID, Content: input.Content, RecipientIDs: input.RecipientIDs, IdempotencyKey: key}
+	r := MessageRequest{GroupID: scope.Claim.GroupID, TopicID: scope.TopicID, ActorID: scope.MemberID,
+		Content: input.Content, RecipientIDs: input.RecipientIDs, IdempotencyKey: key, ReplyToMessageID: input.ReplyToMessageID}
 	_, replay, err := lookupMutation(ctx, tx, r.scope(), r.payload())
 	if err != nil {
 		return domain.Message{}, memberToolOperationError(action, err)
