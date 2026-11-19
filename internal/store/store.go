@@ -103,9 +103,7 @@ func (s *Store) CreateGroup(ctx context.Context, input CreateGroupInput) (domain
 	if replay {
 		g, err = scanGroup(tx.QueryRowContext(ctx, "SELECT "+groupColumns+" FROM groups WHERE id = ?", id))
 	} else {
-		g, err = scanGroup(tx.QueryRowContext(ctx,
-			"INSERT INTO groups(id, name, description, created_at) VALUES(?, ?, ?, ?) RETURNING "+groupColumns,
-			id, input.Name, input.Description, time.Now().UTC().Format(timestampLayout)))
+		g, err = insertGroupInTx(ctx, tx, id, input.Name, input.Description, time.Now().UTC().Format(timestampLayout))
 	}
 	if err != nil {
 		return domain.Group{}, storeError("创建群组失败", err)
@@ -114,6 +112,12 @@ func (s *Store) CreateGroup(ctx context.Context, input CreateGroupInput) (domain
 		return domain.Group{}, storeError("保存群组失败", err)
 	}
 	return g, nil
+}
+
+func insertGroupInTx(ctx context.Context, tx *sql.Tx, id, name, description, createdAt string) (domain.Group, error) {
+	return scanGroup(tx.QueryRowContext(ctx,
+		"INSERT INTO groups(id, name, description, created_at) VALUES(?, ?, ?, ?) RETURNING "+groupColumns,
+		id, name, description, createdAt))
 }
 
 func (s *Store) GetGroup(ctx context.Context, id string) (domain.Group, error) {
