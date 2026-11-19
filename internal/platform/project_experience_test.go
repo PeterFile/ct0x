@@ -5,6 +5,8 @@ package platform
 import (
 	"context"
 	"errors"
+	"io"
+	"path/filepath"
 	"testing"
 
 	"agentworkspace/internal/domain"
@@ -68,6 +70,12 @@ func TestMemberProjectExperienceLookupRequiresCurrentEvidenceAuthority(t *testin
 	tools := NewMemberTools(f.db)
 	grant, err := NewMemberArtifactGrant(f.service)
 	artifactsMust(t, err)
+	open := grant.open
+	opens := 0
+	grant.open = func(hash string) (io.ReadCloser, error) {
+		opens++
+		return open(hash)
+	}
 	issue := func(operations ...string) string {
 		t.Helper()
 		token, err := tools.Issue(ctx, claim, MemberToolGrants{Operations: operations, Artifacts: grant})
@@ -87,8 +95,8 @@ func TestMemberProjectExperienceLookupRequiresCurrentEvidenceAuthority(t *testin
 	tools.Revoke(token)
 	token = issue("read_history")
 	page, err := tools.LookupProjectExperiences(ctx, token, q)
-	if err != nil || len(page.Items) != 1 || page.Items[0].ID != plain.ID {
-		t.Fatalf("history-only lookup leaked a foreign topic/group or a material-dependent record: %+v, %v", page, err)
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID != plain.ID || opens != 0 {
+		t.Fatalf("history-only lookup attempted or leaked material or an unbound record: %+v, %v; opens=%d", page, err, opens)
 	}
 	if contents, err := tools.ReadArtifact(ctx, token, MemberArtifactReadInput{ArtifactID: ref.ArtifactID, VersionID: ref.VersionID}); contents.Content != "" || !errors.Is(err, store.ErrMemberToolDenied) {
 		t.Fatalf("experience broadened the artifact grant: %+v, %v", contents, err)
@@ -104,6 +112,9 @@ func TestMemberProjectExperienceLookupRequiresCurrentEvidenceAuthority(t *testin
 		page.Items[2].Retirement.ReplacementOutcome == nil || *page.Items[2].Retirement.ReplacementOutcome != accepted {
 		t.Fatalf("existing material capability did not unlock only the exact readable evidence: %+v, %v", page, err)
 	}
+	if opens != 1 {
+		t.Fatalf("a repeated exact pin must be verified once per lookup, got %d opens", opens)
+	}
 	for _, m := range []domain.Message{proposal, retirement} {
 		read, err := tools.ReadHistory(ctx, token, MemberHistoryReadInput{MessageID: m.ID})
 		if err != nil || read.Content != m.Content || !read.ContentComplete {
@@ -114,8 +125,38 @@ func TestMemberProjectExperienceLookupRequiresCurrentEvidenceAuthority(t *testin
 	if err != nil || read.Content != "accepted version data" || read.VersionID != ref.VersionID {
 		t.Fatalf("existing grant cannot open the exact artifact: %+v, %v", read, err)
 	}
-	_, err = f.db.RequestTurnCancel(ctx, claim.GroupID, claim.TurnID)
-	artifactsMust(t, err)
+	checkUnavailable := func(t *testing.T) {
+		t.Helper()
+		for _, query := range []ProjectExperienceQuery{q, {Query: "accepted compatibility fix"}, {Query: "temporarily use old exporter"}} {
+			page, err := tools.LookupProjectExperiences(ctx, token, query)
+			if len(page.Items) != 0 || page.NextCursor != "" || !errors.Is(err, errMemberArtifactIO) {
+				t.Fatalf("an unreadable exact pin did not fail the whole page for %q: %+v, %v", query.Query, page, err)
+			}
+		}
+		if _, err := tools.ReadArtifact(ctx, token, MemberArtifactReadInput{ArtifactID: ref.ArtifactID, VersionID: ref.VersionID}); !errors.Is(err, errMemberArtifactIO) {
+			t.Fatalf("lookup did not use exact artifact readability semantics: %v", err)
+		}
+	}
+	blobPath := filepath.Join("blobs", v.BlobHash)
+	artifactsMust(t, f.private.Remove(blobPath))
+	t.Run("missing blob", checkUnavailable)
+	artifactsMust(t, f.private.WriteFile(blobPath, []byte("wrong digest"), 0400))
+	t.Run("corrupt blob", checkUnavailable)
+	page, err = tools.LookupProjectExperiences(ctx, token, ProjectExperienceQuery{Query: constraint.Content})
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID != plain.ID {
+		t.Fatalf("unreferenced blob affected a page with no pins: %+v, %v", page, err)
+	}
+
+	// Force a committed invalidation inside exact-reader I/O. The final fence
+	// must suppress the entire page and report denial rather than the blob error.
+	tools.Revoke(token)
+	grant.open = func(string) (io.ReadCloser, error) {
+		_, err := f.db.RequestTurnCancel(ctx, claim.GroupID, claim.TurnID)
+		artifactsMust(t, err)
+		return nil, errors.New("private file read error")
+	}
+	token = issue("read_history", "read_artifact")
 	checkDenied(token)
-	t.Log("normal capability issuance; exact Group/Topic; both existing history and artifact grants enforced; no resurrection if replacement material is denied; revoked and cancelled scopes denied")
+	checkDenied(token) // Already cancelled.
+	t.Log("exact tuple and full blob read verified once per lookup; absent/corrupt original or replacement pins suppress the page; revocation and cancellation fences preserved")
 }

@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"slices"
 	"strings"
 	"time"
 
@@ -170,9 +169,11 @@ func insertProjectExperienceRetirement(ctx context.Context, tx *sql.Tx, origin d
 	}
 	args = []any{id, experienceID, origin.GroupID, topicID, in.MessageID, in.ReplacementVersion}
 	args = append(append(args, experienceOutcomeArgs(in.ReplacementOutcome)...), time.Now().UTC().Format(timestampLayout))
-	_, err := tx.ExecContext(ctx, `INSERT INTO project_experience_retirements(id,experience_id,group_id,topic_id,message_id,
-	 replacement_version,review_id,submission_id,task_id,artifact_id,version_id,retired_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, args...)
-	return err
+	if _, err := tx.ExecContext(ctx, `INSERT INTO project_experience_retirements(id,experience_id,group_id,topic_id,message_id,
+	 replacement_version,review_id,submission_id,task_id,artifact_id,version_id,retired_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, args...); err != nil {
+		return err
+	}
+	return recordExperienceRetirementWitnessInTx(ctx, tx, experienceID, id)
 }
 
 func experienceLocalMessageInTx(ctx context.Context, tx *sql.Tx, origin domain.ProjectExperienceOrigin, id string, earliest int64) error {
@@ -218,25 +219,8 @@ func localExperienceOriginInTx(ctx context.Context, tx *sql.Tx, groupID string) 
 
 func experienceOriginInTx(ctx context.Context, tx *sql.Tx, groupID string) (domain.ProjectExperienceOrigin, error) {
 	var origin domain.ProjectExperienceOrigin
-	// B assigns the slot on release; a missing object in an applied migration
-	// must not be mistaken for an old database that never installed it.
-	version := slices.Index(migrations, projectExperienceSchema) + 1
-	if version == 0 {
-		return origin, ErrProjectExperienceUnavailable
-	}
-	var installed bool
-	var objects int
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),
-	 (SELECT count(*) FROM sqlite_schema WHERE (type='table' AND name IN ('project_experiences','project_experience_retirements'))
-	 OR (type='view' AND name IN ('project_experience_message_evidence','project_experience_accepted_evidence')))`,
-		version).Scan(&installed, &objects); err != nil {
+	if err := requireProjectExperienceSchemaInTx(ctx, tx); err != nil {
 		return origin, err
-	}
-	if !installed && objects == 0 {
-		return origin, ErrProjectExperienceUnavailable
-	}
-	if !installed || objects != 4 {
-		return origin, errors.New("项目经验数据库结构不完整")
 	}
 	// D's immutable ownership is resolved inside the same snapshot as source
 	// visibility. It is never a substitute for the original group's authority.
@@ -245,9 +229,15 @@ func experienceOriginInTx(ctx context.Context, tx *sql.Tx, groupID string) (doma
 	 JOIN workspaces w ON w.id=p.workspace_id WHERE g.id=?`, groupID).
 		Scan(&origin.WorkspaceID, &origin.ProjectID, &origin.ChannelID, &origin.GroupID)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && (origin.WorkspaceID == "" || origin.ProjectID == "" || origin.ChannelID == "") {
-		return domain.ProjectExperienceOrigin{}, errors.New("项目经验缺少已验证的项目归属")
+		return domain.ProjectExperienceOrigin{}, errProjectExperienceIntegrity
 	}
-	return origin, err
+	if err != nil {
+		return domain.ProjectExperienceOrigin{}, err
+	}
+	if err := requireProjectExperienceEvidenceInTx(ctx, tx, origin); err != nil {
+		return domain.ProjectExperienceOrigin{}, err
+	}
+	return origin, nil
 }
 
 func experienceOriginArgs(origin domain.ProjectExperienceOrigin) []any {

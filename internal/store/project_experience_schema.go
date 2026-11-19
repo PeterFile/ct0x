@@ -35,7 +35,7 @@ CREATE TABLE project_experiences (
        (confirmation_message_id IS NULL AND review_id IS NOT NULL AND submission_id IS NOT NULL
         AND task_id IS NOT NULL AND artifact_id IS NOT NULL AND version_id IS NOT NULL))
 );
-CREATE INDEX project_experiences_scope ON project_experiences(project_id,group_id,topic_id,selected_at DESC,id DESC);
+CREATE INDEX project_experiences_scope ON project_experiences(group_id,project_id,topic_id,selected_at DESC,id DESC);
 
 CREATE TABLE project_experience_retirements (
  id TEXT PRIMARY KEY NOT NULL CHECK(id<>''),
@@ -58,6 +58,13 @@ CREATE TABLE project_experience_retirements (
         AND version_id IS NOT NULL AND trim(replacement_version)<>''))
 );
 
+-- The witness has its own lifetime. Losing the retirement detail must not make
+-- the original record look as though it never retired.
+CREATE TABLE project_experience_retirement_witnesses (
+ experience_id TEXT PRIMARY KEY NOT NULL REFERENCES project_experiences(id),
+ receipt TEXT NOT NULL
+) WITHOUT ROWID;
+
 CREATE TRIGGER project_experiences_no_replace BEFORE INSERT ON project_experiences
 WHEN EXISTS(SELECT 1 FROM project_experiences WHERE id=NEW.id)
 BEGIN SELECT RAISE(ABORT, '经验原始记录不可替换'); END;
@@ -72,6 +79,13 @@ CREATE TRIGGER project_experience_retirements_no_update BEFORE UPDATE ON project
 BEGIN SELECT RAISE(ABORT, '经验停用记录不可修改'); END;
 CREATE TRIGGER project_experience_retirements_no_delete BEFORE DELETE ON project_experience_retirements
 BEGIN SELECT RAISE(ABORT, '经验停用记录不可删除'); END;
+CREATE TRIGGER project_experience_retirement_witnesses_no_replace BEFORE INSERT ON project_experience_retirement_witnesses
+WHEN EXISTS(SELECT 1 FROM project_experience_retirement_witnesses WHERE experience_id=NEW.experience_id)
+BEGIN SELECT RAISE(ABORT, '经验停用见证不可替换'); END;
+CREATE TRIGGER project_experience_retirement_witnesses_no_update BEFORE UPDATE ON project_experience_retirement_witnesses
+BEGIN SELECT RAISE(ABORT, '经验停用见证不可修改'); END;
+CREATE TRIGGER project_experience_retirement_witnesses_no_delete BEFORE DELETE ON project_experience_retirement_witnesses
+BEGIN SELECT RAISE(ABORT, '经验停用见证不可删除'); END;
 
 -- A sender label alone is never confirmation. A legacy message may still be
 -- the original proposal, but even a real chat needs an explicit selection write.

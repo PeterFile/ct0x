@@ -78,7 +78,8 @@ func (s *Store) SearchProjectExperiences(ctx context.Context, groupID string, q 
 // SearchProjectExperiencesForTool is trusted platform composition only. The
 // caller must hold the registry's read_history authorization and may pass
 // allowArtifacts only with its existing same-group read_artifact grant. This
-// method independently fences the exact Turn, member, Group and topic in SQL.
+// method fences the Turn, member, Group and topic in SQL. Before returning any
+// candidates to a member, the platform must verify their exact blobs.
 func (s *Store) SearchProjectExperiencesForTool(ctx context.Context, scope MemberToolScope, allowArtifacts bool, q ProjectExperienceQuery) (ProjectExperiencePage, error) {
 	const action = "检索成员项目经验失败"
 	tx, err := s.beginMemberToolTx(ctx, scope)
