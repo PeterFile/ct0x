@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -226,12 +227,31 @@ func TestThreadRoutingLegacyFallbackAndDamagedSchema(t *testing.T) {
 	if version == 0 {
 		t.Fatal("thread routing migration is not registered")
 	}
+	const linksStart = "CREATE TABLE thread_routing_links"
+	topicsDDL, linksDDL, found := strings.Cut(threadRoutingSchema, linksStart)
+	if !found {
+		t.Fatal("missing links DDL")
+	}
+	withoutConstraint := func(ddl, constraint string) string {
+		t.Helper()
+		changed := strings.Replace(ddl, constraint, "", 1)
+		if changed == ddl {
+			t.Fatalf("missing fixture constraint %q", constraint)
+		}
+		return changed
+	}
 	for _, damage := range []struct {
 		name, statement string
 		args            []any
 	}{
 		{"missing_topics_table", `DROP TABLE thread_routing_topics`, nil},
 		{"missing_links_table", `DROP TABLE thread_routing_links`, nil},
+		{"missing_title_unique", `DROP TABLE thread_routing_topics;` +
+			withoutConstraint(topicsDDL, "    UNIQUE(group_id, title_key),\n"), nil},
+		{"missing_reply_scope_fk", `DROP TABLE thread_routing_links; ` + linksStart +
+			withoutConstraint(linksDDL, "    FOREIGN KEY(reply_to_message_id, group_id, reply_to_topic_id) REFERENCES messages(id, group_id, topic_id),\n"), nil},
+		{"missing_reply_check", `DROP TABLE thread_routing_links; ` + linksStart +
+			withoutConstraint(linksDDL, "    CHECK((reply_to_message_id IS NULL)=(reply_to_topic_id IS NULL)),\n"), nil},
 		{"missing_routing_marker", `DELETE FROM schema_migrations WHERE version=?`, []any{version}},
 		{"missing_issue_index", `DROP INDEX thread_routing_issue`, nil},
 		{"nonunique_issue_index", `DROP INDEX thread_routing_issue; CREATE INDEX thread_routing_issue ON thread_routing_topics(group_id, issue_id)`, nil},

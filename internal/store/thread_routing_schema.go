@@ -2,8 +2,14 @@ package store
 
 // threadRoutingSchema is registered by the migration coordinator. It does not
 // backfill names from legacy chat or change any legacy scope or position.
-const threadRoutingSchema = `
-CREATE TABLE thread_routing_topics (
+const threadRoutingSchema = "\n" + threadRoutingTopicsTable + ";\n" + threadRoutingIssueIndex + ";\n" +
+	threadRoutingLinksTable + ";\n" + threadRoutingLinksInsert + ";\n" + threadRoutingLinksUpdate + ";\n" + threadRoutingLinksDelete + ";\n"
+
+// Compare the installed DDL to the declarations, not just column presence:
+// the composite references and name uniqueness are part of the routing proof.
+// SQLite records these statements without their trailing delimiters.
+const (
+	threadRoutingTopicsTable = `CREATE TABLE thread_routing_topics (
     group_id TEXT NOT NULL REFERENCES groups(id),
     topic_id TEXT NOT NULL CHECK(topic_id<>''),
     title TEXT NOT NULL CHECK(title<>''),
@@ -13,9 +19,8 @@ CREATE TABLE thread_routing_topics (
     PRIMARY KEY(group_id, topic_id),
     UNIQUE(group_id, title_key),
     FOREIGN KEY(origin_message_id, group_id, topic_id) REFERENCES messages(id, group_id, topic_id)
-);
-` + threadRoutingIssueIndex + `;
-CREATE TABLE thread_routing_links (
+)`
+	threadRoutingLinksTable = `CREATE TABLE thread_routing_links (
     message_id TEXT PRIMARY KEY NOT NULL,
     group_id TEXT NOT NULL,
     topic_id TEXT NOT NULL,
@@ -28,15 +33,7 @@ CREATE TABLE thread_routing_links (
     FOREIGN KEY(message_id, group_id, topic_id) REFERENCES messages(id, group_id, topic_id),
     FOREIGN KEY(reply_to_message_id, group_id, reply_to_topic_id) REFERENCES messages(id, group_id, topic_id),
     FOREIGN KEY(task_id, group_id) REFERENCES tasks(id, group_id)
-);
-` + threadRoutingLinksInsert + `;
-` + threadRoutingLinksUpdate + `;
-` + threadRoutingLinksDelete + `;
-`
-
-// SQLite records the DDL without its trailing statement delimiter. Keep the
-// guard definitions shared with the installed-schema check.
-const (
+)`
 	threadRoutingIssueIndex  = `CREATE UNIQUE INDEX thread_routing_issue ON thread_routing_topics(group_id, issue_id) WHERE issue_id<>''`
 	threadRoutingLinksInsert = `CREATE TRIGGER thread_routing_links_insert BEFORE INSERT ON thread_routing_links
 WHEN EXISTS(SELECT 1 FROM thread_routing_links WHERE message_id=NEW.message_id)

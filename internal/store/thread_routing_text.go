@@ -69,26 +69,56 @@ func (t threadTextRoute) resolveAliases(evidence threadTopicEvidence) threadTopi
 	return evidence
 }
 
-func threadClauses(text string) []string {
-	return strings.FieldsFunc(text, func(r rune) bool { return strings.ContainsRune("\n。！；，;!,", r) })
-}
+func threadClauseSeparator(r rune) bool { return strings.ContainsRune("\n。！；，;!,", r) }
 
 // Explicit storage scopes bypass topic matching but not comparison semantics.
 func threadComparisonReply(body string) bool {
-	if !validHistoryText(body, maxThreadTextBytes) {
-		return false
-	}
-	active := unquotedThreadText(body)
-	if !threadComparison.MatchString(active) {
-		return false
-	}
-	for i, clause := range threadClauses(active) {
-		clause = strings.TrimSpace(clause)
-		if threadCurrent.MatchString(clause) || i == 0 && (threadNewSubject.MatchString(clause) || threadInvite.MatchString(clause)) {
-			return true
+	return validHistoryText(body, maxThreadTextBytes) && threadComparison.MatchString(unquotedThreadText(body))
+}
+
+// Strip only balanced, trailing parentheticals marked as comparison. Do this
+// before splitting clauses so punctuation inside cannot expose a quoted issue.
+func stripThreadComparisonSuffixes(text string) (string, bool) {
+	var kept strings.Builder
+	var closers []rune
+	var start, after int
+	for i, r := range text {
+		switch r {
+		case '(', '（':
+			if len(closers) == 0 {
+				start = i
+			}
+			if r == '(' {
+				closers = append(closers, ')')
+			} else {
+				closers = append(closers, '）')
+			}
+		case ')', '）':
+			if len(closers) == 0 || closers[len(closers)-1] != r {
+				return "", false
+			}
+			closers = closers[:len(closers)-1]
+			if len(closers) != 0 || !threadComparison.MatchString(text[start:i]) {
+				continue
+			}
+			end := i + utf8.RuneLen(r)
+			tail := strings.TrimLeftFunc(text[end:], func(c rune) bool { return c != '\n' && unicode.IsSpace(c) })
+			if next, _ := utf8.DecodeRuneInString(tail); tail != "" && !threadClauseSeparator(next) && !strings.ContainsRune(".？?", next) {
+				return "", false
+			}
+			kept.WriteString(text[after:start])
+			kept.WriteByte(' ')
+			after = end
 		}
 	}
-	return false
+	if len(closers) != 0 {
+		return "", false
+	}
+	if after == 0 {
+		return text, true
+	}
+	kept.WriteString(text[after:])
+	return kept.String(), true
 }
 
 func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) (threadTextRoute, error) {
@@ -97,23 +127,43 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 		return route, nil
 	}
 	active := unquotedThreadText(body)
-	clauses := threadClauses(active)
 	route.comparison = threadComparison.MatchString(active)
+	if route.comparison {
+		var separated bool
+		active, separated = stripThreadComparisonSuffixes(active)
+		if !separated {
+			route.conflict = true
+			return route, nil
+		}
+	}
+	clauses := strings.FieldsFunc(active, threadClauseSeparator)
 	var title, exact string
 	var openingFollowup bool
 	for i, clause := range clauses {
 		clause = strings.TrimSpace(clause)
+		opening := i == 0 && threadNewSubject.MatchString(clause)
+		invite := i == 0 && threadInvite.MatchString(clause)
+		current := threadCurrent.MatchString(clause)
+		if route.comparison && threadComparison.MatchString(clause) {
+			if opening || invite || current {
+				// The marked comparison and current subject are not delimited.
+				route.conflict = true
+				return route, nil
+			}
+			clauses[i] = ""
+			continue
+		}
 		switch {
-		case i == 0 && threadNewSubject.MatchString(clause):
+		case opening:
 			route.current = true
 			title = threadName(threadNewSubject.ReplaceAllString(clause, ""))
-		case i == 0 && threadInvite.MatchString(clause):
+		case invite:
 			route.current = true
 			title = threadName(threadInvite.ReplaceAllString(clause, ""))
 			if !threadBusiness.MatchString(title) && len(issueTokens(title)) != 1 {
 				title = ""
 			}
-		case threadCurrent.MatchString(clause):
+		case current:
 			if route.current && title == "" {
 				route.conflict = true
 				return route, nil
@@ -133,12 +183,12 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 				}
 				route.aliases[threadTitleKey(subject)] = nil
 			}
-		case threadComparison.MatchString(clause):
-			clauses[i] = ""
 		}
 	}
 	if route.comparison {
-		active = strings.Join(clauses, "\n")
+		// Do not turn neighboring clauses into a single title when whitespace
+		// is normalized for matching.
+		active = strings.Join(clauses, "。")
 	}
 	if title != "" {
 		exact = title
@@ -213,6 +263,7 @@ func threadTitleEvidenceInTx(ctx context.Context, tx *sql.Tx, group, active stri
 	}
 	defer rows.Close()
 	text := threadTitleKey(active)
+	var matches threadTitleMatches
 	for n := 0; rows.Next(); n++ {
 		if n == maxThreadTitles {
 			// Never infer a unique name from an incomplete sample. The issue ID
@@ -223,18 +274,25 @@ func threadTitleEvidenceInTx(ctx context.Context, tx *sql.Tx, group, active stri
 		if err := rows.Scan(&topic, &key, &issue); err != nil {
 			return evidence, false, err
 		}
-		_, exact := aliases[key]
-		if exact || (!threadGeneric.MatchString(key) && hasThreadToken(text, key, isNonHanWord)) {
-			evidence.add(topic)
-			// An explicitly named full title is stronger than other titles
-			// that shorten to that same text, regardless of catalog order.
-			delete(aliases, key)
+		if !threadGeneric.MatchString(key) {
+			matches.record(text, key, topic)
 		}
 		if len(aliases) != 0 {
 			alias := threadIssueAlias(key, issue)
 			if candidates, wanted := aliases[alias]; wanted {
 				aliases[alias] = append(candidates, topic)
 			}
+		}
+	}
+	// The longest complete match at a position suppresses a shorter one
+	// there, and a previously matched span suppresses only its contents.
+	var furthestEnd int
+	for start, match := range matches {
+		end := start + len(match.key)
+		if match.key != "" && end > furthestEnd {
+			evidence.add(match.topic)
+			delete(aliases, match.key)
+			furthestEnd = end
 		}
 	}
 	return evidence, true, rows.Err()
@@ -307,22 +365,27 @@ func issueTokens(text string) []string {
 	return ids
 }
 
-func hasThreadToken(text, token string, word func(rune) bool) bool {
-	if token == "" {
-		return false
-	}
-	for offset := 0; offset < len(text); {
-		index := strings.Index(text[offset:], token)
+// Keep at most one match per byte position, independent of catalog order.
+// Only allocate this bounded index when a complete title actually occurs.
+type threadTitleMatches []struct{ key, topic string }
+
+func (m *threadTitleMatches) record(text, key, topic string) {
+	for offset := 0; key != "" && offset < len(text); {
+		index := strings.Index(text[offset:], key)
 		if index == -1 {
-			return false
+			return
 		}
 		start := offset + index
-		if threadTokenBounds(text, start, start+len(token), word) {
-			return true
+		if threadTokenBounds(text, start, start+len(key), isNonHanWord) {
+			if *m == nil {
+				*m = make(threadTitleMatches, len(text))
+			}
+			if slot := &(*m)[start]; len(key) > len(slot.key) {
+				slot.key, slot.topic = key, topic
+			}
 		}
 		offset = start + 1
 	}
-	return false
 }
 
 func threadTokenBounds(text string, start, end int, word func(rune) bool) bool {
