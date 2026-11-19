@@ -431,6 +431,21 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 			if !strings.Contains(result, "decision_request_unknown") || strings.Contains(result, "FOREIGN KEY") || strings.Contains(result, `"isError":false`) {
 				t.Fatal("opaque F write failure appeared certain or exposed private diagnostics")
 			}
+			// Still the same live native intake, before the terminal notification.
+			for _, attempt := range []struct{ id, args string }{
+				{"same-ask", handoffProposal},
+				{"new-ask", strings.Replace(handoffProposal, "样本有限", "其他样本", 1)},
+				{"plain-clarify", `{"content":"要看全周吗？","intent_assessment":{"disposition":"clarify","reason":"边界未定","question":"要看全周吗？"}}`},
+				{"plain-send", `{"content":"另发一条消息。"}`},
+			} {
+				if followup := send(attempt.id, attempt.args); !strings.Contains(followup, "forbidden") || !strings.Contains(followup, `"isError":true`) {
+					t.Fatalf("send_message %q was not fenced after an uncertain proposal", attempt.id)
+				}
+			}
+			const readChannel = `{"jsonrpc":"2.0","id":"read-after-unknown","method":"tools/call","params":{"name":"read_channel","arguments":{}}}`
+			if readback := call(readChannel); !strings.Contains(readback, `"isError":false`) || !strings.Contains(readback, `\"chat_candidate\"`) {
+				t.Fatal("a read on the live intake was fenced along with writes")
+			}
 		case "default-route":
 			if !strings.Contains(result, "forbidden") || strings.Contains(result, "decision_request_unknown") {
 				t.Fatal("default recipient acquired explicit request authority")

@@ -70,6 +70,11 @@ func (s *MemberTools) AssessChatIntent(ctx context.Context, token string, input 
 	if !s.isChatIntake(entry) || input.Action == domain.ChatActionReadOnlyInvestigation && !entry.investigationIntake() {
 		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
 	}
+	unlock, ok := entry.intake.threadDecision.lockMutation()
+	if !ok {
+		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
+	}
+	defer unlock()
 	return s.chatEngine.AssessChatIntent(ctx, entry.scope, entry.candidate.ID, input, content, key)
 }
 
@@ -80,6 +85,11 @@ func (s *MemberTools) withChatIntake(token string, use func(store.MemberToolScop
 	if !s.isChatIntake(entry) {
 		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
 	}
+	unlock, ok := entry.intake.threadDecision.lockMutation()
+	if !ok {
+		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
+	}
+	defer unlock()
 	return use(entry.scope, entry.candidate.ID)
 }
 
