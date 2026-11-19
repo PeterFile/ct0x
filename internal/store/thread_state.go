@@ -27,6 +27,7 @@ type ThreadStateUpdate struct {
 	Slot                           int
 	Kind                           domain.ThreadStateKind
 	Action, Content, SourceMessage string
+	CoveredThroughMessageID        string // Empty preserves the prior explicit coverage.
 }
 
 func validThreadStateScope(scope domain.ThreadStateScope) bool {
@@ -72,7 +73,8 @@ func (s *Store) SetLocalThreadState(ctx context.Context, scope domain.ThreadStat
 	const action = "保存话题状态失败"
 	if !validThreadStateScope(scope) || !memberToolKeyValid(key) || !validTriggerID(update.SourceMessage) ||
 		update.ExpectedRevision < 0 || update.ExpectedRevision == math.MaxInt64 || update.Slot < 0 || update.Slot >= threadStateSlotCount ||
-		!validThreadStateKind(update.Kind) || !validThreadStateContent(update.Content) || (update.Action != "set" && update.Action != "invalidate") {
+		!validThreadStateKind(update.Kind) || !validThreadStateContent(update.Content) || (update.Action != "set" && update.Action != "invalidate") ||
+		(update.CoveredThroughMessageID != "" && !validTriggerID(update.CoveredThroughMessageID)) {
 		return domain.ThreadStateSnapshot{}, ErrInvalid
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -105,9 +107,23 @@ func setLocalThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.Threa
 		update.Content, update.SourceMessage, scope.GroupID, scope.TopicID).Scan(&sourceID, &position, &complete); err != nil {
 		return empty, err
 	}
+	var coverage *domain.ThreadStateCoverage
+	if messageID := update.CoveredThroughMessageID; messageID != "" {
+		coverage = &domain.ThreadStateCoverage{MessageID: messageID}
+		if err := tx.QueryRowContext(ctx, `SELECT l.sequence FROM message_log l
+		 JOIN messages m ON (m.id,m.group_id,m.topic_id)=(l.message_id,l.group_id,l.topic_id)
+		 WHERE (l.message_id,l.group_id,l.topic_id)=(?,?,?)`, messageID, scope.GroupID, scope.TopicID).Scan(&coverage.MessageLogPosition); err != nil {
+			return empty, err
+		}
+	}
 	mutation := mutationScope{operation: "set_thread_state", actorID: "user", groupID: scope.GroupID, key: key}
 	payload := mutationPayload(scope.TopicID, scope.TaskID, strconv.FormatInt(scope.TaskRevision, 10), strconv.FormatInt(update.ExpectedRevision, 10),
 		strconv.Itoa(update.Slot), string(update.Kind), update.Action, update.Content, update.SourceMessage)
+	if coverage != nil {
+		// An explicit anchor and omission are different commands even when the
+		// effective position would match. Old callers retain their key payload.
+		payload = append(payload, mutationPayload(coverage.MessageID)...)
+	}
 	revision := update.ExpectedRevision + 1
 	recordID := strconv.FormatInt(revision, 10)
 	id, replay, err := lookupMutation(ctx, tx, mutation, payload)
@@ -119,7 +135,7 @@ func setLocalThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.Threa
 			return empty, errThreadStateIntegrity
 		}
 		snapshot, err := readThreadStateInTx(ctx, tx, scope, revision)
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && coverage != nil && (snapshot.CoveredThrough == nil || *snapshot.CoveredThrough != *coverage)) {
 			return empty, errThreadStateIntegrity
 		}
 		return snapshot, err
@@ -133,6 +149,15 @@ func setLocalThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.Threa
 	}
 	if current.Revision != update.ExpectedRevision {
 		return empty, ErrThreadStateConflict
+	}
+	if coverage == nil {
+		coverage = current.CoveredThrough
+	} else if current.CoveredThrough != nil && coverage.MessageLogPosition < current.CoveredThrough.MessageLogPosition {
+		return empty, ErrThreadStateConflict
+	}
+	var coveredID, coveredPosition any
+	if coverage != nil {
+		coveredID, coveredPosition = coverage.MessageID, coverage.MessageLogPosition
 	}
 	var invalidates any
 	for _, previous := range current.Records {
@@ -156,9 +181,10 @@ func setLocalThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.Threa
 		return empty, ErrThreadStateConflict
 	}
 	if err := coordinatorWrite(ctx, tx, `INSERT INTO thread_state_revisions
-	 (group_id,topic_id,task_id,task_revision,revision,slot,kind,content,source_id,source_position,confirmed_at,invalidates_revision)
-	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, scope.GroupID, scope.TopicID, scope.TaskID, scope.TaskRevision, revision, update.Slot, update.Kind,
-		update.Content, sourceID, position, time.Now().UTC().Format(timestampLayout), invalidates); err != nil {
+	 (group_id,topic_id,task_id,task_revision,revision,slot,kind,content,source_id,source_position,confirmed_at,invalidates_revision,
+	  covered_through_message_id,covered_through_position)
+	 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, scope.GroupID, scope.TopicID, scope.TaskID, scope.TaskRevision, revision, update.Slot, update.Kind,
+		update.Content, sourceID, position, time.Now().UTC().Format(timestampLayout), invalidates, coveredID, coveredPosition); err != nil {
 		return empty, err
 	}
 	if err := coordinatorWrite(ctx, tx, `INSERT INTO mutation_idempotency(operation,actor_id,group_id,idempotency_key,payload,record_id)

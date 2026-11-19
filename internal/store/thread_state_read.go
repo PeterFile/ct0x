@@ -34,6 +34,12 @@ const threadStateSnapshotSQL = `WITH slots(slot) AS (VALUES(0),(1),(2),(3),(4),(
     AND pm.sender_id='user' AND pm.content=p.content
  ORDER BY slots.slot`
 
+const threadStateCoverageSQL = `SELECT r.covered_through_message_id, r.covered_through_position,
+ EXISTS(SELECT 1 FROM message_log l JOIN messages m ON (m.id,m.group_id,m.topic_id)=(l.message_id,l.group_id,l.topic_id)
+    WHERE (l.sequence,l.message_id,l.group_id,l.topic_id)=(r.covered_through_position,r.covered_through_message_id,r.group_id,r.topic_id)),
+ coalesce((SELECT covered_through_position FROM thread_state_revisions WHERE ` + threadStateKey + ` AND revision=:revision-1),0)
+ FROM thread_state_revisions r WHERE ` + threadStateKey + ` AND revision=:revision`
+
 func readThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.ThreadStateScope, revision int64) (domain.ThreadStateSnapshot, error) {
 	var empty domain.ThreadStateSnapshot
 	args := []any{sql.Named("grp", scope.GroupID), sql.Named("topic", scope.TopicID), sql.Named("task", scope.TaskID), sql.Named("task_revision", scope.TaskRevision)}
@@ -58,7 +64,13 @@ func readThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.ThreadSta
 	if revision == 0 {
 		return out, nil
 	}
-	rows, err := tx.QueryContext(ctx, threadStateSnapshotSQL, append(args, sql.Named("revision", revision))...)
+	args = append(args, sql.Named("revision", revision))
+	var err error
+	out.CoveredThrough, err = readThreadStateCoverageInTx(ctx, tx, args)
+	if err != nil {
+		return empty, err
+	}
+	rows, err := tx.QueryContext(ctx, threadStateSnapshotSQL, args...)
 	if err != nil {
 		return empty, err
 	}
@@ -97,6 +109,26 @@ func readThreadStateInTx(ctx context.Context, tx *sql.Tx, scope domain.ThreadSta
 	return out, nil
 }
 
+func readThreadStateCoverageInTx(ctx context.Context, tx *sql.Tx, args []any) (*domain.ThreadStateCoverage, error) {
+	var messageID sql.NullString
+	var position sql.NullInt64
+	var verified bool
+	var previous int64
+	if err := tx.QueryRowContext(ctx, threadStateCoverageSQL, args...).Scan(&messageID, &position, &verified, &previous); err != nil {
+		return nil, err
+	}
+	if messageID.Valid != position.Valid || position.Int64 < previous {
+		return nil, errThreadStateIntegrity
+	}
+	if !position.Valid {
+		return nil, nil
+	}
+	if !verified || position.Int64 <= 0 || !validTriggerID(messageID.String) {
+		return nil, errThreadStateIntegrity
+	}
+	return &domain.ThreadStateCoverage{MessageID: messageID.String, MessageLogPosition: position.Int64}, nil
+}
+
 func confirmThreadStateSource(source *domain.ThreadStateSource, stamp string) bool {
 	at, err := time.Parse(timestampLayout, stamp)
 	if err != nil || !validTriggerID(source.MessageID) || !validTriggerID(source.SourceID) || source.MessageLogPosition <= 0 {
@@ -108,17 +140,21 @@ func confirmThreadStateSource(source *domain.ThreadStateSource, stamp string) bo
 
 // LoadThreadPreparation is a trusted peek after ordinary delivery binding.
 // This path cannot request Task state. The immutable trigger, state and recent
-// candidates are read in one transaction, with no inferred coverage bound.
+// candidates are read in one transaction. Only explicitly saved coverage
+// narrows the legacy history window.
 // An installed schema returns a snapshot at revision zero for empty state.
 func (s *Store) LoadThreadPreparation(ctx context.Context, thread domain.ThreadRef, triggerID string, limit int) ([]domain.Message, *domain.ThreadStateSnapshot, error) {
 	var state *domain.ThreadStateSnapshot
-	history, err := s.listPreparationHistory(ctx, thread.GroupID, triggerID, limit, func(tx *sql.Tx, trigger domain.Message) error {
+	history, err := s.listPreparationHistory(ctx, thread.GroupID, triggerID, limit, func(tx *sql.Tx, trigger domain.Message) (int64, error) {
 		if trigger.GroupID != thread.GroupID || trigger.TopicID != thread.TopicID || trigger.ID != triggerID {
-			return ErrNotFound
+			return 0, ErrNotFound
 		}
 		var err error
 		state, err = preparationThreadStateInTx(ctx, tx, domain.ThreadStateScope{ThreadRef: thread}, triggerID)
-		return err
+		if err != nil || state == nil || state.CoveredThrough == nil {
+			return 0, err
+		}
+		return state.CoveredThrough.MessageLogPosition, nil
 	})
 	if err != nil {
 		return nil, nil, err

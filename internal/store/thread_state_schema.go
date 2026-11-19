@@ -22,8 +22,12 @@ CREATE TABLE thread_state_revisions (
     source_position INTEGER NOT NULL REFERENCES message_log(sequence),
     confirmed_at TEXT NOT NULL,
     invalidates_revision INTEGER CHECK(invalidates_revision>0 AND invalidates_revision<revision),
+    covered_through_message_id TEXT CHECK(covered_through_message_id<>''),
+    covered_through_position INTEGER REFERENCES message_log(sequence) CHECK(covered_through_position>0),
     PRIMARY KEY(group_id, topic_id, task_id, task_revision, revision),
     CHECK((task_id='' AND task_revision=0) OR (task_id<>'' AND task_revision>0)),
+    CHECK((covered_through_message_id IS NULL)=(covered_through_position IS NULL)),
+    FOREIGN KEY(covered_through_message_id, group_id, topic_id) REFERENCES messages(id, group_id, topic_id),
     FOREIGN KEY(group_id, topic_id, task_id, task_revision, invalidates_revision)
         REFERENCES thread_state_revisions(group_id, topic_id, task_id, task_revision, revision)
 ) STRICT, WITHOUT ROWID;
@@ -66,6 +70,14 @@ BEGIN
         WHERE l.sequence=NEW.source_position AND (l.group_id,l.topic_id)=(NEW.group_id,NEW.topic_id)
         AND s.id=NEW.source_id AND s.kind='local_user_chat' AND s.turn_id IS NULL AND s.claim_digest IS NULL
         AND m.sender_id='user' AND m.content=NEW.content);
+    SELECT RAISE(ABORT, '话题状态覆盖位置无效或回退') WHERE
+        (NEW.covered_through_position IS NOT NULL AND NOT EXISTS(
+            SELECT 1 FROM message_log l JOIN messages m ON (m.id,m.group_id,m.topic_id)=(l.message_id,l.group_id,l.topic_id)
+            WHERE (l.sequence,l.message_id,l.group_id,l.topic_id)=
+                (NEW.covered_through_position,NEW.covered_through_message_id,NEW.group_id,NEW.topic_id)))
+        OR coalesce(NEW.covered_through_position,0)<coalesce((
+            SELECT covered_through_position FROM thread_state_revisions WHERE (group_id,topic_id,task_id,task_revision,revision)=
+                (NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision,NEW.revision-1)),0);
     SELECT RAISE(ABORT, '状态记录或失效来源不匹配') WHERE EXISTS(
         SELECT 1 FROM thread_state_revisions older WHERE (older.group_id,older.topic_id,older.task_id,older.task_revision,older.slot)=
             (NEW.group_id,NEW.topic_id,NEW.task_id,NEW.task_revision,NEW.slot)

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -28,12 +29,13 @@ func (a localAPI) threadState(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var body struct {
-			ExpectedRevision *int64                 `json:"expected_revision"`
-			Slot             *int                   `json:"slot"`
-			Kind             domain.ThreadStateKind `json:"kind"`
-			Action           string                 `json:"action"`
-			Content          string                 `json:"content"`
-			SourceMessageID  string                 `json:"source_message_id"`
+			ExpectedRevision        *int64                 `json:"expected_revision"`
+			Slot                    *int                   `json:"slot"`
+			Kind                    domain.ThreadStateKind `json:"kind"`
+			Action                  string                 `json:"action"`
+			Content                 string                 `json:"content"`
+			SourceMessageID         string                 `json:"source_message_id"`
+			CoveredThroughMessageID json.RawMessage        `json:"covered_through_message_id"`
 		}
 		if !DecodeJSON(w, r, &body) {
 			return
@@ -42,9 +44,14 @@ func (a localAPI) threadState(w http.ResponseWriter, r *http.Request) {
 			operationError(w, store.ErrInvalid)
 			return
 		}
+		var coverageID string
+		if body.CoveredThroughMessageID != nil && (json.Unmarshal(body.CoveredThroughMessageID, &coverageID) != nil || coverageID == "") {
+			operationError(w, store.ErrInvalid)
+			return
+		}
 		snapshot, err = a.local.SetThreadState(r.Context(), scope, store.ThreadStateUpdate{
 			ExpectedRevision: *body.ExpectedRevision, Slot: *body.Slot, Kind: body.Kind, Action: body.Action,
-			Content: body.Content, SourceMessage: body.SourceMessageID,
+			Content: body.Content, SourceMessage: body.SourceMessageID, CoveredThroughMessageID: coverageID,
 		}, key)
 	}
 	switch {

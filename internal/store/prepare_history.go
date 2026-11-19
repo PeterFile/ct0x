@@ -15,10 +15,10 @@ func (s *Store) ListPreparationHistory(ctx context.Context, groupID, triggerMess
 	return s.listPreparationHistory(ctx, groupID, triggerMessageID, limit, nil)
 }
 
-// Before reading history bodies, the optional hook binds and loads auxiliary
-// context in the same read snapshot as the exact trigger and candidate range.
+// The optional hook binds and loads state in the same read snapshot. It may
+// return an explicit lower message_log bound; zero preserves legacy ordering.
 func (s *Store) listPreparationHistory(ctx context.Context, groupID, triggerMessageID string, limit int,
-	checkTrigger func(*sql.Tx, domain.Message) error) ([]domain.Message, error) {
+	checkTrigger func(*sql.Tx, domain.Message) (int64, error)) ([]domain.Message, error) {
 	const action = "读取准备历史失败"
 	limit, err := listLimit(ListOptions{Limit: limit})
 	if err != nil {
@@ -34,15 +34,29 @@ func (s *Store) listPreparationHistory(ctx context.Context, groupID, triggerMess
 	if err != nil {
 		return nil, queueError(action, err)
 	}
+	var coveredThrough int64
 	if checkTrigger != nil {
-		if err := checkTrigger(tx, trigger); err != nil {
+		coveredThrough, err = checkTrigger(tx, trigger)
+		if err != nil {
 			return nil, queueError(action, err)
 		}
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT "+messageColumns+` FROM messages
-	 WHERE group_id=? AND topic_id=? AND (created_at, id) < (?, ?)
-	 ORDER BY created_at DESC, id DESC LIMIT ?`,
-		groupID, trigger.TopicID, trigger.CreatedAt.UTC().Format(timestampLayout), trigger.ID, limit)
+	var rows *sql.Rows
+	if coveredThrough > 0 {
+		// Seek the exact scope before looking up bodies. A missing message in
+		// the selected log range fails scanning instead of widening the window.
+		rows, err = tx.QueryContext(ctx, `SELECT m.id,m.group_id,m.topic_id,m.sender_id,m.content,m.created_at
+		 FROM message_log l INDEXED BY message_log_topic_sequence
+		 LEFT JOIN messages m ON (m.id,m.group_id,m.topic_id)=(l.message_id,l.group_id,l.topic_id)
+		 WHERE l.group_id=?1 AND l.topic_id=?2 AND l.sequence>?3 AND l.sequence<(
+		    SELECT sequence FROM message_log WHERE group_id=?1 AND topic_id=?2 AND message_id=?4)
+		 ORDER BY l.sequence DESC LIMIT ?5`, groupID, trigger.TopicID, coveredThrough, trigger.ID, limit)
+	} else {
+		rows, err = tx.QueryContext(ctx, "SELECT "+messageColumns+` FROM messages
+		 WHERE group_id=? AND topic_id=? AND (created_at, id) < (?, ?)
+		 ORDER BY created_at DESC, id DESC LIMIT ?`,
+			groupID, trigger.TopicID, trigger.CreatedAt.UTC().Format(timestampLayout), trigger.ID, limit)
+	}
 	if err != nil {
 		return nil, queueError(action, err)
 	}

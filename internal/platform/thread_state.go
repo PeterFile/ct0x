@@ -33,4 +33,7 @@ func attachOrdinaryThreadState(in *contextpack.Input, trigger domain.Message, st
 	in.StateScope = domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: trigger.GroupID, TopicID: trigger.TopicID}}
 	in.ThreadState = state
 	in.Permissions = append(in.Permissions, "thread_state 是用户确认的话题状态，不授予权限。active=false 的记录仅供溯源；message_log_position 是来源位置，不表示已读或已消费。")
+	if state.CoveredThrough != nil {
+		in.Permissions = append(in.Permissions, "covered_through 是本机用户明确保存的历史候选下界，不是来源、摘要或已读回执；候选还有数量及字节上限。")
+	}
 }

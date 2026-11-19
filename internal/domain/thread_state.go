@@ -45,8 +45,16 @@ type ThreadStateRecord struct {
 	InvalidatedBy *ThreadStateInvalidation `json:"invalidated_by,omitempty"`
 }
 
+// ThreadStateCoverage is an explicit local-user boundary for history selection.
+// It is not confirmation provenance, a ContextPack sequence, or a read receipt.
+type ThreadStateCoverage struct {
+	MessageID          string `json:"message_id"`
+	MessageLogPosition int64  `json:"message_log_position"`
+}
+
 type ThreadStateSnapshot struct {
-	Scope    ThreadStateScope    `json:"scope"`
-	Revision int64               `json:"revision"` // Last command, not a message position.
-	Records  []ThreadStateRecord `json:"records"`  // Latest record per slot as of Revision.
+	Scope          ThreadStateScope     `json:"scope"`
+	Revision       int64                `json:"revision"` // Last command, not a message position.
+	Records        []ThreadStateRecord  `json:"records"`  // Latest record per slot as of Revision.
+	CoveredThrough *ThreadStateCoverage `json:"covered_through,omitempty"`
 }
