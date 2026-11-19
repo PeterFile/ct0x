@@ -42,6 +42,7 @@ func threadDecisionFixture(t *testing.T) (chatFixture, domain.DecisionRequest) {
 	installDecisionAnswerFixture(t, f.s)
 	q := askThreadDecision(t, f) // Prove that an existing opt-in can be answered after installation.
 	installThreadDecisionAnswerFixture(t, f.s)
+	f.s.EnableThreadDecisionExecution()
 	if _, err := f.s.ApplyTurnReceipt(ctx, f.scope.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}); err != nil {
 		t.Fatal(err)
 	}
@@ -58,16 +59,38 @@ func ThreadDecisionHTTPFixture(t *testing.T) (*Store, string, domain.DecisionReq
 
 func TestThreadDecisionAnswerReturnsOnlyToTheAsker(t *testing.T) {
 	f := chatSetup(t, "user", false)
+	// Reopen the actual public-migration database before installing either
+	// private answer fragment. Even the startup assertion cannot install SQL.
+	old := queueHandle(t, f.path, false)
+	old.EnableThreadDecisionExecution()
+	if _, err := old.ListAnswerableDecisions(ctx, ListOptions{}); !errors.Is(err, ErrDecisionRequestsUnavailable) {
+		t.Fatalf("pre-decision database: %v", err)
+	}
+	if page, err := old.ListPendingDeliveries(ctx, PendingOptions{Lane: PendingThreadDecisions}); err != nil || len(page.Items) != 0 {
+		t.Fatalf("typed lane on the old database: %+v %v", page, err)
+	}
 	installDecisionAnswerFixture(t, f.s)
 	q := askThreadDecision(t, f)
 	answer := domain.DecisionAnswerInput{Version: q.Version, OptionIndex: 1}
-	if page, err := f.s.ListAnswerableDecisions(ctx, ListOptions{}); err != nil || len(page.Items) != 0 {
+	if page, err := old.ListAnswerableDecisions(ctx, ListOptions{}); err != nil || len(page.Items) != 0 {
 		t.Fatalf("advertised a route without Thread reply storage: %+v %v", page, err)
 	}
-	if _, err := f.s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, answer, "legacy"); !errors.Is(err, ErrDecisionRelayUnsupported) {
+	if _, err := old.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, answer, "legacy"); !errors.Is(err, ErrDecisionRelayUnsupported) {
 		t.Fatalf("uninstalled Thread reply route: %v", err)
 	}
 	installThreadDecisionAnswerFixture(t, f.s)
+	beforeDisabled := messageSequenceSnapshot(t, f.s)
+	if m, err := f.s.GetMember(ctx, q.GroupID, q.AuthorMemberID); err != nil || m.ProviderID == "" || m.Model == "" {
+		t.Fatalf("disabled startup fixture must have a configured provider/model: %+v %v", m, err)
+	}
+	if page, err := f.s.ListAnswerableDecisions(ctx, ListOptions{}); err != nil || len(page.Items) != 0 {
+		t.Fatalf("schema alone advertised a Thread reply route: %+v %v", page, err)
+	}
+	if got, err := f.s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, answer, "disabled"); !errors.Is(err, ErrDecisionRelayUnsupported) || got.ID != "" {
+		t.Fatalf("schema alone accepted a Thread reply: %+v %v", got, err)
+	}
+	messageSequencePreserved(t, f.s, beforeDisabled)
+	f.s.EnableThreadDecisionExecution()
 	other, err := f.s.GetGroup(ctx, f.otherID)
 	if err != nil || q.GroupName != other.Name || q.GroupID == other.ID {
 		t.Fatalf("fixture must have distinct groups with the same name: %+v %v", other, err)
@@ -129,6 +152,20 @@ func TestThreadDecisionWakeAfterReopenAndSecondClaim(t *testing.T) {
 	assertDecisionAnswerView(t, s, a, nil)
 	claimInput := ClaimTurnInput{GroupID: q.GroupID, DeliveryID: a.WakeDeliveryID, MaxActive: 2, ResourceKeys: []string{"thread-answer-resource"}}
 	before := messageSequenceSnapshot(t, s)
+	typed := claimInput
+	typed.ThreadDecisionAnswerID = a.ID
+	if page, err := s.ListPendingDeliveries(ctx, PendingOptions{Lane: PendingThreadDecisions, Limit: 1}); err != nil || len(page.Items) != 0 {
+		t.Fatalf("disabled startup advertised a historical wake: %+v %v", page, err)
+	}
+	if _, err := s.ResolveThreadDecisionWake(ctx, q.GroupID, a.WakeDeliveryID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("disabled startup resolved a wake: %v", err)
+	}
+	if turn, err := s.ClaimTurn(ctx, typed); !errors.Is(err, ErrMemberToolDenied) || turn.ID != "" {
+		t.Fatalf("disabled startup claimed with a valid typed marker: %+v %v", turn, err)
+	}
+	messageSequencePreserved(t, s, before)
+	s.EnableThreadDecisionExecution()
+	alias.EnableThreadDecisionExecution()
 	if _, err := s.ClaimTurn(ctx, claimInput); !errors.Is(err, ErrMemberToolDenied) {
 		t.Fatalf("typed wake reached ordinary claim: %v", err)
 	}
@@ -194,15 +231,20 @@ func TestThreadDecisionWakeAfterReopenAndSecondClaim(t *testing.T) {
 	if _, err := s.CaptureChatCandidate(ctx, MemberToolScope{Claim: claim, MemberID: turn.MemberID, ConversationID: turn.ConversationID, TopicID: q.TopicID}); !errors.Is(err, ErrMemberToolDenied) {
 		t.Fatalf("claimed wake became a fresh assessor/intake: %v", err)
 	}
-	admitted := false
-	admit := func() bool { admitted = true; return true }
-	wrong := wake
-	wrong.Receipt.GroupID = f.otherID
-	if err := s.CommitThreadDecisionLaunch(ctx, claim, wrong, admit); !errors.Is(err, ErrMemberToolDenied) || admitted {
-		t.Fatalf("foreign plan passed typed launch: %v, admitted=%t", err, admitted)
+	launch := threadDecisionLaunchForTest(t, s, wake, claimInput.ResourceKeys)
+	calls := 0
+	admit := func() bool { calls++; return calls == 1 }
+	wrong := launch
+	wrong.Wake.Receipt.GroupID = f.otherID
+	if err := s.CommitThreadDecisionLaunch(ctx, claim, wrong, admit); !errors.Is(err, ErrMemberToolDenied) || calls != 0 {
+		t.Fatalf("foreign plan passed typed launch: %v, calls=%d", err, calls)
 	}
-	if err := s.CommitThreadDecisionLaunch(ctx, claim, wake, admit); err != nil || !admitted {
-		t.Fatalf("typed continuation not launchable: %v, admitted=%t", err, admitted)
+	cold := queueHandle(t, f.path, false)
+	if err := cold.CommitThreadDecisionLaunch(ctx, claim, launch, admit); !errors.Is(err, ErrMemberToolDenied) || calls != 0 {
+		t.Fatalf("disabled startup committed an existing claim: %v, calls=%d", err, calls)
+	}
+	if err := s.CommitThreadDecisionLaunch(ctx, claim, launch, admit); err != nil || calls != 1 {
+		t.Fatalf("typed continuation did not spend the original one-shot: %v, calls=%d", err, calls)
 	}
 	queueEvent(t, s, claim, provider.AcceptedEvent, "", "")
 	assertDecisionAnswerView(t, s, a, nil)
@@ -214,6 +256,7 @@ func TestThreadDecisionWakeAfterReopenAndSecondClaim(t *testing.T) {
 	if got := saveThreadDecisionForTest(t, s, q); got != a {
 		t.Fatalf("restart requeued the original answer: %+v", got)
 	}
+	s.EnableThreadDecisionExecution()
 	if _, err := s.ClaimTurn(ctx, claimInput); !errors.Is(err, ErrTurnBusy) {
 		t.Fatalf("settlement and reopen allowed a second claim: %v", err)
 	}
@@ -230,7 +273,8 @@ func TestThreadDecisionRecoveryDoesNotRequeueOrAcknowledge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := ClaimTurnInput{GroupID: q.GroupID, DeliveryID: a.WakeDeliveryID, ThreadDecisionAnswerID: a.ID, MaxActive: 2}
+	input := ClaimTurnInput{GroupID: q.GroupID, DeliveryID: a.WakeDeliveryID, ThreadDecisionAnswerID: a.ID, MaxActive: 2, ResourceKeys: []string{"thread-answer-resource"}}
+	launch := threadDecisionLaunchForTest(t, f.s, wake, input.ResourceKeys)
 	turn, err := f.s.ClaimTurn(ctx, input)
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +283,7 @@ func TestThreadDecisionRecoveryDoesNotRequeueOrAcknowledge(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := queueHandle(t, f.path, false)
+	s.EnableThreadDecisionExecution()
 	if count, err := s.RecoverInFlight(ctx); err != nil || count != 1 {
 		t.Fatalf("recovery: %d, %v", count, err)
 	}
@@ -247,7 +292,7 @@ func TestThreadDecisionRecoveryDoesNotRequeueOrAcknowledge(t *testing.T) {
 	}
 	claim := TurnClaim{GroupID: q.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
 	admitted := false
-	if err := s.CommitThreadDecisionLaunch(ctx, claim, wake, func() bool { admitted = true; return true }); !errors.Is(err, ErrStaleClaim) || admitted {
+	if err := s.CommitThreadDecisionLaunch(ctx, claim, launch, func() bool { admitted = true; return true }); !errors.Is(err, ErrStaleClaim) || admitted {
 		t.Fatalf("old claimant launched after recovery: %v, admitted=%t", err, admitted)
 	}
 	assertDecisionAnswerView(t, s, a, nil)
@@ -265,15 +310,13 @@ func saveThreadDecisionForTest(t *testing.T, s *Store, q domain.DecisionRequest)
 func TestThreadDecisionReplyFences(t *testing.T) {
 	for _, change := range []string{"new-user-message", "policy", "changed-source", "withdrawal", "expired", "asker-left", "asker-rejoined"} {
 		for _, when := range []string{"before-answer", "before-claim", "before-launch"} {
-			if change == "asker-rejoined" && when == "before-answer" {
-				continue // No pending wake existed at the time of departure.
-			}
 			t.Run(change+"/"+when, func(t *testing.T) {
 				f, q := threadDecisionFixture(t)
 				s := f.s
 				var a domain.DecisionAnswerReceipt
 				var wake ThreadDecisionWake
 				var claim TurnClaim
+				var launch ThreadDecisionLaunch
 				if when != "before-answer" {
 					a = saveThreadDecisionForTest(t, s, q)
 					var err error
@@ -282,8 +325,10 @@ func TestThreadDecisionReplyFences(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				input := ClaimTurnInput{GroupID: q.GroupID, DeliveryID: a.WakeDeliveryID, MaxActive: 2, ThreadDecisionAnswerID: a.ID}
+				input := ClaimTurnInput{GroupID: q.GroupID, DeliveryID: a.WakeDeliveryID, MaxActive: 2,
+					ThreadDecisionAnswerID: a.ID, ResourceKeys: []string{"thread-answer-resource"}}
 				if when == "before-launch" {
+					launch = threadDecisionLaunchForTest(t, s, wake, input.ResourceKeys)
 					turn, err := s.ClaimTurn(ctx, input)
 					if err != nil {
 						t.Fatal(err)
@@ -310,6 +355,11 @@ func TestThreadDecisionReplyFences(t *testing.T) {
 				case "asker-left", "asker-rejoined":
 					coordinationDecideExec(t, s, `UPDATE members SET status='left' WHERE id=?`, f.scope.MemberID)
 					if change == "asker-rejoined" {
+						if err := s.Close(); err != nil {
+							t.Fatal(err)
+						}
+						s = queueHandle(t, f.path, false)
+						s.EnableThreadDecisionExecution()
 						coordinationDecideExec(t, s, `UPDATE members SET status='active' WHERE id=?`, f.scope.MemberID)
 					}
 				}
@@ -344,7 +394,7 @@ func TestThreadDecisionReplyFences(t *testing.T) {
 				}
 				if claim.TurnID != "" {
 					admitted := false
-					if err := s.CommitThreadDecisionLaunch(ctx, claim, wake, func() bool { admitted = true; return true }); !errors.Is(err, ErrMemberToolDenied) || admitted {
+					if err := s.CommitThreadDecisionLaunch(ctx, claim, launch, func() bool { admitted = true; return true }); !errors.Is(err, ErrMemberToolDenied) || admitted {
 						t.Fatalf("stale claimed wake passed final fence: %v admitted=%t", err, admitted)
 					}
 				}

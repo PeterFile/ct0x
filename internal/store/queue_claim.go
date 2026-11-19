@@ -89,7 +89,7 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 			return domain.Turn{}, queueError(action, ErrTurnBusy)
 		}
 	}
-	if err := threadDecisionClaimInTx(ctx, tx, t, messageID, input.ThreadDecisionAnswerID); err != nil {
+	if err := s.threadDecisionClaimInTx(ctx, tx, t, messageID, input.ThreadDecisionAnswerID); err != nil {
 		return domain.Turn{}, queueError(action, err)
 	}
 	if err := tx.Commit(); err != nil {

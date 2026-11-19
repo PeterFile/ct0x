@@ -22,6 +22,16 @@ type ThreadDecisionWake struct {
 	SourceMessageID, NoticeMessageID, Question string
 }
 
+// ThreadDecisionLaunch is the trusted runtime's frozen startup plan, not a
+// launch permit or a native resume reference. Workspace is the exact configured
+// member value (empty for the default); ResourceKeys is the complete claim set.
+// This plan grants no tools or workspace access.
+type ThreadDecisionLaunch struct {
+	Wake                         ThreadDecisionWake
+	ProviderID, Model, Workspace string
+	ResourceKeys                 []string
+}
+
 // Reserved message/delivery IDs can only exclude legacy paths. The immutable
 // ledger and its exact relations (not the prefix) prove a typed launch.
 func isThreadDecisionRef(id string) bool { return strings.HasPrefix(id, threadDecisionAnswerPrefix) }
@@ -30,11 +40,11 @@ func (s *Store) threadDecisionPendingFilter(ctx context.Context, lane string) (s
 	if lane != PendingThreadDecisions {
 		return ` AND instr(d.id,'` + threadDecisionAnswerPrefix + `')<>1 AND instr(d.message_id,'` + threadDecisionAnswerPrefix + `')<>1`, nil, nil
 	}
-	installed, err := decisionThreadAnswerInstalled(ctx, s.db)
+	ready, err := s.threadDecisionExecutionReady(ctx, s.db)
 	if err != nil {
 		return "", nil, err
 	}
-	if !installed {
+	if !ready {
 		return ` AND 0`, nil, nil
 	}
 	return ` AND EXISTS(SELECT 1 FROM decision_thread_answers a
@@ -81,11 +91,11 @@ func (s *Store) ResolveThreadDecisionWake(ctx context.Context, groupID, delivery
 		return ThreadDecisionWake{}, queueError(action, err)
 	}
 	defer tx.Rollback()
-	installed, err := decisionThreadAnswerInstalled(ctx, tx)
+	ready, err := s.threadDecisionExecutionReady(ctx, tx)
 	if err != nil {
 		return ThreadDecisionWake{}, queueError(action, err)
 	}
-	if !installed {
+	if !ready {
 		return ThreadDecisionWake{}, ErrNotFound
 	}
 	wake, state, turnID, err := decisionThreadWakeInTx(ctx, tx, groupID, deliveryID)
@@ -101,7 +111,7 @@ func (s *Store) ResolveThreadDecisionWake(ctx context.Context, groupID, delivery
 	return wake, nil
 }
 
-func threadDecisionClaimInTx(ctx context.Context, tx *sql.Tx, turn domain.Turn, messageID, answerID string) error {
+func (s *Store) threadDecisionClaimInTx(ctx context.Context, tx *sql.Tx, turn domain.Turn, messageID, answerID string) error {
 	marked := isThreadDecisionRef(turn.DeliveryID) || isThreadDecisionRef(messageID)
 	if !marked && answerID == "" {
 		return nil
@@ -109,11 +119,11 @@ func threadDecisionClaimInTx(ctx context.Context, tx *sql.Tx, turn domain.Turn, 
 	if !marked || !isThreadDecisionRef(answerID) {
 		return ErrMemberToolDenied
 	}
-	installed, err := decisionThreadAnswerInstalled(ctx, tx)
+	ready, err := s.threadDecisionExecutionReady(ctx, tx)
 	if err != nil {
 		return err
 	}
-	if !installed {
+	if !ready {
 		return ErrMemberToolDenied
 	}
 	wake, err := claimedThreadDecisionWakeInTx(ctx, tx, turn)
@@ -136,12 +146,15 @@ func claimedThreadDecisionWakeInTx(ctx context.Context, tx *sql.Tx, turn domain.
 }
 
 // CommitThreadDecisionLaunch is the last fence before invoking a non-granting
-// same-conversation continuation. admit must spend the native wrapper's
-// existing one-shot owner in memory, under its registry lock (no I/O). Invoke
-// only after commit succeeds. This is not evidence of launch or consumption.
-func (s *Store) CommitThreadDecisionLaunch(ctx context.Context, claim TurnClaim, expected ThreadDecisionWake, admit func() bool) error {
+// same-conversation continuation. Hold the existing registry's revoke lock;
+// admit may only spend the existing in-memory one-shot owner, not do I/O or
+// invoke native code. Do not restore a spent owner on error. Invoke only after
+// a successful commit with a live context. This is not execution evidence.
+func (s *Store) CommitThreadDecisionLaunch(ctx context.Context, claim TurnClaim, launch ThreadDecisionLaunch, admit func() bool) error {
 	const action = "提交话题答复续接启动失败"
-	if admit == nil || expected.Receipt.ID == "" {
+	keys := canonicalNativeSet(launch.ResourceKeys) // Copy before taking the write fence.
+	if admit == nil || launch.Wake.Receipt.ID == "" || !nativeStrings(launch.ProviderID, launch.Model) ||
+		!nativeOptionalStrings(launch.Workspace) || !nativeStringSet(keys, 1, 32) {
 		return ErrInvalid
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -154,32 +167,54 @@ func (s *Store) CommitThreadDecisionLaunch(ctx context.Context, claim TurnClaim,
 	if err != nil {
 		return queueError(action, err)
 	}
-	if !nativeFreshTurn(turn) || turn.DeliveryID != expected.Receipt.WakeDeliveryID {
+	if !nativeFreshTurn(turn) || turn.DeliveryID != launch.Wake.Receipt.WakeDeliveryID {
+		return ErrMemberToolDenied
+	}
+	ready, err := s.threadDecisionExecutionReady(ctx, tx)
+	if err != nil {
+		return queueError(action, err)
+	}
+	if !ready {
 		return ErrMemberToolDenied
 	}
 	wake, err := claimedThreadDecisionWakeInTx(ctx, tx, turn)
 	if err != nil {
 		return queueError(action, err)
 	}
-	// Re-read the live claim after the lock statement, including any effects
-	// of triggers. The native runtime owns its provider and resource checks.
-	var fresh bool
-	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM turns WHERE
-	 (id,claim_token,group_id,delivery_id,member_id,conversation_id)=(?,?,?,?,?,?)
-	 AND state='starting' AND cancel_requested_at IS NULL AND accepted_at IS NULL AND native_session_id=''
-	 AND candidate_text='' AND candidate_terminal='' AND receipt_json='')`,
-		turn.ID, claim.Token, turn.GroupID, turn.DeliveryID, turn.MemberID, turn.ConversationID).Scan(&fresh)
+	if wake != launch.Wake {
+		return ErrMemberToolDenied
+	}
+	// Like the native and TaskWork gates, compare the frozen startup facts
+	// to the current claim after the lock write, including trigger effects.
+	// Any binding for this Turn, even an unknown/no-reference row, is evidence.
+	var exact bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM turns t
+	 JOIN members m ON (m.group_id,m.id)=(t.group_id,t.member_id)
+	 WHERE (t.id,t.claim_token,t.group_id,t.delivery_id,t.member_id,t.conversation_id)=(?,?,?,?,?,?)
+	 AND t.state='starting' AND t.cancel_requested_at IS NULL AND t.accepted_at IS NULL AND t.native_session_id=''
+	 AND t.candidate_text='' AND t.candidate_terminal='' AND t.receipt_json=''
+	 AND NOT EXISTS(SELECT 1 FROM native_run_bindings b WHERE b.turn_id=t.id)
+	 AND m.status='active' AND (m.provider_id,m.model,m.workspace)=(?,?,?))`,
+		turn.ID, claim.Token, turn.GroupID, turn.DeliveryID, turn.MemberID, turn.ConversationID,
+		launch.ProviderID, launch.Model, launch.Workspace).Scan(&exact)
+	if err != nil {
+		return queueError(action, err)
+	}
+	if !exact {
+		return ErrMemberToolDenied
+	}
+	resources, err := nativeResourcesInTx(ctx, tx, turn.ID, keys)
 	if err != nil {
 		return queueError(action, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !fresh || wake != expected || !admit() {
+	if !resources || !admit() {
 		return ErrMemberToolDenied
 	}
 	if err := tx.Commit(); err != nil {
 		return queueError(action, err)
 	}
-	return nil
+	return ctx.Err()
 }

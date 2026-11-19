@@ -125,7 +125,7 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 	var save func() (domain.DecisionAnswerReceipt, error)
 	switch q.Relay {
 	case domain.DecisionRelayOriginThread:
-		asker, err := decisionThreadAskerInTx(ctx, tx, q)
+		asker, err := s.decisionThreadAskerInTx(ctx, tx, q)
 		if err != nil {
 			return zero, err
 		}

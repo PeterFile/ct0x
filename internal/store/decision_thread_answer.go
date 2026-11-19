@@ -13,17 +13,31 @@ import (
 const threadDecisionAnswerPrefix = "thread-decision-answer:"
 const decisionThreadUnanswered = ` AND NOT EXISTS(SELECT 1 FROM decision_thread_answers answer WHERE answer.request_id=q.id)`
 
-func decisionThreadAnswerInstalled(ctx context.Context, q interface {
+type threadDecisionSchemaQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}) (bool, error) {
+}
+
+func decisionThreadAnswerInstalled(ctx context.Context, q threadDecisionSchemaQueryer) (bool, error) {
 	var installed bool
 	err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='decision_thread_answers')`).Scan(&installed)
 	return installed, err
 }
 
-func answerableDecisionSQL(ctx context.Context, tx *sql.Tx, taskOnly string) (string, error) {
-	installed, err := decisionThreadAnswerInstalled(ctx, tx)
-	if err != nil || !installed {
+// EnableThreadDecisionExecution is a startup assertion by trusted composition,
+// only after the typed consumer is ready on this Store. A reopened Store starts
+// disabled. The assertion neither installs SQL nor grants member tools.
+func (s *Store) EnableThreadDecisionExecution() { s.threadDecisionExecution.Store(true) }
+
+func (s *Store) threadDecisionExecutionReady(ctx context.Context, q threadDecisionSchemaQueryer) (bool, error) {
+	if !s.threadDecisionExecution.Load() {
+		return false, nil
+	}
+	return decisionThreadAnswerInstalled(ctx, q)
+}
+
+func (s *Store) answerableDecisionSQL(ctx context.Context, tx *sql.Tx, taskOnly string) (string, error) {
+	ready, err := s.threadDecisionExecutionReady(ctx, tx)
+	if err != nil || !ready {
 		return taskOnly, err
 	}
 	return decisionRequestCurrent + decisionRequestUnanswered + decisionThreadUnanswered + ` AND (q.task_id IS NOT NULL
@@ -32,15 +46,15 @@ func answerableDecisionSQL(ctx context.Context, tx *sql.Tx, taskOnly string) (st
 
 type decisionThreadAsker struct{ memberID, conversationID string }
 
-func decisionThreadAskerInTx(ctx context.Context, tx *sql.Tx, q domain.DecisionRequest) (asker decisionThreadAsker, err error) {
+func (s *Store) decisionThreadAskerInTx(ctx context.Context, tx *sql.Tx, q domain.DecisionRequest) (asker decisionThreadAsker, err error) {
 	if q.Kind != domain.DecisionRequestClarification || q.Relay != domain.DecisionRelayOriginThread || q.Chat == nil || q.Task != nil {
 		return asker, ErrDecisionRelayUnsupported
 	}
-	installed, err := decisionThreadAnswerInstalled(ctx, tx)
+	ready, err := s.threadDecisionExecutionReady(ctx, tx)
 	if err != nil {
 		return asker, err
 	}
-	if !installed {
+	if !ready {
 		return asker, ErrDecisionRelayUnsupported
 	}
 	err = tx.QueryRowContext(ctx, `SELECT asker_id,conversation_id FROM decision_thread_answerable

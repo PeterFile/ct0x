@@ -1,7 +1,20 @@
 package store
 
+// Match the immutable asking assessment, not the live view, latest version, or
+// answer ledger. Supersession and departure itself can hide a pending question.
+// Withdrawal is request-level, so it fences all versions.
+const decisionThreadQuestionAsker = `(SELECT c.member_id FROM chat_assessments a JOIN chat_candidates c ON c.id=a.candidate_id
+    WHERE (a.id,c.group_id,c.topic_id,c.message_id,c.generation)=
+          (decision_requests.chat_assessment_id,decision_requests.group_id,decision_requests.topic_id,
+           decision_requests.source_message_id,decision_requests.source_sequence))`
+
+const decisionThreadWithdraw = `UPDATE decision_requests
+    SET withdrawn_at=max(created_at,strftime('%Y-%m-%dT%H:%M:%f','now')||'000000Z')
+    WHERE withdrawn_at IS NULL AND kind='clarification' AND relay='origin_thread' AND task_id IS NULL`
+
 // Append after decisionRequestSchema and decisionAnswerSchema. B assigns the
-// public migration slot. No earlier messages or clarifications are rewritten.
+// public migration slot. Only the withdrawal of an already-left asker's
+// Thread question may change; earlier message and question content is untouched.
 const decisionThreadAnswerSchema = `
 CREATE VIEW decision_thread_answerable AS
 SELECT q.id AS request_id,v.version,v.expires_at,q.group_id,q.topic_id,
@@ -96,13 +109,14 @@ CREATE TRIGGER decision_thread_no_coordination_trigger BEFORE INSERT ON coordina
 WHEN instr(NEW.message_id,'` + threadDecisionAnswerPrefix + `')=1
 BEGIN SELECT RAISE(ABORT,'话题答复不是新的工作授权'); END;
 
--- A queued or already claimed reply cannot revive on departure and rejoin.
+-- Withdraw legacy questions whose asker is already left at installation.
+` + decisionThreadWithdraw + ` AND EXISTS(SELECT 1 FROM members m
+    WHERE (m.group_id,m.id,m.status)=(decision_requests.group_id,` + decisionThreadQuestionAsker + `,'left'));
+
+-- Neither unanswered nor queued/claimed questions may revive after rejoin.
 CREATE TRIGGER decision_thread_asker_departed AFTER UPDATE OF status ON members
 WHEN OLD.status='active' AND NEW.status='left'
 BEGIN
-    UPDATE decision_requests SET withdrawn_at=max(created_at,strftime('%Y-%m-%dT%H:%M:%f','now')||'000000Z')
-    WHERE group_id=OLD.group_id AND withdrawn_at IS NULL AND id IN (
-        SELECT answer.request_id FROM decision_thread_answers answer JOIN deliveries d ON d.id=answer.delivery_id
-        WHERE d.group_id=OLD.group_id AND d.recipient_id=OLD.id);
+    ` + decisionThreadWithdraw + ` AND group_id=OLD.group_id AND ` + decisionThreadQuestionAsker + `=OLD.id;
 END;
 `

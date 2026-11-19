@@ -48,9 +48,9 @@ func TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead(t *testing.T) {
 	handlers := [2]http.Handler{threadDecisionHTTP(t, db), threadDecisionHTTP(t, alias)}
 	global, group := "/api/v1/me/decisions/"+q.ID+"/answer", "/api/v1/groups/"+q.GroupID+"/decisions/"+q.ID+"/answer"
 	const inbox = "/api/v1/me/pending-decisions"
-	assertInbox := func(want bool) {
+	assertInbox := func(h http.Handler, want bool) {
 		t.Helper()
-		w := threadDecisionRequest(handlers[0], http.MethodGet, inbox, nil, "")
+		w := threadDecisionRequest(h, http.MethodGet, inbox, nil, "")
 		var page struct{ Items []domain.DecisionRequest }
 		if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &page) != nil || page.Items == nil ||
 			want && (len(page.Items) != 1 || page.Items[0].ID != q.ID || page.Items[0].ThreadRef != q.ThreadRef) || !want && len(page.Items) != 0 {
@@ -70,7 +70,16 @@ func TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead(t *testing.T) {
 	}
 	const text = "只看工作日"
 	answer := body(q.ThreadRef, text)
-	assertInbox(true)
+	assertInbox(handlers[1], false)
+	for _, route := range []string{global, group} {
+		if w := threadDecisionRequest(handlers[1], http.MethodPost, route, answer, "disabled"); w.Code != http.StatusConflict ||
+			!bytes.Contains(w.Body.Bytes(), []byte(`"decision_relay_unsupported"`)) {
+			t.Fatalf("disabled startup accepted a new Thread reply via %s: %d %s", route, w.Code, w.Body)
+		}
+	}
+	alias.EnableThreadDecisionExecution() // This fixture stands in for C's ready consumer.
+	assertInbox(handlers[0], true)
+	assertInbox(handlers[1], true)
 	foreign := domain.ThreadRef{GroupID: otherGroup, TopicID: q.TopicID}
 	wrongTopic := domain.ThreadRef{GroupID: q.GroupID, TopicID: q.TopicID + " "}
 	for _, bad := range []struct {
@@ -88,7 +97,7 @@ func TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead(t *testing.T) {
 			t.Fatalf("wrong Thread %s: %d %s", bad.path, w.Code, w.Body)
 		}
 	}
-	assertInbox(true)
+	assertInbox(handlers[0], true)
 	var replies [2]*httptest.ResponseRecorder
 	var wg sync.WaitGroup
 	for i, route := range []string{global, group} {
@@ -102,7 +111,7 @@ func TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead(t *testing.T) {
 		json.Unmarshal(replies[0].Body.Bytes(), &saved) != nil || saved.ID == "" || saved.ThreadRef != q.ThreadRef || saved.TaskID != "" || saved.Text != text {
 		t.Fatalf("aliases returned different or invalid receipts: %d %s / %d %s", replies[0].Code, replies[0].Body, replies[1].Code, replies[1].Body)
 	}
-	assertInbox(false)
+	assertInbox(handlers[0], false)
 	if w := threadDecisionRequest(handlers[0], http.MethodPost, group, body(q.ThreadRef, "包括周末"), "different"); w.Code != http.StatusConflict {
 		t.Fatalf("second answer replaced the first: %d %s", w.Code, w.Body)
 	}
@@ -121,9 +130,8 @@ func TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead(t *testing.T) {
 	if w := threadDecisionRequest(h, http.MethodPost, group, answer, "global"); w.Code != http.StatusOK || !bytes.Equal(replies[0].Body.Bytes(), w.Body.Bytes()) {
 		t.Fatalf("reopen did not retain transport dedup: %d %s", w.Code, w.Body)
 	}
-	page, err := reopened.ListPendingDeliveries(ctx, store.PendingOptions{Lane: store.PendingThreadDecisions, Limit: 1})
-	if err != nil || len(page.Items) != 1 || page.NextCursor != nil || page.Items[0].Delivery.ID != saved.WakeDeliveryID {
-		t.Fatalf("aliases/restart did not share one wake: %+v %v", page, err)
+	if page, err := reopened.ListPendingDeliveries(ctx, store.PendingOptions{Lane: store.PendingThreadDecisions, Limit: 1}); err != nil || len(page.Items) != 0 {
+		t.Fatalf("historical reply was runnable on disabled restart: %+v %v", page, err)
 	}
 	if _, err := platform.NewLocalUser(reopened).CreateMessage(ctx, q.GroupID, platform.MessageInput{
 		TopicID: q.TopicID, Content: "新的同话题消息使旧答复无法再次启动。", RecipientIDs: []string{},

@@ -218,7 +218,7 @@ func (s *Store) listPendingDecisionRequests(ctx context.Context, options ListOpt
 		}
 		where = decisionRequestCurrent + decisionRequestUnanswered + ` AND q.task_id IS NOT NULL`
 		if list == decisionListAnswerable {
-			where, err = answerableDecisionSQL(ctx, tx, where)
+			where, err = s.answerableDecisionSQL(ctx, tx, where)
 		}
 	}
 	if err != nil {
