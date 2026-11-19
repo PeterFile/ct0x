@@ -50,18 +50,36 @@ func stateUpdate(expected, slot int, kind, action, text, message string) string 
 	return string(body)
 }
 
+func assertThreadStateUnavailable(t *testing.T, a *groupAPI, endpoint, update string) {
+	t.Helper()
+	w := a.request("PUT", endpoint, update, "without-thread-state")
+	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 503, "thread_state_unavailable")
+	w = a.request("GET", endpoint, "")
+	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 503, "thread_state_unavailable")
+	var clean bool
+	if err := messageSQL(t, a).QueryRow(`SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN ('thread_state_revisions','thread_state_heads'))
+	 AND NOT EXISTS(SELECT 1 FROM mutation_idempotency WHERE operation='set_thread_state')`).Scan(&clean); err != nil || !clean {
+		t.Fatalf("unavailable state command persisted state or a receipt: clean=%v, %v", clean, err)
+	}
+	t.Log("unregistered E2: PUT and GET reject without creating state or receipts")
+}
+
 func TestThreadStateUnavailableOnV30(t *testing.T) {
 	a := openMessageAPI(t, "")
-	if threadStateInstalled(t, a) {
-		t.Skip("requires the unregistered registry")
-	}
 	g := newGroup(t, a, "legacy")
 	m := threadStateMessage(t, a, g.ID, "bug", "legacy message")
-	for _, method := range []string{"PUT", "GET"} {
-		w := a.request(method, threadStateURL(g.ID, m.TopicID), stateUpdate(0, 0, "goal", "set", m.Content, m.ID), "legacy")
-		assertError(t, w.Code, w.Header(), w.Body.Bytes(), 503, "thread_state_unavailable")
+	endpoint := threadStateURL(g.ID, m.TopicID)
+	if threadStateInstalled(t, a) {
+		got := decoded[domain.ThreadStateSnapshot](t, a.request("GET", endpoint, ""), 200)
+		if got.Scope != (domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: g.ID, TopicID: m.TopicID}}) ||
+			got.Revision != 0 || got.Records == nil || len(got.Records) != 0 || got.CoveredThrough != nil {
+			t.Fatalf("installed E2 must return an empty snapshot for the named Thread: %+v", got)
+		}
+		t.Log("installed E2: existing named Thread has an empty revision-zero snapshot")
+	} else {
+		assertThreadStateUnavailable(t, a, endpoint, stateUpdate(0, 0, "goal", "set", m.Content, m.ID))
 	}
-	if got := decoded[domain.Message](t, a.request("GET", threadStateBase+g.ID+"/messages/"+m.ID, ""), 200); got.ID != m.ID {
+	if got := decoded[domain.Message](t, a.request("GET", threadStateBase+g.ID+"/messages/"+m.ID, ""), 200); got.ID != m.ID || got.TopicID != m.TopicID || got.Content != m.Content {
 		t.Fatalf("legacy message changed: %+v", got)
 	}
 }
@@ -70,10 +88,7 @@ func TestThreadStateUnavailableOnV30(t *testing.T) {
 // executable sentinel is never launched, and the new member has no prior Turn.
 func TestThreadStateHandoffPrompt(t *testing.T) {
 	a := openMessageAPI(t, "")
-	if !threadStateInstalled(t, a) {
-		t.Skip("requires the candidate migration overlay")
-	}
-	g, foreign := newGroup(t, a, "home"), newGroup(t, a, "foreign")
+	g := newGroup(t, a, "home")
 	const topic = " export+bug "
 	const constraint = "必须兼容旧版 CSV"
 	const oldPlan = "切回旧导出器"
@@ -85,6 +100,11 @@ func TestThreadStateHandoffPrompt(t *testing.T) {
 	}
 	oldMember := decoded[domain.Member](t, a.request("POST", threadStateBase+g.ID+"/members", `{"name":"first","role":"earlier owner"}`), 201)
 	old := threadStateMessage(t, a, g.ID, topic, constraint, oldMember.ID)
+	if !threadStateInstalled(t, a) {
+		assertThreadStateUnavailable(t, a, endpoint, stateUpdate(0, 0, "constraint", "set", old.Content, old.ID))
+		return
+	}
+	foreign := newGroup(t, a, "foreign")
 	post(0, 0, "constraint", "set", old)
 	plan := threadStateMessage(t, a, g.ID, topic, oldPlan)
 	post(1, 1, "plan", "set", plan)

@@ -16,18 +16,21 @@ func TestThreadStateTailLossFailsClosed(t *testing.T) {
 	for _, name := range []string{"only revision", "last retirement"} {
 		t.Run(name, func(t *testing.T) {
 			a := openMessageAPI(t, "")
-			if !threadStateInstalled(t, a) {
-				t.Skip("requires the candidate migration overlay")
-			}
 			g := newGroup(t, a, "tail loss")
 			const topic = "export"
+			const initialPlan = "use the old exporter"
 			url := threadStateURL(g.ID, topic)
+			if !threadStateInstalled(t, a) {
+				m := threadStateMessage(t, a, g.ID, topic, initialPlan)
+				assertThreadStateUnavailable(t, a, url, stateUpdate(0, 0, "plan", "set", m.Content, m.ID))
+				return
+			}
 			post := func(expected int, action, text string) {
 				t.Helper()
 				m := threadStateMessage(t, a, g.ID, topic, text)
 				decoded[domain.ThreadStateSnapshot](t, a.request("PUT", url, stateUpdate(expected, 0, "plan", action, text, m.ID), action), 200)
 			}
-			expected, action, text := 0, "set", "use the old exporter"
+			expected, action, text := 0, "set", initialPlan
 			if name == "last retirement" {
 				post(expected, action, text)
 				expected, action, text = 1, "invalidate", "retire the old exporter"
