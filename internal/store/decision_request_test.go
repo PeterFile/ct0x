@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,17 @@ import (
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
 )
+
+// isolateDecisionFixtureRegistry leaves decision SQL to the fixture, including
+// on reopen. Call before opening any Store in a nonparallel test.
+func isolateDecisionFixtureRegistry(t *testing.T) {
+	t.Helper()
+	prior := migrations
+	if i := slices.Index(prior, decisionRequestSchema); i >= 0 {
+		migrations = prior[:i:i]
+		t.Cleanup(func() { migrations = prior })
+	}
+}
 
 func installDecisionRequestFixture(t *testing.T, s *Store) {
 	t.Helper()
@@ -34,6 +46,7 @@ func decisionClarificationInput() (domain.ChatAssessment, domain.DecisionContext
 }
 
 func TestDecisionRequestExplicitClarificationSurvivesReopen(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetupSource(t, "user", false, "请帮我整理两批样本。")
 	input, details := decisionClarificationInput()
 	if page, err := f.s.ListPendingDecisionRequests(ctx, ListOptions{}); !errors.Is(err, ErrDecisionRequestsUnavailable) || len(page.Items) != 0 {
@@ -76,6 +89,7 @@ func TestDecisionRequestExplicitClarificationSurvivesReopen(t *testing.T) {
 }
 
 func TestDecisionRequestChatSourceFence(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	for _, name := range []string{"ordinary", "default-routed", "member-relay", "legacy-user-label", "foreign-candidate", "stale-before", "stale-after"} {
 		t.Run(name, func(t *testing.T) {
 			origin := "user"
@@ -177,6 +191,7 @@ func sameDecisionTaskInOtherGroup(t *testing.T, f chatFixture) chatFixture {
 }
 
 func TestDecisionRequestTaskGenerationDedupIsolationAndVersion(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	f.input.Title = "周末样本验证"
 	installDecisionRequestFixture(t, f.s)
@@ -265,6 +280,7 @@ func assertDecisionVersionMissing(t *testing.T, s *Store, request domain.Decisio
 }
 
 func TestDecisionRequestTaskScopeWithdrawalAndExpiry(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	installDecisionRequestFixture(t, f.s)
 	input := decisionTaskInput()
