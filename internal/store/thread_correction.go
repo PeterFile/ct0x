@@ -32,19 +32,30 @@ func threadCorrectionSubject(body string) (subject string, recognized bool) {
 
 func threadCorrectionInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	version := slices.Index(migrations, threadCorrectionSchema) + 1
-	if version == 0 {
-		return false, nil
-	}
-	var installed, later, present bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?),
-	 EXISTS(SELECT 1 FROM main.schema_migrations WHERE version>?), EXISTS(
-	 SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='thread_corrections')`, version, version).Scan(&installed, &later, &present); err != nil {
+	var installed, later bool
+	var objects, intact int
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=:version),
+	 :version>0 AND EXISTS(SELECT 1 FROM main.schema_migrations WHERE version>:version),
+	 count(*),count(CASE WHEN (type='table' AND sql=:corrections)
+	 OR (type='index' AND sql IN (:messages,:attempts,:latest,:incoming))
+	 OR (type='trigger' AND sql IN (:insert_guard,:update_guard,:delete_guard)) THEN 1 END)
+	 FROM main.sqlite_schema WHERE name IN ('thread_corrections','thread_correction_message_scope','thread_correction_attempt_turn',
+	 'thread_corrections_latest','thread_corrections_incoming','thread_corrections_insert','thread_corrections_update','thread_corrections_delete')`,
+		sql.Named("version", version), sql.Named("corrections", threadCorrectionTable),
+		sql.Named("messages", threadCorrectionMessageIndex), sql.Named("attempts", threadCorrectionAttemptIndex),
+		sql.Named("latest", threadCorrectionLatestIndex), sql.Named("incoming", threadCorrectionIncomingIndex),
+		sql.Named("insert_guard", threadCorrectionInsertGuard), sql.Named("update_guard", threadCorrectionUpdateGuard),
+		sql.Named("delete_guard", threadCorrectionDeleteGuard)).Scan(&installed, &later, &objects, &intact)
+	if err != nil {
 		return false, err
 	}
-	if installed != present || !installed && later {
-		return false, errors.New("话题纠正迁移记录与数据库不一致")
+	if !installed && !later && objects == 0 {
+		return false, nil // Legacy v30 and E1a-only installs have no correction footprint.
 	}
-	return installed, nil
+	if !installed || intact != 8 {
+		return false, errors.New("话题纠正迁移记录与数据库结构不一致")
+	}
+	return true, nil
 }
 
 func correctionDestinationInTx(ctx context.Context, tx *sql.Tx, group, subject string) (string, error) {

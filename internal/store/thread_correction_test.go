@@ -181,6 +181,32 @@ func TestThreadCorrectionConcurrentAppendAndReplay(t *testing.T) {
 	threadCounts(t, f.s, map[string]int{"messages": 6, "thread_corrections": 2, "message_command_sources": 4, "deliveries": 0, "mandates": 0, "tasks": 0})
 }
 
+func TestThreadCorrectionLegacyAttemptLocksGenericHistoryToStorage(t *testing.T) {
+	enableThreadCorrectionFixture(t)
+	f, scope, _, attempt := taskAttemptAgent(t)
+	anchor := postThreadMessage(t, f.s, MessageRequest{GroupID: f.groupID, ActorID: "user", TopicID: scope.TopicID,
+		Content: "legacy work topic", RecipientIDs: []string{}})
+	if _, err := f.s.db.Exec(`INSERT INTO thread_routing_topics(group_id,topic_id,title,title_key,issue_id,origin_message_id)
+	 VALUES(?,?,'版本交付','版本交付','REL-56',?)`, f.groupID, anchor.TopicID, anchor.ID); err != nil {
+		t.Fatal(err)
+	}
+	source := correctionPublicPost(t, f.s, f.groupID, "source", "需要记录的跨话题原文")
+	correctionPublicPost(t, f.s, f.groupID, "correct", "这句话指的是 REL-56")
+	input := MemberHistoryReadInput{MessageID: source.ID}
+	if got, err := f.s.ReadHistoryForTool(ctx, scope, input); err != nil || got.Content != source.Content {
+		t.Fatalf("ordinary claim must see corrected input before it is bound to work: %+v, %v", got, err)
+	}
+	if _, err := f.s.ActivateTaskAttempt(ctx, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.s.ReadHistoryForTool(ctx, scope, input); !errors.Is(err, ErrNotFound) || got.MessageID != "" {
+		t.Fatalf("same claim retained effective reads after durable attempt binding: %+v, %v", got, err)
+	}
+	if got, err := f.s.ReadHistoryForTool(ctx, scope, MemberHistoryReadInput{MessageID: anchor.ID}); err != nil || got.Content != anchor.Content {
+		t.Fatalf("attempt lost its storage topic history: %+v, %v", got, err)
+	}
+}
+
 func TestThreadCorrectionDoesNotGrantFrozenInvestigationReads(t *testing.T) {
 	enableThreadCorrectionFixture(t)
 	f, policy, role := investigationUserWorker(t)
@@ -202,6 +228,10 @@ func TestThreadCorrectionDoesNotGrantFrozenInvestigationReads(t *testing.T) {
 	if err != nil || !slices.ContainsFunc(page.Items, func(m domain.Message) bool { return m.ID == origin.ID }) ||
 		slices.ContainsFunc(page.Items, func(m domain.Message) bool { return m.ID == source.ID }) {
 		t.Fatalf("typed scope was widened by a topical overlay: %+v, %v", page, err)
+	}
+	// Even an internal call to the shared generic reader uses storage scope.
+	if got, err := f.s.ReadHistoryForTool(ctx, role.Member, MemberHistoryReadInput{MessageID: source.ID}); !errors.Is(err, ErrNotFound) || got.MessageID != "" {
+		t.Fatalf("typed Turn gained ordinary effective history: %+v, %v", got, err)
 	}
 	artifact := mustPublishArtifact(t, f.s, artifactPublishInput(f.groupID))
 	if _, _, err := f.s.ReadInvestigationArtifact(ctx, role, artifact.ArtifactID, artifact.ID); !errors.Is(err, ErrMemberToolDenied) {
@@ -256,6 +286,46 @@ func TestThreadCorrectionUnavailableKeepsOrdinaryRouting(t *testing.T) {
 			t.Fatalf("storage-only attribution fallback changed: %+v, %v", attr, err)
 		}
 		threadCounts(t, f.s, map[string]int{"messages": 1, "deliveries": 1, "message_command_sources": 1, "message_log": 1})
+	}
+}
+
+func TestThreadCorrectionDamagedInstallRejectsOrdinarySend(t *testing.T) {
+	enableThreadCorrectionFixture(t)
+	version := slices.Index(migrations, threadCorrectionSchema) + 1
+	for _, tc := range []struct {
+		name, statement string
+		args            []any
+	}{
+		{"missing_table", `DROP TABLE thread_corrections`, nil},
+		{"same_columns_without_constraints", `DROP TABLE thread_corrections;
+		 CREATE TABLE thread_corrections (sequence INTEGER,group_id TEXT,command_message_id TEXT,target_message_id TEXT,
+		 original_topic_id TEXT,previous_topic_id TEXT,effective_topic_id TEXT,question TEXT)`, nil},
+		{"missing_marker", `DELETE FROM schema_migrations WHERE version=?`, []any{version}},
+		{"missing_index", `DROP INDEX thread_corrections_incoming`, nil},
+		{"missing_insert_guard", `DROP TRIGGER thread_corrections_insert`, nil},
+		{"missing_delete_guard", `DROP TRIGGER thread_corrections_delete`, nil},
+		{"inert_update_guard", `DROP TRIGGER thread_corrections_update;
+		 CREATE TRIGGER thread_corrections_update BEFORE UPDATE ON thread_corrections BEGIN SELECT 1; END`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := setupMessages(t)
+			r := MessageRequest{GroupID: f.groupID, ActorID: "user", TopicID: "chosen-topic", TopicIDExplicit: true,
+				Content: "普通发言，不带引用", IdempotencyKey: "sent", RecipientIDs: []string{f.a}}
+			m := postThreadMessage(t, f.s, r)
+			if _, err := f.s.db.Exec(tc.statement, tc.args...); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"sent", "fresh"} {
+				r.IdempotencyKey = key
+				if got, err := f.s.PostLocalUserMessage(ctx, r); err == nil || errors.Is(err, ErrInvalid) || got.ID != "" {
+					t.Errorf("installed but broken correction schema allowed ordinary POST (%q): %+v (%v)", key, got, err)
+				}
+			}
+			if got, err := f.s.MessageThreadAttribution(ctx, f.groupID, m.ID); err == nil {
+				t.Errorf("damaged installation produced effective attribution: %+v", got)
+			}
+			threadCounts(t, f.s, map[string]int{"messages": 1, "message_log": 1, "deliveries": 1, "message_command_sources": 1, "mutation_idempotency": 1})
+		})
 	}
 }
 

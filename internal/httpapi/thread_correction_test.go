@@ -92,6 +92,40 @@ func TestThreadCorrectionNormalPost(t *testing.T) {
 	}
 }
 
+func TestThreadCorrectionDefaultPostPersistsClarification(t *testing.T) {
+	a := openMessageAPI(t, "")
+	requireThreadCorrectionFixture(t, a)
+	g := newGroup(t, a, "ambiguous correction")
+	path := "/api/v1/groups/" + g.ID + "/messages"
+	decoded[domain.Member](t, a.request("POST", "/api/v1/groups/"+g.ID+"/members", `{"name":"on call","role":"observer"}`), 201)
+	for _, title := range []string{"NET-56 网关告警", "OPS-42 备份告警"} {
+		m := decoded[domain.Message](t, postCorrectionHTTP(t, a, g.ID, "topic-"+title[:3], map[string]any{
+			"content": "新话题：" + title, "recipient_ids": []string{},
+		}), 201)
+		if m.TopicID == "" {
+			t.Fatalf("unregistered fixture topic: %+v", m)
+		}
+	}
+	original := decoded[domain.Message](t, a.request("POST", path, `{"content":"先确认是否有第二次失败。","recipient_ids":[]}`, "original"), 201)
+	const body = `{"content":"这句话指的是告警"}`
+	w := a.request("POST", path, body, "correction")
+	m := decoded[domain.Message](t, w, 201)
+	if m.ThreadCorrection == nil || m.ThreadCorrection.Question == "" || m.ThreadCorrection.MessageID != "" || m.TopicID != "" ||
+		m.SourceID != "" || len(m.Deliveries) != 0 {
+		t.Fatalf("ordinary composer did not get a durable, inert clarification: %s", w.Body)
+	}
+	if get := a.request("GET", path+"/"+m.ID, ""); get.Code != 200 || !bytes.Equal(get.Body.Bytes(), w.Body.Bytes()) {
+		t.Fatalf("timeline detail lost the clarification: %s", get.Body)
+	}
+	page := decoded[listResult[domain.Message]](t, a.request("GET", path, ""), 200)
+	if len(page.Items) != 4 || page.Items[0].ID != m.ID || page.Items[0].ThreadCorrection == nil || *page.Items[0].ThreadCorrection != *m.ThreadCorrection {
+		t.Fatalf("newest-page refresh lost the persisted question: %+v", page)
+	}
+	if attr, err := a.db.MessageThreadAttribution(t.Context(), g.ID, original.ID); err != nil || attr.Effective != attr.Storage || attr.CorrectionMessageID != "" {
+		t.Fatalf("ambiguous default correction moved the source: %+v, %v", attr, err)
+	}
+}
+
 func TestThreadCorrectionExplicitReplyAndAmbiguity(t *testing.T) {
 	a := openMessageAPI(t, "")
 	requireThreadCorrectionFixture(t, a)

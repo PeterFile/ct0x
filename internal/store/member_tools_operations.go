@@ -66,7 +66,11 @@ func (s *Store) ReadChannelForTool(ctx context.Context, scope MemberToolScope, o
 		return Page[domain.Message]{}, memberToolOperationError(action, err)
 	}
 	defer tx.Rollback()
-	page, err := readCurrentChannelInTx(ctx, tx, scope, options, effectiveHistory)
+	mode, err := memberHistoryModeInTx(ctx, tx, scope)
+	if err != nil {
+		return Page[domain.Message]{}, memberToolOperationError(action, err)
+	}
+	page, err := readCurrentChannelInTx(ctx, tx, scope, options, mode)
 	if err != nil {
 		return Page[domain.Message]{}, memberToolOperationError(action, err)
 	}

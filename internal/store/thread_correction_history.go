@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"slices"
 
 	"agentworkspace/internal/domain"
 )
@@ -13,6 +14,32 @@ const (
 	storageHistory   historyScopeMode = false
 	effectiveHistory historyScopeMode = true
 )
+
+// The caller has already taken the live claim fence in this transaction.
+// Reuse the durable work markers to select a projection; this grants no tool
+// or topic access and does not consult mutable role readiness or policy.
+func memberHistoryModeInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope) (historyScopeMode, error) {
+	if !slices.Contains(migrations, threadCorrectionSchema) {
+		return storageHistory, nil
+	}
+	var deliveryID string
+	var formal bool
+	err := tx.QueryRowContext(ctx, `SELECT t.delivery_id,
+	 EXISTS(SELECT 1 FROM main.coordination_dispatch_state s WHERE s.delivery_id=t.delivery_id OR s.message_id=d.message_id)
+	 OR EXISTS(SELECT 1 FROM main.coordination_assignment_dispatch s WHERE s.delivery_id=t.delivery_id OR s.message_id=d.message_id)
+	 OR EXISTS(SELECT 1 FROM main.task_attempts a WHERE a.turn_id=t.id)
+	 FROM main.turns t JOIN main.deliveries d
+	 ON (d.id,d.group_id,d.conversation_id,d.recipient_id,d.turn_id)=(t.delivery_id,t.group_id,t.conversation_id,t.member_id,t.id)
+	 WHERE t.id=? AND t.group_id=?`, scope.Claim.TurnID, scope.Claim.GroupID).Scan(&deliveryID, &formal)
+	if err != nil || formal {
+		return storageHistory, coordinationRoleRelationError(err)
+	}
+	typed, err := taskWorkMarkerInTx(ctx, tx, deliveryID)
+	if err != nil || typed {
+		return storageHistory, err
+	}
+	return effectiveHistory, nil
+}
 
 const qualifiedMessageColumns = "m.id, m.group_id, m.topic_id, m.sender_id, m.content, m.created_at"
 

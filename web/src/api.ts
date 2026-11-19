@@ -36,14 +36,19 @@ export type MessageDiscussion = Readonly<{
 export type MessageDiscussionWork = Readonly<{
   task_id: string; mandate_id: string; dispatch_request_id: string;
 } & ({ assignment_id?: never; worker_member_id?: never } | { assignment_id: string; worker_member_id: string })>;
+export type ThreadCorrectionReceipt = Readonly<
+  { message_id: string; original_topic_id: string; previous_topic_id: string; effective_topic_id: string; question?: never }
+  | { message_id?: never; original_topic_id: ""; previous_topic_id: ""; effective_topic_id: ""; question: string }
+>;
 export type Message = MessageSource & {
   id: string; group_id: string; topic_id: string; sender_id: string; content: string; created_at: string; deliveries: Delivery[];
   discussion?: MessageDiscussion | null;
   discussion_closure_reason?: string;
   discussion_work?: MessageDiscussionWork;
+  thread_correction?: ThreadCorrectionReceipt;
 };
-export type WireMessage = Omit<Message, "discussion" | "discussion_closure_reason" | "discussion_work"> & {
-  discussion?: unknown; discussion_closure_reason?: unknown; discussion_work?: unknown;
+export type WireMessage = Omit<Message, "discussion" | "discussion_closure_reason" | "discussion_work" | "thread_correction"> & {
+  discussion?: unknown; discussion_closure_reason?: unknown; discussion_work?: unknown; thread_correction?: unknown;
 };
 export type MessageInput = Readonly<{ content: string; recipient_ids?: readonly string[]; topic_id?: string }>;
 type Page<T> = { items: T[]; next_cursor: string };
@@ -131,14 +136,33 @@ function discussionWorkFor(value: unknown, message: Omit<Message, "discussion">)
   return discussionWorkId(assignment_id) && discussionWorkId(worker_member_id) && worker_member_id !== "user"
     ? { ...core, assignment_id, worker_member_id } : core;
 }
-export function decodeMessage({ discussion, discussion_closure_reason, discussion_work, ...message }: WireMessage): Message {
-  // Invalid optional evidence must not conceal an otherwise valid public row or change its receipt.
-  if (discussion === null) return { ...message, discussion };
-  const relation = discussionFor(discussion, message);
-  if (!relation) return message;
-  const reason = discussionClosureFor(discussion_closure_reason, message);
-  const work = relation.kind === "invite" && reason === undefined ? discussionWorkFor(discussion_work, message) : undefined;
-  return { ...message, discussion: relation, ...(reason === undefined ? {} : { discussion_closure_reason: reason }),
+function threadCorrectionFor(value: unknown, message: WireMessage): ThreadCorrectionReceipt | undefined {
+  // Corrections live on main and never have a chat-command source or delivery.
+  if (!isRecord(value) || Array.isArray(value) || message.topic_id !== "" || message.sender_id !== "user" || message.deliveries.length !== 0
+    || (message.source_kind !== undefined && message.source_kind !== "unknown") || (message.source_id !== undefined && message.source_id !== "")) return;
+  const { message_id, original_topic_id, previous_topic_id, effective_topic_id, question } = value;
+  if (question !== undefined) {
+    if (message_id === undefined && original_topic_id === "" && previous_topic_id === "" && effective_topic_id === ""
+      && boundedDiscussionText(question, 512) && question.trim() === question && question !== "" && !/[\p{Cc}\p{Cf}]/u.test(question)) {
+      return { original_topic_id, previous_topic_id, effective_topic_id, question };
+    }
+    return;
+  }
+  if (discussionId(message_id) && message_id !== message.id && boundedDiscussionText(original_topic_id, 4096)
+    && boundedDiscussionText(previous_topic_id, 4096) && discussionId(effective_topic_id)) {
+    return { message_id, original_topic_id, previous_topic_id, effective_topic_id };
+  }
+}
+export function decodeMessage({ discussion, discussion_closure_reason, discussion_work, thread_correction, ...message }: WireMessage): Message {
+  // Invalid optional evidence must not conceal an otherwise valid public row.
+  const correction = threadCorrectionFor(thread_correction, message);
+  const row: Message = correction ? { ...message, thread_correction: correction } : message;
+  if (discussion === null) return { ...row, discussion };
+  const relation = discussionFor(discussion, row);
+  if (!relation) return row;
+  const reason = discussionClosureFor(discussion_closure_reason, row);
+  const work = relation.kind === "invite" && reason === undefined ? discussionWorkFor(discussion_work, row) : undefined;
+  return { ...row, discussion: relation, ...(reason === undefined ? {} : { discussion_closure_reason: reason }),
     ...(work === undefined ? {} : { discussion_work: work }) };
 }
 function validProviderAdapter(value: unknown, current: Record<string, unknown>): value is ProviderAdapter {
@@ -222,8 +246,10 @@ const messagesPath = (groupId: string) => `/api/v1/groups/${encodeURIComponent(g
 export function sendMessage(groupId: string, input: MessageInput, key: string, signal?: AbortSignal) {
   const sent = Object.freeze({ content: input.content,
     recipient_ids: Array.isArray(input.recipient_ids) ? Object.freeze([...input.recipient_ids]) : input.recipient_ids, topic_id: input.topic_id });
-  return post(messagesPath(groupId), sent, key, (value): value is WireMessage => messageIn(groupId, sent.topic_id)(value)
-    && value.content === sent.content, signal).then(decodeMessage);
+  return post(messagesPath(groupId), sent, key, (value): value is WireMessage => messageIn(groupId)(value)
+    && value.content === sent.content && (sent.topic_id === undefined || value.topic_id === sent.topic_id
+      // A scope conflict on a correction is recorded as a clarification on main.
+      || threadCorrectionFor(value.thread_correction, value)?.question !== undefined), signal).then(decodeMessage);
 }
 export async function listMessages(groupId: string, before = "", signal?: AbortSignal): Promise<Page<Message>> {
   const result = await request(`${messagesPath(groupId)}${pageQuery(before)}`, { signal }, pageOf(messageIn(groupId)));

@@ -165,12 +165,12 @@ func readHistoryInTx(ctx context.Context, tx *sql.Tx, groupID string, topicID *s
 	if err := validateHistoryTopic(topicID); err != nil {
 		return domain.Message{}, err
 	}
-	return readHistoryInScopeTx(ctx, tx, groupID, topicID, messageID)
+	return readHistoryInScopeTx(ctx, tx, groupID, topicID, messageID, effectiveHistory)
 }
 
 // The selector is already validated for local-user reads or bound by the live
-// member fence. Check effective membership on metadata before loading content.
-func readHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, topicID *string, messageID string) (domain.Message, error) {
+// member fence. Check membership on metadata before loading content.
+func readHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, topicID *string, messageID string, mode historyScopeMode) (domain.Message, error) {
 	if topicID == nil {
 		return messageInTx(ctx, tx, groupID, messageID)
 	}
@@ -180,8 +180,10 @@ func readHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, topic
 	}
 	filter := "m.topic_id=?"
 	if installed {
-		filter = `coalesce((` + latestEffectiveTopicSQL + `),m.topic_id)=?
-		 AND NOT EXISTS(SELECT 1 FROM main.thread_corrections cmd WHERE cmd.command_message_id=m.id)`
+		if mode == effectiveHistory {
+			filter = `coalesce((` + latestEffectiveTopicSQL + `),m.topic_id)=?`
+		}
+		filter += ` AND NOT EXISTS(SELECT 1 FROM main.thread_corrections cmd WHERE cmd.command_message_id=m.id)`
 	}
 	var found int
 	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM main.messages m WHERE m.group_id=? AND m.id=? AND `+filter,

@@ -35,13 +35,18 @@ func messageThreadAttributionInTx(ctx context.Context, tx *sql.Tx, groupID, mess
 	if err := tx.QueryRowContext(ctx, `SELECT topic_id FROM main.messages WHERE group_id=? AND id=?`, groupID, messageID).Scan(&ref.TopicID); err != nil {
 		return domain.ThreadAttribution{}, err
 	}
-	attr := domain.ThreadAttribution{Storage: ref, Effective: ref}
 	installed, err := threadCorrectionInstalledInTx(ctx, tx)
 	if err != nil || !installed {
-		return attr, err
+		return domain.ThreadAttribution{Storage: ref, Effective: ref}, err
 	}
-	err = tx.QueryRowContext(ctx, `SELECT effective_topic_id,command_message_id FROM main.thread_corrections
-	 WHERE group_id=? AND target_message_id=? AND previous_topic_id<>effective_topic_id ORDER BY sequence DESC LIMIT 1`, groupID, messageID).
+	return correctedThreadAttributionInTx(ctx, tx, ref, messageID)
+}
+
+// The caller has validated the installation and verified this message's storage topic.
+func correctedThreadAttributionInTx(ctx context.Context, tx *sql.Tx, ref domain.ThreadRef, messageID string) (domain.ThreadAttribution, error) {
+	attr := domain.ThreadAttribution{Storage: ref, Effective: ref}
+	err := tx.QueryRowContext(ctx, `SELECT effective_topic_id,command_message_id FROM main.thread_corrections
+	 WHERE group_id=? AND target_message_id=? AND previous_topic_id<>effective_topic_id ORDER BY sequence DESC LIMIT 1`, ref.GroupID, messageID).
 		Scan(&attr.Effective.TopicID, &attr.CorrectionMessageID)
 	if err == sql.ErrNoRows {
 		err = nil

@@ -76,6 +76,36 @@ it.each([
   expect(expandDetails(record).getByText(sender, { exact: true })).toBeVisible();
   expect(vi.mocked(fetch).mock.calls.map(([url]) => url)).toEqual([`/api/v1/groups/${group.id}/messages?limit=50`]);
 });
+it("shows the persisted clarification after a normal composer send and timeline reload", async () => {
+  const correction = "这句话指的是告警";
+  const question = "你指的是本群哪个已存在的话题？请用完整名称或故障编号。";
+  const prior = { ...message, id: "previous-input", content: "先确认是否有第二次失败。", deliveries: [] };
+  const receipt = { ...prior, id: "correction-receipt", content: correction, topic_id: "", source_kind: "unknown",
+    thread_correction: { original_topic_id: "", previous_topic_id: "", effective_topic_id: "", question } };
+  reads.mockResolvedValueOnce(page([prior]));
+  writes.mockResolvedValueOnce(json(receipt, 201));
+  const discussion = () => <main aria-label="讨论"><Discussion groupId={group.id} members={{}} /></main>;
+  const first = render(discussion());
+  await panel().findByRole("article", { name: `消息 ${prior.id}` });
+  change(correction); submit();
+  const record = await panel().findByRole("article", { name: `消息 ${receipt.id}` });
+  expect(within(record).getByText(question)).toBeVisible();
+  expect(within(record).getByText(/投递详情.*暂无投递记录/)).toBeVisible();
+  expect(within(record).queryByRole("button", { name: /转为任务/ })).not.toBeInTheDocument();
+  expect(panel().queryByRole("alert")).not.toBeInTheDocument();
+  expect(content()).toHaveValue("");
+  expect(writes).toHaveBeenCalledTimes(1);
+  expect(writes.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/messages`);
+  expect(JSON.parse(String(writes.mock.calls[0][1]?.body))).toStrictEqual({ content: correction });
+
+  first.unmount();
+  reads.mockResolvedValueOnce(page([receipt, prior]));
+  render(discussion());
+  const reloaded = await panel().findByRole("article", { name: `消息 ${receipt.id}` });
+  expect(within(reloaded).getByText(question)).toBeVisible();
+  expect(writes).toHaveBeenCalledTimes(1);
+});
+
 it("uses newly supplied members without fetching or caching a separate roster", async () => {
   reads.mockResolvedValueOnce(page([{ ...message, sender_id: member.id, deliveries: [] }]));
   const view = render(<Discussion groupId={group.id} members={{}} />);

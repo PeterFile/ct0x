@@ -153,6 +153,15 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 	if err != nil {
 		return route, err
 	}
+	var correctionsInstalled bool
+	if infer {
+		// Even explicit or unstructured sends must not commit against a
+		// damaged correction store. Check in the same routing transaction.
+		correctionsInstalled, err = threadCorrectionInstalledInTx(ctx, tx)
+		if err != nil {
+			return route, err
+		}
+	}
 	if !installed {
 		if correction {
 			return route, threadCorrectionUnavailable()
@@ -175,8 +184,9 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 			return route, err
 		}
 		replyEffectiveTopic = route.replyTopic
-		if infer && !correction {
-			attr, err := messageThreadAttributionInTx(ctx, tx, r.GroupID, r.ReplyToMessageID)
+		if correctionsInstalled && !correction {
+			ref := domain.ThreadRef{GroupID: r.GroupID, TopicID: route.replyTopic}
+			attr, err := correctedThreadAttributionInTx(ctx, tx, ref, r.ReplyToMessageID)
 			if err != nil {
 				return route, err
 			}
@@ -198,11 +208,7 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 		}
 	}
 	if correction {
-		available, err := threadCorrectionInstalledInTx(ctx, tx)
-		if err != nil {
-			return route, err
-		}
-		if !available {
+		if !correctionsInstalled {
 			return route, threadCorrectionUnavailable()
 		}
 		if r.TopicID != "" || r.RelatedTaskID != "" {
