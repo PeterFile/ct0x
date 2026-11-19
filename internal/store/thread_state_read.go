@@ -115,7 +115,7 @@ func (s *Store) LoadThreadPreparation(ctx context.Context, thread domain.ThreadR
 // permission to launch. Use only after the role profile authorizes this view;
 // ready identity alone does not decide what a profile is allowed to render.
 // Requiring the persisted ready owner/coordinator binding excludes ordinary
-// chat and delegated/limited profiles. Claim/execution must still revalidate.
+// chat and non-owner delegates. Claim/execution must still revalidate.
 func (s *Store) LoadAuthorizedTaskThreadState(ctx context.Context, bound CoordinationRoleState) (*domain.ThreadStateSnapshot, error) {
 	p := bound.Provenance
 	if bound.Blocked != CoordinationReady || (p.Kind != CoordinationRoleCoordinator && p.Kind != CoordinationRoleWorker) || p.TaskID == "" {

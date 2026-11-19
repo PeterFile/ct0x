@@ -128,6 +128,12 @@ func TestThreadStateCommandIsolationAndReplay(t *testing.T) {
 	if current.Revision != 3 || len(current.Records) != 2 {
 		t.Fatalf("failed write reserved its key or changed an unrelated slot: %+v", current)
 	}
+	if _, err := raw.Exec(`DROP TRIGGER thread_state_no_update`); err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range []*httptest.ResponseRecorder{a.request("GET", url, ""), a.request("PUT", url, lastUpdate, "atomic")} {
+		assertError(t, w.Code, w.Header(), w.Body.Bytes(), 500, "internal_error")
+	}
 }
 
 func TestThreadStateActualTaskBinding(t *testing.T) {
