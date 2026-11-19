@@ -66,7 +66,7 @@ func (s *Store) ReadChannelForTool(ctx context.Context, scope MemberToolScope, o
 		return Page[domain.Message]{}, memberToolOperationError(action, err)
 	}
 	defer tx.Rollback()
-	page, err := readCurrentChannelInTx(ctx, tx, scope, options)
+	page, err := readCurrentChannelInTx(ctx, tx, scope, options, effectiveHistory)
 	if err != nil {
 		return Page[domain.Message]{}, memberToolOperationError(action, err)
 	}
@@ -77,17 +77,12 @@ func (s *Store) ReadChannelForTool(ctx context.Context, scope MemberToolScope, o
 }
 
 // The caller must fence the live scope in the same transaction before reading.
-func readCurrentChannelInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, options ListOptions) (Page[domain.Message], error) {
+func readCurrentChannelInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, options ListOptions, mode historyScopeMode) (Page[domain.Message], error) {
 	limit, err := listLimit(options)
 	if err != nil {
 		return Page[domain.Message]{}, err
 	}
-	query, args := "SELECT "+messageColumns+" FROM messages WHERE group_id=? AND topic_id=?", []any{scope.Claim.GroupID, scope.TopicID}
-	if c := options.Before; c != nil {
-		query += " AND (created_at,id)<(?,?)"
-		args = append(args, c.CreatedAt.UTC().Format(timestampLayout), c.ID)
-	}
-	rows, err := tx.QueryContext(ctx, query+" ORDER BY created_at DESC,id DESC LIMIT ?", append(args, limit+1)...)
+	rows, err := scopedThreadMessagesInTx(ctx, tx, scope.Claim.GroupID, scope.TopicID, mode, options.Before, "", limit+1)
 	if err != nil {
 		return Page[domain.Message]{}, err
 	}
@@ -97,6 +92,9 @@ func readCurrentChannelInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSco
 		message, err := scanMessage(rows)
 		if err != nil {
 			return Page[domain.Message]{}, err
+		}
+		if mode == effectiveHistory {
+			projectEffectiveTopic(&message, scope.TopicID)
 		}
 		page.Items = append(page.Items, message)
 	}

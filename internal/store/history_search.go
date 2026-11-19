@@ -67,12 +67,12 @@ func searchHistoryInTx(ctx context.Context, tx *sql.Tx, groupID string, q Histor
 	if err := validateHistoryTopic(q.TopicID); err != nil {
 		return HistoryPage{}, err
 	}
-	return searchHistoryInScopeTx(ctx, tx, groupID, q)
+	return searchHistoryInScopeTx(ctx, tx, groupID, q, effectiveHistory)
 }
 
 // searchHistoryInScopeTx shares query validation and SQL, not authorization.
 // Callers must validate a user-selected topic or fence and force the persisted topic.
-func searchHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, q HistoryQuery) (HistoryPage, error) {
+func searchHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, q HistoryQuery, mode historyScopeMode) (HistoryPage, error) {
 	if !validHistoryText(q.Query, 4096) {
 		return HistoryPage{}, fmt.Errorf("%w：搜索词须为有效 UTF-8、无 NUL 且原始长度不超过 4096 字节", ErrInvalid)
 	}
@@ -93,20 +93,19 @@ func searchHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, q H
 	if err := tx.QueryRowContext(ctx, "SELECT 1 FROM groups WHERE id=?", groupID).Scan(&exists); err != nil {
 		return HistoryPage{}, err
 	}
-	statement := "SELECT " + messageColumns + " FROM messages WHERE group_id=?"
-	args := []any{groupID}
+	like := "%" + historyLikeEscaper.Replace(q.Query) + "%"
+	var rows *sql.Rows
 	if q.TopicID != nil {
-		statement += " AND topic_id=?"
-		args = append(args, *q.TopicID)
+		rows, err = scopedThreadMessagesInTx(ctx, tx, groupID, *q.TopicID, mode, before, like, limit+1)
+	} else {
+		statement := "SELECT " + messageColumns + ` FROM messages WHERE group_id=? AND content LIKE ? ESCAPE '\'`
+		args := []any{groupID, like}
+		if before != nil {
+			statement += " AND (created_at, id) < (?, ?)"
+			args = append(args, before.CreatedAt.Format(timestampLayout), before.ID)
+		}
+		rows, err = tx.QueryContext(ctx, statement+" ORDER BY created_at DESC, id DESC LIMIT ?", append(args, limit+1)...)
 	}
-	statement += ` AND content LIKE ? ESCAPE '\'`
-	args = append(args, "%"+historyLikeEscaper.Replace(q.Query)+"%")
-	if before != nil {
-		statement += " AND (created_at, id) < (?, ?)"
-		args = append(args, before.CreatedAt.Format(timestampLayout), before.ID)
-	}
-	statement += " ORDER BY created_at DESC, id DESC LIMIT ?"
-	rows, err := tx.QueryContext(ctx, statement, append(args, limit+1)...)
 	if err != nil {
 		return HistoryPage{}, err
 	}
@@ -116,6 +115,9 @@ func searchHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, q H
 		m, err := scanMessage(rows)
 		if err != nil {
 			return HistoryPage{}, err
+		}
+		if q.TopicID != nil && mode == effectiveHistory {
+			projectEffectiveTopic(&m, *q.TopicID)
 		}
 		page.Items = append(page.Items, m)
 	}
@@ -166,20 +168,29 @@ func readHistoryInTx(ctx context.Context, tx *sql.Tx, groupID string, topicID *s
 	return readHistoryInScopeTx(ctx, tx, groupID, topicID, messageID)
 }
 
-// readHistoryInScopeTx accepts only a validated selector or a fenced bound topic.
+// The selector is already validated for local-user reads or bound by the live
+// member fence. Check effective membership on metadata before loading content.
 func readHistoryInScopeTx(ctx context.Context, tx *sql.Tx, groupID string, topicID *string, messageID string) (domain.Message, error) {
 	if topicID == nil {
 		return messageInTx(ctx, tx, groupID, messageID)
 	}
-	m, err := scanMessage(tx.QueryRowContext(ctx,
-		"SELECT "+messageColumns+" FROM messages WHERE group_id=? AND topic_id=? AND id=?", groupID, *topicID, messageID))
-	if err == nil {
-		err = messageDeliveries(ctx, tx, &m)
+	installed, err := threadCorrectionInstalledInTx(ctx, tx)
+	if err != nil {
+		return domain.Message{}, err
 	}
+	filter := "m.topic_id=?"
+	if installed {
+		filter = `coalesce((` + latestEffectiveTopicSQL + `),m.topic_id)=?
+		 AND NOT EXISTS(SELECT 1 FROM main.thread_corrections cmd WHERE cmd.command_message_id=m.id)`
+	}
+	var found int
+	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM main.messages m WHERE m.group_id=? AND m.id=? AND `+filter,
+		groupID, messageID, *topicID).Scan(&found); err != nil {
+		return domain.Message{}, err
+	}
+	m, err := messageInTx(ctx, tx, groupID, messageID)
 	if err == nil {
-		messages := []domain.Message{m}
-		err = messageSourcesInTx(ctx, tx, messages)
-		m = messages[0]
+		projectEffectiveTopic(&m, *topicID)
 	}
 	return m, err
 }

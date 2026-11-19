@@ -193,7 +193,7 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 		}
 		return empty, preparationFailureWithCause(ctx, errPrepareRead, err)
 	}
-	history, err := p.store.ListPreparationHistory(ctx, group.ID, trigger.ID, p.roleHistoryLimit)
+	history, err := p.store.ListStoredPreparationHistory(ctx, group.ID, trigger.ID, p.roleHistoryLimit)
 	if err != nil {
 		return empty, preparationResolutionError(ctx, err)
 	}

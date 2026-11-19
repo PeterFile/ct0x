@@ -183,6 +183,9 @@ func (s *Store) GetMessage(ctx context.Context, groupID, messageID string) (doma
 	if err := messageThreadLinksInTx(ctx, tx, groupID, messages); err != nil {
 		return domain.Message{}, storeError("读取消息引用失败", err)
 	}
+	if err := messageThreadCorrectionsInTx(ctx, tx, groupID, messages); err != nil {
+		return domain.Message{}, storeError("读取话题纠正失败", err)
+	}
 	if err := projectMessageDiscussionsInTx(ctx, tx, groupID, messages); err != nil {
 		return domain.Message{}, err
 	}

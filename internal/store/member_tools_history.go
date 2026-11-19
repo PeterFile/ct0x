@@ -79,7 +79,7 @@ func (s *Store) SearchHistoryForTool(ctx context.Context, scope MemberToolScope,
 	}
 	page, err := searchHistoryInScopeTx(ctx, tx, scope.Claim.GroupID, HistoryQuery{
 		Query: input.Query, TopicID: &scope.TopicID, Limit: input.Limit, Before: input.Before,
-	})
+	}, effectiveHistory)
 	if err != nil {
 		return MemberHistorySearchResult{}, memberToolOperationError(action, err)
 	}

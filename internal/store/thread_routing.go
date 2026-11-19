@@ -15,6 +15,7 @@ import (
 type localThreadRoute struct {
 	topic, recipient, replyTopic string
 	newTitle, newIssue           string
+	correction                   *domain.ThreadCorrection
 }
 
 func threadRoutingInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
@@ -51,22 +52,25 @@ func localMessageReceiptInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 	if err != nil {
 		return domain.Message{}, err
 	}
-	// The old request payload conflates absent and empty topic_id. Keep that
-	// payload and its replays, but never acknowledge a derived topic as main.
-	if r.TopicIDExplicit && m.TopicID != r.TopicID {
+	items := []domain.Message{m}
+	if err := messageThreadCorrectionsInTx(ctx, tx, r.GroupID, items); err != nil {
+		return domain.Message{}, err
+	}
+	// E1a's request payload conflates absent and empty topic_id. Do not
+	// acknowledge inferred chat as main. A correction receipt always stays
+	// on main, including a clarification of a conflicting manual scope.
+	if items[0].ThreadCorrection == nil && r.TopicIDExplicit && m.TopicID != r.TopicID {
 		return domain.Message{}, ErrConflict
 	}
 	if r.ThreadLinks != (domain.ThreadLinks{}) {
-		items := []domain.Message{m}
 		if err := messageThreadLinksInTx(ctx, tx, r.GroupID, items); err != nil {
 			return domain.Message{}, err
 		}
 		if items[0].ThreadLinks != r.ThreadLinks {
 			return domain.Message{}, errors.New("消息引用与原命令不一致")
 		}
-		m = items[0]
 	}
-	return m, nil
+	return items[0], nil
 }
 
 func publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id string, payload []byte, recipients []string, normalPost bool) (domain.Message, error) {
@@ -78,9 +82,14 @@ func publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 			return domain.Message{}, err
 		}
 	}
+	// A topical command has no chat proof or deliveries, even with explicit
+	// recipients. Keep the original request bytes in the mutation receipt.
+	if route.correction != nil {
+		r.RecipientIDs, recipients = nil, nil
+	}
 	// Compose A's single dispatch decision here: an E recipient is a suggestion
 	// for omitted recipients only; no suggestion retains the existing fallback.
-	if normalPost && r.RecipientIDs == nil {
+	if route.correction == nil && normalPost && r.RecipientIDs == nil {
 		if route.recipient == "" {
 			if err := activeDefaultRecipientInTx(ctx, tx, r.GroupID, &route.recipient); err != nil {
 				return domain.Message{}, err
@@ -94,11 +103,17 @@ func publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 	if err != nil {
 		return domain.Message{}, err
 	}
-	m.SourceID, err = messageCommandSourceInTx(ctx, tx, m.ID, "local_user_chat", payload, r.IdempotencyKey, nil)
-	if err != nil {
-		return domain.Message{}, err
+	if route.correction != nil {
+		if err := insertThreadCorrectionInTx(ctx, tx, &m, route.correction); err != nil {
+			return domain.Message{}, err
+		}
+	} else {
+		m.SourceID, err = messageCommandSourceInTx(ctx, tx, m.ID, "local_user_chat", payload, r.IdempotencyKey, nil)
+		if err != nil {
+			return domain.Message{}, err
+		}
+		m.SourceKind = "local_user_chat"
 	}
-	m.SourceKind = "local_user_chat"
 	if route.newTitle != "" {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO main.thread_routing_topics(group_id,topic_id,title,title_key,issue_id,origin_message_id)
 		 VALUES(?,?,?,?,?,?)`, m.GroupID, m.TopicID, route.newTitle, threadTitleKey(route.newTitle), route.newIssue, m.ID); err != nil {
@@ -121,17 +136,22 @@ func publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 
 func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, infer bool) (localThreadRoute, error) {
 	route := localThreadRoute{topic: r.TopicID}
+	subject, correction := threadCorrectionSubject(r.Content)
+	correction = correction && infer
 	installed, err := threadRoutingInstalledInTx(ctx, tx)
 	if err != nil {
 		return route, err
 	}
 	if !installed {
+		if correction {
+			return route, threadCorrectionUnavailable()
+		}
 		if r.ThreadLinks != (domain.ThreadLinks{}) {
 			return route, fmt.Errorf("%w：当前实例未启用消息引用", ErrInvalid)
 		}
 		return route, nil
 	}
-	var replyAuthor, taskOwner string
+	var replyAuthor, replyEffectiveTopic, taskOwner string
 	var taskTopic sql.NullString
 	if r.ReplyToMessageID != "" {
 		if !validThreadReference(r.ReplyToMessageID) {
@@ -142,6 +162,14 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 		 WHERE m.id=? AND m.group_id=?`, r.ReplyToMessageID, r.GroupID).Scan(&route.replyTopic, &replyAuthor)
 		if err != nil {
 			return route, err
+		}
+		replyEffectiveTopic = route.replyTopic
+		if infer && !correction {
+			attr, err := messageThreadAttributionInTx(ctx, tx, r.GroupID, r.ReplyToMessageID)
+			if err != nil {
+				return route, err
+			}
+			replyEffectiveTopic = attr.Effective.TopicID
 		}
 	}
 	if r.RelatedTaskID != "" {
@@ -158,8 +186,25 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 			return route, err
 		}
 	}
+	if correction {
+		available, err := threadCorrectionInstalledInTx(ctx, tx)
+		if err != nil {
+			return route, err
+		}
+		if !available {
+			return route, threadCorrectionUnavailable()
+		}
+		if r.TopicID != "" || r.RelatedTaskID != "" {
+			// A Task or a manual non-main scope is not authority to change it.
+			route.correction = &domain.ThreadCorrection{Question: "请只引用本群原话并说明目标话题，不附带任务或指定话题，可以吗？"}
+		} else {
+			route.correction, err = resolveThreadCorrectionInTx(ctx, tx, r, subject)
+		}
+		route.topic = ""
+		return route, err
+	}
 	if !infer || r.TopicID != "" || r.TopicIDExplicit {
-		if route.replyTopic == route.topic {
+		if replyEffectiveTopic == route.topic {
 			route.recipient = replyAuthor
 		}
 		return route, nil
@@ -177,7 +222,7 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 	// An ordinary structured reply, including to main, contributes its scope.
 	comparison := text.current && text.comparison && (text.topic != "" || text.newTitle != "")
 	if !comparison && r.ReplyToMessageID != "" {
-		evidence.confirm(route.replyTopic)
+		evidence.confirm(replyEffectiveTopic)
 	}
 	if text.conflict || evidence.conflict || (text.newTitle != "" && evidence.matched) {
 		return route, nil
@@ -190,7 +235,7 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 		return route, nil
 	}
 	switch {
-	case !comparison && replyAuthor != "" && route.replyTopic == route.topic:
+	case !comparison && replyAuthor != "" && replyEffectiveTopic == route.topic:
 		route.recipient = replyAuthor
 	case taskTopic.Valid && taskTopic.String == route.topic && taskOwner != "":
 		route.recipient = taskOwner

@@ -178,7 +178,7 @@ func TestThreadRoutingLegacyFallbackAndDamagedSchema(t *testing.T) {
 	for _, statement := range []string{
 		`DROP TABLE thread_routing_topics`,
 		`DROP TABLE thread_routing_links`,
-		`DELETE FROM schema_migrations WHERE version=(SELECT max(version) FROM schema_migrations)`,
+		fmt.Sprintf(`DELETE FROM schema_migrations WHERE version=%d`, slices.Index(migrations, threadRoutingSchema)+1),
 	} {
 		t.Run(statement, func(t *testing.T) {
 			s, _ := openTestStore(t)
