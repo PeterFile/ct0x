@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"database/sql"
 	"errors"
 	"slices"
 	"testing"
@@ -9,15 +10,21 @@ import (
 	"agentworkspace/internal/store"
 )
 
-func TestMemberRoleHistoryKeepsStorageScopeAfterCorrection(t *testing.T) {
-	f := memberRoleCoordinatorFixture(t)
+func threadCorrectionFixtureInstalled(t *testing.T, db *sql.DB) bool {
+	t.Helper()
+	var version int
 	var installed bool
-	if err := f.raw.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_corrections')`).Scan(&installed); err != nil {
+	if err := db.QueryRow(`SELECT (SELECT max(version) FROM schema_migrations),
+	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_corrections')`).Scan(&version, &installed); err != nil {
 		t.Fatal(err)
 	}
-	if !installed {
-		t.Skip("threadCorrectionSchema is not registered; use the private migration overlay")
-	}
+	t.Logf("fixture schema v%d, thread corrections installed=%t", version, installed)
+	return installed
+}
+
+func TestMemberRoleHistoryKeepsStorageScopeAfterCorrection(t *testing.T) {
+	f := memberRoleCoordinatorFixture(t)
+	installed := threadCorrectionFixtureInstalled(t, f.raw)
 	ctx := t.Context()
 	worker := f.assignWorker(t, true)
 	coordinatorToken := memberRoleIssue(t, f.tools, f.coordinatorScope)
@@ -30,27 +37,34 @@ func TestMemberRoleHistoryKeepsStorageScopeAfterCorrection(t *testing.T) {
 		}
 		return m
 	}
-	// The fixture's existing formal topic predates E1a's topic catalog.
 	anchor := post("role-history-anchor", MessageInput{TopicID: f.request.TopicID, Content: "formal topic anchor", RecipientIDs: []string{}})
-	if _, err := f.raw.Exec(`INSERT INTO thread_routing_topics(group_id,topic_id,title,title_key,issue_id,origin_message_id)
-	 VALUES(?,?,'部署审批记录','部署审批记录','REL-71',?)`, f.groupID, anchor.TopicID, anchor.ID); err != nil {
-		t.Fatal(err)
-	}
-	wrongTopic := post("other-origin", MessageInput{Content: "新话题：REL-72 镜像回滚规划", RecipientIDs: []string{}})
-	incoming := post("incoming", MessageInput{TopicID: wrongTopic.TopicID, Content: "scope-marker incoming", RecipientIDs: []string{}})
-	outgoing := post("outgoing", MessageInput{TopicID: anchor.TopicID, Content: "scope-marker outgoing", RecipientIDs: []string{}})
-	for _, move := range []struct {
-		issue  string
-		m      domain.Message
-		wanted string
-	}{{"REL-71", incoming, anchor.TopicID}, {"REL-72", outgoing, wrongTopic.TopicID}} {
-		correction := post(move.issue, MessageInput{Content: "这句话指的是 " + move.issue,
-			ThreadLinks: domain.ThreadLinks{ReplyToMessageID: move.m.ID}})
-		if correction.ThreadCorrection == nil || correction.ThreadCorrection.EffectiveTopicID != move.wanted || len(correction.Deliveries) != 0 {
-			t.Fatalf("correction fixture did not create a topical move: %+v", correction)
+	otherTopic := "other-legacy-topic"
+	if installed {
+		// The fixture's existing formal topic predates E1a's topic catalog.
+		if _, err := f.raw.Exec(`INSERT INTO thread_routing_topics(group_id,topic_id,title,title_key,issue_id,origin_message_id)
+		 VALUES(?,?,'部署审批记录','部署审批记录','REL-71',?)`, f.groupID, anchor.TopicID, anchor.ID); err != nil {
+			t.Fatal(err)
 		}
+		otherTopic = post("other-origin", MessageInput{Content: "新话题：REL-72 镜像回滚规划", RecipientIDs: []string{}}).TopicID
 	}
-	// A normal claim in the same group/topic must still get the effective view.
+	incoming := post("incoming", MessageInput{TopicID: otherTopic, Content: "scope-marker incoming", RecipientIDs: []string{}})
+	outgoing := post("outgoing", MessageInput{TopicID: anchor.TopicID, Content: "scope-marker outgoing", RecipientIDs: []string{}})
+	ordinaryAllow, ordinaryDeny := outgoing, incoming
+	if installed {
+		for _, move := range []struct {
+			issue  string
+			m      domain.Message
+			wanted string
+		}{{"REL-71", incoming, anchor.TopicID}, {"REL-72", outgoing, otherTopic}} {
+			correction := post(move.issue, MessageInput{Content: "这句话指的是 " + move.issue,
+				ThreadLinks: domain.ThreadLinks{ReplyToMessageID: move.m.ID}})
+			if correction.ThreadCorrection == nil || correction.ThreadCorrection.EffectiveTopicID != move.wanted || len(correction.Deliveries) != 0 {
+				t.Fatalf("correction fixture did not create a topical move: %+v", correction)
+			}
+		}
+		ordinaryAllow, ordinaryDeny = incoming, outgoing
+	}
+	// A normal claim uses the same storage scope unless a correction moves a message.
 	peer := f.member(t, f.groupID)
 	trigger := post("ordinary", MessageInput{Content: "普通群聊", TopicID: anchor.TopicID, RecipientIDs: []string{peer.ID}})
 	turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.groupID, DeliveryID: trigger.Deliveries[0].ID, MaxActive: 8})
@@ -69,7 +83,7 @@ func TestMemberRoleHistoryKeepsStorageScopeAfterCorrection(t *testing.T) {
 	}{
 		{"coordination", coordinatorToken, outgoing, incoming},
 		{"worker", workerToken, outgoing, incoming},
-		{"ordinary", ordinary, incoming, outgoing},
+		{"ordinary", ordinary, ordinaryAllow, ordinaryDeny},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			page, err := f.tools.ReadChannel(ctx, tc.token, store.ListOptions{})

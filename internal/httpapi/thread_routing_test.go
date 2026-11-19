@@ -13,26 +13,25 @@ import (
 	"agentworkspace/internal/store"
 )
 
-func requireThreadRoutingFixture(t *testing.T, a *groupAPI) {
+func threadRoutingFixtureInstalled(t *testing.T, a *groupAPI) bool {
 	t.Helper()
 	var installed bool
 	if err := messageSQL(t, a).QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_routing_topics')`).Scan(&installed); err != nil {
 		t.Fatal(err)
 	}
-	if !installed {
-		t.Skip("threadRoutingSchema is not registered; use the private migration overlay")
-	}
+	t.Logf("thread routing schema installed=%t", installed)
+	return installed
 }
 
 func TestThreadRoutingNormalEntry(t *testing.T) {
 	a := openMessageAPI(t, "")
-	requireThreadRoutingFixture(t, a)
+	installed := threadRoutingFixtureInstalled(t, a)
 	group := newGroup(t, a, "routing")
 	path := "/api/v1/groups/" + group.ID + "/messages"
 	content := "新议题：PAY-431 下载超时。先讨论重试策略。"
 	first := decoded[domain.Message](t, a.request("POST", path, `{"content":"`+content+`"}`, "first"), 201)
-	if first.TopicID == "" || first.Content != content {
-		t.Fatalf("normal POST did not persist the named subject: topic=%q, content=%q", first.TopicID, first.Content)
+	if (first.TopicID != "") != installed || first.Content != content {
+		t.Fatalf("normal POST with routing installed=%t: topic=%q, content=%q", installed, first.TopicID, first.Content)
 	}
 	followup := decoded[domain.Message](t, a.request("POST", path, `{"content":"PAY-431 现在有什么进展？"}`, "followup"), 201)
 	if followup.TopicID != first.TopicID || followup.ID == first.ID {
@@ -92,7 +91,7 @@ func TestThreadRoutingMainSelectorReplay(t *testing.T) {
 
 func TestThreadRoutingOpeningFollowupClause(t *testing.T) {
 	a := openMessageAPI(t, "")
-	requireThreadRoutingFixture(t, a)
+	installed := threadRoutingFixtureInstalled(t, a)
 	group := newGroup(t, a, "opening")
 	path := "/api/v1/groups/" + group.ID + "/messages"
 	post := func(content string) domain.Message {
@@ -105,15 +104,15 @@ func TestThreadRoutingOpeningFollowupClause(t *testing.T) {
 	}
 	const opening = "新议题：导出 BUG EX-421。跟进导出故障。"
 	export := post(opening)
-	if export.TopicID == "" || export.Content != opening || len(export.Deliveries) != 0 {
-		t.Fatalf("opening with action prose did not persist its subject as public only: %+v", export)
+	if (export.TopicID != "") != installed || export.Content != opening || len(export.Deliveries) != 0 {
+		t.Fatalf("public opening with routing installed=%t: %+v", installed, export)
 	}
 	if followup := post("跟进那个导出 BUG"); followup.TopicID != export.TopicID {
 		t.Fatalf("named followup: topic=%q, want %q", followup.TopicID, export.TopicID)
 	}
 	other := post("新议题：数据库连接告警 OPS-61")
-	if other.TopicID == "" || other.TopicID == export.TopicID {
-		t.Fatalf("second fixture did not create a distinct topic: %+v", other)
+	if (other.TopicID != "") != installed || (installed && other.TopicID == export.TopicID) {
+		t.Fatalf("second opening with routing installed=%t: %+v", installed, other)
 	}
 	for _, content := range []string{
 		"新议题：导出 BUG EX-421。跟进数据库连接告警。",
@@ -132,7 +131,7 @@ func TestThreadRoutingOpeningFollowupClause(t *testing.T) {
 
 func TestThreadRoutingColdIssueName(t *testing.T) {
 	a := openMessageAPI(t, "")
-	requireThreadRoutingFixture(t, a)
+	installed := threadRoutingFixtureInstalled(t, a)
 	group := newGroup(t, a, "cold names")
 	path := "/api/v1/groups/" + group.ID + "/messages"
 	post := func(content string, replyTo ...string) domain.Message {
@@ -152,8 +151,11 @@ func TestThreadRoutingColdIssueName(t *testing.T) {
 		t.Fatal(err)
 	}
 	byID, byName := post("EX-421 怎么样了？"), post("跟进那个导出 BUG")
-	if root.TopicID == "" || byID.TopicID != root.TopicID || byName.TopicID != root.TopicID {
-		t.Fatalf("dormant issue should resolve by exact ID and explicit name: root=%q id=%q name=%q", root.TopicID, byID.TopicID, byName.TopicID)
+	if (root.TopicID != "") != installed || byID.TopicID != root.TopicID || byName.TopicID != root.TopicID {
+		t.Fatalf("dormant issue with routing installed=%t: root=%q id=%q name=%q", installed, root.TopicID, byID.TopicID, byName.TopicID)
+	}
+	if !installed {
+		return // Both forms of follow-up were verified to stay on main.
 	}
 	prefix := post("New topic: OPS-61: Report retention")
 	if prefix.TopicID == "" || post("Follow up on report retention").TopicID != prefix.TopicID {
@@ -199,6 +201,18 @@ func TestThreadRoutingColdIssueName(t *testing.T) {
 		if m := post("当前讨论导出 BUG，EX-421"); m.TopicID != "" {
 			t.Fatalf("contradictory exact title and issue escaped main: %+v", m)
 		}
+		if m := post("当前讨论导出 BUG EX-421"); m.TopicID != root.TopicID {
+			t.Fatalf("contained title must not contradict the longest complete title: got %q want %q", m.TopicID, root.TopicID)
+		}
+		for _, content := range []string{
+			"导出 BUG EX-421 和导出 BUG 都要跟进。",
+			"导出 BUG 和导出 BUG EX-421 都要跟进。",
+			"导出 BUG，EX-421，引用仅作对照。",
+		} {
+			if m := post(content); m.TopicID != "" {
+				t.Errorf("independent mention of the shorter title escaped main: %q → %q", content, m.TopicID)
+			}
+		}
 	})
 	generic := post("New topic: incident OPS-62")
 	if generic.TopicID == "" || post("Follow up on incident").TopicID != "" || post("New topic: incident report").TopicID != "" {
@@ -206,9 +220,94 @@ func TestThreadRoutingColdIssueName(t *testing.T) {
 	}
 }
 
+func TestThreadRoutingComparisonDoesNotWakeQuotedAuthor(t *testing.T) {
+	a := openMessageAPI(t, "")
+	installed := threadRoutingFixtureInstalled(t, a)
+	group := newGroup(t, a, "comparison")
+	path := "/api/v1/groups/" + group.ID
+	newMember := func(name string) string {
+		t.Helper()
+		return decoded[domain.Member](t, a.request("POST", path+"/members", `{"name":"`+name+`","role":"role"}`), 201).ID
+	}
+	post := func(t *testing.T, content, reply string, recipients []string) domain.Message {
+		t.Helper()
+		input := map[string]any{"content": content}
+		if reply != "" {
+			input["reply_to_message_id"] = reply
+		}
+		if recipients != nil {
+			input["recipient_ids"] = recipients
+		}
+		body, err := json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decoded[domain.Message](t, a.request("POST", path+"/messages", string(body)), 201)
+	}
+	quotedAuthor := newMember("quoted author")
+	quotedTopic := post(t, "新话题：EX-421 导出错误", "", []string{})
+	if (quotedTopic.TopicID != "") != installed || len(quotedTopic.Deliveries) != 0 {
+		t.Fatalf("public comparison source with routing installed=%t: %+v", installed, quotedTopic)
+	}
+	quoted, err := a.db.CreateMessage(t.Context(), store.MessageRequest{
+		GroupID: group.ID, TopicID: quotedTopic.TopicID, ActorID: quotedAuthor, Content: "旧导出故障。",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !installed {
+		t.Run("legacy_reply_unavailable", func(t *testing.T) {
+			const body = `{"content":"引用仅作对照。","topic_id":"legacy-topic"`
+			w := a.request("POST", path+"/messages", body+`,"reply_to_message_id":"`+quoted.ID+`"}`, "legacy-reply")
+			assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+			// The rejected reference must not consume the key or persist a row.
+			m := decoded[domain.Message](t, a.request("POST", path+"/messages", body+`}`, "legacy-reply"), 201)
+			if m.TopicID != "legacy-topic" || m.Content != "引用仅作对照。" || m.ReplyToMessageID != "" ||
+				len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != quotedAuthor {
+				t.Fatalf("legacy explicit topic or default delivery changed: %+v", m)
+			}
+			page := decoded[listResult[domain.Message]](t, a.request("GET", path+"/messages", ""), 200)
+			if len(page.Items) != 3 || page.Items[0].ID != m.ID {
+				t.Fatalf("rejected reply changed the timeline: %+v", page)
+			}
+		})
+		return
+	}
+	check := func(t *testing.T, content, topic, recipient string, explicit []string) {
+		t.Helper()
+		m := post(t, content, quoted.ID, explicit)
+		if m.Content != content || m.TopicID != topic || m.ReplyToMessageID != quoted.ID {
+			t.Errorf("comparison changed scope or raw reference: %+v, want topic %q", m, topic)
+		}
+		if (recipient == "" && len(m.Deliveries) != 0) ||
+			(recipient != "" && (len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != recipient)) {
+			t.Errorf("comparison got deliveries %+v, want recipient %q", m.Deliveries, recipient)
+		}
+	}
+	t.Run("only_quoted_author", func(t *testing.T) {
+		check(t, "当前讨论支付网关故障，引用仅作对照。", "", "", nil)
+	})
+	fallback := newMember("eligible fallback")
+	t.Run("earliest_quoted_author", func(t *testing.T) {
+		check(t, "当前讨论支付网关故障，引用仅作对照。", "", fallback, nil)
+		check(t, "引用仅作对照。", "", fallback, nil)
+	})
+	t.Run("same_clause", func(t *testing.T) {
+		current := post(t, "新议题：支付网关故障", "", []string{quotedAuthor})
+		if current.TopicID == "" || current.TopicID == quotedTopic.TopicID {
+			t.Fatalf("missing independent current topic: %+v", current)
+		}
+		check(t, "当前讨论支付网关故障（EX-421仅作对照）", current.TopicID, quotedAuthor, nil)
+		check(t, "当前讨论支付网关故障 (EX-421, 仅供参考)。", current.TopicID, "", []string{})
+		check(t, "当前讨论支付网关故障 EX-421仅作对照", "", fallback, nil)
+		check(t, "当前讨论支付网关故障（EX-421，仅作对照", "", fallback, nil)
+		check(t, "当前讨论账单入账故障（EX-421仅作对照）", "", quotedAuthor, []string{quotedAuthor})
+	})
+}
+
 func TestThreadRoutingEvidenceAndRecipients(t *testing.T) {
 	a := openMessageAPI(t, "")
-	requireThreadRoutingFixture(t, a)
+	installed := threadRoutingFixtureInstalled(t, a)
 	group, other := newGroup(t, a, "routing"), newGroup(t, a, "other")
 	path := "/api/v1/groups/" + group.ID + "/messages"
 	members := "/api/v1/groups/" + group.ID + "/members"
@@ -228,8 +327,9 @@ func TestThreadRoutingEvidenceAndRecipients(t *testing.T) {
 	plan := decoded[domain.Message](t, post("plan", map[string]any{
 		"content": "我们来讨论明年仓库容量规划。先列风险。", "recipient_ids": []string{},
 	}), 201)
-	if alert.TopicID == "" || plan.TopicID == "" || alert.TopicID == plan.TopicID || len(plan.Deliveries) != 0 {
-		t.Fatalf("opening did not preserve distinct subjects / public-only: %+v %+v", alert, plan)
+	if (alert.TopicID != "") != installed || (plan.TopicID != "") != installed || (installed && alert.TopicID == plan.TopicID) ||
+		len(plan.Deliveries) != 0 || len(alert.Deliveries) != 1 || alert.Deliveries[0].RecipientID != second.ID {
+		t.Fatalf("opening with routing installed=%t did not preserve topics or recipients: %+v %+v", installed, alert, plan)
 	}
 	if _, err := messageSQL(t, a).Exec(`UPDATE messages SET created_at=? WHERE id=?`, time.Now().UTC().AddDate(0, -6, 0).Format("2006-01-02T15:04:05.000000000Z"), alert.ID); err != nil {
 		t.Fatal(err)
@@ -240,10 +340,16 @@ func TestThreadRoutingEvidenceAndRecipients(t *testing.T) {
 		{"数据库连接告警与明年仓库容量规划都看一下", "", first.ID},
 		{"今天随便聊两句", "", first.ID},
 	} {
+		if !installed {
+			tc.topic, tc.recipient = "", first.ID // Legacy delivery is independent of message text.
+		}
 		m := decoded[domain.Message](t, post(fmt.Sprintf("watch-%d", i), map[string]any{"content": tc.content}), 201)
 		if m.TopicID != tc.topic || len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != tc.recipient {
 			t.Fatalf("%q: got topic=%q deliveries=%+v; want topic=%q recipient=%q", tc.content, m.TopicID, m.Deliveries, tc.topic, tc.recipient)
 		}
+	}
+	if !installed {
+		return // Typed reply rejection on v30 is covered by the comparison test.
 	}
 	foreign := decoded[domain.Message](t, a.request("POST", "/api/v1/groups/"+other.ID+"/messages", `{"content":"foreign"}`), 201)
 	bad := post("reply", map[string]any{"content": "新话题：不会注册的议题", "reply_to_message_id": foreign.ID})

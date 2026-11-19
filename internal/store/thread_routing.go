@@ -16,6 +16,7 @@ type localThreadRoute struct {
 	topic, recipient, replyTopic string
 	newTitle, newIssue           string
 	correction                   *domain.ThreadCorrection
+	comparisonAuthor             string // Reference-only author excluded from fallback.
 }
 
 func threadRoutingInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
@@ -24,11 +25,11 @@ func threadRoutingInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	var objects, intact int
 	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=:version),
 	 :version>0 AND EXISTS(SELECT 1 FROM main.schema_migrations WHERE version>:version),
-	 count(*),count(CASE WHEN type='table' AND name IN ('thread_routing_topics','thread_routing_links')
-	 OR sql IN (:issue,:insert_guard,:update_guard,:delete_guard) THEN 1 END)
+	 count(*),count(CASE WHEN sql IN (:topics,:links,:issue,:insert_guard,:update_guard,:delete_guard) THEN 1 END)
 	 FROM main.sqlite_schema WHERE name IN ('thread_routing_topics','thread_routing_links','thread_routing_issue',
 	 'thread_routing_links_insert','thread_routing_links_update','thread_routing_links_delete')`,
-		sql.Named("version", version), sql.Named("issue", threadRoutingIssueIndex), sql.Named("insert_guard", threadRoutingLinksInsert),
+		sql.Named("version", version), sql.Named("topics", threadRoutingTopicsTable), sql.Named("links", threadRoutingLinksTable),
+		sql.Named("issue", threadRoutingIssueIndex), sql.Named("insert_guard", threadRoutingLinksInsert),
 		sql.Named("update_guard", threadRoutingLinksUpdate), sql.Named("delete_guard", threadRoutingLinksDelete)).Scan(&installed, &later, &objects, &intact)
 	if err != nil {
 		return false, err
@@ -39,18 +40,10 @@ func threadRoutingInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 		}
 		return false, nil
 	}
-	if intact != 6 {
+	if objects != 6 || intact != 6 {
 		return false, errors.New("话题归属数据库结构不完整")
 	}
-	// Prepare a zero-row projection, even for an explicit topic or empty group.
-	// A registered but damaged installation must not route as uninstalled.
-	rows, err := tx.QueryContext(ctx, `SELECT t.group_id,t.topic_id,t.title,t.title_key,t.issue_id,t.origin_message_id,
-	 l.message_id,l.group_id,l.topic_id,l.reply_to_message_id,l.reply_to_topic_id,l.task_id
-	 FROM main.thread_routing_topics t, main.thread_routing_links l LIMIT 0`)
-	if err != nil {
-		return true, err
-	}
-	return true, rows.Close()
+	return true, nil
 }
 
 func localMessageReceiptInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id string, normalPost bool) (domain.Message, error) {
@@ -99,10 +92,10 @@ func publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 		r.RecipientIDs, recipients = nil, nil
 	}
 	// Compose A's single dispatch decision here: an E recipient is a suggestion
-	// for omitted recipients only; no suggestion retains the existing fallback.
+	// for omitted recipients only. Fallback cannot wake a reference-only author.
 	if route.correction == nil && normalPost && r.RecipientIDs == nil {
 		if route.recipient == "" {
-			if err := activeDefaultRecipientInTx(ctx, tx, r.GroupID, &route.recipient); err != nil {
+			if err := activeDefaultRecipientInTx(ctx, tx, r.GroupID, route.comparisonAuthor, &route.recipient); err != nil {
 				return domain.Message{}, err
 			}
 		}
@@ -220,8 +213,13 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 		route.topic = ""
 		return route, err
 	}
+	// Unclassified long text may contain a comparison cue outside the budget.
+	// Keep the verified quote, but do not use it as routing evidence.
+	referenceOnly := r.ReplyToMessageID != "" && len(r.Content) > maxThreadTextBytes
 	if !infer || r.TopicID != "" || r.TopicIDExplicit {
-		if replyAuthor != "" && replyEffectiveTopic == route.topic && !threadComparisonReply(r.Content) {
+		if referenceOnly || (replyAuthor != "" && threadComparisonReply(r.Content)) {
+			route.comparisonAuthor = replyAuthor
+		} else if replyEffectiveTopic == route.topic {
 			route.recipient = replyAuthor
 		}
 		return route, nil
@@ -235,10 +233,10 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 	if taskTopic.Valid {
 		evidence.confirm(taskTopic.String)
 	}
-	// Comparison references never select the quoted topic or author, even
-	// when we cannot resolve the explicitly stated current subject.
-	comparison := text.current && text.comparison
-	if !comparison && r.ReplyToMessageID != "" {
+	referenceOnly = referenceOnly || text.comparison
+	if referenceOnly {
+		route.comparisonAuthor = replyAuthor
+	} else if r.ReplyToMessageID != "" {
 		evidence.confirm(replyEffectiveTopic)
 	}
 	evidence = text.resolveAliases(evidence)
@@ -253,7 +251,7 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 		return route, nil
 	}
 	switch {
-	case !comparison && replyAuthor != "" && replyEffectiveTopic == route.topic:
+	case !referenceOnly && replyAuthor != "" && replyEffectiveTopic == route.topic:
 		route.recipient = replyAuthor
 	case taskTopic.Valid && taskTopic.String == route.topic && taskOwner != "":
 		route.recipient = taskOwner
@@ -280,9 +278,9 @@ func threadOriginRecipientInTx(ctx context.Context, tx *sql.Tx, group, topic str
 	return member, err
 }
 
-func activeDefaultRecipientInTx(ctx context.Context, tx *sql.Tx, group string, id *string) error {
+func activeDefaultRecipientInTx(ctx context.Context, tx *sql.Tx, group, exclude string, id *string) error {
 	err := tx.QueryRowContext(ctx, `SELECT id FROM members WHERE group_id=? AND status='active'
-	 ORDER BY created_at ASC,id ASC LIMIT 1`, group).Scan(id)
+	 AND (?='' OR id<>?) ORDER BY created_at ASC,id ASC LIMIT 1`, group, exclude, exclude).Scan(id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil // The command has already verified the group.
 	}

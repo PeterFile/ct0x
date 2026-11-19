@@ -29,25 +29,62 @@ func postCorrectionHTTP(t *testing.T, a *groupAPI, group, key string, input map[
 	return a.request("POST", "/api/v1/groups/"+group+"/messages", string(body), key)
 }
 
-func requireThreadCorrectionFixture(t *testing.T, a *groupAPI) {
+func threadCorrectionFixtureInstalled(t *testing.T, a *groupAPI) bool {
 	t.Helper()
+	var version int
 	var installed bool
-	if err := messageSQL(t, a).QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_corrections')`).Scan(&installed); err != nil {
+	if err := messageSQL(t, a).QueryRow(`SELECT (SELECT max(version) FROM schema_migrations),
+	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_corrections')`).Scan(&version, &installed); err != nil {
 		t.Fatal(err)
 	}
-	if !installed {
-		t.Skip("threadCorrectionSchema is not registered; use the private migration overlay")
+	t.Logf("fixture schema v%d, thread corrections installed=%t", version, installed)
+	return installed
+}
+
+func assertUnavailableThreadCorrection(t *testing.T, a *groupAPI, group string, input map[string]any) {
+	t.Helper()
+	const key = "unavailable-correction"
+	path := "/api/v1/groups/" + group + "/messages"
+	before := a.request("GET", path, "")
+	page := decoded[listResult[domain.Message]](t, before, 200)
+	w := postCorrectionHTTP(t, a, group, key, input)
+	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+	if after := a.request("GET", path, ""); after.Code != 200 || !bytes.Equal(after.Body.Bytes(), before.Body.Bytes()) {
+		t.Fatalf("unavailable correction changed the timeline or its receipts: %d %s", after.Code, after.Body)
+	}
+	deliveries := 0
+	for _, m := range page.Items {
+		deliveries += len(m.Deliveries)
+	}
+	raw := messageSQL(t, a)
+	for table, want := range map[string]int{"messages": len(page.Items), "deliveries": deliveries,
+		"message_log": len(page.Items), "message_command_sources": len(page.Items),
+		"mutation_idempotency": len(page.Items), "tasks": 0, "mandates": 0} {
+		var got int
+		if err := raw.QueryRow("SELECT count(*) FROM " + table).Scan(&got); err != nil || got != want {
+			t.Fatalf("unavailable correction: %s count=%d, want %d (%v)", table, got, want, err)
+		}
 	}
 }
 
 func TestThreadCorrectionNormalPost(t *testing.T) {
 	a := openMessageAPI(t, "")
-	requireThreadCorrectionFixture(t, a)
+	installed := threadCorrectionFixtureInstalled(t, a)
 	g := newGroup(t, a, "correction")
 	path := "/api/v1/groups/" + g.ID + "/messages"
-	decoded[domain.Member](t, a.request("POST", "/api/v1/groups/"+g.ID+"/members", `{"name":"owner","role":"observer"}`), 201)
+	owner := decoded[domain.Member](t, a.request("POST", "/api/v1/groups/"+g.ID+"/members", `{"name":"owner","role":"observer"}`), 201)
+	const originalBody = `{"content":"只在连续两次失败后通知。"}`
+	if !installed {
+		original := decoded[domain.Message](t, a.request("POST", path, originalBody, "original"), 201)
+		if original.TopicID != "" || original.ThreadCorrection != nil || len(original.Deliveries) != 1 ||
+			original.Deliveries[0].RecipientID != owner.ID || original.Deliveries[0].State != domain.DeliveryStateQueued {
+			t.Fatalf("ordinary POST lost its legacy main-scope default delivery: %+v", original)
+		}
+		assertUnavailableThreadCorrection(t, a, g.ID, map[string]any{"content": "这句话指的是告警"})
+		return
+	}
 	root := decoded[domain.Message](t, a.request("POST", path, `{"content":"新话题：NET-21 数据库连接告警","recipient_ids":[]}`, "alert"), 201)
-	original := decoded[domain.Message](t, a.request("POST", path, `{"content":"只在连续两次失败后通知。"}`, "original"), 201)
+	original := decoded[domain.Message](t, a.request("POST", path, originalBody, "original"), 201)
 	if root.TopicID == "" || original.TopicID != "" || len(original.Deliveries) != 1 {
 		t.Fatalf("bad topic or delivery fixture: root=%+v original=%+v", root, original)
 	}
@@ -94,10 +131,15 @@ func TestThreadCorrectionNormalPost(t *testing.T) {
 
 func TestThreadCorrectionDefaultPostPersistsClarification(t *testing.T) {
 	a := openMessageAPI(t, "")
-	requireThreadCorrectionFixture(t, a)
+	installed := threadCorrectionFixtureInstalled(t, a)
 	g := newGroup(t, a, "ambiguous correction")
 	path := "/api/v1/groups/" + g.ID + "/messages"
 	decoded[domain.Member](t, a.request("POST", "/api/v1/groups/"+g.ID+"/members", `{"name":"on call","role":"observer"}`), 201)
+	if !installed {
+		// With no predecessor, the unavailable command must not persist a clarification or wake the member.
+		assertUnavailableThreadCorrection(t, a, g.ID, map[string]any{"content": "这句话指的是告警"})
+		return
+	}
 	for _, title := range []string{"NET-56 网关告警", "OPS-42 备份告警"} {
 		m := decoded[domain.Message](t, postCorrectionHTTP(t, a, g.ID, "topic-"+title[:3], map[string]any{
 			"content": "新话题：" + title, "recipient_ids": []string{},
@@ -128,9 +170,27 @@ func TestThreadCorrectionDefaultPostPersistsClarification(t *testing.T) {
 
 func TestThreadCorrectionExplicitReplyAndAmbiguity(t *testing.T) {
 	a := openMessageAPI(t, "")
-	requireThreadCorrectionFixture(t, a)
-	g, other := newGroup(t, a, "same group"), newGroup(t, a, "different group")
+	installed := threadCorrectionFixtureInstalled(t, a)
+	g := newGroup(t, a, "same group")
 	m := decoded[domain.Member](t, a.request("POST", "/api/v1/groups/"+g.ID+"/members", `{"name":"owner","role":"observer"}`), 201)
+	if !installed {
+		const topic = "legacy-topic"
+		original := decoded[domain.Message](t, postCorrectionHTTP(t, a, g.ID, "original", map[string]any{
+			"content": "原话", "topic_id": topic, "recipient_ids": []string{},
+		}), 201)
+		if original.TopicID != topic || original.ThreadCorrection != nil || len(original.Deliveries) != 0 {
+			t.Fatalf("ordinary POST lost its explicit legacy scope or public-only setting: %+v", original)
+		}
+		assertUnavailableThreadCorrection(t, a, g.ID, map[string]any{
+			"content": "这句话指的是 MQ-29。", "reply_to_message_id": original.ID, "recipient_ids": []string{m.ID},
+		})
+		attr, err := a.db.MessageThreadAttribution(t.Context(), g.ID, original.ID)
+		if err != nil || attr.Storage.TopicID != topic || attr.Effective != attr.Storage || attr.CorrectionMessageID != "" {
+			t.Fatalf("unavailable correction changed legacy attribution: %+v, %v", attr, err)
+		}
+		return
+	}
+	other := newGroup(t, a, "different group")
 	put := func(key, content string) domain.Message {
 		t.Helper()
 		return decoded[domain.Message](t, postCorrectionHTTP(t, a, g.ID, key, map[string]any{"content": content, "recipient_ids": []string{}}), 201)

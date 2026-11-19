@@ -11,13 +11,7 @@ import (
 
 func TestPrepareThreadCorrectionUsesEffectiveHistory(t *testing.T) {
 	f := newPrepareFixture(t)
-	var installed bool
-	if err := f.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='thread_corrections')`).Scan(&installed); err != nil {
-		t.Fatal(err)
-	}
-	if !installed {
-		t.Skip("threadCorrectionSchema is not registered; use the private migration overlay")
-	}
+	installed := threadCorrectionFixtureInstalled(t, f.db)
 	local := NewLocalUser(f.s)
 	post := func(key string, input MessageInput) domain.Message {
 		t.Helper()
@@ -27,11 +21,21 @@ func TestPrepareThreadCorrectionUsesEffectiveHistory(t *testing.T) {
 		}
 		return message
 	}
-	root := post("root", MessageInput{Content: "新话题：导入延迟告警", RecipientIDs: []string{}})
+	rootInput := MessageInput{Content: "新话题：导入延迟告警", RecipientIDs: []string{}}
+	if !installed {
+		rootInput.TopicID = "legacy-topic"
+	}
+	root := post("root", rootInput)
 	source := post("source", MessageInput{Content: "有效阈值是连续失败三次。", RecipientIDs: []string{}})
-	// Supplying an empty set here is not what permits reading the source; it is
-	// public same-group chat and the new Turn's binding must match its effective topic.
-	post("correction", MessageInput{Content: "这句话指的是告警", RecipientIDs: []string{}})
+	if root.TopicID == "" || source.TopicID != "" {
+		t.Fatalf("expected distinct storage scopes: root=%+v source=%+v", root, source)
+	}
+	wantTarget, wantMain := 1, 1
+	if installed {
+		// History follows the effective topic, not the correction's recipients.
+		post("correction", MessageInput{Content: "这句话指的是告警", RecipientIDs: []string{}})
+		wantTarget, wantMain = 2, 0
+	}
 	targetTrigger := post("trigger", MessageInput{Content: "继续讨论。", TopicID: root.TopicID, RecipientIDs: []string{f.member.ID}})
 	mainTrigger := post("main", MessageInput{Content: "继续闲聊。", TopicIDExplicit: true, RecipientIDs: []string{f.member.ID}})
 	p := f.preparer(t)
@@ -45,20 +49,28 @@ func TestPrepareThreadCorrectionUsesEffectiveHistory(t *testing.T) {
 	}
 	target := prepare(targetTrigger)
 	main := prepare(mainTrigger)
-	if len(target.Pending) != 1 || target.Pending[0].Source.ID != targetTrigger.ID || len(target.History) != 2 ||
-		target.History[0].Source.ID != root.ID || target.History[1].Source.ID != source.ID || len(main.History) != 0 {
-		t.Fatalf("ordinary preparation must include original exactly once in effective topic and never in main: target=%+v main=%+v", target, main)
+	if len(target.Pending) != 1 || target.Pending[0].Source.ID != targetTrigger.ID ||
+		len(main.Pending) != 1 || main.Pending[0].Source.ID != mainTrigger.ID ||
+		len(target.History) != wantTarget || len(main.History) != wantMain || target.History[0].Source.ID != root.ID {
+		t.Fatalf("ordinary preparation chose the wrong history scope: target=%+v main=%+v", target, main)
+	}
+	history := main.History
+	if installed {
+		history = target.History[1:]
 	}
 	var body struct {
-		TopicID          string `json:"topic_id"`
-		EffectiveTopicID string `json:"effective_topic_id"`
-		SourceID         string `json:"source_id"`
-		SourceKind       string `json:"source_kind"`
-		Content          string `json:"content"`
+		TopicID          string  `json:"topic_id"`
+		EffectiveTopicID *string `json:"effective_topic_id"`
+		SourceID         string  `json:"source_id"`
+		SourceKind       string  `json:"source_kind"`
+		Content          string  `json:"content"`
 	}
-	if err := json.Unmarshal([]byte(target.History[1].Content), &body); err != nil || body.TopicID != source.TopicID || body.EffectiveTopicID != root.TopicID ||
+	if err := json.Unmarshal([]byte(history[0].Content), &body); err != nil || history[0].Source.ID != source.ID || body.TopicID != source.TopicID ||
 		body.SourceID != source.SourceID || body.SourceKind != source.SourceKind || body.Content != source.Content {
-		t.Fatalf("preparation changed original provenance or lost effective scope: %+v, %v", body, err)
+		t.Fatalf("preparation changed original provenance: %+v, %v", body, err)
+	}
+	if hasEffective := body.EffectiveTopicID != nil; hasEffective != installed || hasEffective && *body.EffectiveTopicID != root.TopicID {
+		t.Fatalf("preparation projected the wrong topic: %+v", body)
 	}
 	f.assertQueued(t)
 }
