@@ -73,7 +73,7 @@ func applyTurnReceiptInTx(ctx context.Context, tx *sql.Tx, turn domain.Turn, rec
 	}
 	turn.State, turn.Reason = domain.TurnState(receipt.Outcome), receipt.Reason
 	if terminalOutcome(receipt.Outcome) && strings.TrimSpace(turn.CandidateText) != "" {
-		if err := publishTurnReply(ctx, tx, &turn); err != nil {
+		if err := publishSettledTurnReply(ctx, tx, &turn); err != nil {
 			return domain.Turn{}, err
 		}
 	}
@@ -144,14 +144,54 @@ func receiptLogPath(path string) string {
 	return path
 }
 
-func publishTurnReply(ctx context.Context, tx *sql.Tx, turn *domain.Turn) error {
-	message := domain.Message{
-		ID: rand.Text(), GroupID: turn.GroupID, SenderID: turn.MemberID,
-		Content: turn.CandidateText, CreatedAt: time.Now().UTC(), Deliveries: []domain.Delivery{},
+const turnReplyConversation = ` FROM conversations v WHERE v.group_id=? AND v.id=? AND v.member_id=?`
+
+func publishSettledTurnReply(ctx context.Context, tx *sql.Tx, turn *domain.Turn) error {
+	if turn.State != domain.TurnStateSucceeded {
+		return publishTurnReply(ctx, tx, turn)
 	}
-	if err := tx.QueryRowContext(ctx, "SELECT topic_id FROM conversations WHERE group_id=? AND id=? AND member_id=?",
-		turn.GroupID, turn.ConversationID, turn.MemberID).Scan(&message.TopicID); err != nil {
+	// Fold the indexed candidate/resolve probe into the topic lookup. Match
+	// the recorded publication and intake digests: recovery can rotate the live claim.
+	var topicID string
+	var duplicate bool
+	if err := tx.QueryRowContext(ctx, `SELECT v.topic_id, EXISTS(
+	 SELECT 1 FROM chat_candidates c
+	 CROSS JOIN chat_discussion_events e ON e.candidate_id=c.id
+	    AND e.group_id=c.group_id AND e.topic_id=c.topic_id AND e.source_message_id=c.message_id AND e.actor_id=c.member_id
+	 CROSS JOIN chat_intake_executions i ON i.candidate_id=c.id AND i.turn_id=c.turn_id AND i.purpose='`+domain.ChatIntakePurpose+`'
+	 CROSS JOIN message_command_sources s ON s.message_id=e.message_id
+	    AND s.kind='member' AND s.turn_id=c.turn_id AND s.claim_digest=i.claim_digest
+	 CROSS JOIN message_command_sources source ON source.message_id=c.message_id AND source.id=i.source_id AND source.kind=i.source_kind
+	 CROSS JOIN deliveries incoming ON incoming.id=? AND incoming.turn_id=c.turn_id AND incoming.conversation_id=v.id
+	    AND incoming.message_id=c.message_id AND incoming.group_id=c.group_id AND incoming.topic_id=c.topic_id AND incoming.recipient_id=c.member_id
+	 CROSS JOIN messages m ON m.id=e.message_id AND m.group_id=e.group_id AND m.topic_id=e.topic_id AND m.sender_id=e.actor_id
+	 WHERE c.turn_id=? AND c.group_id=v.group_id AND c.topic_id=v.topic_id AND c.member_id=v.member_id
+	   AND typeof(i.claim_digest)='blob' AND length(i.claim_digest)=32 AND source.kind IN ('local_user_chat','member')
+	   AND e.kind='`+domain.ChatDiscussionResolve+`' AND e.recipient_id IS NULL AND e.delivery_id IS NULL AND e.expected_reply=''
+	   AND m.content COLLATE BINARY=?
+	   AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.message_id=e.message_id)
+	)`+turnReplyConversation, turn.DeliveryID, turn.ID, turn.CandidateText, turn.GroupID, turn.ConversationID, turn.MemberID).Scan(&topicID, &duplicate); err != nil {
 		return err
+	}
+	if duplicate {
+		return nil // The structured publication keeps its own provenance, not a native reply link.
+	}
+	return insertTurnReply(ctx, tx, turn, topicID)
+}
+
+func publishTurnReply(ctx context.Context, tx *sql.Tx, turn *domain.Turn) error {
+	var topicID string
+	if err := tx.QueryRowContext(ctx, "SELECT v.topic_id"+turnReplyConversation,
+		turn.GroupID, turn.ConversationID, turn.MemberID).Scan(&topicID); err != nil {
+		return err
+	}
+	return insertTurnReply(ctx, tx, turn, topicID)
+}
+
+func insertTurnReply(ctx context.Context, tx *sql.Tx, turn *domain.Turn, topicID string) error {
+	message := domain.Message{
+		ID: rand.Text(), GroupID: turn.GroupID, TopicID: topicID, SenderID: turn.MemberID,
+		Content: turn.CandidateText, CreatedAt: time.Now().UTC(), Deliveries: []domain.Delivery{},
 	}
 	if err := insertMessageRow(ctx, tx, message); err != nil {
 		return err
