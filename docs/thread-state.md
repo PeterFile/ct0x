@@ -1,0 +1,34 @@
+# Experimental Thread/Task state (E2)
+
+E2 stores explicit local-human confirmations. It does not derive state from chat, wake anyone, change a Task or Mandate, create a Review, or grant access. The compatibility Thread is the exact `(group_id, topic_id)`; a member's Conversation is only an execution binding. State never crosses groups.
+
+## Local command and reads
+
+Use the existing LocalUser loopback HTTP boundary (the same Host and write-Origin checks as messages; not a member/MCP endpoint):
+
+```http
+PUT /api/v1/groups/{group}/thread-state?topic_id=export-bug
+Content-Type: application/json
+Idempotency-Key: confirm-csv-1
+
+{"expected_revision":0,"slot":0,"kind":"constraint","action":"set","content":"必须兼容旧版 CSV","source_message_id":"<message-id>"}
+```
+
+- `topic_id` is exact, including whitespace; absent or empty means the main topic, not all topics. To address Task state, include both `task_id` and `task_revision`. The Task must be in the group and linked to the exact topic by `task_coordination` and its persisted Mandate. No task-link table is added. An unlinked Task or a same-group Task from another Thread does not qualify. Task versions have independent state; do not silently carry an old confirmation into a new Task version.
+- Slots `0..7` are explicit records. The first write fixes the slot's kind: `goal`, `constraint`, `confirmed_decision` or `plan`. Editing one slot cannot overwrite another. `set` writes an active value; `invalidate` retires an active value and stores its reason, keeping the original value and source. Invalidate before replacing an active plan; use another slot if the disabled plan should remain in the current view alongside the new one. Older snapshots always retain it.
+- Each value or invalidation reason must be a non-blank, exact excerpt of an existing `local_user_chat` message in that Thread, at most 1024 UTF-8 bytes. A displayed `user` sender, member assertion, or platform notice is not sufficient. No Review or WorkInput is accepted by this slice. The server binds the actor, resolves the command-source ID and `message_log` position, and stamps the confirmation. A new change to an existing slot needs a strictly later source position for that slot.
+- A successful command returns `200` and the immutable snapshot at `expected_revision + 1`. Compare-and-append and the group/actor/operation-scoped idempotency receipt commit together. A retry with the same key and input returns that snapshot even after unrelated state updates; it still checks access and the Task version. A changed key payload conflicts (`conflict`); stale CAS, Task version or slot lineage conflicts (`thread_state_conflict`). An inaccessible source, Thread, Task link or historical snapshot returns `404`.
+- `GET` on the same URL returns `{scope, revision, records}`. Revision `0` with `records: []` means no state in an existing Thread/scope. Add `revision=N` (positive) to read the snapshot as of that state revision; an explicit historical read may use an older `task_revision` if the Task still has the exact verified link. Current reads and all writes require the current Task version. `records` are ordered by slot and carry their own last change `revision`, `active`, content and `source`. Invalidation adds `invalidated_by: {reason, source}`; `source` still points to the original. The record at the snapshot revision identifies the last command's evidence (its `invalidated_by.source` for retirement).
+
+## Preparation and integration
+
+- Ordinary preparation goes through `Preparer.Prepare` → `ordinaryThreadContext` → `Store.LoadThreadPreparation`. The existing queue/member/Conversation binding runs first. State and the existing indexed group/topic history window share a read transaction; default history is 50 candidates before the trigger. No state revision or `message_log_position` is a coverage, acknowledgement or consumption frontier. The trigger and history continue to use snapshot-local `ContextPack.Source.Sequence`. Nothing is marked read and no incremental lower bound is inferred.
+- `attachOrdinaryThreadState` fills `contextpack.Input.{StateScope,ThreadState}`. The optional JSON `thread_state` section follows mandatory `pending` and precedes history. It and the trigger cannot be truncated: the existing byte budget counts the full state and history reference floor before adding recent bodies. If the minimum does not fit, preparation returns not ready. When there is no state the prompt retains the old wire format.
+- **E1:** `ordinaryThreadContext` is the scope-selection seam. Today it supplies the immutable trigger's exact `ThreadRef`; Store checks that binding rather than falling back to a broad group view. Wire an effective attribution only with a server-verified selection shared by history, state, and source validation. Do not reinterpret old state or broaden visibility on correction. If E1 adds authoritative Task links, replace the compatibility relation in `threadStateTaskRelation` and its SQL insert guard in a forward migration; do not add duplicate links or treat one as a grant.
+- **C / formal roles:** the ordinary hook runs before provider handoff and does not change native or CLI configuration. A role profile that already authorizes the exact Task view can call `Store.LoadAuthorizedTaskThreadState` after validating the role, before building its own bounded packet. The seam re-reads a ready persisted owner/coordinator binding and verifies the exact Thread/Task version; it is not a claim or permission to run. Typed profiles that only permit claim-scoped inputs (and delegated roles) need their own disclosure decision and binding before rendering any state. No formal role prompt or tool grants are wired here. Native end-to-end delivery must be validated by C.
+
+## Migration and verification
+
+`internal/store/thread_state_schema.go` defines `threadStateSchema`. B should append it to the migration registry in actual merge order. No public number, legacy backfill, or registry edit is part of E2. On uninstalled databases explicit commands return `503 thread_state_unavailable`; existing message and execution preparation paths remain available. Broken installed state fails closed instead of being treated as empty or legacy.
+
+To test installation, copy `internal/store/migrations.go` outside Git, append `threadStateSchema` at the end of its migration slice in the copy, and use `go test -overlay` to replace that path. Run `TestThreadState*` in `./internal/httpapi`, `./internal/platform` and `./internal/contextpack` with the overlay, and `TestThreadStateUnavailableOnV30` with the unmodified registry. This tests the actual v30 baseline and the candidate registration without committing a version. The handoff fixture builds a real provider-independent prompt; it does not launch a model. E1 routing, E3 project knowledge, and the real-model 200-message scenario are separate evidence.

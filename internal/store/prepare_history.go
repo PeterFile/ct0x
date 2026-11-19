@@ -12,6 +12,13 @@ import (
 // in its authoritative group/topic, ordered oldest first and without deliveries.
 // Zero limit selects 50; explicit limits must be 1 through 200.
 func (s *Store) ListPreparationHistory(ctx context.Context, groupID, triggerMessageID string, limit int) ([]domain.Message, error) {
+	return s.listPreparationHistory(ctx, groupID, triggerMessageID, limit, nil)
+}
+
+// Before reading history bodies, the optional hook binds and loads auxiliary
+// context in the same read snapshot as the exact trigger and candidate range.
+func (s *Store) listPreparationHistory(ctx context.Context, groupID, triggerMessageID string, limit int,
+	checkTrigger func(*sql.Tx, domain.Message) error) ([]domain.Message, error) {
 	const action = "读取准备历史失败"
 	limit, err := listLimit(ListOptions{Limit: limit})
 	if err != nil {
@@ -26,6 +33,11 @@ func (s *Store) ListPreparationHistory(ctx context.Context, groupID, triggerMess
 		"SELECT "+messageColumns+" FROM messages WHERE group_id=? AND id=?", groupID, triggerMessageID))
 	if err != nil {
 		return nil, queueError(action, err)
+	}
+	if checkTrigger != nil {
+		if err := checkTrigger(tx, trigger); err != nil {
+			return nil, queueError(action, err)
+		}
 	}
 	rows, err := tx.QueryContext(ctx, "SELECT "+messageColumns+` FROM messages
 	 WHERE group_id=? AND topic_id=? AND (created_at, id) < (?, ?)

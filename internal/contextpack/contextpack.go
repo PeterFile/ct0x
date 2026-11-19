@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"unicode/utf8"
+
+	"agentworkspace/internal/domain"
 )
 
 type Scope struct {
@@ -67,7 +69,11 @@ type Input struct {
 	Permissions      []string
 	Pending, History []Message
 	Summary          *Summary
-	MaxBytes         int
+	// StateScope is independently bound by the caller. State is mandatory but
+	// never supplies ContextPack sequences or summary coverage.
+	StateScope  domain.ThreadStateScope
+	ThreadState *domain.ThreadStateSnapshot
+	MaxBytes    int
 }
 
 var ErrInvalid = errors.New("上下文输入无效")
@@ -83,13 +89,14 @@ func (e *BudgetError) Error() string {
 }
 
 type packet struct {
-	Scope          Scope     `json:"scope"`
-	Responsibility string    `json:"responsibility"`
-	Permissions    []string  `json:"permissions"`
-	Pending        []Message `json:"pending"`
-	Summary        *Summary  `json:"summary,omitempty"`
-	History        []Message `json:"history"`
-	Overflow       []Source  `json:"overflow"`
+	Scope          Scope                       `json:"scope"`
+	Responsibility string                      `json:"responsibility"`
+	Permissions    []string                    `json:"permissions"`
+	Pending        []Message                   `json:"pending"`
+	ThreadState    *domain.ThreadStateSnapshot `json:"thread_state,omitempty"`
+	Summary        *Summary                    `json:"summary,omitempty"`
+	History        []Message                   `json:"history"`
+	Overflow       []Source                    `json:"overflow"`
 }
 
 // Build returns compact JSON without a trailing newline. All material must match
@@ -101,8 +108,9 @@ type packet struct {
 // boundaries.
 // Pending/history are copied and sorted by ascending sequence; other order is
 // preserved. Covered history alone is removed. The complete supplied summary,
-// responsibility, permissions, pending bodies and all uncovered history refs
-// are mandatory. Remaining bytes buy the newest contiguous history suffix.
+// responsibility, permissions, pending bodies, all uncovered history refs
+// and supplied durable Thread/Task state are mandatory. Remaining bytes buy
+// the newest contiguous history suffix.
 // MaxBytes counts every rendered byte, including JSON escaping and delimiters.
 func Build(in Input) ([]byte, error) {
 	if err := validate(in); err != nil {
@@ -110,7 +118,7 @@ func Build(in Input) ([]byte, error) {
 	}
 	p := packet{Scope: in.Scope, Responsibility: in.Responsibility,
 		Permissions: append([]string{}, in.Permissions...), Pending: append([]Message{}, in.Pending...),
-		Summary: in.Summary, History: []Message{}}
+		ThreadState: in.ThreadState, Summary: in.Summary, History: []Message{}}
 	history := make([]Message, 0, len(in.History))
 	for _, m := range in.History {
 		if in.Summary == nil || m.Sequence > in.Summary.CoveredThrough {
@@ -124,7 +132,10 @@ func Build(in Input) ([]byte, error) {
 	for n, m := range history {
 		p.Overflow[n] = m.Source
 	}
-	minimal, _ := json.Marshal(p) // These closed data types cannot fail JSON encoding.
+	minimal, err := json.Marshal(p)
+	if err != nil {
+		return nil, invalid("持久状态无法编码")
+	}
 	size := len(minimal)
 	if size > in.MaxBytes {
 		return nil, &BudgetError{Required: size, Limit: in.MaxBytes}
@@ -159,6 +170,9 @@ func invalid(reason string) error { return fmt.Errorf("%w：%s", ErrInvalid, rea
 func validate(in Input) error {
 	if !validText(in.Scope.GroupID) || !validText(in.Scope.ConversationID) || !validText(in.Responsibility) || in.MaxBytes < 0 {
 		return invalid("范围、职责或预算无效")
+	}
+	if state := in.ThreadState; state != nil && (state.Scope != in.StateScope || state.Scope.GroupID != in.Scope.GroupID || state.Revision <= 0) {
+		return invalid("持久状态的范围或版本无效")
 	}
 	for _, permission := range in.Permissions {
 		if !validText(permission) {

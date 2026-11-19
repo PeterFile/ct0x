@@ -232,9 +232,9 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			return empty, scheduler.ErrNotReady
 		}
 	}
-	history, err := p.store.ListPreparationHistory(ctx, group.ID, trigger.ID, p.historyLimit)
+	history, threadState, err := p.ordinaryThreadContext(ctx, trigger)
 	if err != nil {
-		return empty, preparationReadError(ctx, err)
+		return empty, err
 	}
 	var repairSource *domain.ChatRepairSource
 	if useMemberTools && p.memberTools.tools.chatEngine != nil {
@@ -277,7 +277,7 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			return empty, err
 		}
 	}
-	prompt, err := p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, nativeText, intakeSchema.investigation, repairSource)
+	prompt, err := p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, nativeText, intakeSchema.investigation, threadState, repairSource)
 	if err != nil {
 		return empty, err
 	}
@@ -416,11 +416,12 @@ func preparationReadError(ctx context.Context, err error) error {
 
 func (p *Preparer) buildContext(group domain.Group, member domain.Member, conversation domain.Conversation,
 	trigger domain.Message, history []domain.Message, useMemberTools bool, repairs ...*domain.ChatRepairSource) ([]byte, error) {
-	return p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, false, false, repairs...)
+	return p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, false, false, nil, repairs...)
 }
 
 func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Member, conversation domain.Conversation,
-	trigger domain.Message, history []domain.Message, useMemberTools, nativeText, investigationIntake bool, repairs ...*domain.ChatRepairSource) ([]byte, error) {
+	trigger domain.Message, history []domain.Message, useMemberTools, nativeText, investigationIntake bool,
+	threadState *domain.ThreadStateSnapshot, repairs ...*domain.ChatRepairSource) ([]byte, error) {
 	metadata := struct {
 		Group        domain.Group        `json:"group"`
 		Conversation domain.Conversation `json:"conversation"`
@@ -525,6 +526,9 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 				in.Permissions = append(in.Permissions, nativeSessionTextPermission)
 			}
 		}
+	}
+	if threadState != nil {
+		attachOrdinaryThreadState(&in, trigger, threadState)
 	}
 	if err := appendPreparationMessages(&in, conversation.TopicID, trigger, history); err != nil {
 		if errors.Is(err, errPrepareRead) {
