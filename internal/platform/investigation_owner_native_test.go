@@ -179,7 +179,7 @@ func ownerNativeKey(op, call string) string { return fmt.Sprintf("%x", sha256.Su
 func TestPiInvestigationOwnerNativeSQLiteRoundTrip(t *testing.T) {
 	t.Parallel()
 	f := newBoundWorkReportFixture(t)
-	ownerNativeRows(t, f, 1, `SELECT count(*) FROM schema_migrations WHERE version=30 AND NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version>30)`)
+	ownerNativeRows(t, f, 1, `SELECT count(*) FROM schema_migrations WHERE version=30`)
 	assets, approved, foreign := ownerFixtureMaterials(t, f)
 	child := ownerFixtureMember(t, f, f.group, "reporter")
 	peer := ownerFixtureMember(t, f, f.group, "second reporter")

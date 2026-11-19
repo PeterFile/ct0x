@@ -265,8 +265,14 @@ func TestChatDiscussionWorkReturnRejectsReplySource(t *testing.T) {
 		})
 	}
 	t.Run("synthetic-corruption", func(t *testing.T) {
-		coordinationDecideExec(t, s, `DROP TRIGGER IF EXISTS chat_discussion_work_returns_no_reply_update`)
+		const trigger = "chat_discussion_work_returns_no_reply_update"
+		var ddl string
+		if err := s.db.QueryRow(`SELECT sql FROM main.sqlite_schema WHERE type='trigger' AND name=?`, trigger).Scan(&ddl); err != nil {
+			t.Fatal(err)
+		}
+		coordinationDecideExec(t, s, `DROP TRIGGER `+trigger)
 		coordinationDecideExec(t, s, `UPDATE turns SET reply_message_id=? WHERE id=?`, r.MessageID, h.AuthorTurnID)
+		coordinationDecideExec(t, s, ddl) // Restore the schema so the reader must reject the bad row itself.
 		if got, err := s.ResolveChatDiscussionWorkReturnDelivery(ctx, f.groupID, r.DeliveryID); !errors.Is(err, ErrMemberToolDenied) || got != (domain.ChatDiscussionWorkReturnReceipt{}) {
 			t.Errorf("resolver fell back or accepted conflicting reply evidence: %+v %v", got, err)
 		}
@@ -334,6 +340,64 @@ func TestChatDiscussionWorkReturnSchemaGuard(t *testing.T) {
 		checkHandback(t, f) // The exact replay must not redeliver or acknowledge the damage.
 		coordinationDecidePreserved(t, f.s, before)
 	})
+
+	t.Run("new-handback-without-protection", func(t *testing.T) {
+		f := setupWorkReturn(t)
+		coordinationDecideExec(t, f.s, `DROP TRIGGER chat_discussion_work_return_deliveries_identity`)
+		messageSequenceLedger(t, f.s, 31)
+		before := coordinationDecideSnapshot(t, f.s)
+		checkHandback(t, f)
+		coordinationDecidePreserved(t, f.s, before)
+	})
+
+	for _, name := range []string{"lookalike-table", "missing-composite-foreign-key", "no-op-protection"} {
+		t.Run(name, func(t *testing.T) {
+			f := setupWorkReturn(t)
+			_, r := checkWorkReturnWake(t, f)
+			s := f.s
+			switch name {
+			case "lookalike-table":
+				// Keep all columns and lookup keys, but lose the marker, FKs and table triggers.
+				coordinationDecideExec(t, s, dropTable+`; CREATE TABLE chat_discussion_work_returns (
+				 origin_message_id TEXT PRIMARY KEY NOT NULL,
+				 group_id TEXT NOT NULL,
+				 topic_id TEXT NOT NULL,
+				 invitation_message_id TEXT NOT NULL UNIQUE,
+				 handback_id TEXT NOT NULL UNIQUE,
+				 message_id TEXT NOT NULL UNIQUE,
+				 delivery_id TEXT UNIQUE,
+				 CHECK(message_id NOT IN (origin_message_id,invitation_message_id))
+				) STRICT, WITHOUT ROWID`)
+			case "missing-composite-foreign-key":
+				// Keep the other FKs and restore every trigger to isolate the composite FK check.
+				defs := messageSequenceRows(t, s.db, `SELECT sql FROM main.sqlite_schema
+				 WHERE tbl_name='chat_discussion_work_returns' AND type IN ('table','trigger') ORDER BY type,name`)
+				if len(defs) != 4 {
+					t.Fatalf("expected the real table and its three attached triggers, got %d definitions", len(defs))
+				}
+				const fk = ",\n    FOREIGN KEY(origin_message_id,invitation_message_id) REFERENCES chat_discussion_events(origin_message_id,message_id)"
+				table := defs[0][0].(string)
+				withoutFK := strings.Replace(table, fk, "", 1)
+				if withoutFK == table {
+					t.Fatal("fixture did not remove the composite foreign key")
+				}
+				coordinationDecideExec(t, s, dropTable)
+				coordinationDecideExec(t, s, withoutFK)
+				for _, row := range defs[1:] {
+					coordinationDecideExec(t, s, row[0].(string))
+				}
+			case "no-op-protection":
+				coordinationDecideExec(t, s, `DROP TRIGGER chat_discussion_work_returns_delete;
+				 CREATE TRIGGER chat_discussion_work_returns_delete BEFORE DELETE ON chat_discussion_work_returns
+				 BEGIN SELECT 1; END`)
+			}
+			messageSequenceLedger(t, s, 31)
+			before := coordinationDecideSnapshot(t, s)
+			checkResolve(t, s, r.GroupID, r.DeliveryID, ErrConflict)
+			checkHandback(t, f)
+			coordinationDecidePreserved(t, s, before)
+		})
+	}
 
 	for _, tc := range []struct{ name, damage string }{
 		{"marker-without-table", dropTable},

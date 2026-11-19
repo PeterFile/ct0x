@@ -408,6 +408,10 @@ func TestChatDiscussionWorkReturnLegacyReplay(t *testing.T) {
 	f := setupWorkReturnAdmission(t)
 	f.settleIntake(t)
 	f.startWorker(t)
+	messageSequenceLedger(t, f.s, 30)
+	if got, err := f.s.ResolveChatDiscussionWorkReturnDelivery(ctx, f.groupID, f.invite.Event.DeliveryID); got != (domain.ChatDiscussionWorkReturnReceipt{}) || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("legacy v30 delivery must have no typed return: %+v %v", got, err)
+	}
 	h := workReturnHandback(t, f.s, f.owner)
 
 	migrations = all

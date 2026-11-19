@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 
 	"agentworkspace/internal/domain"
@@ -14,28 +16,36 @@ import (
 
 var chatDiscussionWorkReturnVersion = slices.Index(migrations, chatDiscussionWorkReturnSchema) + 1
 
+var chatDiscussionWorkReturnDDL = func() string {
+	// In immutable v31, column-one CREATEs start statements and column-one
+	// comments separate them. SQLite stores only the statement, without ';'.
+	ddl := strings.Split(chatDiscussionWorkReturnSchema, "\nCREATE ")[1:]
+	for i, body := range ddl {
+		body, _, _ = strings.Cut(body, "\n--")
+		ddl[i] = "CREATE " + strings.TrimSuffix(strings.TrimSpace(body), ";")
+	}
+	encoded, _ := json.Marshal(ddl) // A slice of strings always marshals.
+	return string(encoded)
+}()
+
 // A missing registration is legacy only if the return footprint is absent.
-// Triggers on other tables can survive a dropped return table. With a marker,
-// require the real table and its typed lookup keys without reading any returns.
+// With a marker, require the original table (including composite foreign
+// keys) and every v31 trigger body, including triggers on other tables.
 func chatDiscussionWorkReturnInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	var state int
-	err := tx.QueryRowContext(ctx, `SELECT CASE
+	err := tx.QueryRowContext(ctx, `WITH footprint AS (
+	 SELECT type,sql FROM main.sqlite_schema WHERE name='chat_discussion_work_returns' COLLATE NOCASE
+	 OR (type='trigger' AND lower(name) GLOB 'chat_discussion_work_return[s_]*')
+	)
+	SELECT CASE
 	 WHEN EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?1) THEN
-	   CASE WHEN EXISTS(SELECT 1 FROM pragma_table_list('chat_discussion_work_returns')
-	          WHERE "schema"='main' AND type='table' AND wr=1 AND strict=1 AND ncol=7)
-	     AND (SELECT count(*)=7 FROM pragma_table_xinfo('chat_discussion_work_returns','main')
-	          WHERE type='TEXT' AND hidden=0 AND (name,pk,"notnull") IN (
-	           ('origin_message_id',1,1), ('group_id',0,1), ('topic_id',0,1), ('invitation_message_id',0,1),
-	           ('handback_id',0,1), ('message_id',0,1), ('delivery_id',0,0)))
-	     AND (SELECT count(DISTINCT key_name) FROM (
-	            SELECT min(c.name) AS key_name FROM pragma_index_list('chat_discussion_work_returns','main') i
-	            JOIN pragma_index_info(i.name,'main') c WHERE i.origin='u' GROUP BY i.name HAVING count(*)=1
-	          ) WHERE key_name IN ('invitation_message_id','handback_id','message_id','delivery_id'))=4
-	   THEN 1 ELSE -1 END
+	   CASE WHEN EXISTS(
+	     SELECT value FROM json_each(?2)
+	     EXCEPT SELECT sql FROM footprint WHERE type IN ('table','trigger')
+	   ) THEN -1 ELSE 1 END
 	 WHEN (?1>0 AND EXISTS(SELECT 1 FROM main.schema_migrations WHERE version>?1))
-	   OR EXISTS(SELECT 1 FROM main.sqlite_schema WHERE name='chat_discussion_work_returns' COLLATE NOCASE
-	      OR (type='trigger' AND lower(name) GLOB 'chat_discussion_work_return[s_]*')) THEN -1
-	 ELSE 0 END`, chatDiscussionWorkReturnVersion).Scan(&state)
+	   OR EXISTS(SELECT 1 FROM footprint) THEN -1
+	 ELSE 0 END`, chatDiscussionWorkReturnVersion, chatDiscussionWorkReturnDDL).Scan(&state)
 	if err != nil {
 		return false, err
 	}
