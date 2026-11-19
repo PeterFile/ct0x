@@ -400,7 +400,7 @@ func TestPiInvestigationOwnerNativeFollowupAndAdmissionRefusal(t *testing.T) {
 	testPiInvestigationOwnerNativeFollowup(t, "admitted", "declined-callback", "outcome-false")
 }
 
-func TestPiInvestigationOwnerNativeFollowupStaysQueuedWithoutTypedLaunch(t *testing.T) {
+func TestPiInvestigationOwnerNativeDisabledTypedExtensionLeavesWakeQueued(t *testing.T) {
 	testPiInvestigationOwnerNativeFollowup(t, "typed-launch-disabled")
 }
 
@@ -497,7 +497,7 @@ func TestInvestigationOwnerManagementAllowsOriginalUserFollowup(t *testing.T) {
 	testInvestigationOwnerManagementAdmission(t, "local_user_chat", domain.TaskWorkSourceFollowup)
 }
 
-func TestInvestigationOwnerManagementAllowsOriginalUserReport(t *testing.T) {
+func TestInvestigationOwnerManagementOriginalUserReport(t *testing.T) {
 	testInvestigationOwnerManagementAdmission(t, "local_user_chat", domain.TaskWorkSourceReport)
 }
 

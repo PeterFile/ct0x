@@ -28,165 +28,202 @@ const (
 )
 
 func TestInvestigationOwnerManagementHTTP(t *testing.T) {
-	for _, kind := range []domain.TaskWorkSourceKind{domain.TaskWorkSourceReport, domain.TaskWorkSourceFollowup} {
-		t.Run(string(kind), func(t *testing.T) {
-			ctx := t.Context()
-			f := newBoundWorkReportFixture(t)
-			var version int
-			roleOK(t, f.raw.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version))
-			if version != 30 {
-				t.Fatalf("fixture did not open v30: %d", version)
-			}
-			child := ownerFixtureMember(t, f, f.group, "child")
-			peer := ownerFixtureMember(t, f, f.group, "second child")
-			unsupported := ownerFixtureMember(t, f, f.group, "partial transport support")
-			outside := ownerFixtureMember(t, f, f.group, "outside policy")
-			foreign := ownerFixtureMember(t, f, f.other, "foreign")
-			grant, approved, forbidden := ownerFixtureMaterials(t, f)
-			role := f.prepareInvestigationOwner(t, []domain.ArtifactVersionRef{approved}, 2, child.ID, peer.ID, unsupported.ID)
-			const question = "  核对第一项。\n保留原文。🧪 "
-			const firstKey = "Owner/Exact:Delegation1"
-			input := domain.DelegateWorkInput{MemberID: child.ID, Question: question, AllowTopicMessages: true, ArtifactVersions: []domain.ArtifactVersionRef{approved}}
-			body := ownerWorkJSON(t, input)
-			const handback = `{"summary":"请协调者核对后续范围。"}`
-			// Reports-only opt-in does not mount either new tool or issue its purpose.
-			for _, op := range []string{delegateWorkOp, handbackWorkOp} {
-				if w := f.http(t, role.Member.Claim.Token, op, body, firstKey); w.Code != http.StatusNotFound {
-					t.Fatalf("default owner write mounted: %s %d", op, w.Code)
-				}
-			}
-			legacy := f.runtime
-			sampled := map[string][]string{}
-			sample := func(m domain.Member, p provider.PiFreshInvestigationProfile) bool {
-				if m.GroupID != f.group || m.ID == f.lead.ID || m.ID == f.worker.ID || m.ID == outside.ID || m.ID == foreign.ID ||
-					p.SourceKind != domain.TaskWorkSourceDelegation || p.Action != domain.ChatActionReadOnlyInvestigation ||
-					len(p.Operations) == 0 || p.Operations[len(p.Operations)-1] != platform.ReportWorkOperation {
-					t.Fatal("sampling escaped the bounded PolicyRevision/child profile")
-				}
-				sampled[m.ID] = append(sampled[m.ID], strings.Join(p.Operations, "/"))
-				return m.ID != unsupported.ID || len(p.Operations) < 2
-			}
-			var err error
-			f.runtime, err = platform.NewMemberToolRuntimeWithInvestigationOwnerManagement(f.db, f.options, f.engine, sample)
-			roleOK(t, err)
-			f.mount(t)
-			tools := f.runtime.Tools()
-			denyInitial := func(r *platform.MemberToolRuntime, scope store.CoordinationToolScope, assets *platform.MemberArtifactGrant) {
-				t.Helper()
-				if token, _, err := r.IssueInitialInvestigationOwnerTools(ctx, scope, assets); token != "" || !errors.Is(err, store.ErrMemberToolDenied) {
-					t.Fatalf("unexpected initial owner registration: %v", err)
-				}
-			}
-			denyInitial(f.runtime, role, grant) // Unbound Attempt.
-			role = f.bindInvestigationOwner(t, role)
-			denyInitial(legacy, role, grant)
-			denyInitial(f.runtime, role, nil) // Cannot silently widen or shrink #200 materials.
-			stale := role
-			stale.Member.Claim.Token = "old-claim"
-			denyInitial(f.runtime, stale, grant)
-			token, profile, err := f.runtime.IssueInitialInvestigationOwnerTools(ctx, role, grant)
-			roleOK(t, err)
-			defer tools.Revoke(token)
-			denyInitial(f.runtime, role, grant)
-			candidates := []string{child.ID, peer.ID}
-			slices.Sort(candidates)
-			const channel, artifact = platform.ReadInvestigationChannelOperation, platform.ReadInvestigationArtifactOperation
-			want := []string{channel, artifact, "submit_result", delegateWorkOp}
-			if !slices.Equal(profile.Operations, want) || !slices.Equal(profile.DelegateCandidateIDs, candidates) ||
-				!slices.Equal(sampled[child.ID], []string{"report_work", channel + "/report_work", artifact + "/report_work", channel + "/" + artifact + "/report_work"}) {
-				t.Fatalf("initial token lacks exact owner/child transport profiles: %v", profile.Operations)
-			}
-			profile.DelegateCandidateIDs[0], profile.Operations[0] = foreign.ID, handbackWorkOp
-			if names, err := tools.TransportOperations(ctx, token); err != nil || !slices.Equal(names, want) {
-				t.Fatalf("issuer result changed registration or discovery: %v", err)
-			}
-			f.acceptWork(t, role.Member)
-			if got := f.expectHTTP(t, token, channel, `{}`, "", http.StatusOK); !strings.Contains(got, f.source.ID) {
-				t.Fatal("lost the initial scoped material read")
-			}
-			f.expectHTTP(t, token, artifact, ownerWorkJSON(t, approved), "", http.StatusOK)
-			f.expectHTTP(t, token, "read_channel", `{}`, "", http.StatusForbidden)
-			f.expectHTTP(t, token, handbackWorkOp, handback, "initial-handback", http.StatusForbidden)
-			memberMCPRoleProfile(t, f.roleRuntimeFixture, token, "submit_result", channel, artifact) // Catalog order; no new MCP writes.
-			ownerWorkRejectOrdinary(t, f, role, grant, body, handback)
+	testInvestigationOwnerManagementHTTP(t, domain.TaskWorkSourceReport)
+}
 
-			before := f.ownerWorkCounts(t)
-			for _, extra := range []string{`"caller_id":"fake"`, `"group_id":"foreign"`, `"task_id":"foreign"`, `"grant":{}`, `"claim":"fake"`, `"turn_id":"fake"`, `"question":"duplicate"`} {
-				f.expectHTTP(t, token, delegateWorkOp, strings.TrimSuffix(body, "}")+","+extra+"}", "bad-wire", http.StatusBadRequest)
-			}
-			for _, raw := range []string{`"allow_topic_messages":null`, `"artifact_versions":[null]`, `"artifact_versions":[{"artifact_id":"a","version_id":"v","grant":true}]`,
-				`"artifact_versions":[{"artifact_id":"a","Version_ID":"v"}]`, `"artifact_versions":[{"artifact_id":"a","version_id":"v","version_id":"v"}]`} {
-				args := fmt.Sprintf(`{"member_id":%q,"question":"x",%s}`, child.ID, raw)
-				f.expectHTTP(t, token, delegateWorkOp, args, "bad-material-wire", http.StatusBadRequest)
-			}
-			f.expectHTTP(t, token, delegateWorkOp, strings.Replace(body, `"question"`, `"Question"`, 1), firstKey, http.StatusBadRequest)
-			f.expectHTTP(t, token, delegateWorkOp, fmt.Sprintf(`{"member_id":%q,"question":"\ud800"}`, child.ID), firstKey, http.StatusBadRequest)
-			for _, key := range []string{"", " " + firstKey, firstKey + ",other"} {
-				f.expectHTTP(t, token, delegateWorkOp, body, key, http.StatusBadRequest)
-			}
-			for _, id := range []string{foreign.ID, outside.ID, unsupported.ID, f.worker.ID, f.lead.ID} {
-				f.expectHTTP(t, token, delegateWorkOp, strings.Replace(body, child.ID, id, 1), firstKey, http.StatusForbidden)
-			}
-			in := input
-			in.ArtifactVersions = []domain.ArtifactVersionRef{forbidden}
-			f.expectHTTP(t, token, delegateWorkOp, ownerWorkJSON(t, in), firstKey, http.StatusForbidden) // Actual B subset fence.
-			in.ArtifactVersions = []domain.ArtifactVersionRef{approved, approved}
-			f.expectHTTP(t, token, delegateWorkOp, ownerWorkJSON(t, in), firstKey, http.StatusBadRequest) // B's input bound.
-			if f.ownerWorkCounts(t) != before {
-				t.Fatal("malformed/unauthorized write left a receipt or effect")
-			}
+func TestInvestigationOwnerManagementHTTPOnFollowup(t *testing.T) {
+	testInvestigationOwnerManagementHTTP(t, domain.TaskWorkSourceFollowup)
+}
 
-			delegated, id := f.proveOwnerWorkReceipt(t, token, delegateWorkOp, body, firstKey, kind == domain.TaskWorkSourceReport)
-			d, err := f.engine.GetTaskWorkDelegation(ctx, f.group, id)
-			roleOK(t, err)
-			f.delegation = d
-			var receipt map[string]any
-			roleOK(t, json.Unmarshal([]byte(delegated), &receipt))
-			if len(receipt) != 3 || receipt["delegation_id"] != d.ID || receipt["created_at"] == nil || receipt["wake_queued"] != true ||
-				d.AuthorTurnID != role.Member.Claim.TurnID || d.AuthorAttemptID != role.AttemptID || d.MemberID != child.ID || d.Question != question ||
-				d.AssignmentID != role.Provenance.AssignmentID || !d.AllowTopicMessages || !slices.Equal(d.ArtifactVersions, []domain.ArtifactVersionRef{approved}) {
-				t.Fatal("delegation receipt leaked or lost the unique B effect/provenance")
-			}
-			wake, err := f.engine.ResolveTaskWorkDelivery(ctx, f.group, d.DeliveryID)
-			roleOK(t, err)
-			if wake.SourceID != d.ID || wake.SourceKind != domain.TaskWorkSourceDelegation || wake.MemberID != child.ID || wake.MessageID != d.MessageID {
-				t.Fatal("delegation has no matching formal wake")
-			}
-			f.expectHTTP(t, token, delegateWorkOp, strings.Replace(body, "核对第一项", "改变请求", 1), firstKey, http.StatusConflict)
-			f.settleWork(t, role.Member, true)
-			f.expectHTTP(t, token, delegateWorkOp, body, firstKey, http.StatusForbidden) // Still registered, but stale in B.
-
-			worker := f.claimWork(t, d.DeliveryID)
-			wrong := role
-			wrong.Member = worker
-			denyInitial(f.runtime, wrong, grant)
-			workerToken, err := f.runtime.IssueWorkDelegationTools(ctx, worker.Claim, grant)
-			roleOK(t, err)
-			defer tools.Revoke(workerToken)
-			if names, err := tools.TransportOperations(ctx, workerToken); err != nil || !slices.Equal(names, []string{channel, artifact, platform.ReportWorkOperation}) {
-				t.Fatal("managed runtime changed the delegated child profile")
-			}
-			f.expectHTTP(t, workerToken, delegateWorkOp, body, firstKey, http.StatusForbidden)
-			f.expectHTTP(t, workerToken, handbackWorkOp, handback, "not-owner", http.StatusForbidden)
-			f.acceptWork(t, worker)
-			var next string
-			if kind == domain.TaskWorkSourceReport {
-				var r struct {
-					ReportID string `json:"report_id"`
-				}
-				roleOK(t, json.Unmarshal([]byte(f.expectHTTP(t, workerToken, platform.ReportWorkOperation, testDeliveredBody, "report-http", http.StatusCreated)), &r))
-				saved, err := f.engine.GetTaskWorkReport(ctx, f.group, r.ReportID)
-				roleOK(t, err)
-				next = saved.DeliveryID
-			}
-			f.settleWork(t, worker, true)
-			if kind == domain.TaskWorkSourceFollowup {
-				queued, _ := queueInvestigationWorkInput(t, f, "核对原材料。", false)
-				next = queued.WorkDeliveryID
-			}
-			ownerWorkContinuation(t, f, kind, next, grant, candidates, body, firstKey, peer.ID, handback)
-		})
+func testInvestigationOwnerManagementHTTP(t *testing.T, kind domain.TaskWorkSourceKind) {
+	ctx := t.Context()
+	f := newBoundWorkReportFixture(t)
+	// Both continuations start with a real delegation. Exercise the common
+	// initial-owner rejection and scope checks only in the report case.
+	isReport := kind == domain.TaskWorkSourceReport
+	if isReport {
+		var version int
+		roleOK(t, f.raw.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version))
+		if version != 30 {
+			t.Fatalf("fixture did not open v30: %d", version)
+		}
 	}
+	child := ownerFixtureMember(t, f, f.group, "child")
+	peer := ownerFixtureMember(t, f, f.group, "second child")
+	grant, publishMaterial := newOwnerFixtureMaterialPublisher(t, f)
+	approved := publishMaterial(f.group)
+	workerIDs := []string{child.ID, peer.ID}
+	var unsupportedID, outsideID, foreignID string
+	var forbidden domain.ArtifactVersionRef
+	if isReport {
+		unsupportedID = ownerFixtureMember(t, f, f.group, "partial transport support").ID
+		outsideID = ownerFixtureMember(t, f, f.group, "outside policy").ID
+		foreignID = ownerFixtureMember(t, f, f.other, "foreign").ID
+		workerIDs = append(workerIDs, unsupportedID)
+		forbidden = publishMaterial(f.other)
+	}
+	role := f.prepareInvestigationOwner(t, []domain.ArtifactVersionRef{approved}, 2, workerIDs...)
+	const question = "  核对第一项。\n保留原文。🧪 "
+	const firstKey = "Owner/Exact:Delegation1"
+	input := domain.DelegateWorkInput{MemberID: child.ID, Question: question, AllowTopicMessages: true, ArtifactVersions: []domain.ArtifactVersionRef{approved}}
+	body := ownerWorkJSON(t, input)
+	const handback = `{"summary":"请协调者核对后续范围。"}`
+	if isReport {
+		// Reports-only opt-in does not mount either new tool or issue its purpose.
+		for _, op := range []string{delegateWorkOp, handbackWorkOp} {
+			if w := f.http(t, role.Member.Claim.Token, op, body, firstKey); w.Code != http.StatusNotFound {
+				t.Fatalf("default owner write mounted: %s %d", op, w.Code)
+			}
+		}
+	}
+	legacy := f.runtime
+	sampled := map[string][]string{}
+	sample := func(m domain.Member, p provider.PiFreshInvestigationProfile) bool {
+		if m.GroupID != f.group || m.ID == f.lead.ID || m.ID == f.worker.ID || m.ID == outsideID || m.ID == foreignID ||
+			p.SourceKind != domain.TaskWorkSourceDelegation || p.Action != domain.ChatActionReadOnlyInvestigation ||
+			len(p.Operations) == 0 || p.Operations[len(p.Operations)-1] != platform.ReportWorkOperation {
+			t.Fatal("sampling escaped the bounded PolicyRevision/child profile")
+		}
+		if isReport {
+			sampled[m.ID] = append(sampled[m.ID], strings.Join(p.Operations, "/"))
+		}
+		return m.ID != unsupportedID || len(p.Operations) < 2
+	}
+	var err error
+	f.runtime, err = platform.NewMemberToolRuntimeWithInvestigationOwnerManagement(f.db, f.options, f.engine, sample)
+	roleOK(t, err)
+	f.mount(t)
+	tools := f.runtime.Tools()
+	denyInitial := func(r *platform.MemberToolRuntime, scope store.CoordinationToolScope, assets *platform.MemberArtifactGrant) {
+		t.Helper()
+		if token, _, err := r.IssueInitialInvestigationOwnerTools(ctx, scope, assets); token != "" || !errors.Is(err, store.ErrMemberToolDenied) {
+			t.Fatalf("unexpected initial owner registration: %v", err)
+		}
+	}
+	if isReport {
+		denyInitial(f.runtime, role, grant) // Unbound Attempt.
+	}
+	role = f.bindInvestigationOwner(t, role)
+	if isReport {
+		denyInitial(legacy, role, grant)
+		denyInitial(f.runtime, role, nil) // Cannot silently widen or shrink #200 materials.
+		stale := role
+		stale.Member.Claim.Token = "old-claim"
+		denyInitial(f.runtime, stale, grant)
+	}
+	token, profile, err := f.runtime.IssueInitialInvestigationOwnerTools(ctx, role, grant)
+	roleOK(t, err)
+	defer tools.Revoke(token)
+	candidates := []string{child.ID, peer.ID}
+	slices.Sort(candidates)
+	const channel, artifact = platform.ReadInvestigationChannelOperation, platform.ReadInvestigationArtifactOperation
+	if isReport {
+		denyInitial(f.runtime, role, grant)
+		want := []string{channel, artifact, "submit_result", delegateWorkOp}
+		if !slices.Equal(profile.Operations, want) || !slices.Equal(profile.DelegateCandidateIDs, candidates) ||
+			!slices.Equal(sampled[child.ID], []string{"report_work", channel + "/report_work", artifact + "/report_work", channel + "/" + artifact + "/report_work"}) {
+			t.Fatalf("initial token lacks exact owner/child transport profiles: %v", profile.Operations)
+		}
+		profile.DelegateCandidateIDs[0], profile.Operations[0] = foreignID, handbackWorkOp
+		if names, err := tools.TransportOperations(ctx, token); err != nil || !slices.Equal(names, want) {
+			t.Fatalf("issuer result changed registration or discovery: %v", err)
+		}
+	}
+	f.acceptWork(t, role.Member)
+	if isReport {
+		if got := f.expectHTTP(t, token, channel, `{}`, "", http.StatusOK); !strings.Contains(got, f.source.ID) {
+			t.Fatal("lost the initial scoped material read")
+		}
+		f.expectHTTP(t, token, artifact, ownerWorkJSON(t, approved), "", http.StatusOK)
+		f.expectHTTP(t, token, "read_channel", `{}`, "", http.StatusForbidden)
+		f.expectHTTP(t, token, handbackWorkOp, handback, "initial-handback", http.StatusForbidden)
+		memberMCPRoleProfile(t, f.roleRuntimeFixture, token, "submit_result", channel, artifact) // Catalog order; no new MCP writes.
+		ownerWorkRejectOrdinary(t, f, role, grant, body, handback)
+
+		before := f.ownerWorkCounts(t)
+		for _, extra := range []string{`"caller_id":"fake"`, `"group_id":"foreign"`, `"task_id":"foreign"`, `"grant":{}`, `"claim":"fake"`, `"turn_id":"fake"`, `"question":"duplicate"`} {
+			f.expectHTTP(t, token, delegateWorkOp, strings.TrimSuffix(body, "}")+","+extra+"}", "bad-wire", http.StatusBadRequest)
+		}
+		for _, raw := range []string{`"allow_topic_messages":null`, `"artifact_versions":[null]`, `"artifact_versions":[{"artifact_id":"a","version_id":"v","grant":true}]`,
+			`"artifact_versions":[{"artifact_id":"a","Version_ID":"v"}]`, `"artifact_versions":[{"artifact_id":"a","version_id":"v","version_id":"v"}]`} {
+			args := fmt.Sprintf(`{"member_id":%q,"question":"x",%s}`, child.ID, raw)
+			f.expectHTTP(t, token, delegateWorkOp, args, "bad-material-wire", http.StatusBadRequest)
+		}
+		f.expectHTTP(t, token, delegateWorkOp, strings.Replace(body, `"question"`, `"Question"`, 1), firstKey, http.StatusBadRequest)
+		f.expectHTTP(t, token, delegateWorkOp, fmt.Sprintf(`{"member_id":%q,"question":"\ud800"}`, child.ID), firstKey, http.StatusBadRequest)
+		for _, key := range []string{"", " " + firstKey, firstKey + ",other"} {
+			f.expectHTTP(t, token, delegateWorkOp, body, key, http.StatusBadRequest)
+		}
+		for _, id := range []string{foreignID, outsideID, unsupportedID, f.worker.ID, f.lead.ID} {
+			f.expectHTTP(t, token, delegateWorkOp, strings.Replace(body, child.ID, id, 1), firstKey, http.StatusForbidden)
+		}
+		in := input
+		in.ArtifactVersions = []domain.ArtifactVersionRef{forbidden}
+		f.expectHTTP(t, token, delegateWorkOp, ownerWorkJSON(t, in), firstKey, http.StatusForbidden) // Actual B subset fence.
+		in.ArtifactVersions = []domain.ArtifactVersionRef{approved, approved}
+		f.expectHTTP(t, token, delegateWorkOp, ownerWorkJSON(t, in), firstKey, http.StatusBadRequest) // B's input bound.
+		if f.ownerWorkCounts(t) != before {
+			t.Fatal("malformed/unauthorized write left a receipt or effect")
+		}
+	}
+
+	delegated, id := f.proveOwnerWorkReceipt(t, token, delegateWorkOp, body, firstKey, isReport)
+	d, err := f.engine.GetTaskWorkDelegation(ctx, f.group, id)
+	roleOK(t, err)
+	f.delegation = d
+	var receipt map[string]any
+	roleOK(t, json.Unmarshal([]byte(delegated), &receipt))
+	if len(receipt) != 3 || receipt["delegation_id"] != d.ID || receipt["created_at"] == nil || receipt["wake_queued"] != true ||
+		d.AuthorTurnID != role.Member.Claim.TurnID || d.AuthorAttemptID != role.AttemptID || d.MemberID != child.ID || d.Question != question ||
+		d.AssignmentID != role.Provenance.AssignmentID || !d.AllowTopicMessages || !slices.Equal(d.ArtifactVersions, []domain.ArtifactVersionRef{approved}) {
+		t.Fatal("delegation receipt leaked or lost the unique B effect/provenance")
+	}
+	if isReport {
+		wake, err := f.engine.ResolveTaskWorkDelivery(ctx, f.group, d.DeliveryID)
+		roleOK(t, err)
+		if wake.SourceID != d.ID || wake.SourceKind != domain.TaskWorkSourceDelegation || wake.MemberID != child.ID || wake.MessageID != d.MessageID {
+			t.Fatal("delegation has no matching formal wake")
+		}
+		f.expectHTTP(t, token, delegateWorkOp, strings.Replace(body, "核对第一项", "改变请求", 1), firstKey, http.StatusConflict)
+	}
+	f.settleWork(t, role.Member, true)
+	if isReport {
+		f.expectHTTP(t, token, delegateWorkOp, body, firstKey, http.StatusForbidden) // Still registered, but stale in B.
+	}
+
+	worker := f.claimWork(t, d.DeliveryID)
+	if isReport {
+		wrong := role
+		wrong.Member = worker
+		denyInitial(f.runtime, wrong, grant)
+	}
+	workerToken, err := f.runtime.IssueWorkDelegationTools(ctx, worker.Claim, grant)
+	roleOK(t, err)
+	defer tools.Revoke(workerToken)
+	if isReport {
+		if names, err := tools.TransportOperations(ctx, workerToken); err != nil || !slices.Equal(names, []string{channel, artifact, platform.ReportWorkOperation}) {
+			t.Fatal("managed runtime changed the delegated child profile")
+		}
+		f.expectHTTP(t, workerToken, delegateWorkOp, body, firstKey, http.StatusForbidden)
+		f.expectHTTP(t, workerToken, handbackWorkOp, handback, "not-owner", http.StatusForbidden)
+	}
+	f.acceptWork(t, worker)
+	var next string
+	if isReport {
+		var r struct {
+			ReportID string `json:"report_id"`
+		}
+		roleOK(t, json.Unmarshal([]byte(f.expectHTTP(t, workerToken, platform.ReportWorkOperation, testDeliveredBody, "report-http", http.StatusCreated)), &r))
+		saved, err := f.engine.GetTaskWorkReport(ctx, f.group, r.ReportID)
+		roleOK(t, err)
+		next = saved.DeliveryID
+	}
+	f.settleWork(t, worker, true)
+	if !isReport {
+		queued, _ := queueInvestigationWorkInput(t, f, "核对原材料。", false)
+		next = queued.WorkDeliveryID
+	}
+	ownerWorkContinuation(t, f, kind, next, grant, candidates, body, firstKey, peer.ID, handback)
 }
 
 func ownerWorkContinuation(t *testing.T, f *boundWorkReportFixture, kind domain.TaskWorkSourceKind, deliveryID string, grant *platform.MemberArtifactGrant,
@@ -305,6 +342,12 @@ func ownerFixtureMember(t *testing.T, f *boundWorkReportFixture, group, name str
 
 func ownerFixtureMaterials(t *testing.T, f *boundWorkReportFixture) (*platform.MemberArtifactGrant, domain.ArtifactVersionRef, domain.ArtifactVersionRef) {
 	t.Helper()
+	grant, publish := newOwnerFixtureMaterialPublisher(t, f)
+	return grant, publish(f.group), publish(f.other)
+}
+
+func newOwnerFixtureMaterialPublisher(t *testing.T, f *boundWorkReportFixture) (*platform.MemberArtifactGrant, func(group string) domain.ArtifactVersionRef) {
+	t.Helper()
 	root, err := os.OpenRoot(t.TempDir())
 	roleOK(t, err)
 	t.Cleanup(func() { root.Close() })
@@ -322,7 +365,7 @@ func ownerFixtureMaterials(t *testing.T, f *boundWorkReportFixture) (*platform.M
 	}
 	grant, err := platform.NewMemberArtifactGrant(artifacts)
 	roleOK(t, err)
-	return grant, publish(f.group), publish(f.other)
+	return grant, publish
 }
 
 func ownerWorkRejectOrdinary(t *testing.T, f *boundWorkReportFixture, role store.CoordinationToolScope, grant *platform.MemberArtifactGrant, body, handback string) {
