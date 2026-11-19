@@ -314,6 +314,7 @@ func (f *boundWorkReportFixture) workCounts(t *testing.T) [4]int {
 }
 
 func TestBoundWorkDelegationTransport(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	f := newBoundWorkReportFixture(t)
 	f.mountMemberToolHandlers(t.Context())
@@ -421,6 +422,7 @@ func TestBoundWorkDelegationTransport(t *testing.T) {
 const testReportBody = `{"kind":"progress","summary":"Checked the notes"}`
 
 func TestBoundWorkReportReadSelectsExactOwnerReport(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	f := newBoundWorkReportFixture(t)
 	f.delegate(t, nil, nil, false)
@@ -657,6 +659,7 @@ func (f *boundWorkReportFixture) reportKey(t *testing.T, text string) string {
 }
 
 func TestBoundWorkReportMCPUnknownWriteReplay(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	f := newBoundWorkReportFixture(t)
 	f.delegate(t, nil, nil, false)

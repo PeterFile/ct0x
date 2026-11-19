@@ -28,10 +28,12 @@ const (
 )
 
 func TestInvestigationOwnerManagementHTTP(t *testing.T) {
+	t.Parallel()
 	testInvestigationOwnerManagementHTTP(t, domain.TaskWorkSourceReport)
 }
 
 func TestInvestigationOwnerManagementHTTPOnFollowup(t *testing.T) {
+	t.Parallel()
 	testInvestigationOwnerManagementHTTP(t, domain.TaskWorkSourceFollowup)
 }
 

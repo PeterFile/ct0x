@@ -397,6 +397,7 @@ func TestPiInvestigationOwnerNativeUnknownAndCurrentFences(t *testing.T) {
 }
 
 func TestPiInvestigationOwnerNativeFollowupAndAdmissionRefusal(t *testing.T) {
+	t.Parallel()
 	testPiInvestigationOwnerNativeFollowup(t, "admitted", "declined-callback", "outcome-false")
 }
 
@@ -494,6 +495,7 @@ func testPiInvestigationOwnerNativeFollowup(t *testing.T, modes ...string) {
 }
 
 func TestInvestigationOwnerManagementAllowsOriginalUserFollowup(t *testing.T) {
+	t.Parallel()
 	testInvestigationOwnerManagementAdmission(t, "local_user_chat", domain.TaskWorkSourceFollowup)
 }
 
@@ -506,6 +508,7 @@ func TestInvestigationOwnerManagementMemberFollowupStaysUnmanaged(t *testing.T) 
 }
 
 func TestInvestigationOwnerManagementUsesUnmanagedReportForMemberOrigin(t *testing.T) {
+	t.Parallel()
 	testInvestigationOwnerManagementAdmission(t, "member", domain.TaskWorkSourceReport)
 }
 
