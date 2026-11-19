@@ -38,6 +38,7 @@ func askThreadDecision(t *testing.T, f chatFixture, key string) domain.DecisionR
 
 func threadDecisionFixture(t *testing.T) (chatFixture, domain.DecisionRequest) {
 	t.Helper()
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	installDecisionAnswerFixture(t, f.s)
 	installThreadDecisionAnswerFixture(t, f.s)
@@ -58,6 +59,7 @@ func ThreadDecisionHTTPFixture(t *testing.T) (*Store, string, domain.DecisionReq
 }
 
 func TestThreadDecisionAnswerReturnsOnlyToTheAsker(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	// Reopen the actual public-migration database before installing either
 	// private answer fragment. Even the startup assertion cannot install SQL.

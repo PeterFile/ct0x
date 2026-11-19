@@ -9,6 +9,7 @@ import (
 )
 
 func TestThreadDecisionDepartureWithdrawsCurrentAndSupersededQuestionsOnly(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	s := f.s
 	installDecisionAnswerFixture(t, s)
@@ -85,6 +86,7 @@ func TestThreadDecisionDepartureWithdrawsCurrentAndSupersededQuestionsOnly(t *te
 }
 
 func TestThreadDecisionInstallWithdrawsLegacyQuestionFromAlreadyLeftAsker(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	installDecisionAnswerFixture(t, f.s)
 	q := askThreadDecision(t, f, "ask-thread")
@@ -106,6 +108,7 @@ func TestThreadDecisionInstallWithdrawsLegacyQuestionFromAlreadyLeftAsker(t *tes
 }
 
 func TestThreadDecisionInstallWithdrawsLegacyQuestionAfterAskerRejoined(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	s := f.s
 	installDecisionAnswerFixture(t, s)

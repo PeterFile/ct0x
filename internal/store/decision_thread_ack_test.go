@@ -180,6 +180,7 @@ func TestThreadDecisionAcknowledgementLedgerGuards(t *testing.T) {
 }
 
 func TestThreadDecisionAcknowledgementDeniesAskingAndOrdinaryTurns(t *testing.T) {
+	isolateDecisionFixtureRegistry(t)
 	f := chatSetup(t, "user", false)
 	s := f.s
 	installDecisionAnswerFixture(t, s)
