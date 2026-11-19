@@ -3,6 +3,7 @@ package platform
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"slices"
 
 	"agentworkspace/internal/domain"
@@ -29,6 +30,9 @@ func (s *MemberTools) SendDiscussion(ctx context.Context, token string, input Me
 	receipt, err := s.db.ApplyChatDiscussion(ctx, entry.scope, entry.candidate.ID, domain.ChatDiscussionAction{
 		Kind: input.Kind, Content: content, RecipientID: input.RecipientID, ExpectedReply: input.ExpectedReply,
 	}, key)
+	if errors.Is(err, store.ErrChatDiscussionMutationUnknown) {
+		return receipt, err // Preserve evidence even if the cause looks like a denial.
+	}
 	return receipt, memberRoleError(ctx, err)
 }
 

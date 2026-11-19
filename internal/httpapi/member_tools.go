@@ -274,6 +274,10 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 			return
 		}
 		receipt, sendErr := a.tools.SendDiscussion(r.Context(), token, action, input.Content.value, key)
+		if errors.Is(sendErr, store.ErrChatDiscussionMutationUnknown) {
+			WriteError(w, http.StatusInternalServerError, "internal_error", store.ErrChatDiscussionMutationUnknown.Error())
+			return
+		}
 		if errors.Is(sendErr, store.ErrChatDiscussionContextTooLarge) {
 			WriteError(w, http.StatusBadRequest, "invalid_input", sendErr.Error())
 			return

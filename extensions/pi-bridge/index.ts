@@ -4,6 +4,7 @@ import { Value } from "typebox/value";
 import { INVESTIGATION_ARTIFACT, INVESTIGATION_ASSESSMENT_ACTION, INVESTIGATION_CHANNEL, openBridge, validUnicode } from "./bridge.mjs";
 
 const discussionOnlyExcerptBytes = 4096;
+const discussionExpectedReplyJSONBytes = 1024;
 const investigationSummaryBytes = 8192;
 const investigationResult = Type.Object({ summary: Type.String({ minLength: 1, maxLength: investigationSummaryBytes,
   description: "纯文本调查结论（最多 8192 UTF-8 字节）；说明用了哪些获准资料和未决问题。提交不代表接纳。" }) }, { additionalProperties: false });
@@ -30,7 +31,8 @@ const chatAssessmentFields = {
 const discussionAction = Type.Object({
   kind: Type.Union([Type.Literal("invite"), Type.Literal("reply"), Type.Literal("resolve")]),
   recipient_id: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "仅 invite 必填；选择 list_members 返回的一个现有同群成员 ID。" })),
-  expected_reply: Type.Optional(Type.String({ maxLength: 4096, description: "仅 invite 可填；省略时以邀请正文为准。" })),
+  expected_reply: Type.Optional(Type.String({ maxLength: discussionExpectedReplyJSONBytes - 2,
+    description: `仅 invite 可填；按 Go JSON 字符串编码（含引号、转义）最多 ${discussionExpectedReplyJSONBytes} UTF-8 字节；省略时以邀请正文为准。` })),
 }, { additionalProperties: false, description: "仅用于已保存讨论评估后的接力；不得与 recipient_ids 或 intent_assessment 同传。reply 与 resolve 不带 recipient_id 或 expected_reply。" });
 
 function sendMessageParameters(continueWork: boolean, discussionOnly = false, investigation = false, relay = false) {
@@ -231,13 +233,21 @@ function validWorkInputID(value: string): boolean {
   return validOpaqueIDShape(value) && !/^\p{White_Space}|\p{White_Space}$/u.test(value);
 }
 
+function validExpectedReply(value: string): boolean {
+  if (value === "") return true;
+  if (!validNonBlankText(value, discussionExpectedReplyJSONBytes)) return false;
+  // Go json.Marshal also escapes HTML-sensitive characters and U+2028/U+2029.
+  const encoded = JSON.stringify(value).replace(/[<>&\u2028\u2029]/gu, char => "\\u" + char.charCodeAt(0).toString(16).padStart(4, "0"));
+  return Buffer.byteLength(encoded, "utf8") <= discussionExpectedReplyJSONBytes;
+}
+
 function validDiscussion(message: { content: string; discussion?: Static<typeof discussionAction> }): boolean {
   const action = message.discussion;
   if (!action || Object.hasOwn(message, "recipient_ids") || Object.hasOwn(message, "intent_assessment") ||
       !validNonBlankText(message.content, 16384)) return false;
   return action.kind === "invite" ?
     typeof action.recipient_id === "string" && validOpaqueIDShape(action.recipient_id) &&
-      (action.expected_reply === undefined || action.expected_reply === "" || validNonBlankText(action.expected_reply, 4096)) :
+      (action.expected_reply === undefined || validExpectedReply(action.expected_reply)) :
     !Object.hasOwn(action, "recipient_id") && !Object.hasOwn(action, "expected_reply");
 }
 

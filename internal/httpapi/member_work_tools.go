@@ -203,10 +203,13 @@ func decodeContinueWork(raw json.RawMessage, content memberToolField[string]) (p
 // original arguments. In particular, never drop unknown or null fields to
 // manufacture a valid replay out of an invalid request.
 func memberMCPContinueWorkArguments(arguments json.RawMessage) json.RawMessage {
-	var input memberToolSendInput
+	var input struct {
+		Content    memberToolField[string]          `json:"content"`
+		Assessment memberToolField[json.RawMessage] `json:"intent_assessment"`
+	}
 	decoder := json.NewDecoder(bytes.NewReader(arguments))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&input) != nil || !input.Assessment.present || input.RecipientIDs.present {
+	if decoder.Decode(&input) != nil || !input.Assessment.present {
 		return arguments
 	}
 	proposal, ok := decodeContinueWork(input.Assessment.value, input.Content)
