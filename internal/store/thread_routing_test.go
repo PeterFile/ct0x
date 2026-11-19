@@ -175,15 +175,22 @@ func TestThreadRoutingLegacyFallbackAndDamagedSchema(t *testing.T) {
 
 	migrations = original
 	enableThreadRoutingFixture(t)
-	for _, statement := range []string{
-		`DROP TABLE thread_routing_topics`,
-		`DROP TABLE thread_routing_links`,
-		`DELETE FROM schema_migrations WHERE version=(SELECT max(version) FROM schema_migrations)`,
+	version := slices.Index(migrations, threadRoutingSchema) + 1
+	if version == 0 {
+		t.Fatal("thread routing migration is not registered")
+	}
+	for _, damage := range []struct {
+		name, statement string
+		args            []any
+	}{
+		{"missing_topics_table", `DROP TABLE thread_routing_topics`, nil},
+		{"missing_links_table", `DROP TABLE thread_routing_links`, nil},
+		{"missing_routing_marker", `DELETE FROM schema_migrations WHERE version=?`, []any{version}},
 	} {
-		t.Run(statement, func(t *testing.T) {
+		t.Run(damage.name, func(t *testing.T) {
 			s, _ := openTestStore(t)
 			groupID := group(t, s).ID
-			if _, err := s.db.Exec(statement); err != nil {
+			if _, err := s.db.Exec(damage.statement, damage.args...); err != nil {
 				t.Fatal(err)
 			}
 			if m, err := s.PostLocalUserMessage(ctx, MessageRequest{GroupID: groupID, ActorID: "user", TopicID: "legacy", Content: "still explicit", IdempotencyKey: "damaged"}); err == nil || m.ID != "" {
