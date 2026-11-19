@@ -28,10 +28,12 @@ func TestInvestigationTaskWorkLaunchSQLiteFollowup(t *testing.T) {
 }
 
 func TestInvestigationTaskWorkLaunchSQLiteDelegation(t *testing.T) {
+	t.Parallel()
 	testInvestigationTaskWorkLaunchSQLite(t, domain.TaskWorkSourceDelegation, "admitted")
 }
 
 func TestInvestigationTaskWorkLaunchSQLiteReport(t *testing.T) {
+	t.Parallel()
 	testInvestigationTaskWorkLaunchSQLite(t, domain.TaskWorkSourceReport, "admitted")
 }
 

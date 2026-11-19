@@ -177,6 +177,7 @@ func ownerNativeStop(t *testing.T, emit func(provider.Event) error, req provider
 func ownerNativeKey(op, call string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(op+call))) }
 
 func TestPiInvestigationOwnerNativeSQLiteRoundTrip(t *testing.T) {
+	t.Parallel()
 	f := newBoundWorkReportFixture(t)
 	ownerNativeRows(t, f, 1, `SELECT count(*) FROM schema_migrations WHERE version=30 AND NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version>30)`)
 	assets, approved, foreign := ownerFixtureMaterials(t, f)
@@ -324,6 +325,7 @@ func TestPiInvestigationOwnerNativeSQLiteRoundTrip(t *testing.T) {
 }
 
 func TestPiInvestigationOwnerNativeUnknownAndCurrentFences(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"lost-write-reply", "current-policy-changed", "config-changed", "cancel-before-invoke"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newBoundWorkReportFixture(t)
@@ -500,6 +502,7 @@ func TestInvestigationOwnerManagementAllowsOriginalUserFollowup(t *testing.T) {
 }
 
 func TestInvestigationOwnerManagementOriginalUserReport(t *testing.T) {
+	t.Parallel()
 	testInvestigationOwnerManagementAdmission(t, "local_user_chat", domain.TaskWorkSourceReport)
 }
 
