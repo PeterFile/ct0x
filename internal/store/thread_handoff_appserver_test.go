@@ -167,15 +167,12 @@ func TestNativeThreadHandoffUncertainWriteAndDefaultRoute(t *testing.T) {
 			source := f.message(t, handoffTopic, recipients)
 			f.run(t, prepare)
 			turn := waitNativeHandoff(t, f.db, source.GroupID, source.ID)
-			want, held := domain.TurnStateSucceeded, 0
-			if mode == "unknown" {
-				want, held = domain.TurnStateUnknown, 1 // Even after a valid native terminal.
-			}
+			// Neither F error confirms rollback, even after a valid native terminal.
 			var resources, rows, assessments int
 			handoffOK(t, f.raw.QueryRow("SELECT count(*) FROM resource_claims WHERE turn_id=?", turn.ID).Scan(&resources))
 			handoffOK(t, f.raw.QueryRow("SELECT count(*) FROM decision_requests WHERE group_id=?", source.GroupID).Scan(&rows))
 			handoffOK(t, f.raw.QueryRow("SELECT count(*) FROM chat_assessments WHERE candidate_id IN (SELECT id FROM chat_candidates WHERE turn_id=?)", turn.ID).Scan(&assessments))
-			if turn.State != want || turn.CandidateTerminal != domain.TurnStateSucceeded || resources != held || rows != 0 || assessments != 0 {
+			if turn.State != domain.TurnStateUnknown || turn.CandidateTerminal != domain.TurnStateSucceeded || resources != 1 || rows != 0 || assessments != 0 {
 				t.Fatalf("%s: outcome=%s evidence=%s resources=%d requests=%d assessments=%d", mode, turn.State, turn.CandidateTerminal, resources, rows, assessments)
 			}
 		})
@@ -647,14 +644,14 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 				t.Fatal("a read on the live intake was fenced along with writes")
 			}
 		case "default-route":
-			if !strings.Contains(result, "forbidden") || strings.Contains(result, "decision_request_unknown") {
-				t.Fatal("default recipient acquired explicit request authority")
+			if !strings.Contains(result, "decision_request_unknown") || !strings.Contains(result, `"isError":true`) {
+				t.Fatal("F's default-route denial appeared certain without rollback evidence")
 			}
 		default:
-			if !strings.Contains(result, `\"decision_request\"`) || !strings.Contains(result, `"isError":false`) || send("same-ask", handoffProposal) != result ||
-				!strings.Contains(send("same-ask", strings.Replace(handoffProposal, "样本有限", "其他样本", 1)), "conflict") ||
-				!strings.Contains(send("scope-selector", strings.Replace(handoffProposal, `"facts":`, `"group_id":"foreign","facts":`, 1)), "invalid_input") {
-				t.Fatal("native projection, replay, conflict or scope isolation failed")
+			if !strings.Contains(result, `\"decision_request\"`) || !strings.Contains(result, `"isError":false`) ||
+				!strings.Contains(send("scope-selector", strings.Replace(handoffProposal, `"facts":`, `"group_id":"foreign","facts":`, 1)), "invalid_input") ||
+				send("same-ask", handoffProposal) != result {
+				t.Fatal("native projection, scope isolation or replay failed")
 			}
 		}
 		var native struct{ Result json.RawMessage }

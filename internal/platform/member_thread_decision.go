@@ -62,20 +62,32 @@ func (s *MemberTools) AssessChatDecisionClarification(ctx context.Context, token
 	if err == nil {
 		return request, nil
 	}
-	// Preserve F's existing business error mapping, not as rollback proof.
-	// Opaque, joined and context errors stay unknown.
-	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
-		if marker, ok := cause.(interface{ CommitOutcomeUnknown() bool }); ok && marker.CommitOutcomeUnknown() {
-			break
-		}
-		if marker, ok := cause.(interface{ RollbackConfirmed() bool }); ok && !marker.RollbackConfirmed() {
-			break
-		}
-		switch cause {
-		case store.ErrMemberToolDenied, store.ErrInvalid, store.ErrConflict, store.ErrDecisionRequestsUnavailable:
-			return domain.DecisionRequest{}, err
-		}
+	if threadDecisionRejectionConfirmed(err) {
+		return domain.DecisionRequest{}, err
 	}
 	decision.uncertain.Store(true)
 	return domain.DecisionRequest{}, errors.Join(ErrThreadDecisionRequestUnknown, err)
+}
+
+func threadDecisionRejectionConfirmed(err error) bool {
+	// F's returned error must attest to rollback or no mutation. A business
+	// category or a marker found only in an inner cause cannot prove that.
+	if _, ok := err.(interface{ RollbackConfirmed() bool }); !ok {
+		return false
+	}
+	// Only a single chain to a business category is accepted; negative
+	// outcome evidence anywhere in that chain takes precedence.
+	for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+		if marker, ok := cause.(interface{ CommitOutcomeUnknown() bool }); ok && marker.CommitOutcomeUnknown() {
+			return false
+		}
+		if marker, ok := cause.(interface{ RollbackConfirmed() bool }); ok && !marker.RollbackConfirmed() {
+			return false
+		}
+		switch cause {
+		case store.ErrMemberToolDenied, store.ErrInvalid, store.ErrConflict, store.ErrDecisionRequestsUnavailable:
+			return true
+		}
+	}
+	return false
 }
