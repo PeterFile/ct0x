@@ -164,7 +164,7 @@ func TestBHandbackA7(t *testing.T) {
 			t.Fatalf("wrong queued wake: %+v", d)
 		}
 		if role, err := s.ResolveCoordinationDelivery(ctx, f.groupID, delivery); err != nil ||
-			role.Provenance.Kind != CoordinationRoleOrdinary || role.Blocked != CoordinationMemberInactive {
+			role.Provenance.Kind != CoordinationRoleOrdinary || role.Blocked != CoordinationDiscussionWorkReturnHandlerRequired {
 			t.Fatalf("legacy preparation must not start the discussion return: %+v %v", role, err)
 		}
 		coordinationDecideExec(t, s, "UPDATE members SET status='left' WHERE id=?", f.a)
