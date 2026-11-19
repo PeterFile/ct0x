@@ -20,21 +20,27 @@ type localThreadRoute struct {
 
 func threadRoutingInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	version := slices.Index(migrations, threadRoutingSchema) + 1
-	if version == 0 {
-		return false, nil
-	}
-	var installed, unexpected bool
-	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?),
-	 EXISTS(SELECT 1 FROM main.schema_migrations WHERE version>?) OR EXISTS(
-	 SELECT 1 FROM main.sqlite_schema WHERE name IN ('thread_routing_topics','thread_routing_links'))`, version, version).Scan(&installed, &unexpected)
+	var installed, later bool
+	var objects, intact int
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=:version),
+	 :version>0 AND EXISTS(SELECT 1 FROM main.schema_migrations WHERE version>:version),
+	 count(*),count(CASE WHEN type='table' AND name IN ('thread_routing_topics','thread_routing_links')
+	 OR sql IN (:issue,:insert_guard,:update_guard,:delete_guard) THEN 1 END)
+	 FROM main.sqlite_schema WHERE name IN ('thread_routing_topics','thread_routing_links','thread_routing_issue',
+	 'thread_routing_links_insert','thread_routing_links_update','thread_routing_links_delete')`,
+		sql.Named("version", version), sql.Named("issue", threadRoutingIssueIndex), sql.Named("insert_guard", threadRoutingLinksInsert),
+		sql.Named("update_guard", threadRoutingLinksUpdate), sql.Named("delete_guard", threadRoutingLinksDelete)).Scan(&installed, &later, &objects, &intact)
 	if err != nil {
 		return false, err
 	}
 	if !installed {
-		if unexpected {
+		if later || objects != 0 {
 			return false, errors.New("话题归属迁移记录缺失")
 		}
 		return false, nil
+	}
+	if intact != 6 {
+		return false, errors.New("话题归属数据库结构不完整")
 	}
 	// Prepare a zero-row projection, even for an explicit topic or empty group.
 	// A registered but damaged installation must not route as uninstalled.
@@ -47,7 +53,12 @@ func threadRoutingInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	return true, rows.Close()
 }
 
-func localMessageReceiptInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id string) (domain.Message, error) {
+func localMessageReceiptInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id string, normalPost bool) (domain.Message, error) {
+	if normalPost && r.ThreadLinks == (domain.ThreadLinks{}) {
+		if _, err := threadRoutingInstalledInTx(ctx, tx); err != nil {
+			return domain.Message{}, err
+		}
+	}
 	m, err := messageInTx(ctx, tx, r.GroupID, id)
 	if err != nil {
 		return domain.Message{}, err
@@ -56,7 +67,7 @@ func localMessageReceiptInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 	if err := messageThreadCorrectionsInTx(ctx, tx, r.GroupID, items); err != nil {
 		return domain.Message{}, err
 	}
-	// E1a's request payload conflates absent and empty topic_id. Do not
+	// Legacy reservations conflated absent and empty topic_id. Do not
 	// acknowledge inferred chat as main. A correction receipt always stays
 	// on main, including a clarification of a conflicting manual scope.
 	if items[0].ThreadCorrection == nil && r.TopicIDExplicit && m.TopicID != r.TopicID {
@@ -204,7 +215,7 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 		return route, err
 	}
 	if !infer || r.TopicID != "" || r.TopicIDExplicit {
-		if replyEffectiveTopic == route.topic {
+		if replyAuthor != "" && replyEffectiveTopic == route.topic && !threadComparisonReply(r.Content) {
 			route.recipient = replyAuthor
 		}
 		return route, nil
@@ -218,12 +229,13 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 	if taskTopic.Valid {
 		evidence.confirm(taskTopic.String)
 	}
-	// With a stated current subject, a marked comparison is just evidence.
-	// An ordinary structured reply, including to main, contributes its scope.
-	comparison := text.current && text.comparison && (text.topic != "" || text.newTitle != "")
+	// Comparison references never select the quoted topic or author, even
+	// when we cannot resolve the explicitly stated current subject.
+	comparison := text.current && text.comparison
 	if !comparison && r.ReplyToMessageID != "" {
 		evidence.confirm(replyEffectiveTopic)
 	}
+	evidence = text.resolveAliases(evidence)
 	if text.conflict || evidence.conflict || (text.newTitle != "" && evidence.matched) {
 		return route, nil
 	}

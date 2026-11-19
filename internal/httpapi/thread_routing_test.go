@@ -46,6 +46,90 @@ func TestThreadRoutingNormalEntry(t *testing.T) {
 	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 409, "conflict")
 }
 
+func TestThreadRoutingMainSelectorReplay(t *testing.T) {
+	a := openMessageAPI(t, "")
+	group := newGroup(t, a, "selector choices")
+	path := "/api/v1/groups/" + group.ID + "/messages"
+	checks := []struct{ key, first, changed string }{
+		{"auto-first", `{"content":"just chatting"}`, `{"content":"just chatting","topic_id":""}`},
+		{"main-first", `{"content":"just chatting","topic_id":""}`, `{"content":"just chatting"}`},
+	}
+	receipts := make([]domain.Message, len(checks))
+	for i, tc := range checks {
+		m := decoded[domain.Message](t, a.request("POST", path, tc.first, tc.key), 201)
+		if m.ID == "" || m.TopicID != "" || m.GroupID != group.ID || m.SenderID != "user" || m.Content != "just chatting" {
+			t.Fatalf("selector fixture should persist the original main message: %+v", m)
+		}
+		receipts[i] = m
+		w := a.request("POST", path, tc.changed, tc.key)
+		if w.Code != 409 {
+			t.Errorf("%s: selector change returned %d, want conflict: %s", tc.key, w.Code, w.Body)
+		} else {
+			assertError(t, w.Code, w.Header(), w.Body.Bytes(), 409, "conflict")
+		}
+	}
+	if err := a.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	a = openMessageAPI(t, a.path)
+	for i, tc := range checks {
+		m := decoded[domain.Message](t, a.request("POST", path, tc.first, tc.key), 201)
+		if m.ID != receipts[i].ID || m.SourceID != receipts[i].SourceID {
+			t.Errorf("%s: reopen changed receipt: %+v", tc.key, m)
+		}
+		w := a.request("POST", path, tc.changed, tc.key)
+		if w.Code != 409 {
+			t.Errorf("%s: reopened selector change returned %d, want conflict: %s", tc.key, w.Code, w.Body)
+		} else {
+			assertError(t, w.Code, w.Header(), w.Body.Bytes(), 409, "conflict")
+		}
+	}
+	page := decoded[listResult[domain.Message]](t, a.request("GET", path, ""), 200)
+	if len(page.Items) != 2 {
+		t.Fatalf("retries changed the number of messages: %d", len(page.Items))
+	}
+}
+
+func TestThreadRoutingOpeningFollowupClause(t *testing.T) {
+	a := openMessageAPI(t, "")
+	requireThreadRoutingFixture(t, a)
+	group := newGroup(t, a, "opening")
+	path := "/api/v1/groups/" + group.ID + "/messages"
+	post := func(content string) domain.Message {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{"content": content, "recipient_ids": []string{}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return decoded[domain.Message](t, a.request("POST", path, string(body)), 201)
+	}
+	const opening = "新议题：导出 BUG EX-421。跟进导出故障。"
+	export := post(opening)
+	if export.TopicID == "" || export.Content != opening || len(export.Deliveries) != 0 {
+		t.Fatalf("opening with action prose did not persist its subject as public only: %+v", export)
+	}
+	if followup := post("跟进那个导出 BUG"); followup.TopicID != export.TopicID {
+		t.Fatalf("named followup: topic=%q, want %q", followup.TopicID, export.TopicID)
+	}
+	other := post("新议题：数据库连接告警 OPS-61")
+	if other.TopicID == "" || other.TopicID == export.TopicID {
+		t.Fatalf("second fixture did not create a distinct topic: %+v", other)
+	}
+	for _, content := range []string{
+		"新议题：导出 BUG EX-421。跟进数据库连接告警。",
+		"新议题：索引切换计划。跟进数据库连接告警。",
+		"新议题：索引切换计划。跟进 OPS-61。",
+		"新议题：导出 BUG EX-421。跟进另一个单号 EX-422。",
+	} {
+		if got := post(content); got.TopicID != "" || len(got.Deliveries) != 0 {
+			t.Errorf("conflicting evidence escaped main: %q → %+v", content, got)
+		}
+	}
+	if got := post("新议题：导出 BUG EX-421。跟进导出 BUG。"); got.TopicID != export.TopicID {
+		t.Fatalf("agreeing named subject did not return to its topic: %+v", got)
+	}
+}
+
 func TestThreadRoutingColdIssueName(t *testing.T) {
 	a := openMessageAPI(t, "")
 	requireThreadRoutingFixture(t, a)
@@ -83,6 +167,39 @@ func TestThreadRoutingColdIssueName(t *testing.T) {
 		post("跟进 EX-422").TopicID != second.TopicID || post("再核对一次", root.ID).TopicID != root.TopicID {
 		t.Fatalf("ambiguous names must not override exact issue/reply evidence: first=%q second=%q", root.TopicID, second.TopicID)
 	}
+	t.Run("strong_evidence_disambiguates_alias", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, content, reply, want string
+		}{
+			{"issue", "跟进那个导出 BUG，EX-421", "", root.TopicID},
+			{"reply", "跟进那个导出 BUG", second.ID, second.TopicID},
+			{"contradictory_issue_and_reply", "跟进那个导出 BUG，EX-421", second.ID, ""},
+			{"contradictory_exact_title_and_reply", "当前讨论导出 BUG EX-421", second.ID, ""},
+			{"incompatible_reply", "跟进那个导出 BUG", prefix.ID, ""},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				var refs []string
+				if tc.reply != "" {
+					refs = append(refs, tc.reply)
+				}
+				if m := post(tc.content, refs...); m.TopicID != tc.want || m.ReplyToMessageID != tc.reply || len(m.Deliveries) != 0 {
+					t.Fatalf("topic=%q, want %q; receipt=%+v", m.TopicID, tc.want, m)
+				}
+			})
+		}
+	})
+	t.Run("exact_title_beats_shared_alias", func(t *testing.T) {
+		plain := post("新议题：导出 BUG")
+		if plain.TopicID == "" || plain.TopicID == root.TopicID || plain.TopicID == second.TopicID {
+			t.Fatalf("exact-title fixture did not open a different topic: %+v", plain)
+		}
+		if m := post("当前讨论导出 BUG"); m.TopicID != plain.TopicID {
+			t.Fatalf("full title must not lose to shared shortened titles: got %q want %q", m.TopicID, plain.TopicID)
+		}
+		if m := post("当前讨论导出 BUG，EX-421"); m.TopicID != "" {
+			t.Fatalf("contradictory exact title and issue escaped main: %+v", m)
+		}
+	})
 	generic := post("New topic: incident OPS-62")
 	if generic.TopicID == "" || post("Follow up on incident").TopicID != "" || post("New topic: incident report").TopicID != "" {
 		t.Fatalf("generic words created or selected a thread without an issue: %+v", generic)
@@ -162,6 +279,7 @@ func TestThreadRoutingEvidenceAndRecipients(t *testing.T) {
 		{"author", "阈值是多少？", alert.TopicID, second.ID, false},
 		{"public-reply", "只记录这个问题。", alert.TopicID, "", true},
 		{"comparison", "引用仅作对照，当前讨论明年仓库容量规划。", plan.TopicID, first.ID, false},
+		{"unknown-comparison", "当前讨论支付网关故障，引用仅作对照。", "", first.ID, false},
 		{"conflicting-reply", "明年仓库容量规划还需要讨论。", "", first.ID, false},
 	} {
 		input := map[string]any{"content": tc.content, "reply_to_message_id": author.ID}
@@ -174,13 +292,20 @@ func TestThreadRoutingEvidenceAndRecipients(t *testing.T) {
 			t.Fatalf("%s: wrong scope, link, or delivery: %+v", tc.key, m)
 		}
 	}
+	explicitComparison := decoded[domain.Message](t, post("explicit-comparison", map[string]any{
+		"content": "当前讨论支付网关故障，引用仅作对照。", "reply_to_message_id": author.ID, "topic_id": alert.TopicID,
+	}), 201)
+	if explicitComparison.TopicID != alert.TopicID || explicitComparison.ReplyToMessageID != author.ID ||
+		len(explicitComparison.Deliveries) != 1 || explicitComparison.Deliveries[0].RecipientID != first.ID {
+		t.Fatalf("explicit topic changed or comparison selected the quoted author: %+v", explicitComparison)
+	}
 	page := decoded[listResult[domain.Message]](t, a.request("GET", path, ""), 200)
-	if len(page.Items) != 12 || page.Items[0].ReplyToMessageID != author.ID || page.NextCursor != "" {
+	if len(page.Items) != 14 || page.Items[0].ReplyToMessageID != author.ID || page.NextCursor != "" {
 		t.Fatalf("one group timeline did not carry the stable link: %+v", page)
 	}
 
 	raw := messageSQL(t, a)
-	for table, want := range map[string]int{"thread_routing_topics": 2, "tasks": 0, "mandates": 0, "deliveries": 9} {
+	for table, want := range map[string]int{"thread_routing_topics": 2, "tasks": 0, "mandates": 0, "deliveries": 11} {
 		var got int
 		if err := raw.QueryRow("SELECT count(*) FROM " + table).Scan(&got); err != nil || got != want {
 			t.Fatalf("%s: got %d, %v; want %d", table, got, err, want)

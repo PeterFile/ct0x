@@ -62,7 +62,7 @@ func correctionDestinationInTx(ctx context.Context, tx *sql.Tx, group, subject s
 	if len(issues) != 0 {
 		return "", nil // An issue embedded in extra prose is not an exact selector.
 	}
-	match, complete, err := threadTitleEvidenceInTx(ctx, tx, group, "", "", key)
+	match, complete, err := threadTitleEvidenceInTx(ctx, tx, group, "", nil, key)
 	if err != nil || !complete || match.conflict {
 		return "", err
 	}
