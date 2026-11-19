@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { prepareDecisionAnswer } from "./decision-api";
+import { prepareDecisionAnswer, readDecisionAnswer } from "./decision-api";
 import type { PendingDecision } from "./decision-api";
 import { journalDecisionAttempt, loadDecisionJournal } from "./decision-journal";
 import { PendingReviews } from "./PendingReviews";
@@ -19,18 +19,19 @@ const taskQuestion = (source: string, version: number, topic_id: string) => ({
   choices: ["仅工作日", "纳入周末"], authorization: { scope: "只读取现有周末样本。", impact: "需额外核对两批数据。" },
   created_at: timestamp, updated_at: timestamp,
 } satisfies PendingDecision);
-const receiptFor = (item: ReturnType<typeof taskQuestion>, text: string, option_index?: number) => ({
+const receiptFor = (item: PendingDecision, text: string, option_index?: number) => ({
   id: `answer-${item.id}`, request_id: item.id, group_id: item.group_id, topic_id: item.topic_id, version: item.version,
-  actor_id: "user", task_id: item.task.task_id, task_revision: item.task.task_revision, text, option_index,
-  reply_message_id: `reply-${item.id}`, wake_delivery_id: `delivery-${item.id}`, wake_message_id: `wake-${item.id}`, created_at: timestamp,
+  actor_id: "user", task_id: item.task?.task_id ?? "", task_revision: item.task?.task_revision ?? 0, text, option_index,
+  reply_message_id: `reply-${item.id}`, wake_delivery_id: `delivery-${item.id}`,
+  wake_message_id: item.relay === "origin_thread" ? `reply-${item.id}` : `wake-${item.id}`, created_at: timestamp,
 });
 const groupPath = (id: string) => `/api/v1/groups/${encodeURIComponent(id)}`;
 const identityPath = (id: string) => `${groupPath(id)}/identity`;
 const membership = (group_id: string, project_id: string) => ({ group_id, project_id, workspace_id: "workspace-1", channel_id: `channel:${group_id}` });
 const pendingPath = "/api/v1/me/pending-decisions";
-const answerPath = (item: ReturnType<typeof taskQuestion>, groupScoped = false) =>
+const answerPath = (item: PendingDecision, groupScoped = false) =>
   `${groupScoped ? groupPath(item.group_id) : "/api/v1/me"}/decisions/${encodeURIComponent(item.id)}/answer`;
-const statusPath = (item: ReturnType<typeof taskQuestion>) => `${answerPath(item)}?${new URLSearchParams({
+const statusPath = (item: PendingDecision) => `${answerPath(item)}?${new URLSearchParams({
   group_id: item.group_id, topic_id: item.topic_id, version: String(item.version),
 })}`;
 const absent = () => json({ error: { code: "not_found" } }, 404);
@@ -282,6 +283,86 @@ it("restores a committed lost response and native handling by exact history read
     expect(init).toMatchObject({ method: "GET", redirect: "error", cache: "no-store" });
   }
   expect(post).toHaveBeenCalledTimes(1);
+});
+
+it("shows a saved Thread answer separately from its exact GET acknowledgement", async () => {
+  vi.useFakeTimers();
+  const item = {
+    id: "question/thread", version: 4, kind: "clarification", group_id: "group/thread", topic_id: "alerts/weekend +",
+    group_name: "Alerts", recipient_id: "user", relay: "origin_thread",
+    chat: { source_id: "chat-source", candidate_id: "candidate", assessment_id: "assessment", notice_message_id: "notice" },
+    source_message_id: "message", source_sequence: 2, author_member_id: "owner", author_turn_id: "question-turn",
+    facts: "The weekend sample is available.", question: "Include the weekend sample?", recommendation: "Use weekdays first.",
+    created_at: timestamp, updated_at: timestamp,
+  } satisfies PendingDecision;
+  const text = "Use weekday samples only.";
+  const { attempt } = await prepareDecisionAnswer(item, { text }, randomUUID(), item.group_id);
+  expect(journalDecisionAttempt(attempt)).not.toBeNull();
+  const receipt = receiptFor(item, text), ack = { turn_id: "continued-thread-turn", consumed_at: timestamp };
+  const status = deferred<Response>();
+  const reads = vi.fn<typeof fetch>().mockReturnValueOnce(status.promise);
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) =>
+    String(input) === `${pendingPath}?limit=50` ? Promise.resolve(page()) : reads(input, init));
+
+  render(<PendingDecisions active groupId={item.group_id} />);
+  expect(reads).toHaveBeenCalledTimes(1);
+  expect(screen.getByText(/答复结果未确认/)).toBeVisible();
+  expect(screen.queryByText("答复已保存")).not.toBeInTheDocument();
+  expect(screen.queryByText("负责人已处理")).not.toBeInTheDocument();
+
+  await act(async () => status.resolve(json({ receipt, handling: null, delivery_state: "accepted", run_state: "completed" })));
+  const saved = within(screen.getByText(receipt.id).closest("li")!);
+  function expectSavedWithoutHandling() {
+    expect(saved.getByText("答复已保存")).toBeVisible();
+    expect(saved.getByText("尚未确认负责人处理。")).toBeVisible();
+    expect(saved.queryByText("负责人已处理")).not.toBeInTheDocument();
+  }
+  expectSavedWithoutHandling();
+
+  async function readStatus(reply: unknown) {
+    const before = reads.mock.calls.length;
+    reads.mockResolvedValueOnce(json(reply));
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "刷新待决事项" })); });
+    expect(reads).toHaveBeenCalledTimes(before + 1);
+  }
+  await readStatus({ receipt, handling: { ...ack, attempt_id: handling.attempt_id } });
+  expectSavedWithoutHandling();
+
+  const changedDelivery = { wake_delivery_id: "different-delivery" };
+  for (const mismatch of [
+    { request_id: "different-request" }, { group_id: "different-group" }, { topic_id: "different-thread" },
+    { version: item.version + 1 }, { task_id: "unexpected-task" }, { task_revision: 1 },
+    { id: "different-answer" }, changedDelivery, { text: "Use weekend samples too." },
+  ]) {
+    await readStatus({ receipt: { ...receipt, ...mismatch }, handling: ack });
+    expectSavedWithoutHandling();
+  }
+
+  // On reload, the journal digest must bind the receipt without an in-memory copy.
+  const [history] = loadDecisionJournal() ?? [];
+  expect(history).toHaveProperty("receiptDigest");
+  reads.mockResolvedValueOnce(json({ receipt: { ...receipt, ...changedDelivery }, handling: ack }));
+  await expect(readDecisionAnswer(history, new AbortController().signal)).rejects.toMatchObject({ code: "invalid_response" });
+
+  await readStatus({ receipt, handling: ack });
+  for (const [path, init] of reads.mock.calls) {
+    expect(path).toBe(statusPath(item));
+    expect(init).toMatchObject({ method: "GET", redirect: "error", cache: "no-store" });
+  }
+  expect(saved.getByText("答复已保存")).toBeVisible();
+  expect(saved.getByText("负责人已处理")).toBeVisible();
+  expect(saved.queryByText("尚未确认负责人处理。")).not.toBeInTheDocument();
+});
+
+it("rejects Task handling without a valid Attempt ID", async () => {
+  const item = taskQuestion("missing-ack-attempt", 3, "alerts"), text = "Use weekday samples only.";
+  const { attempt } = await prepareDecisionAnswer(item, { text }, randomUUID());
+  const receipt = receiptFor(item, text), fetcher = vi.fn<typeof fetch>();
+  vi.stubGlobal("fetch", fetcher);
+  for (const attempt_id of [undefined, "", " "]) {
+    fetcher.mockResolvedValueOnce(json({ receipt, handling: { ...handling, attempt_id } }));
+    await expect(readDecisionAnswer(attempt, new AbortController().signal)).rejects.toMatchObject({ code: "invalid_response" });
+  }
 });
 
 it("retries a recovered attempt only on explicit matching input after checking exact history", async () => {

@@ -19,7 +19,8 @@ export type DecisionReceipt = Readonly<{
   task_id: string; task_revision: number; option_index?: number; text: string;
   reply_message_id: string; wake_delivery_id: string; wake_message_id: string; created_at: string;
 }>;
-export type DecisionHandling = Readonly<{ turn_id: string; attempt_id: string; consumed_at: string }>;
+export type DecisionHandling = Readonly<{ turn_id: string; consumed_at: string }
+  & ({ attempt_id: string } | { attempt_id?: never })>;
 export type DecisionAnswerView = Readonly<{ receipt: DecisionReceipt; handling: DecisionHandling | null }>;
 export type DecisionReference = Readonly<Pick<DecisionReceipt, "request_id" | "group_id" | "topic_id" | "version" | "task_id" | "task_revision">>;
 export type DecisionAttempt = Readonly<{ ref: DecisionReference; scope: "me" | "group"; key: string; digest: string }>;
@@ -237,8 +238,11 @@ export async function readDecisionAnswer(entry: DecisionJournalEntry, signal: Ab
     view = await boundedGet(`/api/v1/me${answerPath(ref)}?${query}`, signal,
       (value): value is DecisionAnswerView => {
         if (!record(value) || !matchesReference(value.receipt, ref)) return false;
-        const { handling } = value;
-        return handling === null || (record(handling) && id(handling.turn_id) && id(handling.attempt_id) && timestamp(handling.consumed_at));
+        const { receipt, handling } = value;
+        if (handling === null) return true;
+        if (!record(handling) || !id(handling.turn_id) || !timestamp(handling.consumed_at)) return false;
+        return receipt.task_id === "" && receipt.task_revision === 0
+          ? Object.keys(handling).length === 2 : id(handling.attempt_id);
       });
   } catch (error) {
     if (!signal.aborted && error instanceof ApiError && error.status === 404 && error.code === "not_found") return null;
