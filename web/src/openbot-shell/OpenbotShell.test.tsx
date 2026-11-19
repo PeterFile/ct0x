@@ -404,11 +404,12 @@ it("answers the exact project Task from the real inbox and the original chat, ke
   fireEvent.click(rail("待我决定"));
   expect(inbox().getAllByRole("heading", { name: "待我决定" })).toHaveLength(1);
   expect(await inbox().findByText(firstReview.submission.summary)).toBeVisible();
-  const target = within(await inbox().findByRole("article", { name: chosenName }));
-  expect(await inbox().findByRole("article", { name: foreignName })).toBeVisible();
+  const decisionList = within(await inbox().findByRole("list", { name: "待答复的问题" }));
+  const target = within(await decisionList.findByRole("article", { name: chosenName }));
+  expect(await decisionList.findByRole("article", { name: foreignName })).toBeVisible();
   fireEvent.click(target.getByText("来源与版本标识", { selector: "summary" }));
   for (const id of ["settlement", other.id, chosen.task.task_id]) expect(target.getByText(id)).toBeVisible();
-  change(within(inbox().getByRole("article", { name: localName })).getByRole("textbox"), text);
+  change(within(decisionList.getByRole("article", { name: localName })).getByRole("textbox"), text);
   fireEvent.click(target.getByRole("radio", { name: "纳入周末" }));
   fireEvent.click(target.getByRole("button", { name: "提交答复" }));
   await waitFor(() => expect(writes()).toHaveLength(1));
