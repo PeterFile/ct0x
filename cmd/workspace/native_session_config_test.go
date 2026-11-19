@@ -59,18 +59,22 @@ func TestNativeSessionConfigDefaultOffAndPrerequisites(t *testing.T) {
 	if _, err := parseConfig(codexOnly, io.Discard); err != nil {
 		t.Fatalf("fresh Codex AppServer must not require a Pi extension: %v", err)
 	}
-	if _, err := parseConfig(append(slices.Clone(codexOnly), "--enable-native-session-resume"), io.Discard); err == nil {
-		t.Error("Pi resume opt-in accepted a Codex-only configuration without a trusted Pi extension")
+	if c, err := parseConfig(append(slices.Clone(codexOnly), "--enable-native-session-resume"), io.Discard); err != nil ||
+		!c.enableNativeSessionResume || !c.enableCodexAppServer || c.piMemberToolsExtension != "" || c.nativePiThinking != "" {
+		t.Fatalf("Codex-only resume should not require a Pi extension or thinking: %v", err)
+	}
+	if _, err := parseConfig(append(slices.Clone(codexOnly), "--enable-codex-app-server=false", "--enable-native-session-resume"), io.Discard); err == nil {
+		t.Fatal("Codex-only resume accepted without the AppServer opt-in")
 	}
 	mixed := append(slices.Clone(codexOnly), "--pi-member-tools-extension", base[len(base)-1], "--enable-native-session-resume", "--native-pi-thinking=off")
 	if c, err := parseConfig(mixed, io.Discard); err != nil || !c.enableNativeSessionResume || !c.enableCodexAppServer {
-		t.Fatalf("Pi resume and fresh Codex AppServer must coexist: %v", err)
+		t.Fatalf("Pi and Codex native options must coexist: %v", err)
 	}
 	var help bytes.Buffer
 	if err := runWithSearch(context.Background(), []string{"--help"}, &help, provider.Search{}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"--enable-native-session-resume  实验性 Pi 1.4.0 原生文本会话续接", "--native-pi-thinking", "默认禁用", "Codex AppServer 仍为全新单轮", "不启用文件会话、调查续接或运行中追加"} {
+	for _, want := range []string{"--enable-native-session-resume  实验性原生文本会话续接", "--native-pi-thinking", "默认禁用", "Codex 0.166.0 须同时启用 --enable-codex-app-server，限普通 chat_intake/v1", "不启用文件会话、调查续接或运行中追加"} {
 		if !strings.Contains(help.String(), want) {
 			t.Fatalf("help omits %q", want)
 		}

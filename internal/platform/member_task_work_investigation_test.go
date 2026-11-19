@@ -20,10 +20,19 @@ import (
 	"agentworkspace/internal/store"
 )
 
+// Keep the independent owner wakes as separate Platform shard entries.
+func TestInvestigationTaskWorkOwnerTransportV30Followup(t *testing.T) {
+	testInvestigationTaskWorkOwnerTransportV30(t, domain.TaskWorkSourceFollowup)
+}
+
+func TestInvestigationTaskWorkOwnerTransportV30Report(t *testing.T) {
+	testInvestigationTaskWorkOwnerTransportV30(t, domain.TaskWorkSourceReport)
+}
+
 // These are postclaim transport tests, not permission to start a process.
 // Every typed record and Attempt comes from the real v30 owner/member APIs.
-func TestInvestigationTaskWorkOwnerTransportV30(t *testing.T) {
-	for _, kind := range []domain.TaskWorkSourceKind{domain.TaskWorkSourceFollowup, domain.TaskWorkSourceReport} {
+func testInvestigationTaskWorkOwnerTransportV30(t *testing.T, kinds ...domain.TaskWorkSourceKind) {
+	for _, kind := range kinds {
 		t.Run(string(kind), func(t *testing.T) {
 			ctx := t.Context()
 			f := newBoundWorkReportFixture(t)

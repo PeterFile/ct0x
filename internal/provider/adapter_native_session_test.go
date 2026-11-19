@@ -265,6 +265,29 @@ exec "$FIXTURE_CODEX_PROCESS" "$@"`)
 	}
 }
 
+func TestCodexNativeTextSessionProfileSupported(t *testing.T) {
+	selected := Provider{Name: Codex, Version: "0.166.0", Path: "/configured/codex"}
+	if !CodexNativeTextSessionProfileSupported(selected, "explicit-model", "") {
+		t.Fatal("exact declared native text profile was rejected")
+	}
+	for _, invalid := range []struct{ name, version, path, model, thinking string }{
+		{Pi, "1.4.0", selected.Path, "explicit-model", ""},
+		{Codex, "0.162.1", selected.Path, "explicit-model", ""},
+		{Codex, "0.166.1", selected.Path, "explicit-model", ""},
+		{Codex, selected.Version, "relative", "explicit-model", ""},
+		{Codex, selected.Version, "/configured/../codex", "explicit-model", ""},
+		{Codex, selected.Version, selected.Path, "", ""},
+		{Codex, selected.Version, selected.Path, "model\tname", ""},
+		{Codex, selected.Version, selected.Path, "model\xff", ""},
+		{Codex, selected.Version, selected.Path, "explicit-model", "high"},
+	} {
+		p := Provider{Name: invalid.name, Version: invalid.version, Path: invalid.path}
+		if CodexNativeTextSessionProfileSupported(p, invalid.model, invalid.thinking) {
+			t.Fatal("unsupported declared Codex profile was promoted")
+		}
+	}
+}
+
 // Version fixtures only: constructing a native adapter must not launch a CLI.
 func TestNativeSessionAdaptersExplicitFreshCaptureAndFrozenInput(t *testing.T) {
 	selected, _, path := memberToolFiles(t, `: > "$0.invoked"; exit 99`)
@@ -309,7 +332,8 @@ func TestNativeSessionAdaptersExplicitFreshCaptureAndFrozenInput(t *testing.T) {
 				t.Fatal("adapter retained caller-owned binding bytes")
 			}
 			caps, err := registry.Capabilities(selection, p)
-			if err != nil || !caps.Supports(CapabilityNativeResume) || caps.Steer != SupportUnsupported {
+			if err != nil || !caps.Supports(CapabilityNativeResume) || !caps.Supports(CapabilityPlatformTools) || !caps.Supports(CapabilityTerminalEvidence) ||
+				caps.Steer != SupportUnsupported || caps.Cancel != SupportUnsupported || caps.PermissionInteraction != SupportUnsupported {
 				t.Fatalf("wrong capability report for the native text builder: %+v, %v", caps, err)
 			}
 			if _, err := DefaultAdapterRegistry().Capabilities(selection, p); err == nil {

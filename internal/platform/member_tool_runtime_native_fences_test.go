@@ -30,21 +30,14 @@ func TestNativeSessionRuntimeSameInodeConfigDrift(t *testing.T) {
 		for _, stage := range []string{"before-adapter", "after-adapter"} {
 			t.Run(name+"/"+stage, func(t *testing.T) {
 				ctx := context.Background()
-				f, prepared := nativeSessionPreparation(t, "generic")
-				run := prepared.Executor.(*memberToolRuntimeRun)
+				var f *rolePrepareFixture
+				var prepared scheduler.PreparedExecution
 				if name == provider.Codex {
-					// Exercise the provider-only fixture constructor through the same
-					// runtime fences; no released Preparer can build this Codex plan.
-					selected := f.opts.Providers[1]
-					selected.Name, selected.Version = provider.Codex, "0.166.0"
-					profile := &run.nativeSession.profile
-					profile.Adapter, profile.Protocol = provider.CodexNativeSessionAdapterVersion, provider.CodexNativeSessionProtocolVersion
-					profile.CLIVersion, profile.NativePolicy.Sandbox = selected.Version, "read-only"
-					profile.Thinking, prepared.Request.Thinking = "", ""
-					run.nativeSession.factory = func(config provider.NativeMemberToolConfig, names []string, resume *provider.NativeSessionReference, binding json.RawMessage) (provider.Executor, error) {
-						return provider.NewCodexAppServerNativeSessionMemberToolAdapter(config, names, provider.CodexAppServerSessionOptions{Resume: resume, Binding: binding}).NewExecutor(selected, 0)
-					}
+					f, prepared = codexNativeIntakePreparation(t)
+				} else {
+					f, prepared = nativeSessionPreparation(t, "generic")
 				}
+				run := prepared.Executor.(*memberToolRuntimeRun)
 				// A second valid in-memory capability makes syntax checking insufficient.
 				other := f.message(t, f.group.ID, "separate-topic", "user", "fixture", f.worker.ID)
 				turn, err := f.s.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group.ID, DeliveryID: other.Deliveries[0].ID, MaxActive: 2})

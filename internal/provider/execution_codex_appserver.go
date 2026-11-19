@@ -34,14 +34,14 @@ func NewCodexAppServerExecutor(path string, timeout time.Duration) (Executor, er
 
 type codexAppServerRead struct {
 	message  codexRPCMessage
-	damaged  bool
+	failure  error // Normalized reader/decoder sentinel, never a native error string.
 	done     bool
 	complete bool
 }
 
 // No native frame is raw-logged. The protocol owner records only validated
-// lifecycle identity/outcome and config provenance summaries; free-form native
-// errors, details, configuration and response text never enter stdout logs.
+// lifecycle identity/outcome, config provenance and bounded bootstrap summaries.
+// Free-form native errors, details, configuration and response text never enter stdout logs.
 func readCodexAppServerOutput(source io.Reader, output chan<- codexAppServerRead) {
 	reader := newCodexRPCReader(source)
 	for {
@@ -50,7 +50,7 @@ func readCodexAppServerOutput(source io.Reader, output chan<- codexAppServerRead
 			if err == io.EOF {
 				output <- codexAppServerRead{done: true, complete: true}
 			} else {
-				output <- codexAppServerRead{damaged: true}
+				output <- codexAppServerRead{failure: err}
 				_, drainErr := io.Copy(io.Discard, reader.input)
 				output <- codexAppServerRead{done: true, complete: drainErr == nil}
 			}
@@ -252,6 +252,9 @@ func (e codexAppServerExecutor) execute(ctx context.Context, request ExecuteRequ
 			_, _ = outLog.Write(append(raw, '\n'))
 		},
 	}
+	if session != nil {
+		protocol.bootstrap = &codexAppServerBootstrapFailure{Type: "bootstrap_failure", Phase: "initialize"}
+	}
 	protocol.lifecycle = func(event Event) {
 		// Explicit projection, not a reconstructed native frame. In particular,
 		// never persist Event.Text or nested terminal error/details.
@@ -293,8 +296,19 @@ func (e codexAppServerExecutor) execute(ctx context.Context, request ExecuteRequ
 				if !waited && r.Terminal == "" {
 					beginExit(1500 * time.Millisecond)
 				}
-			} else if result.damaged {
-				protocol.fail()
+			} else if result.failure != nil {
+				reason := "stdout_read_failed"
+				if protocol.bootstrapAt(codexBootstrapResumePending) {
+					switch result.failure {
+					case errCodexRPCFrame:
+						reason = "rpc_frame_rejected"
+					case errCodexRPCSize:
+						reason = "rpc_frame_too_large"
+					case io.ErrUnexpectedEOF:
+						reason = "rpc_frame_incomplete"
+					}
+				}
+				protocol.failWithDiagnostic(reason)
 			} else {
 				protocol.receive(result.message)
 				if stopping && !inputClosed {
@@ -339,7 +353,7 @@ func (e codexAppServerExecutor) execute(ctx context.Context, request ExecuteRequ
 		case <-writeError:
 			writeError = nil
 			if !inputClosed {
-				protocol.fail()
+				protocol.failWithDiagnostic("stdin_write_failed")
 			}
 		}
 	}
@@ -354,6 +368,17 @@ func (e codexAppServerExecutor) execute(ctx context.Context, request ExecuteRequ
 	r.DirectChildReaped = cmd.ProcessState != nil
 	if r.DirectChildReaped {
 		r.ExitCode = cmd.ProcessState.ExitCode()
+	}
+	// At most one projection for an opt-in session that stopped before completing
+	// thread binding and initial replay. The projection never drives execution.
+	if diagnostic := protocol.bootstrap; diagnostic != nil {
+		if diagnostic.Reason == "" {
+			diagnostic.Reason = "connection_ended"
+			if ctx.Err() != nil {
+				diagnostic.Reason = "context_done"
+			}
+		}
+		_, _ = outLog.Write(append(mustCodexAppServerJSON(diagnostic), '\n'))
 	}
 	outClose, errClose := stdout.Close(), stderr.Close()
 	r.LogsTruncated = outLog.truncated || errLog.truncated

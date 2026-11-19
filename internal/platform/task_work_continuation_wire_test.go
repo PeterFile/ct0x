@@ -593,7 +593,9 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 			var out provider.ExecutionReceipt
 			scheduled := slices.Contains([]string{"confirmed", "wrong-resource", "commit-unknown", "untrusted-native-receipt"}, mode)
 			if scheduled {
-				runCtx, stop := context.WithTimeout(ctx, 5*time.Second)
+				// The executor cancels on completion. Allow for the full HTTP sequence
+				// and SQLite work under -race; this only bounds a stalled fixture.
+				runCtx, stop := context.WithTimeout(ctx, 60*time.Second)
 				defer stop()
 				err = scheduler.Run(runCtx, f.db, scheduler.Options{Recovered: true, RuntimeDir: f.root, MaxActive: f.options.RoleMaxActive},
 					func(ctx context.Context, pending store.PendingDelivery) (scheduler.PreparedExecution, error) {
