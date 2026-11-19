@@ -1,5 +1,5 @@
-// Invalidate only the roster that owns the committed join. Reuse the message
-// feed's observations; no second polling loop or optimistic member objects.
+// Invalidate only the group whose feed observed or may have skipped a join.
+// No second polling loop or optimistic member objects.
 const refreshes = new EventTarget();
 
 export function refreshBackgroundRoster(groupId: string) {

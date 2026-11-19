@@ -27,6 +27,8 @@ export function useMessageFeed(groupId: string, active: boolean, pollDetails = t
   const [feed, setFeed] = useState<Feed>({ entries: new Map(), floor: 0 });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
   const [pollError, setPollError] = useState("");
+  const [latestGap, setLatestGap] = useState(0);
+  const latestHead = useRef<{ groupId: string; id?: string; version: number } | null>(null);
   const [details, setDetails] = useState<Record<string, { pending: boolean; error: string }>>({});
   const clock = useRef(0), epoch = useRef(0), running = useRef(false), pageBusy = useRef(false);
   const controllers = useRef(new Set<AbortController>()), detailBusy = useRef(new Set<string>());
@@ -39,6 +41,16 @@ export function useMessageFeed(groupId: string, active: boolean, pollDetails = t
       valid: () => running.current && generation === epoch.current && !controller.signal.aborted,
       close: () => controllers.current.delete(controller) };
   }, []);
+  const observeLatest = useCallback((items: Message[], next: string, version: number) => {
+    const previous = latestHead.current;
+    if (previous?.groupId === groupId) {
+      if (previous.version > version) return;
+      // More history exists and the prior head is no longer visible. A join
+      // may have fallen between windows; there is no need to page that range.
+      if (next && !items.some(message => message.id === previous.id)) setLatestGap(version);
+    }
+    latestHead.current = { groupId, id: items[0]?.id, version };
+  }, [groupId]);
   const loadPage = useCallback(async (before = "", reset = true) => {
     if (!running.current || pageBusy.current) return;
     pageBusy.current = true; lastRequest.current = { before, reset };
@@ -48,12 +60,13 @@ export function useMessageFeed(groupId: string, active: boolean, pollDetails = t
     try {
       const result = await listMessages(groupId, before, read.signal);
       if (!read.valid()) return;
+      if (!before) observeLatest(result.items, result.next_cursor, read.version);
       setFeed(previous => merge(previous, result.items, read.version, reset));
       setPage({ pending: false, error: "", next: result.next_cursor });
     } catch (error) {
       if (read.valid()) setPage(previous => ({ ...previous, pending: false, error: errorText(error) }));
     } finally { if (read.valid()) pageBusy.current = false; read.close(); }
-  }, [groupId, beginRead]);
+  }, [groupId, beginRead, observeLatest]);
   const refreshDetail = useCallback(async (id: string) => {
     if (!running.current || detailBusy.current.has(id)) return;
     detailBusy.current.add(id);
@@ -118,6 +131,7 @@ export function useMessageFeed(groupId: string, active: boolean, pollDetails = t
         try {
           const result = await listMessages(groupId, "", read.signal);
           if (read.valid() && window === windowVersion.current) {
+            observeLatest(result.items, result.next_cursor, read.version);
             for (const message of result.items) if (!hasPending(message)) terminal.add(message.id);
             setFeed(previous => merge(previous, result.items, read.version));
             setPollError("");
@@ -125,7 +139,7 @@ export function useMessageFeed(groupId: string, active: boolean, pollDetails = t
         } catch (error) {
           if (read.valid() && window === windowVersion.current) setPollError(errorText(error));
         } finally { read.close(); }
-        // A visible roster needs latest-page join events, not hidden chat's
+        // Roster observation only needs the latest page, not hidden chat's
         // per-delivery detail requests.
         if (!pollDetails || stopped || window !== windowVersion.current || pageBusy.current) return;
         const pending = new Set(loaded.current.filter(message => hasPending(message) && !terminal.has(message.id)).map(message => message.id));
@@ -145,7 +159,7 @@ export function useMessageFeed(groupId: string, active: boolean, pollDetails = t
     }
     timer = setTimeout(() => void cycle(), 5000);
     return () => { stopped = true; clearTimeout(timer); };
-  }, [active, groupId, beginRead, refreshDetail, pollDetails]);
-  return { items, page, pollError, details, loadPage, refreshDetail, beginSend, confirm, preserveReference,
+  }, [active, groupId, beginRead, observeLatest, refreshDetail, pollDetails]);
+  return { items, page, pollError, latestGap, details, loadPage, refreshDetail, beginSend, confirm, preserveReference,
     retry: () => loadPage(lastRequest.current.before, lastRequest.current.reset) };
 }

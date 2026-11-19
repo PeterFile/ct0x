@@ -56,7 +56,7 @@ function DiscussionScope({ groupId, active, observeRoster, members, recipientSel
   const formId = useId(), feed = useMessageFeed(groupId, observeFeed, active);
   const scroll = useMessageScroll(active, feed.items, feed.page);
   const loaded = useMemo(() => new Map(feed.items.map(message => [message.id, message])), [feed.items]);
-  const seenJoins = useRef(new Set<string>());
+  const seenJoins = useRef(new Set<string>()), refreshedGap = useRef(0);
   useEffect(() => {
     if (!observeFeed) return;
     let joined = false;
@@ -65,8 +65,11 @@ function DiscussionScope({ groupId, active, observeRoster, members, recipientSel
       seenJoins.current.add(message.id);
       joined = true;
     }
-    if (joined) refreshBackgroundRoster(groupId);
-  }, [observeFeed, feed.items, groupId]);
+    if (joined || (observeRoster && feed.latestGap !== refreshedGap.current)) {
+      refreshedGap.current = feed.latestGap;
+      refreshBackgroundRoster(groupId);
+    }
+  }, [observeFeed, observeRoster, feed.items, feed.latestGap, groupId]);
   const [content, setContent] = useState("");
   const [route, setRoute] = useState("default"), [recipients, setRecipients] = useState<string[]>([]);
   const [mention, setMention] = useState<{ start: number; end: number; query: string } | null>(null);
