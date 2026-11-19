@@ -53,7 +53,7 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
   const scroll = useMessageScroll(active, feed.items, feed.page);
   const loaded = useMemo(() => new Map(feed.items.map(message => [message.id, message])), [feed.items]);
   const [content, setContent] = useState("");
-  const [quote, setQuote] = useState<(Pick<Message, "id" | "sender_id" | "source_kind"> & { excerpt: string }) | null>(null);
+  const [quote, setQuote] = useState<(Pick<Message, "id" | "topic_id" | "sender_id" | "source_kind"> & { excerpt: string }) | null>(null);
   const [quoteAuthor, setQuoteAuthor] = useState<Pick<Member, "id" | "name"> | null>(null);
   const [quoteError, setQuoteError] = useState("");
   const [route, setRoute] = useState("default"), [recipients, setRecipients] = useState<string[]>([]);
@@ -115,7 +115,7 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
   }
   function selectQuote(message: Message) {
     if (!active || blocked || operation.current || message.group_id !== groupId) return;
-    setQuote({ id: message.id, sender_id: message.sender_id, source_kind: message.source_kind,
+    setQuote({ id: message.id, topic_id: message.topic_id, sender_id: message.sender_id, source_kind: message.source_kind,
       excerpt: discussionPreview(message.content.replace(/[\p{White_Space}\p{Cc}]+/gu, " ").trim()) });
     textarea.current?.focus({ preventScroll: true });
   }
@@ -152,7 +152,8 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
     }
     operation.current ??= { key: crypto.randomUUID(), input: Object.freeze({ content,
       ...(route === "default" ? {} : { recipient_ids: Object.freeze(route === "public" ? [] : [...recipients]) }),
-      ...(quote ? { reply_to_message_id: quote.id } : {}) }) };
+      ...(quote ? { reply_to_message_id: quote.id } : {}),
+      ...(quote?.topic_id ? { topic_id: quote.topic_id } : {}) }) };
     setMention(null);
     const current = operation.current, controller = new AbortController(); posting.current = controller;
     setMutation({ pending: true, uncertain: false, error: "", notice: "" });

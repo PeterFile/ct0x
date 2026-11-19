@@ -158,6 +158,30 @@ it("previews and cancels a quote without clearing text or @, then freezes the wh
   view.rerender(scope(other.id)); expect(content()).toHaveValue("别的群的草稿");
 });
 
+it.each([
+  { scenario: "keeps the original topic when replying", cancel: false },
+  { scenario: "sends an ordinary draft after canceling the reply", cancel: true },
+])("$scenario", async ({ cancel }) => {
+  const original = { ...message, id: "old-topic-message", sender_id: twin.id, topic_id: "quarterly-report",
+    content: "只看本季度", deliveries: [] };
+  writes.mockImplementationOnce(async (_url, init) => {
+    const { content, topic_id, reply_to_message_id } = JSON.parse(String(init?.body));
+    return json({ ...message, id: "topic-reply", content, topic_id: topic_id ?? "", deliveries: [],
+      reply_to: reply_to_message_id ? { message_id: original.id, group_id: original.group_id, topic_id: original.topic_id,
+        sender_id: twin.id, sender_name: twin.name, source_kind: "unknown", excerpt: original.content } : undefined }, 201);
+  });
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => init?.method === "POST" ? writes(input, init)
+    : Promise.resolve(page([original])));
+  render(scope());
+  fireEvent.click(await screen.findByRole("button", { name: `回复，消息 ${original.id}` }));
+  const draft = "那去年同期呢？";
+  change(draft);
+  if (cancel) fireEvent.click(screen.getByRole("button", { name: "取消引用" }));
+  submit(); await screen.findByText(/消息已持久化/);
+  expect(JSON.parse(String(attempt().body))).toEqual(cancel ? { content: draft }
+    : { content: draft, topic_id: original.topic_id, reply_to_message_id: original.id });
+});
+
 it("resolves the original author's name only when replying to an unpaged member", async () => {
   const original = { ...message, sender_id: departed.id, content: "以前的范围", deliveries: [] };
   const read = vi.fn(async (url: RequestInfo | URL) => String(url).endsWith(`/members/${departed.id}`) ? json(departed) : page([original]));
