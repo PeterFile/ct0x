@@ -69,7 +69,19 @@ func taskWorkChildrenSettledInTx(ctx context.Context, tx *sql.Tx, p domain.TaskW
 		if err != nil {
 			return err
 		}
-		if child.delegation == nil || child.delegation.TaskWorkParent != p || child.turnID == "" {
+		if child.delegation == nil || child.delegation.TaskWorkParent != p {
+			return ErrConflict
+		}
+		if child.turnID == "" {
+			// The verified delivery has never been claimed. An obsolete
+			// queued delegation is suppressed, not a terminal execution.
+			stale, err := taskImpactRefStaleInTx(ctx, tx, p.GroupID, domain.TaskImpactStaleDelegation, child.delegation.ID)
+			if err != nil {
+				return err
+			}
+			if stale {
+				continue
+			}
 			return ErrConflict
 		}
 		var settled bool
