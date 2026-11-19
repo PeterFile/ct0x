@@ -23,16 +23,34 @@ func threadStateFixtureInstalled(t *testing.T, f *prepareFixture) bool {
 func assertLegacyThreadPreparation(t *testing.T, f *prepareFixture, pending store.PendingDelivery) scheduler.PreparedExecution {
 	t.Helper()
 	got, err := f.preparer(t).Prepare(t.Context(), pending)
-	if err != nil || got.Executor == nil || got.PreparedThreadState != nil || strings.Contains(got.Request.Prompt, `"thread_state"`) {
-		t.Fatalf("ordinary preparation without E2 schema changed: stamp=%+v, err=%v, prompt=%q", got.PreparedThreadState, err, got.Request.Prompt)
+	if err != nil || got.Executor == nil || strings.Contains(got.Request.Prompt, `"thread_state"`) {
+		t.Fatalf("ordinary preparation without E2 schema changed: err=%v, prompt=%q", err, got.Request.Prompt)
 	}
+	trigger, err := f.s.GetMessage(t.Context(), pending.GroupID, pending.Delivery.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrections := threadCorrectionFixtureInstalled(t, f.db)
+	assertEmptyStatePreparationStamp(t, got.PreparedThreadState, trigger, corrections)
 	pack := decodePreparation(t, got.Request.Prompt)
 	if pack.Scope.GroupID != pending.GroupID || pack.Scope.ConversationID != pending.Delivery.ConversationID ||
 		len(pack.Pending) != 1 || pack.Pending[0].ID != pending.Delivery.MessageID {
 		t.Fatalf("legacy prompt lost the exact delivery trigger: %+v", pack)
 	}
-	t.Log("unregistered E2: ordinary Prepare retains the exact trigger without a Thread state stamp")
+	t.Logf("unregistered E2: ordinary Prepare retains the exact trigger with no Thread state (correction fence: %t)", corrections)
 	return got
+}
+
+func assertEmptyStatePreparationStamp(t *testing.T, stamp *store.PreparedThreadState, trigger domain.Message, wantFence bool) {
+	t.Helper()
+	if wantFence {
+		thread := domain.ThreadRef{GroupID: trigger.GroupID, TopicID: trigger.TopicID}
+		if stamp == nil || stamp.ThreadRef != thread || stamp.MessageID != trigger.ID || stamp.Revision != 0 {
+			t.Fatalf("empty-state preparation lost its bound fence: %+v", stamp)
+		}
+	} else if stamp != nil {
+		t.Fatalf("legacy preparation invented a claim stamp: %+v", stamp)
+	}
 }
 
 func TestThreadStatePreparationFailsClosed(t *testing.T) {

@@ -38,11 +38,15 @@ func TestThreadStateTailLossFailsClosed(t *testing.T) {
 			m := decoded[domain.Member](t, a.request("POST", threadStateBase+g.ID+"/members",
 				`{"name":"handoff","role":"inspect","provider_id":"fixture","model":"fixture/model"}`), 201)
 			trigger := threadStateMessage(t, a, g.ID, topic, "inspect the current plan", m.ID)
-			cli := filepath.Join(t.TempDir(), "never-run")
+			root := t.TempDir()
+			private, cli := filepath.Join(root, "private"), filepath.Join(root, "never-run")
+			if err := os.Mkdir(private, 0700); err != nil {
+				t.Fatal(err)
+			}
 			if err := os.WriteFile(cli, []byte("#!/bin/sh\nexit 99\n"), 0700); err != nil {
 				t.Fatal(err)
 			}
-			p, err := platform.NewPreparer(a.db, platform.PrepareOptions{PrivateWorkspaceRoot: t.TempDir(),
+			p, err := platform.NewPreparer(a.db, platform.PrepareOptions{PrivateWorkspaceRoot: private,
 				Providers: []provider.Provider{{ID: "fixture", Name: provider.Codex, Version: "0.162.1", Installation: provider.Installed, Path: cli}}})
 			if err != nil {
 				t.Fatal(err)

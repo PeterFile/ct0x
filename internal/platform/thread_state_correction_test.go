@@ -14,21 +14,63 @@ import (
 	"agentworkspace/internal/store"
 )
 
-func requireStateCorrectionFixture(t *testing.T, f *prepareFixture) {
+// Exercise the real ordinary path in installations that cannot test both features.
+func stateCorrectionFixtureReady(t *testing.T, f *prepareFixture) bool {
 	t.Helper()
-	requireThreadStateFixture(t, f)
-	requireCorrectionLedger(t, f)
+	state := threadStateFixtureInstalled(t, f)
+	corrections := threadCorrectionFixtureInstalled(t, f.db)
+	if !state || !corrections {
+		assertStateCorrectionScopedFallback(t, f, state, corrections)
+		return false
+	}
+	return true
 }
 
-func requireCorrectionLedger(t *testing.T, f *prepareFixture) {
+func assertStateCorrectionUnavailable(t *testing.T, f *prepareFixture, scope domain.ThreadStateScope, source domain.Message) {
 	t.Helper()
-	var installed bool
-	if err := f.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='thread_corrections')`).Scan(&installed); err != nil {
+	if got, err := f.s.SetLocalThreadState(t.Context(), scope, store.ThreadStateUpdate{Kind: domain.ThreadStateConstraint,
+		Action: "set", Content: source.Content, SourceMessage: source.ID, CoveredThroughMessageID: source.ID}, "unavailable"); !errors.Is(err, store.ErrThreadStateUnavailable) || got.Revision != 0 || got.Records != nil || got.CoveredThrough != nil {
+		t.Fatalf("unregistered E2 returned a state write: %+v, %v", got, err)
+	}
+	if got, err := f.s.GetLocalThreadState(t.Context(), scope, 0); !errors.Is(err, store.ErrThreadStateUnavailable) || got.Records != nil || got.CoveredThrough != nil {
+		t.Fatalf("unregistered E2 returned a state read: %+v, %v", got, err)
+	}
+}
+
+func assertStateCorrectionScopedFallback(t *testing.T, f *prepareFixture, state, corrections bool) {
+	t.Helper()
+	group, topic := f.group.ID, "fallback-export"
+	source := stateCorrectionPost(t, f, group, topic, "fallback-source", "Keep the original export header.")
+	stateCorrectionPost(t, f, group, "fallback-import", "other-thread", "Not part of the export.")
+	foreign, err := f.s.CreateGroup(t.Context(), store.CreateGroupInput{Name: "other group"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !installed {
-		t.Skip("requires the private correction migration overlay")
+	stateCorrectionPost(t, f, foreign.ID, topic, "other-group", "Not part of this group.")
+	if !state {
+		assertStateCorrectionUnavailable(t, f, domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: group, TopicID: topic}}, source)
 	}
+	trigger := stateCorrectionPost(t, f, group, topic, "fallback-trigger", "Continue export work.", f.member.ID)
+	got, pack := stateCorrectionPrepare(t, f.preparer(t), trigger)
+	delivery := trigger.Deliveries[0]
+	if got.Executor == nil || pack.Scope != (contextpack.Scope{GroupID: group, ConversationID: delivery.ConversationID}) ||
+		pack.State != nil || pack.Summary != nil || len(pack.Pending) != 1 || pack.Pending[0].ID != trigger.ID ||
+		len(pack.History) != 1 || pack.History[0].ID != source.ID || len(pack.Overflow) != 0 {
+		t.Fatalf("fallback preparation lost its scoped trigger/history or invented state: %+v", pack)
+	}
+	var body domain.Message
+	if err := json.Unmarshal([]byte(pack.History[0].Content), &body); err != nil || body.GroupID != group || body.TopicID != topic ||
+		body.Content != source.Content || body.EffectiveTopicID != nil {
+		t.Fatalf("fallback history changed the original message: %+v, %v", body, err)
+	}
+	assertEmptyStatePreparationStamp(t, got.PreparedThreadState, trigger, state || corrections)
+	var clean bool
+	if err := f.db.QueryRow(`SELECT state='queued' AND turn_id='' AND NOT EXISTS(SELECT 1 FROM turns)
+	 AND NOT EXISTS(SELECT 1 FROM resource_claims) FROM deliveries WHERE id=?`, delivery.ID).Scan(&clean); err != nil || !clean {
+		t.Fatalf("fallback preparation changed the queued delivery or reserved resources: %t, %v", clean, err)
+	}
+	f.assertQueued(t)
+	t.Logf("scoped ordinary preparation without both migrations (state: %t, corrections: %t)", state, corrections)
 }
 
 func stateCorrectionPost(t *testing.T, f *prepareFixture, group, topic, key, text string, recipients ...string) domain.Message {
@@ -64,6 +106,7 @@ func stateCorrectionSet(t *testing.T, f *prepareFixture, scope domain.ThreadStat
 }
 
 type stateCorrectionPacket struct {
+	Scope            contextpack.Scope
 	Pending, History []contextpack.Message
 	Overflow         []contextpack.Source
 	State            *domain.ThreadStateSnapshot `json:"thread_state"`
@@ -85,7 +128,9 @@ func stateCorrectionPrepare(t *testing.T, p *Preparer, trigger domain.Message) (
 
 func TestThreadStateCorrectionHandoffHistory(t *testing.T) {
 	f := newPrepareFixture(t)
-	requireStateCorrectionFixture(t, f)
+	if !stateCorrectionFixtureReady(t, f) {
+		return
+	}
 	f.opts.MaxContextBytes = 64 << 10
 	p := f.preparer(t)
 	group := f.group.ID
@@ -157,7 +202,9 @@ func TestThreadStateCorrectionHandoffHistory(t *testing.T) {
 
 func TestThreadStateCorrectionFencesClaimAndReturnedEvidence(t *testing.T) {
 	f := newPrepareFixture(t)
-	requireStateCorrectionFixture(t, f)
+	if !stateCorrectionFixtureReady(t, f) {
+		return
+	}
 	p, group := f.preparer(t), f.group.ID
 	a := stateCorrectionPost(t, f, group, "", "a", "新话题：OPS-11 出口")
 	b := stateCorrectionPost(t, f, group, "", "b", "新话题：OPS-12 入口")
@@ -220,7 +267,9 @@ func TestThreadStateCorrectionFencesClaimAndReturnedEvidence(t *testing.T) {
 
 func TestThreadStateCorrectionCoverageAndFreshConfirmation(t *testing.T) {
 	f := newPrepareFixture(t)
-	requireStateCorrectionFixture(t, f)
+	if !stateCorrectionFixtureReady(t, f) {
+		return
+	}
 	p, group := f.preparer(t), f.group.ID
 	a := stateCorrectionPost(t, f, group, "", "a", "新话题：OPS-21 导出")
 	b := stateCorrectionPost(t, f, group, "", "b", "新话题：OPS-22 导入")
@@ -277,7 +326,10 @@ func TestThreadStateCorrectionCoverageAndFreshConfirmation(t *testing.T) {
 // on having any E2 state (or even the E2 migration).
 func TestThreadStateCorrectionClaimWithoutState(t *testing.T) {
 	f := newPrepareFixture(t)
-	requireCorrectionLedger(t, f)
+	if !threadCorrectionFixtureInstalled(t, f.db) {
+		assertStateCorrectionScopedFallback(t, f, threadStateFixtureInstalled(t, f), false)
+		return
+	}
 	p, group := f.preparer(t), f.group.ID
 	a := stateCorrectionPost(t, f, group, "", "a", "新话题：LOG-45 导出")
 	source := stateCorrectionPost(t, f, group, "", "source", "Corrected-in note.")
@@ -287,21 +339,47 @@ func TestThreadStateCorrectionClaimWithoutState(t *testing.T) {
 		t.Fatalf("missing correction fence in empty state: %+v", before)
 	}
 	stateCorrectionMove(t, f, source, "LOG-45", a.TopicID, "in")
-	if turn, err := f.s.ClaimTurn(t.Context(), store.ClaimTurnInput{GroupID: group, DeliveryID: trigger.Deliveries[0].ID, MaxActive: 1,
+	deliveryID := trigger.Deliveries[0].ID
+	if turn, err := f.s.ClaimTurn(t.Context(), store.ClaimTurnInput{GroupID: group, DeliveryID: deliveryID, MaxActive: 1,
 		PreparedThreadState: prepared.PreparedThreadState, ResourceKeys: prepared.ResourceKeys}); turn.ID != "" || !errors.Is(err, store.ErrTurnBusy) {
 		t.Fatalf("history-only incoming correction admitted a stale prompt: %+v, %v", turn, err)
+	}
+	var clean bool
+	if err := f.db.QueryRow(`SELECT state='queued' AND turn_id='' AND NOT EXISTS(SELECT 1 FROM turns)
+	 AND NOT EXISTS(SELECT 1 FROM resource_claims) FROM deliveries WHERE id=?`, deliveryID).Scan(&clean); err != nil || !clean {
+		t.Fatalf("stale claim changed the queued delivery or left a durable reservation: clean=%t, %v", clean, err)
+	}
+	fresh, after := stateCorrectionPrepare(t, p, trigger)
+	if after.State != nil || len(after.Pending) != 1 || after.Pending[0].ID != trigger.ID ||
+		!slices.ContainsFunc(after.History, func(m contextpack.Message) bool { return m.ID == source.ID }) {
+		t.Fatalf("fresh preparation lost the trigger or corrected-in history, or invented state: %+v", after)
+	}
+	assertEmptyStatePreparationStamp(t, fresh.PreparedThreadState, trigger, true)
+	if turn, err := f.s.ClaimTurn(t.Context(), store.ClaimTurnInput{GroupID: group, DeliveryID: deliveryID, MaxActive: 1,
+		PreparedThreadState: fresh.PreparedThreadState, ResourceKeys: fresh.ResourceKeys}); err != nil || turn.ID == "" || turn.DeliveryID != deliveryID || turn.State != domain.TurnStateStarting {
+		t.Fatalf("fresh preparation could not claim the same delivery: %+v, %v", turn, err)
 	}
 }
 
 func TestThreadStateCorrectionKeepsFormalStoredEvidence(t *testing.T) {
 	f := newRolePrepareFixture(t)
-	requireStateCorrectionFixture(t, f.prepareFixture)
 	role := f.state.Provenance
 	scope := domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: role.GroupID, TopicID: role.TopicID}, TaskID: role.TaskID, TaskRevision: role.TaskRevision}
 	destination := stateCorrectionPost(t, f.prepareFixture, role.GroupID, "", "elsewhere", "新话题：REL-17 独立讨论")
 	source := stateCorrectionPost(t, f.prepareFixture, role.GroupID, role.TopicID, "formal-source", "Keep the signed release list.")
+	if !threadStateFixtureInstalled(t, f.prepareFixture) {
+		assertStateCorrectionUnavailable(t, f.prepareFixture, scope, source)
+		if got, err := f.s.LoadAuthorizedTaskThreadState(t.Context(), f.state); err != nil || got != nil {
+			t.Fatalf("bound formal preparation without E2 returned state: %+v, %v", got, err)
+		}
+		assertLegacyThreadPreparation(t, f.prepareFixture, f.ordinary)
+		f.assertQueued(t)
+		return
+	}
 	stateCorrectionSet(t, f.prepareFixture, scope, 0, 0, domain.ThreadStateConstraint, "set", source, source.ID)
-	stateCorrectionMove(t, f.prepareFixture, source, "REL-17", destination.TopicID, "out")
+	if threadCorrectionFixtureInstalled(t, f.db) {
+		stateCorrectionMove(t, f.prepareFixture, source, "REL-17", destination.TopicID, "out")
+	}
 	got, err := f.s.LoadAuthorizedTaskThreadState(t.Context(), f.state)
 	if err != nil || got == nil || got.Scope != scope || len(got.Records) != 1 || got.Records[0].Source.MessageID != source.ID ||
 		got.Records[0].Content != source.Content || got.CoveredThrough == nil || got.CoveredThrough.MessageID != source.ID {

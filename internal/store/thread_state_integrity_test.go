@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"slices"
 	"testing"
 
 	"agentworkspace/internal/domain"
@@ -23,8 +24,16 @@ func assertUnregisteredThreadState(t *testing.T, s *Store, source domain.Message
 	if err != nil {
 		t.Fatal(err)
 	}
-	if history, state, err := s.LoadThreadPreparation(ctx, thread, trigger.ID, 50); err != nil || state != nil || len(history) != 1 || history[0].ID != source.ID {
-		t.Fatalf("unregistered E2 changed legacy history or invented state: %+v, %+v, %v", history, state, err)
+	got, err := s.LoadThreadPreparation(ctx, thread, trigger.ID, 50)
+	if err != nil || got.State != nil || len(got.History) != 1 || got.History[0].ID != source.ID {
+		t.Fatalf("unregistered E2 changed scoped history or invented state: %+v, %v", got, err)
+	}
+	if slices.Contains(migrations, threadCorrectionSchema) {
+		if got.Claim == nil || got.Claim.ThreadRef != thread || got.Claim.MessageID != trigger.ID || got.Claim.Revision != 0 || got.Claim.stateInstalled {
+			t.Fatalf("E1b-only preparation lost its bound correction stamp: %+v", got.Claim)
+		}
+	} else if got.Claim != nil {
+		t.Fatalf("legacy preparation invented a claim stamp: %+v", got.Claim)
 	}
 	var clean bool
 	if err := s.db.QueryRow(`SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN ('thread_state_revisions','thread_state_heads'))
