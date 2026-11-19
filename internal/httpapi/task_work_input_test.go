@@ -105,6 +105,7 @@ func TestTaskWorkInputsHTTPScopedHistory(t *testing.T) {
 	impacts := decoded[listResult[domain.TaskImpact]](t, get(impactURL), 200)
 	if len(impacts.Items) != 1 || impacts.Items[0].Kind != domain.TaskImpactConstraintConfirmed ||
 		impacts.Items[0].Source.InputID != inbox[0].ID || impacts.Items[0].Source.MessageID != inbox[0].ReplyMessageID ||
+		impacts.Items[0].Source.SourceSequence != inbox[0].SourceSequence || impacts.Items[0].Source.SourceSequence <= 0 ||
 		impacts.Items[0].Acknowledgement == nil || impacts.Items[0].Delivery != nil || impacts.Items[0].Decision != nil {
 		t.Fatalf("incorrect impact (pending input must not appear, ACK is not delivery): %+v", impacts)
 	}
@@ -123,7 +124,8 @@ func TestTaskWorkInputsHTTPScopedHistory(t *testing.T) {
 	if handoff.Kind != domain.TaskImpactWorkInputReturned || handoff.Acknowledgement != nil || handoff.Plan != nil || handoff.Decision == nil ||
 		handoff.Decision.Question != returned.Return.Question || handoff.Decision.Question == "" || !handoff.Decision.ScopeCurrent ||
 		handoff.Decision.AttemptID != returned.Return.AttemptID || handoff.Decision.TurnID != worker.Claim.TurnID ||
-		handoff.Source.MessageID != returned.ReplyMessageID || handoff.Source.SourceID != returned.SourceID || handoff.Source.TriggerID != returned.TriggerID ||
+		handoff.Source.MessageID != returned.ReplyMessageID || handoff.Source.SourceSequence != returned.SourceSequence ||
+		handoff.Source.SourceID != returned.SourceID || handoff.Source.TriggerID != returned.TriggerID ||
 		handoff.Source.AssignmentID != returned.AssignmentID || handoff.Source.MandateID != returned.MandateID ||
 		handoff.Source.AuthorityGeneration != 1 || handoff.TaskRevision != returned.TaskRevision {
 		t.Fatalf("handoff lost the concrete question or original authorized scope: %+v", handoff)

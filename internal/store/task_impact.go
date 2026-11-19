@@ -16,8 +16,9 @@ func taskImpactSchemaInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
 	return installed, err
 }
 
-// The sole producer is the fresh branch of the real owner handling command.
-// A lower proposal ACK after a higher one is historical handling, not a revert.
+// The real owner handling command calls this only on fresh handling. Each
+// changed input is independent: neither proposal order nor a shared excerpt
+// proves supersession. The ACK transaction fences the evidence it invalidates.
 func recordTaskImpactInTx(ctx context.Context, tx *sql.Tx, i domain.TaskWorkInput, request domain.DispatchRequest) error {
 	if i.Return == nil && (i.Consumption == nil || i.AfterConstraintRevision <= i.BeforeConstraintRevision) {
 		return nil
@@ -33,24 +34,11 @@ func recordTaskImpactInTx(ctx context.Context, tx *sql.Tx, i domain.TaskWorkInpu
 		return coordinationDispatchWrite(ctx, tx, insertRoot, i.ID, i.ID, i.GroupID, i.TaskID, i.TaskID, i.TaskRevision,
 			i.Return.ReturnedAt.Format(timestampLayout), domain.TaskImpactWorkInputReturned, i.ID, "")
 	}
-	var previous int64
-	var quote string
-	err = tx.QueryRowContext(ctx, `SELECT j.after_revision,j.after_constraint FROM task_work_inputs j
-	 JOIN task_work_input_consumptions c ON c.input_id=j.id
-	 WHERE (j.group_id,j.task_id,j.task_revision)=(?,?,?) AND j.after_revision>j.before_revision
-	 AND (j.assignment_id,j.mandate_id)=(?,?) AND j.id<>? ORDER BY j.after_revision DESC LIMIT 1`,
-		i.GroupID, i.TaskID, i.TaskRevision, i.AssignmentID, i.MandateID, i.ID).Scan(&previous, &quote)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	if previous >= i.AfterConstraintRevision || quote == i.AfterConstraint {
-		return nil
-	}
 
 	// Publish only in the original thread, without deliveries, source text,
 	// or foreign-topic task IDs. This is not a wake, read receipt or grant.
 	message, err := createMessageInTx(ctx, tx, MessageRequest{GroupID: i.GroupID, TopicID: i.TopicID, ActorID: i.WorkerMemberID,
-		RecipientIDs: []string{}, Content: fmt.Sprintf("平台记录：负责人已确认任务 %s（版本 %d）的后续约束。请按新约束重新核对原计划和验收要求；历史报告、提交和评审不被改写。", i.TaskID, i.TaskRevision)}, nil)
+		RecipientIDs: []string{}, Content: fmt.Sprintf("平台记录：负责人已确认任务 %s（版本 %d）一条后续输入中的约束。请据此重新核对原计划和验收要求；历史报告、提交和评审不被改写。", i.TaskID, i.TaskRevision)}, nil)
 	if err != nil {
 		return err
 	}

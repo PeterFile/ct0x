@@ -13,6 +13,11 @@ import (
 func impactInput(t *testing.T, f chatFixture, quote, constraint string) (domain.ChatAssessmentReceipt, domain.ChatCandidate) {
 	t.Helper()
 	a, c := newWorkInputCandidate(t, f, quote)
+	return assessImpactInput(t, f, a, c, constraint), c
+}
+
+func assessImpactInput(t *testing.T, f chatFixture, a MemberToolScope, c domain.ChatCandidate, constraint string) domain.ChatAssessmentReceipt {
+	t.Helper()
 	apply := f.s.ApplyChatAssessment
 	if !f.s.taskWorkExecution.Load() {
 		apply = f.s.ApplyChatAssessmentDormant
@@ -24,7 +29,7 @@ func impactInput(t *testing.T, f chatFixture, quote, constraint string) (domain.
 		t.Fatalf("trusted followup: %+v %v", out, err)
 	}
 	taskWorkTestReceipt(t, f.s, a, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}, domain.TurnStateNotStarted)
-	return out, c
+	return out
 }
 
 func impacts(t *testing.T, s *Store, groupID, taskID string) []domain.TaskImpact {
@@ -186,31 +191,148 @@ func TestConstraintImpactReplansWithExistingOwnerAndExactReports(t *testing.T) {
 	dispatchAssertFK(t, s)
 }
 
-func TestConstraintImpactContextOnlyAndLateOlderACK(t *testing.T) {
+func TestConstraintImpactIndependentACKs(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		assessOrder [2]int
+	}{
+		{"older-source-ACKed-last", [2]int{0, 1}},
+		{"newer-source-assessed-first-ACKed-last", [2]int{1, 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, owner, child, _ := workReportOwner(t, 1)
+			s, scope, p := f.s, owner.Member, owner.Provenance
+			quotes := [2]string{"保持旧格式兼容", "注明结论来源"}
+			var intake [2]MemberToolScope
+			var sources [2]domain.ChatCandidate
+			var proposals [2]domain.ChatAssessmentReceipt
+			for n, quote := range quotes {
+				intake[n], sources[n] = newWorkInputCandidate(t, f, quote)
+			}
+			if sources[0].Generation >= sources[1].Generation {
+				t.Fatalf("user messages must commit in A, B order: %d >= %d", sources[0].Generation, sources[1].Generation)
+			}
+			for _, n := range tc.assessOrder {
+				proposals[n] = assessImpactInput(t, f, intake[n], sources[n], quotes[n])
+			}
+			// Confirm in reverse proposal order, independently of message order.
+			late, early := tc.assessOrder[0], tc.assessOrder[1]
+			ack := func(n int) domain.TaskWorkInput {
+				t.Helper()
+				id := proposals[n].WorkInputID
+				got, err := s.AcknowledgeWorkInputWithKey(ctx, scope, id, id)
+				if err != nil || got.ID != id || got.Consumption == nil {
+					t.Fatalf("ACK %q: %+v %v", quotes[n], got, err)
+				}
+				return got
+			}
+			first := ack(early)
+			if got := impacts(t, s, p.GroupID, p.TaskID); len(got) != 1 || got[0].Source.InputID != first.ID {
+				t.Fatalf("only the first ACK should have an impact so far: %+v", got)
+			}
+			d, err := s.DelegateWork(ctx, scope, domain.DelegateWorkInput{MemberID: child.ID, Question: "核对已确认的要求。"}, "intervening-check")
+			if err != nil {
+				t.Fatal(err)
+			}
+			wake, err := s.ResolveTaskWorkDelivery(ctx, p.GroupID, d.DeliveryID)
+			if err != nil || wake.Blocked != "" {
+				t.Fatalf("intervening delegation: %+v %v", wake, err)
+			}
+			worker := taskWorkTestClaim(t, s, wake)
+			queueEvent(t, s, worker.Claim, provider.AcceptedEvent, "", "")
+			report, err := s.ReportWork(ctx, worker, domain.ReportWorkInput{Kind: domain.TaskWorkReportDelivered, Summary: "已核对已确认的要求。"}, "intervening-report")
+			if err != nil {
+				t.Fatal(err)
+			}
+			taskWorkTestReceipt(t, s, worker, queueReceipt(provider.OutcomeSucceeded), domain.TurnStateSucceeded)
+			if got, err := s.GetWorkReportForMember(ctx, scope, report.ID); err != nil || got != report {
+				t.Fatalf("report not current between ACKs: %+v %v", got, err)
+			}
+
+			second := ack(late)
+			items := impacts(t, s, p.GroupID, p.TaskID)
+			if len(items) != 4 {
+				t.Fatalf("independent ACKs must record two confirmations and invalidate the intervening delegation and report: %+v", items)
+			}
+			for order, want := range []domain.TaskWorkInput{second, first} {
+				n := tc.assessOrder[order]
+				var before string
+				if order == 1 {
+					before = quotes[late] // The first persisted proposal was still pending when assessed.
+				}
+				idx := slices.IndexFunc(items, func(x domain.TaskImpact) bool {
+					return x.Kind == domain.TaskImpactConstraintConfirmed && x.Source.InputID == want.ID
+				})
+				if idx < 0 {
+					t.Fatalf("missing confirmation for %q: %+v", quotes[n], items)
+				}
+				x, c := items[idx], sources[n]
+				if x.Source.MessageID != c.MessageID || x.Source.SourceSequence != c.Generation || x.Source.SourceSequence != want.SourceSequence ||
+					x.Source.SourceID != c.SourceID || x.Source.TriggerID != want.TriggerID || x.Acknowledgement == nil ||
+					*x.Acknowledgement != *want.Consumption || x.Decision != nil || x.Plan == nil ||
+					x.Plan.BeforeConstraintRevision != int64(order) || x.Plan.BeforeConstraint != before ||
+					x.Plan.AfterConstraintRevision != int64(order+1) || x.Plan.AfterConstraint != quotes[n] {
+					t.Fatalf("lost original proposal snapshot or exact ACK for %q: %+v", quotes[n], x)
+				}
+			}
+			for _, x := range []domain.TaskImpact{
+				requireImpact(t, items, domain.TaskImpactStaleDelegation, d.ID),
+				requireImpact(t, items, domain.TaskImpactStaleWorkReport, report.ID),
+			} {
+				if x.Source.InputID != second.ID || x.Source.SourceSequence != second.SourceSequence ||
+					x.Acknowledgement == nil || *x.Acknowledgement != *second.Consumption {
+					t.Fatalf("wrong ACK invalidated the intervening evidence: %+v", x)
+				}
+			}
+			if _, err := s.GetWorkReportForMember(ctx, scope, report.ID); !errors.Is(err, ErrConflict) {
+				t.Fatalf("pre-confirmation report remained current: %v", err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s = queueHandle(t, f.path, false)
+			s.EnableInvestigationExecution()
+			s.EnableTaskWorkExecution()
+			if got, err := s.GetTaskWorkReport(ctx, p.GroupID, report.ID); err != nil || got != report {
+				t.Fatalf("lost immutable report after reopening: %+v %v", got, err)
+			}
+			if got, err := s.ResolveTaskWorkDelivery(ctx, p.GroupID, report.DeliveryID); err != nil || got.Blocked != "constraint_impact_stale" {
+				t.Fatalf("intervening report wake was usable after reopen: %+v %v", got, err)
+			}
+			before := messageSequenceSnapshot(t, s)
+			if !reflect.DeepEqual(ack(early), first) || !reflect.DeepEqual(ack(late), second) {
+				t.Fatal("identical replay after reopening changed an ACK")
+			}
+			messageSequencePreserved(t, s, before)
+			if saved := impacts(t, s, p.GroupID, p.TaskID); !reflect.DeepEqual(saved, items) {
+				t.Fatalf("reopen or replay changed the impacts: %+v", saved)
+			}
+		})
+	}
+}
+
+func TestConstraintImpactContextOnlyAndSharedQuote(t *testing.T) {
 	f := chatSetup(t, "user", false)
 	owner := chatAuthorityWorker(t, f)
-	for _, in := range []struct{ body, quote string }{{"保持旧格式兼容", "保持旧格式兼容"}, {"保持旧版 CSV 兼容", "保持旧版 CSV 兼容"}, {"供参考：有旧格式样本。", ""}} {
-		impactInput(t, f, in.body, in.quote)
-	}
-	inbox, err := f.s.ListWorkInputsForMember(ctx, owner.Member)
-	if err != nil || len(inbox) != 3 {
-		t.Fatalf("inbox: %+v %v", inbox, err)
-	}
-	for _, n := range []int{1, 0, 2} {
-		if _, err := f.s.AcknowledgeWorkInputWithKey(ctx, owner.Member, inbox[n].ID, inbox[n].ID); err != nil {
+	const quote = "注明结论来源"
+	for _, tc := range []struct {
+		body, excerpt string
+		confirmations int
+	}{
+		{"在正文" + quote, quote, 1},
+		{"供参考：有旧格式样本。", "", 1},
+		{"在摘要" + quote, quote, 2},
+	} {
+		r, _ := impactInput(t, f, tc.body, tc.excerpt)
+		if _, err := f.s.AcknowledgeWorkInputWithKey(ctx, owner.Member, r.WorkInputID, r.WorkInputID); err != nil {
 			t.Fatal(err)
 		}
-	}
-	got := impacts(t, f.s, f.groupID, owner.Provenance.TaskID)
-	if len(got) != 1 || got[0].Plan == nil || got[0].Plan.AfterConstraintRevision != 2 || got[0].Source.InputID != inbox[1].ID {
-		t.Fatalf("late or context-only confirmations falsely changed effective constraint: %+v", got)
-	}
-	restated, _ := impactInput(t, f, "保持旧版 CSV 兼容", "保持旧版 CSV 兼容")
-	if _, err := f.s.AcknowledgeWorkInputWithKey(ctx, owner.Member, restated.WorkInputID, "restated"); err != nil {
-		t.Fatal(err)
-	}
-	if unchanged := impacts(t, f.s, f.groupID, owner.Provenance.TaskID); !reflect.DeepEqual(unchanged, got) {
-		t.Fatalf("same effective quote marked current work stale again: %+v", unchanged)
+		got := impacts(t, f.s, f.groupID, owner.Provenance.TaskID)
+		if len(got) != tc.confirmations || slices.ContainsFunc(got, func(x domain.TaskImpact) bool {
+			return x.Kind == domain.TaskImpactConstraintConfirmed && x.Source.InputID == r.WorkInputID
+		}) != (tc.excerpt != "") {
+			t.Fatalf("context is not a change and shared excerpt does not identify a replay: %+v", got)
+		}
 	}
 }
 

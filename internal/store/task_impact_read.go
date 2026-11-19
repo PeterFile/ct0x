@@ -72,7 +72,7 @@ func (s *Store) ListTaskImpacts(ctx context.Context, groupID, taskID string, opt
 }
 
 const taskImpactSelect = `SELECT x.id,x.kind,x.task_id,x.task_revision,t.status,x.created_at,x.ref_id,
- i.group_id,i.topic_id,i.id,f.reply_message_id,i.source_id,f.trigger_id,i.task_id,i.task_revision,
+ i.group_id,i.topic_id,i.id,f.reply_message_id,origin.message_sequence,i.source_id,f.trigger_id,i.task_id,i.task_revision,
  i.assignment_id,i.mandate_id,r.authority_generation,i.worker_member_id,
  coalesce(c.turn_id,''),coalesce(c.attempt_id,''),c.consumed_at,
  m.acceptance,i.before_revision,i.before_constraint,i.after_revision,i.after_constraint,coalesce(x.notice_message_id,''),
@@ -92,6 +92,8 @@ const taskImpactSelect = `SELECT x.id,x.kind,x.task_id,x.task_revision,t.status,
  JOIN tasks t ON (t.id,t.group_id)=(x.task_id,x.group_id)
  JOIN task_work_inputs i ON (i.id,i.group_id)=(x.input_id,x.group_id)
  JOIN chat_followup_routes f ON (f.source_id,f.group_id,f.topic_id)=(i.source_id,i.group_id,i.topic_id)
+ JOIN coordination_triggers origin ON (origin.id,origin.group_id,origin.topic_id,origin.message_id)=
+ (f.trigger_id,i.group_id,i.topic_id,f.reply_message_id)
  JOIN coordination_assignments a ON (a.id,a.task_id,a.group_id,a.worker_member_id)=(i.assignment_id,i.task_id,i.group_id,i.worker_member_id)
  JOIN coordination_dispatch_requests r ON (r.id,r.group_id,r.task_id,r.task_revision,r.topic_id,r.mandate_id)=
  (a.request_id,i.group_id,i.task_id,i.task_revision,i.topic_id,i.mandate_id)
@@ -127,7 +129,7 @@ func scanTaskImpact(row scanner) (x domain.TaskImpact, err error) {
 	var stamp string
 	src := &x.Source
 	err = row.Scan(&x.ID, &x.Kind, &x.TaskID, &x.TaskRevision, &x.CurrentTaskStatus, &stamp, &x.EvidenceID,
-		&src.GroupID, &src.TopicID, &src.InputID, &src.MessageID, &src.SourceID, &src.TriggerID, &src.TaskID, &src.TaskRevision,
+		&src.GroupID, &src.TopicID, &src.InputID, &src.MessageID, &src.SourceSequence, &src.SourceID, &src.TriggerID, &src.TaskID, &src.TaskRevision,
 		&src.AssignmentID, &src.MandateID, &src.AuthorityGeneration, &src.OwnerMemberID,
 		&ack.TurnID, &ack.AttemptID, &consumed,
 		&plan.Acceptance, &plan.BeforeConstraintRevision, &plan.BeforeConstraint, &plan.AfterConstraintRevision, &plan.AfterConstraint, &plan.NoticeMessageID,
@@ -162,7 +164,7 @@ func scanTaskImpact(row scanner) (x domain.TaskImpact, err error) {
 	switch x.Kind {
 	case domain.TaskImpactConstraintConfirmed:
 		x.Plan, x.EvidenceID = &plan, ""
-		x.Reason = "负责人已确认新约束；原计划须按原授权和验收要求重新核对。"
+		x.Reason = "负责人已确认此后续输入中的约束；原计划须按原授权和验收要求重新核对。"
 	case domain.TaskImpactWorkInputReturned:
 		choice.ReturnedAt = x.CreatedAt
 		x.Decision, x.EvidenceID = &choice, ""

@@ -15,11 +15,14 @@ const (
 )
 
 // TaskImpactSource identifies the proven original user input and its admitted
-// owner scope. It is not an authority to answer, replace a pin, or start work.
+// owner scope. SourceSequence is the original message's commit sequence (the
+// WorkInput's SourceSequence), not the order of proposals or acknowledgements.
+// It is not an authority to answer, replace a pin, or start work.
 type TaskImpactSource struct {
 	ThreadRef
 	InputID             string `json:"input_id"`
 	MessageID           string `json:"message_id"`
+	SourceSequence      int64  `json:"source_sequence"`
 	SourceID            string `json:"source_id"`
 	TriggerID           string `json:"trigger_id"`
 	TaskID              string `json:"task_id"`
@@ -30,8 +33,9 @@ type TaskImpactSource struct {
 	OwnerMemberID       string `json:"owner_member_id"`
 }
 
-// Before and after are the original proposal versions, not a claim that the
-// previous proposal was effective. Acceptance is from the immutable Mandate.
+// Before and after are this WorkInput's original proposal snapshots, numbered
+// by assessment persistence. Neither is an effective-constraint view or a
+// replacement of another input. Acceptance is from the immutable Mandate.
 type TaskImpactPlan struct {
 	Acceptance               string `json:"acceptance"`
 	BeforeConstraintRevision int64  `json:"before_constraint_revision"`
