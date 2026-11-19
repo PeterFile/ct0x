@@ -29,6 +29,15 @@ func installDecisionAnswerFixture(t *testing.T, s *Store) {
 	s.EnableTaskWorkExecution()
 }
 
+func assertDecisionAnswerView(t *testing.T, s *Store, a domain.DecisionAnswerReceipt, handling *domain.TaskWorkInputConsumption) {
+	t.Helper()
+	got, err := s.GetDecisionAnswerView(ctx, a.ThreadRef, a.RequestID, a.Version)
+	want := domain.DecisionAnswerView{Receipt: a, Handling: handling}
+	if err != nil || !reflect.DeepEqual(got, want) {
+		t.Fatalf("decision answer view = %+v (handling: %+v), %v; want receipt %+v, handling %+v", got, got.Handling, err, a, handling)
+	}
+}
+
 func TestDecisionAnswerOneWakeAndExplicitOwnerAckAfterReopen(t *testing.T) {
 	f := chatSetup(t, "user", false)
 	f.input.Title = "周末样本验证"
@@ -125,6 +134,23 @@ func TestDecisionAnswerOneWakeAndExplicitOwnerAckAfterReopen(t *testing.T) {
 		t.Fatalf("pending isolation: %+v %v", p, err)
 	}
 	after := messageSequenceSnapshot(t, s)
+	assertDecisionAnswerView(t, s, a, nil)
+	for _, wrong := range []struct {
+		thread  domain.ThreadRef
+		id      string
+		version int64
+	}{
+		// The other group has a same-named Task but no saved answer of its own.
+		{otherQ.ThreadRef, q.ID, q.Version},
+		{otherQ.ThreadRef, otherQ.ID, otherQ.Version},
+		{domain.ThreadRef{GroupID: q.GroupID, TopicID: q.TopicID + " "}, q.ID, q.Version},
+		{q.ThreadRef, "missing", q.Version},
+		{q.ThreadRef, q.ID, q.Version + 1},
+	} {
+		if got, err := s.GetDecisionAnswerView(ctx, wrong.thread, wrong.id, wrong.version); !errors.Is(err, ErrNotFound) || got != (domain.DecisionAnswerView{}) {
+			t.Fatalf("wrong scope %+v returned an answer: %+v %v", wrong, got, err)
+		}
+	}
 	changed := response
 	changed.Text = "加入周末"
 	if got, err := s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, changed, "another-answer"); got.ID != "" || !errors.Is(err, ErrConflict) {
@@ -187,21 +213,35 @@ func TestDecisionAnswerOneWakeAndExplicitOwnerAckAfterReopen(t *testing.T) {
 	if inbox, err := s.ListWorkInputsForMember(ctx, live); err != nil || len(inbox) != 1 || inbox[0].ID != a.ID {
 		t.Fatalf("decision missing from the bounded worker inbox: %+v %v", inbox, err)
 	}
+	queueEvent(t, s, live.Claim, provider.AcceptedEvent, "", "")
+	assertDecisionAnswerView(t, s, a, nil) // Accepted input with a bound Attempt is not an ACK.
+	var handling *domain.TaskWorkInputConsumption
 	for _, key := range []string{"ack-first", "ack-second"} {
 		got, err := s.AcknowledgeWorkInputWithKey(ctx, live, i.ID, key)
 		if err != nil || got.Consumption == nil || got.Consumption.TurnID != live.Claim.TurnID || got.Consumption.AttemptID != attempt.ID {
 			t.Fatalf("explicit handling not durable: %+v %v", got, err)
 		}
+		if handling != nil && *got.Consumption != *handling {
+			t.Fatalf("ACK replay changed handling: %+v, want %+v", got.Consumption, handling)
+		}
+		handling = got.Consumption
 	}
+	afterAck := messageSequenceSnapshot(t, s)
+	assertDecisionAnswerView(t, s, a, handling)
 	if got, err := s.GetDecisionAnswer(ctx, q.ThreadRef, q.ID, q.Version); err != nil || got != a {
 		t.Fatalf("handling changed saved answer: %+v %v", got, err)
 	}
-	if got, err := s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, response, "retry-after-ack"); err != nil || got != a {
-		t.Fatalf("retry after handling changed saved answer: %+v %v", got, err)
+	messageSequencePreserved(t, s, afterAck)
+	for _, key := range []string{"global", "retry-after-ack"} {
+		if got, err := s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, response, key); err != nil || got != a {
+			t.Fatalf("retry after handling changed saved answer: %+v %v", got, err)
+		}
 	}
 	if _, err := s.ClaimTurn(ctx, ClaimTurnInput{GroupID: q.GroupID, DeliveryID: a.WakeDeliveryID, MaxActive: 4}); !errors.Is(err, ErrTurnBusy) {
 		t.Fatalf("saved answer could claim a second continuation: %v", err)
 	}
+	taskWorkTestReceipt(t, s, live, queueReceipt(provider.OutcomeSucceeded), domain.TurnStateSucceeded)
+	assertDecisionAnswerView(t, s, a, handling)
 	for query, want := range map[string]int{
 		`SELECT count(*) FROM task_work_deliveries WHERE source_kind='followup'`: 1,
 		`SELECT count(*) FROM decision_answer_consumptions`:                      1,
@@ -311,6 +351,11 @@ func TestDecisionAnswerWithdrawalAfterClaimFencesLaunchAndAck(t *testing.T) {
 		t.Fatalf("withdrawal bypassed handling fence: %v", err)
 	}
 	messageSequencePreserved(t, s, before)
+	queueEvent(t, s, live.Claim, provider.AcceptedEvent, "", "")
+	queueEvent(t, s, live.Claim, provider.TerminalEvent, "", provider.OutcomeSucceeded)
+	assertDecisionAnswerView(t, s, a, nil)
+	taskWorkTestReceipt(t, s, live, queueReceipt(provider.OutcomeSucceeded), domain.TurnStateSucceeded)
+	assertDecisionAnswerView(t, s, a, nil) // Settlement and resource release are not ACKs either.
 }
 
 func TestDecisionAnswerDoesNotTreatClarificationAsGenericChat(t *testing.T) {

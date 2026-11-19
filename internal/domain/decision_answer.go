@@ -27,3 +27,10 @@ type DecisionAnswerReceipt struct {
 	WakeMessageID  string    `json:"wake_message_id"`
 	CreatedAt      time.Time `json:"created_at"`
 }
+
+// DecisionAnswerView separates the immutable saved receipt from explicit owner
+// handling. Without a persisted acknowledgement, Handling is nil.
+type DecisionAnswerView struct {
+	Receipt  DecisionAnswerReceipt     `json:"receipt"`
+	Handling *TaskWorkInputConsumption `json:"handling"`
+}

@@ -15,3 +15,7 @@ func (s *LocalUser) ListPendingTaskDecisions(ctx context.Context, opts store.Lis
 func (s *LocalUser) AnswerDecisionRequest(ctx context.Context, thread domain.ThreadRef, id string, input domain.DecisionAnswerInput, key string) (domain.DecisionAnswerReceipt, error) {
 	return coordination.New(s.db).AnswerDecisionRequest(ctx, thread, id, input, key)
 }
+
+func (s *LocalUser) GetDecisionAnswerView(ctx context.Context, thread domain.ThreadRef, id string, version int64) (domain.DecisionAnswerView, error) {
+	return coordination.New(s.db).GetDecisionAnswerView(ctx, thread, id, version)
+}

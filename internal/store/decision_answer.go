@@ -238,8 +238,19 @@ func decisionAnswerReceiptInTx(ctx context.Context, tx *sql.Tx, thread domain.Th
 // GetDecisionAnswer reads the saved fact, even after the work/version is no
 // longer runnable. It does not requeue the wake or report owner handling.
 func (s *Store) GetDecisionAnswer(ctx context.Context, thread domain.ThreadRef, id string, version int64) (domain.DecisionAnswerReceipt, error) {
+	view, err := s.readDecisionAnswer(ctx, thread, id, version, false)
+	return view.Receipt, err
+}
+
+// GetDecisionAnswerView reads the saved receipt and its explicit handling in
+// one snapshot, without checking current execution authority or waking work.
+func (s *Store) GetDecisionAnswerView(ctx context.Context, thread domain.ThreadRef, id string, version int64) (domain.DecisionAnswerView, error) {
+	return s.readDecisionAnswer(ctx, thread, id, version, true)
+}
+
+func (s *Store) readDecisionAnswer(ctx context.Context, thread domain.ThreadRef, id string, version int64, includeHandling bool) (domain.DecisionAnswerView, error) {
 	const action = "读取用户决定回执失败"
-	var zero domain.DecisionAnswerReceipt
+	var zero domain.DecisionAnswerView
 	if !validTriggerID(id) || !validTriggerID(thread.GroupID) || version <= 0 {
 		return zero, ErrInvalid
 	}
@@ -251,14 +262,46 @@ func (s *Store) GetDecisionAnswer(ctx context.Context, thread domain.ThreadRef, 
 	if err := requireDecisionAnswersInTx(ctx, tx); err != nil {
 		return zero, decisionRequestError(action, err)
 	}
-	a, err := decisionAnswerReceiptInTx(ctx, tx, thread, id, version)
+	receipt, err := decisionAnswerReceiptInTx(ctx, tx, thread, id, version)
 	if err != nil {
 		return zero, decisionRequestError(action, err)
+	}
+	view := domain.DecisionAnswerView{Receipt: receipt}
+	if includeHandling {
+		view.Handling, err = decisionAnswerHandlingInTx(ctx, tx, receipt)
+		if err != nil {
+			return zero, decisionRequestError(action, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return zero, decisionRequestError(action, err)
 	}
-	return a, nil
+	return view, nil
+}
+
+func decisionAnswerHandlingInTx(ctx context.Context, tx *sql.Tx, receipt domain.DecisionAnswerReceipt) (*domain.TaskWorkInputConsumption, error) {
+	// Check the durable continuation identity, not its current Turn or Task state.
+	var handling domain.TaskWorkInputConsumption
+	var stamp string
+	var bound bool
+	err := tx.QueryRowContext(ctx, `SELECT h.turn_id,h.attempt_id,h.consumed_at, EXISTS(SELECT 1`+taskWorkContinuationRelations+`
+	 JOIN task_work_continuations b ON (b.delivery_id,b.turn_id,b.attempt_id)=(w.delivery_id,t.id,a.id)
+	 WHERE (b.delivery_id,b.turn_id,b.attempt_id)=(?,h.turn_id,h.attempt_id))
+	 FROM decision_answer_consumptions h WHERE h.answer_id=?`, receipt.WakeDeliveryID, receipt.ID).
+		Scan(&handling.TurnID, &handling.AttemptID, &stamp, &bound)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !bound {
+		return nil, ErrNotFound
+	}
+	if handling.ConsumedAt, err = time.Parse(timestampLayout, stamp); err != nil {
+		return nil, err
+	}
+	return &handling, nil
 }
 
 func isDecisionAnswerID(id string) bool { return strings.HasPrefix(id, decisionAnswerSourcePrefix) }

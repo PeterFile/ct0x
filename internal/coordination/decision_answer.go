@@ -17,6 +17,10 @@ func (e *Engine) GetDecisionAnswer(ctx context.Context, thread domain.ThreadRef,
 	return e.store.GetDecisionAnswer(ctx, thread, id, version)
 }
 
+func (e *Engine) GetDecisionAnswerView(ctx context.Context, thread domain.ThreadRef, id string, version int64) (domain.DecisionAnswerView, error) {
+	return e.store.GetDecisionAnswerView(ctx, thread, id, version)
+}
+
 func (e *Engine) ListPendingTaskDecisions(ctx context.Context, opts store.ListOptions) (store.Page[domain.DecisionRequest], error) {
 	return e.store.ListPendingTaskDecisions(ctx, opts)
 }

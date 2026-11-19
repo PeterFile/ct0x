@@ -15,6 +15,7 @@ func LocalUserRoutes(local *platform.LocalUser) []Route {
 	a := localAPI{local}
 	return []Route{
 		{http.MethodGet, "/api/v1/me/pending-decisions", a.listPendingDecisions},
+		{http.MethodGet, "/api/v1/me/decisions/{decision}/answer", a.getDecisionAnswer},
 		{http.MethodPost, "/api/v1/me/decisions/{decision}/answer", noQuery(a.answerDecision)},
 		{http.MethodPost, "/api/v1/groups/{group}/decisions/{decision}/answer", noQuery(a.answerDecision)},
 		{http.MethodGet, "/api/v1/groups", a.listGroups},

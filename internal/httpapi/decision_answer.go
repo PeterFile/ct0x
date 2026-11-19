@@ -3,6 +3,8 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"net/url"
+	"strconv"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/store"
@@ -21,6 +23,32 @@ func (a localAPI) listPendingDecisions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writePage(w, page, scope, "", nil)
+}
+
+func (a localAPI) getDecisionAnswer(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.ContentLength != 0 || len(r.TransferEncoding) != 0 {
+		operationError(w, store.ErrInvalid)
+		return
+	}
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil || len(query) != 3 || len(query["group_id"]) != 1 || len(query["topic_id"]) != 1 || len(query["version"]) != 1 {
+		operationError(w, store.ErrInvalid)
+		return
+	}
+	version, err := strconv.ParseInt(query.Get("version"), 10, 64)
+	if err != nil || version <= 0 {
+		operationError(w, store.ErrInvalid)
+		return
+	}
+	// TopicID must be supplied, even when its exact value is the empty main topic.
+	thread := domain.ThreadRef{GroupID: query.Get("group_id"), TopicID: query.Get("topic_id")}
+	view, err := a.local.GetDecisionAnswerView(r.Context(), thread, r.PathValue("decision"), version)
+	if err != nil {
+		decisionAnswerHTTPError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, view)
 }
 
 func (a localAPI) answerDecision(w http.ResponseWriter, r *http.Request) {
