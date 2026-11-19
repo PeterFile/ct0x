@@ -36,7 +36,7 @@ func requireDecisionAnswersInTx(ctx context.Context, tx *sql.Tx) error {
 
 // AnswerDecisionRequest is a trusted local-user command shared by both routes.
 // thread is an exact assertion from the selected item, never a route to search.
-func (s *Store) AnswerDecisionRequest(ctx context.Context, actor string, thread domain.ThreadRef, id string, input domain.DecisionAnswerInput, key string) (domain.DecisionAnswerReceipt, error) {
+func (s *Store) AnswerDecisionRequest(ctx context.Context, actor string, thread domain.ThreadRef, id string, input domain.DecisionAnswerInput, key string) (_ domain.DecisionAnswerReceipt, err error) {
 	const action = "保存待决事项答复失败"
 	var zero domain.DecisionAnswerReceipt
 	if actor != "user" {
@@ -51,22 +51,58 @@ func (s *Store) AnswerDecisionRequest(ctx context.Context, actor string, thread 
 	if err != nil {
 		return zero, decisionRequestError(action, err)
 	}
-	defer tx.Rollback()
+	phase := "mutation"
+	defer func() {
+		rollback := tx.Rollback()
+		if err != nil {
+			failure := taskWorkMutationFailure(action, phase, err, rollback)
+			if failure.RollbackConfirmed() {
+				failure.message = decisionRequestError(action, err).Error()
+			} else {
+				failure.message = ErrDecisionAnswerUnknown.Error()
+				failure.cause = errors.Join(ErrDecisionAnswerUnknown, failure.cause)
+			}
+			err = failure
+		}
+	}()
 	if err := requireDecisionAnswersInTx(ctx, tx); err != nil {
-		return zero, decisionRequestError(action, err)
+		return zero, err
 	}
 	a, err := s.answerDecisionInTx(ctx, tx, actor, thread, id, input, key)
 	if err != nil {
-		return zero, decisionRequestError(action, err)
+		return zero, err
 	}
+	phase = "commit"
 	if err := tx.Commit(); err != nil {
-		return zero, ErrDecisionAnswerUnknown
+		return zero, err
 	}
 	return a, nil
 }
 
 func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string, thread domain.ThreadRef, id string, input domain.DecisionAnswerInput, key string) (domain.DecisionAnswerReceipt, error) {
 	var zero domain.DecisionAnswerReceipt
+	mutation := mutationScope{operation: "answer_decision_request", actorID: actor, groupID: thread.GroupID, key: key}
+	// Keep the canonical request form, not the resolved label of an option.
+	payload := mutationPayload(id, thread.TopicID, strconv.FormatInt(input.Version, 10), strconv.Itoa(input.OptionIndex), input.Text)
+	record, replay, err := lookupMutation(ctx, tx, mutation, payload)
+	if err != nil {
+		return zero, err
+	}
+	if replay {
+		// Exact keyed reconciliation reads the original proof even after the
+		// Task/version has closed. It is not a new authorization to do work.
+		a, err := decisionAnswerReceiptInTx(ctx, tx, thread, id, input.Version)
+		if errors.Is(err, sql.ErrNoRows) {
+			return zero, ErrConflict
+		}
+		if err != nil {
+			return zero, err
+		}
+		if a.ID != record || a.ActorID != actor || a.OptionIndex != input.OptionIndex || (input.OptionIndex == 0 && a.Text != input.Text) {
+			return zero, ErrConflict
+		}
+		return a, nil
+	}
 	q, err := decisionRequestVersionInTx(ctx, tx, decisionRequestCurrent, thread, id, input.Version, time.Now())
 	if errors.Is(err, sql.ErrNoRows) {
 		return zero, ErrConflict
@@ -87,12 +123,6 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 		}
 		text = q.Choices[input.OptionIndex-1]
 	}
-	mutation := mutationScope{operation: "answer_decision_request", actorID: actor, groupID: q.GroupID, key: key}
-	payload := mutationPayload(q.ID, q.TopicID, strconv.FormatInt(q.Version, 10), strconv.Itoa(input.OptionIndex), input.Text)
-	record, replay, err := lookupMutation(ctx, tx, mutation, payload)
-	if err != nil {
-		return zero, err
-	}
 	v, dispatch, err := coordinationAssignmentLoad(ctx, tx, q.Task.AssignmentID)
 	if err != nil {
 		return zero, coordinationRoleRelationError(err)
@@ -108,7 +138,7 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM decision_answers WHERE request_id=?)`, q.ID).Scan(&alreadySaved); err != nil {
 			return zero, err
 		}
-		if replay || alreadySaved {
+		if alreadySaved {
 			return zero, ErrConflict // Broken proof is not an absent answer.
 		}
 		a, err = saveDecisionTaskAnswerInTx(ctx, tx, q, v, actor, text, input.OptionIndex)
@@ -116,10 +146,10 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 	if err != nil {
 		return zero, err
 	}
-	if a.Text != text || (replay && record != a.ID) {
+	if a.ActorID != actor || a.OptionIndex != input.OptionIndex || a.Text != text {
 		return zero, ErrConflict
 	}
-	if key != "" && !replay {
+	if key != "" {
 		if err := coordinationDispatchWrite(ctx, tx, `INSERT INTO mutation_idempotency(operation,actor_id,group_id,idempotency_key,payload,record_id)
 		 VALUES(?,?,?,?,?,?)`, mutation.operation, mutation.actorID, mutation.groupID, key, payload, a.ID); err != nil {
 			return zero, err
@@ -169,6 +199,10 @@ func decisionTaskAuthorityInTx(ctx context.Context, tx *sql.Tx, q domain.Decisio
 	if blocked != "" {
 		return ErrConflict
 	}
+	return decisionTaskChatAuthorityInTx(ctx, tx, f)
+}
+
+func decisionTaskChatAuthorityInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts) error {
 	basis, err := taskWorkOwnerChatBasisInTx(ctx, tx, f)
 	if err == nil && basis.action == domain.ChatActionReadOnlyInvestigation {
 		// Saving a queued wake does not enable a process or provider. Durable
@@ -280,14 +314,13 @@ func (s *Store) readDecisionAnswer(ctx context.Context, thread domain.ThreadRef,
 }
 
 func decisionAnswerHandlingInTx(ctx context.Context, tx *sql.Tx, receipt domain.DecisionAnswerReceipt) (*domain.TaskWorkInputConsumption, error) {
-	// Check the durable continuation identity, not its current Turn or Task state.
+	// Check the durable continuation identity, not current execution authority.
 	var handling domain.TaskWorkInputConsumption
 	var stamp string
 	var bound bool
-	err := tx.QueryRowContext(ctx, `SELECT h.turn_id,h.attempt_id,h.consumed_at, EXISTS(SELECT 1`+taskWorkContinuationRelations+`
-	 JOIN task_work_continuations b ON (b.delivery_id,b.turn_id,b.attempt_id)=(w.delivery_id,t.id,a.id)
-	 WHERE (b.delivery_id,b.turn_id,b.attempt_id)=(?,h.turn_id,h.attempt_id))
-	 FROM decision_answer_consumptions h WHERE h.answer_id=?`, receipt.WakeDeliveryID, receipt.ID).
+	err := tx.QueryRowContext(ctx, `SELECT c.turn_id,c.attempt_id,c.consumed_at, `+decisionAnswerHandlingMatch+decisionAnswerEvidence+
+		decisionAnswerReplacementJoin+` JOIN decision_answer_consumptions c ON c.answer_id=ans.id
+	 WHERE (ans.id,work.delivery_id)=(?,?)`, receipt.ID, receipt.WakeDeliveryID).
 		Scan(&handling.TurnID, &handling.AttemptID, &stamp, &bound)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil

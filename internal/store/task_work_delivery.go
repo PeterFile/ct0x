@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"agentworkspace/internal/domain"
 )
@@ -246,8 +247,8 @@ func taskWorkDeliveryInTx(ctx context.Context, tx *sql.Tx, groupID, deliveryID s
 		return f, ErrMemberToolDenied
 	}
 	switch {
-	case d.SourceKind == domain.TaskWorkSourceFollowup && isDecisionAnswerID(d.SourceID):
-		err = decisionAnswerWakeSourceInTx(ctx, tx, *d)
+	case d.SourceKind == domain.TaskWorkSourceFollowup && (isDecisionAnswerID(d.SourceID) || strings.HasPrefix(d.SourceID, decisionAnswerReplacementPrefix)):
+		d.SourceID, err = decisionAnswerWakeSourceInTx(ctx, tx, *d)
 		f.decisionAnswer = err == nil
 	case d.SourceKind == domain.TaskWorkSourceFollowup:
 		f.assessmentID, f.sourceTurnID, err = taskWorkFollowupSourceInTx(ctx, tx, *d)
