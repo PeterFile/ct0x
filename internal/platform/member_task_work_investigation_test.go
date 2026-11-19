@@ -29,13 +29,15 @@ func TestInvestigationTaskWorkOwnerTransportV30Report(t *testing.T) {
 	testInvestigationTaskWorkOwnerTransportV30(t, domain.TaskWorkSourceReport)
 }
 
-// These are postclaim transport tests, not permission to start a process.
-// Every typed record and Attempt comes from the real v30 owner/member APIs.
+// These postclaim fixtures exercise the scoped HTTP handlers, not the outer
+// loopback server or permission to start a process. Every typed record and
+// Attempt comes from the real v30 owner/member APIs.
 func testInvestigationTaskWorkOwnerTransportV30(t *testing.T, kinds ...domain.TaskWorkSourceKind) {
 	for _, kind := range kinds {
 		t.Run(string(kind), func(t *testing.T) {
 			ctx := t.Context()
 			f := newBoundWorkReportFixture(t)
+			f.mountMemberToolHandlers(ctx)
 			var version int
 			roleOK(t, f.raw.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version))
 			if version != 30 {
