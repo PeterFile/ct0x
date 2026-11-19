@@ -131,8 +131,11 @@ func TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, route := range []string{global, group} {
-		if w := threadDecisionRequest(h, http.MethodPost, route, answer, "global"); w.Code != http.StatusConflict {
-			t.Fatalf("stale source revived through alias %s: %d %s", route, w.Code, w.Body)
+		if w := threadDecisionRequest(h, http.MethodPost, route, answer, "global"); w.Code != http.StatusOK || !bytes.Equal(replies[0].Body.Bytes(), w.Body.Bytes()) {
+			t.Fatalf("stale replay through alias %s did not return the original receipt: %d %s", route, w.Code, w.Body)
+		}
+		if w := threadDecisionRequest(h, http.MethodPost, route, answer, "stale-new-key"); w.Code != http.StatusConflict {
+			t.Fatalf("new key answered the stale source through alias %s: %d %s", route, w.Code, w.Body)
 		}
 	}
 	read := func(thread domain.ThreadRef, version int64) *httptest.ResponseRecorder {

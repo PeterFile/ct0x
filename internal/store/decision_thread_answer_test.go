@@ -317,10 +317,19 @@ func TestThreadDecisionReplyFences(t *testing.T) {
 				if page, err := s.ListAnswerableDecisions(ctx, ListOptions{}); err != nil || len(page.Items) != 0 {
 					t.Fatalf("stale version in inbox: %+v %v", page, err)
 				}
-				if got, err := s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, domain.DecisionAnswerInput{Version: q.Version, Text: "只看工作日"}, "thread-answer"); !errors.Is(err, ErrConflict) || got.ID != "" {
-					t.Fatalf("stale question was still answerable: %+v %v", got, err)
-				}
-				if a.ID != "" {
+				answer := domain.DecisionAnswerInput{Version: q.Version, Text: "只看工作日"}
+				got, err := s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, answer, "thread-answer")
+				if a.ID == "" {
+					if !errors.Is(err, ErrConflict) || got.ID != "" {
+						t.Fatalf("stale question was still answerable: %+v %v", got, err)
+					}
+				} else {
+					if err != nil || got != a {
+						t.Fatalf("stale replay did not return the original receipt: got %+v, err %v, want %+v", got, err, a)
+					}
+					if got, err := s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, answer, "stale-new-key"); !errors.Is(err, ErrConflict) || got.ID != "" {
+						t.Fatalf("stale question was answerable with a new key: %+v %v", got, err)
+					}
 					if _, err := s.ResolveThreadDecisionWake(ctx, q.GroupID, a.WakeDeliveryID); !errors.Is(err, ErrNotFound) {
 						t.Fatalf("stale wake was still ready: %v", err)
 					}

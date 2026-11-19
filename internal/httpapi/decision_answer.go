@@ -80,10 +80,10 @@ func (a localAPI) answerDecision(w http.ResponseWriter, r *http.Request) {
 
 func decisionAnswerHTTPError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, store.ErrDecisionAnswersUnavailable), errors.Is(err, store.ErrDecisionRequestsUnavailable):
-		WriteError(w, http.StatusServiceUnavailable, "decision_answers_unavailable", "当前版本尚未安装决定回送记录")
 	case errors.Is(err, store.ErrDecisionAnswerUnknown):
 		WriteError(w, http.StatusServiceUnavailable, "decision_answer_unknown", store.ErrDecisionAnswerUnknown.Error())
+	case errors.Is(err, store.ErrDecisionAnswersUnavailable), errors.Is(err, store.ErrDecisionRequestsUnavailable):
+		WriteError(w, http.StatusServiceUnavailable, "decision_answers_unavailable", "当前版本尚未安装决定回送记录")
 	case errors.Is(err, store.ErrDecisionRelayUnsupported):
 		WriteError(w, http.StatusConflict, "decision_relay_unsupported", store.ErrDecisionRelayUnsupported.Error())
 	case errors.Is(err, store.ErrMemberToolDenied):

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -11,31 +12,64 @@ import (
 	"agentworkspace/internal/domain"
 )
 
-func decisionAnswerWakeSourceInTx(ctx context.Context, tx *sql.Tx, d domain.TaskWorkDelivery) error {
+func decisionAnswerWakeSourceInTx(ctx context.Context, tx *sql.Tx, d domain.TaskWorkDelivery) (id string, err error) {
 	if err := requireDecisionAnswersInTx(ctx, tx); err != nil {
-		return err
+		return "", err
 	}
-	var exact bool
-	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1`+decisionAnswerEvidence+`
-	 WHERE (ans.id,work.delivery_id,work.message_id,work.sender_member_id)=(?,?,?,?) AND `+decisionAnswerProof+`)`,
-		d.SourceID, d.DeliveryID, d.MessageID, d.SenderMemberID).Scan(&exact)
-	if err == nil && !exact {
-		err = ErrMemberToolDenied
+	query := `SELECT ans.id` + decisionAnswerEvidence
+	identity := `(work.source_id,work.delivery_id,work.message_id,work.sender_member_id)`
+	if strings.HasPrefix(d.SourceID, decisionAnswerReplacementPrefix) {
+		query += decisionAnswerReplacementJoin
+		identity = `(replacement.source_id,replacement.delivery_id,replacement.message_id,replacement.sender_member_id)`
 	}
-	return err
+	err = tx.QueryRowContext(ctx, query+` WHERE `+identity+`=(?,?,?,?) AND `+decisionAnswerProof,
+		d.SourceID, d.DeliveryID, d.MessageID, d.SenderMemberID).Scan(&id)
+	return id, coordinationRoleRelationError(err)
 }
 
 // Readiness and ACK both recheck the current version rather than treating a
 // saved human statement or physically queued delivery as authority to start.
-const decisionAnswerCurrent = `q.withdrawn_at IS NULL AND (v.expires_at IS NULL OR v.expires_at>?)
+const decisionAnswerCurrentScope = `q.withdrawn_at IS NULL
  AND v.version=(SELECT max(version) FROM decision_request_versions WHERE request_id=q.id) AND (` + decisionRequestCurrentTask + `)`
 
+const decisionAnswerCurrent = decisionAnswerCurrentScope + ` AND (v.expires_at IS NULL OR v.expires_at>?)`
+
 func decisionAnswerLiveInTx(ctx context.Context, tx *sql.Tx, id string) (bool, error) {
+	return decisionAnswerLiveAtInTx(ctx, tx, id, time.Now().UTC())
+}
+
+func decisionAnswerLiveAtInTx(ctx context.Context, tx *sql.Tx, id string, at time.Time) (bool, error) {
 	var live bool
 	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1`+decisionAnswerEvidence+`
 	 JOIN tasks t ON (t.id,t.group_id)=(q.task_id,q.group_id)
-	 WHERE ans.id=? AND `+decisionAnswerCurrent+`)`, id, time.Now().UTC().Format(timestampLayout)).Scan(&live)
+	 WHERE ans.id=? AND `+decisionAnswerCurrent+`)`, id, at.UTC().Format(timestampLayout)).Scan(&live)
 	return live, err
+}
+
+// An ACK is historical evidence only for the exact typed delivery and its
+// bound owner Attempt. This check does not depend on current task/turn state.
+const decisionAnswerHandlingMatch = `EXISTS(SELECT 1` + taskWorkContinuationRelations + `
+ JOIN task_work_continuations b ON (b.delivery_id,b.turn_id,b.attempt_id)=(w.delivery_id,t.id,a.id)
+ WHERE b.delivery_id IN (work.delivery_id,replacement.delivery_id) AND (b.turn_id,b.attempt_id)=(c.turn_id,c.attempt_id))`
+
+// The common fresh Submission guard has already checked the Task's active
+// Attempt. decisionAnswerCurrent proves that very Attempt is bound to the
+// answer's original Assignment, Mandate and authority generation.
+func requireHandledDecisionAnswersInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) error {
+	installed, err := decisionAnswerInstalledInTx(ctx, tx)
+	if err != nil || !installed {
+		return err
+	}
+	var pending bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1`+decisionAnswerEvidence+decisionAnswerReplacementJoin+`
+ JOIN tasks t ON (t.id,t.group_id)=(q.task_id,q.group_id)
+ WHERE (q.group_id,q.task_id,q.task_revision,t.active_attempt_id)=(?,?,?,?) AND `+decisionAnswerCurrent+` AND `+decisionAnswerProof+`
+ AND NOT EXISTS(SELECT 1 FROM decision_answer_consumptions c WHERE c.answer_id=ans.id AND `+decisionAnswerHandlingMatch+`))`,
+		input.GroupID, input.TaskID, input.ExpectedRevision, input.AttemptID, time.Now().UTC().Format(timestampLayout)).Scan(&pending)
+	if err == nil && pending {
+		err = fmt.Errorf("%w：仍有尚未确认处理的用户决定", ErrConflict)
+	}
+	return err
 }
 
 // Same scan shape as a WorkInput, with genuine source IDs and no chat candidate,
@@ -47,14 +81,14 @@ const decisionAnswerWorkInputSelect = `SELECT ans.id,q.group_id,q.topic_id,q.tas
  coalesce(char(10) || '拟议范围：' || json_extract(v.question_json,'$.authorization.scope') ||
           char(10) || '影响：' || json_extract(v.question_json,'$.authorization.impact'),'') || char(10) || '答复原文：' || char(10) || reply.content,
  0,'',0,'',ans.created_at,c.turn_id,c.attempt_id,c.consumed_at,
- NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL` + decisionAnswerEvidence + `
+ NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL` + decisionAnswerEvidence + decisionAnswerReplacementJoin + `
  JOIN tasks t ON (t.id,t.group_id)=(q.task_id,q.group_id)
- LEFT JOIN decision_answer_consumptions c ON c.answer_id=ans.id`
+ LEFT JOIN decision_answer_consumptions c ON c.answer_id=ans.id AND ` + decisionAnswerHandlingMatch
 
-// A pending answer is visible to its continuation only; later turns of the
-// same work may see it as history only after explicit handling.
+// A pending answer is visible to its exact physical wake only; later turns of
+// the same work may see it as history only after explicit handling.
 const decisionAnswerWorkerWhere = ` WHERE (q.assignment_id,q.task_revision,q.group_id,q.topic_id,q.task_id,q.owner_member_id,q.mandate_id)=
- (?,?,?,?,?,?,?) AND (work.delivery_id=? OR c.answer_id IS NOT NULL) AND ` + decisionAnswerProof + ` AND ` + decisionAnswerCurrent
+ (?,?,?,?,?,?,?) AND (? IN (work.delivery_id,replacement.delivery_id) OR c.answer_id IS NOT NULL) AND ` + decisionAnswerProof + ` AND ` + decisionAnswerCurrent
 
 func decisionAnswerWorkInputArgs(p CoordinationRoleProvenance, mandateID string) []any {
 	return append(workerWorkInputArgs(p), mandateID, p.DeliveryID, time.Now().UTC().Format(timestampLayout))
@@ -79,9 +113,13 @@ func decisionAnswerWorkInputHistoryInTx(ctx context.Context, tx *sql.Tx, role Co
 	if err != nil {
 		return page, err
 	}
-	where := decisionAnswerWorkerWhere
-	args := decisionAnswerWorkInputArgs(p, r.MandateID)
-	if c := opts.Before; c != nil {
+	return mergeDecisionAnswerWorkInputHistoryInTx(ctx, tx, decisionAnswerWorkerWhere, decisionAnswerWorkInputArgs(p, r.MandateID), opts.Before, limit, page)
+}
+
+// Read at most limit+1 answers with the same exclusive cursor and sort order
+// as legacy inputs, then merge the two bounded streams for a single page.
+func mergeDecisionAnswerWorkInputHistoryInTx(ctx context.Context, tx *sql.Tx, where string, args []any, before *Cursor, limit int, page Page[domain.TaskWorkInput]) (Page[domain.TaskWorkInput], error) {
+	if c := before; c != nil {
 		where += ` AND (ans.created_at,ans.id)<(?,?)`
 		args = append(args, c.CreatedAt.UTC().Format(timestampLayout), c.ID)
 	}

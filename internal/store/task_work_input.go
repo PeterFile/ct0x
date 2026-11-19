@@ -94,6 +94,14 @@ func (s *Store) ListTaskWorkInputs(ctx context.Context, groupID, taskID string, 
 		if err != nil {
 			return Page[domain.TaskWorkInput]{}, taskError(action, err)
 		}
+		decisions, err := decisionAnswerInstalledInTx(ctx, tx)
+		if err == nil && decisions {
+			page, err = mergeDecisionAnswerWorkInputHistoryInTx(ctx, tx, ` WHERE (q.group_id,q.task_id)=(?,?) AND `+decisionAnswerProof,
+				[]any{groupID, taskID}, options.Before, limit, page)
+		}
+		if err != nil {
+			return Page[domain.TaskWorkInput]{}, taskError(action, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Page[domain.TaskWorkInput]{}, taskError(action, err)
