@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -32,7 +33,18 @@ func (r MessageRequest) scope() mutationScope {
 	return mutationScope{operation: "create_message", actorID: r.ActorID, groupID: r.GroupID, key: r.IdempotencyKey}
 }
 
-func (r MessageRequest) payload() []byte {
+func (r MessageRequest) payload() []byte { return r.encodePayload("") }
+
+// Only the idempotency record needs the new selector discriminator. Keep the
+// immutable command-source payload in its existing exact format.
+func (r MessageRequest) topicSelectionPayload() []byte {
+	if r.TopicIDExplicit {
+		return r.encodePayload("+topic-selector/v1:main")
+	}
+	return r.encodePayload("+topic-selector/v1:auto")
+}
+
+func (r MessageRequest) encodePayload(selector string) []byte {
 	fields := []string{r.GroupID, r.TopicID, r.Content, "omitted"}
 	if r.RecipientIDs != nil {
 		fields[3] = "explicit"
@@ -42,6 +54,7 @@ func (r MessageRequest) payload() []byte {
 		fields[3] += "+thread-links/v1"
 		fields = append(fields, r.ReplyToMessageID, r.RelatedTaskID)
 	}
+	fields[3] += selector // Cannot collide with a legacy recipient list or link payload.
 	return mutationPayload(append(fields, recipientSet(r.RecipientIDs)...)...)
 }
 
@@ -61,12 +74,15 @@ func (s *Store) LookupMessageReceipt(ctx context.Context, request MessageRequest
 		return domain.Message{}, false, storeError("读取消息回执失败", err)
 	}
 	id, found, err := lookupMutation(ctx, tx, request.scope(), request.payload())
+	if request.ActorID == "user" && request.TopicID == "" && errors.Is(err, ErrConflict) {
+		id, found, err = lookupMutation(ctx, tx, request.scope(), request.topicSelectionPayload())
+	}
 	if err != nil {
 		return domain.Message{}, false, storeError("读取消息回执失败", err)
 	}
 	var m domain.Message
 	if found {
-		m, err = localMessageReceiptInTx(ctx, tx, request, id)
+		m, err = localMessageReceiptInTx(ctx, tx, request, id, request.ActorID == "user")
 		if err != nil {
 			return domain.Message{}, false, storeError("读取消息回执失败", err)
 		}

@@ -14,7 +14,7 @@ CREATE TABLE thread_routing_topics (
     UNIQUE(group_id, title_key),
     FOREIGN KEY(origin_message_id, group_id, topic_id) REFERENCES messages(id, group_id, topic_id)
 );
-CREATE UNIQUE INDEX thread_routing_issue ON thread_routing_topics(group_id, issue_id) WHERE issue_id<>'';
+` + threadRoutingIssueIndex + `;
 CREATE TABLE thread_routing_links (
     message_id TEXT PRIMARY KEY NOT NULL,
     group_id TEXT NOT NULL,
@@ -29,11 +29,20 @@ CREATE TABLE thread_routing_links (
     FOREIGN KEY(reply_to_message_id, group_id, reply_to_topic_id) REFERENCES messages(id, group_id, topic_id),
     FOREIGN KEY(task_id, group_id) REFERENCES tasks(id, group_id)
 );
-CREATE TRIGGER thread_routing_links_insert BEFORE INSERT ON thread_routing_links
-WHEN EXISTS(SELECT 1 FROM thread_routing_links WHERE message_id=NEW.message_id)
-BEGIN SELECT RAISE(ABORT, '消息引用不可替换'); END;
-CREATE TRIGGER thread_routing_links_update BEFORE UPDATE ON thread_routing_links
-BEGIN SELECT RAISE(ABORT, '消息引用不可修改'); END;
-CREATE TRIGGER thread_routing_links_delete BEFORE DELETE ON thread_routing_links
-BEGIN SELECT RAISE(ABORT, '消息引用不可删除'); END;
+` + threadRoutingLinksInsert + `;
+` + threadRoutingLinksUpdate + `;
+` + threadRoutingLinksDelete + `;
 `
+
+// SQLite records the DDL without its trailing statement delimiter. Keep the
+// guard definitions shared with the installed-schema check.
+const (
+	threadRoutingIssueIndex  = `CREATE UNIQUE INDEX thread_routing_issue ON thread_routing_topics(group_id, issue_id) WHERE issue_id<>''`
+	threadRoutingLinksInsert = `CREATE TRIGGER thread_routing_links_insert BEFORE INSERT ON thread_routing_links
+WHEN EXISTS(SELECT 1 FROM thread_routing_links WHERE message_id=NEW.message_id)
+BEGIN SELECT RAISE(ABORT, '消息引用不可替换'); END`
+	threadRoutingLinksUpdate = `CREATE TRIGGER thread_routing_links_update BEFORE UPDATE ON thread_routing_links
+BEGIN SELECT RAISE(ABORT, '消息引用不可修改'); END`
+	threadRoutingLinksDelete = `CREATE TRIGGER thread_routing_links_delete BEFORE DELETE ON thread_routing_links
+BEGIN SELECT RAISE(ABORT, '消息引用不可删除'); END`
+)

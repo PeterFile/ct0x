@@ -41,6 +41,13 @@ func TestThreadRoutingV30MigrationAndReopenedRetry(t *testing.T) {
 	owner := member(t, old, groupID).ID
 	before := MessageRequest{ActorID: "user", GroupID: groupID, TopicID: "Legacy/Explicit", Content: "exact legacy content", IdempotencyKey: "legacy"}
 	legacy := postThreadMessage(t, old, before)
+	// The trusted explicit-delivery entry still writes the exact old payload,
+	// including the historical equivalence of omitted and empty topic IDs.
+	oldMain := MessageRequest{ActorID: "user", GroupID: groupID, Content: "old main", IdempotencyKey: "old-main"}
+	legacyMain, err := old.CreateLocalUserMessage(ctx, oldMain, []string{owner})
+	if err != nil {
+		t.Fatal(err)
+	}
 	var oldSequence int64
 	if err := old.db.QueryRow(`SELECT sequence FROM message_log WHERE message_id=?`, legacy.ID).Scan(&oldSequence); err != nil {
 		t.Fatal(err)
@@ -53,6 +60,12 @@ func TestThreadRoutingV30MigrationAndReopenedRetry(t *testing.T) {
 	current := queueHandle(t, path, false)
 	if got := postThreadMessage(t, current, before); !reflect.DeepEqual(got, legacy) {
 		t.Fatalf("migration changed legacy receipt: got %+v want %+v", got, legacy)
+	}
+	for _, explicit := range []bool{false, true} {
+		oldMain.TopicIDExplicit = explicit
+		if got := postThreadMessage(t, current, oldMain); !reflect.DeepEqual(got, legacyMain) {
+			t.Fatalf("migration changed legacy main receipt: got %+v want %+v", got, legacyMain)
+		}
 	}
 	var sequence int64
 	var topic string
@@ -99,25 +112,42 @@ func TestThreadRoutingV30MigrationAndReopenedRetry(t *testing.T) {
 	if got := race(reopened, reopenedPeer); !reflect.DeepEqual(got, first) {
 		t.Fatalf("reopen changed receipt: got %+v want %+v", got, first)
 	}
-	for _, query := range []string{
-		`SELECT payload FROM message_command_sources WHERE message_id=?`,
-		`SELECT payload FROM mutation_idempotency WHERE record_id=?`,
+	for _, tc := range []struct {
+		id, query string
+		want      []byte
+	}{
+		{first.ID, `SELECT payload FROM message_command_sources WHERE message_id=?`, fresh.payload()},
+		{first.ID, `SELECT payload FROM mutation_idempotency WHERE record_id=?`, fresh.topicSelectionPayload()},
+		{legacyMain.ID, `SELECT payload FROM message_command_sources WHERE message_id=?`, oldMain.payload()},
+		{legacyMain.ID, `SELECT payload FROM mutation_idempotency WHERE record_id=?`, oldMain.payload()},
 	} {
-		if err := reopened.db.QueryRow(query, first.ID).Scan(&proof); err != nil || !bytes.Equal(proof, fresh.payload()) {
-			t.Fatalf("inference rewrote the exact local-user request payload: %x (%v)", proof, err)
+		if err := reopened.db.QueryRow(tc.query, tc.id).Scan(&proof); err != nil || !bytes.Equal(proof, tc.want) {
+			t.Fatalf("stored request fingerprint mismatch: %x (%v)", proof, err)
 		}
+	}
+	if m, found, err := reopened.LookupMessageReceipt(ctx, fresh); err != nil || !found || !reflect.DeepEqual(m, first) {
+		t.Fatalf("lookup lost a versioned receipt: %+v, found=%t, err=%v", m, found, err)
+	}
+	fresh.TopicIDExplicit = true
+	if _, _, err := reopened.LookupMessageReceipt(ctx, fresh); !errors.Is(err, ErrConflict) {
+		t.Fatalf("lookup accepted a changed main selector: %v", err)
 	}
 	if err := reopened.db.QueryRow(`SELECT sequence,topic_id FROM message_log WHERE message_id=?`, first.ID).Scan(&sequence, &topic); err != nil || sequence <= oldSequence || topic != first.TopicID {
 		t.Fatalf("inferred scope and stable position disagree: %q %d %v", topic, sequence, err)
 	}
-	threadCounts(t, reopened, map[string]int{"messages": 2, "deliveries": 2, "message_log": 2, "message_command_sources": 2, "thread_routing_topics": 1, "tasks": 0, "mandates": 0})
+	threadCounts(t, reopened, map[string]int{"messages": 3, "deliveries": 3, "message_log": 3, "message_command_sources": 3, "thread_routing_topics": 1, "tasks": 0, "mandates": 0})
 }
 
 func TestThreadRoutingTaskLinkAndScopedHistory(t *testing.T) {
 	enableThreadRoutingFixture(t)
 	f := setupMessages(t)
 	origin := postThreadMessage(t, f.s, MessageRequest{ActorID: "user", GroupID: f.groupID,
-		Content: "新议题：磁盘阵列更换计划", RecipientIDs: []string{}})
+		Content: "新议题：磁盘阵列更换计划 OPS-101", RecipientIDs: []string{}})
+	other := postThreadMessage(t, f.s, MessageRequest{ActorID: "user", GroupID: f.groupID,
+		Content: "新议题：磁盘阵列更换计划 OPS-102", RecipientIDs: []string{}})
+	if other.TopicID == origin.TopicID || other.TopicID == "" || origin.TopicID == "" {
+		t.Fatalf("expected distinct topics with the same shortened name: %q %q", origin.TopicID, other.TopicID)
+	}
 	admission, err := f.s.RequestWork(ctx, f.groupID, domain.RequestWorkRequest{TopicID: origin.TopicID, MessageID: origin.ID,
 		Mode: domain.RoutingDecisionCreateNew, Reason: "explicit fixture operation", NewTask: &domain.NewTaskRequest{
 			Title: "check array", Acceptance: "record compatibility", AssigneeID: f.b,
@@ -125,7 +155,7 @@ func TestThreadRoutingTaskLinkAndScopedHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := MessageRequest{ActorID: "user", GroupID: f.otherID, Content: "followup", IdempotencyKey: "link", ThreadLinks: domain.ThreadLinks{RelatedTaskID: admission.Task.ID}}
+	request := MessageRequest{ActorID: "user", GroupID: f.otherID, Content: "跟进那个磁盘阵列更换计划", IdempotencyKey: "link", ThreadLinks: domain.ThreadLinks{RelatedTaskID: admission.Task.ID}}
 	if _, err := f.s.PostLocalUserMessage(ctx, request); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("foreign task reference accepted: %v", err)
 	}
@@ -152,7 +182,12 @@ func TestThreadRoutingTaskLinkAndScopedHistory(t *testing.T) {
 	if _, err := f.s.MessageThreadAttribution(ctx, f.otherID, followup.ID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("cross-group scope read: %v", err)
 	}
-	threadCounts(t, f.s, map[string]int{"thread_routing_topics": 1, "thread_routing_links": 1, "deliveries": 1, "tasks": 1, "mandates": 1})
+	conflict := request
+	conflict.IdempotencyKey, conflict.Content, conflict.RecipientIDs = "contradiction", "跟进那个磁盘阵列更换计划，OPS-102", []string{}
+	if m := postThreadMessage(t, f.s, conflict); m.TopicID != "" || m.RelatedTaskID != admission.Task.ID || len(m.Deliveries) != 0 {
+		t.Fatalf("contradictory issue and task must remain on main without delivery: %+v", m)
+	}
+	threadCounts(t, f.s, map[string]int{"thread_routing_topics": 2, "thread_routing_links": 2, "deliveries": 1, "tasks": 1, "mandates": 1})
 }
 
 func TestThreadRoutingLegacyFallbackAndDamagedSchema(t *testing.T) {
@@ -172,6 +207,18 @@ func TestThreadRoutingLegacyFallbackAndDamagedSchema(t *testing.T) {
 		t.Fatalf("unavailable explicit optional capability accepted: %v", err)
 	}
 	threadCounts(t, legacy, map[string]int{"messages": 1, "deliveries": 1})
+	t.Run("unregistered_orphan_schema", func(t *testing.T) {
+		if _, err := legacy.db.Exec(`CREATE TABLE thread_routing_topics (orphan TEXT)`); err != nil {
+			t.Fatal(err)
+		}
+		r.ReplyToMessageID = ""
+		if _, err := legacy.PostLocalUserMessage(ctx, r); err == nil {
+			t.Error("orphan schema allowed the legacy write path")
+		}
+		if _, err := legacy.GetMessage(ctx, groupID, m.ID); err == nil {
+			t.Error("orphan schema allowed the local timeline detail path")
+		}
+	})
 
 	migrations = original
 	enableThreadRoutingFixture(t)
@@ -186,17 +233,35 @@ func TestThreadRoutingLegacyFallbackAndDamagedSchema(t *testing.T) {
 		{"missing_topics_table", `DROP TABLE thread_routing_topics`, nil},
 		{"missing_links_table", `DROP TABLE thread_routing_links`, nil},
 		{"missing_routing_marker", `DELETE FROM schema_migrations WHERE version=?`, []any{version}},
+		{"missing_issue_index", `DROP INDEX thread_routing_issue`, nil},
+		{"nonunique_issue_index", `DROP INDEX thread_routing_issue; CREATE INDEX thread_routing_issue ON thread_routing_topics(group_id, issue_id)`, nil},
+		{"missing_replace_guard", `DROP TRIGGER thread_routing_links_insert`, nil},
+		{"missing_update_guard", `DROP TRIGGER thread_routing_links_update`, nil},
+		{"missing_delete_guard", `DROP TRIGGER thread_routing_links_delete`, nil},
 	} {
 		t.Run(damage.name, func(t *testing.T) {
 			s, _ := openTestStore(t)
 			groupID := group(t, s).ID
+			request := MessageRequest{GroupID: groupID, ActorID: "user", Content: "新议题：QA-409 核对索引计划", IdempotencyKey: "origin"}
+			origin := postThreadMessage(t, s, request)
+			other := group(t, s).ID
 			if _, err := s.db.Exec(damage.statement, damage.args...); err != nil {
 				t.Fatal(err)
 			}
-			if m, err := s.PostLocalUserMessage(ctx, MessageRequest{GroupID: groupID, ActorID: "user", TopicID: "legacy", Content: "still explicit", IdempotencyKey: "damaged"}); err == nil || m.ID != "" {
-				t.Fatalf("damaged installed E schema fell open: %+v, %v", m, err)
+			if _, err := s.PostLocalUserMessage(ctx, request); err == nil {
+				t.Error("damaged install allowed a normal POST replay")
 			}
-			threadCounts(t, s, map[string]int{"messages": 0, "deliveries": 0, "message_log": 0})
+			for i, content := range []string{"跟进 QA-409", "当前讨论 QA-409 核对索引计划"} {
+				for _, g := range []string{groupID, other} {
+					if m, err := s.PostLocalUserMessage(ctx, MessageRequest{GroupID: g, ActorID: "user", Content: content, IdempotencyKey: fmt.Sprintf("damaged-%d", i)}); err == nil || m.ID != "" {
+						t.Errorf("damaged install accepted %q in group %s: %+v (%v)", content, g, m, err)
+					}
+				}
+			}
+			if _, err := s.GetMessage(ctx, groupID, origin.ID); err == nil {
+				t.Error("damaged install allowed the local timeline detail path")
+			}
+			threadCounts(t, s, map[string]int{"messages": 1, "deliveries": 0, "message_log": 1})
 		})
 	}
 }

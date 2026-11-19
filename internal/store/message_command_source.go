@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"strings"
 
 	"agentworkspace/internal/domain"
@@ -35,13 +36,23 @@ func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, re
 		return domain.Message{}, storeError("验证用户消息失败", err)
 	}
 	payload := r.payload()
-	id, replay, err := reserveMutation(ctx, tx, r.scope(), payload)
+	reservation := payload
+	bindSelector := normalPost && r.TopicID == "" && r.IdempotencyKey != ""
+	if bindSelector {
+		reservation = r.topicSelectionPayload()
+	}
+	id, replay, err := reserveMutation(ctx, tx, r.scope(), reservation)
+	if bindSelector && errors.Is(err, ErrConflict) {
+		// Exact legacy reservations are still replayable; this only reads
+		// and cannot create an unversioned key or rewrite its source proof.
+		id, replay, err = lookupMutation(ctx, tx, r.scope(), payload)
+	}
 	if err != nil {
 		return domain.Message{}, storeError("读取用户消息回执失败", err)
 	}
 	var message domain.Message
 	if replay {
-		message, err = localMessageReceiptInTx(ctx, tx, r, id)
+		message, err = localMessageReceiptInTx(ctx, tx, r, id, normalPost)
 	} else {
 		message, err = publishLocalMessageInTx(ctx, tx, r, id, payload, recipients, normalPost)
 	}
