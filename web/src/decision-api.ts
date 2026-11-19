@@ -20,7 +20,11 @@ export type DecisionReceipt = Readonly<{
   reply_message_id: string; wake_delivery_id: string; wake_message_id: string; created_at: string;
 }>;
 export type DecisionHandling = Readonly<{ turn_id: string; attempt_id: string; consumed_at: string }>;
-type DecisionAnswerView = Readonly<{ receipt: DecisionReceipt; handling: DecisionHandling | null }>;
+export type DecisionAnswerView = Readonly<{ receipt: DecisionReceipt; handling: DecisionHandling | null }>;
+export type DecisionReference = Readonly<Pick<DecisionReceipt, "request_id" | "group_id" | "topic_id" | "version" | "task_id" | "task_revision">>;
+export type DecisionAttempt = Readonly<{ ref: DecisionReference; scope: "me" | "group"; key: string; digest: string }>;
+export type DecisionHistory = Readonly<{ ref: DecisionReference; receiptDigest: string }>;
+export type DecisionJournalEntry = DecisionAttempt | DecisionHistory;
 type DecisionPage = { items: PendingDecision[]; next_cursor: string };
 
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
@@ -28,6 +32,20 @@ const nonblank = (value: unknown): value is string => typeof value === "string" 
 const id = (value: unknown): value is string => nonblank(value) && !/[\0\r\n\ud800-\udfff]/u.test(value);
 const pathId = (value: unknown): value is string => id(value) && value !== "." && value !== "..";
 const positive = (value: unknown): value is number => typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+export const decisionReference = (item: PendingDecision): DecisionReference => ({
+  request_id: item.id, group_id: item.group_id, topic_id: item.topic_id, version: item.version,
+  task_id: item.task?.task_id ?? "", task_revision: item.task?.task_revision ?? 0,
+});
+const binding = (ref: DecisionReference) => [ref.group_id, ref.topic_id, ref.request_id, ref.task_id, ref.task_revision];
+export const requestKey = (ref: DecisionReference) => JSON.stringify(binding(ref));
+export const decisionKey = (ref: DecisionReference) => JSON.stringify([...binding(ref), ref.version]);
+// A write lock is not a receipt binding. The backend allows one answer even
+// if the version or its underlying task revision becomes stale.
+export const decisionWriteSlot = (ref: DecisionReference) => JSON.stringify([ref.group_id, ref.request_id]);
+export const validDecisionReference = (value: unknown): value is DecisionReference => record(value)
+  && Object.keys(value).length === 6 && pathId(value.request_id) && pathId(value.group_id)
+  && typeof value.topic_id === "string" && positive(value.version)
+  && (value.task_id === "" ? value.task_revision === 0 : pathId(value.task_id) && positive(value.task_revision));
 const timestamp = (value: unknown): value is string => typeof value === "string"
   && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?Z$/.test(value)
   && !/^0001-01-01T00:00:00(?:\.0+)?Z$/.test(value) && Number.isFinite(Date.parse(value));
@@ -61,6 +79,7 @@ async function request<T>(path: string, init: RequestInit, valid: (value: unknow
     throw new ApiError("无法连接本地服务，请重试。");
   }
   const value: unknown = await response.json().catch(() => null);
+  init.signal?.throwIfAborted();
   if (!response.ok) {
     const failure = record(value) && record(value.error) ? value.error : {};
     const reason = response.status === 400 ? "答复内容未通过验证"
@@ -84,72 +103,136 @@ export function listPendingDecisions(before: string, signal: AbortSignal) {
     && typeof value.next_cursor === "string" && (value.next_cursor === "" || value.next_cursor !== before));
 }
 
-type GroupIdentity = { group_id: string; workspace_id: string; project_id: string; channel_id: string };
-type ProjectLabel = { id: string; name: string };
-export type DecisionProject = Readonly<{ id: string; name?: string }>;
-function coalesce<T>(cache: Map<string, Promise<T>>, key: string, read: () => Promise<T>) {
-  const previous = cache.get(key);
-  if (previous) return previous;
-  const pending = read();
-  cache.set(key, pending);
-  return pending;
+async function boundedGet<T>(path: string, signal: AbortSignal, valid: (value: unknown) => value is T) {
+  signal.throwIfAborted();
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  const timeout = setTimeout(stop, 5000);
+  signal.addEventListener("abort", stop, { once: true });
+  try {
+    return await request(path, { method: "GET", signal: controller.signal }, valid);
+  } finally {
+    clearTimeout(timeout);
+    signal.removeEventListener("abort", stop);
+  }
 }
 
-// Only an exact Group -> Project relationship authorizes a project label.
-export function decisionProjects(signal: AbortSignal) {
-  const groups = new Map<string, Promise<DecisionProject | undefined>>();
-  const projects = new Map<string, Promise<ProjectLabel | undefined>>();
-  return (groupId: string) => coalesce(groups, groupId, async () => {
-    const identity = await request(`/api/v1/groups/${encodeURIComponent(groupId)}/identity`, { signal }, (value): value is GroupIdentity =>
-      record(value) && value.group_id === groupId && id(value.workspace_id) && pathId(value.project_id) && id(value.channel_id))
-      .catch(() => undefined);
-    if (!identity || signal.aborted) return;
-    const projectId = identity.project_id;
-    const project = await coalesce(projects, projectId, () => request(`/api/v1/projects/${encodeURIComponent(projectId)}`, { signal },
-      (value): value is ProjectLabel => record(value) && value.id === projectId && nonblank(value.name)).catch(() => undefined));
-    return { id: projectId, name: project?.name };
-  });
+type GroupIdentity = { group_id: string; workspace_id: string; project_id: string; channel_id: string };
+type ProjectProof = { id: string; workspace_id: string; name: string };
+export type DecisionProject = Readonly<Pick<ProjectProof, "id" | "name">>;
+
+// This resolver belongs to one active view scope. Optional failures are cached in
+// that scope too, so repeated list loads don't fan out another set of reads.
+export function decisionProjects(signal: AbortSignal, resolved: (groupId: string, project: DecisionProject) => void) {
+  const groups = new Set<string>();
+  const queue: string[] = [];
+  const projects = new Map<string, Promise<ProjectProof>>();
+  let running = 0;
+  async function lookup(groupId: string) {
+    const identity = await boundedGet(`/api/v1/groups/${encodeURIComponent(groupId)}/identity`, signal,
+      (value): value is GroupIdentity => record(value) && value.group_id === groupId
+        && id(value.workspace_id) && pathId(value.project_id) && id(value.channel_id));
+    if (signal.aborted) return;
+    const { project_id, workspace_id } = identity;
+    const key = JSON.stringify([workspace_id, project_id]);
+    let proof = projects.get(key);
+    if (!proof) {
+      proof = boundedGet(`/api/v1/projects/${encodeURIComponent(project_id)}`, signal,
+        (value): value is ProjectProof => record(value) && value.id === project_id
+          && value.workspace_id === workspace_id && nonblank(value.name));
+      projects.set(key, proof);
+    }
+    const { id: projectId, name } = await proof;
+    if (!signal.aborted) resolved(groupId, { id: projectId, name });
+  }
+  function drain() {
+    while (!signal.aborted && running < 4 && queue.length) {
+      running++;
+      void lookup(queue.shift()!).catch(() => { /* A label is not required to answer. */ }).finally(() => { running--; drain(); });
+    }
+  }
+  return (groupIds: Iterable<string>) => {
+    for (const groupId of groupIds) {
+      if (signal.aborted || queue.length >= 100) break;
+      if (groups.has(groupId)) continue;
+      groups.add(groupId);
+      queue.push(groupId);
+    }
+    drain();
+  };
 }
 
 // Match the Go text contract in UTF-8 bytes without trimming the statement.
 export const validDecisionText = (value: unknown): value is string => nonblank(value) && value.length <= 4096
   && !/[\0\ud800-\udfff]/u.test(value) && new TextEncoder().encode(value).length <= 4096;
 
-export function prepareDecisionAnswer(item: PendingDecision, selection: DecisionSelection, key: string, groupId?: string) {
-  const { id: requestId, group_id, topic_id, version, recipient_id, task } = item;
+const answerPath = (ref: DecisionReference) => `/decisions/${encodeURIComponent(ref.request_id)}/answer`;
+function answerBody({ group_id, topic_id, version }: DecisionReference, text: string, option_index?: number) {
+  const base = { group_id, topic_id, version };
+  return JSON.stringify(option_index === undefined ? { ...base, text } : { ...base, option_index });
+}
+const matchesReference = (value: unknown, ref: DecisionReference): value is DecisionReceipt => record(value)
+  && value.request_id === ref.request_id && value.group_id === ref.group_id && value.topic_id === ref.topic_id
+  && value.version === ref.version && value.task_id === ref.task_id && value.task_revision === ref.task_revision
+  && value.actor_id === "user" && validDecisionText(value.text) && timestamp(value.created_at)
+  && (value.option_index === undefined || (positive(value.option_index) && value.option_index <= 4))
+  && [value.id, value.reply_message_id, value.wake_delivery_id, value.wake_message_id].every(id);
+async function digest(fields: unknown[]) {
+  const bytes = new TextEncoder().encode(JSON.stringify(fields));
+  const hash = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+const answerDigest = (ref: DecisionReference, scope: DecisionAttempt["scope"], key: string, body: string, text: string) =>
+  digest(["decision-attempt", decisionKey(ref), scope, key, body, text]);
+const receiptFields = (receipt: DecisionReceipt) => [receipt.id, receipt.reply_message_id, receipt.wake_delivery_id,
+  receipt.wake_message_id, receipt.created_at, receipt.option_index, receipt.text];
+const receiptDigest = (ref: DecisionReference, receipt: DecisionReceipt) => digest(["decision-receipt", decisionKey(ref), ...receiptFields(receipt)]);
+export async function decisionHistory(ref: DecisionReference, receipt: DecisionReceipt): Promise<DecisionHistory> {
+  return { ref, receiptDigest: await receiptDigest(ref, receipt) };
+}
+
+export async function prepareDecisionAnswer(item: PendingDecision, selection: DecisionSelection, key: string, groupId?: string) {
+  const ref = decisionReference(item);
   const option_index = selection.option_index;
   const text = option_index === undefined ? selection.text : item.choices?.[option_index - 1];
-  if (!pathId(requestId) || !pathId(group_id) || (groupId !== undefined && groupId !== group_id)
-    || !positive(version) || !validDecisionText(text)
-    || (option_index !== undefined && (!positive(option_index) || selection.text !== undefined))) {
+  if (!validDecisionReference(ref) || (groupId !== undefined && groupId !== ref.group_id)
+    || !validDecisionText(text) || (option_index !== undefined && (!positive(option_index) || selection.text !== undefined))) {
     throw new ApiError("答复内容或来源不符合约定。", 400);
   }
-  const taskId = task?.task_id ?? "", taskRevision = task?.task_revision ?? 0;
-  const base = { group_id, topic_id, version };
-  const body = JSON.stringify(option_index === undefined ? { ...base, text } : { ...base, option_index });
-  const scope = groupId === undefined ? "/api/v1/me" : `/api/v1/groups/${encodeURIComponent(groupId)}`;
-  const answerPath = `/decisions/${encodeURIComponent(requestId)}/answer`;
-  const query = new URLSearchParams({ group_id, topic_id, version: String(version) });
-  const matchesAnswer = (value: unknown): value is DecisionReceipt => record(value)
-    && value.request_id === requestId && value.group_id === group_id && value.topic_id === topic_id && value.version === version
-    && value.actor_id === recipient_id && value.task_id === taskId && value.task_revision === taskRevision
-    && value.option_index === option_index && value.text === text && timestamp(value.created_at)
-    && [value.id, value.reply_message_id, value.wake_delivery_id, value.wake_message_id].every(id);
-  // Snapshot the envelope and receipt binding once. Status is a separate, local-user GET for either write alias.
+  const scope = groupId === undefined ? "me" : "group";
+  const path = scope === "me" ? "/api/v1/me" : `/api/v1/groups/${encodeURIComponent(ref.group_id)}`;
+  const body = answerBody(ref, text, option_index);
+  const attempt: DecisionAttempt = { ref, scope, key, digest: await answerDigest(ref, scope, key, body, text) };
   return {
-    post: async () => Object.freeze(await request(`${scope}${answerPath}`, {
+    attempt,
+    post: async () => Object.freeze(await request(`${path}${answerPath(ref)}`, {
       method: "POST", headers: { "Content-Type": "application/json", "Idempotency-Key": key }, body,
-    }, matchesAnswer)),
-    status: (signal: AbortSignal, saved?: DecisionReceipt) => request(`/api/v1/me${answerPath}?${query}`, { method: "GET", signal },
-      (value): value is DecisionAnswerView => {
-        if (!record(value)) return false;
-        const { receipt, handling } = value;
-        if (!matchesAnswer(receipt)) return false;
-        // In addition to the answer binding, require the same immutable receipt and wake, if already known.
-        if (saved && (receipt.id !== saved.id || receipt.reply_message_id !== saved.reply_message_id
-          || receipt.wake_delivery_id !== saved.wake_delivery_id || receipt.wake_message_id !== saved.wake_message_id
-          || receipt.created_at !== saved.created_at)) return false;
-        return handling === null || (record(handling) && id(handling.turn_id) && id(handling.attempt_id) && timestamp(handling.consumed_at));
-      }),
+    }, (value): value is DecisionReceipt => matchesReference(value, ref) && value.option_index === option_index && value.text === text)),
   };
+}
+
+// The historical local-user GET is the same for either POST alias. An exact 404
+// is not a positive result or permission to start a different answer.
+export async function readDecisionAnswer(entry: DecisionJournalEntry, signal: AbortSignal, saved?: DecisionReceipt): Promise<DecisionAnswerView | null> {
+  const { ref } = entry, { group_id, topic_id, version } = ref;
+  const query = new URLSearchParams({ group_id, topic_id, version: String(version) });
+  let view: DecisionAnswerView;
+  try {
+    view = await boundedGet(`/api/v1/me${answerPath(ref)}?${query}`, signal,
+      (value): value is DecisionAnswerView => {
+        if (!record(value) || !matchesReference(value.receipt, ref)) return false;
+        const { handling } = value;
+        return handling === null || (record(handling) && id(handling.turn_id) && id(handling.attempt_id) && timestamp(handling.consumed_at));
+      });
+  } catch (error) {
+    if (!signal.aborted && error instanceof ApiError && error.status === 404 && error.code === "not_found") return null;
+    throw error;
+  }
+  const { receipt, handling } = view;
+  const matches = saved ? JSON.stringify(receiptFields(receipt)) === JSON.stringify(receiptFields(saved))
+    : "key" in entry ? await answerDigest(ref, entry.scope, entry.key, answerBody(ref, receipt.text, receipt.option_index), receipt.text) === entry.digest
+    : await receiptDigest(ref, receipt) === entry.receiptDigest;
+  signal.throwIfAborted();
+  if (!matches) throw new ApiError("服务返回的答复与本地记录不一致。", 200, "invalid_response");
+  return { receipt: Object.freeze(receipt), handling: handling && Object.freeze(handling) };
 }

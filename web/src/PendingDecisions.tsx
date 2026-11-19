@@ -1,54 +1,155 @@
 import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { ApiError, isDefinitiveRejection } from "./api";
-import { decisionProjects, listPendingDecisions, prepareDecisionAnswer, validDecisionText } from "./decision-api";
-import type { DecisionHandling, DecisionProject, DecisionReceipt, DecisionSelection, PendingDecision } from "./decision-api";
+import { decisionHistory, decisionKey, decisionProjects, decisionReference, decisionWriteSlot, listPendingDecisions, prepareDecisionAnswer,
+  readDecisionAnswer, requestKey, validDecisionText } from "./decision-api";
+import type { DecisionAnswerView, DecisionAttempt, DecisionJournalEntry, DecisionProject, DecisionReference, DecisionSelection, PendingDecision } from "./decision-api";
+import { journalDecisionAttempt, journalLimit, loadDecisionJournal, settleDecisionAttempt } from "./decision-journal";
 import "./pending-decisions.css";
 
 type Row = { item: PendingDecision; project?: DecisionProject };
 type Draft = { text: string; optionIndex: number };
 const emptyDraft: Draft = { text: "", optionIndex: 0 };
-type Send = ReturnType<typeof prepareDecisionAnswer>;
-type Write = { kind: "posting"; send: Send } | { kind: "uncertain"; send: Send; message: string }
+type Post = Awaited<ReturnType<typeof prepareDecisionAnswer>>["post"];
+type Write = { kind: "posting" } | { kind: "uncertain"; record: DecisionJournalEntry; post?: Post; message: string }
   | { kind: "rejected"; stale: boolean; message: string }
-  | { kind: "saved"; send: Send; receipt: DecisionReceipt; handling?: DecisionHandling | null };
-type Interaction = { row: Row; draft?: Draft; write?: Write };
-const binding = (item: PendingDecision) => [item.group_id, item.topic_id, item.id, item.task?.task_id ?? "", item.task?.task_revision ?? 0];
-const requestKey = (item: PendingDecision) => JSON.stringify(binding(item));
-const versionKey = (item: PendingDecision) => JSON.stringify([...binding(item), item.version]);
+  | ({ kind: "saved"; record: DecisionJournalEntry } & DecisionAnswerView);
+type Interaction = { reference: DecisionReference; item?: PendingDecision; draft?: Draft; write?: Write };
+const inGroup = (groupId: string | undefined, source: { group_id: string }) => groupId === undefined || groupId === source.group_id;
+const unconfirmed = "答复结果未确认。";
+const visible = () => document.visibilityState !== "hidden";
+
+// Keep older unknowns for reconciliation without fencing a newer pending
+// version. The Engine still checks the version and enforces uniqueness.
+function blocksAnswer({ reference, write }: Interaction, version: number, replay?: Write) {
+  return write !== replay && (write?.kind === "posting" || write?.kind === "saved"
+    || (write?.kind === "uncertain" && reference.version >= version));
+}
 
 // One local-user workbench, shared by the global inbox and optional group mount.
-// A navigation/unmount isn't a reason to abandon an unresolved write or fork its key.
+// Admitted writes outlive a view; optional labels and status reads do not.
 let interactions = new Map<string, Interaction>();
+let restored = false;
 const listeners = new Set<() => void>();
+const checkOnWrite = new Set<(reference: DecisionReference) => void>();
 function subscribe(listener: () => void) {
   listeners.add(listener);
   return () => { listeners.delete(listener); };
 }
 const snapshot = () => interactions;
-function remember(row: Row, patch: Omit<Partial<Interaction>, "row">) {
-  const key = versionKey(row.item);
-  interactions = new Map(interactions).set(key, { ...interactions.get(key), ...patch, row });
+function remember(reference: DecisionReference, patch: Omit<Partial<Interaction>, "reference">, evicted?: DecisionReference) {
+  const key = decisionKey(reference);
+  interactions = new Map(interactions).set(key, { ...interactions.get(key), ...patch, reference });
+  if (evicted) interactions.delete(decisionKey(evicted));
   for (const listener of listeners) listener();
 }
+function restoreJournal() {
+  if (restored) return;
+  const entries = loadDecisionJournal();
+  if (!entries) return;
+  restored = true;
+  for (const record of entries) {
+    if (interactions.get(decisionKey(record.ref))?.write) continue;
+    remember(record.ref, { write: { kind: "uncertain", record, message: `${unconfirmed}请核对保存状态。` } });
+  }
+}
 
-type Read = { groupId?: string; rows: Row[]; next: string; before: string; state: "loading" | "ready" | "error" | "unavailable"; message?: string };
-const loading = (groupId?: string, before = "", rows: Row[] = []): Read => ({ groupId, rows, before, next: "", state: "loading" });
+async function confirmAnswer(expected: Write, record: DecisionJournalEntry, view: DecisionAnswerView,
+  signal?: AbortSignal, beforeSave?: () => void) {
+  const history = "key" in record ? await decisionHistory(record.ref, view.receipt).catch(() => undefined) : undefined;
+  if ((signal && (signal.aborted || !visible())) || interactions.get(decisionKey(record.ref))?.write !== expected) return false;
+  const pointer = history && "key" in record && settleDecisionAttempt(record, history) ? history : record;
+  beforeSave?.();
+  remember(record.ref, { draft: undefined, write: { kind: "saved", record: pointer, ...view } });
+  return true;
+}
+
+async function checkAnswer(key: string, signal: AbortSignal) {
+  const entry = interactions.get(key), write = entry?.write;
+  if (!entry || !write || (write.kind !== "uncertain" && write.kind !== "saved") || (write.kind === "saved" && write.handling)) return false;
+  try {
+    const answer = await readDecisionAnswer(write.record, signal, write.kind === "saved" ? write.receipt : undefined);
+    if (signal.aborted || !visible() || interactions.get(key)?.write !== write) return false;
+    if (!answer) return write.kind === "uncertain" && "key" in write.record;
+    if (write.kind === "saved") {
+      if (answer.handling) remember(entry.reference, { write: { ...write, handling: answer.handling } });
+    } else if (!await confirmAnswer(write, write.record, answer, signal)) return false;
+    return answer.handling === null;
+  } catch {
+    // Stop automatic reads for this reference on an error. Neither an error nor
+    // a missing receipt can erase proven state or permit another answer.
+    return false;
+  }
+}
+
+const statusBackoff = [2000, 4000, 8000, 12000, 20000, 20000];
+const statusBatch = 4;
+function useAnswerChecks(groupId: string | undefined, refreshVersion: number) {
+  useEffect(() => {
+    let wave: AbortController | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    function stop() { wave?.abort(); clearTimeout(timer); }
+    function recent() {
+      return [...interactions].reverse().filter(([, { reference, write }]) => inGroup(groupId, reference)
+        && (write?.kind === "uncertain" || (write?.kind === "saved" && !write.handling))).slice(0, journalLimit).map(([key]) => key);
+    }
+    function start(keys = recent()) {
+      stop();
+      if (!keys.length || !visible()) return;
+      const controller = new AbortController();
+      wave = controller;
+      const { signal } = controller;
+      async function round(keys: string[], attempt: number) {
+        const remaining: string[] = [];
+        for (let i = 0; i < keys.length; i += statusBatch) {
+          if (signal.aborted || !visible()) return;
+          const batch = keys.slice(i, i + statusBatch);
+          const repeat = await Promise.all(batch.map(key => checkAnswer(key, signal)));
+          for (const [index, key] of batch.entries()) if (repeat[index]) remaining.push(key);
+        }
+        const delay = statusBackoff[attempt];
+        if (!signal.aborted && remaining.length && delay !== undefined && visible()) {
+          timer = setTimeout(() => void round(remaining.slice(0, statusBatch), attempt + 1), delay);
+        }
+      }
+      void round(keys, 0);
+    }
+    // Mount/manual/visibility can reconcile the bounded local history once;
+    // active polling uses only one small batch, never one timer per receipt.
+    function afterWrite(reference: DecisionReference) {
+      if (!inGroup(groupId, reference)) return;
+      const key = decisionKey(reference);
+      start([key, ...recent().filter(other => other !== key)].slice(0, statusBatch));
+    }
+    const visibility = () => start();
+    checkOnWrite.add(afterWrite);
+    document.addEventListener("visibilitychange", visibility);
+    start();
+    return () => { stop(); checkOnWrite.delete(afterWrite); document.removeEventListener("visibilitychange", visibility); };
+  }, [groupId, refreshVersion]);
+}
+
+type Read = { rows: PendingDecision[]; next: string; before: string; state: "loading" | "ready" | "error" | "unavailable"; message?: string };
+const loading = (before = "", rows: PendingDecision[] = []): Read => ({ rows, before, next: "", state: "loading" });
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请重试。";
 const migrationUnavailable = (error: unknown) => error instanceof ApiError
   && error.status === 503 && error.code === "decision_answers_unavailable";
 const listUnavailable = (error: unknown) => error instanceof ApiError
   && (error.status === 404 || error.status === 405 || migrationUnavailable(error));
-const inGroup = (groupId: string | undefined, item: PendingDecision) => groupId === undefined || groupId === item.group_id;
 const sourceLabel = ({ item, project }: Row) => `${project?.name ?? "项目未确认"} · ${item.group_name}`;
 const originTitle = (item: PendingDecision) => item.task?.task_title ?? (item.topic_id === "" ? "主话题" : `话题 ${item.topic_id}`);
 
 export function PendingDecisions({ active, groupId }: { active: boolean; groupId?: string }) {
+  return active ? <DecisionInbox key={JSON.stringify(groupId ?? null)} groupId={groupId} /> : null;
+}
+
+function DecisionInbox({ groupId }: { groupId?: string }) {
   const sectionId = useId();
-  const [read, setRead] = useState(() => loading(groupId));
+  const [page, setRead] = useState(() => loading());
+  const [projects, setProjects] = useState(() => new Map<string, DecisionProject>());
   const [statusVersion, setStatusVersion] = useState(0);
-  const page = read.groupId === groupId ? read : loading(groupId);
   const local = useSyncExternalStore(subscribe, snapshot, snapshot);
+  const projectLookup = useRef<ReturnType<typeof decisionProjects>>(null);
   const reading = useRef<AbortController | null>(null);
   const receiptList = useRef<HTMLElement>(null);
   const focusOnSave = useRef(false);
@@ -58,102 +159,138 @@ export function PendingDecisions({ active, groupId }: { active: boolean; groupId
     const controller = new AbortController();
     reading.current = controller;
     const { signal } = controller;
-    setRead(previous => loading(groupId, before, before && previous.groupId === groupId ? previous.rows : []));
+    setRead(previous => loading(before, before ? previous.rows : []));
     try {
       const result = await listPendingDecisions(before, signal);
       if (signal.aborted) return;
-      const projectFor = decisionProjects(signal);
-      const rows = await Promise.all(result.items.filter(item => inGroup(groupId, item))
-        .map(async item => ({ item, project: await projectFor(item.group_id) })));
-      if (signal.aborted) return;
+      const items = result.items.filter(item => inGroup(groupId, item));
       setRead(previous => {
-        const existing = before && previous.groupId === groupId ? previous.rows : [];
-        const combined = new Map(existing.map(row => [row.item.id, row]));
-        for (const row of rows) combined.set(row.item.id, row);
-        return { groupId, rows: [...combined.values()], next: result.next_cursor, before, state: "ready" };
+        const combined = new Map((before ? previous.rows : []).map(item => [item.id, item]));
+        for (const item of items) combined.set(item.id, item);
+        return { rows: [...combined.values()], next: result.next_cursor, before, state: "ready" };
       });
+      projectLookup.current?.(items.map(item => item.group_id));
     } catch (error) {
       if (!signal.aborted) setRead(previous => listUnavailable(error)
-        ? { ...loading(groupId), state: "unavailable" }
+        ? { ...loading(), state: "unavailable" }
         : { ...previous, state: "error", message: errorText(error) });
     }
   }, [groupId]);
   useEffect(() => {
-    if (!active) return;
+    const scope = new AbortController();
+    projectLookup.current = decisionProjects(scope.signal, (groupId, project) => {
+      setProjects(previous => new Map(previous).set(groupId, project));
+    });
+    restoreJournal();
     void load();
-    return () => reading.current?.abort();
-  }, [active, load]);
+    return () => { scope.abort(); reading.current?.abort(); };
+  }, [load]);
+  useAnswerChecks(groupId, statusVersion);
   useEffect(() => {
-    if (active && focusOnSave.current) receiptList.current?.focus();
+    if (focusOnSave.current) receiptList.current?.focus();
     focusOnSave.current = false;
-  }, [active, local]);
+  }, [local]);
 
   function refresh(before = "") {
+    restoreJournal();
     setStatusVersion(previous => previous + 1);
     void load(before);
   }
 
-  async function submit(row: Row, selection?: DecisionSelection, origin?: HTMLElement | null) {
-    if (!active || !inGroup(groupId, row.item)) return;
-    const request = requestKey(row.item);
-    // Consult the shared ledger before any await; a render is not the write lock.
+  const itemsById = new Map(page.rows.map(item => [item.id, item]));
+  function hasNewerRow(reference: DecisionReference) {
+    const item = itemsById.get(reference.request_id);
+    return item !== undefined && item.group_id === reference.group_id && item.version > reference.version;
+  }
+
+  async function submit(reference: DecisionReference, item?: PendingDecision, selection?: DecisionSelection, origin?: HTMLElement | null) {
+    if (!inGroup(groupId, reference)) return;
+    restoreJournal();
+    const key = decisionKey(reference), slot = decisionWriteSlot(reference);
+    const previous = interactions.get(key)?.write;
+    const replay = previous?.kind === "uncertain" ? previous : undefined;
+    const current = item && page.state === "ready" && !reading.current?.signal.aborted && itemsById.get(item.id) === item;
+    if (replay ? hasNewerRow(reference) || !("key" in replay.record) || (replay.post ? selection !== undefined : !current || !selection)
+      : !current || !selection || (previous?.kind === "rejected" && previous.stale)) return;
+    // Take the same-document lock before hashing or reading. The server, not
+    // browser storage, enforces a single effect across independent tabs.
     for (const entry of interactions.values()) {
-      if ((entry.write?.kind === "posting" || entry.write?.kind === "saved") && requestKey(entry.row.item) === request) return;
+      if (decisionWriteSlot(entry.reference) === slot && blocksAnswer(entry, reference.version, replay)) return;
     }
-    const entry = interactions.get(versionKey(row.item));
-    const previous = entry?.write;
-    const replay = previous?.kind === "uncertain";
-    if (replay ? selection !== undefined : (!selection || page.state !== "ready" || reading.current?.signal.aborted
-      || !page.rows.includes(row) || (previous?.kind === "rejected" && previous.stale))) return;
-    const source = replay && entry ? entry.row : row;
-    let send: Send | undefined;
+    const posting: Write = { kind: "posting" };
+    remember(reference, { ...(item ? { item } : {}), write: posting });
+    const focus = () => { if (origin?.contains(document.activeElement)) focusOnSave.current = true; };
+    const wake = () => { for (const listener of checkOnWrite) listener(reference); };
+    let attempt: DecisionAttempt | undefined, post: Post | undefined, sent = false;
     try {
-      send = previous?.kind === "uncertain" ? previous.send : selection
-        ? prepareDecisionAnswer(row.item, selection, crypto.randomUUID(), groupId) : undefined;
-      if (!send) return;
-      remember(source, { write: { kind: "posting", send } });
-      const receipt = await send.post();
-      if (origin?.contains(document.activeElement)) focusOnSave.current = true;
-      remember(source, { draft: undefined, write: { kind: "saved", send, receipt } });
+      if (replay && "key" in replay.record) {
+        attempt = replay.record;
+        post = replay.post;
+        if (!post) {
+          const prepared = await prepareDecisionAnswer(item!, selection!, attempt.key, attempt.scope === "group" ? reference.group_id : undefined);
+          if (prepared.attempt.digest !== attempt.digest) throw new ApiError("输入与原答复不一致。请原样重选或重输。");
+          post = prepared.post;
+        }
+        const found = await readDecisionAnswer(attempt, new AbortController().signal);
+        if (found) {
+          if (await confirmAnswer(posting, attempt, found, undefined, focus)) wake();
+          return;
+        }
+      } else {
+        const prepared = await prepareDecisionAnswer(item!, selection!, crypto.randomUUID(), groupId);
+        attempt = prepared.attempt;
+        post = prepared.post;
+        const recovery = journalDecisionAttempt(attempt);
+        if (recovery?.evicted) remember(reference, {}, recovery.evicted.ref);
+      }
+      sent = true;
+      const receipt = await post();
+      if (await confirmAnswer(posting, attempt, { receipt, handling: null }, undefined, focus)) wake();
     } catch (error) {
       const stale = error instanceof ApiError && (error.status === 404 || error.status === 409);
       const reason = migrationUnavailable(error) ? "待决答复暂不可用。"
-        : error instanceof ApiError && error.code === "decision_relay_unsupported" ? "当前服务不支持回送此话题的答复。" : errorText(error);
-      const message = reason + (stale ? "请刷新待决事项。" : "");
-      if (send && (replay || !isDefinitiveRejection(error))) {
-        remember(source, { write: { kind: "uncertain", send, message: `答复结果未确认。${message}可重试同一次答复。` } });
+        : error instanceof ApiError && error.code === "decision_relay_unsupported" ? "当前服务不支持回送此话题的答复。"
+        : errorText(error);
+      if (attempt && (replay || (sent && !isDefinitiveRejection(error)))) {
+        remember(reference, { write: { kind: "uncertain", record: attempt, post: sent ? post : replay?.post, message: unconfirmed + reason } });
+        if (sent) wake();
       } else {
-        remember(source, { write: { kind: "rejected", stale, message } });
+        if (attempt && sent) settleDecisionAttempt(attempt);
+        remember(reference, { write: { kind: "rejected", stale, message: reason + (stale ? "请刷新待决事项。" : "") } });
       }
     }
   }
 
-  if (!active) return null;
-  const scoped = [...local.values()].filter(({ row }) => inGroup(groupId, row.item));
-  const saved = scoped.flatMap(({ row, write }) => write?.kind === "saved" ? [{ row, receipt: write.receipt, handling: write.handling }] : []);
-  const answered = new Set(saved.map(({ row }) => requestKey(row.item)));
-  const posting = new Set(scoped.flatMap(({ row, write }) => write?.kind === "posting" ? [requestKey(row.item)] : []));
-  const rows = page.rows.filter(row => !answered.has(requestKey(row.item)));
-  const listed = new Set(rows.map(row => versionKey(row.item)));
-  const unresolved = scoped.filter(({ row, write }) => !answered.has(requestKey(row.item)) && !listed.has(versionKey(row.item))
+  const scoped = [...local.values()].filter(({ reference }) => inGroup(groupId, reference));
+  const saved = scoped.flatMap(({ reference, item, write }) => write?.kind === "saved" ? [{ reference, item, ...write }] : []);
+  const answered = new Set(saved.map(({ reference }) => requestKey(reference)));
+  const writesByIssue = new Map<string, Interaction[]>();
+  for (const entry of scoped) {
+    if (!entry.write || entry.write.kind === "rejected") continue;
+    const slot = decisionWriteSlot(entry.reference);
+    const writes = writesByIssue.get(slot);
+    if (writes) writes.push(entry);
+    else writesByIssue.set(slot, [entry]);
+  }
+  const writeLocked = (reference: DecisionReference, replay?: Write) =>
+    writesByIssue.get(decisionWriteSlot(reference))?.some(entry => blocksAnswer(entry, reference.version, replay)) ?? false;
+  const rows = page.rows.map(item => ({ item, reference: decisionReference(item), project: projects.get(item.group_id) }))
+    .filter(({ reference }) => !answered.has(requestKey(reference)));
+  const listed = new Set(rows.map(({ reference }) => decisionKey(reference)));
+  const unresolved = scoped.filter(({ reference, write }) => !listed.has(decisionKey(reference))
     && (write?.kind === "posting" || write?.kind === "uncertain"));
-  function writeStatus(row: Row, write?: Write): ReactNode {
-    if (write?.kind === "posting") return <p role="status">正在保存答复…</p>;
+  function writeStatus(reference: DecisionReference, write?: Write): ReactNode {
+    if (write?.kind === "posting") return <p role="status">正在核对或保存答复…</p>;
     if (write?.kind === "rejected") return <p role="alert">{write.message}</p>;
     return write?.kind === "uncertain" ? <>
       <p role="alert">{write.message}</p>
-      <button type="button" disabled={posting.has(requestKey(row.item))}
-        onClick={event => void submit(row, undefined, event.currentTarget.parentElement)}>重试同一次答复</button>
+      {write.post && !hasNewerRow(reference) && !writeLocked(reference, write)
+        ? <button type="button" onClick={event => void submit(reference, undefined, undefined, event.currentTarget.parentElement)}>
+          重试同一次答复
+        </button> : null}
     </> : null;
   }
   return <section className="pending-decisions" aria-labelledby={sectionId}>
-    {scoped.map(({ row, write }) => {
-      if (write?.kind === "uncertain" || (write?.kind === "saved" && !write.handling)) {
-        const key = versionKey(row.item);
-        return <CheckAnswerStatus key={key} answerKey={key} send={write.send} refreshVersion={statusVersion} />;
-      }
-      return null;
-    })}
     <header className="pending-decisions-toolbar">
       <h3 id={sectionId}>待决事项</h3>
       <button type="button" disabled={page.state === "loading"} onClick={() => refresh()}>刷新待决事项</button>
@@ -165,84 +302,58 @@ export function PendingDecisions({ active, groupId }: { active: boolean; groupId
     </div> : null}
     {page.state === "ready" && !rows.length ? <p role="status">{page.next ? "本页没有可显示的待决事项。" : "没有待决事项。"}</p> : null}
     {rows.length ? <ul className="pending-decisions-list" aria-label="待答复的问题">{rows.map(row => {
-      const key = versionKey(row.item);
+      const { item, reference } = row, key = decisionKey(reference);
       const { draft = emptyDraft, write } = local.get(key) ?? {};
-      const blocked = page.state !== "ready" || posting.has(requestKey(row.item)) || write?.kind === "uncertain"
-        || (write?.kind === "rejected" && write.stale);
-      return <li key={key}><DecisionCard row={row} draft={draft} blocked={blocked}
-        onDraft={draft => { if (!blocked) remember(row, { draft }); }} onSubmit={(selection, card) => void submit(row, selection, card)}>
-        {writeStatus(row, write)}
+      const reenter = write?.kind === "uncertain" && "key" in write.record && !write.post;
+      const blocked = page.state !== "ready" || writeLocked(reference, reenter ? write : undefined) || (write?.kind === "rejected" && write.stale);
+      return <li key={key}><DecisionCard row={row} draft={draft} blocked={blocked} reenter={reenter}
+        onDraft={draft => { if (!blocked) remember(reference, { item, draft }); }}
+        onSubmit={(selection, card) => void submit(reference, item, selection, card)}>
+        {writeStatus(reference, write)}
       </DecisionCard></li>;
     })}</ul> : null}
     {page.next ? <div><button type="button" onClick={() => void load(page.next)}>加载更多待决事项</button></div> : null}
     {unresolved.length ? <section className="pending-decisions-card" aria-label="尚未确认的答复">
       <h4>尚未确认的答复</h4>
-      <ul className="pending-decisions-list">{unresolved.map(({ row, write }) => <li key={versionKey(row.item)}>
-        <p>事项 <code>{row.item.id}</code> · 决定版本 {row.item.version}</p>
-        {writeStatus(row, write)}
+      <ul className="pending-decisions-list">{unresolved.map(({ reference, item, write }) => <li key={decisionKey(reference)}>
+        <p>事项 <code>{reference.request_id}</code> · 决定版本 {reference.version}</p>
+        <SourceDetails reference={reference} item={item} project={projects.get(reference.group_id)} />
+        {writeStatus(reference, write)}
       </li>)}</ul>
     </section> : null}
     {saved.length ? <section className="pending-decisions-card" aria-label="答复回执" tabIndex={-1} ref={receiptList}>
       <h4>答复回执</h4>
-      <ul className="pending-decisions-list">{saved.map(({ row, receipt, handling }) => <li key={versionKey(row.item)}>
-        <p role="status">答复已保存</p>
-        {handling ? <p role="status">负责人已处理</p>
-          : handling === null ? <p className="pending-decisions-note">尚未确认负责人处理。</p> : null}
-        <p className="pending-decisions-note">{sourceLabel(row)} · {originTitle(row.item)} · 决定版本 {receipt.version}</p>
-        <p className="pending-decisions-copy">{receipt.text}</p>
-        <p className="pending-decisions-note">回执 ID：<code>{receipt.id}</code></p>
-        <SourceDetails row={row} />
-      </li>)}</ul>
+      <ul className="pending-decisions-list">{saved.map(({ reference, item, receipt, handling }) => {
+        const project = projects.get(reference.group_id);
+        return <li key={decisionKey(reference)}>
+          <p role="status">答复已保存</p>
+          {handling ? <p role="status">负责人已处理</p> : <p className="pending-decisions-note">尚未确认负责人处理。</p>}
+          <p className="pending-decisions-note">{item ? `${sourceLabel({ item, project })} · ${originTitle(item)}` : `${project?.name ?? "项目未确认"} · ${reference.group_id}`} · 决定版本 {receipt.version}</p>
+          <p className="pending-decisions-copy">{receipt.text}</p>
+          <p className="pending-decisions-note">回执 ID：<code>{receipt.id}</code></p>
+          <SourceDetails reference={reference} item={item} project={project} />
+        </li>;
+      })}</ul>
     </section> : null}
   </section>;
 }
 
-function CheckAnswerStatus({ answerKey, send, refreshVersion }: { answerKey: string; send: Send; refreshVersion: number }) {
-  useEffect(() => {
-    let read: AbortController | undefined;
-    function refresh() {
-      read?.abort();
-      if (document.visibilityState === "hidden") return;
-      const entry = interactions.get(answerKey), write = entry?.write;
-      if (!entry || !write || (write.kind !== "uncertain" && write.kind !== "saved") || write.send !== send
-        || (write.kind === "saved" && write.handling)) return;
-      const controller = new AbortController();
-      read = controller;
-      const saved = write.kind === "saved" ? write.receipt : undefined;
-      void send.status(controller.signal, saved).then(({ receipt, handling }) => {
-        // Ignore a read superseded by navigation, another read, or an explicit retry.
-        if (controller.signal.aborted || interactions.get(answerKey)?.write !== write) return;
-        if (write.kind === "saved" && write.handling === handling) return;
-        remember(entry.row, { draft: undefined, write: {
-          kind: "saved", send, receipt: saved ?? Object.freeze(receipt), handling: handling && Object.freeze(handling),
-        } });
-      }, () => {
-        // A missing or unverified status read cannot erase a receipt or settle an uncertain write.
-      });
-    }
-    refresh();
-    document.addEventListener("visibilitychange", refresh);
-    return () => { document.removeEventListener("visibilitychange", refresh); read?.abort(); };
-  }, [answerKey, send, refreshVersion]);
-  return null;
-}
-
-function SourceDetails({ row: { item, project } }: { row: Row }) {
+function SourceDetails({ reference, item, project }: { reference: DecisionReference; item?: PendingDecision; project?: DecisionProject }) {
   return <details>
     <summary>来源与版本标识</summary>
     <dl>
       {project ? <><dt>项目 ID</dt><dd><code>{project.id}</code></dd></> : null}
-      <dt>群组 ID</dt><dd><code>{item.group_id}</code></dd>
-      {item.task ? <><dt>任务 ID</dt><dd><code>{item.task.task_id}</code> · 任务版本 {item.task.task_revision}</dd></> : null}
-      <dt>话题 ID</dt><dd>{item.topic_id === "" ? "主话题（空标识）" : <code>{item.topic_id}</code>}</dd>
-      <dt>来源消息 ID</dt><dd><code>{item.source_message_id}</code></dd>
-      <dt>事项 ID</dt><dd><code>{item.id}</code></dd>
+      <dt>群组 ID</dt><dd><code>{reference.group_id}</code></dd>
+      {reference.task_id ? <><dt>任务 ID</dt><dd><code>{reference.task_id}</code> · 任务版本 {reference.task_revision}</dd></> : null}
+      <dt>话题 ID</dt><dd>{reference.topic_id === "" ? "主话题（空标识）" : <code>{reference.topic_id}</code>}</dd>
+      {item ? <><dt>来源消息 ID</dt><dd><code>{item.source_message_id}</code></dd></> : null}
+      <dt>事项 ID</dt><dd><code>{reference.request_id}</code></dd>
     </dl>
   </details>;
 }
 
-function DecisionCard({ row, draft, blocked, onDraft, onSubmit, children }: {
-  row: Row; draft: Draft; blocked: boolean; onDraft: (draft: Draft) => void;
+function DecisionCard({ row, draft, blocked, reenter, onDraft, onSubmit, children }: {
+  row: Row; draft: Draft; blocked: boolean; reenter: boolean; onDraft: (draft: Draft) => void;
   onSubmit: (selection: DecisionSelection, card: HTMLElement | null) => void; children: ReactNode;
 }) {
   const field = useId(), { item } = row;
@@ -251,7 +362,7 @@ function DecisionCard({ row, draft, blocked, onDraft, onSubmit, children }: {
   const title = originTitle(item);
   return <article className="pending-decisions-card" aria-label={`${sourceLabel(row)} · ${title}`}>
     <header>
-      <p className="pending-decisions-note">{sourceLabel(row)}{!row.project?.name ? <> · <code>{item.group_id}</code></> : null}</p>
+      <p className="pending-decisions-note">{sourceLabel(row)}{!row.project ? <> · <code>{item.group_id}</code></> : null}</p>
       <h4>{title}</h4>
       <p className="pending-decisions-note">决定版本 {item.version}</p>
     </header>
@@ -264,7 +375,8 @@ function DecisionCard({ row, draft, blocked, onDraft, onSubmit, children }: {
         <dt>影响</dt><dd className="pending-decisions-copy">{item.authorization.impact}</dd>
       </> : null}
     </dl>
-    <SourceDetails row={row} />
+    <SourceDetails reference={decisionReference(item)} item={item} project={row.project} />
+    {reenter ? <p className="pending-decisions-note">如需重试，请原样重选或重输答复；重试前会核对保存状态。</p> : null}
     <form onSubmit={event => {
       event.preventDefault();
       if (!blocked && valid) onSubmit(choosing ? { option_index: draft.optionIndex } : { text: draft.text }, event.currentTarget.closest("article"));
@@ -282,7 +394,7 @@ function DecisionCard({ row, draft, blocked, onDraft, onSubmit, children }: {
         <textarea id={field} rows={2} maxLength={4096} value={draft.text} disabled={choosing}
           onChange={event => onDraft({ ...draft, text: event.currentTarget.value })} />
         {!choosing && draft.text !== "" && !valid ? <p className="pending-decisions-note">答复不能只含空白，长度不能超过 4096 字节。</p> : null}
-        <button type="submit" disabled={blocked || !valid}>提交答复</button>
+        <button type="submit" disabled={blocked || !valid}>{reenter ? "重试同一次答复" : "提交答复"}</button>
       </fieldset>
     </form>
     {children}

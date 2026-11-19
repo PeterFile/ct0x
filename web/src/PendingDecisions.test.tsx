@@ -1,6 +1,6 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
-import { afterEach, expect, it, vi } from "vitest";
-import { PendingDecisions } from "./PendingDecisions";
+import { createHash, randomUUID } from "node:crypto";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { PendingReviews } from "./PendingReviews";
 import { deferred, json, page } from "./test/groups";
 
@@ -25,10 +25,36 @@ const groupPath = (id: string) => `/api/v1/groups/${encodeURIComponent(id)}`;
 const identityPath = (id: string) => `${groupPath(id)}/identity`;
 const membership = (group_id: string, project_id: string) => ({ group_id, project_id, workspace_id: "workspace-1", channel_id: `channel:${group_id}` });
 const pendingPath = "/api/v1/me/pending-decisions";
+const answerPath = (item: ReturnType<typeof taskQuestion>, groupScoped = false) =>
+  `${groupScoped ? groupPath(item.group_id) : "/api/v1/me"}/decisions/${encodeURIComponent(item.id)}/answer`;
+const statusPath = (item: ReturnType<typeof taskQuestion>) => `${answerPath(item)}?${new URLSearchParams({
+  group_id: item.group_id, topic_id: item.topic_id, version: String(item.version),
+})}`;
+const absent = () => json({ error: { code: "not_found" } }, 404);
 const formFor = (name: string) => within(screen.getByRole("article", { name }));
 const payments = "支付项目 · 告警 · 周末样本验证", settlement = "结算项目 · 告警 · 周末样本验证";
+const fallback = "项目未确认 · 告警 · 周末样本验证";
+const handling = { turn_id: "continuation-turn", attempt_id: "continuation-attempt", consumed_at: timestamp };
+const storedValues = () => Object.values(sessionStorage).join("\n");
+let PendingDecisions: typeof import("./PendingDecisions").PendingDecisions;
+let setVisibility: (value: DocumentVisibilityState) => void;
+async function reloadModule() {
+  vi.resetModules();
+  ({ PendingDecisions } = await import("./PendingDecisions"));
+}
 
-afterEach(() => vi.unstubAllGlobals());
+beforeEach(async () => {
+  sessionStorage.clear();
+  const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+  setVisibility = value => { visibility.mockReturnValue(value); };
+  vi.stubGlobal("crypto", { randomUUID, subtle: {
+    async digest(_algorithm: string, bytes: Uint8Array) {
+      return Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer;
+    },
+  } });
+  await reloadModule();
+});
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 it("answers only the chosen same-name Task and replays the exact write after leaving the workbench page", async () => {
   const first = taskQuestion("payments", 7, "alerts/weekend"), second = taskQuestion("settlement", 2, "");
@@ -45,8 +71,9 @@ it("answers only the chosen same-name Task and replays the exact write after lea
     case `${pendingPath}?limit=50`: return page(items);
     case identityPath(first.group_id): return json(membership(first.group_id, "payments"));
     case identityPath(second.group_id): return json(membership(second.group_id, "settlement"));
-    case "/api/v1/projects/payments": return json({ id: "payments", name: "支付项目" });
-    case "/api/v1/projects/settlement": return json({ id: "settlement", name: "结算项目" });
+    case "/api/v1/projects/payments": return json({ id: "payments", name: "支付项目", workspace_id: "workspace-1" });
+    case "/api/v1/projects/settlement": return json({ id: "settlement", name: "结算项目", workspace_id: "workspace-1" });
+    case statusPath(first): return absent();
     default: throw new Error(`Unexpected request: ${String(input)}`);
     }
   });
@@ -55,8 +82,8 @@ it("answers only the chosen same-name Task and replays the exact write after lea
   expect(transport).not.toHaveBeenCalled();
   view.rerender(<PendingDecisions active />);
   expect(screen.getByText("正在载入待决事项…")).toBeVisible();
-  await screen.findByRole("article", { name: payments });
-  const chosen = formFor(payments), unrelated = formFor(settlement);
+  const chosen = within(await screen.findByRole("article", { name: payments }));
+  const unrelated = within(await screen.findByRole("article", { name: settlement }));
   const priorReceipts = screen.queryAllByText("答复已保存").length;
   for (const text of [first.facts, first.question, first.recommendation]) expect(chosen.getByText(text)).toBeVisible();
   expect(chosen.getByText(first.authorization.scope)).toBeVisible();
@@ -66,7 +93,7 @@ it("answers only the chosen same-name Task and replays the exact write after lea
   const submit = chosen.getByRole("button", { name: "提交答复" });
   act(() => { fireEvent.click(submit); fireEvent.click(submit); });
   expect(submit).toBeDisabled();
-  expect(post).toHaveBeenCalledTimes(1);
+  await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
   const [path, init] = post.mock.calls[0];
   const key = new Headers(init?.headers).get("Idempotency-Key");
   expect(key).toBeTruthy();
@@ -74,8 +101,7 @@ it("answers only the chosen same-name Task and replays the exact write after lea
   expect(init?.redirect).toBe("error");
   expect(JSON.parse(String(init?.body))).toEqual({ group_id: first.group_id, topic_id: first.topic_id, version: 7, text });
 
-  // The server committed but the browser lost the response. Reloading the
-  // list does not return this item and is not evidence of the answer itself.
+  // A lost response and an item missing from the list are not evidence of saving.
   view.unmount();
   items = [second];
   await act(async () => lost.resolve(json({}, 502)));
@@ -116,7 +142,7 @@ it("filters by exact group, coalesces source reads, and requires a new selection
     switch (String(input)) {
     case `${pendingPath}?limit=50`: return page(items);
     case identityPath(first.group_id): return json(membership(first.group_id, "looking-up"));
-    case "/api/v1/projects/looking-up": return json({ id: "wrong-project", name: "不应出现的项目" });
+    case "/api/v1/projects/looking-up": return json({ id: "wrong-project", name: "不应出现的项目", workspace_id: "workspace-1" });
     default: throw new Error(`Unexpected request: ${String(input)}`);
     }
   });
@@ -125,9 +151,10 @@ it("filters by exact group, coalesces source reads, and requires a new selection
   const name = "项目未确认 · 告警 · 周末样本验证";
   await screen.findByRole("article", { name });
   expect(screen.getAllByRole("article")).toHaveLength(2);
-  expect(transport.mock.calls.map(([url]) => url)).toEqual([
-    `${pendingPath}?limit=50`, identityPath(first.group_id), "/api/v1/projects/looking-up",
-  ]);
+  const sourceReads = () => transport.mock.calls.map(([url]) => String(url))
+    .filter(url => url.endsWith("/identity") || url.startsWith("/api/v1/projects/"));
+  const expectedProofReads = [identityPath(first.group_id), "/api/v1/projects/looking-up"];
+  await waitFor(() => expect(sourceReads()).toEqual(expectedProofReads));
   expect(screen.queryByText("不应出现的项目", { exact: false })).not.toBeInTheDocument();
   expect(formFor(name).getByText(/项目未确认/)).toHaveTextContent(first.group_id);
   const choose = () => fireEvent.click(formFor(name).getByRole("radio", { name: "纳入周末" }));
@@ -141,6 +168,7 @@ it("filters by exact group, coalesces source reads, and requires a new selection
   expect(submit()).toBeDisabled();
   choose(); fireEvent.click(submit());
   expect(await screen.findByText("答复已保存")).toBeVisible();
+  expect(sourceReads()).toEqual(expectedProofReads); // The failed optional proof was cached in this group scope.
   expect(post).toHaveBeenCalledTimes(2);
   const keys = post.mock.calls.map(([path, init], index) => {
     expect(path).toBe(`${groupPath(first.group_id)}/decisions/${first.id}/answer`);
@@ -148,6 +176,303 @@ it("filters by exact group, coalesces source reads, and requires a new selection
     return new Headers(init?.headers).get("Idempotency-Key");
   });
   expect(keys[0]).toBeTruthy(); expect(keys[1]).toBeTruthy(); expect(keys[0]).not.toBe(keys[1]);
+});
+
+it("serves pending work before optional D reads and never uses a label from another workspace or scope", async () => {
+  const first = taskQuestion("labels-late", 6, "alerts/late"), foreign = taskQuestion("labels-mismatch", 2, "");
+  const broken = { ...taskQuestion("labels-broken", 1, ""), group_name: "告警故障演练" };
+  const late = deferred<Response>(), failing = deferred<Response>();
+  let identityReads = 0;
+  const fetcher = vi.fn<typeof fetch>(async input => {
+    switch (String(input)) {
+    case `${pendingPath}?limit=50`: return page([first, foreign, broken], "older");
+    case `${pendingPath}?limit=50&before=older`: return page([first]);
+    case identityPath(first.group_id): return ++identityReads === 1 ? json(membership(first.group_id, "late")) : json({}, 503);
+    case identityPath(foreign.group_id): return json(membership(foreign.group_id, "mismatch"));
+    case identityPath(broken.group_id): return failing.promise;
+    case "/api/v1/projects/late": return late.promise;
+    case "/api/v1/projects/mismatch": return json({ id: "mismatch", workspace_id: "workspace-2", name: "不应出现的跨工作区项目" });
+    default: throw new Error(`Unexpected request: ${String(input)}`);
+    }
+  });
+  vi.stubGlobal("fetch", fetcher);
+  const view = render(<PendingDecisions active />);
+  const target = within((await screen.findAllByRole("article", { name: fallback }))[0]);
+  fireEvent.change(target.getByRole("textbox"), { target: { value: "不用等待项目名称。" } });
+  expect(target.getByRole("button", { name: "提交答复" })).toBeEnabled();
+  expect(target.getByText(/项目未确认/)).toHaveTextContent(first.group_id);
+  expect(screen.getByRole("button", { name: "加载更多待决事项" })).toBeEnabled();
+  await act(async () => {
+    late.resolve(json({ id: "late", workspace_id: "workspace-1", name: "稍后核实的项目" }));
+    failing.resolve(json({}, 503));
+  });
+  const confirmed = "稍后核实的项目 · 告警 · 周末样本验证";
+  expect(within(await screen.findByRole("article", { name: confirmed })).getByRole("textbox")).toHaveValue("不用等待项目名称。");
+  expect(formFor(fallback).getByText(/项目未确认/)).toHaveTextContent(foreign.group_id);
+  expect(formFor(fallback).queryByText("项目 ID")).not.toBeInTheDocument();
+  expect(screen.queryByText(/不应出现的跨工作区项目/)).not.toBeInTheDocument();
+  expect(formFor("项目未确认 · 告警故障演练 · 周末样本验证").getByText(/项目未确认/)).toHaveTextContent(broken.group_id);
+
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "加载更多待决事项" })); });
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "刷新待决事项" })); });
+  expect(screen.getByRole("article", { name: confirmed })).toBeVisible();
+  expect(formFor(fallback).getByText(/项目未确认/)).toHaveTextContent(foreign.group_id);
+  const readsFor = (path: string) => fetcher.mock.calls.filter(([url]) => url === path);
+  const outsideScope = [identityPath(foreign.group_id), identityPath(broken.group_id), "/api/v1/projects/mismatch"];
+  for (const path of [identityPath(first.group_id), "/api/v1/projects/late", ...outsideScope]) {
+    expect(readsFor(path)).toHaveLength(1);
+  }
+
+  view.rerender(<PendingDecisions active groupId={first.group_id} />);
+  expect(await screen.findByRole("article", { name: fallback })).toBeVisible();
+  await waitFor(() => expect(identityReads).toBe(2));
+  expect(screen.queryByRole("article", { name: confirmed })).not.toBeInTheDocument();
+  expect(readsFor("/api/v1/projects/late")).toHaveLength(1);
+  for (const path of outsideScope) expect(readsFor(path)).toHaveLength(1);
+});
+
+it("restores a committed lost response and native handling by exact history reads after a fresh page load", async () => {
+  const item = taskQuestion("reload-committed", 11, "alerts/lost +"), text = "  不在浏览器日志中保留原文。  ";
+  const receipt = receiptFor(item, text), lost = deferred<Response>(), history = deferred<Response>();
+  const post = vi.fn<typeof fetch>(() => lost.promise);
+  const status = vi.fn<typeof fetch>().mockReturnValueOnce(history.promise).mockResolvedValueOnce(json({ receipt, handling }));
+  let items = [item];
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === `${pendingPath}?limit=50`) return Promise.resolve(page(items));
+    if (String(input) === answerPath(item, true) && init?.method === "POST") return post(input, init);
+    if (String(input) === statusPath(item) && init?.method === "GET") return status(input, init);
+    return Promise.resolve(absent());
+  });
+  let view = render(<PendingDecisions active groupId={item.group_id} />);
+  const card = within(await screen.findByRole("article", { name: fallback }));
+  fireEvent.change(card.getByRole("textbox"), { target: { value: text } });
+  fireEvent.click(card.getByRole("button", { name: "提交答复" }));
+  await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+  const key = new Headers(post.mock.calls[0][1]?.headers).get("Idempotency-Key")!;
+  expect(storedValues()).toContain(key);
+  for (const secret of [text, item.facts, item.task.task_title, item.task.mandate_id]) expect(storedValues()).not.toContain(secret);
+
+  view.unmount(); items = [];
+  await reloadModule();
+  view = render(<PendingDecisions active groupId="another-group" />);
+  expect(await screen.findByText("没有待决事项。")).toBeVisible();
+  expect(status).not.toHaveBeenCalled();
+  view.rerender(<PendingDecisions active />);
+  expect(await screen.findByText(/答复结果未确认/)).toBeVisible();
+  expect(screen.queryByText("答复已保存")).not.toBeInTheDocument();
+  expect(post).toHaveBeenCalledTimes(1);
+  await act(async () => history.resolve(json({ receipt, handling })));
+  expect(await screen.findByText(receipt.id)).toBeVisible();
+  expect(screen.getByText("答复已保存")).toBeVisible();
+  expect(screen.getByText("负责人已处理")).toBeVisible();
+  expect(storedValues()).not.toContain(key);
+  expect(storedValues()).not.toContain(text);
+
+  view.unmount();
+  await reloadModule();
+  render(<PendingDecisions active />);
+  expect(await screen.findByText("负责人已处理")).toBeVisible();
+  expect(screen.getByText(receipt.id)).toBeVisible();
+  expect(status).toHaveBeenCalledTimes(2);
+  for (const [path, init] of status.mock.calls) {
+    expect(path).toBe(statusPath(item));
+    expect(init).toMatchObject({ method: "GET", redirect: "error", cache: "no-store" });
+  }
+  expect(post).toHaveBeenCalledTimes(1);
+});
+
+it("retries a recovered attempt only on explicit matching input after checking exact history", async () => {
+  const item = taskQuestion("reload-retry", 5, ""), text = "  原样重输；保留空格。  ";
+  const receipt = receiptFor(item, text);
+  const post = vi.fn<typeof fetch>().mockResolvedValueOnce(json({}, 502)).mockResolvedValueOnce(json(receipt));
+  let ambiguous = true, current = item;
+  const reads = vi.fn<typeof fetch>(async () => ambiguous ? json({ receipt: { ...receipt, text: "别的答复" }, handling }) : absent());
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === `${pendingPath}?limit=50`) return Promise.resolve(page([current]));
+    if (init?.method === "POST") return post(input, init);
+    if (String(input) === statusPath(item)) return reads(input, init);
+    return Promise.resolve(absent());
+  });
+  const first = render(<PendingDecisions active groupId={item.group_id} />);
+  const enter = (value: string) => fireEvent.change(formFor(fallback).getByRole("textbox"), { target: { value } });
+  await screen.findByRole("article", { name: fallback });
+  enter(text); fireEvent.click(formFor(fallback).getByRole("button", { name: "提交答复" }));
+  await screen.findByText(/答复结果未确认/);
+  first.unmount();
+  await reloadModule();
+  render(<PendingDecisions active />);
+  await screen.findByRole("article", { name: fallback });
+  expect(formFor(fallback).getByRole("textbox")).toHaveValue("");
+  expect(post).toHaveBeenCalledTimes(1);
+  expect(screen.queryByText("答复已保存")).not.toBeInTheDocument();
+  const retry = () => fireEvent.click(formFor(fallback).getByRole("button", { name: "重试同一次答复" }));
+  enter(text.trim()); await act(async () => retry());
+  expect(screen.getByRole("alert")).toHaveTextContent(/不一致/);
+  expect(post).toHaveBeenCalledTimes(1);
+  enter(text); await act(async () => retry());
+  expect(screen.getByRole("alert")).toHaveTextContent(/答复结果未确认/);
+  expect(screen.queryByText("负责人已处理")).not.toBeInTheDocument();
+  expect(post).toHaveBeenCalledTimes(1);
+
+  const refresh = () => fireEvent.click(screen.getByRole("button", { name: "刷新待决事项" }));
+  current = { ...item, version: item.version + 1 };
+  refresh();
+  const currentCard = within(await screen.findByRole("article", { name: fallback }));
+  expect(currentCard.getByText(`决定版本 ${current.version}`)).toBeVisible();
+  expect(currentCard.getByRole("textbox")).toHaveValue("");
+  const history = within(screen.getByRole("region", { name: "尚未确认的答复" }));
+  expect(history.getByRole("alert")).toHaveTextContent("答复结果未确认");
+  expect(post).toHaveBeenCalledTimes(1);
+
+  ambiguous = false; current = item;
+  const before = reads.mock.calls.length;
+  refresh();
+  await waitFor(() => expect(reads.mock.calls.length).toBeGreaterThan(before));
+  await screen.findByRole("article", { name: fallback });
+  expect(post).toHaveBeenCalledTimes(1);
+  const priorReads = reads.mock.calls.length;
+  retry();
+  expect(await screen.findByText("答复已保存")).toBeVisible();
+  expect(post).toHaveBeenCalledTimes(2);
+  const identity = ([path, init]: Parameters<typeof fetch>) => ({ path, body: init?.body, key: new Headers(init?.headers).get("Idempotency-Key") });
+  expect(identity(post.mock.calls[0])).toMatchObject({ path: answerPath(item, true), key: expect.any(String) });
+  expect(identity(post.mock.calls[1])).toEqual(identity(post.mock.calls[0]));
+  expect(reads.mock.invocationCallOrder.slice(priorReads).some(call => call < post.mock.invocationCallOrder[1])).toBe(true);
+});
+
+it("answers a strictly newer version without resolving the older unknown", async () => {
+  const older = taskQuestion("unknown-version", 2, "alerts"), newer = { ...older, version: 3 };
+  const post = vi.fn<typeof fetch>().mockResolvedValueOnce(json({}, 502))
+    .mockResolvedValueOnce(json(receiptFor(newer, newer.choices[1], 2)));
+  let current = older;
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === `${pendingPath}?limit=50`) return Promise.resolve(page([current]));
+    if (init?.method === "POST") return post(input, init);
+    return Promise.resolve(absent());
+  });
+  render(<PendingDecisions active />);
+  await screen.findByRole("article", { name: fallback });
+  const select = () => fireEvent.click(formFor(fallback).getByRole("radio", { name: "纳入周末" }));
+  const submit = () => formFor(fallback).getByRole("button", { name: "提交答复" });
+  select(); fireEvent.click(submit());
+  expect(await screen.findByRole("alert")).toHaveTextContent("答复结果未确认");
+  expect(submit()).toBeDisabled();
+  current = newer;
+  fireEvent.click(screen.getByRole("button", { name: "刷新待决事项" }));
+  await screen.findByText(`决定版本 ${newer.version}`);
+  expect(submit()).toBeDisabled(); // A new version requires a fresh selection.
+  const history = within(screen.getByRole("region", { name: "尚未确认的答复" }));
+  expect(history.getByText(`决定版本 ${older.version}`, { exact: false }))
+    .toHaveTextContent(`事项 ${older.id} · 决定版本 ${older.version}`);
+  expect(history.queryByRole("button", { name: "重试同一次答复" })).not.toBeInTheDocument();
+  expect(post).toHaveBeenCalledTimes(1);
+  select(); expect(submit()).toBeEnabled(); fireEvent.click(submit());
+  expect(await screen.findByText("答复已保存")).toBeVisible();
+  expect(history.getByRole("alert")).toHaveTextContent("答复结果未确认");
+  expect(post).toHaveBeenCalledTimes(2);
+  const [[, first], [path, next]] = post.mock.calls;
+  expect(path).toBe(answerPath(newer));
+  expect(JSON.parse(String(next?.body))).toEqual({ group_id: newer.group_id, topic_id: newer.topic_id, version: newer.version, option_index: 2 });
+  expect(new Headers(next?.headers).get("Idempotency-Key")).not.toBe(new Headers(first?.headers).get("Idempotency-Key"));
+});
+
+it.each(["disabled", "at quota"])("sends and explicitly replays the same answer when sessionStorage is %s", async storage => {
+  const item = taskQuestion("journal-unavailable", 1, ""), text = "  保留答复原文。  ";
+  const receipt = receiptFor(item, text);
+  const post = vi.fn<typeof fetch>().mockResolvedValueOnce(json({}, 502)).mockResolvedValueOnce(json(receipt));
+  const unavailable = () => { throw new DOMException("Storage unavailable", storage === "disabled" ? "SecurityError" : "QuotaExceededError"); };
+  if (storage === "disabled") vi.spyOn(Storage.prototype, "getItem").mockImplementation(unavailable);
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(unavailable);
+  const reads = vi.fn<typeof fetch>(async () => absent());
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === `${pendingPath}?limit=50`) return Promise.resolve(page([item]));
+    if (String(input) === answerPath(item) && init?.method === "POST") return post(input, init);
+    if (String(input) === statusPath(item) && init?.method === "GET") return reads(input, init);
+    return Promise.resolve(absent());
+  });
+  const view = render(<PendingDecisions active />);
+  const card = within(await screen.findByRole("article", { name: fallback }));
+  fireEvent.change(card.getByRole("textbox"), { target: { value: text } });
+  fireEvent.click(card.getByRole("button", { name: "提交答复" }));
+  expect(await card.findByRole("alert")).toHaveTextContent("答复结果未确认");
+  expect(post).toHaveBeenCalledTimes(1);
+
+  view.rerender(<PendingDecisions active={false} />);
+  view.rerender(<PendingDecisions active />);
+  const reopened = within(await screen.findByRole("article", { name: fallback }));
+  expect(screen.queryByText("答复已保存")).not.toBeInTheDocument();
+  expect(post).toHaveBeenCalledTimes(1);
+  const priorReads = reads.mock.calls.length;
+  fireEvent.click(reopened.getByRole("button", { name: "重试同一次答复" }));
+  expect(await screen.findByText(receipt.id)).toBeVisible();
+  expect(screen.getByText("答复已保存")).toBeVisible();
+  expect(post).toHaveBeenCalledTimes(2);
+  expect(storedValues()).not.toContain(text);
+  const [[path, init], [replayPath, replay]] = post.mock.calls;
+  const key = new Headers(init?.headers).get("Idempotency-Key");
+  expect(key).toBeTruthy();
+  expect(path).toBe(answerPath(item));
+  expect(JSON.parse(String(init?.body))).toEqual({ group_id: item.group_id, topic_id: "", version: 1, text });
+  expect(replayPath).toBe(path);
+  expect(replay?.body).toBe(init?.body);
+  expect(new Headers(replay?.headers).get("Idempotency-Key")).toBe(key);
+  expect(reads.mock.invocationCallOrder.slice(priorReads).some(call => call < post.mock.invocationCallOrder[1])).toBe(true);
+});
+
+it.each(["handled", "uncertain", "hidden", "budget"] as const)("checks for exact handling with %s", async ending => {
+  vi.useFakeTimers();
+  const item = taskQuestion("poll-ack", 3, ""), receipt = receiptFor(item, item.choices[1], 2);
+  const uncertain = ending === "uncertain";
+  let ack: typeof handling | null = null;
+  const reads = vi.fn<typeof fetch>(async () => uncertain && !ack ? absent()
+    : json({ receipt, handling: ack, delivery_state: "accepted", run_state: "completed" }));
+  vi.stubGlobal("fetch", (input: RequestInfo | URL, init?: RequestInit) => {
+    if (String(input) === `${pendingPath}?limit=50`) return Promise.resolve(page([item]));
+    if (String(input) === statusPath(item)) return reads(input, init);
+    if (init?.method === "POST") return Promise.resolve(uncertain ? json({}, 502)
+      : json({ ...receipt, delivery_state: "accepted", run_state: "completed" }));
+    return Promise.resolve(absent());
+  });
+  render(<PendingDecisions active />);
+  await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  fireEvent.click(formFor(fallback).getByRole("radio", { name: "纳入周末" }));
+  await act(async () => {
+    fireEvent.click(formFor(fallback).getByRole("button", { name: "提交答复" }));
+    await vi.advanceTimersByTimeAsync(0);
+  });
+  if (uncertain) {
+    expect(screen.getByText(/答复结果未确认/)).toBeVisible();
+    expect(screen.queryByText("答复已保存")).not.toBeInTheDocument();
+  } else {
+    expect(screen.getByText("答复已保存")).toBeVisible();
+    expect(screen.getByText("尚未确认负责人处理。")).toBeVisible();
+  }
+  expect(screen.queryByText("负责人已处理")).not.toBeInTheDocument();
+  expect(reads).toHaveBeenCalledTimes(1);
+
+  if (ending === "handled" || uncertain) {
+    ack = handling;
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+    expect(screen.getByText("答复已保存")).toBeVisible();
+    expect(screen.getByText("负责人已处理")).toBeVisible();
+    expect(reads).toHaveBeenCalledTimes(2);
+  } else if (ending === "hidden") {
+    setVisibility("hidden"); // No visibilitychange event is required to suspend the next read.
+  } else {
+    await act(async () => { await vi.advanceTimersByTimeAsync(120000); });
+    expect(reads.mock.calls.length).toBeGreaterThan(1);
+    expect(reads.mock.calls.length).toBeLessThanOrEqual(7);
+  }
+  const stopped = reads.mock.calls.length;
+  await act(async () => { await vi.advanceTimersByTimeAsync(120000); });
+  expect(reads).toHaveBeenCalledTimes(stopped);
+  if (ending === "hidden") expect(reads).toHaveBeenCalledTimes(1);
+  if (ending === "budget") {
+    ack = handling;
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: "刷新待决事项" })); });
+    expect(screen.getByText("负责人已处理")).toBeVisible();
+    expect(reads).toHaveBeenCalledTimes(stopped + 1);
+  }
 });
 
 it("keeps a migration-absent decision inbox optional alongside the real review inbox", async () => {

@@ -1,5 +1,6 @@
+import { webcrypto } from "node:crypto";
 import * as ReactDOMClient from "react-dom/client";
-import { act, fireEvent, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PendingDecision } from "../decision-api";
 import { deferred, group, json, other, page } from "../test/groups";
@@ -334,6 +335,7 @@ describe("global pending reviews in the production entry", () => {
 });
 
 it("answers the exact project Task from the real inbox and the original chat, keeping saved and handled separate", async () => {
+  vi.stubGlobal("crypto", webcrypto);
   const network = transport.getMockImplementation()!;
   const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
   const question = (source: typeof group, suffix: string, topic_id: string, version: number, title = task.title) => ({
@@ -383,7 +385,7 @@ it("answers the exact project Task from the real inbox and the original chat, ke
       if (url === `/api/v1/groups/${source.id}/identity`) return Promise.resolve(json({
         group_id: source.id, project_id, workspace_id: "workspace", channel_id: `channel-${source.id}`,
       }));
-      if (url === `/api/v1/projects/${project_id}`) return Promise.resolve(json({ id: project_id, name }));
+      if (url === `/api/v1/projects/${project_id}`) return Promise.resolve(json({ id: project_id, name, workspace_id: "workspace" }));
     }
     if (url.startsWith(`/api/v1/groups/${other.id}/messages?`)) return Promise.resolve(page([announcement]));
     return network(input, init);
@@ -403,13 +405,13 @@ it("answers the exact project Task from the real inbox and the original chat, ke
   expect(inbox().getAllByRole("heading", { name: "待我决定" })).toHaveLength(1);
   expect(await inbox().findByText(firstReview.submission.summary)).toBeVisible();
   const target = within(await inbox().findByRole("article", { name: chosenName }));
-  expect(inbox().getByRole("article", { name: foreignName })).toBeVisible();
+  expect(await inbox().findByRole("article", { name: foreignName })).toBeVisible();
   fireEvent.click(target.getByText("来源与版本标识", { selector: "summary" }));
   for (const id of ["settlement", other.id, chosen.task.task_id]) expect(target.getByText(id)).toBeVisible();
   change(within(inbox().getByRole("article", { name: localName })).getByRole("textbox"), text);
   fireEvent.click(target.getByRole("radio", { name: "纳入周末" }));
   fireEvent.click(target.getByRole("button", { name: "提交答复" }));
-  expect(writes()).toHaveLength(1);
+  await waitFor(() => expect(writes()).toHaveLength(1));
   expect(identity(writes()[0])).toMatchObject({ url: globalPost, key: expect.any(String) });
   expect(JSON.parse(String(writes()[0][1]?.body))).toEqual({ group_id: other.id, topic_id: chosen.topic_id, version: 7, option_index: 2 });
   expect(transport.mock.calls.some(([url]) => /\/(messages|tasks)(?:\/|\?)/.test(String(url)))).toBe(false);
@@ -432,8 +434,9 @@ it("answers the exact project Task from the real inbox and the original chat, ke
   expect(listReads()).toBe(readCount);
   fireEvent.click(summary);
   const grouped = within(await chat().findByRole("region", { name: "待决事项" }));
-  const localCard = within(await grouped.findByRole("article", { name: localName }));
-  expect(grouped.queryByRole("article", { name: foreignName })).not.toBeInTheDocument();
+  const localArticle = await grouped.findByRole("article", { name: localName });
+  expect(grouped.getAllByRole("article")).toEqual([localArticle]);
+  const localCard = within(localArticle);
   expect(localCard.getByRole("textbox")).toHaveValue(text);
   expect(receiptRow(grouped, receipt.id).getByText("答复已保存")).toBeVisible();
   expect(grouped.queryByText("负责人已处理")).not.toBeInTheDocument();
@@ -442,7 +445,7 @@ it("answers the exact project Task from the real inbox and the original chat, ke
   expect(await receiptRow(grouped, receipt.id).findByText("负责人已处理")).toBeVisible();
 
   fireEvent.click(localCard.getByRole("button", { name: "提交答复" }));
-  expect(writes()).toHaveLength(2);
+  await waitFor(() => expect(writes()).toHaveLength(2));
   expect(identity(writes()[1])).toMatchObject({ url: groupPost, key: expect.any(String) });
   expect(JSON.parse(String(writes()[1][1]?.body))).toEqual({ group_id: other.id, topic_id: "", version: 9, text });
   pending = [foreign];
