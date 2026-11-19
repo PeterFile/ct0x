@@ -42,11 +42,23 @@ func (r *MemberToolRuntime) wrapCoordinationRole(binding MemberToolRunBinding, e
 		}
 	}
 	if investigation != nil {
-		if investigation.build == nil || factory != nil || binding.ProviderName != provider.Pi || investigation.providerID != binding.ProviderID || investigation.request.Model != binding.Model {
+		if factory != nil || binding.ProviderName != provider.Pi || investigation.providerID != binding.ProviderID || investigation.request.Model != binding.Model {
 			return nil, errMemberToolRuntimeBinding
 		}
 		frozen := *investigation
 		frozen.scope.ArtifactVersions = slices.Clone(frozen.scope.ArtifactVersions)
+		if managed := investigation.owner; managed != nil {
+			if !r.investigationOwnerLaunchEnabled() || expected.Kind != store.CoordinationRoleWorker || investigation.build != nil ||
+				managed.selected.ID != binding.ProviderID || managed.selected.Name != binding.ProviderName || len(facts) != 0 {
+				return nil, errMemberToolRuntimeBinding
+			}
+			copy := *managed
+			copy.Operations = slices.Clone(managed.Operations)
+			copy.DelegateCandidateIDs = slices.Clone(managed.DelegateCandidateIDs)
+			frozen.owner = &copy
+		} else if investigation.build == nil {
+			return nil, errMemberToolRuntimeBinding
+		}
 		investigation = &frozen
 	} else if factory == nil {
 		return nil, errMemberToolRuntimeBinding
@@ -103,7 +115,7 @@ func (e *memberToolRuntimeRun) roleStartup(ctx context.Context, claim store.Turn
 
 func (e *memberToolRuntimeRun) rolePreflight(ctx context.Context, request provider.ExecuteRequest, scope store.CoordinationToolScope, token string, operations []string, config *memberToolRuntimeConfigFile) bool {
 	r := e.runtime
-	if ctx.Err() != nil || !r.roleFence.rootValid(request.RuntimeDir) || !r.clearRunDirectory(request) || !r.rootValid() || !e.configValid(config) {
+	if ctx.Err() != nil || !r.roleFence.rootValid(request.RuntimeDir) || !r.clearRunDirectory(request) || !r.rootValid() || !e.roleConfigValid(config) {
 		return false
 	}
 	// Bound database verification independently of caller cancellation, including
@@ -120,8 +132,16 @@ func (e *memberToolRuntimeRun) rolePreflight(ctx context.Context, request provid
 	entry, found := r.tools.capabilities[sha256.Sum256([]byte(token))]
 	valid := found && e.matchesRoleRegistration(entry, scope, operations)
 	r.tools.mu.RUnlock()
-	return valid && r.roleFence.rootValid(request.RuntimeDir) && r.rootValid() && e.configValid(config) &&
+	return valid && r.roleFence.rootValid(request.RuntimeDir) && r.rootValid() && e.roleConfigValid(config) &&
 		e.investigation.validateRequest(request) && checkCtx.Err() == nil && ctx.Err() == nil
+}
+
+func (e *memberToolRuntimeRun) managedInitialOwner() bool {
+	return e.investigation != nil && e.investigation.owner != nil
+}
+
+func (e *memberToolRuntimeRun) roleConfigValid(config *memberToolRuntimeConfigFile) bool {
+	return e.configValid(config) && (!e.managedInitialOwner() || config.digestMatches())
 }
 
 func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, request provider.ExecuteRequest, onEvent func(provider.Event) error) provider.ExecutionReceipt {
@@ -163,9 +183,18 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 		}
 		scope.AttemptID = binding.AttemptID
 	}
-	if e.investigation != nil {
+	switch {
+	case e.managedInitialOwner():
+		// Match the same immutable scope that shaped the #200 preparation.
+		// Issuance and the final role transaction independently check live authority.
+		current, scopeErr := r.tools.db.GetTaskInvestigationScope(ctx, scope.Provenance.GroupID, scope.Provenance.TaskID)
+		if scopeErr != nil || !e.investigation.matchesScope(&current) {
+			return unknown
+		}
+		token, _, err = r.IssueInitialInvestigationOwnerTools(ctx, scope, e.investigation.artifacts)
+	case e.investigation != nil:
 		token, err = r.tools.issueInvestigationRole(ctx, scope, e.investigation, e.dispatchCapabilities)
-	} else {
+	default:
 		token, err = r.tools.issueCoordinationRoleWithCapabilities(ctx, scope, e.dispatchCapabilities)
 	}
 	if err != nil {
@@ -185,7 +214,12 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 		}
 		return unknown
 	}
-	config, err = r.createConfig(token)
+	var typed provider.PiFreshInvestigationBinding
+	if e.managedInitialOwner() {
+		config, typed, err = r.writeInvestigationConfig(token, scope.Member.Claim.TurnID, initialInvestigationOwnerProfile(operations))
+	} else {
+		config, err = r.createConfig(token)
+	}
 	if err != nil || !e.rolePreflight(ctx, request, scope, token, operations, config) {
 		return startupFailure()
 	}
@@ -193,9 +227,18 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 	var session *memberToolNativeTurn
 	nativeRequest := request
 	if e.investigation != nil {
-		issued := provider.NativeMemberToolConfig{Path: filepath.Join(r.configRoot, config.name), SHA256: config.digest}
-		native, err = e.investigation.build(issued, slices.Clone(operations))
-		if err != nil || native == nil || !e.commitInvestigationLaunch(ctx, request, scope, token, operations, config, owner) {
+		if e.managedInitialOwner() {
+			selected, launch := e.investigation.owner.selected, r.investigationTaskWork
+			if !launch.Supports(selected, copyPiFreshInvestigationProfile(typed.Profile)) || ctx.Err() != nil {
+				return startupFailure()
+			}
+			typed.Profile = copyPiFreshInvestigationProfile(typed.Profile)
+			native, err = launch.Construct(ctx, selected, typed)
+		} else {
+			issued := provider.NativeMemberToolConfig{Path: filepath.Join(r.configRoot, config.name), SHA256: config.digest}
+			native, err = e.investigation.build(issued, slices.Clone(operations))
+		}
+		if err != nil || nilTaskWorkExecutor(native) || !e.commitInvestigationLaunch(ctx, request, scope, token, operations, config, owner) {
 			return startupFailure()
 		}
 	} else {
@@ -216,7 +259,7 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 	aggregate := raw
 	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), memberToolRuntimeVerificationTimeout)
 	defer cancel()
-	if !e.roleHistorical(checkCtx, request, scope) {
+	if !e.roleHistorical(checkCtx, request, scope) || e.managedInitialOwner() && (raw.NativeRef != nil || ctx.Err() != nil && raw.Outcome != provider.OutcomeUnknown) {
 		aggregate.Outcome = provider.OutcomeUnknown
 		aggregate.Reason = "角色执行历史身份或执行根无法确认，需对账后再处理"
 	} else if raw.Outcome == provider.OutcomeNotStarted {
@@ -251,20 +294,28 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 func (e *memberToolRuntimeRun) commitInvestigationLaunch(ctx context.Context, request provider.ExecuteRequest, scope store.CoordinationToolScope,
 	token string, operations []string, config *memberToolRuntimeConfigFile, owner *memberToolRoleFenceOwner) bool {
 	r := e.runtime
-	if ctx.Err() != nil || !r.roleFence.rootValid(request.RuntimeDir) || !r.clearRunDirectory(request) || !r.rootValid() || !e.configValid(config) ||
-		!e.investigation.validateRequest(request) || !owner.beginInvoke() {
+	validFiles := func() bool {
+		return r.roleFence.rootValid(request.RuntimeDir) && r.clearRunDirectory(request) && r.rootValid() &&
+			e.roleConfigValid(config) && e.investigation.validateRequest(request)
+	}
+	if ctx.Err() != nil || !validFiles() || !owner.beginInvoke() {
 		return false
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, memberToolRuntimeVerificationTimeout)
 	defer cancel()
-	r.tools.mu.RLock()
-	defer r.tools.mu.RUnlock()
-	entry, found := r.tools.capabilities[sha256.Sum256([]byte(token))]
-	if !found || !e.matchesRoleRegistration(entry, scope, operations) {
-		return false
-	}
-	current, err := e.roleStartup(checkCtx, scope.Member.Claim)
-	return err == nil && current == scope && checkCtx.Err() == nil
+	checked := func() bool {
+		r.tools.mu.RLock()
+		defer r.tools.mu.RUnlock()
+		entry, found := r.tools.capabilities[sha256.Sum256([]byte(token))]
+		if !found || !e.matchesRoleRegistration(entry, scope, operations) {
+			return false
+		}
+		current, err := e.roleStartup(checkCtx, scope.Member.Claim)
+		return err == nil && current == scope && checkCtx.Err() == nil
+	}()
+	// As for typed wakes, construction and the last authority read do not
+	// waive the digest/physical root checks at invocation. No legacy fallback.
+	return checked && (!e.managedInitialOwner() || validFiles() && checkCtx.Err() == nil)
 }
 
 func (e *memberToolRuntimeRun) matchesRoleRegistration(entry memberToolRegistration, scope store.CoordinationToolScope, operations []string) bool {

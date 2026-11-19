@@ -32,6 +32,35 @@ func NewPiInvestigationTaskWorkLaunch(extensionPath string, timeout time.Duratio
 	return &InvestigationTaskWorkLaunch{Supports: a.Supports, Construct: a.NewExecutor, Commit: commit}
 }
 
+// DelegateSupport takes an immutable startup catalog, applying the same member
+// and adapter gates as child preparation. It samples no live accounts or tools.
+func (l *InvestigationTaskWorkLaunch) DelegateSupport(providers []provider.Provider) InvestigationDelegateSupport {
+	if l == nil || l.Supports == nil {
+		return nil
+	}
+	catalog := make(map[string]provider.Provider, len(providers))
+	for _, selected := range providers {
+		if _, duplicate := catalog[selected.ID]; duplicate {
+			return nil
+		}
+		selected.Evidence = slices.Clone(selected.Evidence)
+		catalog[selected.ID] = selected
+	}
+	supports, artifacts := l.Supports, l.Artifacts != nil
+	return func(member domain.Member, profile provider.PiFreshInvestigationProfile) bool {
+		return profile.Action == domain.ChatActionReadOnlyInvestigation && profile.SourceKind == domain.TaskWorkSourceDelegation &&
+			(artifacts || !slices.Contains(profile.Operations, ReadInvestigationArtifactOperation)) &&
+			supportsInvestigationTaskWorkMember(member, catalog[member.ProviderID], profile, supports)
+	}
+}
+
+func supportsInvestigationTaskWorkMember(member domain.Member, selected provider.Provider, profile provider.PiFreshInvestigationProfile,
+	supports func(provider.Provider, provider.PiFreshInvestigationProfile) bool) bool {
+	return selected.ID == member.ProviderID && selected.Name == provider.Pi && member.Status == domain.MemberStatusActive &&
+		member.Workspace == "" && len(member.Model) <= 256 && memberToolRuntimeText(member.Model) &&
+		supports(selected, copyPiFreshInvestigationProfile(profile))
+}
+
 func freezeInvestigationTaskWorkLaunch(db *store.Store, launch *InvestigationTaskWorkLaunch) (*InvestigationTaskWorkLaunch, error) {
 	if launch == nil || launch.Supports == nil || launch.Construct == nil || launch.Commit == nil {
 		return nil, errMemberToolRuntimeConfig
@@ -76,13 +105,21 @@ func (e *taskWorkRun) issueInvestigationTaskWork(ctx context.Context, launch *st
 	}
 	launch.AttemptID = attempt.ID
 	role := store.CoordinationToolScope{Member: scope, Provenance: e.plan.provenance, AttemptID: attempt.ID}
+	if e.plan.investigation.managed {
+		token, _, err := r.IssueFreshInvestigationOwnerManagementTools(ctx, role, work, artifacts)
+		return token, err
+	}
 	token, _, err := r.IssueFreshInvestigationOwnerTools(ctx, role, work, artifacts)
 	return token, err
 }
 
 func (p *investigationTaskWorkPreparation) matchesRegistration(entry memberToolRegistration, launch store.FreshTaskWorkLaunch) bool {
+	purpose := ""
+	if p.managed && launch.Delivery.SourceKind.IsOwnerContinuation() {
+		purpose = memberContinuingInvestigationOwnerPurpose
+	}
 	if entry.scope != launch.Scope || entry.role != (store.CoordinationToolScope{}) || entry.candidate != nil ||
-		entry.purpose != "" || entry.taskWork != nil || entry.grants.Skills != nil ||
+		entry.purpose != purpose || !slices.Equal(entry.delegateCandidateIDs, p.candidateIDs) || entry.taskWork != nil || entry.grants.Skills != nil ||
 		!slices.Equal(entry.grants.Operations, p.profile.Operations) || (entry.grants.Artifacts != nil) != (len(p.versions) != 0) {
 		return false
 	}
@@ -115,17 +152,23 @@ func (e *taskWorkRun) createInvestigationTaskWorkConfig(ctx context.Context, lau
 	}
 	profile := plan.profile
 	profile.Operations = slices.Clone(issued.grants.Operations)
-	data, digest, err := provider.PiFreshInvestigationConfig(r.endpoint, token, issued.scope.Claim.TurnID, profile)
+	file, binding, err := r.writeInvestigationConfig(token, issued.scope.Claim.TurnID, profile)
+	return investigationTaskWorkConfig{file: file, binding: binding, issued: issued}, err
+}
+
+// The caller already matched the exact registration and owns cleanup of even
+// a partial file. No state, grant or candidate IDs enter the private bootstrap.
+func (r *MemberToolRuntime) writeInvestigationConfig(token, runID string, profile provider.PiFreshInvestigationProfile) (*memberToolRuntimeConfigFile, provider.PiFreshInvestigationBinding, error) {
+	data, digest, err := provider.PiFreshInvestigationConfig(r.endpoint, token, runID, profile)
 	if err != nil {
-		return investigationTaskWorkConfig{}, err
+		return nil, provider.PiFreshInvestigationBinding{}, err
 	}
 	file, err := r.writeConfig(data)
 	if err != nil {
-		return investigationTaskWorkConfig{file: file}, err
+		return file, provider.PiFreshInvestigationBinding{}, err
 	}
-	binding := provider.PiFreshInvestigationBinding{ConfigPath: filepath.Join(r.configRoot, file.name), ConfigSHA256: digest,
-		RunID: issued.scope.Claim.TurnID, Profile: profile}
-	return investigationTaskWorkConfig{file: file, binding: binding, issued: issued}, nil
+	return file, provider.PiFreshInvestigationBinding{ConfigPath: filepath.Join(r.configRoot, file.name), ConfigSHA256: digest,
+		RunID: runID, Profile: profile}, nil
 }
 
 // Constructing the exact adapter is still not permission to invoke it.

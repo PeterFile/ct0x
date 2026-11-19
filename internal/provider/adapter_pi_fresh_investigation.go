@@ -15,7 +15,14 @@ import (
 
 // Only this entry (and its pinned pure bridge validators) implements the typed
 // investigation profile. It does not qualify either ordinary Pi entry point.
-const piFreshInvestigationEntrySHA = "217884b1c05b05fc8bb30374d249c6a8057cec134c5855735cce74e31a54fee9"
+const piFreshInvestigationEntrySHA = "94db410965bee6275fa193b0b83977ae6f1df3244294f36ff09a503e8ac2af57"
+
+const (
+	// PiInitialInvestigationOwnerRole is a C-only wire role, not a B wake.
+	PiInitialInvestigationOwnerRole domain.TaskWorkSourceKind = "initial_owner"
+	DelegateWorkTool                                          = "delegate_work"
+	HandbackWorkTool                                          = "handback_work"
+)
 
 // PiFreshInvestigationProfile is the launcher-selected profile of an issued
 // investigation capability. Operation names describe transport, not grants.
@@ -37,15 +44,33 @@ func (p PiFreshInvestigationProfile) valid() bool {
 			names = names[1:]
 		}
 	}
+	reads := len(p.Operations) - len(names)
 	switch p.SourceKind {
-	case domain.TaskWorkSourceFollowup:
-		return slices.Equal(names, PiFreshTaskWorkToolNames())
+	case PiInitialInvestigationOwnerRole:
+		return reads != 0 && (slices.Equal(names, []string{"submit_result"}) ||
+			slices.Equal(names, []string{"submit_result", DelegateWorkTool}))
 	case domain.TaskWorkSourceDelegation:
 		return slices.Equal(names, []string{"report_work"})
 	case domain.TaskWorkSourceReport:
-		return len(names) != 0 && names[0] == "read_work_report" && slices.Equal(names[1:], PiFreshTaskWorkToolNames())
+		if len(names) == 0 || names[0] != "read_work_report" {
+			return false
+		}
+		return validPiInvestigationContinuation(names[1:], reads == 0)
+	case domain.TaskWorkSourceFollowup:
+		return validPiInvestigationContinuation(names, true)
+	default:
+		return false
 	}
-	return false
+}
+
+func validPiInvestigationContinuation(names []string, allowManagement bool) bool {
+	owner := PiFreshTaskWorkToolNames()
+	if len(names) < len(owner) || !slices.Equal(names[:len(owner)], owner) {
+		return false
+	}
+	suffix := names[len(owner):]
+	return len(suffix) == 0 || allowManagement && (slices.Equal(suffix, []string{HandbackWorkTool}) ||
+		slices.Equal(suffix, []string{DelegateWorkTool, HandbackWorkTool}))
 }
 
 // PiFreshInvestigationBinding pairs the launcher's issued digest with the
@@ -120,6 +145,7 @@ func (a PiFreshInvestigationAdapter) NewExecutor(ctx context.Context, selected P
 	pi := baseline.(piExecutor)
 	pi.memberTools = &piMemberToolOptions{extensionPath: bridge, configPath: filepath.Clean(binding.ConfigPath),
 		toolNames: issued.Operations, configSHA256: binding.ConfigSHA256, investigationConfigFile: file, typedWorkRole: string(issued.SourceKind),
+		investigation:       issued.SourceKind == PiInitialInvestigationOwnerRole || slices.Contains(issued.Operations, HandbackWorkTool),
 		investigationBearer: piInvestigationBearerFingerprint{size: len(issued.Token), digest: sha256.Sum256([]byte(issued.Token))}}
 	return &piFreshInvestigationExecutor{pi: pi, adapter: a, runID: binding.RunID}, nil
 }

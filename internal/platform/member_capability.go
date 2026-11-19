@@ -40,6 +40,7 @@ type memberToolRegistration struct {
 	investigationOwner *investigationWorkOwnerBinding
 	// Frozen server capability facts are not grants or model-controlled input.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
+	delegateCandidateIDs []string
 }
 
 // MemberTools owns process-local capabilities; durable claims authorize every use.
@@ -54,6 +55,8 @@ type MemberTools struct {
 	freshTaskWork    FreshTaskWorkLaunch    // Independent of the legacy work-input preview.
 	workReportEngine *coordination.Engine   // Transport only; independent of either launch opt-in.
 	workspace        *memberWorkspaceRegistry
+
+	investigationDelegateSupport InvestigationDelegateSupport // Immutable trusted opt-in.
 }
 
 func NewMemberTools(db *store.Store) *MemberTools {

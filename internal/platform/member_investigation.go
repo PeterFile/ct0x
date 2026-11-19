@@ -52,6 +52,21 @@ func investigationRootDelivery(ctx context.Context, db *store.Store, thread doma
 	return d, ctx.Err()
 }
 
+func investigationAdmissionMatchesScope(admission domain.ChatAssessmentReceipt, scope domain.TaskInvestigationScope, requestID string) bool {
+	return admission.DispatchRequestID == requestID && admission.ThreadRef == scope.ThreadRef && admission.TaskID == scope.TaskID &&
+		admission.MandateID == scope.MandateID && admission.PolicyRevision == scope.PolicyRevision && admission.Action == domain.ChatActionReadOnlyInvestigation
+}
+
+func requireStrictInvestigationAdmissionRoot(ctx context.Context, db *store.Store, admission domain.ChatAssessmentReceipt) error {
+	if admission.SourceKind != "local_user_chat" || admission.SourceSenderID != "user" || admission.Purpose != domain.ChatIntakePurpose ||
+		admission.Outcome != "admitted" || admission.Disposition != "prepare_work" || !admission.AuthorityEvidenceVerified ||
+		admission.DiscussionOnly || admission.DiscussionOnlyExcerpt != "" {
+		return investigationReadError(ctx, errInvestigationFirstRoot)
+	}
+	_, err := investigationRootDelivery(ctx, db, admission.ThreadRef, admission.MessageID, admission.SourceID, admission.AssessedBy, admission.TurnID)
+	return investigationReadError(ctx, err)
+}
+
 // Historical lookup classifies a formal role delivery even if its current
 // policy is disabled. An error or mismatched investigation must not fall back
 // to ordinary role tools, context or workspace.
@@ -76,17 +91,10 @@ func taskInvestigationForRole(ctx context.Context, db *store.Store, role store.C
 	if err != nil {
 		return nil, investigationReadError(ctx, err)
 	}
-	if admission.DispatchRequestID != role.RequestID || admission.TaskID != scope.TaskID ||
-		admission.GroupID != scope.GroupID || admission.TopicID != scope.TopicID || admission.MandateID != scope.MandateID ||
-		admission.PolicyRevision != scope.PolicyRevision || admission.Action != domain.ChatActionReadOnlyInvestigation {
+	if !investigationAdmissionMatchesScope(admission, scope, role.RequestID) {
 		return nil, store.ErrMemberToolDenied
 	}
-	if admission.SourceKind != "local_user_chat" || admission.SourceSenderID != "user" || admission.Purpose != domain.ChatIntakePurpose ||
-		admission.Outcome != "admitted" || admission.Disposition != "prepare_work" || !admission.AuthorityEvidenceVerified ||
-		admission.DiscussionOnly || admission.DiscussionOnlyExcerpt != "" {
-		return nil, errInvestigationFirstRoot
-	}
-	if _, err := investigationRootDelivery(ctx, db, admission.ThreadRef, admission.MessageID, admission.SourceID, admission.AssessedBy, admission.TurnID); err != nil {
+	if err := requireStrictInvestigationAdmissionRoot(ctx, db, admission); err != nil {
 		return nil, err
 	}
 	if role.Kind == store.CoordinationRoleWorker {
@@ -154,54 +162,84 @@ func validInvestigationRoleScope(scope store.CoordinationToolScope) bool {
 // The runtime supplies a frozen, prepared profile after binding any Attempt.
 func (s *MemberTools) issueInvestigationRole(ctx context.Context, scope store.CoordinationToolScope, prepared *investigationRolePreparation,
 	facts []store.DispatchWorkerCapabilityFact) (string, error) {
-	if prepared == nil || !validInvestigationRoleScope(scope) {
+	if prepared == nil {
 		return "", store.ErrMemberToolDenied
+	}
+	token, _, err := s.issueInitialInvestigationTools(ctx, scope, prepared, facts, prepared.artifacts)
+	return token, err
+}
+
+// The opt-in connector has no #200 preparation packet; it must instead be
+// the exact original worker role, with a bound Attempt and persisted admission.
+func (s *MemberTools) issueInitialInvestigationTools(ctx context.Context, scope store.CoordinationToolScope, prepared *investigationRolePreparation,
+	facts []store.DispatchWorkerCapabilityFact, artifacts *MemberArtifactGrant) (string, InvestigationOwnerToolProfile, error) {
+	var empty InvestigationOwnerToolProfile
+	entry := memberToolRegistration{scope: scope.Member, role: scope, purpose: memberInvestigationRolePurpose}
+	managed := prepared == nil
+	if managed {
+		entry.purpose = memberInitialInvestigationOwnerPurpose
+		if !s.InvestigationOwnerManagementEnabled() || !entry.initialInvestigationOwnerValid() {
+			return "", empty, store.ErrMemberToolDenied
+		}
+	} else if !validInvestigationRoleScope(scope) {
+		return "", empty, store.ErrMemberToolDenied
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.capabilities) >= maxMemberToolRegistrations {
-		return "", store.ErrMemberToolDenied
+		return "", empty, store.ErrMemberToolDenied
 	}
-	for _, entry := range s.capabilities {
-		if entry.scope.Claim.TurnID == scope.Member.Claim.TurnID {
-			return "", store.ErrMemberToolDenied
+	for _, existing := range s.capabilities {
+		if existing.scope.Claim.TurnID == scope.Member.Claim.TurnID {
+			return "", empty, store.ErrMemberToolDenied
 		}
 	}
 	saved, err := taskInvestigationForRole(ctx, s.db, scope.Provenance)
 	if err != nil {
-		return "", err
+		return "", empty, err
 	}
-	if !prepared.matchesScope(saved) {
-		return "", store.ErrMemberToolDenied
+	if saved == nil || !managed && !prepared.matchesScope(saved) {
+		return "", empty, store.ErrMemberToolDenied
 	}
 	state, err := s.resolveInvestigationRole(ctx, scope)
 	if err != nil {
-		return "", err
+		return "", empty, err
 	}
-	if state.ProviderID != prepared.providerID || state.Model != prepared.request.Model {
-		return "", store.ErrMemberToolDenied
+	if !managed && (state.ProviderID != prepared.providerID || state.Model != prepared.request.Model) {
+		return "", empty, store.ErrMemberToolDenied
 	}
 	operations := investigationRoleOperations(scope.Provenance.Kind, *saved)
-	var grant *MemberArtifactGrant
+	if len(operations) == 0 {
+		return "", empty, store.ErrMemberToolDenied
+	}
 	if len(saved.ArtifactVersions) != 0 {
-		artifacts := prepared.artifacts
 		if artifacts == nil || artifacts.db != s.db || artifacts.open == nil {
-			return "", store.ErrMemberToolDenied
+			return "", empty, store.ErrMemberToolDenied
 		}
 		frozen := *artifacts
-		grant = &frozen
+		entry.grants.Artifacts = &frozen
 	}
+	if managed {
+		entry.delegateCandidateIDs, err = s.investigationDelegateCandidates(ctx, scope.Provenance, *saved)
+		if err != nil {
+			return "", empty, err
+		}
+	}
+	entry.grants.Operations = entry.withOwnerManagementOperations(operations)
+	entry.dispatchCapabilities = slices.Clone(facts)
 	token := rand.Text()
 	key := sha256.Sum256([]byte(token))
 	if _, exists := s.capabilities[key]; exists || token == scope.Member.Claim.Token {
-		return "", store.ErrMemberToolDenied
+		return "", empty, store.ErrMemberToolDenied
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return "", empty, err
 	}
-	s.capabilities[key] = memberToolRegistration{scope: scope.Member, role: scope, purpose: memberInvestigationRolePurpose,
-		grants: MemberToolGrants{Operations: operations, Artifacts: grant}, dispatchCapabilities: slices.Clone(facts)}
-	return token, nil
+	s.capabilities[key] = entry
+	if !managed {
+		return token, empty, nil
+	}
+	return token, entry.investigationOwnerProfile(), nil
 }
 
 // Resolve the live claim, exact role/Attempt and current investigation policy
@@ -245,6 +283,8 @@ func (s *MemberTools) investigationTransportOperations(ctx context.Context, entr
 			}
 		case name == investigationRoleCommand(entry.role.Provenance.Kind):
 			names = append(names, name)
+		case name == DelegateWorkOperation && entry.initialInvestigationOwnerValid() && len(entry.delegateCandidateIDs) != 0:
+			names = append(names, name)
 		default:
 			return nil, store.ErrMemberToolDenied
 		}
@@ -270,7 +310,8 @@ func (s *MemberTools) withInvestigationRead(ctx context.Context, token, operatio
 		if entry.workReport.delivery.SourceKind != domain.TaskWorkSourceDelegation {
 			return store.ErrMemberToolDenied
 		}
-	} else if entry.purpose != memberInvestigationRolePurpose || entry.role.Member != entry.scope || !validInvestigationRoleScope(entry.role) {
+	} else if !entry.initialInvestigationOwnerValid() &&
+		(entry.purpose != memberInvestigationRolePurpose || entry.role.Member != entry.scope || !validInvestigationRoleScope(entry.role)) {
 		return store.ErrMemberToolDenied
 	}
 	return investigationReadError(ctx, use(entry))

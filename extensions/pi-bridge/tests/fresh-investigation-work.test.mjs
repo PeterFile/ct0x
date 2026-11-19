@@ -17,8 +17,11 @@ const turn = "turn-investigation";
 const stamp = "2026-11-18T00:00:00.123456789Z";
 const channel = "read_investigation_channel", artifact = "read_investigation_artifact";
 const readReport = "read_work_report", report = "report_work";
+const delegate = "delegate_work", handback = "handback_work";
 const owner = ["read_work_inputs", "ack_work_input", "hand_back_work_input", "submit_result"];
 const reportOwner = [channel, artifact, readReport, ...owner];
+const initialOwner = [channel, artifact, "submit_result", delegate];
+const managedReport = [readReport, ...owner, delegate, handback];
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 const issue = (kind, operations) => ({ run_id: turn, action: "read_only_investigation", source_kind: kind, operations });
 const submit = { summary: "纯文本成果" };
@@ -114,7 +117,7 @@ async function bind(t, fx, operations, options) {
   await session.bindExtensions({ mode: "json", onError: err => errors.push(err.error) });
   const active = session.getActiveToolNames();
   // Attempt to activate names outside the signed registration.
-  session.setActiveToolsByName([...operations, ...reportOwner, report, "bash", "read", "send_message", "decide_dispatch"]);
+  session.setActiveToolsByName([...operations, ...reportOwner, report, delegate, handback, "hand_back_work", "bash", "read", "send_message", "decide_dispatch"]);
   const tools = new Map(session.agent.state.tools.map(tool => [tool.name, tool]));
   return { tools, session, active, errors, invoke: (op, args, id = "fixture-call", signal) => tools.get(op).execute(id, args, signal) };
 }
@@ -153,19 +156,27 @@ const fragment = { artifact_id: "artifact-1", version_id: "approved-v2", sha256:
   content_complete: false, encoding: "base64", content: "/wECBA==" };
 const page = { items: [], next_cursor: "" };
 const receipt = { submission_id: "submit-fixture", created_at: stamp, artifact_version_count: 0, summary_omitted: true };
+const delegateArgs = { member_id: "approved-peer", question: "  核对这一项🧪。\n", allow_topic_messages: false,
+  artifact_versions: [{ artifact_id: "artifact-1", version_id: "approved-v2" }] };
+const handbackArgs = { summary: "  请协调者核对范围。\n" };
+const delegateReceipt = { delegation_id: "delegation-fixture", created_at: stamp, wake_queued: true };
+const handbackReceipt = { handback_id: "handback-fixture", notice_message_id: "notice-fixture", created_at: stamp };
 
 const replies = {
   [channel]: [200, page], [artifact]: [200, fragment], [readReport]: [200, boundReport], [report]: [201, reportReceipt],
   read_work_inputs: [200, page], ack_work_input: [200, { input_id: "one", disposition: "confirmed" }],
   hand_back_work_input: [200, { input_id: "two", disposition: "returned" }], submit_result: [201, receipt],
+  [delegate]: [201, delegateReceipt], [handback]: [201, handbackReceipt],
 };
 const args = {
-  [artifact]: fragmentArgs, [report]: reportArgs,
+  [artifact]: fragmentArgs, [report]: reportArgs, [delegate]: delegateArgs, [handback]: handbackArgs,
   ack_work_input: { input_id: "one" }, hand_back_work_input: { input_id: "two", reason: "未获授权" }, submit_result: submit,
 };
 
 for (const [kind, operations] of [
   ["followup", [channel, artifact, ...owner]], ["delegation", [artifact, report]], ["delegation", [report]], ["report", reportOwner],
+  ["initial_owner", initialOwner], ["initial_owner", [channel, "submit_result"]],
+  ["followup", [channel, ...owner, delegate, handback]], ["report", managedReport], ["report", [readReport, ...owner, handback]],
 ]) {
   test(`Pi 1.4.0 registers only the exact ${kind} profile (${operations.length} tools)`, async t => {
     const reportOnly = operations.length === 1;
@@ -185,10 +196,10 @@ for (const [kind, operations] of [
       const payload = payloads[op] ?? {};
       assert.throws(() => tool.prepareArguments({ ...payload, task_id: "forged" }), /参数.*未发送/);
       const expected = reportOnly ? { ...reportReceipt, kind: "progress", wake_queued: false } : replies[op][1];
-      assert.deepEqual(await invoke(op, tool.prepareArguments(payload)), result(expected));
+      assert.deepEqual(await invoke(op, tool.prepareArguments(payload), `fixture-${op}`), result(expected));
     }
     assert.deepEqual(sent, operations.map(op => ({ op, body: JSON.stringify(payloads[op] ?? {}),
-      key: op === report || owner.slice(1).includes(op) ? sha(op + "fixture-call") : undefined })));
+      key: [report, delegate, handback, ...owner.slice(1)].includes(op) ? sha(op + `fixture-${op}`) : undefined })));
     assert.deepEqual(session.messages, []);
     await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     await assert.rejects(invoke(operations[0], payloads[operations[0]] ?? {}), /会话.*未发送/);
@@ -211,6 +222,10 @@ test("config digest and exact source profile are checked before session binding"
     { ...good, task_id: "unbound" }, { ...good, run_id: "../run" }, { ...good, action: "text_submission" },
     issue("handback", [report]), issue("followup", [channel, "submit_result"]), issue("delegation", [report, readReport]),
     issue("report", [readReport]), issue("delegation", [artifact, channel, report]), issue("delegation", [report, report]),
+    issue("initial_owner", ["submit_result", delegate]), issue("initial_owner", [...initialOwner, handback]),
+    issue("initial_owner", [channel, ...owner, delegate]), issue("delegation", [report, delegate]),
+    issue("report", [...reportOwner, delegate, handback]), issue("report", [readReport, ...owner, delegate]),
+    issue("followup", [...owner, handback, delegate]), issue("followup", [...owner, "hand_back_work"]),
   ]) {
     const changed = await issueFile(t, bad);
     await denied(changed.path, changed.digest);
@@ -278,18 +293,22 @@ test("investigation input gate neither swallows valid JSON nor intercepts TUI in
   await assert.rejects(tui.prompt("interactive input"), /synthetic model admission/);
 });
 
-test("Pi JSON print pairs report_work and retains the delegation uncertainty marker", async t => {
+for (const [role, ops, op, payload] of [
+  ["delegation", [report], report, reportArgs],
+  ["initial_owner", initialOwner, delegate, delegateArgs],
+  ["report", managedReport, handback, handbackArgs],
+]) test(`Pi JSON print pairs ${op} and retains the ${role} uncertainty marker`, async t => {
   const sent = intercept(t, () => [201, undefined]);
-  const fx = await issueFile(t, issue("delegation", [report]));
+  const fx = await issueFile(t, issue(role, ops));
   let requests = 0;
-  const session = await openSession(t, fx, [report], { modelRuntime: {
+  const session = await openSession(t, fx, ops, { modelRuntime: {
     hasConfiguredAuth: () => true, // Synthetic provider, never credentials.
     streamSimple(model) {
       const first = requests++ === 0;
       assert.ok(requests <= 2);
       const stream = createAssistantMessageEventStream();
       const stopReason = first ? "toolUse" : "stop";
-      const content = first ? [{ type: "toolCall", id: "fixture-call", name: report, arguments: reportArgs }] : [{ type: "text", text: "native stop" }];
+      const content = first ? [{ type: "toolCall", id: "fixture-call", name: op, arguments: payload }] : [{ type: "text", text: "native stop" }];
       stream.push({ type: "done", reason: stopReason, message: {
         role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), stopReason, content,
         usage: { input: 1, output: 1, totalTokens: 2, cacheRead: 0, cacheWrite: 0, cost: { input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0 } },
@@ -297,22 +316,23 @@ test("Pi JSON print pairs report_work and retains the delegation uncertainty mar
       return stream;
     },
   } });
-  const { frames, jsonl, errors, exit } = await runJSONPrint(t, session, "synthetic report");
+  const { frames, jsonl, errors, exit } = await runJSONPrint(t, session, "synthetic typed write");
   assert.deepEqual(errors, []);
   assert.equal(exit, 0);
   assert.equal(requests, 2);
   assert.equal(sent.length, 1);
   const [start, end, ...extra] = frames.filter(f => /^tool_execution_(start|end)$/.test(f.type));
   assert.deepEqual(extra, []);
-  assert.deepEqual(start, { type: "tool_execution_start", toolCallId: "fixture-call", toolName: report, args: reportArgs });
+  assert.deepEqual(start, { type: "tool_execution_start", toolCallId: "fixture-call", toolName: op, args: payload });
   assert.equal(end.type, "tool_execution_end");
-  assert.equal(end.toolName, report);
+  assert.equal(end.toolName, op);
   assert.equal(end.toolCallId, start.toolCallId);
   assert.equal(end.isError, true);
-  checkUnknown(end.result, "delegation", sent[0]);
+  assert.deepEqual(sent[0], { op, body: JSON.stringify(payload), key: sha(op + "fixture-call") });
+  checkUnknown(end.result, role, sent[0]);
   assert.deepEqual(frames.at(-1), { type: "agent_settled", aborted: false });
   const dir = process.env.TEST_PI_TYPED_PRINT_FIXTURES;
-  if (dir) await writeFile(join(dir, "delegation-unknown.jsonl"), jsonl, { mode: 0o600, flag: "wx" });
+  if (dir) await writeFile(join(dir, `${role}-unknown.jsonl`), jsonl, { mode: 0o600, flag: "wx" });
 });
 
 test("report owner denies selectors, mixed work input reads, versions on submit, and malformed evidence", async t => {
@@ -346,6 +366,76 @@ test("report owner denies selectors, mixed work input reads, versions on submit,
   assert.deepEqual(await invoke("read_work_inputs", { input_id: "one", offset: 5, max_bytes: 4 }), result(segment));
   assert.deepEqual(await invoke("submit_result", submit), result(receipt));
 });
+
+test("owner commands reject any extra selector or unchecked nested material before send", async t => {
+  const sent = intercept(t, op => replies[op]);
+  const { tools, invoke } = await bind(t, await issueFile(t, issue("report", managedReport)), managedReport);
+  const getter = { artifact_id: "artifact-1", get version_id() { assert.fail("evaluated a getter"); } };
+  const version = delegateArgs.artifact_versions[0];
+  for (const [op, payload] of [
+    [delegate, { ...delegateArgs, caller: "forged" }], [delegate, { ...delegateArgs, idempotency_key: "forged" }],
+    [delegate, { ...delegateArgs, question: "界".repeat(1366) }], [delegate, { ...delegateArgs, member_id: " owner" }],
+    [delegate, { ...delegateArgs, allow_topic_messages: null }], [delegate, { ...delegateArgs, allow_topic_messages: 0 }],
+    ...[null, [null], [getter], [new String("invalid")], Array(1), Array(17).fill(version),
+      Object.assign([version], { extra: true }), [{ ...version, task_id: "forged" }], [{ ...version, version_id: "界".repeat(43) }],
+      [{ ...version, version_id: "\ud800" }]].map(refs => [delegate, { ...delegateArgs, artifact_versions: refs }]),
+    [handback, { ...handbackArgs, reason: "not the ABI" }], [handback, { ...handbackArgs, input_id: "not an input return" }],
+    [handback, { ...handbackArgs, coordinator_id: "forged" }], [handback, { summary: "🧪".repeat(2049) }],
+  ]) {
+    assert.throws(() => tools.get(op).prepareArguments(payload), /参数.*未发送/);
+    await assert.rejects(invoke(op, payload), /参数.*未发送/);
+  }
+  assert.equal(sent.length, 0);
+  // Omitted selectors stay omitted; explicitly false and nested tuples are not rewritten.
+  const bare = { member_id: delegateArgs.member_id, question: delegateArgs.question };
+  assert.deepEqual(await invoke(delegate, bare, "without-selectors"), result(delegateReceipt));
+  assert.deepEqual(await invoke(delegate, delegateArgs, "with-selectors"), result(delegateReceipt));
+  await assert.rejects(invoke(delegate, delegateArgs, "with-selectors"), /已使用.*未发送/);
+  assert.deepEqual(await invoke(handback, handbackArgs, "handback"), result(handbackReceipt));
+  await assert.rejects(invoke(handback, handbackArgs, "handback"), /已使用.*未发送/);
+  assert.deepEqual(sent.map(c => c.body), [bare, delegateArgs, handbackArgs].map(p => JSON.stringify(p)));
+});
+
+for (const [role, ops, op] of [["initial_owner", initialOwner, delegate], ["report", managedReport, handback]]) {
+  test(`Pi ${op} treats only a definite HTTP denial as known and never resends an unknown write`, async t => {
+    let answer = [409, { error: { code: "conflict", message: "declined" } }];
+    let abort;
+    const sent = intercept(t, () => { abort?.(); return answer; });
+    const session = () => issueFile(t, issue(role, ops)).then(fx => bind(t, fx, ops));
+    const payload = args[op];
+    const { invoke } = await session();
+    const before = new AbortController();
+    before.abort();
+    await assert.rejects(invoke(op, payload, "fixture-call", before.signal), /取消.*未发送/);
+    assert.equal(sent.length, 0);
+    await assert.rejects(invoke(op, payload), /被拒绝.*conflict/);
+    await assert.rejects(invoke(op, payload), /已使用.*未发送/);
+    assert.equal(sent.length, 1);
+    const good = replies[op][1];
+    for (const reply of [
+      [500, { error: { code: "internal_error", message: "Current failure" } }], [201, undefined], [200, good],
+      [201, { ...good, wake_queued: false }], [201, { ...good, created_at: "wrong" }],
+      [201, JSON.stringify(good).replace('"created_at":', '"created_at":"wrong","created_at":')],
+      [201, { ...good, task_id: "foreign" }], [302, good],
+    ]) {
+      const { invoke } = await session();
+      const i = sent.length;
+      answer = reply;
+      checkUnknown(await invoke(op, payload), role, sent[i]);
+      await assert.rejects(invoke(op, payload), /结果未知/);
+      await assert.rejects(invoke("submit_result", submit, "another-command"), /阻止后续写入/);
+      assert.equal(sent.length, i + 1);
+    }
+    const running = new AbortController();
+    abort = () => running.abort();
+    answer = [201, good];
+    const cancelled = await session();
+    const i = sent.length;
+    checkUnknown(await cancelled.invoke(op, payload, "fixture-call", running.signal), role, sent[i]);
+    await assert.rejects(cancelled.invoke(op, payload, "another-call"), /阻止后续写入/);
+    assert.equal(sent.length, i + 1);
+  });
+}
 
 test("a malformed or missing write receipt never retries or permits a different write", async t => {
   let reportReply = [409, { error: { code: "conflict", message: "rejected" } }];

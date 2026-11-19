@@ -26,6 +26,7 @@ func TestInvestigationTaskWorkOwnerTransportV30Followup(t *testing.T) {
 }
 
 func TestInvestigationTaskWorkOwnerTransportV30Report(t *testing.T) {
+	t.Parallel()
 	testInvestigationTaskWorkOwnerTransportV30(t, domain.TaskWorkSourceReport)
 }
 

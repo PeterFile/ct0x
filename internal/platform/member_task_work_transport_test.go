@@ -37,9 +37,52 @@ type boundWorkReportFixture struct {
 	delegation domain.TaskWorkDelegation
 }
 
+// Cache only the real migrated schema, not a populated role fixture. Each
+// caller writes these immutable bytes to its own file before opening a Store.
+var taskWorkSchemaImage = sync.OnceValues(func() ([]byte, error) {
+	dir, err := os.MkdirTemp("", "task-work-schema-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "workspace.db")
+	db, err := store.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Close(); err != nil {
+		return nil, err
+	}
+	// Fail rather than snapshot just the main file if any sidecar remains.
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	if len(files) != 1 || files[0].Name() != filepath.Base(path) || !files[0].Type().IsRegular() {
+		return nil, errors.New("closed task-work schema is not a standalone database file")
+	}
+	image, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(image) == 0 {
+		return nil, errors.New("empty task-work schema image")
+	}
+	return image, nil
+})
+
+func newTaskWorkRoleRuntime(t *testing.T) *roleRuntimeFixture {
+	t.Helper()
+	schema, err := taskWorkSchemaImage()
+	if err != nil {
+		t.Fatalf("create task-work schema image: %v", err)
+	}
+	return newRoleRuntimeWithSchema(t, schema)
+}
+
 func newBoundWorkReportFixture(t *testing.T) *boundWorkReportFixture {
 	t.Helper()
-	f := &boundWorkReportFixture{roleRuntimeFixture: newRoleRuntime(t)}
+	f := &boundWorkReportFixture{roleRuntimeFixture: newTaskWorkRoleRuntime(t)}
 	f.engine = coordination.New(f.db)
 	var err error
 	f.runtime, err = platform.NewMemberToolRuntimeWithTaskWorkReports(f.db, f.options, f.engine)
@@ -107,51 +150,106 @@ func (f *boundWorkReportFixture) delegate(t *testing.T, parentRefs, childRefs []
 	ctx := t.Context()
 	child, err := f.local.CreateMember(ctx, f.group, platform.MemberInput{Name: "Child", Role: "Proofreader", ProviderID: f.worker.ProviderID, Model: f.worker.Model}, "")
 	roleOK(t, err)
-	_, err = f.db.SetDispatchPolicy(ctx, f.group, []string{f.worker.ID, child.ID}, 1, "report-workers")
+	owner := f.prepareInvestigationOwner(t, parentRefs, 1, child.ID)
+	owner = f.bindInvestigationOwner(t, owner)
+	f.acceptWork(t, owner.Member)
+	// Legacy transport fixtures construct the wake directly in B. The owner
+	// management fixture exercises its own real HTTP writer instead.
+	f.delegation, err = f.engine.DelegateWork(ctx, owner.Member, domain.DelegateWorkInput{MemberID: child.ID, Question: "核对第一条意见",
+		AllowTopicMessages: topicGrant, ArtifactVersions: childRefs}, "delegate")
+	roleOK(t, err)
+	f.settleWork(t, owner.Member, true)
+}
+
+func (f *boundWorkReportFixture) prepareInvestigationOwner(t *testing.T, parentRefs []domain.ArtifactVersionRef, maxDelegations int, workerIDs ...string) store.CoordinationToolScope {
+	t.Helper()
+	deliveryID := f.queueInvestigationOwner(t, parentRefs, maxDelegations, workerIDs...)
+	owner := f.claim(t, deliveryID)
+	ownerScope, err := f.db.BindMemberTool(t.Context(), owner.claim)
+	roleOK(t, err)
+	return store.CoordinationToolScope{Member: ownerScope, Provenance: owner.provenance}
+}
+
+func (f *boundWorkReportFixture) queueInvestigationOwner(t *testing.T, parentRefs []domain.ArtifactVersionRef, maxDelegations int, workerIDs ...string) string {
+	t.Helper()
+	admitted := f.assessInvestigationFixture(t, true, parentRefs, maxDelegations, workerIDs...)
+	if admitted.Outcome != "admitted" || !admitted.AuthorityEvidenceVerified {
+		t.Fatalf("fixture lacks verified v30 investigation admission: %s %s", admitted.Outcome, admitted.ReasonCode)
+	}
+	decision := f.decideInvestigationFixture(t, admitted, "assign")
+	assignment, err := f.db.MaterializeAssignment(t.Context(), decision.Assignment.ID, 1, time.Now().UTC())
+	roleOK(t, err)
+	return assignment.Delivery.DeliveryID
+}
+
+func (f *boundWorkReportFixture) assessInvestigationFixture(t *testing.T, enabled bool, parentRefs []domain.ArtifactVersionRef, maxDelegations int, workerIDs ...string) domain.ChatAssessmentReceipt {
+	t.Helper()
+	return f.assessInvestigationFixtureFrom(t, enabled, "", parentRefs, maxDelegations, workerIDs...)
+}
+
+func (f *boundWorkReportFixture) assessInvestigationFixtureFrom(t *testing.T, enabled bool, sender string, parentRefs []domain.ArtifactVersionRef, maxDelegations int, workerIDs ...string) domain.ChatAssessmentReceipt {
+	t.Helper()
+	ctx := t.Context()
+	_, err := f.db.SetDispatchPolicy(ctx, f.group, append([]string{f.worker.ID}, workerIDs...), 1, "report-workers")
 	roleOK(t, err)
 	thread := domain.ThreadRef{GroupID: f.group, TopicID: "report-fixture"}
 	f.policy, err = f.engine.SetChatPolicy(ctx, thread, domain.ChatPolicyRequest{Enabled: true, Action: domain.ChatActionTextSubmission, MaxAdmissions: 1,
-		Investigation: &domain.ChatInvestigationPolicy{Objective: "Check the notes", AllowTopicMessages: true, MaxDelegations: 1, ArtifactVersions: parentRefs}}, 0, "report-policy")
+		Investigation: &domain.ChatInvestigationPolicy{Objective: "Check the notes", AllowTopicMessages: true, MaxDelegations: maxDelegations, ArtifactVersions: parentRefs}}, 0, "report-policy")
 	roleOK(t, err)
-	f.engine.EnableInvestigationExecution()
+	if enabled {
+		f.engine.EnableInvestigationExecution()
+	}
 	f.engine.EnableTaskWorkExecution() // Fixture only: no C executable is installed.
-	f.source, err = f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: thread.TopicID, Content: "请调查公开讨论。", RecipientIDs: []string{f.lead.ID}}, "source")
+	recipient := f.lead.ID
+	if sender != "" {
+		recipient = sender
+	}
+	f.source, err = f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: thread.TopicID, Content: "请调查公开讨论。", RecipientIDs: []string{recipient}}, "source")
 	roleOK(t, err)
+	if sender != "" {
+		publisher := f.claimWork(t, f.source.Deliveries[0].ID)
+		f.source, err = f.db.SendMessageForTool(ctx, publisher, store.MemberToolMessageInput{Content: "建议按书面策略调查。", RecipientIDs: []string{f.lead.ID}}, "member-source")
+		roleOK(t, err)
+		f.settleWork(t, publisher, false)
+	}
 	intake := f.claimWork(t, f.source.Deliveries[0].ID)
 	candidate, err := f.engine.CaptureChatCandidate(ctx, intake)
 	roleOK(t, err)
 	admitted, err := f.engine.AssessChatIntent(ctx, intake, candidate.ID, domain.ChatAssessment{Disposition: "prepare_work", Action: domain.ChatActionReadOnlyInvestigation,
 		Reason: "按原规则调查"}, "记录授权范围。", "admit")
 	roleOK(t, err)
-	if admitted.Outcome != "admitted" || !admitted.AuthorityEvidenceVerified {
-		t.Fatalf("fixture lacks verified v30 investigation admission: %s %s", admitted.Outcome, admitted.ReasonCode)
-	}
 	f.settleWork(t, intake, false)
+	return admitted
+}
+
+func (f *boundWorkReportFixture) decideInvestigationFixture(t *testing.T, admitted domain.ChatAssessmentReceipt, kind string) domain.DecisionReceipt {
+	t.Helper()
+	ctx := t.Context()
 	dispatch, err := f.db.MaterializeDispatchRequest(ctx, admitted.DispatchRequestID, 1, time.Now().UTC())
 	roleOK(t, err)
 	co := f.claim(t, dispatch.Delivery.DeliveryID)
 	coMember, err := f.db.BindMemberTool(ctx, co.claim)
 	roleOK(t, err)
-	decision, err := f.db.DecideDispatchWithCapabilities(ctx, store.CoordinationToolScope{Member: coMember, Provenance: co.provenance},
-		store.CoordinatorDecisionInput{Kind: "assign", WorkerMemberID: f.worker.ID, Reason: "调查"}, "assign", []store.DispatchWorkerCapabilityFact{{
-			GroupID: f.group, MemberID: f.worker.ID, ProviderID: f.worker.ProviderID, Model: f.worker.Model, TaskID: co.provenance.TaskID,
-			TaskRevision: co.provenance.TaskRevision, RequiredProfile: store.DispatchInvestigationWorkerProfile}})
+	input := store.CoordinatorDecisionInput{Kind: kind, Reason: "调查"}
+	var facts []store.DispatchWorkerCapabilityFact
+	if kind == "assign" {
+		input.WorkerMemberID = f.worker.ID
+		facts = []store.DispatchWorkerCapabilityFact{{GroupID: f.group, MemberID: f.worker.ID, ProviderID: f.worker.ProviderID,
+			Model: f.worker.Model, TaskID: co.provenance.TaskID, TaskRevision: co.provenance.TaskRevision, RequiredProfile: store.DispatchInvestigationWorkerProfile}}
+	}
+	decision, err := f.db.DecideDispatchWithCapabilities(ctx, store.CoordinationToolScope{Member: coMember, Provenance: co.provenance}, input, kind, facts)
 	roleOK(t, err)
 	f.settleWork(t, coMember, false)
-	assignment, err := f.db.MaterializeAssignment(ctx, decision.Assignment.ID, 1, time.Now().UTC())
+	return decision
+}
+
+func (f *boundWorkReportFixture) bindInvestigationOwner(t *testing.T, owner store.CoordinationToolScope) store.CoordinationToolScope {
+	t.Helper()
+	var err error
+	f.original, err = f.db.BindAssignmentAttempt(t.Context(), owner)
 	roleOK(t, err)
-	owner := f.claim(t, assignment.Delivery.DeliveryID)
-	ownerScope, err := f.db.BindMemberTool(ctx, owner.claim)
-	roleOK(t, err)
-	f.original, err = f.db.BindAssignmentAttempt(ctx, store.CoordinationToolScope{Member: ownerScope, Provenance: owner.provenance})
-	roleOK(t, err)
-	f.acceptWork(t, ownerScope)
-	// The writer is not a member operation in this slice. B derives the original
-	// scope, author Attempt and allowed subset from the live owner here.
-	f.delegation, err = f.engine.DelegateWork(ctx, ownerScope, domain.DelegateWorkInput{MemberID: child.ID, Question: "核对第一条意见",
-		AllowTopicMessages: topicGrant, ArtifactVersions: childRefs}, "delegate")
-	roleOK(t, err)
-	f.settleWork(t, ownerScope, true)
+	owner.AttemptID = f.original.AttemptID
+	return owner
 }
 
 func (f *boundWorkReportFixture) call(t *testing.T, token, id, op, args string, failed bool) string {
@@ -216,6 +314,7 @@ func (f *boundWorkReportFixture) workCounts(t *testing.T) [4]int {
 }
 
 func TestBoundWorkDelegationTransport(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	f := newBoundWorkReportFixture(t)
 	f.mountMemberToolHandlers(t.Context())
@@ -322,7 +421,8 @@ func TestBoundWorkDelegationTransport(t *testing.T) {
 
 const testReportBody = `{"kind":"progress","summary":"Checked the notes"}`
 
-func TestBoundWorkReportReadTransport(t *testing.T) {
+func TestBoundWorkReportReadSelectsExactOwnerReport(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	f := newBoundWorkReportFixture(t)
 	f.delegate(t, nil, nil, false)
@@ -558,7 +658,8 @@ func (f *boundWorkReportFixture) reportKey(t *testing.T, text string) string {
 	return key
 }
 
-func TestBoundWorkReportMCPUnknownReplay(t *testing.T) {
+func TestBoundWorkReportMCPUnknownWriteReplay(t *testing.T) {
+	t.Parallel()
 	ctx := t.Context()
 	f := newBoundWorkReportFixture(t)
 	f.delegate(t, nil, nil, false)

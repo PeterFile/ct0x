@@ -29,7 +29,7 @@ func TestFreshTaskWorkB29NativeWireConfirmedInput(t *testing.T) {
 	testFreshTaskWorkB29NativeWire(t, "confirmed")
 }
 
-func TestFreshTaskWorkB29NativeWireContextAfterHandback(t *testing.T) {
+func TestFreshTaskWorkB29NativeWireContextForReturnedInput(t *testing.T) {
 	testFreshTaskWorkB29NativeWire(t, "context-after-handback")
 }
 
@@ -38,6 +38,7 @@ func TestFreshTaskWorkB29NativeWireUncertaintyAndCancellation(t *testing.T) {
 }
 
 func TestFreshTaskWorkB29NativeWireResourceClaims(t *testing.T) {
+	t.Parallel()
 	testFreshTaskWorkB29NativeWire(t, "wrong-resource", "extra-resource", "late-resource")
 }
 
@@ -49,7 +50,7 @@ func TestFreshTaskWorkB29NativeWireLaunchGateRejectsPreAdmissionPolicyChanges(t 
 	testFreshTaskWorkB29NativeWire(t, "late-policy", "policy-before-gate")
 }
 
-func TestFreshTaskWorkB29NativeWireLaunchGateFailedCommit(t *testing.T) {
+func TestFreshTaskWorkB29NativeWireRejectsFailedLaunchCommit(t *testing.T) {
 	testFreshTaskWorkB29NativeWire(t, "failed-launch-commit")
 }
 
@@ -63,7 +64,7 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
-			f := newRoleRuntime(t)
+			f := newTaskWorkRoleRuntime(t)
 			f.options.RoleMaxActive = 2 // The assessor can record input while the prior worker is unsettled.
 			engine := coordination.New(f.db)
 			f.options.ChatIntake = engine

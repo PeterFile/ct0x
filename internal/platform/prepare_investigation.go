@@ -164,6 +164,17 @@ type investigationRolePreparation struct {
 	// The exact fresh request before the scheduler fills the two claim fields.
 	request provider.ExecuteRequest
 	build   func(provider.NativeMemberToolConfig, []string) (provider.Executor, error)
+	owner   *initialInvestigationOwnerPreparation
+}
+
+type initialInvestigationOwnerPreparation struct {
+	InvestigationOwnerToolProfile
+	selected provider.Provider
+}
+
+func initialInvestigationOwnerProfile(operations []string) provider.PiFreshInvestigationProfile {
+	return provider.PiFreshInvestigationProfile{Action: domain.ChatActionReadOnlyInvestigation,
+		SourceKind: provider.PiInitialInvestigationOwnerRole, Operations: operations}
 }
 
 func (p *investigationRolePreparation) validateRequest(request provider.ExecuteRequest) bool {
@@ -193,7 +204,12 @@ func (p *investigationRolePreparation) matchesRegistration(entry memberToolRegis
 	if p == nil {
 		return entry.purpose == "" && grant == nil
 	}
-	if entry.purpose != memberInvestigationRolePurpose || !slices.Equal(entry.grants.Operations, investigationRoleOperations(entry.role.Provenance.Kind, p.scope)) {
+	if p.owner != nil {
+		if !entry.initialInvestigationOwnerValid() || !slices.Equal(entry.grants.Operations, p.owner.Operations) ||
+			!slices.Equal(entry.delegateCandidateIDs, p.owner.DelegateCandidateIDs) {
+			return false
+		}
+	} else if entry.purpose != memberInvestigationRolePurpose || !slices.Equal(entry.grants.Operations, investigationRoleOperations(entry.role.Provenance.Kind, p.scope)) {
 		return false
 	}
 	if len(p.scope.ArtifactVersions) == 0 {
@@ -301,12 +317,24 @@ func (p *Preparer) planInvestigationRole(ctx context.Context, state store.Coordi
 			return empty, rolePreparationBlocked(state, "investigation_no_supported_worker", nil)
 		}
 	}
-	in, err := investigationPreparationContext(role, scope, facts, p.roleMaxContextBytes)
+	prepared := &investigationRolePreparation{investigationPreparationSettings: *cfg, scope: scope}
+	if role.Kind == store.CoordinationRoleWorker && p.memberTools.investigationOwnerLaunchEnabled() {
+		candidates, err := p.memberTools.tools.investigationDelegateCandidates(ctx, role, scope)
+		if err != nil {
+			return empty, preparationResolutionError(ctx, err)
+		}
+		names := investigationOwnerOperations(operations, candidates, false)
+		if !supportsInvestigationTaskWorkMember(member, selected, initialInvestigationOwnerProfile(names), p.memberTools.investigationTaskWork.Supports) {
+			return empty, rolePreparationBlocked(state, "unsupported_provider", nil)
+		}
+		prepared.owner = &initialInvestigationOwnerPreparation{InvestigationOwnerToolProfile{Operations: names, DelegateCandidateIDs: candidates}, selected}
+	}
+	in, err := investigationPreparationContext(role, scope, facts, prepared.owner, p.roleMaxContextBytes)
 	if err != nil {
 		return empty, err
 	}
 	return rolePreparationPlan{state: state, selected: selected, selection: provider.AdapterSelection{ID: provider.PiMemberToolAdapterID, Protocol: provider.PiExtensionProtocol}, dispatchCapabilities: facts, input: in,
-		investigation: &investigationRolePreparation{investigationPreparationSettings: *cfg, scope: scope}}, nil
+		investigation: prepared}, nil
 }
 
 func (p *Preparer) prepareInvestigationRole(ctx context.Context, plan rolePreparationPlan, member domain.Member, prompt string) (scheduler.PreparedExecution, error) {
@@ -321,9 +349,11 @@ func (p *Preparer) prepareInvestigationRole(ctx context.Context, plan rolePrepar
 	}
 	prepared.cwd = cwd
 	prepared.request = provider.ExecuteRequest{CWD: cwd.path, Prompt: prompt, Model: member.Model, Thinking: p.roleThinking}
-	prepared.build = func(config provider.NativeMemberToolConfig, names []string) (provider.Executor, error) {
-		adapter := provider.NewPiInvestigationAdapter(p.piMemberToolsExtension, config, names)
-		return adapter.NewExecutor(plan.selected, p.executionTimeout)
+	if prepared.owner == nil {
+		prepared.build = func(config provider.NativeMemberToolConfig, names []string) (provider.Executor, error) {
+			adapter := provider.NewPiInvestigationAdapter(p.piMemberToolsExtension, config, names)
+			return adapter.NewExecutor(plan.selected, p.executionTimeout)
+		}
 	}
 	binding := MemberToolRunBinding{GroupID: role.GroupID, MemberID: role.MemberID, ConversationID: role.ConversationID,
 		DeliveryID: role.DeliveryID, ProviderID: plan.selected.ID, ProviderName: plan.selected.Name, Model: member.Model}
@@ -379,6 +409,16 @@ func (p *Preparer) investigationDispatchCandidates(ctx context.Context, state st
 		if err != nil {
 			return nil, roleExecutorPreparationError(ctx, state, err)
 		}
+		if p.memberTools.investigationOwnerLaunchEnabled() {
+			// The first worker may have zero or more supported peers. Qualify
+			// both profile shapes without enumerating other members for it here.
+			supports := p.memberTools.investigationTaskWork.Supports
+			withDelegate := append(slices.Clone(operations), DelegateWorkOperation)
+			if !supportsInvestigationTaskWorkMember(member, selected, initialInvestigationOwnerProfile(operations), supports) ||
+				!supportsInvestigationTaskWorkMember(member, selected, initialInvestigationOwnerProfile(withDelegate), supports) {
+				continue
+			}
+		}
 		facts = append(facts, store.DispatchWorkerCapabilityFact{GroupID: role.GroupID, MemberID: id, ProviderID: selected.ID, Model: member.Model,
 			RequiredProfile: store.DispatchInvestigationWorkerProfile, TaskID: role.TaskID, TaskRevision: role.TaskRevision})
 	}
@@ -388,7 +428,7 @@ func (p *Preparer) investigationDispatchCandidates(ctx context.Context, state st
 // This constructor deliberately accepts neither the trigger nor any history,
 // conversation or member descriptions, existing workspace or work input data.
 func investigationPreparationContext(role store.CoordinationRoleProvenance, scope domain.TaskInvestigationScope,
-	facts []store.DispatchWorkerCapabilityFact, maxBytes int) (contextpack.Input, error) {
+	facts []store.DispatchWorkerCapabilityFact, owner *initialInvestigationOwnerPreparation, maxBytes int) (contextpack.Input, error) {
 	var empty contextpack.Input
 	operations := investigationRoleOperations(role.Kind, scope)
 	if len(operations) == 0 || len(scope.Objective) > 256 || !utf8.ValidString(scope.Objective) || strings.TrimSpace(scope.Objective) == "" ||
@@ -414,20 +454,25 @@ func investigationPreparationContext(role store.CoordinationRoleProvenance, scop
 		}
 		workers = append(workers, fact.MemberID)
 	}
+	var candidates []string
+	if owner != nil {
+		operations, candidates = owner.Operations, owner.DelegateCandidateIDs
+	}
 	metadata, err := json.Marshal(struct {
-		Role               store.CoordinationRoleKind  `json:"role"`
-		MemberID           string                      `json:"member_id"`
-		TopicID            string                      `json:"topic_id"`
-		TaskID             string                      `json:"task_id"`
-		TaskRevision       int64                       `json:"task_revision"`
-		AssignmentID       string                      `json:"assignment_id,omitempty"`
-		Objective          string                      `json:"objective"`
-		AllowTopicMessages bool                        `json:"allow_topic_messages"`
-		ArtifactVersions   []domain.ArtifactVersionRef `json:"artifact_versions,omitempty"`
-		WorkerMemberIDs    []string                    `json:"dispatch_candidate_ids,omitempty"`
+		Role                 store.CoordinationRoleKind  `json:"role"`
+		MemberID             string                      `json:"member_id"`
+		TopicID              string                      `json:"topic_id"`
+		TaskID               string                      `json:"task_id"`
+		TaskRevision         int64                       `json:"task_revision"`
+		AssignmentID         string                      `json:"assignment_id,omitempty"`
+		Objective            string                      `json:"objective"`
+		AllowTopicMessages   bool                        `json:"allow_topic_messages"`
+		ArtifactVersions     []domain.ArtifactVersionRef `json:"artifact_versions,omitempty"`
+		WorkerMemberIDs      []string                    `json:"dispatch_candidate_ids,omitempty"`
+		DelegateCandidateIDs []string                    `json:"delegate_candidate_ids,omitempty"`
 	}{Role: role.Kind, MemberID: role.MemberID, TopicID: role.TopicID, TaskID: role.TaskID, TaskRevision: role.TaskRevision,
 		AssignmentID: role.AssignmentID, Objective: scope.Objective, AllowTopicMessages: scope.AllowTopicMessages,
-		ArtifactVersions: scope.ArtifactVersions, WorkerMemberIDs: workers})
+		ArtifactVersions: scope.ArtifactVersions, WorkerMemberIDs: workers, DelegateCandidateIDs: candidates})
 	if err != nil {
 		return empty, errPrepareRead
 	}
@@ -441,6 +486,9 @@ func investigationPreparationContext(role store.CoordinationRoleProvenance, scop
 		permissions = append(permissions, "正式 decide_dispatch 只可从本轮提供的候选 ID 选择执行成员，或记录拒绝。候选 ID 仅表示已采样的实现能力，不授予权限、其他资料或账号可用性。")
 	} else {
 		permissions = append(permissions, "通过单独的 submit_result 提交不超过 8192 UTF-8 字节的纯文本结论；指出使用的获准资料及未决问题，不附成果版本。提交不代表接纳。")
+	}
+	if owner != nil {
+		permissions = append(permissions, investigationOwnerPermissions(candidates, false)...)
 	}
 	return contextpack.Input{Scope: contextpack.Scope{GroupID: role.GroupID, ConversationID: role.ConversationID},
 		Responsibility: string(metadata), MaxBytes: min(maxBytes, investigationMaxContextBytes), Permissions: permissions}, nil

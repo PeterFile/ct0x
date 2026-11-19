@@ -25,6 +25,7 @@ type config struct {
 	piMemberToolsExtension, roleThinking                        string
 	executionMaxActive, memberToolsMaxMembers                   int
 	piFreshTaskWorkExtension, piFreshInvestigationWorkExtension string
+	enableInvestigationOwnerManagement                          bool
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -170,6 +171,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 }
 
 func (c config) validateInvestigationOption() error {
+	if c.enableInvestigationOwnerManagement && (!c.enableInvestigationExecution || c.piFreshInvestigationWorkExtension == "") {
+		return errors.New("调查负责人管理须同时启用只读调查和独立的调查后续工作扩展")
+	}
 	if !c.enableInvestigationExecution {
 		if c.piFreshInvestigationWorkExtension != "" {
 			return errors.New("调查后续工作须显式启用 --enable-investigation-execution")
