@@ -36,7 +36,8 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 	query := `UPDATE deliveries AS d SET turn_id=?
 	 WHERE id=? AND group_id=? AND state='queued' AND turn_id=''
 	 AND EXISTS(SELECT 1 FROM members WHERE id=d.recipient_id AND group_id=d.group_id AND status='active')`
-	if s.background.installed {
+	// Match the pending scan's ordering gate. Routed A1 deliveries still need readiness below.
+	if s.background.enabled.Load() {
 		query += " AND NOT " + groupBackgroundEarlierSQL
 	}
 	err = tx.QueryRowContext(ctx, query+" RETURNING conversation_id,recipient_id", t.ID, input.DeliveryID, input.GroupID).

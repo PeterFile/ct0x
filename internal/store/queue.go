@@ -49,7 +49,8 @@ func (s *Store) ListPendingDeliveries(ctx context.Context, options PendingOption
 	 JOIN messages msg ON msg.id=d.message_id AND msg.group_id=d.group_id
 	 WHERE d.state='queued' AND d.turn_id='' AND m.status='active'
 	 AND NOT EXISTS(SELECT 1 FROM turns WHERE (conversation_id=d.conversation_id OR member_id=d.recipient_id) AND ` + activeTurnPredicate + `)`
-	if s.background.installed {
+	// A disabled dispatcher cannot advance its backlog; don't let it block ordinary deliveries.
+	if s.background.enabled.Load() {
 		query += " AND NOT " + groupBackgroundEarlierSQL
 	}
 	// A handled redundant wake stays in history but cannot consume a scheduler

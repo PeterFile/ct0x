@@ -117,6 +117,34 @@ func TestGroupBackgroundDispatchReviewDisabledRestart(t *testing.T) {
 	off.assertCount(t, 0, `SELECT count(*) FROM deliveries WHERE message_id IN (?,?)`, public.ID, msg.ID)
 }
 
+func TestGroupBackgroundDispatchReviewExplicitAfterDisabledRestart(t *testing.T) {
+	ctx := context.Background()
+	const topic = "同话题"
+	f := newBackgroundFixture(t, "", true)
+	g := f.group(t, "")
+	member := backgroundMember(t, f, g.ID, discussionProfile)
+	earlier := f.post(t, g.ID, "", platform.MessageInput{Content: "需要默认回应", TopicID: topic})
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	off := newBackgroundFixture(t, f.path, false)
+	later := off.post(t, g.ID, "", platform.MessageInput{Content: "明确指定", TopicID: topic, RecipientIDs: []string{member.ID}})
+	if len(later.Deliveries) != 1 || later.Deliveries[0].RecipientID != member.ID {
+		t.Fatalf("want one explicitly addressed delivery: %+v", later.Deliveries)
+	}
+	off.pass(t, backgroundOptions())
+	deliveryID := later.Deliveries[0].ID
+	page, err := off.db.ListPendingDeliveries(ctx, store.PendingOptions{Lane: "human"})
+	if err != nil || len(page.Items) != 1 || page.Items[0].Delivery.ID != deliveryID {
+		t.Errorf("addressed delivery not visible in the human queue after disabled restart: %+v, %v", page.Items, err)
+	}
+	if _, err := off.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: g.ID, DeliveryID: deliveryID, MaxActive: 1}); err != nil {
+		t.Errorf("addressed delivery not claimable after disabled restart: %v", err)
+	}
+	off.assertCount(t, 1, `SELECT count(*) FROM group_background_intents WHERE message_id=? AND delivery_id IS NULL`, earlier.ID)
+}
+
 func TestGroupBackgroundDispatchReviewReadyAtClaim(t *testing.T) {
 	ctx := context.Background()
 	f := newBackgroundFixture(t, "", true)
