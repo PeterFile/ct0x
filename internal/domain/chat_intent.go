@@ -1,6 +1,11 @@
 package domain
 
-import "time"
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+	"time"
+)
 
 const (
 	ChatActionTextSubmission        = "text_submission"
@@ -27,10 +32,41 @@ type ChatPolicyRequest struct {
 
 // ChatInvestigationPolicy is a local-user allowlist, not a tool or delegation grant.
 type ChatInvestigationPolicy struct {
-	Objective          string               `json:"objective"`
-	AllowTopicMessages bool                 `json:"allow_topic_messages"`
-	ArtifactVersions   []ArtifactVersionRef `json:"artifact_versions"`
-	MaxDelegations     int                  `json:"max_delegations"`
+	Objective          string                     `json:"objective"`
+	AllowTopicMessages bool                       `json:"allow_topic_messages"`
+	ArtifactVersions   []ArtifactVersionRef       `json:"artifact_versions"`
+	MaxDelegations     int                        `json:"max_delegations"`
+	ClueTerms          ChatInvestigationClueTerms `json:"clue_terms,omitzero"`
+}
+
+// ChatInvestigationClueTerms is omitted for legacy rules; null must not
+// silently turn a configured boundary into the legacy investigation path.
+type ChatInvestigationClueTerms []string
+
+func (terms *ChatInvestigationClueTerms) UnmarshalJSON(data []byte) error {
+	var phrases []string
+	if err := json.Unmarshal(data, &phrases); err != nil {
+		return err
+	}
+	if phrases == nil {
+		return errors.New("只读调查线索词组必须为非空数组")
+	}
+	*terms = phrases
+	return nil
+}
+
+// MatchesClue checks literal containment only. A caller previewing a delivery
+// uses its persisted Message.Content; only Store can prove source and authority.
+func (p ChatInvestigationPolicy) MatchesClue(body string) bool {
+	if len(p.ClueTerms) == 0 {
+		return false
+	}
+	for _, term := range p.ClueTerms {
+		if term == "" || !strings.Contains(body, term) {
+			return false
+		}
+	}
+	return true
 }
 
 // TaskInvestigationScope is immutable admission evidence, not live permission.
@@ -79,6 +115,10 @@ type ChatCandidate struct {
 	SourceID               string            `json:"source_id"`
 	SourceKind             string            `json:"source_kind"`
 	RepairSource           *ChatRepairSource `json:"repair_source,omitempty"`
+
+	// Trusted issuance hint at capture time. A new assessment repeats all
+	// checks under its own claim fence; this flag is not a persisted receipt.
+	InvestigationClueMatched bool `json:"-"`
 
 	// Advisory live same-topic hints, not a selection or proof of authority.
 	// MessageID is the source to quote and the original reply destination.

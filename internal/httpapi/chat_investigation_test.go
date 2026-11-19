@@ -28,11 +28,18 @@ func TestChatInvestigationPolicyHTTPOptIn(t *testing.T) {
 		!strings.Contains(w.Body.String(), `"investigation_supported":true`) || !strings.Contains(w.Body.String(), `"investigation_execution_enabled":false`) {
 		t.Fatalf("empty policy must advertise support without scope or readiness: %d %s", w.Code, w.Body)
 	}
-	body := `{"enabled":true,"action":"text_submission","max_admissions":1,"expected_revision":0,"investigation":{"objective":"核对讨论中未决事项","allow_topic_messages":true,"max_delegations":0}}`
+	body := `{"enabled":true,"action":"text_submission","max_admissions":1,"expected_revision":0,"investigation":{"objective":"核对讨论中未决事项","allow_topic_messages":true,"max_delegations":0,"clue_terms":["导出","只有表头"]}}`
+	for _, terms := range []string{`null`, `[]`, `[""]`} {
+		bad := strings.Replace(body, `["导出","只有表头"]`, terms, 1)
+		if w := request(http.MethodPut, bad, "configure-investigation"); w.Code != http.StatusBadRequest {
+			t.Fatalf("malformed clue terms %s were not rejected: %d %s", terms, w.Code, w.Body)
+		}
+	}
 	w := request(http.MethodPut, body, "configure-investigation")
 	var policy domain.ChatPolicy
 	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &policy) != nil || policy.Revision != 1 || policy.Investigation == nil ||
-		!policy.Investigation.AllowTopicMessages || policy.ConfigurationSourceID == "" || !policy.InvestigationSupported || policy.InvestigationExecutionEnabled {
+		!policy.Investigation.AllowTopicMessages || !policy.Investigation.MatchesClue("导出偶尔只有表头") || policy.Investigation.MatchesClue("导出") ||
+		policy.ConfigurationSourceID == "" || !policy.InvestigationSupported || policy.InvestigationExecutionEnabled {
 		t.Fatalf("configuration before runtime opt-in failed: %d %s", w.Code, w.Body)
 	}
 	for _, other := range []*httptest.ResponseRecorder{request(http.MethodGet, "", ""), request(http.MethodPut, body, "configure-investigation")} {
