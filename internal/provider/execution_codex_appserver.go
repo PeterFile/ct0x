@@ -145,7 +145,7 @@ func (e codexAppServerExecutor) execute(ctx context.Context, request ExecuteRequ
 	cmd := exec.Command(e.path, codexAppServerArguments()...)
 	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = request.CWD, stdinR, stdoutW, stderrW
 	cmd.Env = env
-	if member != nil && member.bindThreadDecisionContext != nil && !member.bindThreadDecisionContext(ctx) {
+	if member != nil && member.threadDecision != nil && !member.threadDecision.bindLifetime(ctx) {
 		r.Outcome, r.Reason = OutcomeUnknown, "话题答复续轮的工具会话已失效，需对账"
 		return r
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/store"
@@ -17,9 +18,9 @@ var threadDecisionAckMCPTool = memberMCPTool{
 
 // Only MCP can call this handler. Neither an Idempotency-Key header nor model
 // arguments can supply a selector or override the server-derived call identity.
-func (a memberToolAPI) ackThreadDecisionMCP(w http.ResponseWriter, r *http.Request, token string, id any) {
+func (a memberToolAPI) ackThreadDecisionMCP(w http.ResponseWriter, r *http.Request, token string, id any, entered time.Time) {
 	buffer := newMemberMCPBuffer()
-	view, err := a.tools.AcknowledgeThreadDecision(r.Context(), token, memberMCPKey(token, id))
+	view, err := a.tools.AcknowledgeThreadDecision(r.Context(), token, memberMCPKey(token, id), entered)
 	switch {
 	case errors.Is(err, store.ErrTaskWorkMutationUnknown):
 		// Check this before cancellation, stale claim or business errors in the cause.

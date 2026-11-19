@@ -233,7 +233,7 @@ func (e codexAppServerExecutor) executeMember(ctx context.Context, request Execu
 	const tokenPrefix = "AGENT_WORKSPACE_MCP_TOKEN_"
 	session.tokenEnv = tokenPrefix + strings.ToUpper(hex.EncodeToString(nonce))
 	strip := session.tokenEnv + "="
-	if session.bindThreadDecisionContext != nil {
+	if session.threadDecision != nil {
 		strip = tokenPrefix // This profile never inherits another platform MCP bearer.
 	}
 	env := make([]string, 0, len(os.Environ())+1)
@@ -256,7 +256,7 @@ type codexAppServerMemberSession struct {
 	ready    bool
 	native   *codexAppServerSession
 	// Non-nil only for the fresh, single-tool Thread decision continuation.
-	bindThreadDecisionContext func(context.Context) bool
+	threadDecision *codexAppServerThreadDecisionSession
 }
 
 func codexAppServerMemberName(inherited []string, entropy io.Reader) (string, error) {
@@ -298,7 +298,7 @@ func (m *codexAppServerMemberSession) configure(inherited []string, config map[s
 		"url": m.endpoint, "bearer_token_env_var": m.tokenEnv, "enabled": true, "enabled_tools": m.names,
 		"omit_tools_from": []string{"code_mode", "deferred"}, "tools": toolApprovals,
 	}
-	if m.bindThreadDecisionContext != nil {
+	if m.threadDecision != nil {
 		features["goals"] = false
 		server["required"] = true
 	}
@@ -319,7 +319,7 @@ func (p *codexAppServerProtocol) memberStatus(raw json.RawMessage) {
 	tools, toolsErr := codexAppServerMap(status["tools"])
 	if err != nil || toolsErr != nil || name != p.member.server || string(status["runtimeStatus"]) != `"connected"` || string(status["authStatus"]) != `"bearerToken"` ||
 		origin != p.member.origin || !codexAppServerNoError(status["toolsError"]) || !codexAppServerNoError(status["pluginId"]) ||
-		p.member.bindThreadDecisionContext != nil && len(tools) != len(p.member.names) {
+		p.member.threadDecision != nil && len(tools) != len(p.member.names) {
 		p.fail()
 		return
 	}

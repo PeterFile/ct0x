@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/store"
@@ -31,10 +32,16 @@ var memberMCPWithReports = slices.Concat(memberMCPComposedTools, memberWorkRepor
 // No session ID, initialization state, execution queue or additional authority.
 func MemberMCPRoutes(tools *platform.MemberTools) []Route {
 	a := memberToolAPI{tools}
-	return []Route{{http.MethodPost, "/api/v1/member-tools/mcp", memberToolNative(a.memberMCP)}}
+	return []Route{{http.MethodPost, "/api/v1/member-tools/mcp", func(w http.ResponseWriter, r *http.Request) {
+		// Take the ACK cutoff at ingress, not after reading a possibly delayed body.
+		entered := time.Now()
+		memberToolNative(func(w http.ResponseWriter, r *http.Request, token string) {
+			a.memberMCP(w, r, token, entered)
+		})(w, r)
+	}}}
 }
 
-func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token string) {
+func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token string, entered time.Time) {
 	// Fresh Pi uses its own native wire. Keep #181's unpaged MCP schema and
 	// legacy receipts; never execute a fresh command through that schema.
 	if a.tools.IsFreshTaskWorkCapability(token) {
@@ -157,7 +164,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				memberMCPError(w, 400, id, -32602, "话题答复确认不接受参数")
 				return
 			}
-			a.ackThreadDecisionMCP(w, r, token, id)
+			a.ackThreadDecisionMCP(w, r, token, id, entered)
 			return
 		}
 		continuation, excerpt, decision := false, false, false

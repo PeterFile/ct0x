@@ -222,21 +222,18 @@ func (e *threadDecisionRun) execute(ctx context.Context, claim store.TurnClaim, 
 		defer r.tools.Revoke(token) // Drain F writes before classifying the receipt.
 		native, err := provider.NewCodexAppServerThreadDecisionExecutor(e.selected, r.endpoint, token, func(nativeCtx context.Context) bool {
 			return r.tools.bindThreadDecisionAckContext(token, ack, nativeCtx) && checkCtx.Err() == nil
-		}, e.timeout)
+		}, ack.observeLifecycle, e.timeout)
 		if err != nil || !validFiles() || checkCtx.Err() != nil || ctx.Err() != nil {
 			return unknown
 		}
 		forward := event
 		if event != nil {
 			forward = func(ev provider.Event) error {
-				if ev.Kind == provider.TerminalEvent {
-					ack.terminal.Store(true)
-				}
 				if err := event(ev); err != nil {
 					return err
 				}
 				if ev.Kind == provider.AcceptedEvent {
-					close(ack.accepted) // The scheduler's callback commits acceptance.
+					close(ack.acceptanceSaved) // The scheduler's callback commits acceptance.
 				}
 				return nil
 			}

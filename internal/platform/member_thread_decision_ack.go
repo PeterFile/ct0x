@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
@@ -18,12 +19,14 @@ const AckThreadDecisionOperation = provider.CodexThreadDecisionAckTool
 // This registration never enters the ordinary member capability map: there is
 // no MemberToolScope, inherited grant, or native resume reference.
 type threadDecisionAckRegistration struct {
-	claim    store.TurnClaim
-	answerID string
-	native   context.Context // Bound once, under MemberTools.mu, before child startup.
-	accepted chan struct{}   // Closed only after the scheduler persists native acceptance.
-	revoked  chan struct{}
-	terminal atomic.Bool
+	claim           store.TurnClaim
+	answerID        string
+	native          context.Context // Bound once, under MemberTools.mu, before child startup.
+	acceptanceSaved chan struct{}   // Closed only after the scheduler persists native acceptance.
+	revoked         chan struct{}
+
+	observedAcceptance atomic.Pointer[time.Time]
+	observedTerminal   atomic.Bool
 
 	callOnce  sync.Once
 	callKey   string
@@ -45,7 +48,7 @@ func (s *MemberTools) commitThreadDecisionAckLaunch(ctx context.Context, owner *
 		return "", nil, err
 	}
 	ack := &threadDecisionAckRegistration{claim: owner.claim, answerID: launch.Wake.Receipt.ID,
-		accepted: make(chan struct{}), revoked: make(chan struct{})}
+		acceptanceSaved: make(chan struct{}), revoked: make(chan struct{})}
 	if s.threadDecisionAcks == nil {
 		s.threadDecisionAcks = make(map[[sha256.Size]byte]*threadDecisionAckRegistration)
 	}
@@ -73,33 +76,54 @@ func (s *MemberTools) revokeThreadDecisionAckLocked(key [sha256.Size]byte) bool 
 	return true
 }
 
+// Called by the parser, before logging or asynchronous delivery. Never take
+// the registry lock here: it can be held through a Store transaction.
+func (a *threadDecisionAckRegistration) observeLifecycle(kind provider.EventKind) {
+	switch kind {
+	case provider.AcceptedEvent:
+		at := time.Now() // Keep the monotonic clock for comparison with HTTP ingress.
+		a.observedAcceptance.Store(&at)
+	case provider.TerminalEvent:
+		a.observedTerminal.Store(true)
+	}
+}
+
 // Caller holds the registry lock. Discovery can happen before acceptance.
 func (a *threadDecisionAckRegistration) live() bool {
-	return a.native != nil && a.native.Err() == nil && !a.terminal.Load()
+	return a.native != nil && a.native.Err() == nil && !a.observedTerminal.Load()
 }
 
 // AcknowledgeThreadDecision serves only the dedicated MCP operation. The
-// transport supplies its stable key, but cannot select a claim or answer.
-func (s *MemberTools) AcknowledgeThreadDecision(ctx context.Context, token, key string) (domain.DecisionAnswerView, error) {
+// transport supplies its stable key and server-side ingress time, but cannot
+// select a claim or answer.
+func (s *MemberTools) AcknowledgeThreadDecision(ctx context.Context, token, key string, entered time.Time) (domain.DecisionAnswerView, error) {
 	var zero domain.DecisionAnswerView
 	digest := sha256.Sum256([]byte(token))
 	s.mu.RLock()
 	ack := s.threadDecisionAcks[digest]
-	if ack == nil || !ack.live() || ctx.Err() != nil {
+	if ack == nil || ctx.Err() != nil {
+		s.mu.RUnlock()
+		return zero, store.ErrMemberToolDenied
+	}
+	observed := ack.observedAcceptance.Load()
+	// The terminal load in live is the admission fence, ordered against the
+	// parser's terminal store. Body parsing or lock contention cannot make a
+	// request that entered before native acceptance eligible.
+	if observed == nil || !observed.Before(entered) || !ack.live() {
 		s.mu.RUnlock()
 		return zero, store.ErrMemberToolDenied
 	}
 	native := ack.native
 	s.mu.RUnlock()
 
-	// Native output delivery is asynchronous. Allow it to persist acceptance
-	// without holding the registry lock or using a Store write as a readiness probe.
+	// Only admitted calls may wait for the asynchronous scheduler write.
+	// Do not hold the registry lock or use a Store write as a readiness probe.
 	callCtx, cancel := context.WithTimeout(native, memberToolRuntimeVerificationTimeout)
 	defer cancel()
 	stop := context.AfterFunc(ctx, cancel)
 	defer stop()
 	select {
-	case <-ack.accepted:
+	case <-ack.acceptanceSaved:
 	case <-ack.revoked:
 		return zero, store.ErrMemberToolDenied
 	case <-callCtx.Done():
@@ -108,9 +132,11 @@ func (s *MemberTools) AcknowledgeThreadDecision(ctx context.Context, token, key 
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.threadDecisionAcks[digest] != ack || !ack.live() || ctx.Err() != nil || callCtx.Err() != nil {
+	if s.threadDecisionAcks[digest] != ack || native.Err() != nil || ctx.Err() != nil || callCtx.Err() != nil {
 		return zero, store.ErrMemberToolDenied
 	}
+	// Admission already preceded native terminal observation. The Store now
+	// arbitrates against any durable terminal, and revocation still drains.
 	// Freeze the first attempted identity even if Store cannot confirm its
 	// outcome. Revoke waits through the F transaction and uncertainty latch.
 	ack.callOnce.Do(func() { ack.callKey = key })

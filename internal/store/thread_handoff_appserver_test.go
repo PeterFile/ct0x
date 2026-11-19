@@ -14,11 +14,13 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"agentworkspace/internal/domain"
+	"agentworkspace/internal/provider"
 	"agentworkspace/internal/scheduler"
 	"agentworkspace/internal/store"
 )
@@ -31,6 +33,7 @@ func newAppServerHandoff(t *testing.T, mode string, observe func(*http.Request))
 	script := "#!/bin/sh\nAW_F_HANDOFF_CHILD=1 exec '" + strings.ReplaceAll(executable, "'", "'\\''") + "' -test.run='^TestNativeThreadHandoffChild$' -- \"$@\"\n"
 	handoffOK(t, os.WriteFile(f.executable, []byte(script), 0700))
 	t.Setenv("AW_F_HANDOFF_MODE", mode)
+	t.Setenv("AW_F_HANDOFF_RUNTIME", f.runtime)
 	t.Setenv("HOME", f.root)
 	t.Setenv("CODEX_HOME", f.root)
 	listener, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -277,6 +280,178 @@ func TestNativeThreadHandoffExplicitAck(t *testing.T) {
 	}
 }
 
+// These fixtures have one native execution. Its lifecycle log is written on
+// the parser goroutine, independently of the scheduler event callback.
+func waitHandoffProjection(t *testing.T, runtime string, kind provider.EventKind) {
+	t.Helper()
+	waitHandoffFixture(t, func() bool {
+		paths, _ := filepath.Glob(filepath.Join(runtime, "*", "stdout.jsonl"))
+		for _, path := range paths {
+			data, _ := os.ReadFile(path)
+			if bytes.Contains(data, []byte(`"kind":"`+string(kind)+`"`)) {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+func waitHandoffFixture(t *testing.T, ready func() bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for !ready() {
+		select {
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for the fixture handshake")
+		case <-ticker.C:
+		}
+	}
+}
+
+type handoffGatedBody struct {
+	io.Reader
+	wait func()
+}
+
+func (b handoffGatedBody) Read(p []byte) (int, error) {
+	b.wait()
+	return b.Reader.Read(p)
+}
+
+func TestNativeThreadHandoffAckIngressAndTerminalLag(t *testing.T) {
+	authorization := make(chan string, 1)
+	f := newAppServerHandoff(t, "ack-window", func(req *http.Request) {
+		select {
+		case authorization <- req.Header.Get("Authorization"):
+		default:
+		}
+	})
+	prepare, err := f.preparer.EnableThreadDecisionHandoff(t.Context())
+	handoffOK(t, err)
+	a, _ := f.seedAnswer(t)
+	responseBlocked, releaseResponse := make(chan struct{}), make(chan struct{})
+	releaseTerminal := sync.OnceFunc(func() { close(releaseResponse) })
+	defer releaseTerminal()
+	f.run(t, func(ctx context.Context, p store.PendingDelivery, wake store.ThreadDecisionWake) (scheduler.PreparedThreadDecision, error) {
+		plan, err := prepare(ctx, p, wake)
+		if err != nil {
+			return plan, err
+		}
+		execute := plan.Execute
+		plan.Execute = func(ctx context.Context, claim store.TurnClaim, request provider.ExecuteRequest, event func(provider.Event) error) provider.ExecutionReceipt {
+			return execute(ctx, claim, request, func(ev provider.Event) error {
+				if ev.Kind == provider.ResponseEvent {
+					close(responseBlocked) // Park the queue BEFORE it starts the terminal callback.
+					select {
+					case <-releaseResponse:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+				return event(ev)
+			})
+		}
+		return plan, nil
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	var bearer string
+	select {
+	case bearer = <-authorization:
+	case <-ctx.Done():
+		t.Fatal("fixture did not discover the typed tool")
+	}
+	call := func(req *http.Request) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		f.handler.ServeHTTP(w, req.WithContext(ctx))
+		return w
+	}
+	request := func() *http.Request { return handoffMCPRequest(t, f.endpoint+"/mcp", bearer, handoffAckRequest) }
+	reading, releaseBody := make(chan struct{}), make(chan struct{})
+	unblockBody := sync.OnceFunc(func() { close(releaseBody) })
+	defer unblockBody()
+	early := request()
+	early.Body = io.NopCloser(handoffGatedBody{Reader: early.Body, wait: sync.OnceFunc(func() {
+		close(reading)
+		<-releaseBody
+	})})
+	earlyDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { earlyDone <- call(early) }()
+	select {
+	case <-reading:
+	case <-ctx.Done():
+		t.Fatal("fixture did not enter MCP before acceptance")
+	}
+	handoffOK(t, os.WriteFile(filepath.Join(f.runtime, "allow-acceptance"), nil, 0600))
+	waitHandoffProjection(t, f.runtime, provider.AcceptedEvent)
+	unblockBody()
+	select {
+	case w := <-earlyDone:
+		if !strings.Contains(w.Body.String(), "forbidden") {
+			t.Error("a request that entered before observed acceptance became eligible")
+		}
+	case <-ctx.Done():
+		t.Fatal("pre-acceptance request did not finish")
+	}
+	handoffOK(t, os.WriteFile(filepath.Join(f.runtime, "allow-terminal"), nil, 0600))
+	select {
+	case <-responseBlocked:
+	case <-ctx.Done():
+		t.Fatal("fixture did not park the callback queue after durable acceptance")
+	}
+	waitHandoffProjection(t, f.runtime, provider.TerminalEvent)
+	if w := call(request()); !strings.Contains(w.Body.String(), "forbidden") {
+		t.Error("an ACK entered after native terminal but before its durable callback")
+	}
+	releaseTerminal()
+	if turn := waitNativeHandoff(t, f.db, a.GroupID, a.ReplyMessageID); turn.State != domain.TurnStateSucceeded {
+		t.Fatal("fixture did not settle after releasing the callback queue")
+	}
+	f.assertSavedOnly(t, a)
+}
+
+func TestNativeThreadHandoffReflectedBearerIsNotProjected(t *testing.T) {
+	for _, mode := range []string{"reflect-thread-id", "reflect-turn-id"} {
+		t.Run(mode, func(t *testing.T) {
+			var authorization atomic.Pointer[string]
+			f := newAppServerHandoff(t, mode, func(req *http.Request) {
+				value := req.Header.Get("Authorization")
+				authorization.CompareAndSwap(nil, &value)
+			})
+			prepare, err := f.preparer.EnableThreadDecisionHandoff(t.Context())
+			handoffOK(t, err)
+			a, _ := f.seedAnswer(t)
+			f.run(t, prepare)
+			turn := waitNativeHandoff(t, f.db, a.GroupID, a.ReplyMessageID)
+			bearer := authorization.Load()
+			if bearer == nil || !strings.HasPrefix(*bearer, "Bearer thread-ack-") {
+				t.Fatal("fixture did not observe the actual typed bearer")
+			}
+			token := strings.TrimPrefix(*bearer, "Bearer ")
+			var receipt string
+			handoffOK(t, f.raw.QueryRow(`SELECT receipt_json FROM turns WHERE id=?`, turn.ID).Scan(&receipt))
+			wantSession := ""
+			if mode == "reflect-turn-id" {
+				wantSession = "fixture-thread"
+			}
+			if turn.State != domain.TurnStateUnknown || turn.AcceptedAt != nil || turn.NativeSessionID != wantSession || strings.Contains(receipt, token) {
+				t.Fatal("the parser trusted or persisted a bearer-bearing lifecycle ID")
+			}
+			for _, name := range []string{"stdout.jsonl", "stderr.log"} {
+				data, err := os.ReadFile(filepath.Join(f.runtime, turn.ID, name))
+				handoffOK(t, err)
+				if bytes.Contains(data, []byte(token)) {
+					t.Fatal("native runtime logged the reflected bearer")
+				}
+			}
+			f.assertSavedOnly(t, a)
+		})
+	}
+}
+
 const handoffProposal = `{"content":"要只看工作日吗？","intent_assessment":{"disposition":"clarify","reason":"边界未定","question":"要只看工作日吗？","decision_context":{"facts":"样本有限","recommendation":"先看工作日","choices":["工作日","全周"]}}}`
 
 // This subprocess is the local Go test binary. It never consults any provider
@@ -287,6 +462,13 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 	}
 	mode := os.Getenv("AW_F_HANDOFF_MODE")
 	ackMode := mode == "ack" || mode == "ack-unknown"
+	runtime := os.Getenv("AW_F_HANDOFF_RUNTIME")
+	waitGate := func(name string) {
+		waitHandoffFixture(t, func() bool {
+			_, err := os.Stat(filepath.Join(runtime, name))
+			return err == nil
+		})
+	}
 	decoder, encoder := json.NewDecoder(os.Stdin), json.NewEncoder(os.Stdout)
 	type frame struct {
 		ID     json.RawMessage
@@ -342,10 +524,7 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 	if cwd != physical || selected.Model != handoffModel || selected.ApprovalPolicy != "never" || selected.Sandbox != "read-only" || len(selected.Config.Servers) != serverCount {
 		t.Fatal("fixture received wrong native selection or unsafe profile")
 	}
-	const threadID, turnID = "fixture-thread", "fixture-turn"
-	respond(thread, map[string]any{"thread": map[string]any{"id": threadID, "turns": []any{}, "ephemeral": false}, "cwd": selected.CWD,
-		"model": selected.Model, "approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly", "networkAccess": false}})
-	respond(read("config/read"), config)
+	threadID, turnID := "fixture-thread", "fixture-turn"
 	var call func(string) string
 	var boundServer string
 	var enabledTools []string
@@ -375,6 +554,20 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 			handoffOK(t, err)
 			return string(data)
 		}
+		switch mode {
+		case "reflect-thread-id":
+			// Observe the exact secret via the fixture's discovery request,
+			// without writing a separate credential file.
+			if !strings.Contains(call(handoffMCPList), handoffAckTool) {
+				t.Fatal("fixture could not discover the typed ACK before thread binding")
+			}
+			threadID = token
+		case "reflect-turn-id":
+			turnID = "reflected-" + token
+		}
+		respond(thread, map[string]any{"thread": map[string]any{"id": threadID, "turns": []any{}, "ephemeral": false}, "cwd": selected.CWD,
+			"model": selected.Model, "approvalPolicy": "never", "sandbox": map[string]any{"type": "readOnly", "networkAccess": false}})
+		respond(read("config/read"), config)
 		status := read("mcpServerStatus/list")
 		tools := map[string]any{}
 		if slices.Equal(settings.Tools, []string{handoffAckTool}) {
@@ -410,7 +603,14 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 		t.Fatal("fixture: expected a single prompt")
 	}
 	respond(start, map[string]any{"turn": turn("inProgress")})
+	if mode == "ack-window" {
+		waitGate("allow-acceptance")
+	}
 	notify("turn/started", map[string]any{"threadId": threadID, "turn": turn("inProgress")})
+	if ackMode {
+		// Emitting a stdio frame is not proof that the parser has consumed it.
+		waitHandoffProjection(t, runtime, provider.AcceptedEvent)
+	}
 	reply := "续轮文本"
 	var items []any
 	if !strings.Contains(prompt.Input[0].Text, "thread_decision_reply/v1") {
@@ -474,7 +674,7 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 			item := map[string]any{"id": "native-ack", "type": "mcpToolCall", "server": boundServer, "tool": handoffAckTool,
 				"status": "inProgress", "arguments": json.RawMessage(`{}`), "result": nil, "error": nil}
 			notify("item/started", map[string]any{"threadId": threadID, "turnId": turnID, "item": item})
-			result := call(handoffAckRequest) // Race legitimately with delivery of the persisted acceptance.
+			result := call(handoffAckRequest) // Native acceptance is observed; its durable write may still be pending.
 			if mode == "ack-unknown" {
 				if !strings.Contains(result, "thread_decision_ack_unknown") || strings.Contains(result, "FOREIGN KEY") || !strings.Contains(result, `"isError":true`) {
 					t.Fatal("uncertain ACK appeared certain or exposed private diagnostics")
@@ -493,6 +693,9 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 			notify("item/completed", map[string]any{"threadId": threadID, "turnId": turnID, "item": item})
 			items = append(items, item)
 		}
+	}
+	if mode == "ack-window" {
+		waitGate("allow-terminal")
 	}
 	answer := map[string]any{"id": "answer", "type": "agentMessage", "text": reply}
 	notify("item/completed", map[string]any{"threadId": threadID, "turnId": turnID, "item": answer})
