@@ -152,6 +152,15 @@ func (s *Store) SubmitTaskWorkResult(ctx context.Context, scope MemberToolScope,
 		if blocked != "" || current != attempt.ID {
 			return out, ErrConflict
 		}
+		if f.decisionAnswer {
+			handled, err := taskWorkInputHandledInTx(ctx, tx, f.d.SourceID)
+			if err != nil {
+				return out, err
+			}
+			if !handled {
+				return out, ErrConflict
+			}
+		}
 	}
 	result, err := s.submitTaskInTx(ctx, tx, derived, &d.TopicID)
 	if err != nil {

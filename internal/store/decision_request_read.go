@@ -25,8 +25,10 @@ func requireDecisionRequestsInTx(ctx context.Context, tx *sql.Tx) error {
 }
 
 func decisionRequestError(action string, err error) error {
-	if errors.Is(err, ErrDecisionRequestsUnavailable) {
-		return ErrDecisionRequestsUnavailable
+	for _, known := range []error{ErrDecisionRequestsUnavailable, ErrDecisionAnswersUnavailable, ErrDecisionRelayUnsupported} {
+		if errors.Is(err, known) {
+			return known
+		}
 	}
 	return queueError(action, err)
 }
@@ -94,8 +96,18 @@ const decisionRequestCurrentChat = `q.task_id IS NULL AND EXISTS(SELECT 1 FROM c
     WHERE (o.source_kind,o.message_id,o.group_id,o.topic_id)=('local_im',q.source_message_id,q.group_id,q.topic_id))
  AND NOT EXISTS(SELECT 1 FROM chat_followup_routes f WHERE f.source_id=q.chat_source_id)`
 
-const decisionRequestPending = ` WHERE q.recipient_id='user' AND q.withdrawn_at IS NULL
+const decisionRequestCurrent = ` WHERE q.recipient_id='user' AND q.withdrawn_at IS NULL
  AND (v.expires_at IS NULL OR v.expires_at>?) AND ((` + decisionRequestCurrentTask + `) OR (` + decisionRequestCurrentChat + `))`
+
+const decisionRequestUnanswered = ` AND NOT EXISTS(SELECT 1 FROM decision_answers ans WHERE ans.request_id=q.id)`
+
+func decisionRequestPendingSQL(ctx context.Context, tx *sql.Tx) (string, error) {
+	installed, err := decisionAnswerInstalledInTx(ctx, tx)
+	if installed {
+		return decisionRequestCurrent + decisionRequestUnanswered, err
+	}
+	return decisionRequestCurrent, err
+}
 
 func scanDecisionRequest(row scanner) (out domain.DecisionRequest, err error) {
 	var task domain.DecisionTaskRef
@@ -134,17 +146,32 @@ func scanDecisionRequest(row scanner) (out domain.DecisionRequest, err error) {
 	return out, nil
 }
 
-// pendingDecisionRequestInTx is the exact-version fence for a future answer.
-// The answer command must run this and consume the version in the same write
-// transaction, with same-state CAS and durable answer uniqueness, not trust a page.
 func pendingDecisionRequestInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, id string, version int64, now time.Time) (domain.DecisionRequest, error) {
-	return scanDecisionRequest(tx.QueryRowContext(ctx, decisionRequestSelect+decisionRequestPending+`
+	where, err := decisionRequestPendingSQL(ctx, tx)
+	if err != nil {
+		return domain.DecisionRequest{}, err
+	}
+	return decisionRequestVersionInTx(ctx, tx, where, thread, id, version, now)
+}
+
+func decisionRequestVersionInTx(ctx context.Context, tx *sql.Tx, where string, thread domain.ThreadRef, id string, version int64, now time.Time) (domain.DecisionRequest, error) {
+	return scanDecisionRequest(tx.QueryRowContext(ctx, decisionRequestSelect+where+`
  AND (q.group_id,q.topic_id,q.id,v.version)=(?,?,?,?)`, now.UTC().Format(timestampLayout), thread.GroupID, thread.TopicID, id, version))
 }
 
 // ListPendingDecisionRequests is for trusted local-user composition only. The
 // cursor refers to original capture order; amendments do not reorder a page.
 func (s *Store) ListPendingDecisionRequests(ctx context.Context, options ListOptions) (Page[domain.DecisionRequest], error) {
+	return s.listPendingDecisionRequests(ctx, options, false)
+}
+
+// ListPendingTaskDecisions exposes only the currently supported answer relay.
+// A request-only installation is not an empty, operational answer inbox.
+func (s *Store) ListPendingTaskDecisions(ctx context.Context, options ListOptions) (Page[domain.DecisionRequest], error) {
+	return s.listPendingDecisionRequests(ctx, options, true)
+}
+
+func (s *Store) listPendingDecisionRequests(ctx context.Context, options ListOptions, taskOnly bool) (Page[domain.DecisionRequest], error) {
 	const action = "读取待决事项失败"
 	var page Page[domain.DecisionRequest]
 	limit, err := listLimit(options)
@@ -159,7 +186,19 @@ func (s *Store) ListPendingDecisionRequests(ctx context.Context, options ListOpt
 	if err := requireDecisionRequestsInTx(ctx, tx); err != nil {
 		return page, decisionRequestError(action, err)
 	}
-	query := decisionRequestSelect + decisionRequestPending
+	var where string
+	if taskOnly {
+		if err := requireDecisionAnswersInTx(ctx, tx); err != nil {
+			return page, decisionRequestError(action, err)
+		}
+		where = decisionRequestCurrent + decisionRequestUnanswered + ` AND q.task_id IS NOT NULL`
+	} else {
+		where, err = decisionRequestPendingSQL(ctx, tx)
+		if err != nil {
+			return page, decisionRequestError(action, err)
+		}
+	}
+	query := decisionRequestSelect + where
 	args := []any{time.Now().UTC().Format(timestampLayout)}
 	if c := options.Before; c != nil {
 		query += ` AND (q.created_at,q.id)<(?,?)`

@@ -113,6 +113,21 @@ func taskDecisionRequestInTx(ctx context.Context, tx *sql.Tx, role CoordinationT
 	if withdrawn || (savedExpiry != "" && savedExpiry <= stamp) {
 		return zero, ErrConflict
 	}
+	if id != "" {
+		installed, err := decisionAnswerInstalledInTx(ctx, tx)
+		if err != nil {
+			return zero, err
+		}
+		if installed {
+			var answered bool
+			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM decision_answers WHERE request_id=?)`, id).Scan(&answered); err != nil {
+				return zero, err
+			}
+			if answered {
+				return zero, ErrConflict
+			}
+		}
+	}
 	if replay {
 		// An old transport replay cannot claim to be the current question.
 		if id == "" || record != decisionVersionRecord(id, version) {
