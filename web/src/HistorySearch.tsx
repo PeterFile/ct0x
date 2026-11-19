@@ -143,7 +143,7 @@ function SearchResults({ groupId, query: { q, topic_id: topicId }, active }: { g
       </li>)}</ol>
       {page.next && !page.error ? <button type="button" disabled={page.pending} onClick={() => load(page.next)}>加载更早结果</button> : null}
     </div>
-    {selection ? <HistoryDetail key={selection.version} source={selection.source} id={detailId} active={active} />
+    {selection ? <HistoryDetail key={selection.version} groupId={groupId} topicId={topicId} source={selection.source} id={detailId} active={active} />
       : <p className="history-search-note">选择一条结果，读取完整消息。</p>}
   </section>;
 }
@@ -159,8 +159,10 @@ function MessageSource({ message }: { message: Message }) {
   </>;
 }
 
-function HistoryDetail({ source, id, active }: { source: Message; id: string; active: boolean }) {
-  const { group_id: groupId, topic_id: topicId, id: messageId } = source;
+function HistoryDetail({ groupId, topicId, source, id, active }: {
+  groupId: string; topicId?: string; source: Message; id: string; active: boolean;
+}) {
+  const { topic_id: recordedTopicId, id: messageId } = source;
   const [version, setVersion] = useState(0);
   const [detail, setDetail] = useState<{ message: Message | null; pending: boolean; error: string }>({ message: null, pending: true, error: "" });
   function retry() {
@@ -175,13 +177,15 @@ function HistoryDetail({ source, id, active }: { source: Message; id: string; ac
     if (!detail.pending) return;
     let ignore = false;
     const controller = new AbortController();
-    readHistory(groupId, messageId, topicId, controller.signal).then(message => {
+    // Recheck current membership in the submitted scope, without falling back
+    // to another topic or the whole group if a correction moved the source out.
+    readHistory(groupId, messageId, topicId, controller.signal, recordedTopicId).then(message => {
       if (!ignore) setDetail({ message, pending: false, error: "" });
     }, error => {
       if (!ignore) setDetail({ message: null, pending: false, error: errorText(error) });
     });
     return () => { ignore = true; controller.abort(); };
-  }, [active, groupId, topicId, messageId, version, detail.pending]);
+  }, [active, groupId, topicId, messageId, recordedTopicId, version, detail.pending]);
   return <section className="history-search-detail" id={id} aria-label="完整消息" aria-busy={detail.pending}>
     <h3>完整消息</h3>
     <MessageSource message={detail.message ?? source} />
