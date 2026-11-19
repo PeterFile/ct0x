@@ -54,8 +54,17 @@ type roleRuntimeFixture struct {
 
 func newRoleRuntime(t *testing.T) *roleRuntimeFixture {
 	t.Helper()
+	return newRoleRuntimeWithSchema(t, nil)
+}
+
+func newRoleRuntimeWithSchema(t *testing.T, schema []byte) *roleRuntimeFixture {
+	t.Helper()
 	base := t.TempDir()
 	f := &roleRuntimeFixture{path: filepath.Join(base, "workspace.db"), root: filepath.Join(base, "runtime")}
+	if schema != nil {
+		roleOK(t, os.Chmod(base, 0700))
+		roleOK(t, os.WriteFile(f.path, schema, 0600))
+	}
 	var err error
 	f.db, err = store.Open(f.path)
 	roleOK(t, err)

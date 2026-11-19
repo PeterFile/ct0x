@@ -63,7 +63,7 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 	for _, mode := range modes {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
-			f := newRoleRuntime(t)
+			f := newTaskWorkRoleRuntime(t)
 			f.options.RoleMaxActive = 2 // The assessor can record input while the prior worker is unsettled.
 			engine := coordination.New(f.db)
 			f.options.ChatIntake = engine

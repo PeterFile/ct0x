@@ -37,9 +37,52 @@ type boundWorkReportFixture struct {
 	delegation domain.TaskWorkDelegation
 }
 
+// Cache only the real migrated schema, not a populated role fixture. Each
+// caller writes these immutable bytes to its own file before opening a Store.
+var taskWorkSchemaImage = sync.OnceValues(func() ([]byte, error) {
+	dir, err := os.MkdirTemp("", "task-work-schema-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "workspace.db")
+	db, err := store.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Close(); err != nil {
+		return nil, err
+	}
+	// Fail rather than snapshot just the main file if any sidecar remains.
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	if len(files) != 1 || files[0].Name() != filepath.Base(path) || !files[0].Type().IsRegular() {
+		return nil, errors.New("closed task-work schema is not a standalone database file")
+	}
+	image, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(image) == 0 {
+		return nil, errors.New("empty task-work schema image")
+	}
+	return image, nil
+})
+
+func newTaskWorkRoleRuntime(t *testing.T) *roleRuntimeFixture {
+	t.Helper()
+	schema, err := taskWorkSchemaImage()
+	if err != nil {
+		t.Fatalf("create task-work schema image: %v", err)
+	}
+	return newRoleRuntimeWithSchema(t, schema)
+}
+
 func newBoundWorkReportFixture(t *testing.T) *boundWorkReportFixture {
 	t.Helper()
-	f := &boundWorkReportFixture{roleRuntimeFixture: newRoleRuntime(t)}
+	f := &boundWorkReportFixture{roleRuntimeFixture: newTaskWorkRoleRuntime(t)}
 	f.engine = coordination.New(f.db)
 	var err error
 	f.runtime, err = platform.NewMemberToolRuntimeWithTaskWorkReports(f.db, f.options, f.engine)
