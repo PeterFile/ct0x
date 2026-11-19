@@ -17,6 +17,8 @@ type MessageRequest struct {
 	GroupID, TopicID, Content, IdempotencyKey string
 	ActorID                                   string   `json:"-"`
 	RecipientIDs                              []string // Nil permits routing; non-nil (even empty) is an explicit set.
+	TopicIDExplicit                           bool     `json:"-"`
+	domain.ThreadLinks
 }
 
 type MessageListOptions struct {
@@ -34,6 +36,11 @@ func (r MessageRequest) payload() []byte {
 	fields := []string{r.GroupID, r.TopicID, r.Content, "omitted"}
 	if r.RecipientIDs != nil {
 		fields[3] = "explicit"
+	}
+	if r.ThreadLinks != (domain.ThreadLinks{}) {
+		// This mode cannot collide with a legacy recipient list of any length.
+		fields[3] += "+thread-links/v1"
+		fields = append(fields, r.ReplyToMessageID, r.RelatedTaskID)
 	}
 	return mutationPayload(append(fields, recipientSet(r.RecipientIDs)...)...)
 }
@@ -59,7 +66,7 @@ func (s *Store) LookupMessageReceipt(ctx context.Context, request MessageRequest
 	}
 	var m domain.Message
 	if found {
-		m, err = messageInTx(ctx, tx, request.GroupID, id)
+		m, err = localMessageReceiptInTx(ctx, tx, request, id)
 		if err != nil {
 			return domain.Message{}, false, storeError("读取消息回执失败", err)
 		}
@@ -102,6 +109,9 @@ func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolv
 	if err := requireMessageActor(ctx, tx, r.GroupID, r.ActorID); err != nil {
 		return domain.Message{}, err
 	}
+	if r.ThreadLinks != (domain.ThreadLinks{}) {
+		return domain.Message{}, fmt.Errorf("%w：消息引用仅可在本机用户发言中使用", ErrInvalid)
+	}
 	id, replay, err := reserveMutation(ctx, tx, r.scope(), r.payload())
 	if err != nil {
 		return domain.Message{}, err
@@ -109,6 +119,12 @@ func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolv
 	if replay {
 		return messageInTx(ctx, tx, r.GroupID, id)
 	}
+	return insertRequestedMessageInTx(ctx, tx, r, id, r.TopicID, resolved)
+}
+
+// id and original request have already been authorized and reserved. Only the
+// new row and its deliveries take the resolved storage topic, not the proof.
+func insertRequestedMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id, topicID string, resolved []string) (domain.Message, error) {
 	if strings.TrimSpace(r.Content) == "" {
 		return domain.Message{}, fmt.Errorf("%w：消息内容不能为空", ErrInvalid)
 	}
@@ -124,7 +140,7 @@ func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolv
 		}
 	}
 	message := domain.Message{
-		ID: id, GroupID: r.GroupID, TopicID: r.TopicID, SenderID: r.ActorID,
+		ID: id, GroupID: r.GroupID, TopicID: topicID, SenderID: r.ActorID,
 		Content: r.Content, CreatedAt: time.Now().UTC(),
 	}
 	if err := insertMessageRow(ctx, tx, message); err != nil {
@@ -132,13 +148,13 @@ func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolv
 	}
 	stamp := message.CreatedAt.Format(timestampLayout)
 	for _, recipient := range resolved {
-		c, err := conversationInTx(ctx, tx, r.GroupID, recipient, r.TopicID)
+		c, err := conversationInTx(ctx, tx, r.GroupID, recipient, topicID)
 		if err != nil {
 			return domain.Message{}, err
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO deliveries(id, message_id, conversation_id, recipient_id, group_id, topic_id, created_at)
-			 VALUES(?, ?, ?, ?, ?, ?, ?)`, rand.Text(), id, c.ID, recipient, r.GroupID, r.TopicID, stamp); err != nil {
+			 VALUES(?, ?, ?, ?, ?, ?, ?)`, rand.Text(), id, c.ID, recipient, r.GroupID, topicID, stamp); err != nil {
 			return domain.Message{}, err
 		}
 	}
@@ -164,6 +180,9 @@ func (s *Store) GetMessage(ctx context.Context, groupID, messageID string) (doma
 		return domain.Message{}, storeError("读取消息失败", err)
 	}
 	messages := []domain.Message{m}
+	if err := messageThreadLinksInTx(ctx, tx, groupID, messages); err != nil {
+		return domain.Message{}, storeError("读取消息引用失败", err)
+	}
 	if err := projectMessageDiscussionsInTx(ctx, tx, groupID, messages); err != nil {
 		return domain.Message{}, err
 	}

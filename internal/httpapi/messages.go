@@ -19,12 +19,16 @@ func MessageRoutes(local *platform.LocalUser) []Route {
 }
 
 func (a localAPI) createMessage(w http.ResponseWriter, r *http.Request) {
-	var input platform.MessageInput
+	var input localMessageRequest
 	key, ok := requestKey(w, r)
 	if !ok || !DecodeJSON(w, r, &input) {
 		return
 	}
-	message, err := a.local.CreateMessage(r.Context(), r.PathValue("group"), input, key)
+	if input.TopicID != nil {
+		input.MessageInput.TopicID = *input.TopicID
+		input.TopicIDExplicit = true
+	}
+	message, err := a.local.CreateMessage(r.Context(), r.PathValue("group"), input.MessageInput, key)
 	operationResult(w, http.StatusCreated, message, err)
 }
 
