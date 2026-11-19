@@ -207,16 +207,17 @@ func (schema memberToolIntakeSchema) requiresIssuedPiConfig() bool {
 }
 
 type memberToolRuntimeRun struct {
-	runtime       *MemberToolRuntime
-	binding       MemberToolRunBinding
-	factory       MemberToolExecutorFactory
-	used          atomic.Bool
-	role          *store.CoordinationRoleProvenance
-	intake        bool
-	intakeSchema  memberToolIntakeSchema
-	intakeBuilder func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
-	investigation *investigationRolePreparation
-	nativeSession *memberToolNativeSessionPlan
+	runtime                  *MemberToolRuntime
+	binding                  MemberToolRunBinding
+	factory                  MemberToolExecutorFactory
+	used                     atomic.Bool
+	role                     *store.CoordinationRoleProvenance
+	intake                   bool
+	intakeSchema             memberToolIntakeSchema
+	intakeBuilder            func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
+	projectExperienceBuilder func(provider.NativeMemberToolConfig) (provider.Executor, error)
+	investigation            *investigationRolePreparation
+	nativeSession            *memberToolNativeSessionPlan
 	// Cloned at trusted wrapping and again when the claimed token is registered.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
@@ -270,6 +271,13 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 			config.cleanup()
 		}
 	}()
+	if e.projectExperienceBuilder != nil {
+		// Ordinary startup issues history, not an artifact grant or an approved
+		// version. Never obtain either from the context or lookup results.
+		if err := r.tools.BindPiProjectExperience(ctx, token, claim, domain.ArtifactVersionRef{}); err != nil {
+			return unknown
+		}
+	}
 	config, err = r.createConfig(token)
 	if receipt := e.preflight(ctx, request, claim, token, config); receipt != nil {
 		return *receipt
@@ -399,6 +407,14 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 	if entry.purpose == memberInvestigationRolePurpose {
 		strictTools = entry.grants.Operations
 	}
+	var experienceTools []string
+	if entry.projectExperience.bound {
+		var err error
+		experienceTools, err = provider.PiProjectExperienceToolNames(entry.grants.Operations)
+		if err != nil {
+			return nil, errMemberToolRuntimeBinding
+		}
+	}
 	data, err := json.Marshal(struct {
 		Endpoint               string   `json:"endpoint"`
 		Token                  string   `json:"token"`
@@ -406,7 +422,8 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 		DiscussionOnlyExcerpt  bool     `json:"discussion_only_excerpt,omitempty"`
 		IntakeAssessmentAction string   `json:"intake_assessment_action,omitempty"`
 		InvestigationTools     []string `json:"investigation_tools,omitempty"`
-	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools})
+		ProjectExperienceTools []string `json:"project_experience_tools,omitempty"`
+	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools, experienceTools})
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}
@@ -457,7 +474,7 @@ func (e *memberToolRuntimeRun) configValid(c *memberToolRuntimeConfigFile) bool 
 	if c == nil || !c.valid() {
 		return false
 	}
-	return e.nativeSession == nil || c.digestMatches()
+	return (e.nativeSession == nil && e.projectExperienceBuilder == nil) || c.digestMatches()
 }
 
 func (c *memberToolRuntimeConfigFile) digestMatches() bool {

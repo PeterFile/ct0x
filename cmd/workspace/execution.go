@@ -28,6 +28,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if err := config.validateNativeSessionConfig(); err != nil {
 		return nil, nil, nil, err
 	}
+	if err := config.validatePiProjectExperience(); err != nil {
+		return nil, nil, nil, err
+	}
 	if err := config.validateInvestigationDataDir(); err != nil {
 		return nil, nil, nil, err
 	}
@@ -117,6 +120,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			}
 		}
 		options.MemberTools, options.PiMemberToolsExtension = tools, config.piMemberToolsExtension
+		options.EnablePiProjectExperience = config.enablePiProjectExperience // History only.
 		options.EnableCodexAppServer = config.enableCodexAppServer
 		options.EnableNativeSessionResume = config.enableNativeSessionResume
 		options.NativePiThinking = config.nativePiThinking

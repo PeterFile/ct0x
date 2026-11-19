@@ -137,6 +137,10 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if memberTools != nil {
 		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)
 		routes = append(routes, httpapi.MemberHistoryToolRoutes(memberTools.Tools())...)
+		if config.enablePiProjectExperience {
+			routes = append(routes, httpapi.MemberProjectExperienceToolRoutes(memberTools.Tools())...)
+			toolStatus += "；使用受信扩展的全新 Pi 历史轮可检索当前话题的项目经验，普通启动不签发成果读取权限"
+		}
 		if config.enableInvestigationExecution {
 			routes = append(routes, httpapi.MemberInvestigationToolRoutes(memberTools.Tools())...)
 			if config.piFreshInvestigationWorkExtension != "" {

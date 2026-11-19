@@ -35,6 +35,7 @@ type memberToolRegistration struct {
 	candidate          *domain.ChatCandidate
 	purpose            string
 	intake             memberToolIntakeSchema
+	projectExperience  memberProjectExperienceTransport // Optional, one-time native projection before launch.
 	taskWork           *taskWorkToolBinding
 	workReport         *taskWorkReportBinding
 	investigationOwner *investigationWorkOwnerBinding
