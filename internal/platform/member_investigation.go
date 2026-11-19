@@ -262,7 +262,11 @@ func (s *MemberTools) withInvestigationRead(ctx context.Context, token, operatio
 	if !found || !isInvestigationReadOperation(operation) || !slices.Contains(entry.grants.Operations, operation) {
 		return store.ErrMemberToolDenied
 	}
-	if entry.workReport != nil {
+	if entry.investigationOwner != nil {
+		if !entry.investigationWorkOwnerValid() || entry.investigationOwner.delivery.SourceKind != domain.TaskWorkSourceFollowup {
+			return store.ErrMemberToolDenied
+		}
+	} else if entry.workReport != nil {
 		if entry.workReport.delivery.SourceKind != domain.TaskWorkSourceDelegation {
 			return store.ErrMemberToolDenied
 		}
@@ -292,7 +296,7 @@ func (s *MemberTools) ReadInvestigationChannel(ctx context.Context, token string
 		if entry.workReport != nil {
 			page, err = s.workReportEngine.ReadTaskWorkChannel(ctx, entry.scope, options)
 		} else {
-			page, err = s.db.ReadInvestigationChannel(ctx, entry.role, options)
+			page, err = s.db.ReadInvestigationChannel(ctx, entry.investigationReadRole(), options)
 		}
 		if err != nil {
 			return err
@@ -342,7 +346,8 @@ func (s *MemberTools) ReadInvestigationArtifact(ctx context.Context, token strin
 			return store.ErrInvalid
 		}
 		ref := domain.ArtifactVersionRef{ArtifactID: input.ArtifactID, VersionID: input.VersionID}
-		if entry.workReport != nil && !slices.Contains(entry.workReport.versions, ref) {
+		if (entry.workReport != nil && !slices.Contains(entry.workReport.versions, ref)) ||
+			(entry.investigationOwner != nil && !slices.Contains(entry.investigationOwner.versions, ref)) {
 			return store.ErrMemberToolDenied
 		}
 		readVersion := func() (domain.ArtifactVersion, error) {
@@ -350,7 +355,7 @@ func (s *MemberTools) ReadInvestigationArtifact(ctx context.Context, token strin
 				_, version, err := s.workReportEngine.ReadTaskWorkArtifact(ctx, entry.scope, ref.ArtifactID, ref.VersionID)
 				return version, err
 			}
-			_, version, err := s.db.ReadInvestigationArtifact(ctx, entry.role, ref.ArtifactID, ref.VersionID)
+			_, version, err := s.db.ReadInvestigationArtifact(ctx, entry.investigationReadRole(), ref.ArtifactID, ref.VersionID)
 			return version, err
 		}
 		version, err := readVersion()

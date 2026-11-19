@@ -25,12 +25,16 @@ import (
 
 // Platform CI shards by top-level test name. Spread these independent SQLite
 // scenarios across test entries so one shard does not run all of them.
-func TestFreshTaskWorkB29NativeWire(t *testing.T) {
-	testFreshTaskWorkB29NativeWire(t, "confirmed", "context-after-handback")
+func TestFreshTaskWorkB29NativeWireConfirmedInput(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "confirmed")
+}
+
+func TestFreshTaskWorkB29NativeWireContextAfterHandback(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "context-after-handback")
 }
 
 func TestFreshTaskWorkB29NativeWireUncertaintyAndCancellation(t *testing.T) {
-	testFreshTaskWorkB29NativeWire(t, "commit-unknown", "cancel-before-gate")
+	testFreshTaskWorkB29NativeWire(t, "commit-unknown", "untrusted-native-receipt", "cancel-before-gate")
 }
 
 func TestFreshTaskWorkB29NativeWireResourceClaims(t *testing.T) {
@@ -41,8 +45,16 @@ func TestFreshTaskWorkB29NativeWireWorkspaceAndConfig(t *testing.T) {
 	testFreshTaskWorkB29NativeWire(t, "replaced-original-cwd", "workspace-before-gate", "late-config")
 }
 
-func TestFreshTaskWorkB29NativeWireLaunchGate(t *testing.T) {
-	testFreshTaskWorkB29NativeWire(t, "late-policy", "policy-before-gate", "failed-launch-commit", "policy-after-gate")
+func TestFreshTaskWorkB29NativeWireLaunchGateRejectsPreAdmissionPolicyChanges(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "late-policy", "policy-before-gate")
+}
+
+func TestFreshTaskWorkB29NativeWireLaunchGateFailedCommit(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "failed-launch-commit")
+}
+
+func TestFreshTaskWorkB29NativeWireLaunchGatePolicyAfterAdmission(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "policy-after-gate")
 }
 
 // All authority is established through v29 APIs. The only substitutions are a
@@ -217,6 +229,7 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 				}
 				beforeGateChanged = true
 			}
+			const unknownAckKey = "unknown-key"
 			call := func(op, body, key string, status int) string {
 				t.Helper()
 				w := f.http(t, token, op, body, key)
@@ -261,10 +274,10 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 						roleOK(t, os.Mkdir(typedCWD, 0700))
 					}
 					beforeGate()
-					return roleNative(func(_ context.Context, req provider.ExecuteRequest, _ func(provider.Event) error) provider.ExecutionReceipt {
+					return roleNative(func(_ context.Context, req provider.ExecuteRequest, emit func(provider.Event) error) provider.ExecutionReceipt {
 						calls++
 						switch mode {
-						case "confirmed", "commit-unknown", "context-after-handback", "policy-after-gate":
+						case "confirmed", "commit-unknown", "untrusted-native-receipt", "context-after-handback", "policy-after-gate":
 						default:
 							t.Fatal("synthetic executor entered despite a committed pre-launch change or invalid binding")
 						}
@@ -273,6 +286,13 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 							t.Fatal("prompt was not confined to the Mandate and input handle")
 						}
 						id := fmt.Sprintf(`{"input_id":%q}`, wake.WorkInputID)
+						if mode == "untrusted-native-receipt" {
+							roleOK(t, emit(provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: req.RunID}))
+							roleOK(t, emit(provider.Event{Kind: provider.ResponseEvent, NativeSessionID: req.RunID, Text: "不应发布"}))
+							roleOK(t, emit(provider.Event{Kind: provider.TerminalEvent, NativeSessionID: req.RunID, Terminal: provider.OutcomeSucceeded}))
+							return provider.ExecutionReceipt{Started: true, Accepted: true, Outcome: provider.OutcomeSucceeded,
+								Terminal: provider.OutcomeSucceeded, NativeSessionID: req.RunID, DirectChildReaped: true, OutputComplete: false}
+						}
 						if mode == "policy-after-gate" {
 							// This runs at entry to a synthetic executor, after the launch
 							// gate. Live tools use B's authority now, not the launch permit.
@@ -330,18 +350,18 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 							return provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}
 						}
 						call("list_members", `{}`, "", 403)
-						call("report_work", `{}`, "no-report", 404)
+						if mode == "confirmed" {
+							call("report_work", `{"kind":"progress","summary":"not a delegate"}`, "no-report", 403)
+						} else {
+							call("report_work", `{}`, "no-report", 404)
+						}
 						call("hand_back_work", `{}`, "no-task-handback", 404)
 						call("mcp", `{}`, "", 403)
 						call("read_work_inputs", id[:len(id)-1]+`,"limit":1}`, "", 400)
 						call("submit_result", `{"summary":"text","artifact_versions":[]}`, "refs", 400)
 						call("submit_result", `{"summary":"too early"}`, "premature", 409)
 						if mode == "commit-unknown" {
-							_, err := f.raw.Exec(`CREATE TABLE commit_guard(id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED);
-								CREATE TRIGGER ack_commit_fault AFTER INSERT ON mutation_idempotency
-								BEGIN INSERT INTO commit_guard VALUES('nonexistent-group'); END`)
-							roleOK(t, err)
-							text := call("ack_work_input", id, "unknown-key", 500)
+							text := call("ack_work_input", id, unknownAckKey, 500)
 							if !strings.Contains(text, "未确认") || strings.Contains(text, "commit_guard") {
 								t.Fatal("B commit uncertainty leaked details or lost reconciliation guidance")
 							}
@@ -409,7 +429,20 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 					}), nil
 				},
 			}
-			f.runtime, err = platform.NewMemberToolRuntime(f.db, f.options)
+			if mode == "confirmed" {
+				// Both profiles in one registry: this persisted text admission
+				// must still use the real text gate and bootstrap.
+				entry, err := filepath.Abs("../../extensions/pi-bridge/fresh-investigation-work.ts")
+				roleOK(t, err)
+				launch := platform.NewPiInvestigationTaskWorkLaunch(entry, 0,
+					func(context.Context, store.FreshTaskWorkLaunch, func() bool) error {
+						t.Error("text followup reached the investigation commit")
+						return store.ErrMemberToolDenied
+					})
+				f.runtime, err = platform.NewMemberToolRuntimeWithTaskWorkReports(f.db, f.options, engine, launch)
+			} else {
+				f.runtime, err = platform.NewMemberToolRuntime(f.db, f.options)
+			}
 			roleOK(t, err)
 			defer f.runtime.Close()
 			tools := f.runtime.Tools()
@@ -566,33 +599,96 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 			if mode == "extra-resource" {
 				keys = append(keys, "extra-key")
 			}
-			live = claim(queued.Delivery.ID, keys)
-			prepared.Request.RunID, prepared.Request.RuntimeDir = live.Claim.TurnID, f.root
-			out := prepared.Executor.Execute(ctx, prepared.Request, nil)
+			if mode == "commit-unknown" {
+				// Install after seeding and before the scheduler opens transactions.
+				// Only the target ACK inserts a deferred FK violation at COMMIT.
+				_, err := f.raw.Exec(`CREATE TABLE commit_guard(id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED);
+					CREATE TRIGGER ack_commit_fault AFTER INSERT ON mutation_idempotency
+					WHEN NEW.operation = 'acknowledge_work_input' AND NEW.idempotency_key = '` + unknownAckKey + `'
+					BEGIN INSERT INTO commit_guard VALUES('nonexistent-group'); END`)
+				roleOK(t, err)
+			}
+			var out provider.ExecutionReceipt
+			scheduled := slices.Contains([]string{"confirmed", "wrong-resource", "commit-unknown", "untrusted-native-receipt"}, mode)
+			if scheduled {
+				// Only the seeded wake is needed. The executor cancels on completion,
+				// leaving the deadline as a watchdog rather than polling while it runs.
+				runCtx, stop := context.WithTimeout(ctx, 60*time.Second)
+				defer stop()
+				err = scheduler.Run(runCtx, f.db, scheduler.Options{Recovered: true, RuntimeDir: f.root, MaxActive: f.options.RoleMaxActive, PollInterval: time.Hour},
+					func(ctx context.Context, pending store.PendingDelivery) (scheduler.PreparedExecution, error) {
+						if pending.Delivery.ID != queued.Delivery.ID {
+							return scheduler.PreparedExecution{}, scheduler.ErrNotReady
+						}
+						p, err := prep.Prepare(ctx, pending)
+						if err != nil {
+							return scheduler.PreparedExecution{}, err
+						}
+						prepared = p
+						if mode == "wrong-resource" {
+							p.ResourceKeys = keys // Deliberately disagree with the actual private CWD.
+						}
+						native := p.Executor
+						p.Executor = roleNative(func(ctx context.Context, req provider.ExecuteRequest, emit func(provider.Event) error) provider.ExecutionReceipt {
+							defer stop()
+							out = provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown}
+							done := make(chan struct{})
+							go func() {
+								// Fixture failures must not Goexit the scheduler's receipt writer.
+								defer close(done)
+								turn, err := f.db.GetTurn(ctx, f.group, req.RunID)
+								roleOK(t, err)
+								live, err = f.db.BindMemberTool(ctx, store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken})
+								roleOK(t, err)
+								prepared.Request = req
+								out = native.Execute(ctx, req, emit)
+							}()
+							<-done
+							return out
+						})
+						return p, nil
+					})
+				if !errors.Is(err, context.Canceled) || err.Error() != context.Canceled.Error() || live.Claim.TurnID == "" {
+					t.Fatalf("normal scheduler did not execute and drain the typed text fixture: %v", err)
+				}
+			} else {
+				live = claim(queued.Delivery.ID, keys)
+				prepared.Request.RunID, prepared.Request.RuntimeDir = live.Claim.TurnID, f.root
+				out = prepared.Executor.Execute(ctx, prepared.Request, nil)
+			}
 			want := provider.OutcomeUnknown
 			if mode == "confirmed" || mode == "context-after-handback" {
 				want = provider.OutcomeNotStarted
 			}
-			wantCalls := 0
-			if mode == "confirmed" || mode == "context-after-handback" || mode == "commit-unknown" || mode == "policy-after-gate" {
+			wantRaw, wantCalls := want, 0
+			if mode == "untrusted-native-receipt" {
+				wantRaw = provider.OutcomeSucceeded // Storage must not settle this terminal.
+			}
+			if slices.Contains([]string{"confirmed", "context-after-handback", "commit-unknown", "policy-after-gate", "untrusted-native-receipt"}, mode) {
 				wantCalls = 1
 			}
 			if strings.HasSuffix(mode, "-before-gate") && !beforeGateChanged {
 				t.Fatal("controller did not reach the pre-launch mutation")
 			}
-			if out.Outcome != want || calls != wantCalls || out.NativeRef != nil ||
+			if out.Outcome != wantRaw || calls != wantCalls || out.NativeRef != nil ||
 				mode == "replaced-original-cwd" && (token == "" || !strings.Contains(out.Reason, "专用目录身份")) {
 				t.Fatalf("wrong guarded result: %v calls=%d", out.Outcome, calls)
 			}
-			var boundAttempts, nativeRecords int
-			roleOK(t, f.raw.QueryRow(`SELECT (SELECT count(*) FROM task_attempts WHERE turn_id=?),
-				(SELECT count(*) FROM native_run_bindings WHERE turn_id=?)`, live.Claim.TurnID, live.Claim.TurnID).Scan(&boundAttempts, &nativeRecords))
-			wantAttempts := 1 // B's original continuation binder ran once, before construction.
+			var boundAttempts, nativeRecords, barriers int
+			roleOK(t, f.raw.QueryRow(`SELECT (SELECT count(*) FROM task_attempts WHERE turn_id=?1),
+				(SELECT count(*) FROM native_run_bindings WHERE turn_id=?1),
+				(SELECT count(*) FROM native_run_bindings WHERE turn_id=?1 AND purpose='unknown' AND binding_version=0
+				 AND binding_json IS NULL AND profile_sha256 IS NULL AND native_ref_json IS NULL AND resumed_from_turn_id IS NULL)`, live.Claim.TurnID).
+				Scan(&boundAttempts, &nativeRecords, &barriers))
+			wantAttempts, wantBarriers := 1, 0
 			if mode == "wrong-resource" || mode == "extra-resource" {
 				wantAttempts = 0
 			}
-			if boundAttempts != wantAttempts || nativeRecords != 0 {
-				t.Fatalf("startup changed B binding or wrote a native record: attempts=%d native=%d", boundAttempts, nativeRecords)
+			if scheduled {
+				wantBarriers = 1 // Apply records a no-reference barrier, not a native session.
+			}
+			if boundAttempts != wantAttempts || nativeRecords != wantBarriers || barriers != wantBarriers {
+				t.Fatalf("wrong B Attempt or native barrier: attempts=%d rows=%d barriers=%d", boundAttempts, nativeRecords, barriers)
 			}
 			if mode == "failed-launch-commit" {
 				var faultRows int
@@ -612,7 +708,17 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 					t.Fatal("config survived revocation")
 				}
 			}
-			turn := settle(live.Claim, out.Outcome)
+			var turn domain.Turn
+			if scheduled {
+				turn, err = f.db.GetTurn(ctx, f.group, live.Claim.TurnID)
+				roleOK(t, err)
+				if turn.State != domain.TurnState(want) || turn.ReplyMessageID != "" ||
+					mode == "untrusted-native-receipt" && (turn.AcceptedAt == nil || turn.CandidateTerminal != domain.TurnStateSucceeded) {
+					t.Fatalf("scheduler did not preserve terminal evidence without settling an untrusted receipt: %s", turn.State)
+				}
+			} else {
+				turn = settle(live.Claim, out.Outcome)
+			}
 			if want == provider.OutcomeUnknown {
 				if turn.State != domain.TurnStateUnknown || turn.ClaimToken != live.Claim.Token ||
 					((mode == "cancel-before-gate" || mode == "policy-after-gate") && turn.CancelRequestedAt == nil) {

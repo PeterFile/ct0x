@@ -48,14 +48,32 @@ func newBoundWorkReportFixture(t *testing.T) *boundWorkReportFixture {
 	return f
 }
 
+func (f *boundWorkReportFixture) memberToolRoutes() []httpapi.Route {
+	tools := f.runtime.Tools()
+	return slices.Concat(httpapi.MemberToolRoutes(tools), httpapi.MemberRoleToolRoutes(tools),
+		httpapi.MemberInvestigationToolRoutes(tools), httpapi.MemberMCPRoutes(tools))
+}
+
 func (f *boundWorkReportFixture) mount(t *testing.T) {
 	t.Helper()
-	tools := f.runtime.Tools()
-	routes := slices.Concat(httpapi.MemberToolRoutes(tools), httpapi.MemberRoleToolRoutes(tools),
-		httpapi.MemberInvestigationToolRoutes(tools), httpapi.MemberMCPRoutes(tools))
-	srv, err := httpapi.NewServer(httpapi.DefaultAddress, routes...)
+	srv, err := httpapi.NewServer(httpapi.DefaultAddress, f.memberToolRoutes()...)
 	roleOK(t, err)
 	f.handler = srv.Handler
+}
+
+// mountMemberToolHandlers exercises the real route, bearer, JSON and B checks
+// in-process. Use mount to also exercise the outer Host/origin guard and
+// network deadline.
+func (f *boundWorkReportFixture) mountMemberToolHandlers(ctx context.Context) {
+	mux := http.NewServeMux()
+	for _, route := range f.memberToolRoutes() {
+		mux.HandleFunc(route.Method+" "+route.Pattern, route.Handler)
+	}
+	f.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The synthetic f.http requests have no independent context. Keep
+		// their SQLite work within the fixture lifetime, not a network deadline.
+		mux.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func (f *boundWorkReportFixture) claimWork(t *testing.T, deliveryID string) store.MemberToolScope {
@@ -200,6 +218,7 @@ func (f *boundWorkReportFixture) workCounts(t *testing.T) [4]int {
 func TestBoundWorkDelegationTransport(t *testing.T) {
 	ctx := t.Context()
 	f := newBoundWorkReportFixture(t)
+	f.mountMemberToolHandlers(t.Context())
 	root, err := os.OpenRoot(t.TempDir())
 	roleOK(t, err)
 	defer root.Close()
@@ -251,6 +270,14 @@ func TestBoundWorkDelegationTransport(t *testing.T) {
 	}
 	const channel, artifact = platform.ReadInvestigationChannelOperation, platform.ReadInvestigationArtifactOperation
 	memberMCPRoleProfile(t, f.roleRuntimeFixture, token, channel, artifact, "report_work")
+	names, err := tools.TransportOperations(ctx, token)
+	roleOK(t, err)
+	if !slices.Equal(names, []string{channel, artifact, "report_work"}) {
+		t.Fatal("delegate's B subset did not produce the canonical typed order")
+	}
+	_, _, err = provider.PiFreshInvestigationConfig(f.options.Endpoint, token, child.Claim.TurnID, provider.PiFreshInvestigationProfile{
+		Action: domain.ChatActionReadOnlyInvestigation, SourceKind: domain.TaskWorkSourceDelegation, Operations: names})
+	roleOK(t, err)
 	page := f.expectHTTP(t, token, channel, `{}`, "", http.StatusOK)
 	var material struct{ Items []domain.Message }
 	roleOK(t, json.Unmarshal([]byte(page), &material))
@@ -435,79 +462,79 @@ func TestBoundWorkReportReadTransport(t *testing.T) {
 
 const boundWorkOrdinaryMCPLimit = 256
 
-func TestBoundWorkReportMCPReserve(t *testing.T) {
-	for _, reportFirst := range []bool{false, true} {
-		name := "reads-first"
-		if reportFirst {
-			name = "report-first"
+func TestBoundWorkReportMCPReserveWithReadsFirst(t *testing.T) {
+	testBoundWorkReportMCPReserve(t, false)
+}
+
+func TestBoundWorkReportMCPReserveReportFirstThenReads(t *testing.T) {
+	testBoundWorkReportMCPReserve(t, true)
+}
+
+func testBoundWorkReportMCPReserve(t *testing.T, reportFirst bool) {
+	f := newBoundWorkReportFixture(t)
+	f.delegate(t, nil, nil, true)
+	child := f.claimWork(t, f.delegation.DeliveryID)
+	token, err := f.runtime.IssueWorkDelegationTools(t.Context(), child.Claim, nil)
+	roleOK(t, err)
+	tools := f.runtime.Tools()
+	defer tools.Revoke(token)
+	const op, channel = platform.ReportWorkOperation, platform.ReadInvestigationChannelOperation
+	const firstReadID, lastReadID = `"first-read"`, `"last-read"`
+	before := f.workCounts(t)
+	progress := func(i int) {
+		t.Helper()
+		text := f.call(t, token, fmt.Sprintf(`"progress-%d"`, i), op, testReportBody, false)
+		if !strings.Contains(text, `"wake_queued":false`) {
+			t.Fatal("progress queued a wake")
 		}
-		t.Run(name, func(t *testing.T) {
-			f := newBoundWorkReportFixture(t)
-			f.delegate(t, nil, nil, true)
-			child := f.claimWork(t, f.delegation.DeliveryID)
-			token, err := f.runtime.IssueWorkDelegationTools(t.Context(), child.Claim, nil)
-			roleOK(t, err)
-			tools := f.runtime.Tools()
-			defer tools.Revoke(token)
-			const op, channel = platform.ReportWorkOperation, platform.ReadInvestigationChannelOperation
-			const firstReadID, lastReadID = `"first-read"`, `"last-read"`
-			before := f.workCounts(t)
-			progress := func(i int) {
-				t.Helper()
-				text := f.call(t, token, fmt.Sprintf(`"progress-%d"`, i), op, testReportBody, false)
-				if !strings.Contains(text, `"wake_queued":false`) {
-					t.Fatal("progress queued a wake")
-				}
-			}
-			if reportFirst {
-				progress(0)
-			}
-			page := f.expectHTTP(t, token, channel, `{}`, "", http.StatusOK)
-			if got := f.call(t, token, firstReadID, channel, `{}`, false); got != page {
-				t.Fatal("first scoped MCP read differs from HTTP")
-			}
-			// Fill only the interior ordinary slots on this token without repeating
-			// the SQLite read. The first and last slots still go through MCP.
-			fingerprint := sha256.Sum256([]byte("synthetic ordinary read"))
-			for i := 2; i < boundWorkOrdinaryMCPLimit; i++ {
-				requestID := sha256.Sum256([]byte(fmt.Sprintf("reserve-test-fill-%d", i)))
-				if err := tools.BindMCPRequest(token, requestID, fingerprint); err != nil {
-					t.Fatalf("bind ordinary MCP slot %d: %v", i, err)
-				}
-			}
-			if got := f.call(t, token, lastReadID, channel, `{}`, false); got != page {
-				t.Fatal("last in-budget MCP read differs from HTTP")
-			}
-			if text := f.call(t, token, `"extra-read"`, channel, `{}`, true); !strings.Contains(text, `"code":"mcp_request_capacity"`) {
-				t.Fatalf("ordinary tool reached the report reserve: %s", text)
-			}
-			if got := f.call(t, token, firstReadID, channel, `{}`, false); got != page {
-				t.Fatal("capacity blocked an ordinary replay")
-			}
-			if !reportFirst {
-				progress(0)
-			}
-			for i := 1; i < domain.MaxWorkReportsPerDelegation-1; i++ {
-				progress(i)
-			}
-			before[3] += domain.MaxWorkReportsPerDelegation - 1
-			if text := f.call(t, token, `"excess-progress"`, op, testReportBody, true); !strings.Contains(text, `"code":"conflict"`) {
-				t.Fatalf("fourth progress did not reach B's reserved-wake rule: %s", text)
-			}
-			f.expectHTTP(t, token, op, testReportBody, "http-excess-progress", http.StatusConflict)
-			if f.workCounts(t) != before || f.reportReceipts(t) != domain.MaxWorkReportsPerDelegation-1 {
-				t.Fatal("rejected progress left a report, receipt, or wake")
-			}
-			text := f.call(t, token, `"fresh-delivered"`, op, testDeliveredBody, false)
-			key := f.reportKey(t, text)
-			for i := range before {
-				before[i]++
-			}
-			if !strings.Contains(text, `"wake_queued":true`) || f.expectHTTP(t, token, op, testDeliveredBody, key, http.StatusCreated) != text ||
-				f.workCounts(t) != before || f.reportReceipts(t) != domain.MaxWorkReportsPerDelegation {
-				t.Fatal("MCP did not create exactly one waking report replayable through HTTP")
-			}
-		})
+	}
+	if reportFirst {
+		progress(0)
+	}
+	page := f.expectHTTP(t, token, channel, `{}`, "", http.StatusOK)
+	if got := f.call(t, token, firstReadID, channel, `{}`, false); got != page {
+		t.Fatal("first scoped MCP read differs from HTTP")
+	}
+	// Fill only the interior ordinary slots on this token without repeating
+	// the SQLite read. The first and last slots still go through MCP.
+	fingerprint := sha256.Sum256([]byte("synthetic ordinary read"))
+	for i := 2; i < boundWorkOrdinaryMCPLimit; i++ {
+		requestID := sha256.Sum256([]byte(fmt.Sprintf("reserve-test-fill-%d", i)))
+		if err := tools.BindMCPRequest(token, requestID, fingerprint); err != nil {
+			t.Fatalf("bind ordinary MCP slot %d: %v", i, err)
+		}
+	}
+	if got := f.call(t, token, lastReadID, channel, `{}`, false); got != page {
+		t.Fatal("last in-budget MCP read differs from HTTP")
+	}
+	if text := f.call(t, token, `"extra-read"`, channel, `{}`, true); !strings.Contains(text, `"code":"mcp_request_capacity"`) {
+		t.Fatalf("ordinary tool reached the report reserve: %s", text)
+	}
+	if got := f.call(t, token, firstReadID, channel, `{}`, false); got != page {
+		t.Fatal("capacity blocked an ordinary replay")
+	}
+	if !reportFirst {
+		progress(0)
+	}
+	for i := 1; i < domain.MaxWorkReportsPerDelegation-1; i++ {
+		progress(i)
+	}
+	before[3] += domain.MaxWorkReportsPerDelegation - 1
+	if text := f.call(t, token, `"excess-progress"`, op, testReportBody, true); !strings.Contains(text, `"code":"conflict"`) {
+		t.Fatalf("fourth progress did not reach B's reserved-wake rule: %s", text)
+	}
+	f.expectHTTP(t, token, op, testReportBody, "http-excess-progress", http.StatusConflict)
+	if f.workCounts(t) != before || f.reportReceipts(t) != domain.MaxWorkReportsPerDelegation-1 {
+		t.Fatal("rejected progress left a report, receipt, or wake")
+	}
+	text := f.call(t, token, `"fresh-delivered"`, op, testDeliveredBody, false)
+	key := f.reportKey(t, text)
+	for i := range before {
+		before[i]++
+	}
+	if !strings.Contains(text, `"wake_queued":true`) || f.expectHTTP(t, token, op, testDeliveredBody, key, http.StatusCreated) != text ||
+		f.workCounts(t) != before || f.reportReceipts(t) != domain.MaxWorkReportsPerDelegation {
+		t.Fatal("MCP did not create exactly one waking report replayable through HTTP")
 	}
 }
 

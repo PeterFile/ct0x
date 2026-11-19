@@ -102,10 +102,10 @@ func TestPiFreshTaskWorkSDKPrintLifecycle(t *testing.T) {
 		complete, marked bool
 	}{
 		{"intact unknown marker", unknown, OutcomeUnknown, true, true},
-		{"missing ack end", dropTypedPrintFrame(t, unknown, "tool_execution_end"), OutcomeUnknown, false, false},
-		{"marker without ack start", dropTypedPrintFrame(t, unknown, "tool_execution_start"), OutcomeUnknown, false, false},
+		{"missing ack end", dropTypedPrintFrame(t, unknown, "tool_execution_end", "ack_work_input"), OutcomeUnknown, false, false},
+		{"marker without ack start", dropTypedPrintFrame(t, unknown, "tool_execution_start", "ack_work_input"), OutcomeUnknown, false, false},
 		{"intact parallel checked and denied", paired, OutcomeSucceeded, true, false},
-		{"denial without ack end", dropTypedPrintFrame(t, paired, "tool_execution_end"), OutcomeUnknown, false, false},
+		{"denial without ack end", dropTypedPrintFrame(t, paired, "tool_execution_end", "ack_work_input"), OutcomeUnknown, false, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			got, events := runTypedWriteTest(t, runID, c.stream, false)
@@ -141,7 +141,7 @@ func TestPiFreshTaskWorkSDKPrintLifecycle(t *testing.T) {
 	})
 }
 
-func dropTypedPrintFrame(t *testing.T, stream, kind string) string {
+func dropTypedPrintFrame(t *testing.T, stream, kind, operation string) string {
 	t.Helper()
 	var rest strings.Builder
 	dropped := 0
@@ -153,14 +153,14 @@ func dropTypedPrintFrame(t *testing.T, stream, kind string) string {
 		if err := json.Unmarshal([]byte(line), &header); err != nil {
 			t.Fatal(err)
 		}
-		if header.Type == kind && header.ToolName == "ack_work_input" {
+		if header.Type == kind && header.ToolName == operation {
 			dropped++
 		} else {
 			rest.WriteString(line)
 		}
 	}
 	if dropped != 1 {
-		t.Fatalf("expected exactly one ack_work_input %s, got %d", kind, dropped)
+		t.Fatalf("expected exactly one %s %s, got %d", operation, kind, dropped)
 	}
 	return rest.String()
 }

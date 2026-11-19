@@ -24,7 +24,7 @@ type config struct {
 	enableCodexAppServer, enableInvestigationExecution          bool
 	piMemberToolsExtension, roleThinking                        string
 	executionMaxActive, memberToolsMaxMembers                   int
-	piFreshTaskWorkExtension                                    string
+	piFreshTaskWorkExtension, piFreshInvestigationWorkExtension string
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -43,6 +43,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags.BoolVar(&config.enableMemberTools, "enable-member-tools", false, "启用 Pi 基础成员工具（默认禁用）")
 	flags.StringVar(&config.piMemberToolsExtension, "pi-member-tools-extension", "", "可信 Pi 扩展的绝对文件路径")
 	config.registerPiFreshTaskWorkFlag(flags, output)
+	config.registerPiFreshInvestigationWorkFlag(flags, output)
 	flags.IntVar(&config.memberToolsMaxMembers, "member-tools-max-members", 4, "成员工具增员容量（1..200）")
 	flags.BoolVar(&config.enableCoordinationRoles, "enable-coordination-roles", false, "显式启用受信协调角色（默认禁用）")
 	flags.BoolVar(&config.enableCodexAppServer, "enable-codex-app-server", false, "显式选择实验性 Codex AppServer 与会话级平台 MCP（默认禁用）")
@@ -170,6 +171,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 
 func (c config) validateInvestigationOption() error {
 	if !c.enableInvestigationExecution {
+		if c.piFreshInvestigationWorkExtension != "" {
+			return errors.New("调查后续工作须显式启用 --enable-investigation-execution")
+		}
 		return nil
 	}
 	if c.enableCodexAppServer {
@@ -177,6 +181,11 @@ func (c config) validateInvestigationOption() error {
 	}
 	if !c.enableExecution || !c.enableMemberTools || !c.enableCoordinationRoles || !filepath.IsAbs(c.piPath) || c.piMemberToolsExtension == "" {
 		return errors.New("只读调查须同时启用执行、成员工具和协调角色，并显式提供可信 Pi 1.4.0 的 --pi-path 和扩展")
+	}
+	if path := c.piFreshInvestigationWorkExtension; path != "" &&
+		(!filepath.IsAbs(path) || strings.ContainsRune(path, 0) || filepath.Clean(path) == filepath.Clean(c.piMemberToolsExtension) ||
+			filepath.Clean(path) == filepath.Clean(c.piFreshTaskWorkExtension)) {
+		return errors.New("调查后续工作须使用独立的可信扩展绝对路径")
 	}
 	return nil
 }

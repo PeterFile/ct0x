@@ -24,10 +24,12 @@ type taskWorkReportBinding struct {
 	versions []domain.ArtifactVersionRef
 }
 
-// NewMemberToolRuntimeWithTaskWorkReports opts into the postclaim report
-// transport only. It neither enables B execution nor installs a launch profile.
-func NewMemberToolRuntimeWithTaskWorkReports(db *store.Store, options MemberToolRuntimeOptions, engine *coordination.Engine) (*MemberToolRuntime, error) {
-	if !engine.UsesStore(db) {
+// NewMemberToolRuntimeWithTaskWorkReports opts into postclaim report,
+// delegation, and typed investigation owner transports. It does not enable B
+// execution. Trusted composition may also supply one investigation launcher
+// with B's final commit; without it this is just the postclaim transport.
+func NewMemberToolRuntimeWithTaskWorkReports(db *store.Store, options MemberToolRuntimeOptions, engine *coordination.Engine, launches ...*InvestigationTaskWorkLaunch) (*MemberToolRuntime, error) {
+	if !engine.UsesStore(db) || len(launches) > 1 {
 		return nil, errMemberToolRuntimeConfig
 	}
 	runtime, err := NewMemberToolRuntime(db, options)
@@ -36,6 +38,12 @@ func NewMemberToolRuntimeWithTaskWorkReports(db *store.Store, options MemberTool
 	}
 	if runtime.roleFence == nil {
 		return nil, errMemberToolRuntimeConfig
+	}
+	if len(launches) == 1 {
+		runtime.investigationTaskWork, err = freezeInvestigationTaskWorkLaunch(db, launches[0])
+		if err != nil {
+			return nil, err
+		}
 	}
 	runtime.tools.workReportEngine = engine
 	return runtime, nil
@@ -101,7 +109,6 @@ func (r *MemberToolRuntime) issueWorkReportProfile(ctx context.Context, claim st
 			d.DeliveryID != work.DeliveryID || d.MessageID != work.MessageID || d.ConversationID != work.ConversationID {
 			return "", store.ErrMemberToolDenied
 		}
-		grants.Operations = []string{ReportWorkOperation}
 		if d.AllowTopicMessages {
 			grants.Operations = append(grants.Operations, ReadInvestigationChannelOperation)
 		}
@@ -114,6 +121,7 @@ func (r *MemberToolRuntime) issueWorkReportProfile(ctx context.Context, claim st
 			binding.versions = slices.Clone(d.ArtifactVersions)
 			grants.Operations = append(grants.Operations, ReadInvestigationArtifactOperation)
 		}
+		grants.Operations = append(grants.Operations, ReportWorkOperation)
 		if err := s.workReportCurrent(ctx, scope, work); err != nil {
 			return "", err
 		}
@@ -168,7 +176,8 @@ func (s *MemberTools) withBoundWorkReport(token, op string, kind domain.TaskWork
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry := s.capabilities[sha256.Sum256([]byte(token))]
-	if !entry.hasBoundWorkReport(op, kind) {
+	if !entry.hasBoundWorkReport(op, kind) ||
+		entry.investigationOwner != nil && !entry.investigationWorkOwnerValid() {
 		return store.ErrMemberToolDenied
 	}
 	return use(entry)
