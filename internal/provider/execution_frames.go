@@ -150,7 +150,7 @@ func (f *executionFrames) finish() {
 
 func (o *executionOutput) recordFrame(frame executionFrame) {
 	if frame.damaged {
-		o.damaged, o.last = true, ""
+		o.damageFrame()
 		return
 	}
 	o.recordPi(bytes.TrimSuffix(frame.data, []byte{'\r'}))

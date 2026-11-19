@@ -12,5 +12,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "bridge.mjs"]
+  "include": ["index.ts", "bridge.mjs", "fresh-task-work.ts", "fresh-task-work.mjs", "fresh-investigation-work.ts"]
 }

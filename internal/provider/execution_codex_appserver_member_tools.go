@@ -25,28 +25,28 @@ var memberToolEndpoint = regexp.MustCompile(`^http://(127\.0\.0\.1|\[::1\]):([0-
 var memberToolBearer = regexp.MustCompile(`^[A-Za-z0-9._~+/-]+=*$`)
 
 type memberToolConfig struct {
-	endpoint string
-	origin   string
-	token    string
-	file     os.FileInfo
-	digest   [32]byte
+	endpoint           string
+	origin             string
+	token              string
+	file               os.FileInfo
+	digest             [32]byte
+	investigationTools []string // Pi strict mode only.
 }
 
 // Trusted, stable ancestors are required. Descriptor and path checks detect
 // replacement/metadata drift, not hostile ancestor mutation or ABA writes.
-func readMemberToolConfig(path string) (memberToolConfig, error) {
-	var config memberToolConfig
+func readMemberToolConfigFile(path string) ([]byte, os.FileInfo, error) {
 	if !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
-		return config, errPiMemberToolConfiguration
+		return nil, nil, errPiMemberToolConfiguration
 	}
 	path = filepath.Clean(path)
 	before, err := os.Lstat(path)
 	if err != nil || before.Mode() != 0600 || before.Size() <= 0 || before.Size() > codexAppServerMemberConfigLimit {
-		return config, errPiMemberToolConfiguration
+		return nil, nil, errPiMemberToolConfiguration
 	}
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return config, errPiMemberToolConfiguration
+		return nil, nil, errPiMemberToolConfiguration
 	}
 	opened, statErr := file.Stat()
 	valid := func(info os.FileInfo) bool {
@@ -58,38 +58,80 @@ func readMemberToolConfig(path string) (memberToolConfig, error) {
 	}
 	if statErr != nil || !valid(opened) {
 		_ = file.Close()
-		return config, errPiMemberToolConfiguration
+		return nil, nil, errPiMemberToolConfiguration
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(file, codexAppServerMemberConfigLimit+1))
 	finished, finishErr := file.Stat()
 	closeErr := file.Close()
 	after, pathErr := os.Lstat(path)
 	if readErr != nil || finishErr != nil || closeErr != nil || pathErr != nil || !valid(finished) || !valid(after) || int64(len(raw)) != before.Size() || !utf8.Valid(raw) {
-		return config, errPiMemberToolConfiguration
+		return nil, nil, errPiMemberToolConfiguration
 	}
+	return raw, after, nil
+}
+
+func readMemberToolConfig(path string) (memberToolConfig, error) {
+	return readMemberToolConfigMode(path, false, false)
+}
+
+func readPiMemberToolConfig(path string, strict bool) (memberToolConfig, error) {
+	return readMemberToolConfigMode(path, true, strict)
+}
+
+func readMemberToolConfigMode(path string, pi, strict bool) (memberToolConfig, error) {
+	raw, file, err := readMemberToolConfigFile(path)
+	if err != nil {
+		return memberToolConfig{}, err
+	}
+	var config memberToolConfig
 	fields, err := codexAppServerMap(raw)
-	// The optional Pi schema hint is not authority; Codex discovers its schema
-	// from MCP under the same bound token rather than reading the hint.
-	if err != nil || len(fields) != 2 && !(len(fields) == 3 && string(fields["continue_work"]) == "true") ||
+	count := 2
+	if strict {
+		count++
+		if json.Unmarshal(fields["investigation_tools"], &config.investigationTools) != nil || len(config.investigationTools) == 0 {
+			return memberToolConfig{}, errPiMemberToolConfiguration
+		}
+	} else {
+		// Optional schema hints are not authority. Codex discovers its schema
+		// through MCP, and never accepts the strict config or investigation hint.
+		if string(fields["continue_work"]) == "true" {
+			count++
+		}
+		if pi && string(fields["discussion_only_excerpt"]) == "true" {
+			count++
+		}
+		if pi && string(fields["intake_assessment_action"]) == `"read_only_investigation"` {
+			count++
+		}
+	}
+	if err != nil || len(fields) != count ||
 		json.Unmarshal(fields["endpoint"], &config.endpoint) != nil || json.Unmarshal(fields["token"], &config.token) != nil {
 		return memberToolConfig{}, errPiMemberToolConfiguration
 	}
-	parts := memberToolEndpoint.FindStringSubmatch(config.endpoint)
-	if len(parts) != 3 || len(config.token) > 256 || !memberToolBearer.MatchString(config.token) {
+	config.origin = memberToolConfigOrigin(config.endpoint, config.token)
+	if config.origin == "" {
 		return memberToolConfig{}, errPiMemberToolConfiguration
+	}
+	config.file, config.digest = file, sha256.Sum256(raw)
+	return config, nil
+}
+
+func memberToolConfigOrigin(endpoint, token string) string {
+	parts := memberToolEndpoint.FindStringSubmatch(endpoint)
+	if len(parts) != 3 || len(token) > 256 || !memberToolBearer.MatchString(token) {
+		return ""
 	}
 	port, err := strconv.Atoi(parts[2])
 	if err != nil || port < 1 || port > 65535 {
-		return memberToolConfig{}, errPiMemberToolConfiguration
+		return ""
 	}
 	// Native httpOrigin uses URL-origin serialization (canonical numeric port,
 	// with HTTP's default port omitted), not the literal configured URL bytes.
-	config.origin = "http://" + parts[1]
+	origin := "http://" + parts[1]
 	if port != 80 {
-		config.origin += ":" + strconv.Itoa(port)
+		origin += ":" + strconv.Itoa(port)
 	}
-	config.file, config.digest = after, sha256.Sum256(raw)
-	return config, nil
+	return origin
 }
 
 type codexAppServerMemberToolExecutor struct {
@@ -136,7 +178,8 @@ func NewCodexAppServerMemberToolExecutor(selected Provider, configPath string, t
 // exact-thread cold resume on Codex 0.166.0. The caller must qualify the latest
 // platform receipt and freeze current grants before supplying Resume. A reference
 // is not authorization. Nil Resume means fresh-and-capture; errors never fall back.
-// Each Execute retains the original HOME/auth and uses a new process and MCP token.
+// Each Execute retains the original HOME/auth and starts a new process. The
+// caller must supply the current turn's MCP token via its issued config.
 func NewCodexAppServerSessionExecutor(selected Provider, configPath string, toolNames []string, options CodexAppServerSessionOptions, timeout time.Duration) (Executor, error) {
 	if !validNativeSessionBinding(options.Binding) || options.Resume != nil && !validCodexNativeReference(options.Resume) {
 		return nil, errExecutorConfiguration
@@ -315,7 +358,7 @@ func (p *codexAppServerProtocol) memberNotification(message codexRPCMessage) boo
 		p.external = true
 		p.cancel()
 		if !valid {
-			p.fail()
+			p.failResumeNotification(message, "notification_not_allowed")
 		}
 		return true
 	}

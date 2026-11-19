@@ -16,10 +16,19 @@ import (
 )
 
 func executionRunner(config config, db *store.Store, engine *coordination.Engine, catalog *platform.ProviderCatalog, endpoint string, output io.Writer, workspace ...platform.MemberWorkspaceOptions) (func(context.Context) error, *platform.MemberToolRuntime, *platform.Preparer, error) {
+	if err := config.validatePiFreshTaskWork(); err != nil {
+		return nil, nil, nil, err
+	}
 	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
 		return nil, nil, nil, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
 	}
+	if err := config.validateInvestigationOption(); err != nil {
+		return nil, nil, nil, err
+	}
 	if err := config.validateNativeSessionConfig(); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := config.validateInvestigationDataDir(); err != nil {
 		return nil, nil, nil, err
 	}
 	runtime, err := privateExecutionRoot(config.dataDir, "runtime")
@@ -34,6 +43,14 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	freshTaskWork, err := config.piFreshTaskWorkLaunch(db, engine, providers)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	investigationTaskWork, err := config.piFreshInvestigationWorkLaunch(db, engine, providers)
+	if err != nil {
+		return nil, nil, nil, err
+	}
 	maxActive := config.executionMaxActive
 	if maxActive == 0 { // Direct config literals may leave the CLI default unset.
 		maxActive = defaultExecutionMaxActive
@@ -42,6 +59,27 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	// Only explicit local-user receipts authorize external directories. Protect
 	// the entire private data root, not just per-conversation workspaces.
 	options := platform.PrepareOptions{Providers: providers, PrivateWorkspaceRoot: workspaces, PrivateDataRoot: config.dataDir}
+	if config.enableInvestigationExecution {
+		// Borrow the existing immutable blob owner independently of file grants.
+		if len(workspace) == 0 || workspace[0].Blobs == nil {
+			return nil, nil, nil, errors.New("只读调查需要成果读取服务")
+		}
+		artifacts, err := platform.NewArtifacts(db, workspace[0].Blobs)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		grant, err := platform.NewMemberArtifactGrant(artifacts)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if _, err := privateExecutionRoot(workspaces, platform.InvestigationCWDName); err != nil {
+			return nil, nil, nil, err
+		}
+		options.Investigation = &platform.InvestigationPreparationOptions{PiPath: config.piPath, Artifacts: grant}
+		if investigationTaskWork != nil {
+			investigationTaskWork.Artifacts = grant
+		}
+	}
 	var tools *platform.MemberToolRuntime
 	if config.enableMemberTools {
 		root, err := privateExecutionRoot(config.dataDir, "member-tools")
@@ -60,7 +98,16 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			toolOptions.ChatIntake = engine
 			options.RoleThinking = config.roleThinking
 		}
-		tools, err = platform.NewMemberToolRuntime(db, toolOptions)
+		toolOptions.FreshTaskWork = freshTaskWork
+		switch {
+		case config.enableInvestigationOwnerManagement:
+			tools, err = platform.NewMemberToolRuntimeWithInvestigationOwnerManagement(db, toolOptions, engine,
+				investigationTaskWork.DelegateSupport(providers), investigationTaskWork)
+		case investigationTaskWork != nil:
+			tools, err = platform.NewMemberToolRuntimeWithTaskWorkReports(db, toolOptions, engine, investigationTaskWork)
+		default:
+			tools, err = platform.NewMemberToolRuntime(db, toolOptions)
+		}
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -92,6 +139,11 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			}
 			return nil, nil, nil, err
 		}
+	}
+	if freshTaskWork != nil || investigationTaskWork != nil {
+		// B's process-local readiness assertion, not Policy or authority. Set
+		// it only after successful composition and before accepting requests.
+		engine.EnableTaskWorkExecution()
 	}
 	return func(ctx context.Context) error {
 		return scheduler.Run(ctx, db, schedulerOptions, preparer.Prepare)

@@ -90,6 +90,10 @@ func validatePreparationRole(state store.CoordinationRoleState, group domain.Gro
 		state.ProviderID != member.ProviderID || state.Model != member.Model || state.AttemptID != "" {
 		return errPrepareBinding
 	}
+	if (p.SourceKind != "" || p.SourceID != "") &&
+		(p.Kind != store.CoordinationRoleWorker || p.SourceKind != domain.TaskWorkSourceFollowup || !memberToolRuntimeText(p.SourceID)) {
+		return errPrepareBinding
+	}
 	switch p.Kind {
 	case store.CoordinationRoleOrdinary:
 		if p.RequestID != "" || p.TaskID != "" || p.TaskRevision != 0 || p.AssignmentID != "" ||
@@ -106,6 +110,9 @@ func validatePreparationRole(state store.CoordinationRoleState, group domain.Gro
 			(p.Kind == store.CoordinationRoleCoordinator && p.AssignmentID != "") ||
 			(p.Kind == store.CoordinationRoleWorker && !memberToolRuntimeText(p.AssignmentID)) {
 			return errPrepareBinding
+		}
+		if p.SourceKind == domain.TaskWorkSourceFollowup {
+			return nil // Typed readiness codes are owned by B, not the legacy role profile.
 		}
 		switch state.Blocked {
 		case store.CoordinationReady, store.CoordinationDependencyNotAccepted, store.CoordinationTaskStale,
@@ -128,6 +135,7 @@ type rolePreparationPlan struct {
 	selection            provider.AdapterSelection
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 	workspace            *domain.TaskWorkspaceScope
+	investigation        *investigationRolePreparation
 	nativeText           bool
 	input                contextpack.Input
 }
@@ -147,6 +155,16 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 	}
 	if r.tools == nil || r.tools.db != p.store || !r.rootValid() {
 		return empty, preparationFailureWithCause(ctx, errPrepareConfig, errMemberToolRuntimeConfig)
+	}
+	investigation, err := taskInvestigationForRole(ctx, p.store, state.Provenance)
+	if errors.Is(err, errInvestigationFirstRoot) {
+		return empty, rolePreparationBlocked(state, "investigation_first_root_required", nil)
+	}
+	if err != nil {
+		return empty, preparationResolutionError(ctx, err)
+	}
+	if investigation != nil {
+		return p.planInvestigationRole(ctx, state, member, *investigation)
 	}
 	workspace, err := p.taskWorkspaceForPreparation(ctx, state.Provenance)
 	if err != nil {
@@ -208,13 +226,10 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 		in.Permissions[1] = "本轮基础角色工具为 " + strings.Join(names, "、") + "；仅在服务器实际提供工作输入工具时使用。读取不会确认已处理；处理后显式确认，无法处理则交回说明。调用者、群组、会话、话题和任务关系由服务端绑定。"
 	}
 	var nativeText bool
-	// Work-input grants and workspace tasks are outside the frozen text profile.
-	if workspace == nil && !workInputs {
-		thinking := ""
-		if selected.Name == provider.Pi {
-			thinking = p.roleThinking
-		}
-		nativeText, err = p.previewNativeSession(ctx, selected, member, conversation, thinking, names, 0)
+	// Keep the existing Pi text-role path. Codex native resume is intake-only;
+	// work-input grants and workspace tasks do not enter either text profile.
+	if selected.Name == provider.Pi && workspace == nil && !workInputs {
+		nativeText, err = p.previewNativeSession(ctx, selected, member, conversation, p.roleThinking, names, 0)
 		if err != nil {
 			return empty, roleWorkspacePreparationError(state, err)
 		}
@@ -253,6 +268,9 @@ func (p *Preparer) prepareCoordinationRole(ctx context.Context, state store.Coor
 	}
 	if err != nil {
 		return empty, err
+	}
+	if plan.investigation != nil {
+		return p.prepareInvestigationRole(ctx, plan, member, string(packet))
 	}
 	var workspace preparationWorkspace
 	if plan.workspace != nil && state.Provenance.Kind == store.CoordinationRoleWorker {

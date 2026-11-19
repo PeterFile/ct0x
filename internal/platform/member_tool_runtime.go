@@ -38,9 +38,12 @@ type MemberToolRuntimeOptions struct {
 	NativeExecutionRoot string
 	// ChatIntake reuses the same Engine and requires the role execution path.
 	ChatIntake *coordination.Engine
-	// WorkInputs is trusted startup composition. Nil keeps work inputs closed;
-	// a typed nil is a configuration error. ContinueWork also requires ChatIntake.
+	// WorkInputs opts into the legacy preview. A typed nil is a configuration
+	// error. Its ContinueWork implementation takes precedence and requires ChatIntake.
 	WorkInputs MemberWorkInputService
+	// FreshTaskWork composes typed continuation via the ChatIntake Engine and
+	// the role execution fence. It does not install the legacy preview.
+	FreshTaskWork *FreshTaskWorkLaunch
 }
 
 type MemberToolRunBinding struct {
@@ -66,6 +69,7 @@ type MemberToolRuntime struct {
 	maxGroupMembers          int
 	roleFence                *memberToolRoleFence
 	executionRoot            *memberToolExecutionRoot
+	investigationTaskWork    *InvestigationTaskWorkLaunch
 }
 
 const memberToolRuntimeVerificationTimeout = 5 * time.Second
@@ -130,6 +134,12 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 	}
 	tools := NewMemberTools(db)
 	tools.workInputs = options.WorkInputs
+	if launch := options.FreshTaskWork; launch != nil {
+		if roleFence == nil || !options.ChatIntake.UsesStore(db) || launch.Supports == nil || launch.Construct == nil {
+			return nil, errMemberToolRuntimeConfig
+		}
+		tools.freshTaskWork = *launch
+	}
 	if options.ChatIntake != nil {
 		if roleFence == nil {
 			return nil, errMemberToolRuntimeConfig
@@ -139,7 +149,8 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 		}
 	}
 	return &MemberToolRuntime{tools: tools, configRoot: root, resolvedRoot: resolved,
-		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence, executionRoot: executionRoot}, nil
+		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence,
+		executionRoot: executionRoot}, nil
 }
 
 func memberToolRuntimeEndpoint(endpoint string) bool {
@@ -189,6 +200,12 @@ func memberToolRuntimeText(value string) bool {
 	return value != "" && utf8.ValidString(value) && strings.TrimSpace(value) == value && !strings.ContainsAny(value, "\x00\r\n")
 }
 
+// These qualified Pi schema hints require the issued-config builder even if
+// issuance rechecks the policy and removes the investigation action.
+func (schema memberToolIntakeSchema) requiresIssuedPiConfig() bool {
+	return schema.piDiscussionExcerpt || schema.investigation
+}
+
 type memberToolRuntimeRun struct {
 	runtime       *MemberToolRuntime
 	binding       MemberToolRunBinding
@@ -196,6 +213,9 @@ type memberToolRuntimeRun struct {
 	used          atomic.Bool
 	role          *store.CoordinationRoleProvenance
 	intake        bool
+	intakeSchema  memberToolIntakeSchema
+	intakeBuilder func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
+	investigation *investigationRolePreparation
 	nativeSession *memberToolNativeSessionPlan
 	// Cloned at trusted wrapping and again when the claimed token is registered.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
@@ -232,7 +252,7 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
 	var token string
 	if e.intake {
-		token, err = r.tools.IssueChatIntake(ctx, claim)
+		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema)
 	} else {
 		token, err = r.tools.Issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers, ProviderID: e.binding.ProviderID, Model: e.binding.Model})
 	}
@@ -367,16 +387,35 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 	if !r.rootValid() {
 		return nil, errMemberToolRuntimeConfig
 	}
+	entry, found := r.nativeRegistration(token)
+	if !found {
+		return nil, errMemberToolRuntimeBinding
+	}
+	var action string
+	if entry.investigationIntake() {
+		action = domain.ChatActionReadOnlyInvestigation
+	}
+	var strictTools []string
+	if entry.purpose == memberInvestigationRolePurpose {
+		strictTools = entry.grants.Operations
+	}
 	data, err := json.Marshal(struct {
-		Endpoint     string `json:"endpoint"`
-		Token        string `json:"token"`
-		ContinueWork bool   `json:"continue_work,omitempty"`
-	}{r.endpoint, token, r.tools.issuedContinueWork(token)})
+		Endpoint               string   `json:"endpoint"`
+		Token                  string   `json:"token"`
+		ContinueWork           bool     `json:"continue_work,omitempty"`
+		DiscussionOnlyExcerpt  bool     `json:"discussion_only_excerpt,omitempty"`
+		IntakeAssessmentAction string   `json:"intake_assessment_action,omitempty"`
+		InvestigationTools     []string `json:"investigation_tools,omitempty"`
+	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools})
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}
-	// Bind the bytes we are issuing, including the existing trailing newline.
-	data = append(data, '\n')
+	return r.writeConfig(append(data, '\n'))
+}
+
+// Both config codecs use the same exclusive, identity-pinned private mount.
+// Bind the bytes we issue (including their newline), never a path readback.
+func (r *MemberToolRuntime) writeConfig(data []byte) (*memberToolRuntimeConfigFile, error) {
 	root, err := os.OpenRoot(r.configRoot)
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
@@ -418,9 +457,10 @@ func (e *memberToolRuntimeRun) configValid(c *memberToolRuntimeConfigFile) bool 
 	if c == nil || !c.valid() {
 		return false
 	}
-	if e.nativeSession == nil {
-		return true
-	}
+	return e.nativeSession == nil || c.digestMatches()
+}
+
+func (c *memberToolRuntimeConfigFile) digestMatches() bool {
 	file, err := c.root.OpenFile(c.name, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return false

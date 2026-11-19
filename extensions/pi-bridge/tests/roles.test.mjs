@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,11 +54,17 @@ async function clientFor(t, handler = success) {
   return { ...server, invoke: createClient(await privateConfig(t, { endpoint: server.endpoint })) };
 }
 
-async function load(t, endpoint = `http://127.0.0.1:1${BASE}`) {
-  const config = await privateConfig(t, { endpoint });
+async function load(t, endpoint = `http://127.0.0.1:1${BASE}`, investigationTools) {
+  const config = await privateConfig(t, { endpoint, ...(investigationTools && { investigation_tools: investigationTools }) });
   const previous = process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG;
+  const previousDigest = process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256;
   try {
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG = config;
+    if (investigationTools) {
+      process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256 = createHash("sha256").update(await readFile(config)).digest("hex");
+    } else {
+      delete process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256;
+    }
     const result = await loadExtensions([entry], process.cwd());
     assert.deepEqual(result.errors, []);
     assert.deepEqual(result.warnings, []);
@@ -67,6 +73,8 @@ async function load(t, endpoint = `http://127.0.0.1:1${BASE}`) {
   } finally {
     if (previous === undefined) delete process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG;
     else process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG = previous;
+    if (previousDigest === undefined) delete process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256;
+    else process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256 = previousDigest;
   }
 }
 
@@ -160,9 +168,13 @@ test("schema/profile: real loader exposes object role schemas without identity o
   for (const field of Object.values(ref.properties)) assert.equal(field.type, "string");
 });
 
-for (const [role, profile] of Object.entries(profiles)) {
+const strictProfiles = {
+  investigation_coordinator: ["read_investigation_channel", "read_investigation_artifact", "decide_dispatch"],
+  investigation_worker: ["read_investigation_artifact", "submit_result"],
+};
+for (const [role, profile] of Object.entries({ ...profiles, ...strictProfiles })) {
   test(`schema/profile: real Pi 1.4.0 SDK clamps ${role} to exact ${profile.length} active and callable tools without a prompt`, async t => {
-    const extensions = await load(t);
+    const extensions = await load(t, undefined, strictProfiles[role]);
     const { createAgentSession, SessionManager, SettingsManager } = await loadSessionSDK();
     const directory = await mkdtemp(join(tmpdir(), "pi-role-session-"));
     t.after(() => rm(directory, { recursive: true, force: true }));

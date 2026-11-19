@@ -48,6 +48,9 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if err := os.MkdirAll(config.dataDir, 0700); err != nil {
 		return fmt.Errorf("创建数据目录失败：%w", err)
 	}
+	if err := config.validateInvestigationDataDir(); err != nil {
+		return err
+	}
 	lock, err := lockDataDir(config.dataDir)
 	if err != nil {
 		return err
@@ -113,7 +116,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		}
 		toolStatus = "平台工具已配置：" + adapterStatus + "；不授予 Coordinator、Assignment 或 RequestWork 权限"
 		if config.enableCoordinationRoles {
-			toolStatus = "平台工具与协调角色已配置：普通投递仍仅六项基础成员工具且不授予角色；启用话题聊天策略后可通过绑定来源的结构化语义评估自动准入与登记文本分派，不开放成员冒充本机用户的 RequestWork/RequestDispatch；受信协调员与工作成员按服务端执行身份分别绑定专用工具；" + adapterStatus + "；分派登记不直接执行，具体成果提交不等于接纳；角色就绪查询仅为采样诊断，不保证后续认领或执行"
+			toolStatus = "平台工具与协调角色已配置：普通投递使用 chat_intake/v1（list_members、read_channel、send_message、search_history、read_history），不授予协调角色工具；启用话题聊天策略后可通过绑定来源的结构化语义评估自动准入与登记文本分派，不开放成员冒充本机用户的 RequestWork/RequestDispatch；受信协调员与工作成员按服务端执行身份分别绑定专用工具；" + adapterStatus + "；分派登记不直接执行，具体成果提交不等于接纳；角色就绪查询仅为采样诊断，不保证后续认领或执行"
 		}
 	}
 	local := platform.NewLocalUser(db)
@@ -133,6 +136,17 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if memberTools != nil {
 		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)
 		routes = append(routes, httpapi.MemberHistoryToolRoutes(memberTools.Tools())...)
+		if config.enableInvestigationExecution {
+			routes = append(routes, httpapi.MemberInvestigationToolRoutes(memberTools.Tools())...)
+			if config.piFreshInvestigationWorkExtension != "" {
+				toolStatus += "；只读调查首轮仍限单收件人的真实本机用户原始消息与首次正式分派；已配置选定 Pi 1.4.0 的补充、委派与报告全新轮，须逐轮确认启动，不新增工作授权、不恢复会话或授予文件写入"
+				if config.enableInvestigationOwnerManagement {
+					toolStatus += "；绑定调查负责人可请求受限委派，调查补充和报告续轮可通知协调员整项交回；当前授权由平台核验"
+				}
+			} else {
+				toolStatus += "；只读调查仅支持选定 Pi 1.4.0、单收件人的真实本机用户原始消息与首次正式分派的角色；仅按策略读取指定资料，不授予续接或文件工具"
+			}
+		}
 		if config.enableCodexAppServer {
 			routes = append(routes, httpapi.MemberMCPRoutes(memberTools.Tools())...)
 		}
@@ -160,10 +174,21 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if config.enableNativeSessionResume {
 		// Keep capacity reporting independent of native-session selection.
 		executionStatus = strings.TrimPrefix(executionStatus, "全新")
-		sessionStatus = "已显式选择实验性 Pi 1.4.0 原生文本会话续接；须通过可信扩展校验并为该用途显式指定 thinking；仅当同一作用域最新持久引用合格时续接，每轮重新发证，续接出错不回退重试；Codex AppServer 仍为全新单轮；不续接目录任务或调查；不支持运行中追加，后续输入仍排队"
+		sessionStatus = "已显式选择实验性原生文本会话续接；仅当同一作用域最新持久引用合格时续接，每轮重新发证，续接出错不回退重试；不续接目录任务或调查；不支持运行中追加，后续输入仍排队"
+		if config.piMemberToolsExtension != "" {
+			sessionStatus += "；Pi 1.4.0 须通过可信扩展校验并为该用途显式指定 thinking"
+		}
+		if config.enableCodexAppServer {
+			sessionStatus += "；Codex 0.166.0 AppServer 仅普通 chat_intake/v1 可续接，角色和 Task 执行仍为全新单轮"
+		}
 	}
 	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录、任务创建、列表与详情、成果版本只读查询与下载及 CLI 目录；目录仅启动时探测、证据仅存内存；%s；%s；%s；工作目录不是主机读取沙箱，数据目录及祖先必须可信且目录身份稳定；其他功能尚未启用）\n", listener.Addr(), executionStatus, sessionStatus, toolStatus); err != nil {
 		return fmt.Errorf("输出启动信息失败：%w", err)
+	}
+	if config.enableInvestigationExecution {
+		// Opt in to B only after the exact adapter, blob owner and routes have
+		// been composed. There is still no local-user policy or per-turn grant.
+		engine.EnableInvestigationExecution()
 	}
 	return serve(ctx, server, listener, 5*time.Second, schedule)
 }

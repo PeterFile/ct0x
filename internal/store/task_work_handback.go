@@ -15,7 +15,7 @@ func (s *Store) HandbackWork(ctx context.Context, scope MemberToolScope, input d
 	if !memberToolKeyValid(key) || !memberToolTextValid(input.Summary, domain.MaxWorkReportBytes) {
 		return domain.TaskWorkHandback{}, ErrInvalid
 	}
-	return workMemberTx(ctx, s, scope, "记录任务移交失败", func(tx *sql.Tx) (out domain.TaskWorkHandback, err error) {
+	return taskWorkB3MutationTx(ctx, s, scope, "记录任务移交失败", func(tx *sql.Tx) (out domain.TaskWorkHandback, err error) {
 		f, attempt, err := taskWorkOwnerInTx(ctx, tx, scope)
 		if err != nil {
 			return out, err

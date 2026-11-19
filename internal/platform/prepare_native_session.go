@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"slices"
 
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/provider"
@@ -22,15 +23,29 @@ func validNativePiThinking(thinking string) bool {
 }
 
 func (p *Preparer) piNativeSessionConfigured(selected provider.Provider) bool {
-	return p.enableNativeSessionResume && selected.Name == provider.Pi &&
+	return p.enableNativeSessionResume && selected.Name == provider.Pi && p.piMemberToolsExtension != "" &&
 		nativeSessionWorkspacePath(p.memberTools.executionRoot.resolvedRoot)
+}
+
+func (p *Preparer) codexNativeIntakeConfigured(selected provider.Provider) bool {
+	return p.enableNativeSessionResume && p.enableCodexAppServer && selected.Name == provider.Codex &&
+		p.memberTools.tools.chatEngine != nil && !p.memberTools.tools.continueWorkEnabled()
 }
 
 func (p *Preparer) nativeSessionEligible(selected provider.Provider, member domain.Member, thinking string) bool {
 	// Legacy grants select and preserve the raw configured root. Do not clean
-	// it into a different authority spelling just to fit the v23 profile.
-	return p.piNativeSessionConfigured(selected) && (member.Workspace == "" || nativeSessionWorkspacePath(member.Workspace)) &&
-		provider.PiNativeTextSessionProfileSupported(selected, member.Model, thinking) && provider.PiNativeSessionBridgeSupported(p.piMemberToolsExtension)
+	// it into a different authority spelling just to fit the native profile.
+	if member.Workspace != "" && !nativeSessionWorkspacePath(member.Workspace) {
+		return false
+	}
+	switch selected.Name {
+	case provider.Pi:
+		return p.piNativeSessionConfigured(selected) && provider.PiNativeTextSessionProfileSupported(selected, member.Model, thinking) &&
+			provider.PiNativeSessionBridgeSupported(p.piMemberToolsExtension)
+	case provider.Codex:
+		return p.codexNativeIntakeConfigured(selected) && provider.CodexNativeTextSessionProfileSupported(selected, member.Model, thinking)
+	}
+	return false
 }
 
 func nativeSessionWorkspacePath(path string) bool {
@@ -44,8 +59,21 @@ func nativeSessionStaticProfile(selected provider.Provider, member domain.Member
 	profile := store.NativeRunProfile{ProviderID: selected.ID, Model: member.Model, Thinking: thinking,
 		CLIPath: selected.Path, CLIVersion: selected.Version, CWD: workspace.cwd, ConfiguredWorkspace: member.Workspace,
 		WorkspaceIdentity: workspace.key, ResourceKeys: []string{workspace.key}, Tools: names, MaxGroupMembers: maxMembers,
-		Adapter: provider.PiNativeSessionAdapterVersion, Protocol: provider.PiNativeSessionProtocolVersion,
-		NativePolicy: store.NativeTextPolicy{Sandbox: "tools-only", ApprovalPolicy: "never"}}
+		NativePolicy: store.NativeTextPolicy{ApprovalPolicy: "never"}}
+	switch selected.Name {
+	case provider.Pi:
+		profile.Adapter, profile.Protocol = provider.PiNativeSessionAdapterVersion, provider.PiNativeSessionProtocolVersion
+		profile.NativePolicy.Sandbox = "tools-only"
+	case provider.Codex:
+		if maxMembers != 0 || !slices.Equal(names, chatIntakeOperations()) {
+			return nil
+		}
+		profile.Adapter, profile.Protocol = provider.CodexNativeSessionAdapterVersion, provider.CodexNativeSessionProtocolVersion
+		profile.NativePolicy.Sandbox = "read-only"
+		profile.MaxGroupMembers = codexV30DiscussionIntakeProfile
+	default:
+		return nil
+	}
 	if grant := workspace.grant; grant.ID != "" {
 		profile.WorkspaceGrantID, profile.WorkspaceRoot, profile.WorkspaceResolvedRoot = grant.ID, grant.Root, grant.ResolvedRoot
 		switch grant.Scope {
@@ -114,7 +142,7 @@ func (p *Preparer) bindNativeSessionPreparation(executor provider.Executor, sele
 		return errPrepareWorkspace
 	}
 	run, ok := executor.(*memberToolRuntimeRun)
-	if !ok {
+	if !ok || selected.Name == provider.Codex && (!run.intake || run.role != nil || run.intakeSchema != (memberToolIntakeSchema{})) {
 		return errPrepareBinding
 	}
 	run.nativeSession = &memberToolNativeSessionPlan{profile: *profile, selectSession: p.store.SelectNativeSession, factory: func(config provider.NativeMemberToolConfig, names []string, resume *provider.NativeSessionReference, binding json.RawMessage) (provider.Executor, error) {
@@ -131,16 +159,28 @@ func (p *Preparer) bindNativeSessionPreparation(executor provider.Executor, sele
 // Like the legacy factory, the per-turn registry samples implementation
 // capabilities and constructs an executor. All native work stays in Execute.
 func (p *Preparer) nativeSessionAdapterRegistry(selection provider.AdapterSelection, config provider.NativeMemberToolConfig, names []string, resume *provider.NativeSessionReference, binding json.RawMessage) (*provider.AdapterRegistry, error) {
-	if selection.ID != provider.PiMemberToolAdapterID || selection.Protocol != provider.PiExtensionProtocol {
+	var adapter provider.Adapter
+	switch selection {
+	case (provider.AdapterSelection{ID: provider.PiMemberToolAdapterID, Protocol: provider.PiExtensionProtocol}):
+		adapter = provider.NewPiNativeSessionMemberToolAdapter(p.piMemberToolsExtension, config, names, provider.PiSessionOptions{Resume: resume, Binding: binding})
+	case (provider.AdapterSelection{ID: provider.CodexAppServerAdapterID, Protocol: provider.CodexAppServerProtocol}):
+		adapter = provider.NewCodexAppServerNativeSessionMemberToolAdapter(config, names, provider.CodexAppServerSessionOptions{Resume: resume, Binding: binding})
+	default:
 		return nil, errMemberToolAdapterUnsupported
 	}
-	adapter := provider.NewPiNativeSessionMemberToolAdapter(p.piMemberToolsExtension, config, names, provider.PiSessionOptions{Resume: resume, Binding: binding})
 	return provider.NewAdapterRegistry(provider.AdapterRegistration{ID: selection.ID, Protocol: selection.Protocol, Adapter: adapter})
+}
+
+func (p *Preparer) piIntakeChangesNativeSchema() bool {
+	return p.piDiscussionSchema || p.memberTools.tools.continueWorkEnabled()
 }
 
 // Provider-wide reporting describes the process configuration only. It cannot
 // assert any member's model, claim, resources, or resumable history.
 func (p *Preparer) nativeReportTools(selected provider.Provider) []string {
+	if p.codexNativeIntakeConfigured(selected) {
+		return chatIntakeOperations()
+	}
 	if !p.piNativeSessionConfigured(selected) {
 		return nil
 	}
@@ -149,7 +189,7 @@ func (p *Preparer) nativeReportTools(selected provider.Provider) []string {
 		if r.tools.chatEngine == nil {
 			return r.operations
 		}
-		if !r.tools.WorkInputsEnabled() {
+		if !p.piIntakeChangesNativeSchema() {
 			return chatIntakeOperations()
 		}
 	}

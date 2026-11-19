@@ -222,7 +222,7 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 		return
 	}
 	var input memberToolSendInput
-	if !decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: &input, required: isContinueWorkRequest}) {
+	if !decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: &input, required: sendMessageNeedsScalars}) {
 		return
 	}
 	if input.Assessment.present {

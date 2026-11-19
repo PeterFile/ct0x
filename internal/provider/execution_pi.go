@@ -17,14 +17,14 @@ const executionLogLimit = 1 << 20
 type executionLog struct {
 	file              *os.File
 	cancel            context.CancelFunc
-	size              int
+	size, tailReserve int
 	truncated, failed bool
 }
 
 func (l *executionLog) Write(p []byte) (int, error) {
 	n := len(p)
-	if len(p) > executionLogLimit-l.size {
-		p, l.truncated = p[:executionLogLimit-l.size], true
+	if room := executionLogLimit - l.tailReserve - l.size; len(p) > room {
+		p, l.truncated = p[:room], true
 	}
 	if !l.failed && len(p) != 0 {
 		written, err := l.file.Write(p)
@@ -48,6 +48,8 @@ type executionOutput struct {
 	dropping, damaged, settled bool
 	last                       Outcome
 	piSession                  *piSessionTracker
+	piTypedWork                *piTypedWorkOutput
+	piInvestigation            *piInvestigationStartup
 }
 
 func (o *executionOutput) Write(p []byte) (int, error) {
@@ -83,7 +85,24 @@ func (o *executionOutput) Write(p []byte) (int, error) {
 
 func (o *executionOutput) emit(event Event) {
 	event.NativeSessionID = o.receipt.NativeSessionID
+	if s := o.piInvestigation; s != nil {
+		switch event.Kind {
+		case ResponseEvent:
+			s.response = event
+			return
+		case TerminalEvent:
+			return // Only deliver after checking the entire framed stream.
+		}
+	}
 	o.delivery.enqueue(event)
+}
+
+func (o *executionOutput) damageFrame() {
+	o.damaged, o.last = true, ""
+	if o.piInvestigation != nil {
+		// A lost or malformed frame could hide a conflicting startup proof.
+		o.piInvestigation.invalid = true
+	}
 }
 
 // Pi 1.4.0 print-mode.js emits the header before prompt(). The ordinary
@@ -113,8 +132,15 @@ func (o *executionOutput) recordPi(line []byte) {
 			Content          json.RawMessage
 		}
 	}
-	if !utf8.Valid(line) || json.Unmarshal(line, &event) != nil || event.Type == "" {
-		o.damaged, o.last = true, ""
+	if !utf8.Valid(line) || json.Unmarshal(line, &event) != nil || event.Type == "" ||
+		o.piTypedWork != nil && !piTypedWorkHasExactType(line) {
+		o.damageFrame()
+		return
+	}
+	if s := o.piInvestigation; s != nil && !s.allow(o, event.Type, line) {
+		if s.invalid && !o.receipt.Accepted {
+			s.observeUnverifiedWrite(event.Type, line, o.runID)
+		}
 		return
 	}
 	r := o.receipt
@@ -142,6 +168,15 @@ func (o *executionOutput) recordPi(line []byte) {
 		o.emit(Event{Kind: SessionEvent})
 	case "agent_start":
 		o.last = ""
+	case "tool_execution_start":
+		if o.piTypedWork != nil && !o.piTypedWork.observeStart(line, r.Accepted && !o.settled) {
+			o.damaged = true
+		}
+	case "tool_execution_end":
+		if o.piTypedWork != nil && !o.piTypedWork.observeEnd(line, o.runID, r.Accepted && !o.settled) {
+			// A bad pair denies settlement but does not erase native terminal evidence.
+			o.damaged = true
+		}
 	case "message_start", "message_end":
 		if event.Message.Role == "" {
 			o.damaged, o.last = true, ""

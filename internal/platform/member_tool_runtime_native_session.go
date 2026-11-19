@@ -15,6 +15,12 @@ import (
 	"agentworkspace/internal/store"
 )
 
+// Within the Codex chat_intake purpose ONLY, use the otherwise unused
+// MaxGroupMembers profile slot to pin the v30 MCP schema (discussion excerpt,
+// no typed variants). v24 used zero with the same tool names. This is a bounded
+// profile-hash discriminator, not an issued cap or a create_member grant.
+const codexV30DiscussionIntakeProfile = 1
+
 type memberToolNativeSessionFactory func(config provider.NativeMemberToolConfig, names []string, resume *provider.NativeSessionReference, binding json.RawMessage) (provider.Executor, error)
 
 type memberToolNativeSessionPlan struct {
@@ -87,7 +93,14 @@ func (e *memberToolRuntimeRun) nativeSessionBinding(ctx context.Context, request
 		return empty, errMemberToolRuntimeBinding
 	}
 	profile := e.nativeSession.profile
-	profile.Tools, profile.MaxGroupMembers = slices.Clone(grants.Operations), grants.MaxGroupMembers
+	if profile.Adapter == provider.CodexNativeSessionAdapterVersion {
+		if !e.matchesCodexNativeIntake(entry) {
+			return empty, errMemberToolRuntimeBinding
+		}
+	} else {
+		profile.MaxGroupMembers = grants.MaxGroupMembers
+	}
+	profile.Tools = slices.Clone(grants.Operations)
 	binding := store.NativeRunBinding{Version: store.NativeRunBindingVersion, GroupID: claim.GroupID, TurnID: claim.TurnID,
 		MemberID: scope.MemberID, ConversationID: scope.ConversationID, TopicID: scope.TopicID, Profile: profile}
 	switch {
@@ -118,6 +131,18 @@ func (e *memberToolRuntimeRun) nativeSessionBinding(ctx context.Context, request
 	return binding, nil
 }
 
+// Only the exact issued v30 text schema may carry the compatibility marker.
+// No Review/Task authority or additional grants are safe to fold into it.
+func (e *memberToolRuntimeRun) matchesCodexNativeIntake(entry memberToolRegistration) bool {
+	if !e.intake || e.role != nil || e.investigation != nil || e.nativeSession.profile.MaxGroupMembers != codexV30DiscussionIntakeProfile ||
+		entry.purpose != domain.ChatIntakePurpose || entry.candidate == nil || entry.candidate.RepairSource != nil || entry.intake != (memberToolIntakeSchema{}) {
+		return false
+	}
+	tools := chatIntakeOperations()
+	return reflect.DeepEqual(entry.grants, MemberToolGrants{Operations: tools}) &&
+		reflect.DeepEqual(e.runtime.tools.textTransportProfile(entry), MemberToolTransportProfile{Operations: tools, DiscussionOnlyExcerpt: true})
+}
+
 func (e *memberToolRuntimeRun) nativeRoleAuthority(ctx context.Context, role store.CoordinationToolScope) (store.NativeAuthorityScope, error) {
 	var empty store.NativeAuthorityScope
 	db, p := e.runtime.tools.db, role.Provenance
@@ -146,6 +171,13 @@ func (e *memberToolRuntimeRun) nativeRoleAuthority(ctx context.Context, role sto
 
 func (e *memberToolRuntimeRun) constructExecutor(ctx context.Context, request provider.ExecuteRequest, claim store.TurnClaim, token string, config *memberToolRuntimeConfigFile, names []string) (provider.Executor, *memberToolNativeTurn, error) {
 	configPath := filepath.Join(e.runtime.configRoot, config.name)
+	if bound := e.intakeSchema.requiresIssuedPiConfig(); bound || e.intakeBuilder != nil {
+		if !bound || e.intakeBuilder == nil || e.nativeSession != nil || e.role != nil || !e.intake {
+			return nil, nil, errMemberToolRuntimeBinding
+		}
+		native, err := e.intakeBuilder(provider.NativeMemberToolConfig{Path: configPath, SHA256: config.digest})
+		return native, nil, err
+	}
 	if e.nativeSession == nil {
 		native, err := e.factory(configPath, claim.TurnID, names)
 		return native, nil, err
@@ -204,7 +236,8 @@ func (e *memberToolRuntimeRun) commitNativeLaunch(ctx context.Context, token str
 	tools.mu.RLock()
 	defer tools.mu.RUnlock()
 	entry, found := tools.capabilities[key]
-	if !found || !sameNativeRegistration(entry, session.registration) || checkCtx.Err() != nil {
+	if !found || !sameNativeRegistration(entry, session.registration) || checkCtx.Err() != nil ||
+		session.binding.Profile.Adapter == provider.CodexNativeSessionAdapterVersion && !e.matchesCodexNativeIntake(entry) {
 		return false
 	}
 	launch := store.NativeSessionLaunch{Scope: entry.scope, Binding: session.binding, DeliveryID: e.binding.DeliveryID,

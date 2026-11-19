@@ -25,11 +25,25 @@ func MemberRoleToolRoutes(tools *platform.MemberTools) []Route {
 		{http.MethodPost, "/api/v1/member-tools/workspace_write", memberToolNative(a.workspaceWrite)},
 		{http.MethodPost, "/api/v1/member-tools/publish_workspace_artifact", memberToolNative(a.publishWorkspaceArtifact)},
 	}
-	if tools.WorkInputsEnabled() {
+	if tools.WorkInputsEnabled() || tools.FreshTaskWorkTransportEnabled() {
 		routes = append(routes,
 			Route{http.MethodPost, "/api/v1/member-tools/read_work_inputs", memberToolNative(a.readWorkInputs)},
 			Route{http.MethodPost, "/api/v1/member-tools/ack_work_input", memberToolNative(a.ackWorkInput)},
 			Route{http.MethodPost, "/api/v1/member-tools/hand_back_work_input", memberToolNative(a.handBackWorkInput)},
+		)
+	}
+	if tools.TaskWorkReportsEnabled() {
+		routes = append(routes,
+			Route{http.MethodPost, "/api/v1/member-tools/" + platform.ReportWorkOperation, memberToolNative(a.reportWork)},
+			Route{http.MethodPost, "/api/v1/member-tools/" + platform.ReadWorkReportOperation, memberToolNative(a.readWorkReport)},
+		)
+	}
+	if tools.InvestigationOwnerManagementEnabled() {
+		// Native HTTP only. Do not add these operations to MCP discovery or
+		// let an ordinary role's capability select an owner wire profile.
+		routes = append(routes,
+			Route{http.MethodPost, "/api/v1/member-tools/" + platform.DelegateWorkOperation, memberToolNative(a.delegateWork)},
+			Route{http.MethodPost, "/api/v1/member-tools/" + platform.HandbackWorkOperation, memberToolNative(a.handbackWork)},
 		)
 	}
 	return routes
@@ -95,6 +109,10 @@ func (a memberToolAPI) submitResult(w http.ResponseWriter, r *http.Request, toke
 		operationError(w, store.ErrInvalid)
 		return
 	}
+	if a.tools.IsFreshTaskWorkCapability(token) {
+		a.submitFreshTaskWorkResult(w, r, token, key)
+		return
+	}
 	var input struct {
 		Summary          memberToolField[string]                           `json:"summary"`
 		ArtifactVersions memberToolField[[]memberRoleArtifactVersionInput] `json:"artifact_versions"`
@@ -144,6 +162,7 @@ func memberRoleToolError(w http.ResponseWriter, operation string, err error) {
 	status, code := http.StatusInternalServerError, "internal_error"
 	message := "操作结果尚未确认；请保留原幂等键和原请求内容用于对账"
 	confirmed, uncertain := memberRoleToolRollbackEvidence(err)
+	ownerWrite := operation == platform.DelegateWorkOperation || operation == platform.HandbackWorkOperation
 	switch {
 	case errors.Is(err, context.Canceled):
 		status, code = http.StatusRequestTimeout, "request_canceled"
@@ -153,8 +172,11 @@ func memberRoleToolError(w http.ResponseWriter, operation string, err error) {
 		// Negative outcome evidence dominates every business cause in the chain.
 	case err == store.ErrMemberToolDenied:
 		status, code, message = http.StatusForbidden, "forbidden", "无权访问成员工具"
-	case confirmed && (operation == "submit_result" || operation == "workspace_write" || operation == "publish_workspace_artifact" ||
-		operation == "ack_work_input" || operation == "hand_back_work_input" || operation == "continue_work"):
+	case ownerWrite && err == store.ErrInvalid:
+		// B rejects malformed values before beginning either owner write.
+		status, code, message = http.StatusBadRequest, "invalid_input", "请求参数无效"
+	case confirmed && (ownerWrite || operation == "submit_result" || operation == "workspace_write" || operation == "publish_workspace_artifact" ||
+		operation == "ack_work_input" || operation == "hand_back_work_input" || operation == "continue_work" || operation == platform.ReportWorkOperation):
 		switch {
 		case errors.Is(err, store.ErrMemberToolDenied):
 			status, code, message = http.StatusForbidden, "forbidden", "无权访问成员工具"

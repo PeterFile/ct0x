@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -49,6 +50,8 @@ type ExecuteRequest struct {
 
 // Response events are completed assistant text snapshots, replacing earlier
 // snapshots (including failed retry responses), not streaming deltas or thoughts.
+// Typed investigation delays the latest response and terminal until stdout is
+// drained so a conflicting startup frame cannot publish a trusted result.
 // Terminal is native evidence, not permission to release external resources.
 // JSONL frames are capped at 64 KiB (1 MiB for opt-in Pi member tools), excluding
 // LF but including an optional CR. Oversized/invalid output makes the outcome
@@ -171,7 +174,7 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		}
 		return r
 	}
-	if e.memberTools.boundConfig() && !memberToolConfigMatches(e.memberTools.configPath, e.memberTools.configSHA256) {
+	if !e.memberTools.launchConfigMatches() {
 		r.Reason = "成员工具配置无效或已变化，执行未启动"
 		return r
 	}
@@ -202,13 +205,33 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		frameLimit, toolFlag = piMemberToolFrameLimit, "--no-builtin-tools"
 	}
 	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex, frameLimit: frameLimit}
+	if opts := e.memberTools; opts != nil && opts.typedWorkRole != "" {
+		out.piTypedWork = &piTypedWorkOutput{role: opts.typedWorkRole, tools: opts.toolNames}
+		outLog.tailReserve = piTypedWriteLogReserve
+	}
 	args := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", toolFlag, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve", "--session-dir", dir, "--session-id", request.RunID}
 	if session != nil {
 		out.piSession = session.tracker
 		args = append(args[:len(args)-4], "--session", session.file, "--session-dir", filepath.Dir(session.file))
 	}
-	if e.memberTools != nil {
-		args = append(args, "--tools", strings.Join(e.memberTools.toolNames, ","), "--extension", e.memberTools.extensionPath)
+	if opts := e.memberTools; opts != nil {
+		typedInvestigation := opts.investigationConfigFile != nil
+		if typedInvestigation {
+			args = append(args, "--no-session") // Exact --session-id, but never load or append to a session file.
+			out.piInvestigation = &piInvestigationStartup{role: opts.typedWorkRole, configSHA256: hex.EncodeToString(opts.configSHA256[:]),
+				unverifiedWrites: piTypedWorkOutput{role: opts.typedWorkRole, tools: opts.toolNames}, bearer: opts.investigationBearer}
+		}
+		args = append(args, "--tools", strings.Join(opts.toolNames, ","), "--extension", opts.extensionPath)
+		if opts.investigation || typedInvestigation {
+			// Explicit prompts prevent Pi from loading ambient SYSTEM.md and
+			// APPEND_SYSTEM.md independently of --no-context-files.
+			systemPrompt := "你只可使用本轮获准的只读调查工具。"
+			if typedInvestigation {
+				systemPrompt = "你只可使用本轮注册的调查工具，在绑定范围内读取材料或执行工具定义的平台操作。"
+			}
+			args = append(args, "--no-themes", "--exclude-tools", "read,bash,powershell,edit,write,grep,find,ls,codemode,tool_search,mcp__*",
+				"--system-prompt", systemPrompt, "--append-system-prompt", "不得向宿主机请求文件、命令或网络工具。")
+		}
 	}
 	if codex {
 		args = []string{"--ask-for-approval", "never", "exec", "--json", "--sandbox", "read-only", "--ignore-user-config", "--ephemeral", "--cd", request.CWD, "--skip-git-repo-check", "--color", "never"}
@@ -247,12 +270,27 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	r.Started, r.Outcome = true, OutcomeUnknown
 	err = cmd.Wait()
 	frames.finish()
+	if out.piInvestigation != nil {
+		out.piInvestigation.finish(out, outDrain.complete)
+	}
 	// Only now may the event queue close. Consolidate delivery failure after its sole
 	// consumer finishes, including failures racing normal native completion.
 	r.DeliveryFailed = delivery.finish()
 	r.DirectChildReaped = cmd.ProcessState != nil
 	if r.DirectChildReaped {
 		r.ExitCode = cmd.ProcessState.ExitCode()
+	}
+	if out.piTypedWork != nil && out.piTypedWork.hasOpenWrite() {
+		out.damaged = true
+	}
+	writeUnknown := out.piTypedWork != nil && out.piTypedWork.unknown != nil
+	if writeUnknown {
+		outLog.failed = !out.piTypedWork.unknown.retain(outLog, piTypedWriteUnknown, nil)
+	} else if s := out.piInvestigation; s != nil && !r.Accepted && outLog.truncated {
+		if evidence := s.unverifiedWrites.unknown; evidence != nil {
+			// Best effort; diagnostic retention does not update execution state.
+			_ = evidence.retain(outLog, piTypedWriteUnverified, &s.bearer)
+		}
 	}
 	outClose, errClose := stdout.Close(), stderr.Close()
 	r.LogsTruncated = outLog.truncated || errLog.truncated
@@ -263,8 +301,15 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	}
 	r.OutputComplete = normalExit && outDrain.complete && errDrain.complete && !out.damaged && len(out.line) == 0 && !out.dropping && !outLog.failed && !errLog.failed && outClose == nil && errClose == nil
 	r.Reason = "执行结果未知，需对账后再重试"
+	if out.piInvestigation != nil && out.piInvestigation.invalid {
+		r.Reason = "调查启动证明无法确认，需对账后再处理"
+	}
 	canSettle := r.OutputComplete && ctx.Err() == nil && !r.DeliveryFailed && r.Terminal != "" &&
+		(out.piTypedWork == nil || !writeUnknown && !outLog.truncated) &&
 		(session == nil || r.Accepted && r.DirectChildReaped && !session.tracker.hasUncertainExecution())
+	if writeUnknown {
+		r.Reason = "成员工具写入结果未知，需对账后再处理"
+	}
 	if canSettle && session != nil {
 		// Only success has a supported persistence proof. Withhold publication
 		// and claim release for other terminals pending reconciliation, without

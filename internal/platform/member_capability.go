@@ -28,26 +28,35 @@ type MemberToolGrants struct {
 }
 
 type memberToolRegistration struct {
-	scope     store.MemberToolScope
-	grants    MemberToolGrants
-	skills    *memberSkillState
-	role      store.CoordinationToolScope
-	candidate *domain.ChatCandidate
-	purpose   string
+	scope              store.MemberToolScope
+	grants             MemberToolGrants
+	skills             *memberSkillState
+	role               store.CoordinationToolScope
+	candidate          *domain.ChatCandidate
+	purpose            string
+	intake             memberToolIntakeSchema
+	taskWork           *taskWorkToolBinding
+	workReport         *taskWorkReportBinding
+	investigationOwner *investigationWorkOwnerBinding
 	// Frozen server capability facts are not grants or model-controlled input.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
+	delegateCandidateIDs []string
 }
 
 // MemberTools owns process-local capabilities; durable claims authorize every use.
 // A runtime must revoke registrations when turns finish to reclaim capacity.
 type MemberTools struct {
-	db           *store.Store
-	mu           sync.RWMutex
-	capabilities map[[sha256.Size]byte]memberToolRegistration
-	mcpRequests  map[[sha256.Size]byte]map[[sha256.Size]byte][sha256.Size]byte
-	chatEngine   *coordination.Engine
-	workInputs   MemberWorkInputService // Immutable after runtime construction.
-	workspace    *memberWorkspaceRegistry
+	db               *store.Store
+	mu               sync.RWMutex
+	capabilities     map[[sha256.Size]byte]memberToolRegistration
+	mcpRequests      map[[sha256.Size]byte]*memberMCPRequests
+	chatEngine       *coordination.Engine
+	workInputs       MemberWorkInputService // Immutable after runtime construction.
+	freshTaskWork    FreshTaskWorkLaunch    // Independent of the legacy work-input preview.
+	workReportEngine *coordination.Engine   // Transport only; independent of either launch opt-in.
+	workspace        *memberWorkspaceRegistry
+
+	investigationDelegateSupport InvestigationDelegateSupport // Immutable trusted opt-in.
 }
 
 func NewMemberTools(db *store.Store) *MemberTools {
@@ -57,20 +66,24 @@ func NewMemberTools(db *store.Store) *MemberTools {
 // Issue is called by the trusted runtime only AFTER ClaimTurn, never during preparation.
 // It refuses duplicate registrations rather than silently rotating a live capability.
 func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants) (string, error) {
-	return s.issue(ctx, claim, grants, "generic")
+	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{})
 }
 
 // IssueChatIntake is a separate trusted runtime seam, never a tool/API input.
 // It freezes a restricted profile and persists the exact claim-bound purpose.
 func (s *MemberTools) IssueChatIntake(ctx context.Context, claim store.TurnClaim) (string, error) {
-	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose)
+	return s.issueChatIntake(ctx, claim, memberToolIntakeSchema{})
+}
+
+func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema) (string, error) {
+	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema)
 }
 
 func chatIntakeOperations() []string {
 	return []string{"list_members", "read_channel", "send_message", "search_history", "read_history"}
 }
 
-func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string) (string, error) {
+func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema) (string, error) {
 	grants.Operations = slices.Clone(grants.Operations)
 	if grants.Skills != nil {
 		// Freeze the source even if the caller overwrites its exported wrapper.
@@ -122,9 +135,17 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 		if captured.Purpose != domain.ChatIntakePurpose {
 			return "", store.ErrMemberToolDenied
 		}
+		if schema.offersInvestigation(captured.Policy) && captured.SourceKind == "local_user_chat" && captured.SourceSenderID == "user" {
+			delivery, err := investigationRootDelivery(ctx, s.db, captured.ThreadRef, captured.MessageID, captured.SourceID, scope.MemberID, claim.TurnID)
+			if err != nil || delivery.ConversationID != scope.ConversationID {
+				schema.investigation = false // Do not add authority on ambiguous or unavailable evidence.
+			}
+		} else {
+			schema.investigation = false
+		}
 		candidate = &captured
 	}
-	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate, purpose: purpose}
+	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate, purpose: purpose, intake: schema}
 	return token, nil
 }
 

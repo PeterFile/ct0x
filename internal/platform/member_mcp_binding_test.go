@@ -53,7 +53,7 @@ func TestMemberMCPRequestBindingCapacityAndRevocation(t *testing.T) {
 		t.Fatalf("capacity evicted or replaced the original binding: %v", err)
 	}
 	key := sha256.Sum256([]byte(token))
-	if len(tools.mcpRequests[key]) != maxMemberMCPRequests || tools.mcpRequests[key][id] != original {
+	if len(tools.mcpRequests[key].ordinary) != maxMemberMCPRequests || tools.mcpRequests[key].ordinary[id] != original {
 		t.Fatal("capacity handling modified live bindings")
 	}
 	tools.Revoke(token)

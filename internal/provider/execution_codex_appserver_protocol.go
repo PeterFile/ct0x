@@ -230,8 +230,23 @@ type codexAppServerItem struct {
 	mcp       *codexSessionMCPContent
 }
 
-// One owner handles a single connection, thread and turn. Provisional frames are
-// bounded and replayed only after the corresponding start response binds identity.
+const (
+	codexBootstrapResumePending = "thread_resume"
+	codexBootstrapResumeBind    = "thread_resume_bind"
+	codexBootstrapResumeReplay  = "thread_resume_replay"
+)
+
+// Phase and Reason are adapter-owned values. Only a correlated RPC error can
+// contribute its bounded numeric code; no message, data, method or ID is copied.
+type codexAppServerBootstrapFailure struct {
+	Type    string `json:"type"`
+	Phase   string `json:"phase"`
+	Reason  string `json:"reason"`
+	RPCCode *int32 `json:"rpc_code,omitempty"`
+}
+
+// One owner handles a single connection, thread and turn. Provisional frames
+// are bounded and replayed only after the corresponding identity is verified.
 type codexAppServerProtocol struct {
 	ctx                   context.Context
 	cancel                context.CancelFunc
@@ -259,20 +274,57 @@ type codexAppServerProtocol struct {
 	external              bool
 	interruptSent         bool
 	interruptAcknowledged bool
+	bootstrap             *codexAppServerBootstrapFailure
 }
 
 func (p *codexAppServerProtocol) fail() {
+	p.failWithDiagnostic("protocol_rejected")
+}
+
+func (p *codexAppServerProtocol) failWithDiagnostic(reason string) {
+	if p.bootstrap != nil && p.bootstrap.Reason == "" {
+		p.bootstrap.Reason = reason
+	}
 	p.damaged = true
 	p.cancel()
+}
+
+func (p *codexAppServerProtocol) bootstrapAt(phase string) bool {
+	return p.bootstrap != nil && p.bootstrap.Phase == phase
+}
+
+// Refine pre-bind rejection without projecting a native method or request ID.
+func (p *codexAppServerProtocol) failResumeNotification(message codexRPCMessage, reason string) {
+	if !p.bootstrapAt(codexBootstrapResumePending) {
+		p.fail()
+		return
+	}
+	if message.ID != nil {
+		reason = "server_request_before_bind"
+	}
+	p.failWithDiagnostic(reason)
 }
 
 func (p *codexAppServerProtocol) next(id int, method string, params any) {
 	if p.ctx.Err() != nil {
 		return
 	}
+	if p.bootstrap != nil {
+		switch id {
+		case 2:
+			p.bootstrap.Phase = "config_before"
+		case 3:
+			p.bootstrap.Phase = "thread_start"
+			if p.session.resume != nil {
+				p.bootstrap.Phase = codexBootstrapResumePending
+			}
+		case 4:
+			p.bootstrap = nil // Thread binding and initial metadata replay completed.
+		}
+	}
 	p.awaiting = id
 	if !p.send(id, method, params) {
-		p.fail()
+		p.failWithDiagnostic("request_enqueue_failed")
 	}
 }
 
@@ -312,8 +364,19 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 		p.interruptAcknowledged = true
 		return
 	}
-	if p.awaiting == 0 || !bytes.Equal(bytes.TrimSpace(message.ID), []byte(strconv.Itoa(p.awaiting))) || message.Error != nil && (p.session == nil || p.awaiting != 9) {
-		p.fail()
+	if p.awaiting == 0 || !bytes.Equal(bytes.TrimSpace(message.ID), []byte(strconv.Itoa(p.awaiting))) {
+		p.failWithDiagnostic("response_id_mismatch")
+		return
+	}
+	if message.Error != nil && (p.session == nil || p.awaiting != 9) {
+		if p.bootstrap != nil {
+			fields, err := codexRPCObject(message.Error, "code")
+			var code *int32
+			if err == nil && json.Unmarshal(fields["code"], &code) == nil {
+				p.bootstrap.RPCCode = code
+			}
+		}
+		p.failWithDiagnostic("rpc_error")
 		return
 	}
 	id := p.awaiting
@@ -326,29 +389,29 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 		_, family := codexAppServerString(fields, "platformFamily")
 		_, platform := codexAppServerString(fields, "platformOs")
 		if err != nil || !agent || !family || !platform || json.Unmarshal(fields["codexHome"], &home) != nil || !filepath.IsAbs(home) {
-			p.fail()
+			p.failWithDiagnostic("initialize_rejected")
 			return
 		}
 		if p.session != nil {
 			if !nativeSessionPath(home) || p.session.resume != nil && p.session.resume.NativeHome != home {
-				p.fail()
+				p.failWithDiagnostic("initialize_rejected")
 				return
 			}
 			p.session.home = home
 		}
 		if !p.send(0, "initialized", nil) {
-			p.fail()
+			p.failWithDiagnostic("request_enqueue_failed")
 			return
 		}
 		p.next(2, "config/read", map[string]any{"cwd": p.request.CWD, "includeLayers": true})
 	case 2, 4:
 		config, err := readCodexAppServerConfig(message.Result)
 		if err != nil {
-			p.fail()
+			p.failWithDiagnostic("config_response_rejected")
 			return
 		}
 		if p.session != nil && !p.session.currentConfig(message.Result, id == 2) {
-			p.fail()
+			p.failWithDiagnostic("config_profile_rejected")
 			return
 		}
 		p.summary(config)
@@ -356,7 +419,7 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			p.before = config
 			threadConfig := codexAppServerConfig(config.names)
 			if p.member != nil && p.member.configure(config.names, threadConfig) != nil {
-				p.fail()
+				p.failWithDiagnostic("member_config_failed")
 				return
 			}
 			params := map[string]any{"cwd": p.request.CWD, "sandbox": "read-only", "approvalPolicy": "never", "config": threadConfig, "ephemeral": false}
@@ -399,6 +462,10 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			}
 		}
 	case 3:
+		// A correlated success envelope alone does not bind a thread.
+		if p.bootstrapAt(codexBootstrapResumePending) {
+			p.bootstrap.Phase = codexBootstrapResumeBind
+		}
 		// In verified 0.166, the actual snapshot projects writable, external or
 		// unrepresentable permissions away from readOnly. Profile identity and
 		// runtime workspace roots alone do not grant writes.
@@ -412,28 +479,40 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			json.Unmarshal(fields["approvalPolicy"], &approval) != nil || approval != "never" ||
 			p.request.Model != "" && (json.Unmarshal(fields["model"], &model) != nil || model != p.request.Model) ||
 			json.Unmarshal(sandbox["type"], &policy) != nil || policy != "readOnly" ||
-			!bytes.Equal(bytes.TrimSpace(thread["turns"]), []byte("[]")) || string(thread["ephemeral"]) != "false" ||
-			(p.threadSeen != "" && threadID != p.threadSeen) {
-			p.fail()
+			!bytes.Equal(bytes.TrimSpace(thread["turns"]), []byte("[]")) || string(thread["ephemeral"]) != "false" {
+			p.failWithDiagnostic("thread_response_rejected")
 			return
 		}
 		if access := sandbox["networkAccess"]; access != nil && string(access) != "false" {
-			p.fail()
+			p.failWithDiagnostic("thread_response_rejected")
 			return
 		}
 		for _, key := range []string{"parentThreadId", "forkedFromId"} {
 			if value := thread[key]; value != nil && string(value) != "null" {
-				p.fail()
+				p.failWithDiagnostic("thread_response_rejected")
 				return
 			}
 		}
+		if p.threadSeen != "" && threadID != p.threadSeen {
+			reason := "thread_response_rejected"
+			if p.bootstrapAt(codexBootstrapResumeBind) {
+				reason = "thread_announcement_mismatch"
+			}
+			p.failWithDiagnostic(reason)
+			return
+		}
 		if p.session != nil && !p.session.threadResponse(message.Result, p.request, threadID) {
-			p.fail()
+			p.failWithDiagnostic("thread_profile_rejected")
 			return
 		}
 		p.threadID, p.receipt.NativeSessionID = threadID, threadID
 		p.emit(Event{Kind: SessionEvent})
-		p.replayBuffer()
+		if p.bootstrapAt(codexBootstrapResumeBind) {
+			p.bootstrap.Phase = codexBootstrapResumeReplay
+		} else if p.bootstrap != nil {
+			p.bootstrap.Phase = "thread_start_replay"
+		}
+		p.replayBuffer(true)
 		p.next(4, "config/read", map[string]any{"cwd": p.request.CWD, "includeLayers": true})
 	case 5:
 		fields, err := codexRPCObject(message.Result, "turn")
@@ -450,7 +529,7 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			}
 		}
 		p.turnID = turnID
-		p.replayBuffer()
+		p.replayBuffer(false)
 		// Already-buffered status can contradict the terminal before capture.
 		p.captureSession()
 	case 7:
@@ -464,7 +543,12 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 			p.fail()
 			return
 		}
-		p.startTurn()
+		if p.ctx.Err() == nil {
+			// Only now are the thread, stable config, scoped MCP status and
+			// writer-held history verified. Nothing in a warning starts a turn.
+			p.replayBuffer(false)
+			p.startTurn()
+		}
 	case 9:
 		// Optional anchor unavailability drops only the reference. Positive
 		// contradictory evidence instead fences settlement inside verification.
@@ -491,19 +575,25 @@ func (p *codexAppServerProtocol) startTurn() {
 func (p *codexAppServerProtocol) bufferNotification(message codexRPCMessage) {
 	size := len(*message.Method) + len(message.Params) + len(message.ID)
 	if len(p.buffer) >= executionFramesCountLimit || size > executionFramesByteLimit-p.bufferBytes {
-		p.fail()
+		p.failWithDiagnostic("buffer_limit")
 		return
 	}
 	p.buffer = append(p.buffer, message)
 	p.bufferBytes += size
 }
 
-func (p *codexAppServerProtocol) replayBuffer() {
+func (p *codexAppServerProtocol) replayBuffer(deferResumeWarnings bool) {
 	buffer := p.buffer
 	p.buffer, p.bufferBytes = nil, 0
 	for _, notification := range buffer {
 		if p.damaged {
 			break
+		}
+		if deferResumeWarnings && *notification.Method == "warning" {
+			// Retain the same budget. Other metadata, including MCP startup
+			// status, keeps its original bind-time replay order.
+			p.bufferNotification(notification)
+			continue
 		}
 		p.notification(notification)
 	}
@@ -518,11 +608,42 @@ func codexAppServerNoError(raw json.RawMessage) bool {
 	return raw == nil || bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
 }
 
+// In rust-v0.166.0 the resume listener can emit a WarningNotification with
+// the conversation ID before returning the correlated response. This is not a
+// thread announcement. Check the exact shape so aliases cannot erase its scope.
+func (p *codexAppServerProtocol) preBindResumeWarning(message codexRPCMessage) {
+	fields, err := codexAppServerMap(message.Params)
+	var text *string
+	if err != nil || message.ID != nil || json.Unmarshal(fields["message"], &text) != nil || text == nil ||
+		len(fields) != 1 && !(len(fields) == 2 && fields["threadId"] != nil) {
+		p.failResumeNotification(message, "notification_params_rejected")
+		return
+	}
+	if codexAppServerNoError(fields["threadId"]) {
+		return // Legacy unscoped warning: missing or null threadId.
+	}
+	threadID, valid := codexAppServerString(fields, "threadId")
+	if !valid {
+		p.failResumeNotification(message, "notification_params_rejected")
+		return
+	}
+	if threadID != p.session.resume.NativeThreadID {
+		p.failResumeNotification(message, "warning_before_thread_bind")
+		return
+	}
+	// Retain only in the bounded in-memory queue, not in logs or delivery.
+	p.bufferNotification(message)
+}
+
 func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 	if p.member != nil && p.memberNotification(message) {
 		return
 	}
 	method := *message.Method
+	if method == "warning" && p.awaiting == 3 && p.threadID == "" && p.member != nil && p.session != nil && p.session.resume != nil {
+		p.preBindResumeWarning(message)
+		return
+	}
 	if method == "remoteControl/status/changed" {
 		// Installed 0.166 emits this connection-level notification during
 		// initialization. It is passive status, never execution or authority.
@@ -548,7 +669,7 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 		var status string
 		_ = json.Unmarshal(fields["status"], &status)
 		if !valid || !slices.Contains([]string{"disabled", "connecting", "connected", "errored"}, status) {
-			p.fail()
+			p.failResumeNotification(message, "connection_metadata_rejected")
 		}
 		return
 	}
@@ -556,23 +677,23 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 		// Passive connection metadata is not platform account readiness or a grant.
 		fields, err := codexAppServerMap(message.Params)
 		if err != nil || message.ID != nil {
-			p.fail()
+			p.failResumeNotification(message, "connection_metadata_rejected")
 			return
 		}
 		if method == "account/rateLimits/updated" {
 			if _, err := codexAppServerMap(fields["rateLimits"]); err != nil || len(fields) != 1 {
-				p.fail()
+				p.failResumeNotification(message, "connection_metadata_rejected")
 			}
 			return // Quota values are opaque; do not retain, log or act on them.
 		}
 		for key, raw := range fields {
 			if key != "authMode" && key != "planType" {
-				p.fail()
+				p.failResumeNotification(message, "connection_metadata_rejected")
 				return
 			}
 			var value *string
 			if json.Unmarshal(raw, &value) != nil {
-				p.fail()
+				p.failResumeNotification(message, "connection_metadata_rejected")
 				return
 			}
 			if value == nil {
@@ -583,7 +704,7 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 				allowed = []string{"free", "go", "plus", "pro", "prolite", "promax", "team", "self_serve_business_prolite", "self_serve_business_usage_based", "business", "ent26", "enterprise_cbp_automation", "enterprise_cbp_usage_based", "enterprise", "edu", "edu_plus", "edu_pro", "sci", "sci_plus", "unknown"}
 			}
 			if !slices.Contains(allowed, *value) {
-				p.fail()
+				p.failResumeNotification(message, "connection_metadata_rejected")
 				return
 			}
 		}
@@ -591,13 +712,21 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 	}
 	fields, err := codexRPCObject(message.Params, "thread", "threadId", "turn", "turnId", "item", "itemId", "requestId", "willRetry", "message", "threadName", "projectId")
 	if err != nil {
-		p.fail()
+		p.failResumeNotification(message, "notification_params_rejected")
 		return
 	}
 	if method == "thread/started" && message.ID == nil {
 		thread, err := codexRPCObject(fields["thread"], "id")
 		id, valid := codexAppServerString(thread, "id")
-		if err != nil || !valid || p.threadSeen != "" || (p.awaiting != 3 && p.threadID == "") || (p.threadID != "" && id != p.threadID) {
+		if err != nil || !valid {
+			p.failResumeNotification(message, "thread_announcement_invalid")
+			return
+		}
+		if p.threadSeen != "" {
+			p.failResumeNotification(message, "thread_announcement_duplicate")
+			return
+		}
+		if (p.awaiting != 3 && p.threadID == "") || (p.threadID != "" && id != p.threadID) {
 			p.fail()
 			return
 		}
@@ -608,7 +737,7 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 	if method == "warning" {
 		var text *string
 		if message.ID != nil || json.Unmarshal(fields["message"], &text) != nil || text == nil {
-			p.fail()
+			p.failResumeNotification(message, "notification_params_rejected")
 			return
 		}
 		if codexAppServerNoError(fields["threadId"]) {
@@ -620,7 +749,29 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 	}
 	threadID, valid := codexAppServerString(fields, "threadId")
 	if !valid || threadID != p.threadID || p.threadID == "" {
-		p.fail()
+		switch {
+		case p.bootstrapAt(codexBootstrapResumeReplay):
+			p.failWithDiagnostic("notification_thread_rejected")
+		case p.bootstrapAt(codexBootstrapResumePending):
+			reason := "notification_not_allowed"
+			// Diagnostic distinctions only, not additions to the allowlist.
+			switch method {
+			case "thread/closed":
+				reason = "thread_closed_before_thread_bind"
+			case "serverRequest/resolved":
+				reason = "server_request_resolved_before_thread_bind"
+			case "turn/started":
+				reason = "turn_started_before_thread_bind"
+			case "turn/completed":
+				reason = "turn_completed_before_thread_bind"
+			}
+			if !valid && reason != "notification_not_allowed" {
+				reason = "notification_params_rejected"
+			}
+			p.failResumeNotification(message, reason)
+		default:
+			p.fail()
+		}
 		return
 	}
 	if p.session != nil && p.session.resume != nil {

@@ -21,6 +21,10 @@ const (
 )
 
 func (a memberToolAPI) readWorkInputs(w http.ResponseWriter, r *http.Request, token string) {
+	if a.tools.IsFreshTaskWorkCapability(token) {
+		a.readFreshTaskWorkInputs(w, r, token)
+		return
+	}
 	if !decodeMemberToolJSON(w, r, &struct{}{}) {
 		return
 	}
@@ -73,6 +77,10 @@ func (a memberToolAPI) mutateWorkInput(w http.ResponseWriter, r *http.Request, t
 		operationError(w, store.ErrInvalid)
 		return
 	}
+	if a.tools.IsFreshTaskWorkCapability(token) {
+		a.mutateFreshTaskWorkInput(w, r, token, handBack, input.InputID.value, input.Reason.value, key)
+		return
+	}
 	operation := "ack_work_input"
 	var err error
 	if handBack {
@@ -101,21 +109,29 @@ func validWorkInputID(id string) bool {
 	return id != "" && len(id) <= 256 && strings.TrimSpace(id) == id && !strings.ContainsFunc(id, unicode.IsControl)
 }
 
-// Select the stricter decode only for continuation. Use the same JSON field
-// matching as the native handler; the raw arguments remain the source of truth.
-func isContinueWorkRequest(body []byte) bool {
+// Select strict scalar decoding before Go JSON replacement characters can
+// alias verbatim source text or an MCP request binding.
+func memberToolSendAssessmentFields(body []byte) (continuation, excerpt bool) {
 	var probe struct {
 		Assessment struct {
-			Disposition string `json:"disposition"`
+			Disposition string          `json:"disposition"`
+			Excerpt     json.RawMessage `json:"discussion_only_excerpt"`
 		} `json:"intent_assessment"`
 	}
-	return json.Unmarshal(body, &probe) == nil && probe.Assessment.Disposition == "continue_work"
+	err := json.Unmarshal(body, &probe)
+	return err == nil && probe.Assessment.Disposition == "continue_work", probe.Assessment.Excerpt != nil
+}
+
+func sendMessageNeedsScalars(body []byte) bool {
+	continuation, excerpt := memberToolSendAssessmentFields(body)
+	return continuation || excerpt
 }
 
 func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Request, token string, raw json.RawMessage, content memberToolField[string], key string) (domain.ChatAssessmentReceipt, bool) {
 	var assessment struct {
 		domain.ChatAssessment
-		Followup json.RawMessage `json:"followup"`
+		Followup              json.RawMessage         `json:"followup"`
+		DiscussionOnlyExcerpt memberToolField[string] `json:"discussion_only_excerpt"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -138,6 +154,9 @@ func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Req
 	if assessment.Followup != nil {
 		memberToolError(w, store.ErrInvalid)
 		return domain.ChatAssessmentReceipt{}, false
+	}
+	if assessment.DiscussionOnlyExcerpt.present {
+		assessment.ChatAssessment.DiscussionOnlyExcerpt = &assessment.DiscussionOnlyExcerpt.value
 	}
 	receipt, err := a.tools.AssessChatIntent(r.Context(), token, assessment.ChatAssessment, content.value, key)
 	if err != nil {

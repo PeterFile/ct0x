@@ -365,3 +365,67 @@ test("native execution forwards cancellation and never returns partial results o
     error => safeFailure(error, /取消.*未发送/));
   assert.equal(requests.length, 0);
 });
+
+test("issued discussion excerpt is verbatim and cannot be coerced or normalized", async t => {
+  const { tools, requests } = await toolsFor(t, (_, response) => json(response, {
+    message_id: "notice", created_at: "2026-11-18T00:00:00Z", delivery_count: 0, content_omitted: true,
+  }, 201), { discussion_only_excerpt: true });
+  const send = tools.get("send_message");
+  const exact = " \n只讨论🙂e\u0301\n";
+  const payload = { content: "先讨论。", intent_assessment: { disposition: "discuss", reason: "明确范围", discussion_only_excerpt: exact } };
+  assert.deepEqual(send.prepareArguments(payload), payload);
+  for (const bad of [null, 42, false]) {
+    assert.throws(() => send.prepareArguments({ ...payload, intent_assessment: { ...payload.intent_assessment, discussion_only_excerpt: bad } }), /未发送/);
+  }
+  assert.throws(() => send.prepareArguments({ ...payload, recipient_ids: null }), /未发送/);
+  for (const bad of ["\u0085", "\ud800", "\0", "🙂".repeat(1024) + "x"]) {
+    await assert.rejects(execute(send, { ...payload, intent_assessment: { ...payload.intent_assessment, discussion_only_excerpt: bad } }), /未发送/);
+  }
+  await execute(send, payload);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(JSON.parse(requests[0].body), payload);
+});
+
+test("issued intake guidance separates continuation, new investigation, and literal discussion", async t => {
+  const config = await privateConfig(t, {
+    continue_work: true, discussion_only_excerpt: true, intake_assessment_action: "read_only_investigation",
+  });
+  const digest = createHash("sha256").update(await readFile(config)).digest("hex");
+  const loaded = await load(config, digest);
+  assert.deepEqual(loaded.errors, []);
+  const send = loaded.extensions[0].tools.get("send_message").definition;
+  const fields = send.parameters.properties.intent_assessment.properties;
+  assert.deepEqual(fields.disposition.anyOf.map(v => v.const), ["discuss", "clarify", "request_work", "prepare_work", "continue_work"]);
+  assert.deepEqual(fields.action.anyOf.map(v => v.const), ["text_submission", "workspace_change", "read_only_investigation"]);
+  assert.match(fields.disposition.description, /仅讨论时优先选discuss.*逐字保留discussion_only_excerpt/u);
+  assert.match(fields.disposition.description, /continue_work仅用于.*续办.*followup\.task_id/u);
+  assert.match(fields.disposition.description, /text_submission仅用于受支持的topic_summary；read_only_investigation仅用于获准范围内明确的新调查/u);
+  assert.match(fields.action.description, /chat_candidate\.policy.*单收件人本机用户原文明确要求另开/u);
+  assert.doesNotMatch(fields.disposition.description, /prepare_work仅限受支持的topic_summary/u);
+  for (const intent_assessment of [
+    { disposition: "continue_work", action: "read_only_investigation", reason: "不能混用动作" },
+    { disposition: "prepare_work", action: "read_only_investigation", reason: "不能续办", followup: { task_id: "old" } },
+    { disposition: "prepare_work", action: "read_only_investigation", reason: "仅讨论", discussion_only_excerpt: " 只讨论。\n" },
+  ]) {
+    await assert.rejects(execute(send, { content: "fixture", intent_assessment }), error => safeFailure(error, /未发送/));
+  }
+});
+
+test("strict investigation registers only the digested tool set and blocks host calls", async t => {
+  const names = ["read_investigation_artifact", "submit_result"];
+  const config = await privateConfig(t, { investigation_tools: names });
+  const digest = createHash("sha256").update(await readFile(config)).digest("hex");
+  for (const bad of [undefined, "0".repeat(64)]) {
+    assert.equal((await load(config, bad)).extensions.length, 0);
+  }
+  const loaded = await load(config, digest);
+  assert.deepEqual(loaded.errors, []);
+  const ext = loaded.extensions[0];
+  assert.deepEqual([...ext.tools.keys()], names);
+  const call = ext.handlers.get("tool_call")[0];
+  for (const toolName of ["read", "bash", "write", "mcp__foreign", "read_channel", "workspace_write"]) {
+    assert.equal((await call({ type: "tool_call", toolName }, {})).block, true);
+  }
+  assert.equal(await call({ type: "tool_call", toolName: names[0] }, {}), undefined);
+  assert.equal(ext.tools.get("submit_result").definition.parameters.properties.artifact_versions, undefined);
+});

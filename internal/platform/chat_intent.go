@@ -38,15 +38,38 @@ func (s *MemberTools) ChatCandidate(ctx context.Context, token string) (*domain.
 		return nil, memberRoleError(ctx, err)
 	}
 	candidate := *entry.candidate
+	if !entry.investigationIntake() {
+		candidate.Policy.Investigation = nil
+		candidate.Policy.InvestigationExecutionEnabled = false
+	}
 	return &candidate, nil
+}
+
+type memberToolIntakeSchema struct {
+	piDiscussionExcerpt bool // The paired Pi bridge can advertise this optional field.
+	investigation       bool // The exact opted-in Pi, fresh root only.
+	investigationBlobs  bool // The runtime owns a separate artifact reader.
+}
+
+func (schema memberToolIntakeSchema) offersInvestigation(policy domain.ChatPolicy) bool {
+	return schema.investigation && policy.Enabled && policy.InvestigationExecutionEnabled && policy.Investigation != nil &&
+		(len(policy.Investigation.ArtifactVersions) == 0 || schema.investigationBlobs)
+}
+
+func (entry memberToolRegistration) investigationIntake() bool {
+	return entry.purpose == domain.ChatIntakePurpose && entry.candidate != nil && entry.intake.offersInvestigation(entry.candidate.Policy)
 }
 
 // AssessChatIntent shares send_message's transport, not the local-user actor.
 // Only the server-captured candidate from this exact execution can be assessed.
 func (s *MemberTools) AssessChatIntent(ctx context.Context, token string, input domain.ChatAssessment, content, key string) (domain.ChatAssessmentReceipt, error) {
-	return s.withChatIntake(token, func(scope store.MemberToolScope, candidateID string) (domain.ChatAssessmentReceipt, error) {
-		return s.chatEngine.AssessChatIntent(ctx, scope, candidateID, input, content, key)
-	})
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry := s.capabilities[sha256.Sum256([]byte(token))]
+	if !s.isChatIntake(entry) || input.Action == domain.ChatActionReadOnlyInvestigation && !entry.investigationIntake() {
+		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
+	}
+	return s.chatEngine.AssessChatIntent(ctx, entry.scope, entry.candidate.ID, input, content, key)
 }
 
 func (s *MemberTools) withChatIntake(token string, use func(store.MemberToolScope, string) (domain.ChatAssessmentReceipt, error)) (domain.ChatAssessmentReceipt, error) {

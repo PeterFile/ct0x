@@ -41,6 +41,15 @@ func (p *Preparer) InspectRoleReadiness(ctx context.Context, pending store.Pendi
 	if provenance.Kind == store.CoordinationRoleOrdinary {
 		return roleInspectionResult(ctx, result, nil)
 	}
+	if provenance.SourceKind != "" {
+		result.MaxContextBytes = p.roleMaxContextBytes
+		plan, err := p.planFreshTaskWork(ctx, input, false)
+		if plan.investigation != nil {
+			result.RequestID = plan.provenance.RequestID
+			result.MaxContextBytes = min(result.MaxContextBytes, investigationMaxContextBytes)
+		}
+		return roleInspectionResult(ctx, result, err)
+	}
 	result.HistoryLimit, result.MaxContextBytes = p.roleHistoryLimit, p.roleMaxContextBytes
 	plan, err := p.planCoordinationRole(ctx, input.state, input.group, input.member, input.conversation, input.trigger)
 	if ctx.Err() != nil {
@@ -53,7 +62,10 @@ func (p *Preparer) InspectRoleReadiness(ctx context.Context, pending store.Pendi
 	if err != nil || ctx.Err() != nil {
 		return roleInspectionResult(ctx, result, err)
 	}
-	if plan.workspace != nil && provenance.Kind == store.CoordinationRoleWorker {
+	if plan.investigation != nil {
+		result.HistoryLimit, result.MaxContextBytes = 0, plan.input.MaxBytes
+		_, err = plan.investigation.resolveCWD(provenance, false)
+	} else if plan.workspace != nil && provenance.Kind == store.CoordinationRoleWorker {
 		_, _, _, err = p.workspacePreparationGrant(ctx, *plan.workspace, input.member.ID)
 	} else {
 		_, _, err = p.resolvePreparationWorkspace(ctx, input.member, input.conversation, false)

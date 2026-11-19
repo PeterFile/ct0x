@@ -25,10 +25,19 @@ func WorkspaceWorkerToolNames() []string {
 var errPiMemberToolConfiguration = errors.New("成员工具执行配置无效")
 
 type piMemberToolOptions struct {
+	// Trusted only from the exact pinned fresh typed adapters, never inferred
+	// from tool names, ordinary digest options, the child stream or the prompt.
+	typedWorkRole string
+
 	extensionPath string
 	configPath    string
 	toolNames     []string
-	configSHA256  [sha256.Size]byte // Nonzero only for the runtime-bound profile.
+	configSHA256  [sha256.Size]byte // Nonzero only for runtime-bound profiles.
+	investigation bool              // Strict first-investigation config and argv.
+
+	// Only typed investigation uses its own wire schema and in-memory session.
+	investigationConfigFile os.FileInfo
+	investigationBearer     piInvestigationBearerFingerprint
 }
 
 // NewPiMemberToolExecutor opts into four native member tools on verified Pi 1.4.0.
@@ -48,39 +57,52 @@ func NewPiMemberToolExecutor(selected Provider, extensionPath, configPath string
 // can include issued work-input operations. Names do not grant authority.
 // It preserves the legacy constructor's file/version gates and does not launch Pi.
 func NewPiMemberToolExecutorWithTools(selected Provider, extensionPath, configPath string, toolNames []string, timeout time.Duration) (Executor, error) {
+	native, err := newPiMemberToolExecutor(selected, extensionPath, configPath, toolNames, timeout, false)
+	if err != nil {
+		return nil, err
+	}
+	return native, nil
+}
+
+func newPiMemberToolExecutor(selected Provider, extensionPath, configPath string, toolNames []string, timeout time.Duration, investigation bool) (piExecutor, error) {
 	if selected.Name != Pi {
-		return nil, errExecutorConfiguration
+		return piExecutor{}, errExecutorConfiguration
 	}
 	baseline, err := NewExecutor(selected, timeout)
 	if err != nil {
-		return nil, err
+		return piExecutor{}, err
 	}
-	names, err := canonicalMemberToolProfile(toolNames, true)
+	var names []string
+	if investigation {
+		names, err = piInvestigationProfile(toolNames)
+	} else {
+		names, err = canonicalMemberToolProfile(toolNames, true)
+	}
 	if err != nil {
-		return nil, err
+		return piExecutor{}, err
 	}
 	if !filepath.IsAbs(extensionPath) || strings.ContainsRune(extensionPath, 0) ||
 		!filepath.IsAbs(configPath) || strings.ContainsRune(configPath, 0) {
-		return nil, errPiMemberToolConfiguration
+		return piExecutor{}, errPiMemberToolConfiguration
 	}
 	info, err := os.Stat(extensionPath)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0444 == 0 {
-		return nil, errPiMemberToolConfiguration
+		return piExecutor{}, errPiMemberToolConfiguration
 	}
 	extension, err := os.Open(extensionPath)
 	if err != nil {
-		return nil, errPiMemberToolConfiguration
+		return piExecutor{}, errPiMemberToolConfiguration
 	}
 	if extension.Close() != nil {
-		return nil, errPiMemberToolConfiguration
+		return piExecutor{}, errPiMemberToolConfiguration
 	}
 	// Clean first so a trailing separator cannot hide a final symlink from Lstat.
 	info, err = os.Lstat(filepath.Clean(configPath))
 	if err != nil || !info.Mode().IsRegular() || info.Mode() != 0600 {
-		return nil, errPiMemberToolConfiguration
+		return piExecutor{}, errPiMemberToolConfiguration
 	}
 	e := baseline.(piExecutor)
-	e.memberTools = &piMemberToolOptions{extensionPath: extensionPath, configPath: configPath, toolNames: names}
+	e.memberTools = &piMemberToolOptions{extensionPath: extensionPath, configPath: configPath, toolNames: names, investigation: investigation}
 	return e, nil
 }
 
@@ -134,4 +156,16 @@ func (o *piMemberToolOptions) environment(inherited []string) []string {
 
 func (o *piMemberToolOptions) boundConfig() bool {
 	return o != nil && o.configSHA256 != ([sha256.Size]byte{})
+}
+
+func (o *piMemberToolOptions) launchConfigMatches() bool {
+	if !o.boundConfig() {
+		return true
+	}
+	if o.investigationConfigFile == nil {
+		return piMemberToolConfigMatches(o.configPath, o.configSHA256, o.investigation)
+	}
+	// The typed adapter already checked the schema of exactly these bytes.
+	raw, file, err := readMemberToolConfigFile(o.configPath)
+	return err == nil && os.SameFile(o.investigationConfigFile, file) && sha256.Sum256(raw) == o.configSHA256
 }

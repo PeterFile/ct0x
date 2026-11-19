@@ -54,7 +54,7 @@ func TestNativeSessionPrepareDefaultOffAndKnownSelectionOnly(t *testing.T) {
 	}
 }
 
-func TestNativeSessionPrepareMixedAdaptersKeepCodexFresh(t *testing.T) {
+func TestNativeSessionPrepareMixedAdaptersKeepUnscopedCodexFresh(t *testing.T) {
 	f := newRolePrepareFixture(t)
 	f.enableRuntime(t)
 	useReleasePiBridge(t, f)
@@ -78,7 +78,7 @@ func TestNativeSessionPrepareMixedAdaptersKeepCodexFresh(t *testing.T) {
 			t.Fatal("mixed selection lost qualified Pi resume capability")
 		}
 		if codex.ID != provider.CodexAppServerAdapterID || !codex.Enabled || codex.Capabilities == nil || !memberToolCapabilitiesSupported(*codex.Capabilities) || codex.Capabilities.NativeResume != provider.SupportUnsupported {
-			t.Fatalf("mixed selection must report fresh-only Codex AppServer with its platform tools and terminal evidence: %+v", codex.Capabilities)
+			t.Fatalf("Codex without chat intake must report fresh AppServer with platform tools and terminal evidence: %+v", codex.Capabilities)
 		}
 	})
 
@@ -100,7 +100,7 @@ func TestNativeSessionPrepareMixedAdaptersKeepCodexFresh(t *testing.T) {
 			prepared, err := p.Prepare(ctx, tc.pending)
 			prepareRoleOK(t, err)
 			if prepared.Executor.(*memberToolRuntimeRun).nativeSession != nil || prepared.Request != legacy.Request || !slices.Equal(prepared.ResourceKeys, legacy.ResourceKeys) {
-				t.Fatal("Pi opt-in selected Codex resume or changed its fresh prompt, model, thinking or claim keys")
+				t.Fatal("native opt-in changed the unqualified Codex prompt, model, thinking or claim keys")
 			}
 			_, receipt := executePreparedAdapterFixture(t, f, prepared, false, func(token string) {
 				names, err := f.opts.MemberTools.Tools().TransportOperations(ctx, token)
@@ -110,7 +110,7 @@ func TestNativeSessionPrepareMixedAdaptersKeepCodexFresh(t *testing.T) {
 					want = memberToolRoleOperations(store.CoordinationRoleCoordinator)
 				}
 				if !slices.Equal(names, want) {
-					t.Fatal("Pi opt-in changed fresh Codex grants")
+					t.Fatal("native opt-in changed fresh Codex grants")
 				}
 			})
 			if receipt.NativeRef != nil {
@@ -157,13 +157,15 @@ func TestNativeSessionPreparePiNonRoleThinkingIsIndependent(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newRolePrepareFixture(t)
 			f.enableRuntime(t)
-			useReleasePiBridge(t, f)
 			f.pending = f.ordinary
 			if intake {
+				useLegacyNativePiBridge(t, f)
 				f.runtimeOptions.ChatIntake = coordination.New(f.s)
 				var err error
 				f.opts.MemberTools, err = NewMemberToolRuntime(f.s, f.runtimeOptions)
 				prepareRoleOK(t, err)
+			} else {
+				useReleasePiBridge(t, f)
 			}
 			const model = "openai-codex/gpt-6.1-sol"
 			f.exec(t, "UPDATE members SET model=? WHERE id=?", model, f.member.ID)
@@ -188,10 +190,54 @@ func TestNativeSessionPreparePiNonRoleThinkingIsIndependent(t *testing.T) {
 	}
 }
 
+func TestNativeSessionPreparePiIntakeBridgeSchemaCompatibility(t *testing.T) {
+	f, first := nativeSessionPreparation(t, domain.ChatIntakePurpose)
+	f.opts.RoleThinking = "" // Isolate the intake-only adapter report.
+	initial, receipt, _ := runNativeSessionFixture(t, f, first, nil, provider.OutcomeSucceeded, true)
+	prior, resumed, _ := runNativeSessionFixture(t, f, nextNativeSessionPreparation(t, f), nil, provider.OutcomeSucceeded, true)
+	if resumed.NativeRef == nil || resumed.NativeRef.Pi == nil || resumed.NativeSessionID != receipt.NativeSessionID ||
+		decodeNativeFixtureBinding(t, resumed).ResumedFromTurnID != initial.TurnID {
+		t.Fatal("qualified #193 intake did not resume its previous binding")
+	}
+	if caps := f.preparer(t).AdapterReports()[f.member.ProviderID].Capabilities; caps == nil || caps.NativeResume != provider.SupportSupported {
+		t.Fatal("qualified #193 intake no longer reports native resume")
+	}
+
+	// Keep the same conversation, issued tool names and native opt-in. Change
+	// only the qualified bridge; no investigation options are configured.
+	useReleasePiBridge(t, f)
+	prepared := nextNativeSessionPreparation(t, f)
+	run := prepared.Executor.(*memberToolRuntimeRun)
+	if !run.intakeSchema.piDiscussionExcerpt || run.intakeSchema.investigation || run.intakeBuilder == nil {
+		t.Fatal("qualified bridge must bind the excerpt config without enabling investigation")
+	}
+	if run.nativeSession != nil {
+		_, wrong, _ := runNativeSessionFixture(t, f, prepared, nil, provider.OutcomeSucceeded, false)
+		t.Fatalf("changed intake schema reached native selection (resumed prior #193 binding: %t)",
+			decodeNativeFixtureBinding(t, wrong).ResumedFromTurnID == prior.TurnID)
+	}
+	if prepared.Request.Thinking != "" || slices.Contains(decodePreparation(t, prepared.Request.Prompt).Permissions, nativeSessionTextPermission) {
+		t.Fatal("fresh intake still advertised the native text profile")
+	}
+	if caps := f.preparer(t).AdapterReports()[f.member.ProviderID].Capabilities; caps == nil || caps.NativeResume != provider.SupportUnsupported || !memberToolCapabilitiesSupported(*caps) {
+		t.Fatal("changed intake must report fresh member tools without native resume")
+	}
+	_, fresh := executePreparedAdapterFixture(t, f, prepared, false, func(token string) {
+		issued, err := f.opts.MemberTools.Tools().TransportOperations(t.Context(), token)
+		prepareRoleOK(t, err)
+		if !slices.Equal(issued, chatIntakeOperations()) {
+			t.Fatal("fresh intake changed its issued operations")
+		}
+	})
+	if fresh.NativeRef != nil {
+		t.Fatal("fresh intake emitted a native binding or reference")
+	}
+}
+
 func TestNativeSessionPreparePiTypedIntakeDoesNotAdvertiseResume(t *testing.T) {
 	f := newRolePrepareFixture(t)
 	f.enableRuntime(t)
-	useReleasePiBridge(t, f)
+	useLegacyNativePiBridge(t, f)
 	f.exec(t, "UPDATE members SET model='fixture/model' WHERE id=?", f.member.ID)
 	f.runtimeOptions.ChatIntake = coordination.New(f.s)
 	// The optional input service changes the schema; sampling must not call it.

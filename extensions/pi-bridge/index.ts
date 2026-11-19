@@ -1,7 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
+import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
-import { openBridge, validUnicode } from "./bridge.mjs";
+import { INVESTIGATION_ARTIFACT, INVESTIGATION_ASSESSMENT_ACTION, INVESTIGATION_CHANNEL, openBridge, validUnicode } from "./bridge.mjs";
+
+const discussionOnlyExcerptBytes = 4096;
+const investigationSummaryBytes = 8192;
+const investigationResult = Type.Object({ summary: Type.String({ minLength: 1, maxLength: investigationSummaryBytes,
+  description: "纯文本调查结论（最多 8192 UTF-8 字节）；说明用了哪些获准资料和未决问题。提交不代表接纳。" }) }, { additionalProperties: false });
 
 const workInputBytes = { reason: 4096, content: 16384, constraint: 2048, handBackReason: 2048 } as const;
 
@@ -11,7 +16,6 @@ const pagination = Type.Object({
 }, { additionalProperties: false });
 
 const chatAssessmentFields = {
-  action: Type.Optional(Type.Union([Type.Literal("text_submission"), Type.Literal("workspace_change")], { description: "结合可信来源和上下文提出文本交付或目录文件修改；只是一项语义建议，当前 Policy、目录授权和 Task 范围由服务器核定，模型不能授予 IO 权限。" })),
   title: Type.Optional(Type.String({ maxLength: 256, description: "仅request_work填写目标；prepare_work须省略。" })),
   description: Type.Optional(Type.String({ maxLength: 8192, description: "仅request_work填写边界；prepare_work须省略。" })),
   acceptance: Type.Optional(Type.String({ maxLength: 4096, description: "仅request_work填写交付验收；prepare_work须省略，服务器固定目标和验收。" })),
@@ -23,15 +27,25 @@ const chatAssessmentFields = {
   }, { additionalProperties: false })),
 };
 
-function sendMessageParameters(continueWork: boolean) {
+function sendMessageParameters(continueWork: boolean, discussionOnly = false, investigation = false) {
   const disposition = Type.Union([
     Type.Literal("discuss"), Type.Literal("clarify"), Type.Literal("request_work"), Type.Literal("prepare_work"),
     ...(continueWork ? [Type.Literal("continue_work")] : []),
-  ], { description: "仅受信chat_intake/v1解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。prepare_work仅限受支持的topic_summary。" +
-    (continueWork ? `continue_work仅用于当前本机用户的明确续办请求；续办理由不得为空白，最多 ${workInputBytes.reason} UTF-8 字节。` : "") });
+  ], { description: "仅受信chat_intake/v1解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。" +
+    (discussionOnly ? "原文明确仅讨论时优先选discuss，逐字保留discussion_only_excerpt，不新建或续办工作。" : "") +
+    (continueWork ? `continue_work仅用于当前本机用户明确要求在原授权内续办；有明确Task编号就用followup.task_id引用原文。不填action或新任务字段。续办理由不得为空白，最多 ${workInputBytes.reason} UTF-8 字节。` : "") +
+    (investigation ? "prepare_work按已签发的action分流：text_submission仅用于受支持的topic_summary；read_only_investigation仅用于获准范围内明确的新调查，不用于续办。" :
+      "prepare_work仅限受支持的topic_summary。") });
   const assessment = Type.Object({
     disposition,
+    action: Type.Optional(Type.Union([Type.Literal("text_submission"), Type.Literal("workspace_change"),
+      ...(investigation ? [Type.Literal(INVESTIGATION_ASSESSMENT_ACTION)] : []),
+    ], { description: investigation ? "仅当本轮已签发该动作、chat_candidate.policy 提供获准调查范围，且绑定的单收件人本机用户原文明确要求另开范围内的调查时，使用 prepare_work、action=read_only_investigation 和 reason。目标、资料和验收由服务器绑定；模型不能授予权限。" :
+      "结合可信来源和上下文提出文本交付或目录文件修改；只是一项语义建议，当前 Policy、目录授权和 Task 范围由服务器核定，模型不能授予 IO 权限。" })),
     ...chatAssessmentFields,
+    ...(discussionOnly ? { discussion_only_excerpt: Type.Optional(Type.String({ minLength: 1, maxLength: discussionOnlyExcerptBytes,
+      description: "仅在 discuss 时逐字引用绑定本机用户消息中明确标示只讨论的连续原文；保留空白、标点和 Unicode 原文，最多 4096 UTF-8 字节。没有则省略。",
+    })) } : {}),
     ...(continueWork ? { followup: Type.Optional(Type.Object({
       task_id: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "仅填写用户明确引用的任务；实际工作和权限由服务器核定。" })),
       constraint: Type.Optional(Type.String({ maxLength: workInputBytes.constraint,
@@ -176,6 +190,17 @@ const tools = [
   },
 ] as const;
 
+const investigationID = Type.String({ minLength: 1, maxLength: 128 });
+const investigationReads = [
+  { name: INVESTIGATION_CHANNEL, label: "读取调查话题", description: "只读取本轮获准的绑定话题，不可选择其他话题。", parameters: pagination },
+  { name: INVESTIGATION_ARTIFACT, label: "读取调查成果版本", description: "只读取本轮批准的确切版本；offset 和 next_offset 是字节位置。",
+    parameters: Type.Object({
+      artifact_id: investigationID, version_id: investigationID,
+      offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 64 << 20 })),
+      max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 16384 })),
+    }, { additionalProperties: false }) },
+] as const;
+
 function workspacePath(value: string, directory: boolean): boolean {
   return Buffer.byteLength(value, "utf8") <= 4096 && !/[\\\\\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(value) &&
     (directory && value === "." || value.split("/").every(part => part !== "" && part !== "." && part !== ".."));
@@ -185,7 +210,7 @@ function utf8TextWithinBytes(value: string, limit: number): boolean {
   return validUnicode(value) && Buffer.byteLength(value, "utf8") <= limit;
 }
 
-function validWorkInputText(value: string, limit: number): boolean {
+function validNonBlankText(value: string, limit: number): boolean {
   // Go's TrimSpace uses Unicode White_Space, not JavaScript's trim (NEL/BOM).
   return utf8TextWithinBytes(value, limit) && /\P{White_Space}/u.test(value) && !value.includes("\u0000");
 }
@@ -200,15 +225,37 @@ function validWorkInputID(value: string): boolean {
 }
 
 export default function piBridge(pi: ExtensionAPI) {
-  const { invoke, continueWork } = openBridge(
+  const { invoke, continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools } = openBridge(
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG,
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256,
   );
-  for (const tool of tools) {
-    const parameters = tool.name === "send_message" && continueWork ? sendMessageParameters(true) : tool.parameters;
+  if (investigationTools) {
+    // Independent of Pi's CLI allowlist. Do not register unrelated platform
+    // tools and fail closed on any unexpected host or other extension call.
+    pi.on("tool_call", event => investigationTools.includes(event.toolName) ? undefined :
+      { block: true, reason: "工具不在本轮只读调查范围内。" });
+  }
+  for (const tool of investigationTools ? [...investigationReads, ...tools] : tools) {
+    if (investigationTools && !investigationTools.includes(tool.name)) continue;
+    let parameters = tool.name === "send_message" && (continueWork || discussionOnlyExcerpt || investigationIntake) ?
+      sendMessageParameters(continueWork, discussionOnlyExcerpt, investigationIntake) : tool.parameters;
+    if (investigationTools && tool.name === "submit_result") parameters = investigationResult;
     pi.registerTool<typeof parameters>({
       ...tool,
       parameters,
+      ...(tool.name === "send_message" && discussionOnlyExcerpt ? {
+        prepareArguments(args: unknown) {
+          // Pi can drop optional nulls and coerce types. Do not let that erase
+          // an excerpt, change its value or mask the presence of recipient_ids.
+          const message = args as { intent_assessment?: Record<string, unknown> } | null;
+          const assessment = message?.intent_assessment;
+          if (message && assessment && Object.hasOwn(assessment, "discussion_only_excerpt") &&
+              (typeof assessment.discussion_only_excerpt !== "string" || Object.hasOwn(message, "recipient_ids"))) {
+            throw new Error("成员工具参数无效，未发送请求。");
+          }
+          return args as Static<typeof parameters>;
+        },
+      } : {}),
       async execute(toolCallId, params, signal, _onUpdate, _ctx) {
         let valid = false;
         let payload: unknown;
@@ -222,20 +269,29 @@ export default function piBridge(pi: ExtensionAPI) {
             valid = Value.Check(parameters, payload);
             if (valid && tool.name === "send_message") {
               const message = payload as { content: string; recipient_ids?: string[]; intent_assessment?: {
-                disposition: string; reason: string; repair?: { review_id: string }; followup?: { task_id?: string; constraint?: string };
+                disposition: string; reason: string; action?: string; discussion_only_excerpt?: string;
+                repair?: { review_id: string }; followup?: { task_id?: string; constraint?: string };
               } };
               if (Object.hasOwn(message, "intent_assessment")) {
                 valid = !Object.hasOwn(message, "recipient_ids");
                 const assessment = message.intent_assessment!;
+                if (Object.hasOwn(assessment, "discussion_only_excerpt")) {
+                  valid = valid && assessment.disposition === "discuss" && validUnicode(message.content) && validUnicode(assessment.reason) &&
+                    validNonBlankText(assessment.discussion_only_excerpt!, discussionOnlyExcerptBytes);
+                }
+                if (assessment.action === INVESTIGATION_ASSESSMENT_ACTION) {
+                  valid = valid && assessment.disposition === "prepare_work" &&
+                    Object.keys(assessment).every(key => ["disposition", "action", "reason"].includes(key));
+                }
                 if (Object.hasOwn(assessment, "repair")) {
                   const id = assessment.repair!.review_id;
                   valid = valid && assessment.disposition === "request_work" && id.trim() === id && validOpaqueIDShape(id);
                 }
                 if (assessment.disposition === "continue_work") {
                   const { task_id: reference, constraint = "" } = assessment.followup ?? {};
-                  valid = valid && validWorkInputText(assessment.reason, workInputBytes.reason) &&
-                    validWorkInputText(message.content, workInputBytes.content) &&
-                    (constraint === "" || validWorkInputText(constraint, workInputBytes.constraint)) &&
+                  valid = valid && validNonBlankText(assessment.reason, workInputBytes.reason) &&
+                    validNonBlankText(message.content, workInputBytes.content) &&
+                    (constraint === "" || validNonBlankText(constraint, workInputBytes.constraint)) &&
                     (reference === undefined || validWorkInputID(reference)) &&
                     Object.keys(assessment).every(key => ["disposition", "reason", "followup"].includes(key));
                 } else {
@@ -246,12 +302,19 @@ export default function piBridge(pi: ExtensionAPI) {
             if (valid && (tool.name === "ack_work_input" || tool.name === "hand_back_work_input")) {
               const input = payload as { input_id: string; reason?: string };
               valid = validWorkInputID(input.input_id) &&
-                (tool.name !== "hand_back_work_input" || validWorkInputText(input.reason!, workInputBytes.handBackReason));
+                (tool.name !== "hand_back_work_input" || validNonBlankText(input.reason!, workInputBytes.handBackReason));
             }
             if (valid && tool.name === "decide_dispatch") {
               // Keep an object schema for Pi; check the conditional field on the safe snapshot.
               const decision = payload as { kind: string; worker_member_id?: string };
               valid = Object.hasOwn(decision, "worker_member_id") === (decision.kind === "assign");
+            }
+            if (valid && tool.name === INVESTIGATION_ARTIFACT) {
+              const { artifact_id, version_id } = payload as { artifact_id: string; version_id: string };
+              valid = [artifact_id, version_id].every(id => validWorkInputID(id) && Buffer.byteLength(id, "utf8") <= 128);
+            }
+            if (valid && investigationTools && tool.name === "submit_result") {
+              valid = validNonBlankText((payload as { summary: string }).summary, investigationSummaryBytes);
             }
             if (valid && (tool.name === "workspace_list" || tool.name === "workspace_read" || tool.name === "workspace_write")) {
               const file = payload as { path: string; create?: boolean; text?: string; expected_sha256?: string };
