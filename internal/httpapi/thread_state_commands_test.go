@@ -14,20 +14,22 @@ import (
 
 func TestThreadStateCommandIsolationAndReplay(t *testing.T) {
 	a := openMessageAPI(t, "")
-	if !threadStateInstalled(t, a) {
-		t.Skip("requires the candidate migration overlay")
-	}
 	ctx := context.Background()
-	g, other := newGroup(t, a, "thread state"), newGroup(t, a, "other group")
+	g := newGroup(t, a, "thread state")
 	const topic = "bug"
 	source := threadStateMessage(t, a, g.ID, topic, "Keep the old CSV format.")
+	url := threadStateURL(g.ID, topic)
+	body := stateUpdate(0, 0, "constraint", "set", source.Content, source.ID)
+	if !threadStateInstalled(t, a) {
+		assertThreadStateUnavailable(t, a, url, body)
+		return
+	}
+	other := newGroup(t, a, "other group")
 	f := threadStateMessage(t, a, other.ID, topic, "PRIVATE_FOREIGN_SOURCE")
 	a2 := openMessageAPI(t, a.path) // Independent connections exercise SQLite serialization.
-	url := threadStateURL(g.ID, topic)
 	put := func(a *groupAPI, expected int, text, sourceID, key string) *httptest.ResponseRecorder {
 		return a.request("PUT", url, stateUpdate(expected, 0, "constraint", "set", text, sourceID), key)
 	}
-	body := stateUpdate(0, 0, "constraint", "set", source.Content, source.ID)
 	crossOrigin := httptest.NewRequest("PUT", "http://"+DefaultAddress+url, strings.NewReader(body))
 	crossOrigin.Header.Set("Origin", "http://other.invalid")
 	crossOrigin.Header.Set("Content-Type", "application/json")
@@ -138,22 +140,24 @@ func TestThreadStateCommandIsolationAndReplay(t *testing.T) {
 
 func TestThreadStateConfirmationRequiresWholeMessage(t *testing.T) {
 	a := openMessageAPI(t, "")
-	if !threadStateInstalled(t, a) {
-		t.Skip("requires the candidate migration overlay")
-	}
+	installed := threadStateInstalled(t, a)
 	g := newGroup(t, a, "whole message")
 	const topic = "bug"
 	url := threadStateURL(g.ID, topic)
 	for slot, text := range []string{"不要删除数据", " 引用别人的建议：‘删除数据’；我不同意。 "} {
 		m := threadStateMessage(t, a, g.ID, topic, text)
+		whole := stateUpdate(slot, slot, "confirmed_decision", "set", text, m.ID)
+		if !installed {
+			assertThreadStateUnavailable(t, a, url, whole)
+			return
+		}
 		key := fmt.Sprintf("decision-%d", slot)
 		w := a.request("PUT", url, stateUpdate(slot, slot, "confirmed_decision", "set", "删除数据", m.ID), key)
 		if w.Code != 400 {
 			t.Errorf("fragment of %q was confirmed: %d %s", text, w.Code, w.Body)
 			return
 		}
-		got := decoded[domain.ThreadStateSnapshot](t, a.request("PUT", url,
-			stateUpdate(slot, slot, "confirmed_decision", "set", text, m.ID), key), 200)
+		got := decoded[domain.ThreadStateSnapshot](t, a.request("PUT", url, whole, key), 200)
 		if got.Revision != int64(slot+1) || got.Records[slot].Content != text {
 			t.Fatalf("confirmation discarded original context: %+v", got)
 		}
@@ -162,16 +166,9 @@ func TestThreadStateConfirmationRequiresWholeMessage(t *testing.T) {
 
 func TestThreadStateActualTaskBinding(t *testing.T) {
 	a := openMessageAPI(t, "")
-	if !threadStateInstalled(t, a) {
-		t.Skip("requires the candidate migration overlay")
-	}
 	ctx := context.Background()
-	g, other := newGroup(t, a, "home"), newGroup(t, a, "foreign")
+	g := newGroup(t, a, "home")
 	source := threadStateMessage(t, a, g.ID, "export", "Keep old CSV syntax.")
-	unlinked, err := a.db.CreateTask(ctx, store.CreateTaskInput{GroupID: g.ID, ActorID: "user", Title: "unlinked", Acceptance: "valid CSV"})
-	if err != nil {
-		t.Fatal(err)
-	}
 	linked, err := a.db.RequestWork(ctx, g.ID, domain.RequestWorkRequest{TopicID: source.TopicID, MessageID: source.ID,
 		Mode: domain.RoutingDecisionCreateNew, Reason: "fixture admission",
 		NewTask: &domain.NewTaskRequest{Title: "linked", Acceptance: "valid CSV"}}, "admission")
@@ -182,13 +179,22 @@ func TestThreadStateActualTaskBinding(t *testing.T) {
 		return threadStateURL(group, topic) + fmt.Sprintf("&task_id=%s&task_revision=%d", id, rev)
 	}
 	body := stateUpdate(0, 0, "constraint", "set", source.Content, source.ID)
+	endpoint := task(g.ID, source.TopicID, linked.Task.ID, 1)
+	if !threadStateInstalled(t, a) {
+		assertThreadStateUnavailable(t, a, endpoint, body)
+		return
+	}
+	other := newGroup(t, a, "foreign")
+	unlinked, err := a.db.CreateTask(ctx, store.CreateTaskInput{GroupID: g.ID, ActorID: "user", Title: "unlinked", Acceptance: "valid CSV"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, path := range []string{task(g.ID, source.TopicID, unlinked.ID, 1), task(g.ID, "other", linked.Task.ID, 1), task(other.ID, source.TopicID, linked.Task.ID, 1)} {
 		decoded[map[string]any](t, a.request("PUT", path, body, "task"), 404)
 		decoded[map[string]any](t, a.request("GET", path, ""), 404)
 	}
 	stale := task(g.ID, source.TopicID, linked.Task.ID, 2)
 	decoded[map[string]any](t, a.request("PUT", stale, body, "task"), 409)
-	endpoint := task(g.ID, source.TopicID, linked.Task.ID, 1)
 	first := a.request("PUT", endpoint, body, "task")
 	decoded[map[string]any](t, first, 200)
 	w := a.request("GET", threadStateURL(g.ID, source.TopicID), "")

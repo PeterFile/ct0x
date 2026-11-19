@@ -26,20 +26,22 @@ func threadStateCoverageBody(expected, slot int, kind string, source domain.Mess
 
 func TestThreadStateCoverageCommand(t *testing.T) {
 	a := openMessageAPI(t, "")
-	if !threadStateInstalled(t, a) {
-		t.Skip("requires the candidate migration overlay")
-	}
-	g, foreign := newGroup(t, a, "export"), newGroup(t, a, "foreign")
+	g := newGroup(t, a, "export")
 	const topic = "exact export"
 	url := threadStateURL(g.ID, topic)
 	source := threadStateMessage(t, a, g.ID, topic, "Keep old CSV support.")
 	anchor := threadStateMessage(t, a, g.ID, topic, "First checkpoint.")
-	later := threadStateMessage(t, a, g.ID, topic, "Later checkpoint.")
-	wrongTopic := threadStateMessage(t, a, g.ID, "", "Do not cross topics.")
-	wrongGroup := threadStateMessage(t, a, foreign.ID, topic, "Do not cross groups.")
 	body := func(expected, slot int, coveredJSON string) string {
 		return threadStateCoverageBody(expected, slot, "constraint", source, coveredJSON)
 	}
+	if !threadStateInstalled(t, a) {
+		assertThreadStateUnavailable(t, a, url, body(0, 0, fmt.Sprintf("%q", anchor.ID)))
+		return
+	}
+	foreign := newGroup(t, a, "foreign")
+	later := threadStateMessage(t, a, g.ID, topic, "Later checkpoint.")
+	wrongTopic := threadStateMessage(t, a, g.ID, "", "Do not cross topics.")
+	wrongGroup := threadStateMessage(t, a, foreign.ID, topic, "Do not cross groups.")
 	without := a.request("PUT", url, body(0, 0, ""), "old-caller")
 	if got := decoded[domain.ThreadStateSnapshot](t, without, 200); got.CoveredThrough != nil {
 		t.Fatalf("a confirmation source became coverage: %+v", got)
@@ -95,16 +97,18 @@ func TestThreadStateCoverageCommand(t *testing.T) {
 
 func TestThreadStateCoveragePreparation(t *testing.T) {
 	a := openMessageAPI(t, "")
-	if !threadStateInstalled(t, a) {
-		t.Skip("requires the candidate migration overlay")
-	}
-	g, foreign := newGroup(t, a, "export"), newGroup(t, a, "foreign")
+	g := newGroup(t, a, "export")
 	const topic = "export"
 	url := threadStateURL(g.ID, topic)
 	old := threadStateMessage(t, a, g.ID, topic, "必须兼容旧版 CSV")
 	pre := threadStateMessage(t, a, g.ID, topic, "PRE_COVERED_BODY")
 	anchor := threadStateMessage(t, a, g.ID, topic, "COVERAGE_ANCHOR_BODY")
 	body := threadStateCoverageBody(0, 0, "constraint", old, fmt.Sprintf("%q", anchor.ID))
+	if !threadStateInstalled(t, a) {
+		assertThreadStateUnavailable(t, a, url, body)
+		return
+	}
+	foreign := newGroup(t, a, "foreign")
 	decoded[domain.ThreadStateSnapshot](t, a.request("PUT", url, body, "mark"), 200)
 	first := threadStateMessage(t, a, g.ID, topic, "Only apply the CSV change to exports.")
 	threadStateMessage(t, a, g.ID, "another topic", "PRIVATE_OTHER_TOPIC")

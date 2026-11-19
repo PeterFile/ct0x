@@ -17,7 +17,6 @@ func TestThreadStateSchedulerRepreparesBeforeClaim(t *testing.T) {
 	for _, name := range []string{"first confirmation", "invalidate prepared plan"} {
 		t.Run(name, func(t *testing.T) {
 			f := newPrepareFixture(t)
-			requireThreadStateFixture(t, f)
 			ctx, stop := context.WithTimeout(t.Context(), 15*time.Second)
 			defer stop()
 			thread := domain.ThreadRef{GroupID: f.group.ID, TopicID: f.trigger.TopicID}
@@ -33,6 +32,20 @@ func TestThreadStateSchedulerRepreparesBeforeClaim(t *testing.T) {
 				return err
 			}
 			expected, action, content := int64(0), "set", "first confirmed plan"
+			if !threadStateFixtureInstalled(t, f) {
+				if err := update(expected, action, content); !errors.Is(err, store.ErrThreadStateUnavailable) {
+					t.Fatalf("state update without E2 schema: %v", err)
+				}
+				got := assertLegacyThreadPreparation(t, f, f.pending)
+				f.assertQueued(t)
+				turn, err := f.s.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group.ID, DeliveryID: f.pending.Delivery.ID, MaxActive: 1,
+					PreparedThreadState: got.PreparedThreadState, ResourceKeys: got.ResourceKeys})
+				if err != nil || turn.ID == "" || turn.DeliveryID != f.pending.Delivery.ID || turn.State != domain.TurnStateStarting {
+					t.Fatalf("legacy delivery could not be claimed: %+v, %v", turn, err)
+				}
+				t.Log("unregistered E2: ClaimTurn accepts legacy preparation after a rejected state update")
+				return
+			}
 			if name == "invalidate prepared plan" {
 				if err := update(0, "set", "old plan"); err != nil {
 					t.Fatal(err)

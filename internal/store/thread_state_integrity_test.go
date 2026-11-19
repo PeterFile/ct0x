@@ -7,21 +7,43 @@ import (
 	"agentworkspace/internal/domain"
 )
 
-func requireThreadStateStoreFixture(t *testing.T) *Store {
+func assertUnregisteredThreadState(t *testing.T, s *Store, source domain.Message) {
 	t.Helper()
-	if threadStateSchemaVersion == 0 {
-		t.Skip("requires the candidate migration overlay")
+	ctx := t.Context()
+	thread := domain.ThreadRef{GroupID: source.GroupID, TopicID: source.TopicID}
+	scope := domain.ThreadStateScope{ThreadRef: thread}
+	if got, err := s.SetLocalThreadState(ctx, scope, ThreadStateUpdate{Kind: domain.ThreadStateGoal,
+		Action: "set", Content: source.Content, SourceMessage: source.ID}, "unregistered"); !errors.Is(err, ErrThreadStateUnavailable) || got.Revision != 0 || got.Records != nil || got.CoveredThrough != nil {
+		t.Fatalf("unregistered E2 returned a write result: %+v, %v", got, err)
 	}
-	s, _ := openTestStore(t)
-	return s
+	if got, err := s.GetLocalThreadState(ctx, scope, 0); !errors.Is(err, ErrThreadStateUnavailable) || got.Records != nil || got.CoveredThrough != nil {
+		t.Fatalf("unregistered E2 returned a read result: %+v, %v", got, err)
+	}
+	trigger, err := s.CreateMessage(ctx, MessageRequest{GroupID: thread.GroupID, TopicID: thread.TopicID, ActorID: "user", Content: "legacy follow-up"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if history, state, err := s.LoadThreadPreparation(ctx, thread, trigger.ID, 50); err != nil || state != nil || len(history) != 1 || history[0].ID != source.ID {
+		t.Fatalf("unregistered E2 changed legacy history or invented state: %+v, %+v, %v", history, state, err)
+	}
+	var clean bool
+	if err := s.db.QueryRow(`SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE name IN ('thread_state_revisions','thread_state_heads'))
+	 AND NOT EXISTS(SELECT 1 FROM mutation_idempotency WHERE operation='set_thread_state')`).Scan(&clean); err != nil || !clean {
+		t.Fatalf("unregistered E2 persisted state or a receipt: clean=%v, %v", clean, err)
+	}
+	t.Log("unregistered E2: commands return unavailable and scoped legacy history has no state")
 }
 
 func TestThreadStateMissingOwnMarker(t *testing.T) {
-	s := requireThreadStateStoreFixture(t)
+	s, _ := openTestStore(t)
 	g := group(t, s)
 	m, err := s.CreateLocalUserMessage(t.Context(), MessageRequest{GroupID: g.ID, ActorID: "user", Content: "trigger"}, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if threadStateSchemaVersion == 0 {
+		assertUnregisteredThreadState(t, s, m)
+		return
 	}
 	thread := domain.ThreadRef{GroupID: g.ID}
 	// Damage only E2. The test must not depend on E1's message projection guard.
@@ -43,12 +65,16 @@ func TestThreadStateHeadMismatchFailsClosed(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := t.Context()
-			s := requireThreadStateStoreFixture(t)
+			s, _ := openTestStore(t)
 			g := group(t, s)
 			scope := domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: g.ID, TopicID: "export"}}
 			m, err := s.CreateLocalUserMessage(ctx, MessageRequest{GroupID: g.ID, TopicID: scope.TopicID, ActorID: "user", Content: "confirm the export"}, nil)
 			if err != nil {
 				t.Fatal(err)
+			}
+			if threadStateSchemaVersion == 0 {
+				assertUnregisteredThreadState(t, s, m)
+				return
 			}
 			for i, key := range []string{"first", "second"} {
 				_, err := s.SetLocalThreadState(ctx, scope, ThreadStateUpdate{ExpectedRevision: int64(i), Slot: i,
@@ -86,7 +112,7 @@ func TestThreadStateStoredEvidenceFailsClosed(t *testing.T) {
 		{"earlier revision", "thread_state_no_delete", `DELETE FROM thread_state_revisions WHERE group_id=? AND revision=1`, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := requireThreadStateStoreFixture(t)
+			s, _ := openTestStore(t)
 			g := group(t, s)
 			scope := domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: g.ID}}
 			ids := make([]string, 0, 4)
@@ -94,6 +120,10 @@ func TestThreadStateStoredEvidenceFailsClosed(t *testing.T) {
 				m, err := s.CreateLocalUserMessage(t.Context(), MessageRequest{GroupID: g.ID, ActorID: "user", Content: text}, nil)
 				if err != nil {
 					t.Fatal(err)
+				}
+				if threadStateSchemaVersion == 0 {
+					assertUnregisteredThreadState(t, s, m)
+					return
 				}
 				u := ThreadStateUpdate{ExpectedRevision: int64(i), Kind: domain.ThreadStateGoal, Action: "set", Content: text, SourceMessage: m.ID}
 				if i >= 2 {

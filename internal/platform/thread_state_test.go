@@ -7,18 +7,32 @@ import (
 	"testing"
 
 	"agentworkspace/internal/domain"
+	"agentworkspace/internal/scheduler"
 	"agentworkspace/internal/store"
 )
 
-func requireThreadStateFixture(t *testing.T, f *prepareFixture) {
+func threadStateFixtureInstalled(t *testing.T, f *prepareFixture) bool {
 	t.Helper()
 	var installed bool
 	if err := f.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='thread_state_revisions')`).Scan(&installed); err != nil {
 		t.Fatal(err)
 	}
-	if !installed {
-		t.Skip("requires the candidate migration overlay")
+	return installed
+}
+
+func assertLegacyThreadPreparation(t *testing.T, f *prepareFixture, pending store.PendingDelivery) scheduler.PreparedExecution {
+	t.Helper()
+	got, err := f.preparer(t).Prepare(t.Context(), pending)
+	if err != nil || got.Executor == nil || got.PreparedThreadState != nil || strings.Contains(got.Request.Prompt, `"thread_state"`) {
+		t.Fatalf("ordinary preparation without E2 schema changed: stamp=%+v, err=%v, prompt=%q", got.PreparedThreadState, err, got.Request.Prompt)
 	}
+	pack := decodePreparation(t, got.Request.Prompt)
+	if pack.Scope.GroupID != pending.GroupID || pack.Scope.ConversationID != pending.Delivery.ConversationID ||
+		len(pack.Pending) != 1 || pack.Pending[0].ID != pending.Delivery.MessageID {
+		t.Fatalf("legacy prompt lost the exact delivery trigger: %+v", pack)
+	}
+	t.Log("unregistered E2: ordinary Prepare retains the exact trigger without a Thread state stamp")
+	return got
 }
 
 func TestThreadStatePreparationFailsClosed(t *testing.T) {
@@ -31,10 +45,14 @@ func TestThreadStatePreparationFailsClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			f := newPrepareFixture(t)
-			requireThreadStateFixture(t, f)
 			thread := domain.ThreadRef{GroupID: f.group.ID, TopicID: "wrong topic"}
 			if history, state, err := f.s.LoadThreadPreparation(ctx, thread, f.trigger.ID, 50); history != nil || state != nil || !errors.Is(err, store.ErrNotFound) {
 				t.Fatalf("changed or missing authoritative scope fell back: %+v, %+v, %v", history, state, err)
+			}
+			if !threadStateFixtureInstalled(t, f) {
+				assertLegacyThreadPreparation(t, f, f.pending)
+				f.assertQueued(t)
+				return
 			}
 			f.exec(t, tc.damage)
 			p := f.preparer(t)
@@ -50,7 +68,7 @@ func TestThreadStatePreparationFailsClosed(t *testing.T) {
 func TestThreadStateRoleLoadingBoundary(t *testing.T) {
 	ctx := context.Background()
 	f := newRolePrepareFixture(t)
-	requireThreadStateFixture(t, f.prepareFixture)
+	installed := threadStateFixtureInstalled(t, f.prepareFixture)
 	p := f.state.Provenance
 	thread := domain.ThreadRef{GroupID: p.GroupID, TopicID: p.TopicID}
 	scope := domain.ThreadStateScope{ThreadRef: thread, TaskID: p.TaskID, TaskRevision: p.TaskRevision}
@@ -59,9 +77,20 @@ func TestThreadStateRoleLoadingBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewLocalUser(f.s).SetThreadState(ctx, scope, store.ThreadStateUpdate{
+	_, err = NewLocalUser(f.s).SetThreadState(ctx, scope, store.ThreadStateUpdate{
 		Kind: domain.ThreadStateConstraint, Action: "set", Content: content, SourceMessage: m.ID,
-	}, "state"); err != nil {
+	}, "state")
+	if !installed {
+		if !errors.Is(err, store.ErrThreadStateUnavailable) {
+			t.Fatalf("Task state command without E2 schema: %v", err)
+		}
+		if got, err := f.s.LoadAuthorizedTaskThreadState(ctx, f.state); got != nil || err != nil {
+			t.Fatalf("Task preparation without E2 schema returned state: %+v, %v", got, err)
+		}
+		assertLegacyThreadPreparation(t, f.prepareFixture, f.ordinary)
+		return
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := f.s.LoadAuthorizedTaskThreadState(ctx, f.state)
