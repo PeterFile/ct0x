@@ -102,11 +102,17 @@ function mergeRuns(previous: AgentRunPage<AgentRunSummary> | null, next: AgentRu
   return before && previous ? { ...next, items: unique([...previous.items, ...next.items], runKey) } : next;
 }
 type TimelineRead = AgentRunDetail & { pollHead: boolean };
+function runStatusChanged(head: AgentRunDetail, older: AgentRunDetail) {
+  return head.run.state !== older.run.state
+    || (head.receipt?.observed_terminal ?? "") !== (older.receipt?.observed_terminal ?? "");
+}
 function mergeTimeline(previous: TimelineRead | null, next: TimelineRead, { before, through }: ReadWindow): TimelineRead {
-  // Only a head read can advance the run status/receipt and stop polling a live run.
+  // Older observations can request a recheck, but only a newest read supplies run metadata.
   const head = before && previous ? previous : next;
+  let pollHead = head.pollHead;
   let { items, next_cursor } = next.timeline;
   if (before && previous) {
+    pollHead ||= runStatusChanged(previous, next);
     items = [...previous.timeline.items, ...items];
   } else if (!through && previous && next_cursor) {
     // Only retain a cached tail when the fresh window ends at an exact shared event.
@@ -125,11 +131,12 @@ function mergeTimeline(previous: TimelineRead | null, next: TimelineRead, { befo
     seen.add(id);
     return true;
   });
-  return { ...head, timeline: { items, next_cursor } };
+  return { ...head, pollHead, timeline: { items, next_cursor } };
 }
 async function readTimeline(run: AgentRunIdentity, { before, through }: ReadWindow, signal: AbortSignal): Promise<TimelineRead> {
   const head = await getAgentRun(run, before, signal);
-  const pollHead = hasPendingEvidence(head);
+  // A newest-only read consumes any recheck hint and bases further polling on its own evidence.
+  let pollHead = hasPendingEvidence(head);
   if (!through) return { ...head, pollHead };
   // Explicit refresh revisits the loaded range for older action receipts. The first
   // page supplies run metadata; later pages may observe completion before that page does.
@@ -141,7 +148,9 @@ async function readTimeline(run: AgentRunIdentity, { before, through }: ReadWind
     const cursor = timeline.next_cursor;
     if (cursors.has(cursor)) throw new ApiError("运行时间线无法继续分页，请重试。", 200, "invalid_response");
     cursors.add(cursor);
-    timeline = (await getAgentRun(run, cursor, signal)).timeline;
+    const older = await getAgentRun(run, cursor, signal);
+    pollHead ||= runStatusChanged(head, older);
+    timeline = older.timeline;
     items.push(...timeline.items);
   }
   return { ...head, pollHead, timeline: { ...timeline, items } };
@@ -265,7 +274,9 @@ function RunEvidence({ active, selected, heading }: { active: boolean; selected:
       <ReadButton active={active} show={Boolean(cursor)} focusTarget={timelineHeading} aria-disabled={read.pending}
         onClick={() => { if (cursor) read.load({ before: cursor }); }}>加载更早证据</ReadButton>
       {displayEntries.length ? <ol className="run-log-timeline" aria-label="事件时间线" role="list">
-        {displayEntries.map(entry => <li key={entry.id}><EvidenceEntry entry={entry} groupId={group_id} active={active} /></li>)}
+        {displayEntries.map(entry => <li key={entry.id}>
+          <EvidenceEntry entry={entry} groupId={group_id} active={active} focusTarget={timelineHeading} />
+        </li>)}
       </ol> : <p className="run-log-note">本轮暂无可查看的时间线记录。</p>}
     </> : null}
   </>;
@@ -291,8 +302,18 @@ function RunReceipt({ detail }: { detail: AgentRunDetail }) {
   </details>;
 }
 
-function EvidenceEntry({ entry, groupId, active }: { entry: AgentRunEntry; groupId: string; active: boolean }) {
-  return <article aria-label={`${entryTitle[entry.kind]} ${entry.id}`}>
+function EvidenceEntry({ entry, groupId, active, focusTarget }: {
+  entry: AgentRunEntry; groupId: string; active: boolean; focusTarget: FocusTarget;
+}) {
+  const article = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    const row = article.current;
+    return () => {
+      // Check focus before a window reset removes this event, not when the read starts.
+      if (row?.contains(row.ownerDocument.activeElement) && !row.closest("[hidden], [inert]")) focusTarget.current?.focus();
+    };
+  }, [focusTarget]);
+  return <article ref={article} aria-label={`${entryTitle[entry.kind]} ${entry.id}`}>
     <header className="run-log-bar"><h4>{entryTitle[entry.kind]}</h4><Time value={entry.created_at} /></header>
     {entry.kind === "trigger_message" || entry.kind === "published_reply" ? <>
       <MessageEvidence message={entry.message} groupId={groupId} active={active} />

@@ -330,6 +330,80 @@ it("does not finalize a live head on an older terminal observation, including af
   expect(transport).toHaveBeenCalledTimes(5);
 });
 
+it.each(["older", "through"])("rechecks an idle unknown head when a %s read observes reconciliation", async (mode) => {
+  vi.useFakeTimers();
+  const through = mode === "through", cursor = "older+/?";
+  const completed = { ...first, state: "succeeded" as const, updated_at: stamp(11) };
+  const prior = reply("prior", "先前发言", first), input = trigger("input", "较早的触发消息");
+  const final = reply("final", "对账后的最终发言", completed, stamp(11)), recheck = deferred<Response>();
+  transport.mockResolvedValueOnce(page([first])).mockResolvedValueOnce(json(view(first, [prior], cursor)));
+  if (through) {
+    // Load the refresh anchor; the explicit refresh's first page still has the unknown head.
+    transport.mockResolvedValueOnce(json(view(first, [input], "past-input")))
+      .mockResolvedValueOnce(json(view(first, [prior], cursor)));
+  }
+  transport.mockResolvedValueOnce(json(view(completed, [input], "past-input", successReceipt)))
+    .mockReturnValueOnce(recheck.promise);
+  render(<AgentRunLogPage active />);
+  await flush();
+  fireEvent.click(pick(first));
+  await flush();
+  const olderButton = evidence().getByRole("button", { name: "加载更早证据" });
+  if (through) {
+    fireEvent.click(olderButton);
+    await flush();
+    expect(timeline().getByText(input.message.preview)).toBeVisible();
+  }
+  await tick(10000);
+  expect(transport).toHaveBeenCalledTimes(through ? 3 : 2);
+
+  fireEvent.click(through ? evidence().getByRole("button", { name: "刷新本轮证据" }) : olderButton);
+  await flush();
+  const observedAt = through ? 4 : 2;
+  expect(transport).toHaveBeenCalledTimes(observedAt + 1);
+  if (through) expect(urlAt(observedAt - 1).href).toBe(urlAt(1).href);
+  expect(urlAt(observedAt).searchParams.get("before")).toBe(cursor);
+  expect(timeline().getByText(input.message.preview)).toBeVisible();
+  expect(evidence().getByText("运行结果未知", { selector: ".run-log-state" })).toBeVisible();
+  expect(evidence().getByText("运行回执（未提供）")).toBeVisible();
+  expect(timeline().queryByText(final.message.preview)).not.toBeInTheDocument();
+
+  await tick();
+  expect(transport).toHaveBeenCalledTimes(observedAt + 2);
+  expect(urlAt(observedAt + 1).href).toBe(urlAt(1).href);
+  await act(async () => recheck.resolve(json(view(completed, [final, prior], "after-prior", successReceipt))));
+  expect(evidence().getByText("运行成功", { selector: ".run-log-state" })).toBeVisible();
+  expect(timeline().getByText(final.message.preview)).toBeVisible();
+  expect(within(expand(evidence().getByText("查看运行回执"))).getByText("报告成功")).toBeVisible();
+  expect(timelineLabels()).toEqual([`触发消息 ${input.id}`, `群内发言 ${prior.id}`, `群内发言 ${final.id}`]);
+  await tick(15000);
+  expect(transport).toHaveBeenCalledTimes(observedAt + 2);
+});
+
+it("does not repeat the newest recheck if it does not confirm an older terminal observation", async () => {
+  vi.useFakeTimers();
+  const unknown = { ...successReceipt, outcome: "unknown" as const, observed_terminal: "" as const, output_complete: false };
+  const observed = { ...unknown, observed_terminal: "succeeded" as const };
+  const head = view(first, [reply("prior", "先前发言", first)], "older", unknown);
+  transport.mockResolvedValueOnce(page([first])).mockResolvedValueOnce(json(head))
+    .mockResolvedValueOnce(json(view(first, [trigger("input", "触发消息")], "", observed))).mockResolvedValueOnce(json(head));
+  render(<AgentRunLogPage active />);
+  await flush();
+  fireEvent.click(pick(first));
+  await flush();
+  fireEvent.click(evidence().getByRole("button", { name: "加载更早证据" }));
+  await flush();
+  await tick();
+  expect(transport).toHaveBeenCalledTimes(4);
+  expect(urlAt(3).href).toBe(urlAt(1).href);
+  expect(evidence().getByText("运行结果未知", { selector: ".run-log-state" })).toBeVisible();
+  const receipt = within(expand(evidence().getByText("查看运行回执")));
+  expect(receipt.getByText("未记录")).toBeVisible();
+  expect(receipt.queryByText("报告成功")).not.toBeInTheDocument();
+  await tick(15000);
+  expect(transport).toHaveBeenCalledTimes(4);
+});
+
 it("only polls the newest page after loading deep history and reuses the verified older frontier", async () => {
   vi.useFakeTimers();
   const live = { ...first, state: "running" as const };
@@ -403,6 +477,41 @@ it("uses the new cursor rather than joining disjoint timeline windows", async ()
   await flush();
   expect(urlAt(4).searchParams.get("before")).toBe("new-cursor");
   expect(timelineLabels()).toEqual([`触发消息 ${input.id}`, `群内发言 ${prior.id}`, `群内发言 ${middle.id}`, `群内发言 ${newest.id}`]);
+});
+
+it.each([false, true])("hands off focus on a disjoint newest window only when still in the removed event (moved away: %s)", async (movedAway) => {
+  vi.useFakeTimers();
+  const live = { ...first, state: "running" as const };
+  const old = reply("old-long", "旧消息摘录", live, stamp(3), true);
+  const newest = reply("new", "新窗口的发言", live, stamp(5));
+  const fullRead = deferred<Response>(), poll = deferred<Response>();
+  transport.mockResolvedValueOnce(page([live])).mockResolvedValueOnce(json(view(live, [old], "old-cursor")))
+    .mockReturnValueOnce(fullRead.promise).mockReturnValueOnce(poll.promise);
+  render(<AgentRunLogPage active />);
+  await flush();
+  fireEvent.click(pick(live));
+  await flush();
+  const oldEvent = timeline().getByRole("article", { name: `群内发言 ${old.id}` });
+  const fullButton = within(oldEvent).getByRole("button", { name: "读取完整消息 old-long" });
+  fullButton.focus();
+  fireEvent.click(fullButton);
+  expect(fullButton).toHaveFocus();
+  const fullSignal = transport.mock.calls[2][1]?.signal;
+  expect(fullSignal?.aborted).toBe(false);
+  const eventControl = movedAway ? within(oldEvent).getByText("查看消息标识") : fullButton;
+  eventControl.focus();
+
+  await tick();
+  expect(transport).toHaveBeenCalledTimes(4);
+  expect(urlAt(3).href).toBe(urlAt(1).href);
+  expect(eventControl).toHaveFocus();
+  const refresh = evidence().getByRole("button", { name: "刷新本轮证据" });
+  if (movedAway) refresh.focus();
+  await act(async () => poll.resolve(json(view(live, [newest], "new-cursor"))));
+  expect(oldEvent).not.toBeInTheDocument();
+  expect(timelineLabels()).toEqual([`群内发言 ${newest.id}`]);
+  expect(fullSignal?.aborted).toBe(true);
+  expect(movedAway ? refresh : evidence().getByRole("heading", { name: "事件时间线" })).toHaveFocus();
 });
 
 it("suspends pending-result refresh while hidden, then updates from a real action receipt and keeps the disclosure", async () => {
