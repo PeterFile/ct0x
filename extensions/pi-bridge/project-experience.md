@@ -13,10 +13,10 @@
 
 ## 发行与已知阻塞
 
-现有运行时先用持久 Turn claim 发证，再绑定本轮传输。私有配置中的 `project_experience_tools` 是**已有**发证的有序投影，不是授权。Go 和 Pi 均校验同一份 0600 配置的 SHA-256，并拒绝同时出现 `continue_work`、`intake_assessment_action` 或 `investigation_tools` 的经验配置；保留 `discussion_only_excerpt`。Pi 的原生 `--tools` 与扩展注册使用同一精确名单。不修改历史原文或经验 Store，不增加授权表或迁移。
+可信运行时在构造或启动适配器前，用持久 Turn claim 签发新 bearer，同时固定本轮的原生传输投影。已签发的 bearer 不可重新绑定或扩权，即使还没有首个原生事件。私有配置中的 `project_experience_tools` 是已签发权限的有序投影，不是授权。Go 和 Pi 均校验同一份 0600 配置的 SHA-256，并拒绝同时出现 `continue_work`、`intake_assessment_action` 或 `investigation_tools` 的经验配置；保留 `discussion_only_excerpt`。Pi 的原生 `--tools` 与扩展注册使用同一精确名单。不修改历史原文或经验 Store，不增加授权表或迁移。
 
-只有在签发时标为全新 Pi 经验轮、且 claim 仍未启动的 bearer 才可调用可信进程内 `MemberTools.BindPiProjectExperience` 完成绑定。若启用成果读取，`MemberTools.IssueFreshPiProjectExperience` 在签发时冻结独立批准的 `ArtifactVersionRef`，并要求已有的 `read_artifact` 操作和同一 Store 的真实 `MemberArtifactGrant`。在首次绑定前先比较 pin 与已签发的 tuple，再在 claim 群组中核对其存在性；绑定后不可改选。调用依然经过现有 `ReadArtifact` 的版本、blob 哈希和授权围栏；撤销 bearer 或持久 claim 失效后拒绝后续读取。pin 不改变 E3 对经验元数据的原有可见性规则，命中、评审记录、群组成员资格和用户下载均不授予字节读取权限。
+若启用成果读取，可信进程内 `MemberTools.IssueFreshPiProjectExperience` 要求独立批准的 `ArtifactVersionRef`、`read_artifact` 操作及同一 Store 的真实 `MemberArtifactGrant`。签发时在 claim 群组中核对确切版本的存在性，并将 pin 固定在 grant 副本上。直接成果读取与 E3 的经验验证共用读取边界，在访问 blob 前拒绝不匹配的版本；如果经验页包含未批准的引用，则整页拒绝，不改变筛选或排名。匹配的读取仍须校验现有版本、blob 哈希及授权；撤销 bearer 或持久 claim 失效后拒绝后续读取。命中、评审记录、群组成员资格和用户下载均不授予字节读取权限。
 
-**普通启动没有成果批准来源。** 它只签发历史权限，始终绑定空成果 pin，不向模型注册 `read_artifact`。调查启动借用的 blob 服务有独立的正式调查范围，不能借给普通轮。受控测试在真实 SQLite claim 上签发一个独立批准的固定 tuple；不提供产品批准策略。普通轮的完整原生接手验收仍需可信批准来源接入此签发接缝；不能用 `read_history`、经验命中或当前成果指针补上。
+**普通启动没有成果批准来源。** 它只签发历史权限，成果 pin 为空，不向模型注册 `read_artifact`。调查启动借用的 blob 服务有独立的正式调查范围，不能借给普通轮。受控测试在真实 SQLite claim 上签发一个独立批准的固定 tuple；不提供产品批准策略。普通轮的完整原生接手验收仍需可信批准来源接入此签发接缝；不能用 `read_history`、经验命中或当前成果指针补上。
 
 安装态测试依赖 #218 `372cc69e13345e82739a91552286f8b99772afb4` 的 `projectIdentitySchema` 先于 #214 `a091ea68ff93b61c47ba38ba404195148a5c78da` 的 `projectExperienceSchema`。公共登记和编号仍由 B 决定。本片基于 #214 的冻结 `MemberTools.LookupProjectExperiences`，不要求修改 E 或 D 的文件。

@@ -285,11 +285,6 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 			config.cleanup()
 		}
 	}()
-	if freshPiExperience {
-		if err := r.tools.BindPiProjectExperience(ctx, token, claim, domain.ArtifactVersionRef{}); err != nil {
-			return unknown
-		}
-	}
 	config, err = r.createConfig(token)
 	if receipt := e.preflight(ctx, request, claim, token, config); receipt != nil {
 		return *receipt
@@ -420,7 +415,7 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 		strictTools = entry.grants.Operations
 	}
 	var experienceTools []string
-	if entry.projectExperience.bound {
+	if entry.projectExperience.enabled {
 		var err error
 		experienceTools, err = provider.PiProjectExperienceToolNames(entry.grants.Operations)
 		if err != nil {

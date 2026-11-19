@@ -87,11 +87,12 @@ func nativeSessionPreparation(t *testing.T, purpose string) (*rolePrepareFixture
 }
 
 type nativeSessionFixtureCall struct {
-	binding store.NativeRunBinding
-	resume  *provider.NativeSessionReference
-	issued  provider.NativeMemberToolConfig
-	token   string
-	raw     provider.ExecutionReceipt
+	binding          store.NativeRunBinding
+	resume           *provider.NativeSessionReference
+	issued           provider.NativeMemberToolConfig
+	token            string
+	raw              provider.ExecutionReceipt
+	beforeFirstEvent func(context.Context)
 }
 
 func runNativeSessionFixture(t *testing.T, f *rolePrepareFixture, prepared scheduler.PreparedExecution, inspect func(*nativeSessionFixtureCall), outcome provider.Outcome, capture bool) (store.TurnClaim, provider.ExecutionReceipt, *nativeSessionFixtureCall) {
@@ -124,6 +125,9 @@ func runNativeSessionFixture(t *testing.T, f *rolePrepareFixture, prepared sched
 			prepareRoleOK(t, err)
 			if !slices.Equal(issued, names) {
 				t.Fatal("current token differs from the binding's actually issued tools")
+			}
+			if call.beforeFirstEvent != nil {
+				call.beforeFirstEvent(ctx)
 			}
 			idDigest := sha256.Sum256([]byte(req.RunID))
 			id := fmt.Sprintf("019f0000-0000-7000-8000-%x", idDigest[:6])
@@ -317,14 +321,30 @@ func TestNativeSessionRuntimeResumeRestartRebindAndUnknownBarrier(t *testing.T) 
 		if _, err := tools.TransportOperations(ctx, firstCall.token); !errors.Is(err, store.ErrMemberToolDenied) {
 			t.Fatal("old process token regained authority after native resume")
 		}
-		// The new resume bearer is live and the claim has not launched yet.
-		_, err := tools.TransportOperations(ctx, call.token)
-		prepareRoleOK(t, err)
-		turn, err := f.s.GetTurn(ctx, call.binding.GroupID, call.binding.TurnID)
-		prepareRoleOK(t, err)
-		claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
-		if err := tools.BindPiProjectExperience(ctx, call.token, claim, domain.ArtifactVersionRef{}); !errors.Is(err, store.ErrMemberToolDenied) {
-			t.Fatalf("the resume registration could add the fresh projection: %v", err)
+		call.beforeFirstEvent = func(ctx context.Context) {
+			// The adapter has been invoked, but the durable snapshot still
+			// looks prelaunch and the resume bearer is live.
+			turn, err := f.s.GetTurn(ctx, call.binding.GroupID, call.binding.TurnID)
+			prepareRoleOK(t, err)
+			if !memberToolTurnPrelaunch(turn) {
+				t.Fatal("fixture left the pre-event window")
+			}
+			claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+			grants := MemberToolGrants{Operations: []string{"search_history", "read_history"}}
+			var replacement string
+			var issueErr error
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				replacement, issueErr = tools.IssueFreshPiProjectExperience(ctx, claim, grants, domain.ArtifactVersionRef{})
+			}()
+			<-done
+			if replacement != "" || !errors.Is(issueErr, store.ErrMemberToolDenied) {
+				t.Fatalf("eligible issuance replaced an invoking resume bearer: %v", issueErr)
+			}
+			if _, err := tools.LookupNativeProjectExperiences(ctx, call.token, ProjectExperienceQuery{Query: "fixture"}); !errors.Is(err, store.ErrMemberToolDenied) {
+				t.Fatalf("the resume bearer acquired the fresh projection: %v", err)
+			}
 		}
 	}, provider.OutcomeSucceeded, true)
 	if decodeNativeFixtureBinding(t, second).ResumedFromTurnID != firstClaim.TurnID {

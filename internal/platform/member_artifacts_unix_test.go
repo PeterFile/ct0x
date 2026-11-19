@@ -180,6 +180,50 @@ func TestMemberArtifactExactHistoryCandidateAndOtherTopic(t *testing.T) {
 	f.counts(t, 1, 3, 3)
 }
 
+func TestMemberProjectExperienceArtifactPinFencesLookupVerification(t *testing.T) {
+	ctx := t.Context()
+	f := newMemberArtifactFixture(t, 64)
+	base := f.publish(t, PublishArtifactInput{Name: "approved"}, "approved bytes", "")
+	head := f.publish(t, PublishArtifactInput{ArtifactID: base.ArtifactID, ExpectedVersionID: base.ID}, "unapproved head", "")
+	other := f.publish(t, PublishArtifactInput{Name: "neighbor"}, "unapproved neighbor", "")
+	f.tools.Revoke(f.token)
+	open := f.grant.open
+	var opened []string
+	f.grant.open = func(hash string) (io.ReadCloser, error) {
+		opened = append(opened, hash)
+		return open(hash)
+	}
+	pin := domain.ArtifactVersionRef{ArtifactID: base.ArtifactID, VersionID: base.ID}
+	grants := MemberToolGrants{Operations: []string{"search_history", "read_history", "read_artifact"}, Artifacts: f.grant}
+	token, err := f.tools.IssueFreshPiProjectExperience(ctx, f.claim, grants, pin)
+	artifactsMust(t, err)
+	defer f.tools.Revoke(token)
+	if f.grant.pin != (domain.ArtifactVersionRef{}) || len(opened) != 0 {
+		t.Fatal("issuance modified the borrowed grant or opened a blob")
+	}
+	*f.grant = MemberArtifactGrant{} // The issued copy retains both owner and pin.
+
+	// Exercise the E lookup verifier without depending on schema registration.
+	verify := func(ref domain.ArtifactVersionRef) error {
+		page := ProjectExperiencePage{Items: []domain.ProjectExperienceHit{{
+			ProjectExperience: domain.ProjectExperience{AcceptedOutcome: &domain.ProjectExperienceOutcome{ArtifactVersionRef: ref}},
+		}}}
+		return f.tools.withAuthorized(ctx, token, "read_history", func(scope store.MemberToolScope, grants MemberToolGrants) error {
+			return f.tools.verifyProjectExperienceArtifacts(ctx, scope, grants.Artifacts, page)
+		})
+	}
+	for _, v := range []domain.ArtifactVersion{head, other} {
+		ref := domain.ArtifactVersionRef{ArtifactID: v.ArtifactID, VersionID: v.ID}
+		got, err := f.tools.ReadArtifact(ctx, token, MemberArtifactReadInput{ArtifactID: ref.ArtifactID, VersionID: ref.VersionID})
+		memberArtifactZeroError(t, got, err, store.ErrMemberToolDenied)
+		requireCapabilityDenied(t, verify(ref))
+	}
+	artifactsMust(t, verify(pin))
+	if len(opened) != 1 || opened[0] != base.BlobHash {
+		t.Fatalf("only the issued tuple should reach blobs, got %d opens", len(opened))
+	}
+}
+
 func TestMemberArtifactScopeAndMetadataPrecedeRealOpen(t *testing.T) {
 	f := newMemberArtifactFixture(t, 64)
 	base := f.publish(t, PublishArtifactInput{Name: "base"}, "base", "")

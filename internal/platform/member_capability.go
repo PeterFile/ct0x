@@ -39,8 +39,7 @@ type memberToolRegistration struct {
 	workReport         *taskWorkReportBinding
 	investigationOwner *investigationWorkOwnerBinding
 
-	projectExperienceAuthority memberProjectExperienceAuthority // Frozen at issuance; absent on legacy and native-session paths.
-	projectExperience          memberProjectExperienceTransport // Optional, one-time native projection before launch.
+	projectExperience memberProjectExperienceTransport // Frozen at issuance; absent on legacy and native-session paths.
 	// Frozen server capability facts are not grants or model-controlled input.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 	delegateCandidateIDs []string
@@ -69,7 +68,7 @@ func NewMemberTools(db *store.Store) *MemberTools {
 // Issue is called by the trusted runtime only AFTER ClaimTurn, never during preparation.
 // It refuses duplicate registrations rather than silently rotating a live capability.
 func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants) (string, error) {
-	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{}, memberProjectExperienceAuthority{})
+	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{}, memberProjectExperienceTransport{})
 }
 
 // IssueChatIntake is a separate trusted runtime seam, never a tool/API input.
@@ -80,14 +79,14 @@ func (s *MemberTools) IssueChatIntake(ctx context.Context, claim store.TurnClaim
 
 func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema, freshPiExperience bool) (string, error) {
 	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema,
-		memberProjectExperienceAuthority{eligible: freshPiExperience})
+		memberProjectExperienceTransport{enabled: freshPiExperience})
 }
 
 func chatIntakeOperations() []string {
 	return []string{"list_members", "read_channel", "send_message", "search_history", "read_history"}
 }
 
-func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema, experience memberProjectExperienceAuthority) (string, error) {
+func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema, experience memberProjectExperienceTransport) (string, error) {
 	grants.Operations = slices.Clone(grants.Operations)
 	if grants.Skills != nil {
 		// Freeze the source even if the caller overwrites its exported wrapper.
@@ -104,8 +103,8 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 	if !memberToolGrantsValid(grants) {
 		return "", store.ErrMemberToolDenied
 	}
-	if experience.eligible && (!experience.permits(grants.Operations) || schema.investigation ||
-		(purpose == domain.ChatIntakePurpose && s.continueWorkEnabled())) {
+	if experience.enabled && (!experience.permits(grants.Operations) || schema.investigation ||
+		(purpose != "generic" && purpose != domain.ChatIntakePurpose) || (purpose == domain.ChatIntakePurpose && s.continueWorkEnabled())) {
 		return "", store.ErrMemberToolDenied
 	}
 	s.mu.Lock()
@@ -122,8 +121,21 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 	if err != nil {
 		return "", err
 	}
-	if experience.eligible && !s.projectExperiencePrelaunch(ctx, scope) {
-		return "", store.ErrMemberToolDenied
+	if experience.enabled {
+		if !s.projectExperiencePrelaunch(ctx, scope) {
+			return "", store.ErrMemberToolDenied
+		}
+		if pin := experience.pin; pin != (domain.ArtifactVersionRef{}) {
+			if !grants.Artifacts.permitsVersion(pin) {
+				return "", store.ErrMemberToolDenied
+			}
+			// Resolve only the independently approved tuple. This checks Store
+			// metadata, not the blob. Every read rechecks both and the grant pin.
+			if _, _, err := s.db.ReadArtifactForTool(ctx, scope, pin.ArtifactID, pin.VersionID); err != nil {
+				return "", store.ErrMemberToolDenied
+			}
+			grants.Artifacts.pin = pin // Narrow only the cloned grant.
+		}
 	}
 	token := rand.Text()
 	key := sha256.Sum256([]byte(token))
@@ -156,8 +168,13 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 		}
 		candidate = &captured
 	}
+	if experience.enabled {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+	}
 	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate, purpose: purpose, intake: schema,
-		projectExperienceAuthority: experience}
+		projectExperience: experience}
 	return token, nil
 }
 

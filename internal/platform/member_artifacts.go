@@ -8,6 +8,7 @@ import (
 	"io"
 	"unicode/utf8"
 
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/store"
 )
 
@@ -17,6 +18,11 @@ import (
 type MemberArtifactGrant struct {
 	db   *store.Store
 	open func(string) (io.ReadCloser, error)
+	pin  domain.ArtifactVersionRef // Optional exact restriction on the issued copy.
+}
+
+func (g *MemberArtifactGrant) permitsVersion(ref domain.ArtifactVersionRef) bool {
+	return g != nil && (g.pin == (domain.ArtifactVersionRef{}) || g.pin == ref)
 }
 
 type MemberArtifactReadInput struct {
@@ -69,6 +75,11 @@ func (s *MemberTools) ReadArtifact(ctx context.Context, token string, input Memb
 var errMemberArtifactIO = errors.New("读取成果内容失败")
 
 func (s *MemberTools) readMemberArtifact(ctx context.Context, scope store.MemberToolScope, grant *MemberArtifactGrant, input MemberArtifactReadInput) (MemberArtifactReadResult, error) {
+	// Both direct reads and lookup verification must honor the issued pin
+	// before resolving metadata or opening a blob.
+	if !grant.permitsVersion(domain.ArtifactVersionRef{ArtifactID: input.ArtifactID, VersionID: input.VersionID}) {
+		return MemberArtifactReadResult{}, store.ErrMemberToolDenied
+	}
 	if input.MaxBytes == 0 {
 		input.MaxBytes = 8192
 	}
