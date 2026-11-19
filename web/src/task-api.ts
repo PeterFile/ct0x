@@ -138,6 +138,12 @@ function post<T>(path: string, body: object, key: string, valid: (value: unknown
 }
 const tasksPath = (groupId: string) => `/api/v1/groups/${encodeURIComponent(groupId)}/tasks`;
 const taskPath = (groupId: string, taskId: string) => `${tasksPath(groupId)}/${encodeURIComponent(taskId)}`;
+export function artifactContentPath(groupId: string, ref: ArtifactVersionRef): string | null {
+  const ids = [groupId, ref.artifact_id, ref.version_id];
+  if (ids.some(id => !id || id === "." || id === ".." || /[\ud800-\udfff]/u.test(id))) return null;
+  const [group, artifact, version] = ids.map(id => encodeURIComponent(id));
+  return `/api/v1/groups/${group}/artifacts/${artifact}/versions/${version}/content`;
+}
 export function registerTaskAttempt(groupId: string, taskId: string, input: TaskAttemptInput, key: string, signal?: AbortSignal) {
   const body = { expected_revision: input.expected_revision, expected_active_attempt_id: input.expected_active_attempt_id };
   return post(`${taskPath(groupId, taskId)}/attempts`, body, key,

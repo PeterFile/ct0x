@@ -201,6 +201,11 @@ describe("global pending reviews in the production entry", () => {
     expect(card(secondReview).getByText(`来源群组：${other.name}`)).toBeVisible();
     expect(card(secondReview).getByText(task.acceptance)).toBeVisible();
     expect(card(secondReview).getByText("任务版本 8")).toBeVisible();
+    fireEvent.click(card(secondReview).getByText("来源与版本标识", { selector: "summary" }));
+    const download = card(secondReview).getByRole("link", { name: "下载固定成果文件" });
+    const { group_id, artifact_versions: [ref] } = secondReview.submission;
+    expect(download).toHaveAttribute("href", `/api/v1/groups/${encodeURIComponent(group_id)}/artifacts/${encodeURIComponent(ref.artifact_id)}/versions/${encodeURIComponent(ref.version_id)}/content`);
+    expect(download).toHaveAttribute("download");
     expect(inbox().queryByText(/项目/)).not.toBeInTheDocument();
     expect(screen.queryByRole("main", { name: "讨论" })).not.toBeInTheDocument();
 
@@ -221,6 +226,27 @@ describe("global pending reviews in the production entry", () => {
     expect(card(firstReview).getByRole("button", { name: "接纳" })).toBeEnabled();
     expect(inbox().queryByText(secondReview.submission.summary)).not.toBeInTheDocument();
     expect(transport.mock.calls.some(([url]) => String(url).includes("/messages"))).toBe(false);
+  });
+
+  it("keeps pagination available after saving the only loaded review", async () => {
+    const network = transport.getMockImplementation()!;
+    transport.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === inboxPath) return Promise.resolve(page([firstReview], "earlier"));
+      if (url === `${inboxPath}&before=earlier`) return Promise.resolve(page([secondReview]));
+      if (url === reviewPath(firstReview)) return Promise.resolve(json(reviewReceipt(firstReview, "accepted", ""), 201));
+      return network(input, init);
+    });
+    await start(); fireEvent.click(rail("待我决定"));
+    await inbox().findByText(firstReview.submission.summary);
+    fireEvent.click(card(firstReview).getByRole("button", { name: "接纳" }));
+    await inbox().findByText(/已保存：接纳/);
+    expect(inbox().queryByRole("article")).not.toBeInTheDocument();
+    expect(inbox().queryByText("没有待验收事项。")).not.toBeInTheDocument();
+    const more = inbox().getByRole("button", { name: "加载更多待验收事项" });
+    expect(more).toBeEnabled();
+    fireEvent.click(more);
+    expect(await inbox().findByText(secondReview.submission.summary)).toBeVisible();
   });
 
   it("retains the loaded chat window, draft and focus, and retries an unconfirmed review with its original evidence", async () => {

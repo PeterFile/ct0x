@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiError, isDefinitiveRejection } from "./api";
-import { listPendingReviews, reviewTask } from "./task-api";
+import { artifactContentPath, listPendingReviews, reviewTask } from "./task-api";
 import type { PendingReview, TaskReview, TaskReviewInput } from "./task-api";
 import "./pending-reviews.css";
 
@@ -120,7 +120,7 @@ export function PendingReviews({ active }: { active: boolean }) {
     {page.pending ? <p role="status">正在载入待验收事项…</p> : null}
     {page.error ? <div role="alert"><p>{page.error}</p>
       <button type="button" onClick={() => void load(page.before)}>重试载入待验收事项</button></div> : null}
-    {!page.pending && !page.error && !items.length ? <p role="status">没有待验收事项。</p> : null}
+    {!page.pending && !page.error && !items.length && !page.next ? <p role="status">没有待验收事项。</p> : null}
     {items.length > 0 ? <ul className="review-inbox-list" aria-label="待验收事项">
       {items.map(item => {
         const id = itemKey(item), state = writes.get(id);
@@ -177,9 +177,12 @@ function ReviewCard({ item, reason, blocked, onReason, onDecision, children }: {
         {item.topic_id ? <><dt>话题 ID</dt><dd>{item.topic_id}</dd></> : null}
         <dt>提交 ID</dt><dd>{submission.id}</dd>
         {submission.artifact_versions.length > 0 ? <><dt>冻结成果版本</dt><dd><ul>
-          {submission.artifact_versions.map(ref => <li key={JSON.stringify([ref.artifact_id, ref.version_id])}>
-            {ref.artifact_id} / {ref.version_id}
-          </li>)}
+          {submission.artifact_versions.map(ref => {
+            const href = artifactContentPath(submission.group_id, ref);
+            return <li key={JSON.stringify([ref.artifact_id, ref.version_id])}>
+              <span>{ref.artifact_id} / {ref.version_id}</span>{href ? <> · <a href={href} download>下载固定成果文件</a></> : null}
+            </li>;
+          })}
         </ul></dd></> : null}
       </dl>
     </details>
