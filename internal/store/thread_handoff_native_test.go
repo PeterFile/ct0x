@@ -39,7 +39,7 @@ type nativeHandoffFixture struct {
 	preparer                                      *platform.Preparer
 	member                                        domain.Member
 	root, runtime, config, workspaces, executable string
-	endpoint                                      string
+	dbPath, endpoint                              string
 	handler                                       http.Handler
 }
 
@@ -48,7 +48,7 @@ func newNativeHandoffFixture(t *testing.T, withSchema bool) *nativeHandoffFixtur
 	f := &nativeHandoffFixture{root: t.TempDir()}
 	// Borrow F's real unregistered fixture fragments, not production migration slots.
 	db, path := store.NativeThreadHandoffFixture(t, withSchema)
-	f.db = db
+	f.db, f.dbPath = db, path
 	var err error
 	f.raw, err = sql.Open("sqlite", path)
 	handoffOK(t, err)
@@ -135,13 +135,20 @@ func (f *nativeHandoffFixture) assertSavedOnly(t *testing.T, a domain.DecisionAn
 
 func TestNativeThreadHandoffRequiresInstalledFAndVerifiedAdapter(t *testing.T) {
 	for _, tc := range []struct {
-		name, version string
-		schema, ready bool
+		name, version                string
+		schema, missingLedger, ready bool
 	}{
-		{"v30", "0.166.0", false, false}, {"unverified", "0.166.1", true, false}, {"ready", "0.166.0", true, true},
+		{"v30", "0.166.0", false, false, false},
+		{"unverified", "0.166.1", true, false, false},
+		{"missing-ack-ledger", "0.166.0", true, true, false},
+		{"ready", "0.166.0", true, false, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newNativeHandoffFixture(t, tc.schema)
+			if tc.missingLedger {
+				_, err := f.raw.Exec(`DROP TABLE decision_thread_answer_consumptions`)
+				handoffOK(t, err)
+			}
 			f.configure(t, tc.version, false)
 			prepare, err := f.preparer.EnableThreadDecisionHandoff(t.Context())
 			if (err == nil) != tc.ready || (prepare != nil) != tc.ready {

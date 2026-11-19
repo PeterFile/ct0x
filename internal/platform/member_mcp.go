@@ -27,7 +27,16 @@ func (s *MemberTools) TransportOperations(ctx context.Context, token string) ([]
 func (s *MemberTools) TransportProfile(ctx context.Context, token string) (MemberToolTransportProfile, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	entry, found := s.capabilities[sha256.Sum256([]byte(token))]
+	key := sha256.Sum256([]byte(token))
+	if ack := s.threadDecisionAcks[key]; ack != nil {
+		if !ack.live() || ctx.Err() != nil {
+			return MemberToolTransportProfile{}, store.ErrMemberToolDenied
+		}
+		// Codex discovers tools before turn/start. This is not permission to
+		// acknowledge anything before the scheduler commits acceptance.
+		return MemberToolTransportProfile{Operations: []string{AckThreadDecisionOperation}}, nil
+	}
+	entry, found := s.capabilities[key]
 	if !found {
 		return MemberToolTransportProfile{}, store.ErrMemberToolDenied
 	}

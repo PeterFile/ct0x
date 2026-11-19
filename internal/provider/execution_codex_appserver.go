@@ -145,6 +145,10 @@ func (e codexAppServerExecutor) execute(ctx context.Context, request ExecuteRequ
 	cmd := exec.Command(e.path, codexAppServerArguments()...)
 	cmd.Dir, cmd.Stdin, cmd.Stdout, cmd.Stderr = request.CWD, stdinR, stdoutW, stderrW
 	cmd.Env = env
+	if member != nil && member.bindThreadDecisionContext != nil && !member.bindThreadDecisionContext(ctx) {
+		r.Outcome, r.Reason = OutcomeUnknown, "话题答复续轮的工具会话已失效，需对账"
+		return r
+	}
 	if cmd.Start() != nil {
 		r.Reason = "无法启动模型进程，提示词未被接收"
 		return r

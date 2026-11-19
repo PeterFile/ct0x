@@ -8,8 +8,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -21,7 +23,7 @@ import (
 	"agentworkspace/internal/store"
 )
 
-func newAppServerHandoff(t *testing.T, mode string) *nativeHandoffFixture {
+func newAppServerHandoff(t *testing.T, mode string, observe func(*http.Request)) *nativeHandoffFixture {
 	t.Helper()
 	f := newNativeHandoffFixture(t, true)
 	executable, err := os.Executable()
@@ -36,7 +38,14 @@ func newAppServerHandoff(t *testing.T, mode string) *nativeHandoffFixture {
 	t.Cleanup(func() { _ = listener.Close() })
 	f.endpoint = "http://" + listener.Addr().String() + "/api/v1/member-tools"
 	f.configure(t, "0.166.0", true) // The new eligible intake must not borrow the old resume profile.
-	server := &http.Server{Handler: f.handler}
+	handler := f.handler
+	if observe != nil {
+		handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			observe(req)
+			f.handler.ServeHTTP(w, req)
+		})
+	}
+	server := &http.Server{Handler: handler}
 	stopped := make(chan struct{})
 	go func() { _ = server.Serve(listener); close(stopped) }()
 	t.Cleanup(func() { _ = server.Close(); <-stopped })
@@ -61,7 +70,7 @@ func (f *nativeHandoffFixture) run(t *testing.T, typed scheduler.PrepareThreadDe
 
 func TestNativeThreadHandoffInboxThroughExistingScheduler(t *testing.T) {
 	ctx := t.Context()
-	f := newAppServerHandoff(t, "ready")
+	f := newAppServerHandoff(t, "ready", nil)
 	prepare, err := f.preparer.EnableThreadDecisionHandoff(ctx)
 	handoffOK(t, err)
 	source := f.message(t, handoffTopic, []string{f.member.ID})
@@ -139,7 +148,7 @@ func TestNativeThreadHandoffInboxThroughExistingScheduler(t *testing.T) {
 func TestNativeThreadHandoffUncertainWriteAndDefaultRoute(t *testing.T) {
 	for _, mode := range []string{"unknown", "default-route"} {
 		t.Run(mode, func(t *testing.T) {
-			f := newAppServerHandoff(t, mode)
+			f := newAppServerHandoff(t, mode, nil)
 			prepare, err := f.preparer.EnableThreadDecisionHandoff(t.Context())
 			handoffOK(t, err)
 			var recipients []string // Same actual recipient, not directly addressed.
@@ -170,6 +179,104 @@ func TestNativeThreadHandoffUncertainWriteAndDefaultRoute(t *testing.T) {
 	}
 }
 
+const (
+	handoffAckTool      = "ack_thread_decision"
+	handoffAckRequest   = `{"jsonrpc":"2.0","id":"same-ack","method":"tools/call","params":{"name":"ack_thread_decision","arguments":{}}}`
+	handoffMCPList      = `{"jsonrpc":"2.0","id":"list","method":"tools/list"}`
+	handoffInheritedEnv = "AGENT_WORKSPACE_MCP_TOKEN_FIXTURE_INHERITED"
+)
+
+func handoffMCPRequest(t *testing.T, endpoint, authorization, body string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, endpoint, strings.NewReader(body))
+	handoffOK(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("MCP-Protocol-Version", "2025-06-18")
+	req.Header.Set("Authorization", authorization)
+	req.Header.Set("Idempotency-Key", "fixture-header-must-not-select-key")
+	return req
+}
+
+func TestNativeThreadHandoffExplicitAck(t *testing.T) {
+	for _, mode := range []string{"ack", "ack-unknown"} {
+		t.Run(mode, func(t *testing.T) {
+			var authorization atomic.Pointer[string] // Test-only observation in memory.
+			f := newAppServerHandoff(t, mode, func(req *http.Request) {
+				value := req.Header.Get("Authorization")
+				authorization.CompareAndSwap(nil, &value)
+			})
+			t.Setenv(handoffInheritedEnv, "fixture-inherited-token")
+			ctx := t.Context()
+			prepare, err := f.preparer.EnableThreadDecisionHandoff(ctx)
+			handoffOK(t, err)
+			a, _ := f.seedAnswer(t)
+			f.assertSavedOnly(t, a)
+			if mode == "ack-unknown" {
+				// Writes reach Commit, where the deferred FK makes the outcome unconfirmed.
+				_, err := f.raw.Exec(`CREATE TABLE fixture_ack_parent(id INTEGER PRIMARY KEY);
+				CREATE TABLE fixture_ack_sink(parent INTEGER REFERENCES fixture_ack_parent(id) DEFERRABLE INITIALLY DEFERRED);
+				CREATE TRIGGER fixture_ack_fault AFTER INSERT ON decision_thread_answer_consumptions
+				BEGIN INSERT INTO fixture_ack_sink VALUES(123); END;`)
+				handoffOK(t, err)
+			}
+			f.run(t, prepare)
+			turn := waitNativeHandoff(t, f.db, a.GroupID, a.ReplyMessageID)
+			if turn.AcceptedAt == nil || turn.CandidateTerminal != domain.TurnStateSucceeded || turn.DeliveryID != a.WakeDeliveryID {
+				t.Fatal("fixture did not persist acceptance and a native terminal on the exact typed turn")
+			}
+			var resources int
+			handoffOK(t, f.raw.QueryRow("SELECT count(*) FROM resource_claims WHERE turn_id=?", turn.ID).Scan(&resources))
+			if mode == "ack-unknown" {
+				if turn.State != domain.TurnStateUnknown || resources != 1 || turn.ReplyMessageID != "" {
+					t.Fatal("native terminal overrode uncertain ACK or released the original claim")
+				}
+				f.assertSavedOnly(t, a)
+			} else {
+				if turn.State != domain.TurnStateSucceeded || resources != 0 {
+					t.Fatal("typed turn with a confirmed ACK did not settle")
+				}
+				readback, err := store.Open(f.dbPath)
+				handoffOK(t, err)
+				defer readback.Close()
+				view, err := readback.GetDecisionAnswerView(ctx, a.ThreadRef, a.RequestID, a.Version)
+				handoffOK(t, err)
+				if view.Receipt != a || view.Handling == nil || view.Handling.TurnID != turn.ID || view.Handling.AttemptID != "" || view.Handling.ConsumedAt.Before(*turn.AcceptedAt) {
+					t.Fatal("no durable ACK for the exact accepted Thread turn")
+				}
+				var key string
+				handoffOK(t, f.raw.QueryRow(`SELECT call_key FROM decision_thread_answer_consumptions WHERE answer_id=?`, a.ID).Scan(&key))
+				if !strings.HasPrefix(key, "mcp-") {
+					t.Fatal("ACK did not use the server-derived MCP key")
+				}
+			}
+			bearer := authorization.Load()
+			if bearer == nil || !strings.HasPrefix(*bearer, "Bearer ") {
+				t.Fatal("no observed native MCP capability")
+			}
+			for _, frame := range []string{handoffMCPList, handoffAckRequest} {
+				w := httptest.NewRecorder()
+				f.handler.ServeHTTP(w, handoffMCPRequest(t, f.endpoint+"/mcp", *bearer, frame))
+				if !strings.Contains(w.Body.String(), "forbidden") {
+					t.Fatal("replayed use of the revoked typed bearer was not denied")
+				}
+			}
+			for _, name := range []string{"stdout.jsonl", "stderr.log"} {
+				data, err := os.ReadFile(filepath.Join(f.runtime, turn.ID, name))
+				handoffOK(t, err)
+				if bytes.Contains(data, []byte(strings.TrimPrefix(*bearer, "Bearer "))) {
+					t.Fatal("native runtime logged the bearer")
+				}
+			}
+			entries, err := os.ReadDir(f.config)
+			handoffOK(t, err)
+			if len(entries) != 0 {
+				t.Fatal("typed MCP should not require a credential file")
+			}
+		})
+	}
+}
+
 const handoffProposal = `{"content":"要只看工作日吗？","intent_assessment":{"disposition":"clarify","reason":"边界未定","question":"要只看工作日吗？","decision_context":{"facts":"样本有限","recommendation":"先看工作日","choices":["工作日","全周"]}}}`
 
 // This subprocess is the local Go test binary. It never consults any provider
@@ -179,6 +286,7 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 		t.Skip("subprocess fixture")
 	}
 	mode := os.Getenv("AW_F_HANDOFF_MODE")
+	ackMode := mode == "ack" || mode == "ack-unknown"
 	decoder, encoder := json.NewDecoder(os.Stdin), json.NewEncoder(os.Stdout)
 	type frame struct {
 		ID     json.RawMessage
@@ -203,6 +311,13 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 	respond(read("initialize"), map[string]string{"userAgent": "fixture", "platformFamily": "unix", "platformOs": "fixture", "codexHome": "/fixture-home"})
 	read("initialized")
 	config := json.RawMessage(`{"config":{"mcp_servers":{}},"origins":{},"layers":[{"name":{"type":"sessionFlags"},"version":"fixture","config":{}}]}`)
+	serverCount := 1
+	if ackMode {
+		serverCount++
+		config = json.RawMessage(`{"config":{"mcp_servers":{"fixture_inherited":{"command":"/not-an-allowed-server"}}},
+			"origins":{"mcp_servers.fixture_inherited":{"name":{"type":"sessionFlags"},"version":"fixture"}},
+			"layers":[{"name":{"type":"sessionFlags"},"version":"fixture","config":{}}]}`)
+	}
 	respond(read("config/read"), config)
 	thread := read("thread/start")
 	var selected struct {
@@ -210,10 +325,12 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 		ApprovalPolicy string `json:"approvalPolicy"`
 		Sandbox        string
 		Config         struct {
-			Servers map[string]struct {
+			Features map[string]json.RawMessage
+			Servers  map[string]struct {
 				URL      string
 				TokenEnv string   `json:"bearer_token_env_var"`
 				Tools    []string `json:"enabled_tools"`
+				Enabled  *bool
 			} `json:"mcp_servers"`
 		}
 	}
@@ -222,7 +339,7 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 	handoffOK(t, err)
 	physical, err := filepath.EvalSymlinks(selected.CWD)
 	handoffOK(t, err)
-	if cwd != physical || selected.Model != handoffModel || selected.ApprovalPolicy != "never" || selected.Sandbox != "read-only" || len(selected.Config.Servers) > 1 {
+	if cwd != physical || selected.Model != handoffModel || selected.ApprovalPolicy != "never" || selected.Sandbox != "read-only" || len(selected.Config.Servers) != serverCount {
 		t.Fatal("fixture received wrong native selection or unsafe profile")
 	}
 	const threadID, turnID = "fixture-thread", "fixture-turn"
@@ -231,25 +348,25 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 	respond(read("config/read"), config)
 	var call func(string) string
 	var boundServer string
+	var enabledTools []string
 	for server, settings := range selected.Config.Servers {
-		boundServer = server
-		if !strings.HasPrefix(settings.URL, "http://127.0.0.1:") || !strings.HasPrefix(settings.TokenEnv, "AGENT_WORKSPACE_MCP_TOKEN_") || os.Getenv(settings.TokenEnv) == "" {
-			t.Fatal("fixture: unbound endpoint")
+		if settings.Enabled == nil {
+			t.Fatal("fixture: missing explicit MCP enablement")
 		}
-		status := read("mcpServerStatus/list")
-		tools := map[string]any{}
-		for _, name := range settings.Tools {
-			tools[name] = map[string]string{"name": name}
+		if server == "fixture_inherited" {
+			if *settings.Enabled || settings.URL != "" || settings.TokenEnv != "" || len(settings.Tools) != 0 {
+				t.Fatal("fixture: inherited server retained tool authority")
+			}
+			continue
 		}
-		respond(status, map[string]any{"data": []any{map[string]any{"name": server, "runtimeStatus": "connected",
-			"httpOrigin": strings.TrimSuffix(settings.URL, "/api/v1/member-tools/mcp"), "authStatus": "bearerToken", "tools": tools}}})
+		boundServer, enabledTools = server, settings.Tools
+		token := os.Getenv(settings.TokenEnv)
+		if !*settings.Enabled || call != nil || !strings.HasPrefix(settings.URL, "http://127.0.0.1:") ||
+			!strings.HasPrefix(settings.TokenEnv, "AGENT_WORKSPACE_MCP_TOKEN_") || token == "" {
+			t.Fatal("fixture: unbound endpoint or more than one enabled server")
+		}
 		call = func(body string) string {
-			req, err := http.NewRequest("POST", settings.URL, strings.NewReader(body))
-			handoffOK(t, err)
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Accept", "application/json, text/event-stream")
-			req.Header.Set("MCP-Protocol-Version", "2025-06-18")
-			req.Header.Set("Authorization", "Bearer "+os.Getenv(settings.TokenEnv))
+			req := handoffMCPRequest(t, settings.URL, "Bearer "+token, body)
 			client := http.Client{Timeout: 7 * time.Second}
 			response, err := client.Do(req)
 			handoffOK(t, err)
@@ -258,6 +375,30 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 			handoffOK(t, err)
 			return string(data)
 		}
+		status := read("mcpServerStatus/list")
+		tools := map[string]any{}
+		if slices.Equal(settings.Tools, []string{handoffAckTool}) {
+			// Discover before acceptance, as the real adapter must do.
+			var listed struct {
+				Result struct{ Tools []struct{ Name string } }
+			}
+			handoffOK(t, json.Unmarshal([]byte(call(handoffMCPList)), &listed))
+			if len(listed.Result.Tools) != 1 || listed.Result.Tools[0].Name != handoffAckTool ||
+				string(selected.Config.Features["goals"]) != "false" || os.Getenv(handoffInheritedEnv) != "" {
+				t.Fatal("typed continuation inherited authority or failed to discover only its ACK")
+			}
+			if ackMode {
+				_, _ = io.WriteString(os.Stderr, token) // Synthetic credential canary must be discarded.
+			}
+		}
+		for _, name := range settings.Tools {
+			tools[name] = map[string]string{"name": name}
+		}
+		respond(status, map[string]any{"data": []any{map[string]any{"name": server, "runtimeStatus": "connected",
+			"httpOrigin": strings.TrimSuffix(settings.URL, "/api/v1/member-tools/mcp"), "authStatus": "bearerToken", "tools": tools}}})
+	}
+	if call == nil {
+		t.Fatal("fixture: expected a bound native MCP server")
 	}
 	turn := func(status string) map[string]any {
 		return map[string]any{"id": turnID, "status": status, "items": []any{}}
@@ -272,9 +413,11 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 	notify("turn/started", map[string]any{"threadId": threadID, "turn": turn("inProgress")})
 	reply := "续轮文本"
 	var items []any
-	if call != nil {
-		if !strings.Contains(call(`{"jsonrpc":"2.0","id":"list","method":"tools/list"}`), `"decision_context"`) {
-			t.Fatal("genuine scoped intake did not discover the option")
+	if !strings.Contains(prompt.Input[0].Text, "thread_decision_reply/v1") {
+		inventory := call(handoffMCPList)
+		if !strings.Contains(inventory, `"decision_context"`) || strings.Contains(inventory, handoffAckTool) ||
+			!strings.Contains(call(handoffAckRequest), "forbidden") {
+			t.Fatal("intake discovery or denial of the dedicated ACK changed")
 		}
 		send := func(id, args string) string {
 			return call(`{"jsonrpc":"2.0","id":` + strconv.Quote(id) + `,"method":"tools/call","params":{"name":"send_message","arguments":` + args + `}}`)
@@ -308,8 +451,32 @@ func TestNativeThreadHandoffChild(t *testing.T) {
 	} else {
 		var packet struct{ Pending []struct{ Content string } }
 		handoffOK(t, json.Unmarshal([]byte(prompt.Input[0].Text), &packet))
-		if !strings.Contains(prompt.Input[0].Text, "thread_decision_reply/v1") || len(packet.Pending) != 3 || packet.Pending[1].Content != handoffQuestion || packet.Pending[2].Content != handoffAnswer {
-			t.Fatal("typed continuation did not receive exactly the stored question and answer")
+		if len(packet.Pending) != 3 || packet.Pending[1].Content != handoffQuestion || packet.Pending[2].Content != handoffAnswer ||
+			!slices.Equal(enabledTools, []string{handoffAckTool}) {
+			t.Fatal("typed continuation did not receive the exact context and dedicated tool")
+		}
+		if ackMode {
+			item := map[string]any{"id": "native-ack", "type": "mcpToolCall", "server": boundServer, "tool": handoffAckTool,
+				"status": "inProgress", "arguments": json.RawMessage(`{}`), "result": nil, "error": nil}
+			notify("item/started", map[string]any{"threadId": threadID, "turnId": turnID, "item": item})
+			result := call(handoffAckRequest) // Race legitimately with delivery of the persisted acceptance.
+			if mode == "ack-unknown" {
+				if !strings.Contains(result, "thread_decision_ack_unknown") || strings.Contains(result, "FOREIGN KEY") || !strings.Contains(result, `"isError":true`) {
+					t.Fatal("uncertain ACK appeared certain or exposed private diagnostics")
+				}
+			} else if !strings.Contains(result, `\"handling\"`) || !strings.Contains(result, `"isError":false`) || call(handoffAckRequest) != result {
+				t.Fatal("explicit ACK or exact-id replay failed")
+			}
+			if !strings.Contains(call(strings.Replace(handoffAckRequest, "same-ack", "new-id", 1)), "conflict") ||
+				!strings.Contains(call(strings.Replace(handoffAckRequest, `"arguments":{}`, `"arguments":{"answer_id":"foreign"}`, 1)), `"code":-32602`) ||
+				!strings.Contains(call(strings.Replace(handoffAckRequest, handoffAckTool, "read_channel", 1)), "forbidden") {
+				t.Fatal("typed bearer allowed an identity change, selector, or unrelated operation")
+			}
+			var native struct{ Result json.RawMessage }
+			handoffOK(t, json.Unmarshal([]byte(result), &native))
+			item["status"], item["result"] = "completed", native.Result
+			notify("item/completed", map[string]any{"threadId": threadID, "turnId": turnID, "item": item})
+			items = append(items, item)
 		}
 	}
 	answer := map[string]any{"id": "answer", "type": "agentMessage", "text": reply}

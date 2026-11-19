@@ -110,6 +110,10 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			memberMCPError(w, 200, id, -32602, "工具列表无需游标")
 			return
 		}
+		if slices.Contains(profile.Operations, platform.AckThreadDecisionOperation) {
+			memberMCPReply(w, id, map[string]any{"tools": []memberMCPTool{threadDecisionAckMCPTool}})
+			return
+		}
 		tools := make([]memberMCPTool, 0, len(profile.Operations))
 		for _, tool := range catalog {
 			if slices.Contains(profile.Operations, tool.Name) {
@@ -142,6 +146,18 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		var object map[string]json.RawMessage
 		if !paramsOK || name == "" || len(name) > 64 || json.Unmarshal(arguments, &object) != nil || object == nil {
 			memberMCPError(w, 400, id, -32602, "工具名称和 arguments 对象无效")
+			return
+		}
+		if name == platform.AckThreadDecisionOperation {
+			if !validMemberToolJSONStrings(frame["id"]) {
+				memberMCPError(w, 400, nil, -32602, "话题确认调用 id 包含无效的 Unicode 字符串转义")
+				return
+			}
+			if len(object) != 0 {
+				memberMCPError(w, 400, id, -32602, "话题答复确认不接受参数")
+				return
+			}
+			a.ackThreadDecisionMCP(w, r, token, id)
 			return
 		}
 		continuation, excerpt, decision := false, false, false

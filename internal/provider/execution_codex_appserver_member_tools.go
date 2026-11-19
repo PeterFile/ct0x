@@ -221,20 +221,29 @@ func (e codexAppServerMemberToolExecutor) Execute(ctx context.Context, request E
 	if err != nil || !os.SameFile(e.configFile, config.file) || config.digest != e.digest || !e.configFile.ModTime().Equal(config.file.ModTime()) {
 		return ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "成员工具配置无效或已变化，执行未启动"}
 	}
+	return e.executeMember(ctx, request, onEvent, config, &codexAppServerMemberSession{names: e.names, native: native})
+}
+
+func (e codexAppServerExecutor) executeMember(ctx context.Context, request ExecuteRequest, onEvent func(Event) error, config memberToolConfig, session *codexAppServerMemberSession) ExecutionReceipt {
 	nonce := make([]byte, 16)
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "无法创建成员工具执行配置"}
 	}
-	session := &codexAppServerMemberSession{endpoint: config.endpoint + "/mcp", origin: config.origin, names: e.names, native: native,
-		tokenEnv: "AGENT_WORKSPACE_MCP_TOKEN_" + strings.ToUpper(hex.EncodeToString(nonce))}
+	session.endpoint, session.origin = config.endpoint+"/mcp", config.origin
+	const tokenPrefix = "AGENT_WORKSPACE_MCP_TOKEN_"
+	session.tokenEnv = tokenPrefix + strings.ToUpper(hex.EncodeToString(nonce))
+	strip := session.tokenEnv + "="
+	if session.bindThreadDecisionContext != nil {
+		strip = tokenPrefix // This profile never inherits another platform MCP bearer.
+	}
 	env := make([]string, 0, len(os.Environ())+1)
 	for _, value := range os.Environ() {
-		if !strings.HasPrefix(value, session.tokenEnv+"=") {
+		if !strings.HasPrefix(value, strip) {
 			env = append(env, value)
 		}
 	}
 	env = append(env, session.tokenEnv+"="+config.token)
-	return e.codexAppServerExecutor.execute(ctx, request, onEvent, session, env)
+	return e.execute(ctx, request, onEvent, session, env)
 }
 
 type codexAppServerMemberSession struct {
@@ -246,6 +255,8 @@ type codexAppServerMemberSession struct {
 	startup  string
 	ready    bool
 	native   *codexAppServerSession
+	// Non-nil only for the fresh, single-tool Thread decision continuation.
+	bindThreadDecisionContext func(context.Context) bool
 }
 
 func codexAppServerMemberName(inherited []string, entropy io.Reader) (string, error) {
@@ -283,10 +294,15 @@ func (m *codexAppServerMemberSession) configure(inherited []string, config map[s
 	for _, tool := range m.names {
 		toolApprovals[tool] = map[string]string{"approval_mode": "approve"}
 	}
-	config["mcp_servers"].(map[string]any)[name] = map[string]any{
+	server := map[string]any{
 		"url": m.endpoint, "bearer_token_env_var": m.tokenEnv, "enabled": true, "enabled_tools": m.names,
 		"omit_tools_from": []string{"code_mode", "deferred"}, "tools": toolApprovals,
 	}
+	if m.bindThreadDecisionContext != nil {
+		features["goals"] = false
+		server["required"] = true
+	}
+	config["mcp_servers"].(map[string]any)[name] = server
 	return nil
 }
 
@@ -302,7 +318,8 @@ func (p *codexAppServerProtocol) memberStatus(raw json.RawMessage) {
 	origin, _ := codexAppServerString(status, "httpOrigin")
 	tools, toolsErr := codexAppServerMap(status["tools"])
 	if err != nil || toolsErr != nil || name != p.member.server || string(status["runtimeStatus"]) != `"connected"` || string(status["authStatus"]) != `"bearerToken"` ||
-		origin != p.member.origin || !codexAppServerNoError(status["toolsError"]) || !codexAppServerNoError(status["pluginId"]) {
+		origin != p.member.origin || !codexAppServerNoError(status["toolsError"]) || !codexAppServerNoError(status["pluginId"]) ||
+		p.member.bindThreadDecisionContext != nil && len(tools) != len(p.member.names) {
 		p.fail()
 		return
 	}
