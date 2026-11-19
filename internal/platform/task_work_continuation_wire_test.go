@@ -55,7 +55,6 @@ func TestFreshTaskWorkB29NativeWireRejectsFailedLaunchCommit(t *testing.T) {
 }
 
 func TestFreshTaskWorkB29NativeWireLaunchGatePolicyAfterAdmission(t *testing.T) {
-	t.Parallel()
 	testFreshTaskWorkB29NativeWire(t, "policy-after-gate")
 }
 
