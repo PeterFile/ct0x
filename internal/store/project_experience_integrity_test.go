@@ -126,3 +126,133 @@ func TestProjectExperienceRejectsChangedDOwnership(t *testing.T) {
 		t.Fatalf("ownership damage check escaped the original Group: %+v, %v", p, err)
 	}
 }
+
+func TestProjectExperienceChecksIndependentSourceScopes(t *testing.T) {
+	const selectionGuard = "project_experiences_no_update"
+	const retirementGuard = "project_experience_retirements_no_update"
+	const witnessGuard = "project_experience_retirement_witnesses_no_update"
+	for _, tc := range []struct {
+		name, guard, statement string
+		retire                 bool
+	}{
+		{"moved retired selection", selectionGuard, `UPDATE project_experiences SET group_id=?2 WHERE id=?1`, true},
+		{"moved unretired selection", selectionGuard, `UPDATE project_experiences SET (group_id,channel_id,project_id)=
+		 (SELECT legacy_group_id,id,project_id FROM channels WHERE legacy_group_id=?2) WHERE id=?1`, false},
+		{"foreign retirement message", retirementGuard, `UPDATE project_experience_retirements SET message_id=?3 WHERE experience_id=?1 AND group_id<>?2`, true},
+		{"foreign witness group", witnessGuard, `UPDATE project_experience_retirement_witnesses
+		 SET receipt=json_set(receipt,'$[1]',?2) WHERE experience_id=?1`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := projectExperienceStore(t)
+			g, other, unrelated := group(t, s), group(t, s), group(t, s)
+			m := experienceStoreMessage(t, s, g.ID, "bug", "original decision")
+			foreign := experienceStoreMessage(t, s, other.ID, "bug", "foreign decision")
+			choice := experienceStoreChoice(m, m.ID)
+			record, err := s.SelectProjectExperience(ctx, g.ID, choice, "original")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.retire {
+				msg := experienceStoreMessage(t, s, g.ID, "bug", "stop using the original decision")
+				if _, err := s.RetireProjectExperience(ctx, g.ID, record.ID, RetireProjectExperienceInput{MessageID: msg.ID}, ""); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Restore the protection before lookup; the error must be from the
+			// conflicting persisted evidence, not merely a missing guard.
+			experienceFault(t, s, `PRAGMA foreign_keys=OFF`)
+			ddl := removeExperienceTestTrigger(t, s, tc.guard)
+			args := []any{record.ID, other.ID}
+			if tc.name == "foreign retirement message" {
+				args = append(args, foreign.ID)
+			}
+			experienceFault(t, s, tc.statement, args...)
+			experienceFault(t, s, ddl)
+			experienceFault(t, s, `PRAGMA foreign_keys=ON`)
+
+			for _, source := range []domain.Message{m, foreign} {
+				assertExperienceIntegrityFailure(t, s, source.GroupID)
+				if got, err := s.SelectProjectExperience(ctx, source.GroupID, experienceStoreChoice(source, source.ID), "fresh"); got.ID != "" || !errors.Is(err, errProjectExperienceIntegrity) {
+					t.Fatalf("damaged source scope allowed a new selection: %+v, %v", got, err)
+				}
+			}
+			if p, err := s.SearchProjectExperiences(ctx, unrelated.ID, ProjectExperienceQuery{Query: "CSV-218"}); err != nil || len(p.Items) != 0 {
+				t.Fatalf("unrelated scope affected by damaged binding: %+v, %v", p, err)
+			}
+		})
+	}
+}
+
+func TestProjectExperienceRejectsOrphanRetirementEvidence(t *testing.T) {
+	s := projectExperienceStore(t)
+	g := group(t, s)
+	m := experienceStoreMessage(t, s, g.ID, "bug", "original decision")
+	choice := experienceStoreChoice(m, m.ID)
+	record, err := s.SelectProjectExperience(ctx, g.ID, choice, "original")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := experienceStoreMessage(t, s, g.ID, "bug", "stop using the original decision")
+	if _, err := s.RetireProjectExperience(ctx, g.ID, record.ID, RetireProjectExperienceInput{MessageID: msg.ID}, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, fault := range []struct{ guard, statement string }{
+		{"project_experiences_no_delete", `DELETE FROM project_experiences WHERE id=?`},
+		{"project_experience_retirements_no_delete", `DELETE FROM project_experience_retirements WHERE experience_id=?`},
+	} {
+		experienceFault(t, s, `PRAGMA foreign_keys=OFF`)
+		ddl := removeExperienceTestTrigger(t, s, fault.guard)
+		experienceFault(t, s, fault.statement, record.ID)
+		experienceFault(t, s, ddl)
+		experienceFault(t, s, `PRAGMA foreign_keys=ON`)
+		// First both retirement facts are orphaned, then only the witness is left.
+		assertExperienceIntegrityFailure(t, s, g.ID)
+		if _, err := s.SelectProjectExperience(ctx, g.ID, choice, "fresh"); !errors.Is(err, errProjectExperienceIntegrity) {
+			t.Fatalf("orphan retirement evidence allowed reselecting the approach: %v", err)
+		}
+	}
+}
+
+func TestProjectExperienceRequiresDGroupGuards(t *testing.T) {
+	s := projectExperienceStore(t)
+	g := group(t, s)
+	m := experienceStoreMessage(t, s, g.ID, "bug", "original decision")
+	choice := experienceStoreChoice(m, m.ID)
+	if _, err := s.SelectProjectExperience(ctx, g.ID, choice, "original"); err != nil {
+		t.Fatal(err)
+	}
+	for _, guard := range []struct{ name, event string }{
+		{"groups_no_rebind", "BEFORE UPDATE"}, {"groups_no_delete", "BEFORE DELETE"},
+		{"groups_project_identity_insert", "AFTER INSERT"}, {"groups_no_replace", "BEFORE INSERT"},
+	} {
+		t.Run(guard.name, func(t *testing.T) {
+			ddl := removeExperienceTestTrigger(t, s, guard.name)
+			assertExperienceIntegrityFailure(t, s, g.ID)
+			experienceFault(t, s, `CREATE TRIGGER `+guard.name+` `+guard.event+` ON groups BEGIN SELECT 1; END`)
+			if guard.name == "groups_no_replace" {
+				// Reproduce the replacement with otherwise valid deferred FKs.
+				experienceFault(t, s, `PRAGMA recursive_triggers=OFF`)
+				tx, err := s.db.BeginTx(ctx, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback()
+				if _, err := tx.Exec(`PRAGMA defer_foreign_keys=ON`); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := tx.Exec(`INSERT OR REPLACE INTO groups(id,name,created_at) VALUES(?,'replaced',?)`, g.ID, g.CreatedAt.Format(timestampLayout)); err != nil {
+					t.Fatal(err)
+				}
+				if err := tx.Commit(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			assertExperienceIntegrityFailure(t, s, g.ID)
+			if _, err := s.SelectProjectExperience(ctx, g.ID, choice, "fresh"); !errors.Is(err, errProjectExperienceIntegrity) {
+				t.Fatalf("a same-name no-op Group guard authorized a selection: %v", err)
+			}
+			removeExperienceTestTrigger(t, s, guard.name)
+			experienceFault(t, s, ddl)
+		})
+	}
+}
