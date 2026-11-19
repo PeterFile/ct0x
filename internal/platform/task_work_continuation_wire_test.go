@@ -41,8 +41,16 @@ func TestFreshTaskWorkB29NativeWireWorkspaceAndConfig(t *testing.T) {
 	testFreshTaskWorkB29NativeWire(t, "replaced-original-cwd", "workspace-before-gate", "late-config")
 }
 
-func TestFreshTaskWorkB29NativeWireLaunchGate(t *testing.T) {
-	testFreshTaskWorkB29NativeWire(t, "late-policy", "policy-before-gate", "failed-launch-commit", "policy-after-gate")
+func TestFreshTaskWorkB29NativeWireLaunchGatePolicyBeforeAdmission(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "late-policy", "policy-before-gate")
+}
+
+func TestFreshTaskWorkB29NativeWireLaunchGateFailedCommit(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "failed-launch-commit")
+}
+
+func TestFreshTaskWorkB29NativeWireLaunchGatePolicyAfterAdmission(t *testing.T) {
+	testFreshTaskWorkB29NativeWire(t, "policy-after-gate")
 }
 
 // All authority is established through v29 APIs. The only substitutions are a
@@ -217,6 +225,7 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 				}
 				beforeGateChanged = true
 			}
+			const unknownAckKey = "unknown-key"
 			call := func(op, body, key string, status int) string {
 				t.Helper()
 				w := f.http(t, token, op, body, key)
@@ -348,11 +357,7 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 						call("submit_result", `{"summary":"text","artifact_versions":[]}`, "refs", 400)
 						call("submit_result", `{"summary":"too early"}`, "premature", 409)
 						if mode == "commit-unknown" {
-							_, err := f.raw.Exec(`CREATE TABLE commit_guard(id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED);
-								CREATE TRIGGER ack_commit_fault AFTER INSERT ON mutation_idempotency
-								BEGIN INSERT INTO commit_guard VALUES('nonexistent-group'); END`)
-							roleOK(t, err)
-							text := call("ack_work_input", id, "unknown-key", 500)
+							text := call("ack_work_input", id, unknownAckKey, 500)
 							if !strings.Contains(text, "未确认") || strings.Contains(text, "commit_guard") {
 								t.Fatal("B commit uncertainty leaked details or lost reconciliation guidance")
 							}
@@ -590,14 +595,23 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 			if mode == "extra-resource" {
 				keys = append(keys, "extra-key")
 			}
+			if mode == "commit-unknown" {
+				// Install after seeding and before the scheduler opens transactions.
+				// Only the target ACK inserts a deferred FK violation at COMMIT.
+				_, err := f.raw.Exec(`CREATE TABLE commit_guard(id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED);
+					CREATE TRIGGER ack_commit_fault AFTER INSERT ON mutation_idempotency
+					WHEN NEW.operation = 'acknowledge_work_input' AND NEW.idempotency_key = '` + unknownAckKey + `'
+					BEGIN INSERT INTO commit_guard VALUES('nonexistent-group'); END`)
+				roleOK(t, err)
+			}
 			var out provider.ExecutionReceipt
 			scheduled := slices.Contains([]string{"confirmed", "wrong-resource", "commit-unknown", "untrusted-native-receipt"}, mode)
 			if scheduled {
-				// The executor cancels on completion. Allow for the full HTTP sequence
-				// and SQLite work under -race; this only bounds a stalled fixture.
+				// Only the seeded wake is needed. The executor cancels on completion,
+				// leaving the deadline as a watchdog rather than polling while it runs.
 				runCtx, stop := context.WithTimeout(ctx, 60*time.Second)
 				defer stop()
-				err = scheduler.Run(runCtx, f.db, scheduler.Options{Recovered: true, RuntimeDir: f.root, MaxActive: f.options.RoleMaxActive},
+				err = scheduler.Run(runCtx, f.db, scheduler.Options{Recovered: true, RuntimeDir: f.root, MaxActive: f.options.RoleMaxActive, PollInterval: time.Hour},
 					func(ctx context.Context, pending store.PendingDelivery) (scheduler.PreparedExecution, error) {
 						if pending.Delivery.ID != queued.Delivery.ID {
 							return scheduler.PreparedExecution{}, scheduler.ErrNotReady

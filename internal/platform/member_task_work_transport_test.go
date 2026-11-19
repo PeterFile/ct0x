@@ -48,14 +48,32 @@ func newBoundWorkReportFixture(t *testing.T) *boundWorkReportFixture {
 	return f
 }
 
+func (f *boundWorkReportFixture) memberToolRoutes() []httpapi.Route {
+	tools := f.runtime.Tools()
+	return slices.Concat(httpapi.MemberToolRoutes(tools), httpapi.MemberRoleToolRoutes(tools),
+		httpapi.MemberInvestigationToolRoutes(tools), httpapi.MemberMCPRoutes(tools))
+}
+
 func (f *boundWorkReportFixture) mount(t *testing.T) {
 	t.Helper()
-	tools := f.runtime.Tools()
-	routes := slices.Concat(httpapi.MemberToolRoutes(tools), httpapi.MemberRoleToolRoutes(tools),
-		httpapi.MemberInvestigationToolRoutes(tools), httpapi.MemberMCPRoutes(tools))
-	srv, err := httpapi.NewServer(httpapi.DefaultAddress, routes...)
+	srv, err := httpapi.NewServer(httpapi.DefaultAddress, f.memberToolRoutes()...)
 	roleOK(t, err)
 	f.handler = srv.Handler
+}
+
+// mountMemberToolHandlers exercises the real route, bearer, JSON and B checks
+// in-process. The transport/security fixtures use mount for the outer
+// Host/origin guard and network deadline.
+func (f *boundWorkReportFixture) mountMemberToolHandlers(ctx context.Context) {
+	mux := http.NewServeMux()
+	for _, route := range f.memberToolRoutes() {
+		mux.HandleFunc(route.Method+" "+route.Pattern, route.Handler)
+	}
+	f.handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The synthetic f.http requests have no independent context. Keep
+		// their SQLite work within the fixture lifetime, not a network deadline.
+		mux.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func (f *boundWorkReportFixture) claimWork(t *testing.T, deliveryID string) store.MemberToolScope {

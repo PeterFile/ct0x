@@ -44,8 +44,9 @@ func TestInvestigationTaskWorkLaunchSQLiteDelegationAfterCommit(t *testing.T) {
 }
 
 // Real v30 queue/claim, Attempt, issued HTTP configuration and final B commit.
-// Normally native invocation is in-process. The startup-proof case uses a
-// shell emitting fixed lifecycle frames; no Pi executable or model is started.
+// Synthetic native calls go through the member-tool handlers, not the outer
+// loopback server. The startup-proof case uses a shell emitting fixed lifecycle
+// frames; no Pi executable or model is started.
 func testInvestigationTaskWorkLaunchSQLite(t *testing.T, kind domain.TaskWorkSourceKind, modes ...string) {
 	for _, mode := range modes {
 		t.Run(string(kind)+"/"+mode, func(t *testing.T) {
@@ -101,8 +102,9 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 			bridgeRoot, err := filepath.Abs("../../extensions/pi-bridge")
 			roleOK(t, err)
 			selected := provider.Provider{ID: f.worker.ProviderID, Name: provider.Pi, Path: cli, Installation: provider.Installed, Version: "1.4.0"}
-			// The executor cancels on completion; this only bounds a stalled SQLite run.
-			runCtx, stop := context.WithTimeout(ctx, 45*time.Second)
+			// Stop when the synthetic executor returns. The watchdog only bounds
+			// this fixture's scheduling, scoped HTTP calls and SQLite work under -race.
+			runCtx, stop := context.WithTimeout(ctx, 90*time.Second)
 			defer stop()
 			var prepared scheduler.PreparedExecution
 			var path, token, resource string
@@ -252,11 +254,12 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 			}
 			f.runtime, err = platform.NewMemberToolRuntimeWithTaskWorkReports(f.db, f.options, f.engine, launch)
 			roleOK(t, err)
-			f.mount(t)
+			f.mountMemberToolHandlers(runCtx)
 			prep, err := platform.NewPreparer(f.db, platform.PrepareOptions{Providers: []provider.Provider{selected}, PrivateWorkspaceRoot: private,
 				MemberTools: f.runtime, PiMemberToolsExtension: filepath.Join(bridgeRoot, "index.ts")})
 			roleOK(t, err)
-			err = scheduler.Run(runCtx, f.db, scheduler.Options{Recovered: true, RuntimeDir: f.root, MaxActive: f.options.RoleMaxActive},
+			// The target wake is already queued; no periodic scan is needed.
+			err = scheduler.Run(runCtx, f.db, scheduler.Options{Recovered: true, RuntimeDir: f.root, MaxActive: f.options.RoleMaxActive, PollInterval: time.Hour},
 				func(ctx context.Context, pending store.PendingDelivery) (scheduler.PreparedExecution, error) {
 					if pending.Delivery.ID != wake.ID {
 						return scheduler.PreparedExecution{}, scheduler.ErrNotReady
