@@ -129,7 +129,7 @@ func (s *Store) GetAgentRun(ctx context.Context, groupID, runID string, options 
 	var candidate bool
 	var receipt, triggerStamp string
 	trigger := AgentRunMessage{}
-	row := tx.QueryRowContext(ctx, "SELECT "+agentRunSummaryColumns+`,c.topic_id,t.delivery_id,t.reply_message_id,
+	row := tx.QueryRowContext(ctx, "SELECT "+agentRunSummaryColumns+`,c.id,c.topic_id,t.delivery_id,t.reply_message_id,
 	 t.accepted_at,t.cancel_requested_at,t.native_session_id,t.candidate_terminal,t.candidate_text<>'',
 	 CASE WHEN length(CAST(t.receipt_json AS BLOB))<=1048576 THEN t.receipt_json ELSE '' END,
 	 input.id,input.sender_id,`+agentRunPreviewSQL("input.content", agentRunPreviewBytes)+`,input.created_at
@@ -139,7 +139,7 @@ func (s *Store) GetAgentRun(ctx context.Context, groupID, runID string, options 
 	     (t.delivery_id,t.group_id,c.id,t.member_id,c.topic_id,t.id)
 	 JOIN messages input ON (input.id,input.group_id,input.topic_id)=(d.message_id,d.group_id,d.topic_id)
 	 WHERE t.group_id=? AND t.id=?`, groupID, runID)
-	detail.Run, err = scanAgentRunSummary(row, &ref.topicID, &ref.deliveryID, &ref.replyID, &accepted, &canceled,
+	detail.Run, err = scanAgentRunSummary(row, &ref.conversationID, &ref.topicID, &ref.deliveryID, &ref.replyID, &accepted, &canceled,
 		&t.NativeSessionID, &t.CandidateTerminal, &candidate, &receipt, &trigger.MessageID, &trigger.SenderID, &trigger.Preview, &triggerStamp)
 	if err != nil {
 		return detail, err

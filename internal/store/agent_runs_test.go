@@ -34,7 +34,7 @@ func TestAgentRunStoreSubmissionSurvivesUnknownAndDeparture(t *testing.T) {
 	if err != nil || view.Run != page.Items[0] || view.Receipt == nil || view.Receipt.Outcome != domain.TurnStateUnknown || len(view.Timeline.Items) != 2 {
 		t.Fatalf("run unknown and committed evidence must coexist: %+v, %v", view, err)
 	}
-	entry := view.Timeline.Items[1]
+	entry := view.Timeline.Items[0]
 	result := entry.Submission
 	if entry.Kind != "submission" || entry.CreatedAt != sub.CreatedAt || result == nil || result.SubmissionID != sub.ID ||
 		result.TaskID != sub.TaskID || result.TaskRevision != sub.TaskRevision || result.AttemptID != sub.AttemptID ||
@@ -44,6 +44,131 @@ func TestAgentRunStoreSubmissionSurvivesUnknownAndDeparture(t *testing.T) {
 	full, err := f.s.GetTaskSubmission(ctx, request.GroupID, result.TaskID, result.SubmissionID)
 	if err != nil || full.Summary != sub.Summary {
 		t.Fatalf("exact Submission read lost full evidence: %+v, %v", full, err)
+	}
+}
+
+func TestAgentRunStoreGenericSubmissionsSurviveUnknown(t *testing.T) {
+	f, scope, _, _, input := taskSubmissionAgent(t)
+	s, claim := f.s, scope.Claim
+	first, err := s.SubmitTask(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	activation := taskAttemptInput(createTestTask(t, s, f.groupID))
+	activation.ActorID, activation.MemberScope = scope.MemberID, &scope
+	attempt, err := s.ActivateTaskAttempt(ctx, activation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input = taskSubmissionInput(attempt)
+	input.ActorID, input.MemberScope, input.IdempotencyKey = scope.MemberID, &scope, "run-log-second-submission"
+	second, err := s.SubmitTask(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real local-user submission in the same group has no member Turn.
+	manual, err := s.ActivateTaskAttempt(ctx, taskAttemptInput(createTestTask(t, s, f.groupID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SubmitTask(ctx, taskSubmissionInput(manual)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := []domain.Submission{second, first}
+	if first.CreatedAt.After(second.CreatedAt) || first.CreatedAt.Equal(second.CreatedAt) && first.ID > second.ID {
+		want[0], want[1] = first, second
+	}
+	options := ListOptions{Limit: 1}
+	for _, sub := range want {
+		view, err := s.GetAgentRun(ctx, f.groupID, claim.TurnID, options)
+		if err != nil || view.Run.State != domain.TurnStateUnknown || view.Receipt == nil || view.Receipt.Outcome != domain.TurnStateUnknown ||
+			len(view.Timeline.Items) != 1 || view.Timeline.NextCursor == nil {
+			t.Fatalf("expected an unknown Run with committed submission evidence: %+v, %v", view, err)
+		}
+		entry := view.Timeline.Items[0]
+		if entry.Kind != "submission" || entry.ID != runSubmissionPrefix+sub.ID || entry.CreatedAt != sub.CreatedAt ||
+			entry.Submission == nil || *entry.Submission != (AgentRunSubmission{
+			SubmissionID: sub.ID, TaskID: sub.TaskID, TaskRevision: sub.TaskRevision, AttemptID: sub.AttemptID, Preview: sub.Summary,
+		}) {
+			t.Fatalf("lost or reordered generic submission: %+v (%+v)", entry, entry.Submission)
+		}
+		options.Before = view.Timeline.NextCursor
+	}
+	tail, err := s.GetAgentRun(ctx, f.groupID, claim.TurnID, options)
+	if err != nil || len(tail.Timeline.Items) != 1 || tail.Timeline.Items[0].Kind != "trigger_message" || tail.Timeline.NextCursor != nil {
+		t.Fatalf("unexpected evidence beyond the two submissions: %+v, %v", tail, err)
+	}
+}
+
+func TestAgentRunStoreDispatchDecisionSurvivesUnknown(t *testing.T) {
+	for _, kind := range []domain.CoordinatorDecisionKind{domain.CoordinatorDecisionKindAssign, domain.CoordinatorDecisionKindDecline} {
+		t.Run(string(kind), func(t *testing.T) {
+			f, request, scope := coordinationDecideScope(t)
+			s, claim := f.s, scope.Member.Claim
+			before, err := s.GetAgentRun(ctx, request.GroupID, claim.TurnID, ListOptions{})
+			if err != nil || len(before.Timeline.Items) != 1 || before.Timeline.Items[0].Kind != "trigger_message" {
+				t.Fatalf("dispatch request without a decision must not create evidence: %+v, %v", before, err)
+			}
+			const key = "private-run-log-dispatch-key"
+			preview := "暂不分配。"
+			input := CoordinatorDecisionInput{Kind: string(kind), Reason: preview}
+			if kind == domain.CoordinatorDecisionKindAssign {
+				preview = strings.Repeat("理", 341) // 1023 bytes; do not split the next rune.
+				input.WorkerMemberID, input.Reason = f.worker, preview+"由 unseen-reason-tail"
+			}
+			receipt, err := s.DecideDispatch(ctx, scope, input, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeUnknown}); err != nil {
+				t.Fatal(err)
+			}
+			view, err := s.GetAgentRun(ctx, request.GroupID, claim.TurnID, ListOptions{Limit: 1})
+			if err != nil || view.Run.State != domain.TurnStateUnknown || view.Receipt == nil || view.Receipt.Outcome != domain.TurnStateUnknown ||
+				len(view.Timeline.Items) != 1 || view.Timeline.NextCursor == nil {
+				t.Fatalf("expected an unknown Run with committed dispatch evidence: %+v, %v", view, err)
+			}
+			entry, d := view.Timeline.Items[0], receipt.Decision
+			if entry.Kind != "dispatch_decision" || entry.ID != runDecisionPrefix+d.ID || entry.CreatedAt != d.CreatedAt ||
+				entry.DispatchDecision == nil || *entry.DispatchDecision != (AgentRunDispatchDecision{
+				DecisionID: d.ID, RequestID: request.ID, TaskID: request.TaskID, Kind: kind, WorkerMemberID: input.WorkerMemberID,
+				AssignmentID: d.AssignmentID, ReasonPreview: preview, Truncated: preview != input.Reason,
+			}) {
+				t.Fatalf("lost exact dispatch receipt: %+v (%+v)", entry, entry.DispatchDecision)
+			}
+			data, err := json.Marshal(entry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, forbidden := range []string{claim.Token, key, "unseen-reason-tail", `"coordinator_turn_id"`, `"delivery_id"`} {
+				if strings.Contains(string(data), forbidden) {
+					t.Fatalf("dispatch decision exposed %q", forbidden)
+				}
+			}
+			if kind == domain.CoordinatorDecisionKindDecline && (strings.Contains(string(data), `"worker_member_id"`) || strings.Contains(string(data), `"assignment_id"`)) {
+				t.Fatalf("decline did not omit assignment fields: %s", data)
+			}
+			tail, err := s.GetAgentRun(ctx, request.GroupID, claim.TurnID, ListOptions{Before: view.Timeline.NextCursor})
+			if err != nil || len(tail.Timeline.Items) != 1 || tail.Timeline.Items[0].Kind != "trigger_message" || tail.Timeline.NextCursor != nil {
+				t.Fatalf("dispatch cursor was not exclusive: %+v, %v", tail, err)
+			}
+
+			// Damage only the frozen receipt's source message in this test DB.
+			other, err := s.CreateMessage(ctx, MessageRequest{GroupID: request.GroupID, TopicID: request.TopicID, ActorID: "user", Content: "不相关消息"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			coordinationDecideExec(t, s, "DROP TRIGGER coordination_dispatch_state_update")
+			coordinationDecideExec(t, s, "UPDATE coordination_dispatch_state SET message_id=? WHERE request_id=?", other.ID, request.ID)
+			view, err = s.GetAgentRun(ctx, request.GroupID, claim.TurnID, ListOptions{})
+			if err != nil || len(view.Timeline.Items) != 1 || view.Timeline.Items[0].Kind != "trigger_message" {
+				t.Fatalf("decision escaped exact dispatch provenance: %+v, %v", view, err)
+			}
+		})
 	}
 }
 

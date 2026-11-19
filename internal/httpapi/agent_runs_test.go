@@ -161,17 +161,23 @@ func TestAgentRunLogLocalUserEvidence(t *testing.T) {
 		}
 	}
 	entries := detail.Timeline.Items
-	wantIDs := []string{trigger.ID, assessment.NoticeMessageID, posted.ID, settled.ReplyMessageID}
+	wantIDs := []string{settled.ReplyMessageID, posted.ID, assessment.NoticeMessageID, trigger.ID}
 	if len(entries) != len(wantIDs) || detail.Timeline.NextCursor != "" {
 		t.Fatalf("timeline: %s", w.Body)
 	}
 	for i, entry := range entries {
 		message := decoded[domain.Message](t, a.request("GET", "/api/v1/groups/"+group.ID+"/history/"+wantIDs[i], ""), 200)
 		wantKind := "published_reply"
-		if i == 0 {
+		if i == len(entries)-1 {
 			wantKind = "trigger_message"
-		} else if len(message.Deliveries) != 0 || message.SenderID != member.ID || entry.CreatedAt.Before(entries[i-1].CreatedAt) {
-			t.Fatalf("expected ordered group publication: entry=%+v, message=%+v", entry, message)
+		} else if len(message.Deliveries) != 0 || message.SenderID != member.ID {
+			t.Fatalf("expected group publication: entry=%+v, message=%+v", entry, message)
+		}
+		if i > 0 {
+			newer := entries[i-1]
+			if newer.CreatedAt.Before(entry.CreatedAt) || newer.CreatedAt.Equal(entry.CreatedAt) && newer.ID <= entry.ID {
+				t.Fatalf("timeline is not ordered by timestamp and ID descending: %+v then %+v", newer, entry)
+			}
 		}
 		if entry.ID == "" || entry.Kind != wantKind || entry.Message.MessageID != message.ID || entry.Message.SenderID != message.SenderID || entry.CreatedAt != message.CreatedAt ||
 			entry.Message.Preview == "" || !utf8.ValidString(entry.Message.Preview) || !strings.HasPrefix(message.Content, entry.Message.Preview) ||
@@ -179,12 +185,13 @@ func TestAgentRunLogLocalUserEvidence(t *testing.T) {
 			t.Fatalf("not a bounded and exact preview: %+v", entry)
 		}
 	}
-	page := decoded[runLogDetail](t, a.request("GET", detailPath+"&limit=1", ""), 200).Timeline
-	if !slices.Equal(page.Items, entries[3:]) || page.NextCursor == "" {
+	page := decoded[runLogDetail](t, a.request("GET", detailPath+"&limit=2", ""), 200).Timeline
+	if !slices.Equal(page.Items, entries[:2]) || page.NextCursor == "" {
 		t.Fatalf("first detail page: %+v", page)
 	}
-	tail := decoded[runLogDetail](t, a.request("GET", detailPath+"&limit=3&before="+url.QueryEscape(page.NextCursor), ""), 200).Timeline
-	if !slices.Equal(tail.Items, entries[:3]) || tail.NextCursor != "" {
+	before := "&before=" + url.QueryEscape(page.NextCursor)
+	tail := decoded[runLogDetail](t, a.request("GET", detailPath+"&limit=3"+before, ""), 200).Timeline
+	if !slices.Equal(tail.Items, entries[2:]) || tail.NextCursor != "" {
 		t.Fatalf("older timeline page not ordered or exclusive: %+v", tail)
 	}
 
@@ -200,7 +207,9 @@ func TestAgentRunLogLocalUserEvidence(t *testing.T) {
 	for _, path := range []string{
 		listMember + "&before=" + first.NextCursor, runLogPath + "?before=invalid", runLogPath + "?member_id=", runLogPath + "?limit=201",
 		detailPath + "&group_id=" + other.ID, detailPath + "&actor_id=" + member.ID, runLogPath + "/" + settled.ID,
-		otherPath + "&before=" + page.NextCursor,
+		otherPath + before,
+		runLogPath + "/" + settled.ID + "?group_id=" + other.ID + before,
+		runLogPath + "/" + unknown.ID + "?group_id=" + group.ID + before,
 	} {
 		w := a.request("GET", path, "")
 		assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")

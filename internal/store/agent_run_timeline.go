@@ -8,6 +8,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
+
+	"agentworkspace/internal/domain"
 )
 
 const (
@@ -15,6 +18,7 @@ const (
 	runMessagePrefix     = "message:"
 	runSubmissionPrefix  = "submission:"
 	runOperationPrefix   = "workspace:"
+	runDecisionPrefix    = "dispatch_decision:"
 )
 
 type AgentRunEntry struct {
@@ -24,6 +28,7 @@ type AgentRunEntry struct {
 	Message            *AgentRunMessage            `json:"message,omitempty"`
 	Submission         *AgentRunSubmission         `json:"submission,omitempty"`
 	WorkspaceOperation *AgentRunWorkspaceOperation `json:"workspace_operation,omitempty"`
+	DispatchDecision   *AgentRunDispatchDecision   `json:"dispatch_decision,omitempty"`
 }
 
 type AgentRunMessage struct {
@@ -41,6 +46,18 @@ type AgentRunSubmission struct {
 	AttemptID    string `json:"attempt_id"`
 	Preview      string `json:"preview"`
 	Truncated    bool   `json:"truncated"`
+}
+
+// A committed dispatch decision does not settle the coordinator's Run.
+type AgentRunDispatchDecision struct {
+	DecisionID     string                         `json:"decision_id"`
+	RequestID      string                         `json:"request_id"`
+	TaskID         string                         `json:"task_id"`
+	Kind           domain.CoordinatorDecisionKind `json:"kind"`
+	WorkerMemberID string                         `json:"worker_member_id,omitempty"`
+	AssignmentID   string                         `json:"assignment_id,omitempty"`
+	ReasonPreview  string                         `json:"reason_preview"`
+	Truncated      bool                           `json:"truncated"`
 }
 
 // State is pending without a receipt, or its exact persisted outcome.
@@ -63,7 +80,7 @@ type AgentRunWorkspaceResult struct {
 }
 
 type agentRunRef struct {
-	groupID, topicID, memberID, runID, deliveryID, triggerID, replyID string
+	groupID, topicID, memberID, runID, conversationID, deliveryID, triggerID, replyID string
 }
 
 type agentRunWindow struct {
@@ -78,7 +95,12 @@ func newAgentRunWindow(options ListOptions) (agentRunWindow, error) {
 	}
 	if c := options.Before; c != nil {
 		prefix, id, ok := strings.Cut(c.ID, ":")
-		if !ok || !validTriggerID(id) || (prefix+":" != runMessagePrefix && prefix+":" != runSubmissionPrefix && prefix+":" != runOperationPrefix) {
+		if !ok || !validTriggerID(id) {
+			return agentRunWindow{}, ErrInvalid
+		}
+		switch prefix + ":" {
+		case runMessagePrefix, runSubmissionPrefix, runOperationPrefix, runDecisionPrefix:
+		default:
 			return agentRunWindow{}, ErrInvalid
 		}
 	}
@@ -113,8 +135,8 @@ func (w agentRunWindow) bound(alias, prefix string, args []any) (string, []any) 
 	return " AND " + alias + ".created_at" + op + "?", append(args, stamp)
 }
 
-// Load at most limit+1 rows per paginated source. Merge newest first to keep
-// the exclusive 'before' position, then present that page in timeline order.
+// Load at most limit+1 rows per paginated source and return the merged page
+// newest first. The oldest item returned defines the exclusive 'before' position.
 func (w agentRunWindow) timeline(ctx context.Context, tx *sql.Tx, ref agentRunRef, trigger AgentRunEntry) (Page[AgentRunEntry], error) {
 	items, err := w.publications(ctx, tx, ref)
 	if err != nil {
@@ -128,8 +150,15 @@ func (w agentRunWindow) timeline(ctx context.Context, tx *sql.Tx, ref agentRunRe
 	if err != nil {
 		return Page[AgentRunEntry]{}, err
 	}
+	decision, err := w.dispatchDecision(ctx, tx, ref)
+	if err != nil {
+		return Page[AgentRunEntry]{}, err
+	}
 	items = append(items, submissions...)
 	items = append(items, operations...)
+	if decision != nil {
+		items = append(items, *decision)
+	}
 	if w.contains(trigger) {
 		items = append(items, trigger)
 	}
@@ -140,7 +169,6 @@ func (w agentRunWindow) timeline(ctx context.Context, tx *sql.Tx, ref agentRunRe
 		last := items[w.limit-1]
 		next = &Cursor{CreatedAt: last.CreatedAt, ID: last.ID}
 	}
-	slices.Reverse(items)
 	return Page[AgentRunEntry]{Items: items, NextCursor: next}, nil
 }
 
@@ -195,25 +223,18 @@ func (w agentRunWindow) publications(ctx context.Context, tx *sql.Tx, ref agentR
 	return items, rows.Err()
 }
 
-// Both existing execution bindings are indexed by Turn. Each leg can supply
-// at most one Attempt, and each Attempt can have at most one Submission.
-// Generic attempts without an indexed execution binding are not scanned.
-var agentRunSubmissionsSQL = `WITH bound(attempt_id,task_id,task_revision) AS (
- SELECT b.attempt_id,b.task_id,b.task_revision FROM coordination_assignment_attempts b
- WHERE b.turn_id=:run AND b.group_id=:grp AND b.worker_member_id=:member
- UNION SELECT c.attempt_id,d.task_id,d.task_revision FROM task_work_continuations c
- JOIN task_work_deliveries d ON d.delivery_id=c.delivery_id
- WHERE c.turn_id=:run AND c.delivery_id=:delivery AND d.group_id=:grp AND d.topic_id=:topic
- AND d.member_id=:member AND d.owner_member_id=d.member_id AND d.source_kind IN ('followup','report')
- ) SELECT s.id,s.task_id,s.task_revision,s.attempt_id,` + agentRunPreviewSQL("s.summary", agentRunPreviewBytes) + `,s.created_at
- FROM bound CROSS JOIN task_attempts a ON a.id=bound.attempt_id
+// Generic and role-bound attempts carry the same immutable Turn/actor identity.
+// Restrict the scan to this group's indexed attempts and probe the unique
+// submission for each matching attempt. The cursor and top-N limit are in SQL.
+var agentRunSubmissionsSQL = `SELECT s.id,s.task_id,s.task_revision,s.attempt_id,` + agentRunPreviewSQL("s.summary", agentRunPreviewBytes) + `,s.created_at
+ FROM task_attempts a INDEXED BY task_attempts_group_task_created_id
  CROSS JOIN task_submissions s ON s.attempt_id=a.id
- WHERE (a.turn_id,a.group_id,a.actor_id,a.task_id,a.task_revision)=(:run,:grp,:member,bound.task_id,bound.task_revision)
- AND (s.task_id,s.group_id,s.task_revision,s.submitted_by)=(a.task_id,a.group_id,a.task_revision,a.actor_id)`
+ AND (s.task_id,s.group_id,s.task_revision,s.submitted_by)=(a.task_id,a.group_id,a.task_revision,a.actor_id)
+ WHERE a.group_id=? AND a.turn_id=? AND a.actor_id=?`
 
 func (w agentRunWindow) submissions(ctx context.Context, tx *sql.Tx, ref agentRunRef) ([]AgentRunEntry, error) {
-	rows, err := tx.QueryContext(ctx, agentRunSubmissionsSQL, sql.Named("run", ref.runID), sql.Named("grp", ref.groupID),
-		sql.Named("member", ref.memberID), sql.Named("delivery", ref.deliveryID), sql.Named("topic", ref.topicID))
+	bound, args := w.bound("s", runSubmissionPrefix, []any{ref.groupID, ref.runID, ref.memberID})
+	rows, err := tx.QueryContext(ctx, agentRunSubmissionsSQL+bound+" ORDER BY s.created_at DESC,s.id DESC LIMIT ?", append(args, w.limit+1)...)
 	if err != nil {
 		return nil, err
 	}
@@ -230,12 +251,49 @@ func (w agentRunWindow) submissions(ctx context.Context, tx *sql.Tx, ref agentRu
 			return nil, err
 		}
 		s.Preview, s.Truncated = agentRunPreview(s.Preview, agentRunPreviewBytes)
-		entry := AgentRunEntry{ID: runSubmissionPrefix + s.SubmissionID, Kind: "submission", CreatedAt: at, Submission: &s}
-		if w.contains(entry) {
-			items = append(items, entry)
-		}
+		items = append(items, AgentRunEntry{ID: runSubmissionPrefix + s.SubmissionID, Kind: "submission", CreatedAt: at, Submission: &s})
 	}
 	return items, rows.Err()
+}
+
+// The coordinator_turn_id lookup yields at most one receipt. Match the frozen
+// request, resolution, and assignment to the delivery/message/conversation
+// already verified against this exact Turn in the same snapshot.
+var agentRunDispatchDecisionSQL = `SELECT c.id,c.request_id,c.task_id,c.kind,coalesce(c.worker_member_id,''),coalesce(c.assignment_id,''),` +
+	agentRunPreviewSQL("c.reason", agentRunPreviewBytes) + `,c.created_at
+ FROM coordination_decisions c
+ CROSS JOIN coordination_dispatch_requests r ON (r.id,r.task_id,r.group_id,r.coordinator_member_id)=
+     (c.request_id,c.task_id,c.group_id,c.coordinator_member_id)
+ CROSS JOIN coordination_dispatch_state s ON (s.decision_id,s.request_id,s.task_id,s.group_id)=(c.id,c.request_id,c.task_id,c.group_id)
+ JOIN messages m ON m.id=s.message_id AND m.sender_id='user'
+ LEFT JOIN coordination_assignments a ON a.request_id=c.request_id
+ WHERE (c.coordinator_turn_id,c.group_id,c.coordinator_member_id)=(?,?,?) AND r.topic_id=?
+ AND (s.delivery_id,s.message_id,s.conversation_id,s.delivered_member_id)=(?,?,?,c.coordinator_member_id)
+ AND ((s.status='assigned' AND c.kind='assign' AND (a.id,a.decision_id,a.task_id,a.group_id,a.worker_member_id)=
+     (c.assignment_id,c.id,c.task_id,c.group_id,c.worker_member_id))
+ OR (s.status='declined' AND c.kind='decline' AND c.assignment_id IS NULL AND c.worker_member_id IS NULL AND a.id IS NULL))`
+
+func (w agentRunWindow) dispatchDecision(ctx context.Context, tx *sql.Tx, ref agentRunRef) (*AgentRunEntry, error) {
+	bound, args := w.bound("c", runDecisionPrefix, []any{ref.runID, ref.groupID, ref.memberID, ref.topicID, ref.deliveryID, ref.triggerID, ref.conversationID})
+	var d AgentRunDispatchDecision
+	var stamp string
+	err := tx.QueryRowContext(ctx, agentRunDispatchDecisionSQL+bound, args...).Scan(&d.DecisionID, &d.RequestID, &d.TaskID, &d.Kind,
+		&d.WorkerMemberID, &d.AssignmentID, &d.ReasonPreview, &stamp)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	at, err := coordinationDispatchTime(stamp)
+	if err != nil {
+		return nil, err
+	}
+	d.ReasonPreview, d.Truncated = agentRunPreview(d.ReasonPreview, agentRunPreviewBytes)
+	if !utf8.ValidString(d.ReasonPreview) {
+		d.ReasonPreview, d.Truncated = "", true
+	}
+	return &AgentRunEntry{ID: runDecisionPrefix + d.DecisionID, Kind: "dispatch_decision", CreatedAt: at, DispatchDecision: &d}, nil
 }
 
 // Reuse the immutable intent-to-receipt join; select no grant, resource key,
