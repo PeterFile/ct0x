@@ -35,22 +35,17 @@ const defaultProjectWorkspace = "SELECT id FROM workspaces WHERE is_default = 1"
 const localProjectScope = "p.workspace_id = (" + defaultProjectWorkspace + ")"
 const projectViewSelect = `SELECT p.id, p.workspace_id, p.name, p.description, p.created_at, d.path, d.node_id
  FROM projects p LEFT JOIN project_directories d ON d.project_id = p.id`
+const projectViewByWorkspace = projectViewSelect + " WHERE p.workspace_id = ? AND p.id = ?"
 
 // CreateProject is a trusted local-user command in the default workspace.
 func (s *Store) CreateProject(ctx context.Context, input CreateProjectInput) (ProjectView, error) {
-	const action = "创建项目失败"
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return ProjectView{}, storeError(action, err)
-	}
-	defer tx.Rollback()
-	var workspaceID string
-	if err := tx.QueryRowContext(ctx, defaultProjectWorkspace).Scan(&workspaceID); err != nil {
-		return ProjectView{}, storeError(action, err)
-	}
+	return s.createProject(ctx, input, os.Stat)
+}
 
+func (s *Store) createProject(ctx context.Context, input CreateProjectInput, stat func(string) (os.FileInfo, error)) (ProjectView, error) {
+	const action = "创建项目失败"
 	// Reuse the reservation's scope slot with the workspace (not a Group ID).
-	scope := mutationScope{operation: "create_project", actorID: "user", groupID: workspaceID, key: input.IdempotencyKey}
+	scope := mutationScope{operation: "create_project", actorID: "user", key: input.IdempotencyKey}
 	fields := []string{input.Name, input.Description}
 	hasDirectory := input.Directory != nil
 	var directory string
@@ -58,21 +53,49 @@ func (s *Store) CreateProject(ctx context.Context, input CreateProjectInput) (Pr
 		directory = *input.Directory
 		fields = append(fields, directory)
 	}
-	id, replay, err := reserveMutation(ctx, tx, scope, mutationPayload(fields...))
+	payload := mutationPayload(fields...)
+	if hasDirectory && scope.key != "" {
+		project, err := s.lookupProjectReplay(ctx, scope, payload)
+		if err != nil {
+			return ProjectView{}, storeError(action, err)
+		}
+		if project != nil {
+			return *project, nil
+		}
+	}
+
+	// An unreachable mount must not hold the Store's only connection.
+	var validationErr error
+	switch {
+	case strings.TrimSpace(input.Name) == "":
+		validationErr = fmt.Errorf("%w：项目名称不能为空", ErrInvalid)
+	case hasDirectory:
+		validationErr = validateProjectDirectory(ctx, directory, stat)
+		if err := ctx.Err(); err != nil {
+			return ProjectView{}, storeError(action, err)
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ProjectView{}, storeError(action, err)
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRowContext(ctx, defaultProjectWorkspace).Scan(&scope.groupID); err != nil {
+		return ProjectView{}, storeError(action, err)
+	}
+	// A competing request may have committed during validation. Resolve its
+	// receipt before applying the validation result, even if the probe failed.
+	id, replay, err := reserveMutation(ctx, tx, scope, payload)
 	if err != nil {
 		return ProjectView{}, storeError(action, err)
 	}
 	if !replay {
-		if strings.TrimSpace(input.Name) == "" {
-			return ProjectView{}, storeError(action, fmt.Errorf("%w：项目名称不能为空", ErrInvalid))
-		}
-		if hasDirectory {
-			if err := validateProjectDirectory(directory); err != nil {
-				return ProjectView{}, storeError(action, err)
-			}
+		if validationErr != nil {
+			return ProjectView{}, storeError(action, validationErr)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO projects(id, workspace_id, name, description, created_at, legacy_origin_group_id)
-		 VALUES(?, ?, ?, ?, ?, NULL)`, id, workspaceID, input.Name, input.Description, time.Now().UTC().Format(timestampLayout)); err != nil {
+		 VALUES(?, ?, ?, ?, ?, NULL)`, id, scope.groupID, input.Name, input.Description, time.Now().UTC().Format(timestampLayout)); err != nil {
 			return ProjectView{}, storeError(action, err)
 		}
 		if hasDirectory {
@@ -84,8 +107,7 @@ func (s *Store) CreateProject(ctx context.Context, input CreateProjectInput) (Pr
 		}
 	}
 
-	// Read the saved metadata even on replay without consulting the filesystem.
-	project, err := scanProjectView(tx.QueryRowContext(ctx, projectViewSelect+" WHERE p.workspace_id = ? AND p.id = ?", workspaceID, id))
+	project, err := scanProjectView(tx.QueryRowContext(ctx, projectViewByWorkspace, scope.groupID, id))
 	if err != nil {
 		return ProjectView{}, storeError(action, err)
 	}
@@ -95,10 +117,57 @@ func (s *Store) CreateProject(ctx context.Context, input CreateProjectInput) (Pr
 	return project, nil
 }
 
-func validateProjectDirectory(path string) error {
+// lookupProjectReplay closes the scoped receipt check before any directory probe.
+func (s *Store) lookupProjectReplay(ctx context.Context, scope mutationScope, payload []byte) (*ProjectView, error) {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRowContext(ctx, defaultProjectWorkspace).Scan(&scope.groupID); err != nil {
+		return nil, err
+	}
+	id, replay, err := lookupMutation(ctx, tx, scope, payload)
+	if err != nil || !replay {
+		return nil, err
+	}
+	project, err := scanProjectView(tx.QueryRowContext(ctx, projectViewByWorkspace, scope.groupID, id))
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &project, nil
+}
+
+// os.Stat is not cancellable. Keep each process-wide slot until the probe
+// returns, even if its caller has already stopped waiting.
+var projectDirectoryProbeSlots = make(chan struct{}, 4)
+
+func validateProjectDirectory(ctx context.Context, path string, stat func(string) (os.FileInfo, error)) error {
 	if filepath.IsAbs(path) {
-		if info, err := os.Stat(path); err == nil && info.IsDir() {
-			return nil
+		select {
+		case projectDirectoryProbeSlots <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		result := make(chan bool, 1)
+		go func() {
+			defer func() { <-projectDirectoryProbeSlots }()
+			if ctx.Err() != nil {
+				return
+			}
+			info, err := stat(path)
+			result <- err == nil && info.IsDir()
+		}()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case isDirectory := <-result:
+			if isDirectory {
+				return nil
+			}
 		}
 	}
 	return fmt.Errorf("%w：项目目录必须是实际存在的绝对目录", ErrInvalid)

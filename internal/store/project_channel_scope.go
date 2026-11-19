@@ -19,8 +19,9 @@ func (s *Store) GetChannelOwnershipForTool(ctx context.Context, scope MemberTool
 		return GroupOwnership{}, ErrMemberToolDenied
 	}
 	var ownership GroupOwnership
-	err = tx.QueryRowContext(ctx, `SELECT p.workspace_id, c.project_id, c.id, g.id
+	err = tx.QueryRowContext(ctx, `SELECT w.id, p.id, c.id, g.id
 	 FROM channels c JOIN projects p ON p.id = c.project_id JOIN groups g ON g.id = c.legacy_group_id
+	 JOIN workspaces w ON w.id = p.workspace_id
 	 WHERE c.legacy_group_id = ? AND c.project_id = ? AND c.id = ?`, scope.Claim.GroupID, projectID, channelID).
 		Scan(&ownership.WorkspaceID, &ownership.ProjectID, &ownership.ChannelID, &ownership.GroupID)
 	if errors.Is(err, sql.ErrNoRows) {

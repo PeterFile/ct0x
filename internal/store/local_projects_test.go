@@ -1,9 +1,12 @@
 package store
 
 import (
+	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestProjectChannelOwnershipForToolUsesLiveGroup(t *testing.T) {
@@ -54,6 +57,187 @@ func TestProjectChannelOwnershipForToolUsesLiveGroup(t *testing.T) {
 	requireMemberToolDenied(t, err)
 	if got != (GroupOwnership{}) {
 		t.Fatalf("revoked scope returned ownership: %+v", got)
+	}
+}
+
+func TestProjectChannelOwnershipForToolRequiresWorkspace(t *testing.T) {
+	f, scope := memberOperationFixture(t)
+	bound, err := f.s.GetGroupOwnership(ctx, f.groupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f.s.GetChannelOwnershipForTool(ctx, scope, bound.ProjectID, bound.ChannelID); err != nil || got != bound {
+		t.Fatalf("fixture must start with a live scope: %+v, %v", got, err)
+	}
+	// Damage only the Workspace; keep the Project, Group and live claim intact.
+	coordinationDecideExec(t, f.s, "PRAGMA foreign_keys=OFF; DROP TRIGGER workspaces_no_delete")
+	coordinationDecideExec(t, f.s, "DELETE FROM workspaces WHERE id = ?", bound.WorkspaceID)
+	coordinationDecideExec(t, f.s, "PRAGMA foreign_keys=ON")
+	got, err := f.s.GetChannelOwnershipForTool(ctx, scope, bound.ProjectID, bound.ChannelID)
+	requireMemberToolDenied(t, err)
+	if got != (GroupOwnership{}) {
+		t.Fatalf("dangling project returned ownership: %+v", got)
+	}
+}
+
+func TestProjectChannelReadsIgnoreDanglingGroup(t *testing.T) {
+	s, _ := openTestStore(t)
+	project, err := s.CreateProject(ctx, CreateProjectInput{Name: "测试项目"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := CreateChannelInput{ProjectID: project.ID, Name: "告警", IdempotencyKey: "dangling"}
+	dangling, err := s.CreateChannel(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthy, err := s.CreateChannel(ctx, CreateChannelInput{ProjectID: project.ID, Name: "讨论"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Leave the Channel and its receipt intact, simulating out-of-band damage.
+	coordinationDecideExec(t, s, "PRAGMA foreign_keys=OFF")
+	coordinationDecideExec(t, s, "DELETE FROM groups WHERE id = ?", dangling.GroupID)
+	coordinationDecideExec(t, s, "PRAGMA foreign_keys=ON")
+	t.Run("detail", func(t *testing.T) {
+		got, err := s.GetChannel(ctx, project.ID, dangling.ID)
+		if !errors.Is(err, ErrNotFound) || got != (ChannelView{}) {
+			t.Fatalf("detail returned a dangling channel: %+v, %v", got, err)
+		}
+	})
+	t.Run("list", func(t *testing.T) {
+		got, err := s.ListChannels(ctx, project.ID, ListOptions{Limit: 1})
+		if err != nil || len(got.Items) != 1 || got.Items[0] != healthy || got.NextCursor != nil {
+			t.Fatalf("list must page only over intact channels: %+v, %v", got, err)
+		}
+	})
+	t.Run("replay", func(t *testing.T) {
+		got, err := s.CreateChannel(ctx, input)
+		if !errors.Is(err, ErrNotFound) || got != (ChannelView{}) {
+			t.Fatalf("replay returned a dangling channel: %+v, %v", got, err)
+		}
+	})
+}
+
+func TestProjectChannelPagePlan(t *testing.T) {
+	s, _ := openTestStore(t)
+	for _, tc := range []struct {
+		name   string
+		before *Cursor
+	}{
+		{"head", nil},
+		{"before", &Cursor{CreatedAt: time.Unix(0, 0), ID: "cursor"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			query, args := channelPageQuery("project", tc.before, 51)
+			rows, err := s.db.QueryContext(ctx, "EXPLAIN QUERY PLAN "+query, args...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			var plan []string
+			for rows.Next() {
+				var id, parent, unused int
+				var detail string
+				if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+					t.Fatal(err)
+				}
+				plan = append(plan, detail)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if len(plan) != 2 || !strings.HasPrefix(plan[0], "SEARCH c ") ||
+				!strings.Contains(plan[0], "channels_project_created_id (project_id=?") ||
+				!strings.HasPrefix(plan[1], "SEARCH g ") || !strings.HasSuffix(plan[1], " (id=?)") {
+				t.Fatalf("want project index followed by a Group PK lookup, without scans or sorting: %q", plan)
+			}
+		})
+	}
+}
+
+func TestProjectDirectoryProbeDoesNotHoldStore(t *testing.T) {
+	s, _ := openTestStore(t)
+	dir := t.TempDir()
+	input := CreateProjectInput{Name: "目录项目", Directory: &dir, IdempotencyKey: "pending"}
+	probeCtx, cancel := context.WithCancel(ctx)
+	started, release, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var probeErr error
+	go func() {
+		defer close(done)
+		_, probeErr = s.createProject(probeCtx, input, func(string) (os.FileInfo, error) {
+			close(started)
+			<-release
+			return nil, os.ErrNotExist
+		})
+	}()
+	defer func() {
+		cancel()
+		close(release)
+		<-done
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("directory probe did not start")
+	}
+
+	// The probe has not returned, but a directoryless write can use the
+	// single Store connection and reserve this still-unclaimed key.
+	writeCtx, stopWrite := context.WithTimeout(ctx, 2*time.Second)
+	defer stopWrite()
+	if _, err := s.CreateProject(writeCtx, CreateProjectInput{Name: "无需目录", IdempotencyKey: input.IdempotencyKey}); err != nil {
+		t.Errorf("directory probe blocked Store progress: %v", err)
+	}
+	cancel()
+	select {
+	case <-done:
+		if !errors.Is(probeErr, context.Canceled) {
+			t.Errorf("canceled directory check returned %v", probeErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("directory probe blocked cancellation")
+	}
+}
+
+func TestProjectDirectoryRechecksReceiptAfterProbe(t *testing.T) {
+	s, _ := openTestStore(t)
+	dir := t.TempDir()
+	input := CreateProjectInput{Name: "目录项目", Directory: &dir, IdempotencyKey: "race"}
+	callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	type outcome struct {
+		project ProjectView
+		err     error
+	}
+	committed := make(chan outcome, 1)
+	project, err := s.createProject(callCtx, input, func(string) (os.FileInfo, error) {
+		other, err := s.CreateProject(callCtx, input)
+		committed <- outcome{other, err}
+		return nil, os.ErrNotExist // The directory may vanish after the competing request checks it.
+	})
+	if err != nil || project.ID == "" {
+		t.Fatalf("matching receipt must win over a failed probe: %+v, %v", project, err)
+	}
+	select {
+	case other := <-committed:
+		if other.err != nil || other.project.ID != project.ID {
+			t.Fatalf("probe race did not replay the competing request: %+v, %v", other.project, other.err)
+		}
+	default:
+		t.Fatal("directory probe did not run")
+	}
+
+	noProbe := func(string) (os.FileInfo, error) {
+		t.Error("a committed receipt must be resolved before any filesystem probe")
+		return nil, os.ErrNotExist
+	}
+	if got, err := s.createProject(ctx, input, noProbe); err != nil || got.ID != project.ID {
+		t.Fatalf("committed replay: %+v, %v", got, err)
+	}
+	input.Description = "变更内容"
+	if got, err := s.createProject(ctx, input, noProbe); !errors.Is(err, ErrConflict) || got != (ProjectView{}) {
+		t.Fatalf("changed payload: %+v, %v", got, err)
 	}
 }
 

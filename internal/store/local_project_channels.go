@@ -22,8 +22,10 @@ type CreateChannelInput struct {
 	ProjectID, Name, Description, IdempotencyKey string
 }
 
-const channelViewSelect = `SELECT c.id, c.project_id, c.legacy_group_id, c.name, c.description, c.created_at
- FROM channels c
+// Keep channels as the outer loop for index-ordered project paging. Each
+// candidate checks for its actual Group by primary key, not by scanning groups.
+const channelViewSelect = `SELECT c.id, c.project_id, g.id, c.name, c.description, c.created_at
+ FROM channels c CROSS JOIN groups g ON g.id = c.legacy_group_id
  WHERE c.project_id = ?`
 
 // CreateChannel is a trusted local-user command. The channel, legacy group,
@@ -94,13 +96,8 @@ func (s *Store) ListChannels(ctx context.Context, projectID string, options List
 	if err := requireLocalProjectInTx(ctx, tx, projectID); err != nil {
 		return Page[ChannelView]{}, storeError(action, err)
 	}
-	query, args := channelViewSelect, []any{projectID}
-	if c := options.Before; c != nil {
-		query += " AND (c.created_at, c.id) < (?, ?)"
-		args = append(args, c.CreatedAt.UTC().Format(timestampLayout), c.ID)
-	}
-	query += " ORDER BY c.created_at DESC, c.id DESC LIMIT ?"
-	rows, err := tx.QueryContext(ctx, query, append(args, limit+1)...)
+	query, args := channelPageQuery(projectID, options.Before, limit+1)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return Page[ChannelView]{}, storeError(action, err)
 	}
@@ -114,6 +111,15 @@ func (s *Store) ListChannels(ctx context.Context, projectID string, options List
 		return Page[ChannelView]{}, storeError(action, err)
 	}
 	return page, nil
+}
+
+func channelPageQuery(projectID string, before *Cursor, limit int) (string, []any) {
+	query, args := channelViewSelect, []any{projectID}
+	if before != nil {
+		query += " AND (c.created_at, c.id) < (?, ?)"
+		args = append(args, before.CreatedAt.UTC().Format(timestampLayout), before.ID)
+	}
+	return query + " ORDER BY c.created_at DESC, c.id DESC LIMIT ?", append(args, limit)
 }
 
 func scanChannelView(row scanner) (ChannelView, error) {
