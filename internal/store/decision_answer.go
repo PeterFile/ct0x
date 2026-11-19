@@ -74,9 +74,6 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 	if err != nil {
 		return zero, err
 	}
-	if q.Task == nil || q.Relay != domain.DecisionRelayTaskOwner {
-		return zero, ErrDecisionRelayUnsupported
-	}
 	if q.RecipientID != actor {
 		return zero, ErrMemberToolDenied
 	}
@@ -93,25 +90,48 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 	if err != nil {
 		return zero, err
 	}
-	v, dispatch, err := coordinationAssignmentLoad(ctx, tx, q.Task.AssignmentID)
-	if err != nil {
-		return zero, coordinationRoleRelationError(err)
+	load := decisionAnswerReceiptInTx
+	table := "decision_answers"
+	var save func() (domain.DecisionAnswerReceipt, error)
+	switch q.Relay {
+	case domain.DecisionRelayOriginThread:
+		asker, err := decisionThreadAskerInTx(ctx, tx, q)
+		if err != nil {
+			return zero, err
+		}
+		load, table = decisionThreadAnswerReceiptInTx, "decision_thread_answers"
+		save = func() (domain.DecisionAnswerReceipt, error) {
+			return saveDecisionThreadAnswerInTx(ctx, tx, q, asker, actor, text, input.OptionIndex)
+		}
+	case domain.DecisionRelayTaskOwner:
+		if q.Task == nil {
+			return zero, ErrDecisionRelayUnsupported
+		}
+		v, dispatch, err := coordinationAssignmentLoad(ctx, tx, q.Task.AssignmentID)
+		if err != nil {
+			return zero, coordinationRoleRelationError(err)
+		}
+		facts := taskWorkFacts{v: v, dispatch: dispatch, d: taskWorkRecord(v, v.r.CoordinatorMemberID, "")}
+		if err := decisionTaskAuthorityInTx(ctx, tx, q, facts); err != nil {
+			return zero, err
+		}
+		save = func() (domain.DecisionAnswerReceipt, error) {
+			return saveDecisionTaskAnswerInTx(ctx, tx, q, v, actor, text, input.OptionIndex)
+		}
+	default:
+		return zero, ErrDecisionRelayUnsupported
 	}
-	facts := taskWorkFacts{v: v, dispatch: dispatch, d: taskWorkRecord(v, v.r.CoordinatorMemberID, "")}
-	if err := decisionTaskAuthorityInTx(ctx, tx, q, facts); err != nil {
-		return zero, err
-	}
-	a, err := decisionAnswerReceiptInTx(ctx, tx, thread, id, input.Version)
+	a, err := load(ctx, tx, thread, id, input.Version)
 	fresh := errors.Is(err, sql.ErrNoRows)
 	if fresh {
 		var alreadySaved bool
-		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM decision_answers WHERE request_id=?)`, q.ID).Scan(&alreadySaved); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM `+table+` WHERE request_id=?)`, q.ID).Scan(&alreadySaved); err != nil {
 			return zero, err
 		}
 		if replay || alreadySaved {
 			return zero, ErrConflict // Broken proof is not an absent answer.
 		}
-		a, err = saveDecisionTaskAnswerInTx(ctx, tx, q, v, actor, text, input.OptionIndex)
+		a, err = save()
 	}
 	if err != nil {
 		return zero, err
@@ -133,15 +153,21 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 		}
 		return zero, err
 	}
-	f, err := taskWorkDeliveryInTx(ctx, tx, q.GroupID, a.WakeDeliveryID)
-	if err != nil {
-		return zero, coordinationRoleRelationError(err)
-	}
-	if !f.decisionAnswer || f.d.SourceID != a.ID || f.d.MessageID != a.WakeMessageID || (fresh && f.turnID != "") {
-		return zero, ErrConflict
-	}
-	if err := decisionTaskAuthorityInTx(ctx, tx, q, f); err != nil {
-		return zero, err
+	if q.Relay == domain.DecisionRelayOriginThread {
+		if err := verifyDecisionThreadAnswerInTx(ctx, tx, a, fresh); err != nil {
+			return zero, err
+		}
+	} else {
+		f, err := taskWorkDeliveryInTx(ctx, tx, q.GroupID, a.WakeDeliveryID)
+		if err != nil {
+			return zero, coordinationRoleRelationError(err)
+		}
+		if !f.decisionAnswer || f.d.SourceID != a.ID || f.d.MessageID != a.WakeMessageID || (fresh && f.turnID != "") {
+			return zero, ErrConflict
+		}
+		if err := decisionTaskAuthorityInTx(ctx, tx, q, f); err != nil {
+			return zero, err
+		}
 	}
 	if key != "" {
 		id, present, err := lookupMutation(ctx, tx, mutation, payload)
@@ -263,11 +289,20 @@ func (s *Store) readDecisionAnswer(ctx context.Context, thread domain.ThreadRef,
 		return zero, decisionRequestError(action, err)
 	}
 	receipt, err := decisionAnswerReceiptInTx(ctx, tx, thread, id, version)
+	if errors.Is(err, sql.ErrNoRows) {
+		installed, installErr := decisionThreadAnswerInstalled(ctx, tx)
+		if installErr != nil {
+			return zero, decisionRequestError(action, installErr)
+		}
+		if installed {
+			receipt, err = decisionThreadAnswerReceiptInTx(ctx, tx, thread, id, version)
+		}
+	}
 	if err != nil {
 		return zero, decisionRequestError(action, err)
 	}
 	view := domain.DecisionAnswerView{Receipt: receipt}
-	if includeHandling {
+	if includeHandling && receipt.TaskID != "" {
 		view.Handling, err = decisionAnswerHandlingInTx(ctx, tx, receipt)
 		if err != nil {
 			return zero, decisionRequestError(action, err)

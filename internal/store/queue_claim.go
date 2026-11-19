@@ -33,10 +33,11 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 	t := domain.Turn{ID: rand.Text(), GroupID: input.GroupID, DeliveryID: input.DeliveryID, ClaimToken: rand.Text(), State: domain.TurnStateStarting}
 	// The first statement is a conditional write, even with a deferred transaction.
 	// Reserving the binding before reads prevents competing read-to-write upgrades.
+	var messageID string
 	err = tx.QueryRowContext(ctx, `UPDATE deliveries SET turn_id=?
 	 WHERE id=? AND group_id=? AND state='queued' AND turn_id=''
 	 AND EXISTS(SELECT 1 FROM members WHERE id=deliveries.recipient_id AND group_id=deliveries.group_id AND status='active')
-	 RETURNING conversation_id,recipient_id`, t.ID, input.DeliveryID, input.GroupID).Scan(&t.ConversationID, &t.MemberID)
+	 RETURNING conversation_id,recipient_id,message_id`, t.ID, input.DeliveryID, input.GroupID).Scan(&t.ConversationID, &t.MemberID, &messageID)
 	if errors.Is(err, sql.ErrNoRows) {
 		var found int
 		err = tx.QueryRowContext(ctx, `SELECT 1 FROM deliveries d JOIN members m ON m.id=d.recipient_id AND m.group_id=d.group_id
@@ -87,6 +88,9 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 		if n != 1 {
 			return domain.Turn{}, queueError(action, ErrTurnBusy)
 		}
+	}
+	if err := threadDecisionClaimInTx(ctx, tx, t, messageID, input.ThreadDecisionAnswerID); err != nil {
+		return domain.Turn{}, queueError(action, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Turn{}, queueError(action, err)

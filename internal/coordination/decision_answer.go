@@ -24,3 +24,7 @@ func (e *Engine) GetDecisionAnswerView(ctx context.Context, thread domain.Thread
 func (e *Engine) ListPendingTaskDecisions(ctx context.Context, opts store.ListOptions) (store.Page[domain.DecisionRequest], error) {
 	return e.store.ListPendingTaskDecisions(ctx, opts)
 }
+
+func (e *Engine) ListAnswerableDecisions(ctx context.Context, opts store.ListOptions) (store.Page[domain.DecisionRequest], error) {
+	return e.store.ListAnswerableDecisions(ctx, opts)
+}

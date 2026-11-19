@@ -10,8 +10,9 @@ type DecisionAnswerInput struct {
 	Text        string `json:"text,omitempty"`
 }
 
-// DecisionAnswerReceipt proves saving one human statement and queuing its
-// owner wake. It is immutable; the WorkInput ACK separately proves handling.
+// DecisionAnswerReceipt proves saving one human statement and queuing its wake.
+// It does not prove the recipient handled it. Task fields are empty for a
+// pre-Task Thread reply, which is itself the wake message.
 type DecisionAnswerReceipt struct {
 	ID        string `json:"id"`
 	RequestID string `json:"request_id"`

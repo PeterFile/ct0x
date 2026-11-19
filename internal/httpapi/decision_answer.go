@@ -17,7 +17,7 @@ func (a localAPI) listPendingDecisions(w http.ResponseWriter, r *http.Request) {
 		operationError(w, err)
 		return
 	}
-	page, err := a.local.ListPendingTaskDecisions(r.Context(), opts)
+	page, err := a.local.ListAnswerableDecisions(r.Context(), opts)
 	if err != nil {
 		decisionAnswerHTTPError(w, err)
 		return

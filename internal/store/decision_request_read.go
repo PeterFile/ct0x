@@ -77,24 +77,28 @@ const decisionRequestCurrentTask = `q.task_id IS NOT NULL AND t.status='open' AN
         (q.assignment_id,q.task_id,q.group_id,q.topic_id,q.task_revision,q.mandate_id,
          q.authority_generation,q.owner_member_id,q.owner_member_id))))`
 
-const decisionRequestCurrentChat = `q.task_id IS NULL AND EXISTS(SELECT 1 FROM chat_candidates c
- JOIN chat_intake_executions i ON (i.candidate_id,i.turn_id,i.purpose,i.source_kind,i.source_id)=
+const decisionRequestChatJoins = ` JOIN chat_intake_executions i ON (i.candidate_id,i.turn_id,i.purpose,i.source_kind,i.source_id)=
     (c.id,c.turn_id,'chat_intake/v1','local_user_chat',q.chat_source_id)
  JOIN turns rt ON rt.id=c.turn_id JOIN deliveries rd ON rd.id=rt.delivery_id
  JOIN message_command_sources s ON (s.id,s.message_id,s.kind)=(q.chat_source_id,q.source_message_id,'local_user_chat')
  JOIN messages source ON (source.id,source.sender_id)=(s.message_id,q.recipient_id)
- JOIN messages n ON (n.id,n.group_id,n.topic_id,n.sender_id)=(a.notice_message_id,q.group_id,q.topic_id,c.member_id)
- WHERE c.id=a.candidate_id AND (c.group_id,c.topic_id,c.message_id,c.generation,c.turn_id,c.member_id)=
+ JOIN messages n ON (n.id,n.group_id,n.topic_id,n.sender_id)=(a.notice_message_id,q.group_id,q.topic_id,c.member_id)`
+
+const decisionRequestChatProof = `(c.group_id,c.topic_id,c.message_id,c.generation,c.turn_id,c.member_id)=
     (q.group_id,q.topic_id,q.source_message_id,q.source_sequence,v.author_turn_id,v.author_member_id)
  AND ` + chatDiscussionReceiveMatches + `
  AND a.decision_id IS NULL AND a.dispatch_request_id IS NULL AND json_extract(a.receipt_json,'$.outcome')='clarify'
  AND json_extract(a.receipt_json,'$.question')=json_extract(v.question_json,'$.question')
- AND NOT EXISTS(SELECT 1 FROM deliveries wake WHERE wake.message_id=n.id))
- AND NOT EXISTS(SELECT 1 FROM message_log l JOIN message_command_sources s ON s.message_id=l.message_id AND s.kind='local_user_chat'
+ AND NOT EXISTS(SELECT 1 FROM deliveries wake WHERE wake.message_id=n.id)`
+
+const decisionRequestChatUnadvanced = `NOT EXISTS(SELECT 1 FROM message_log l JOIN message_command_sources s ON s.message_id=l.message_id AND s.kind='local_user_chat'
     WHERE (l.group_id,l.topic_id)=(q.group_id,q.topic_id) AND l.sequence>q.source_sequence)
  AND NOT EXISTS(SELECT 1 FROM coordination_triggers o JOIN routing_decisions r ON r.trigger_id=o.id
     WHERE (o.source_kind,o.message_id,o.group_id,o.topic_id)=('local_im',q.source_message_id,q.group_id,q.topic_id))
  AND NOT EXISTS(SELECT 1 FROM chat_followup_routes f WHERE f.source_id=q.chat_source_id)`
+
+const decisionRequestCurrentChat = `q.task_id IS NULL AND EXISTS(SELECT 1 FROM chat_candidates c` + decisionRequestChatJoins + `
+ WHERE c.id=a.candidate_id AND ` + decisionRequestChatProof + `) AND ` + decisionRequestChatUnadvanced
 
 const decisionRequestCurrent = ` WHERE q.recipient_id='user' AND q.withdrawn_at IS NULL
  AND (v.expires_at IS NULL OR v.expires_at>?) AND ((` + decisionRequestCurrentTask + `) OR (` + decisionRequestCurrentChat + `))`
@@ -102,11 +106,19 @@ const decisionRequestCurrent = ` WHERE q.recipient_id='user' AND q.withdrawn_at 
 const decisionRequestUnanswered = ` AND NOT EXISTS(SELECT 1 FROM decision_answers ans WHERE ans.request_id=q.id)`
 
 func decisionRequestPendingSQL(ctx context.Context, tx *sql.Tx) (string, error) {
+	where := decisionRequestCurrent
 	installed, err := decisionAnswerInstalledInTx(ctx, tx)
-	if installed {
-		return decisionRequestCurrent + decisionRequestUnanswered, err
+	if err != nil {
+		return "", err
 	}
-	return decisionRequestCurrent, err
+	if installed {
+		where += decisionRequestUnanswered
+	}
+	threadInstalled, err := decisionThreadAnswerInstalled(ctx, tx)
+	if threadInstalled {
+		where += decisionThreadUnanswered
+	}
+	return where, err
 }
 
 func scanDecisionRequest(row scanner) (out domain.DecisionRequest, err error) {
@@ -159,19 +171,30 @@ func decisionRequestVersionInTx(ctx context.Context, tx *sql.Tx, where string, t
  AND (q.group_id,q.topic_id,q.id,v.version)=(?,?,?,?)`, now.UTC().Format(timestampLayout), thread.GroupID, thread.TopicID, id, version))
 }
 
+type decisionList uint8
+
+const (
+	decisionListRequests decisionList = iota
+	decisionListTasks
+	decisionListAnswerable
+)
+
 // ListPendingDecisionRequests is for trusted local-user composition only. The
 // cursor refers to original capture order; amendments do not reorder a page.
 func (s *Store) ListPendingDecisionRequests(ctx context.Context, options ListOptions) (Page[domain.DecisionRequest], error) {
-	return s.listPendingDecisionRequests(ctx, options, false)
+	return s.listPendingDecisionRequests(ctx, options, decisionListRequests)
 }
 
-// ListPendingTaskDecisions exposes only the currently supported answer relay.
-// A request-only installation is not an empty, operational answer inbox.
 func (s *Store) ListPendingTaskDecisions(ctx context.Context, options ListOptions) (Page[domain.DecisionRequest], error) {
-	return s.listPendingDecisionRequests(ctx, options, true)
+	return s.listPendingDecisionRequests(ctx, options, decisionListTasks)
 }
 
-func (s *Store) listPendingDecisionRequests(ctx context.Context, options ListOptions, taskOnly bool) (Page[domain.DecisionRequest], error) {
+// ListAnswerableDecisions is the local-user inbox, not the request kernel.
+func (s *Store) ListAnswerableDecisions(ctx context.Context, options ListOptions) (Page[domain.DecisionRequest], error) {
+	return s.listPendingDecisionRequests(ctx, options, decisionListAnswerable)
+}
+
+func (s *Store) listPendingDecisionRequests(ctx context.Context, options ListOptions, list decisionList) (Page[domain.DecisionRequest], error) {
 	const action = "读取待决事项失败"
 	var page Page[domain.DecisionRequest]
 	limit, err := listLimit(options)
@@ -187,16 +210,19 @@ func (s *Store) listPendingDecisionRequests(ctx context.Context, options ListOpt
 		return page, decisionRequestError(action, err)
 	}
 	var where string
-	if taskOnly {
+	if list == decisionListRequests {
+		where, err = decisionRequestPendingSQL(ctx, tx)
+	} else {
 		if err := requireDecisionAnswersInTx(ctx, tx); err != nil {
 			return page, decisionRequestError(action, err)
 		}
 		where = decisionRequestCurrent + decisionRequestUnanswered + ` AND q.task_id IS NOT NULL`
-	} else {
-		where, err = decisionRequestPendingSQL(ctx, tx)
-		if err != nil {
-			return page, decisionRequestError(action, err)
+		if list == decisionListAnswerable {
+			where, err = answerableDecisionSQL(ctx, tx, where)
 		}
+	}
+	if err != nil {
+		return page, decisionRequestError(action, err)
 	}
 	query := decisionRequestSelect + where
 	args := []any{time.Now().UTC().Format(timestampLayout)}
