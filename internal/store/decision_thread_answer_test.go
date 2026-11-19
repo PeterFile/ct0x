@@ -26,10 +26,10 @@ func installThreadDecisionAnswerFixture(t *testing.T, s *Store) {
 	}
 }
 
-func askThreadDecision(t *testing.T, f chatFixture) domain.DecisionRequest {
+func askThreadDecision(t *testing.T, f chatFixture, key string) domain.DecisionRequest {
 	t.Helper()
 	input, details := decisionClarificationInput()
-	q, err := f.s.ApplyChatDecisionClarification(ctx, f.scope, f.candidate.ID, input, details, input.Question, "ask-thread")
+	q, err := f.s.ApplyChatDecisionClarification(ctx, f.scope, f.candidate.ID, input, details, input.Question, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,8 +40,8 @@ func threadDecisionFixture(t *testing.T) (chatFixture, domain.DecisionRequest) {
 	t.Helper()
 	f := chatSetup(t, "user", false)
 	installDecisionAnswerFixture(t, f.s)
-	q := askThreadDecision(t, f) // Prove that an existing opt-in can be answered after installation.
 	installThreadDecisionAnswerFixture(t, f.s)
+	q := askThreadDecision(t, f, "ask-thread")
 	f.s.EnableThreadDecisionExecution()
 	if _, err := f.s.ApplyTurnReceipt(ctx, f.scope.Claim, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}); err != nil {
 		t.Fatal(err)
@@ -70,15 +70,18 @@ func TestThreadDecisionAnswerReturnsOnlyToTheAsker(t *testing.T) {
 		t.Fatalf("typed lane on the old database: %+v %v", page, err)
 	}
 	installDecisionAnswerFixture(t, f.s)
-	q := askThreadDecision(t, f)
-	answer := domain.DecisionAnswerInput{Version: q.Version, OptionIndex: 1}
+	legacy := askThreadDecision(t, f, "ask-before-install")
 	if page, err := old.ListAnswerableDecisions(ctx, ListOptions{}); err != nil || len(page.Items) != 0 {
 		t.Fatalf("advertised a route without Thread reply storage: %+v %v", page, err)
 	}
-	if _, err := old.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, answer, "legacy"); !errors.Is(err, ErrDecisionRelayUnsupported) {
+	legacyAnswer := domain.DecisionAnswerInput{Version: legacy.Version, OptionIndex: 1}
+	if _, err := old.AnswerDecisionRequest(ctx, "user", legacy.ThreadRef, legacy.ID, legacyAnswer, "legacy"); !errors.Is(err, ErrDecisionRelayUnsupported) {
 		t.Fatalf("uninstalled Thread reply route: %v", err)
 	}
 	installThreadDecisionAnswerFixture(t, f.s)
+	chatNextCandidate(t, &f, true)
+	q := askThreadDecision(t, f, "ask-thread")
+	answer := domain.DecisionAnswerInput{Version: q.Version, OptionIndex: 1}
 	beforeDisabled := messageSequenceSnapshot(t, f.s)
 	if m, err := f.s.GetMember(ctx, q.GroupID, q.AuthorMemberID); err != nil || m.ProviderID == "" || m.Model == "" {
 		t.Fatalf("disabled startup fixture must have a configured provider/model: %+v %v", m, err)
@@ -116,7 +119,7 @@ func TestThreadDecisionAnswerReturnsOnlyToTheAsker(t *testing.T) {
 	messageSequencePreserved(t, f.s, before)
 	a, err := f.s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, answer, "global")
 	if err != nil || a.ID == "" || a.ThreadRef != q.ThreadRef || a.TaskID != "" || a.Text != q.Choices[0] || a.ReplyMessageID != a.WakeMessageID {
-		t.Fatalf("expected one same-Thread reply/wake for the existing clarification: %+v %v", a, err)
+		t.Fatalf("expected one same-Thread reply/wake for the new clarification: %+v %v", a, err)
 	}
 	m, err := f.s.GetMessage(ctx, q.GroupID, a.ReplyMessageID)
 	if err != nil || m.TopicID != q.TopicID || m.SenderID != "user" || m.SourceKind == "local_user_chat" || m.Content != a.Text || len(m.Deliveries) != 1 ||

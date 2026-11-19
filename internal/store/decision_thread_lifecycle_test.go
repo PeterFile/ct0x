@@ -36,8 +36,8 @@ func TestThreadDecisionDepartureWithdrawsCurrentAndSupersededQuestionsOnly(t *te
 		taskWorkTestReceipt(t, s, scope, refusal, domain.TurnStateNotStarted)
 		return q
 	}
-	old := ask(owner.Member.MemberID, "departure-topic", "ask-old", "这次只整理本周样本吗？")
 	installThreadDecisionAnswerFixture(t, s)
+	old := ask(owner.Member.MemberID, "departure-topic", "ask-old", "这次只整理本周样本吗？")
 	current := ask(owner.Member.MemberID, old.TopicID, "ask-new", "是否也整理上周样本？")
 	other := ask(f.a, "other-topic", "ask-other", "是否抽查两份样本？")
 	if page, err := s.ListAnswerableDecisions(ctx, ListOptions{}); err != nil || len(page.Items) != 1 || page.Items[0].ID != task.ID {
@@ -87,7 +87,7 @@ func TestThreadDecisionDepartureWithdrawsCurrentAndSupersededQuestionsOnly(t *te
 func TestThreadDecisionInstallWithdrawsLegacyQuestionFromAlreadyLeftAsker(t *testing.T) {
 	f := chatSetup(t, "user", false)
 	installDecisionAnswerFixture(t, f.s)
-	q := askThreadDecision(t, f)
+	q := askThreadDecision(t, f, "ask-thread")
 	coordinationDecideExec(t, f.s, `UPDATE members SET status='left' WHERE id=?`, q.AuthorMemberID)
 	installThreadDecisionAnswerFixture(t, f.s)
 	if err := f.s.Close(); err != nil {
@@ -103,4 +103,36 @@ func TestThreadDecisionInstallWithdrawsLegacyQuestionFromAlreadyLeftAsker(t *tes
 	if got, err := s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, input, "after-install"); !errors.Is(err, ErrConflict) || got.ID != "" {
 		t.Fatalf("saved a reply to an already-left asker: %+v %v", got, err)
 	}
+}
+
+func TestThreadDecisionInstallWithdrawsLegacyQuestionAfterAskerRejoined(t *testing.T) {
+	f := chatSetup(t, "user", false)
+	s := f.s
+	installDecisionAnswerFixture(t, s)
+	q := askThreadDecision(t, f, "ask-thread")
+	coordinationDecideExec(t, s, `UPDATE members SET status='left' WHERE id=?`, q.AuthorMemberID)
+	coordinationDecideExec(t, s, `UPDATE members SET status='active' WHERE id=?`, q.AuthorMemberID)
+	if page, err := s.ListPendingDecisionRequests(ctx, ListOptions{}); err != nil || len(page.Items) != 1 || page.Items[0].ID != q.ID {
+		t.Fatalf("expected the rejoined asker's question to still be pending before install: %+v %v", page, err)
+	}
+	before := messageSequenceSnapshot(t, s)
+	installThreadDecisionAnswerFixture(t, s)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = queueHandle(t, f.path, false)
+	var withdrawn bool
+	if err := s.db.QueryRow(`SELECT withdrawn_at IS NOT NULL FROM decision_requests WHERE id=?`, q.ID).Scan(&withdrawn); err != nil || !withdrawn {
+		t.Fatalf("legacy question was not durably withdrawn at install: %t, %v", withdrawn, err)
+	}
+	s.EnableThreadDecisionExecution()
+	if page, err := s.ListAnswerableDecisions(ctx, ListOptions{}); err != nil || len(page.Items) != 0 {
+		t.Fatalf("legacy rejoined asker's question revived after install: %+v %v", page, err)
+	}
+	input := domain.DecisionAnswerInput{Version: q.Version, OptionIndex: 1}
+	if got, err := s.AnswerDecisionRequest(ctx, "user", q.ThreadRef, q.ID, input, "after-install"); !errors.Is(err, ErrConflict) || got.ID != "" {
+		t.Fatalf("saved a reply to a withdrawn legacy question: %+v %v", got, err)
+	}
+	delete(before, "decision_requests") // Only the withdrawal stamp may change.
+	messageSequencePreserved(t, s, before)
 }
