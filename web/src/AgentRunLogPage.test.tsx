@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AgentRunLogPage } from "./AgentRunLogPage";
+import { getAgentRun } from "./agent-runs-api";
 import type { AgentRunDetail, AgentRunEntry, AgentRunSummary, AgentRunWorkspaceOperation } from "./agent-runs-api";
 import { deferred, json, page } from "./test/groups";
 
@@ -59,6 +60,41 @@ function expand(summary: HTMLElement) {
 
 beforeEach(() => { transport.mockReset(); vi.stubGlobal("fetch", transport); });
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+it("keeps an explicit public explanation separate from the original reply and persisted receipts", async () => {
+  const original = reply("original-reply", "成员在群里的原话", first);
+  const text = `  <b>${"😀".repeat(253)}</b>\n  `; // Exactly 1024 UTF-8 bytes.
+  const explanation = { kind: "public_explanation", id: `public_explanation:${first.run_id}`, created_at: stamp(4),
+    public_explanation: { text },
+  } satisfies AgentRunEntry;
+  const workspace = operation("recorded-write", "done", 8);
+  transport.mockResolvedValueOnce(page([first])).mockResolvedValueOnce(json(view(first, [workspace, explanation, original], "", {
+    outcome: "unknown", observed_terminal: "succeeded", started: true, accepted: true,
+    delivery_failed: false, direct_child_reaped: true, output_complete: false,
+  })));
+  render(<AgentRunLogPage active />);
+  fireEvent.click(await screen.findByRole("button", { name: `原群 · 运行 ${first.run_id}` }));
+
+  const events = within(await evidence().findByRole("list", { name: "事件时间线" }));
+  expect(events.getAllByRole("article")).toHaveLength(3);
+  const publication = within(events.getByRole("article", { name: `群内发言 ${original.id}` }));
+  expect(publication.getByText(original.message.preview)).toBeVisible();
+  const statement = events.getByRole("article", { name: `公开说明 ${explanation.id}` });
+  expect(within(statement).getByText(/<b>/).textContent).toBe(text);
+  expect(statement.querySelector("time")).toHaveAttribute("datetime", explanation.created_at);
+  expect(within(statement).getByText("这是成员主动公开的陈述，不是运行或动作回执。")).toBeVisible();
+  const action = within(events.getByRole("article", { name: `工作区动作 ${workspace.id}` }));
+  expect(within(expand(action.getByText("查看动作结果"))).getByText(hash)).toBeVisible();
+  expect(within(expand(evidence().getByText("查看运行回执"))).getByText("报告成功")).toBeVisible();
+
+  for (const invalid of [
+    { ...explanation, id: `public_explanation:${second.run_id}` },
+    { ...explanation, public_explanation: { text: `${text}!` } },
+  ]) {
+    transport.mockResolvedValueOnce(json(view(first, [invalid])));
+    await expect(getAgentRun(first)).rejects.toMatchObject({ status: 200, code: "invalid_response" });
+  }
+});
 
 it("renders a global empty run list without requiring a selected chat", async () => {
   transport.mockResolvedValueOnce(page());
