@@ -201,6 +201,13 @@ func TestPiInvestigationOwnerNativeSQLiteRoundTrip(t *testing.T) {
 		func(_ context.Context, _ provider.PiFreshInvestigationBinding, c investigationNativeConfig) provider.Executor {
 			tokens = append(tokens, c.Token)
 			return roleNative(func(run context.Context, req provider.ExecuteRequest, emit func(provider.Event) error) provider.ExecutionReceipt {
+				// Use the scheduler's watchdog for these in-process calls, not
+				// the outer HTTP deadline. The real handlers still recheck live
+				// authorization in SQLite before and after artifact I/O.
+				guardedHandler := f.handler
+				f.mountMemberToolHandlers(run)
+				defer func() { f.handler = guardedHandler }()
+
 				nativeCalls++
 				ops, err := f.runtime.Tools().TransportOperations(run, c.Token)
 				roleOK(t, err)
