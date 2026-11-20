@@ -3,7 +3,7 @@ import { chatInvestigationLimits as limits } from "./chat-api";
 
 type VersionRow = Readonly<{ row: number; artifact_id: string; version_id: string }>;
 export type InvestigationDraft = Readonly<{
-  enabled: boolean; objective: string; allowTopicMessages: boolean; artifactVersions: readonly VersionRow[]; maxDelegations: number;
+  enabled: boolean; objective: string; allowTopicMessages: boolean; artifactVersions: readonly VersionRow[]; maxDelegations: number; clueTerms: string;
 }>;
 
 export function ChatInvestigationSettings({ draft, disabled, supported, onChange }: {
@@ -24,6 +24,10 @@ export function ChatInvestigationSettings({ draft, disabled, supported, onChange
       <textarea id={`${id}-objective`} aria-describedby={`${id}-objective-limit`} rows={2} value={draft.objective}
         onChange={event => change({ objective: event.target.value })} />
       <p className="tasks-note" id={`${id}-objective-limit`}>目标不得为空，最多 {limits.objectiveBytes} UTF-8 字节。</p>
+      <label htmlFor={`${id}-clues`}>调查线索词组（可选）</label>
+      <textarea id={`${id}-clues`} aria-describedby={`${id}-clue-limit`} rows={2} value={draft.clueTerms}
+        onChange={event => change({ clueTerms: event.target.value })} />
+      <p className="tasks-note" id={`${id}-clue-limit`}>每行一个词组，最多 {limits.clueTerms} 个，每个最多 {limits.clueTermBytes} UTF-8 字节。全部词组须按原样出现在同一条消息原文中；「只讨论」不准入。留空则沿用非线索调查方式。</p>
       <label className="chat-policy-toggle"><input type="checkbox" checked={draft.allowTopicMessages}
         onChange={event => change({ allowTopicMessages: event.target.checked })} />允许使用本群主话题已保存消息</label>
       <label htmlFor={`${id}-delegations`}>每项调查最多委派次数</label>
