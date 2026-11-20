@@ -21,7 +21,7 @@ const operationStatus: Record<AgentRunWorkspaceOperation["state"], string> = {
   unknown: "操作结果未知，待核对", applied_sync_error: "已应用，持久同步未确认",
 };
 const entryTitle: Record<AgentRunEntry["kind"], string> = {
-  trigger_message: "触发消息", published_reply: "群内发言", submission: "正式提交",
+  trigger_message: "触发消息", published_reply: "群内发言", public_explanation: "公开说明", submission: "正式提交",
   dispatch_decision: "分派决定", workspace_operation: "工作区动作",
 };
 const runKey = ({ group_id, run_id }: AgentRunIdentity) => JSON.stringify([group_id, run_id]);
@@ -322,6 +322,9 @@ function EvidenceEntry({ entry, groupId, active, focusTarget }: {
         ["事件 ID", <code>{entry.id}</code>], ["群消息 ID", <code>{entry.message.message_id}</code>],
         ["发送者 ID", <code>{entry.message.sender_id}</code>],
       ]} /></details>
+    </> : entry.kind === "public_explanation" ? <>
+      <p className="run-log-copy">{entry.public_explanation.text}</p>
+      <p className="run-log-note">这是成员主动公开的陈述，不是运行或动作回执。</p>
     </> : entry.kind === "submission" ? <>
       <p className="run-log-state">已记录正式提交，非验收</p>
       {entry.submission.truncated ? <p className="run-log-note">提交摘要摘录</p> : null}
