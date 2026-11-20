@@ -1,8 +1,13 @@
 package store
 
 // Register as an append in landing order. Existing Turns have no explanation.
-const agentRunExplanationSchema = `
-CREATE TABLE agent_run_explanations (
+const agentRunExplanationSchema = agentRunExplanationTable + ";\n" +
+	agentRunExplanationNoReplace + ";\n" +
+	agentRunExplanationNoUpdate + ";\n" +
+	agentRunExplanationNoDelete + ";\n"
+
+// SQLite stores each CREATE definition without its statement terminator.
+const agentRunExplanationTable = `CREATE TABLE agent_run_explanations (
     -- The Turn ID is also the source ID; the public timeline namespaces it.
     id TEXT PRIMARY KEY NOT NULL,
     group_id TEXT NOT NULL,
@@ -17,13 +22,15 @@ CREATE TABLE agent_run_explanations (
     UNIQUE(group_id,member_id,idempotency_key),
     FOREIGN KEY(id,group_id,member_id,conversation_id) REFERENCES turns(id,group_id,member_id,conversation_id),
     FOREIGN KEY(conversation_id,group_id,member_id,topic_id) REFERENCES conversations(id,group_id,member_id,topic_id)
-);
-CREATE TRIGGER agent_run_explanations_no_replace BEFORE INSERT ON agent_run_explanations
+) WITHOUT ROWID`
+
+const agentRunExplanationNoReplace = `CREATE TRIGGER agent_run_explanations_no_replace BEFORE INSERT ON agent_run_explanations
 WHEN EXISTS(SELECT 1 FROM agent_run_explanations WHERE id=NEW.id
     OR (group_id,member_id,idempotency_key)=(NEW.group_id,NEW.member_id,NEW.idempotency_key))
-BEGIN SELECT RAISE(ABORT, '公开运行说明不可替换'); END;
-CREATE TRIGGER agent_run_explanations_no_update BEFORE UPDATE ON agent_run_explanations
-BEGIN SELECT RAISE(ABORT, '公开运行说明不可修改'); END;
-CREATE TRIGGER agent_run_explanations_no_delete BEFORE DELETE ON agent_run_explanations
-BEGIN SELECT RAISE(ABORT, '公开运行说明不可删除'); END;
-`
+BEGIN SELECT RAISE(ABORT, '公开运行说明不可替换'); END`
+
+const agentRunExplanationNoUpdate = `CREATE TRIGGER agent_run_explanations_no_update BEFORE UPDATE ON agent_run_explanations
+BEGIN SELECT RAISE(ABORT, '公开运行说明不可修改'); END`
+
+const agentRunExplanationNoDelete = `CREATE TRIGGER agent_run_explanations_no_delete BEFORE DELETE ON agent_run_explanations
+BEGIN SELECT RAISE(ABORT, '公开运行说明不可删除'); END`
