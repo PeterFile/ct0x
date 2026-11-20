@@ -30,7 +30,9 @@ LEFT JOIN chat_policies p ON (p.group_id,p.topic_id)=(q.group_id,q.topic_id)
 WHERE q.kind='clarification' AND q.relay='origin_thread' AND q.task_id IS NULL AND q.recipient_id='user'
 AND q.withdrawn_at IS NULL AND v.author_attempt_id IS NULL
 AND c.member_id<>'user' AND p.revision IS c.policy_revision
-AND ` + decisionRequestChatProof + `
+-- Keep the exact indexed joins visible to SQLite and evaluate the correlated
+-- provenance predicates together to avoid costly query planning.
+AND CASE WHEN ` + decisionRequestChatProof + `
 AND ` + decisionRequestChatUnadvanced + `
 AND (source.group_id,source.topic_id,source.sender_id)=(q.group_id,q.topic_id,'user')
 AND NOT EXISTS(SELECT 1 FROM deliveries extra WHERE extra.message_id=source.id AND extra.id<>rd.id)
@@ -48,7 +50,8 @@ AND length(CAST(source.content AS BLOB))<=65536 AND length(s.payload)<=69632
 AND hex(s.payload)=(printf('%016X',length(CAST(q.group_id AS BLOB)))||hex(q.group_id)||
     printf('%016X',length(CAST(q.topic_id AS BLOB)))||hex(q.topic_id)||
     printf('%016X',length(CAST(source.content AS BLOB)))||hex(source.content)||'00000000000000086578706C69636974'||
-    printf('%016X',length(CAST(c.member_id AS BLOB)))||hex(c.member_id));
+    printf('%016X',length(CAST(c.member_id AS BLOB)))||hex(c.member_id))
+THEN 1 ELSE 0 END;
 
 CREATE TABLE decision_thread_answers (
     id TEXT PRIMARY KEY NOT NULL CHECK(instr(id,'` + threadDecisionAnswerPrefix + `')=1),
