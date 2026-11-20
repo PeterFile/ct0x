@@ -7,8 +7,10 @@ import type { RecipientSelection } from "./Discussion";
 import { Groups } from "./Groups";
 import { HistorySearch } from "./HistorySearch";
 import { Members } from "./Members";
+import { PendingDecisions } from "./PendingDecisions";
 import { PendingReviews } from "./PendingReviews";
 import { Tasks } from "./Tasks";
+import { usePendingReminder } from "./usePendingReminder";
 import "./im-shell.css";
 
 type Context = ShellContext;
@@ -114,8 +116,14 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
     focusNext.current = "list";
     setGlobalPage(null); setPane("list"); setContext(null); setViewVersion(previous => previous + 1);
   }
+  const inboxActive = globalPage === pendingReviewsId;
+  const { pending, onSaved } = usePendingReminder(Boolean(Shell), !inboxActive);
   const globalPages: ShellPage[] = [{ id: pendingReviewsId, label: "待我决定",
-    content: visitedPages.includes(pendingReviewsId) ? <PendingReviews active={globalPage === pendingReviewsId} /> : null }];
+    reminder: pending ? "有待处理事项" : "",
+    content: visitedPages.includes(pendingReviewsId) ? <>
+      <PendingReviews active={inboxActive} onSaved={onSaved} />
+      <PendingDecisions active={inboxActive} onSaved={onSaved} />
+    </> : null }];
   const skipId = globalPage ?? (contextVisible && mobile ? "im-context" : chatVisible ? "im-chat" : "im-groups");
   const skipLabel = globalPages.find(page => page.id === globalPage)?.label
     ?? (contextVisible && mobile ? `${contextLabel}详情` : chatVisible ? "讨论区" : "群组列表");
@@ -153,6 +161,7 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
               aria-controls="im-tasks" onClick={() => openContext("tasks")}>任务</button>
           </div> : null}
         </div>
+        {selected ? <ChatDecisionDisclosure key={selected.id} groupId={selected.id} active={chatVisible} onSaved={onSaved} /> : null}
         <div className="discussion-content">
           <Discussion groupId={inChatPane ? selected?.id : undefined} active={chatVisible} members={members} recipientSelection={recipientSelection} />
         </div>
@@ -188,4 +197,17 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
     {slots.chat}
     {slots.context}
   </div>;
+}
+
+function ChatDecisionDisclosure({ groupId, active, onSaved }: { groupId: string; active: boolean; onSaved: () => void }) {
+  const [open, setOpen] = useState(false), [visited, setVisited] = useState(false);
+  return <details className="chat-decision-disclosure" onToggle={event => {
+    if (event.target !== event.currentTarget) return;
+    const expanded = event.currentTarget.open;
+    setOpen(expanded);
+    if (expanded) setVisited(true);
+  }}>
+    <summary>本群待决事项</summary>
+    {visited ? <PendingDecisions groupId={groupId} active={active && open} onSaved={onSaved} /> : null}
+  </details>;
 }

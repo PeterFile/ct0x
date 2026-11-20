@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiError, isDefinitiveRejection } from "./api";
+import { decisionProjects } from "./decision-api";
 import { artifactContentPath, listPendingReviews, reviewTask } from "./task-api";
 import type { PendingReview, TaskReview, TaskReviewInput } from "./task-api";
 import "./pending-reviews.css";
@@ -16,10 +17,12 @@ const errorText = (error: unknown) => error instanceof ApiError ? error.message 
 const itemKey = (item: PendingReview) => item.submission.id;
 const outcomeText = { accepted: "接纳", rejected: "拒收" };
 
-export function PendingReviews({ active }: { active: boolean }) {
+export function PendingReviews({ active, onSaved }: { active: boolean; onSaved?: () => void }) {
   const [page, setPage] = useState<Page>({ items: [], next: "", pending: true, error: "", before: "" });
   const [drafts, setDrafts] = useState(() => new Map<string, string>());
   const [writes, setWrites] = useState(() => new Map<string, WriteState>());
+  const [projectNames, setProjectNames] = useState(() => new Map<string, string>());
+  const projectLookup = useRef<ReturnType<typeof decisionProjects> | null>(null);
   const ledger = useRef(writes);
   const reading = useRef<AbortController | null>(null);
   const mounted = useRef(false);
@@ -49,10 +52,31 @@ export function PendingReviews({ active }: { active: boolean }) {
     }
   }, []);
   useEffect(() => {
-    if (!active) return;
+    if (!active) {
+      setProjectNames(previous => previous.size ? new Map<string, string>() : previous);
+      return;
+    }
+    const scope = new AbortController();
+    projectLookup.current = decisionProjects(scope.signal, (groupId, { name }) => {
+      setProjectNames(previous => new Map(previous).set(groupId, name));
+    });
     void load();
-    return () => reading.current?.abort();
+    return () => {
+      scope.abort();
+      projectLookup.current = null;
+      reading.current?.abort();
+    };
   }, [active, load]);
+  useEffect(() => {
+    if (!active) return;
+    const groupIds = new Set(page.items.map(item => item.group.id));
+    // Retained receipts and retries can outlive the page that supplied them.
+    for (const state of writes.values()) {
+      if (state.kind === "saved") groupIds.add(state.item.group.id);
+      if (state.kind === "posting" || state.kind === "uncertain") groupIds.add(state.operation.item.group.id);
+    }
+    projectLookup.current?.(groupIds);
+  }, [active, page.items, writes]);
 
   function record(id: string, state: WriteState) {
     // Fence rapid clicks synchronously; rendering is not the write lock.
@@ -80,6 +104,7 @@ export function PendingReviews({ active }: { active: boolean }) {
       if (card?.contains(document.activeElement)) focusReceipt.current = true;
       record(id, { kind: "saved", item: source, receipt });
       setDrafts(previous => { const next = new Map(previous); next.delete(id); return next; });
+      onSaved?.();
     } catch (error) {
       if (!mounted.current) return;
       const uncertain = retry || !isDefinitiveRejection(error);
@@ -98,6 +123,7 @@ export function PendingReviews({ active }: { active: boolean }) {
   const unconfirmed = [...writes].flatMap(([id, state]) => !listed.has(id) && (state.kind === "posting" || state.kind === "uncertain")
     ? [state] : []);
   const saved = [...writes.values()].filter(state => state.kind === "saved");
+  const projectNameFor = (item: PendingReview) => active ? projectNames.get(item.group.id) : undefined;
   useEffect(() => {
     if (focusReceipt.current) {
       if (active) receipts.current?.focus();
@@ -124,7 +150,7 @@ export function PendingReviews({ active }: { active: boolean }) {
     {items.length > 0 ? <ul className="review-inbox-list" aria-label="待验收事项">
       {items.map(item => {
         const id = itemKey(item), state = writes.get(id);
-        return <li key={id}><ReviewCard item={item} reason={drafts.get(id) ?? ""}
+        return <li key={id}><ReviewCard item={item} projectName={projectNameFor(item)} reason={drafts.get(id) ?? ""}
           blocked={readOnly || state?.kind === "posting" || state?.kind === "uncertain" || (state?.kind === "rejected" && state.stale === item)}
           onReason={reason => setDrafts(previous => new Map(previous).set(id, reason))}
           onDecision={(outcome, card) => void decide(item, outcome, card)}>
@@ -136,30 +162,40 @@ export function PendingReviews({ active }: { active: boolean }) {
       onClick={() => void load(page.next)}>加载更多待验收事项</button></div> : null}
     {unconfirmed.length > 0 ? <section className="review-inbox-records" aria-label="尚未确认的验收">
       <h3>尚未确认的验收</h3>
-      {unconfirmed.map(state => <div key={itemKey(state.operation.item)}>
-        <p className="review-inbox-note">提交标识：{state.operation.item.submission.id}</p>
-        {mutationStatus(state)}
-      </div>)}
+      {unconfirmed.map(state => {
+        const { item } = state.operation;
+        const name = projectNameFor(item);
+        return <div key={itemKey(item)}>
+          <p className="review-inbox-note">{name ? `来源项目：${name} · ` : ""}提交标识：{item.submission.id}</p>
+          {mutationStatus(state)}
+        </div>;
+      })}
     </section> : null}
     {saved.length > 0 ? <section className="review-inbox-records" aria-label="验收回执" ref={receipts} tabIndex={-1}>
       <h3>验收回执</h3>
-      {saved.map(({ item, receipt }) => <div key={receipt.id} className="review-inbox-receipt">
-        <p role="status">已保存：{outcomeText[receipt.outcome]} · {item.group.name} / {item.task.title} · 任务版本 {receipt.task_revision}</p>
-        {receipt.reason ? <p className="review-inbox-copy">{receipt.reason}</p> : null}
-        <p className="review-inbox-note">验收标识：<code>{receipt.id}</code></p>
-      </div>)}
+      {saved.map(({ item, receipt }) => {
+        const name = projectNameFor(item);
+        const source = `${name ? `${name} / ` : ""}${item.group.name} / ${item.task.title}`;
+        return <div key={receipt.id} className="review-inbox-receipt">
+          <p role="status">已保存：{outcomeText[receipt.outcome]} · {source} · 任务版本 {receipt.task_revision}</p>
+          {receipt.reason ? <p className="review-inbox-copy">{receipt.reason}</p> : null}
+          <p className="review-inbox-note">验收标识：<code>{receipt.id}</code></p>
+        </div>;
+      })}
     </section> : null}
   </div>;
 }
 
-function ReviewCard({ item, reason, blocked, onReason, onDecision, children }: {
-  item: PendingReview; reason: string; blocked: boolean; onReason: (reason: string) => void;
+function ReviewCard({ item, projectName, reason, blocked, onReason, onDecision, children }: {
+  item: PendingReview; projectName?: string; reason: string; blocked: boolean; onReason: (reason: string) => void;
   onDecision: (outcome: TaskReview["outcome"], card: HTMLElement | undefined) => void; children: ReactNode;
 }) {
   const field = useId();
   const submission = item.submission;
-  return <article className="review-inbox-card" aria-label={`${item.group.name} · ${item.task.title}`}>
+  const label = `${projectName ? `${projectName} · ` : ""}${item.group.name} · ${item.task.title}`;
+  return <article className="review-inbox-card" aria-label={label}>
     <header>
+      {projectName ? <p className="review-inbox-note">来源项目：{projectName}</p> : null}
       <p className="review-inbox-note">来源群组：{item.group.name}</p>
       <h3>{item.task.title}</h3>
       <p className="review-inbox-note">任务版本 {submission.task_revision}</p>

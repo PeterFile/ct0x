@@ -214,11 +214,13 @@ export function listTaskWorkReports(groupId: string, taskId: string, before = ""
   return listTaskWorkPage(groupId, taskId, "work-reports", before, signal, (value): value is TaskWorkReport => scoped(value)
     && ["kind", "summary", "actor_id", "owner_member_id"].every(key => nonblank(value[key])));
 }
-export function listPendingReviews(before = "", signal?: AbortSignal) {
-  const query = new URLSearchParams({ limit: "50" });
+export function listPendingReviews(before = "", signal?: AbortSignal, limit: 1 | 50 = 50) {
+  const query = new URLSearchParams({ limit: String(limit) });
   if (before) query.set("before", before);
-  return request(`/api/v1/me/pending-reviews?${query}`, { signal }, (value): value is TaskPage<PendingReview> => isRecord(value)
-    && Array.isArray(value.items) && value.items.length <= 50 && value.items.every(pendingReviewIn)
+  const init: RequestInit = { signal };
+  if (limit === 1) init.cache = "no-store";
+  return request(`/api/v1/me/pending-reviews?${query}`, init, (value): value is TaskPage<PendingReview> => isRecord(value)
+    && Array.isArray(value.items) && value.items.length <= limit && value.items.every(pendingReviewIn)
     && new Set(value.items.map(item => item.submission.id)).size === value.items.length
     && typeof value.next_cursor === "string");
 }
