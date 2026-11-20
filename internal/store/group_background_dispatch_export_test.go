@@ -3,6 +3,8 @@ package store
 import (
 	"slices"
 	"testing"
+
+	"modernc.org/sqlite"
 )
 
 // OpenGroupBackgroundFixture runs the real migrator against SQLite while this
@@ -20,4 +22,25 @@ func OpenGroupBackgroundFixture(t *testing.T, path string) *Store {
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+// BeforeGroupBackgroundFixtureWrite runs f immediately before a row write to
+// table on the Store fixture's single SQLite connection, until it is closed.
+func BeforeGroupBackgroundFixtureWrite(t *testing.T, s *Store, table string, f func()) {
+	t.Helper()
+	conn, err := s.db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.Raw(func(driverConn any) error {
+		driverConn.(sqlite.HookRegisterer).RegisterPreUpdateHook(func(data sqlite.SQLitePreUpdateData) {
+			if data.TableName == table {
+				f()
+			}
+		})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }

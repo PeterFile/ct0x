@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,6 +31,7 @@ type BackgroundDispatchTemplate struct {
 type BackgroundDispatchOptions struct {
 	MaxActiveMembers int // 1..200. A full group can still reuse a suitable member.
 	ReadyProfiles    []BackgroundDispatchProfile
+	ReadyUntil       time.Time                    // Exclusive readiness ceiling; zero keeps the Store's TTL.
 	Presets          []BackgroundDispatchTemplate // First suitable, in configured order.
 	Create           *BackgroundDispatchTemplate  // Nil forbids auto-creation.
 }
@@ -44,8 +47,14 @@ type groupBackgroundDispatch struct {
 }
 
 type backgroundReadySnapshot struct {
-	profiles map[BackgroundDispatchProfile]bool
-	expires  time.Time
+	profiles          map[BackgroundDispatchProfile]bool
+	monotonicDeadline time.Time
+	wallDeadline      time.Time // Optional absolute ceiling, without a monotonic reading.
+}
+
+func (r *backgroundReadySnapshot) validAt(now time.Time) bool {
+	return r != nil && now.Before(r.monotonicDeadline) &&
+		(r.wallDeadline.IsZero() || now.Before(r.wallDeadline))
 }
 
 const (
@@ -55,7 +64,95 @@ const (
 	backgroundReadyLifetime  = 30 * time.Second
 )
 
+// Open verifies the complete schema so transaction-local readers can use this probe.
 const groupBackgroundSchemaExists = `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='group_background_bindings')`
+
+type backgroundSchemaObject struct {
+	kind, owner, definition string
+}
+
+func canonicalBackgroundDDL(definition string) string {
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(definition), ";"))
+}
+
+func expectedGroupBackgroundObjects() (map[string]backgroundSchemaObject, error) {
+	// Only top-level declarations in this Go migration start with unindented
+	// CREATE. Splitting on semicolons would split the bodies of triggers.
+	const create = "\nCREATE "
+	ddl, ok := strings.CutPrefix(groupBackgroundDispatchSchema, create)
+	invalid := errors.New("无法解析群组后台调度迁移定义")
+	if !ok {
+		return nil, invalid
+	}
+	expected := make(map[string]backgroundSchemaObject)
+	for body := range strings.SplitSeq(ddl, create) {
+		header, _, _ := strings.Cut(body, "\n")
+		fields := strings.Fields(strings.TrimPrefix(header, "UNIQUE "))
+		if len(fields) < 2 {
+			return nil, invalid
+		}
+		kind, name := fields[0], fields[1]
+		owner := name
+		switch kind {
+		case "TABLE":
+		case "INDEX", "TRIGGER":
+			on := slices.Index(fields, "ON")
+			if on < 2 || on+1 >= len(fields) {
+				return nil, invalid
+			}
+			owner, _, _ = strings.Cut(fields[on+1], "(")
+		default:
+			return nil, invalid
+		}
+		if _, duplicate := expected[name]; duplicate || owner == "" {
+			return nil, invalid
+		}
+		expected[name] = backgroundSchemaObject{kind: strings.ToLower(kind), owner: owner,
+			definition: canonicalBackgroundDDL("CREATE " + body)}
+	}
+	return expected, nil
+}
+
+func checkGroupBackgroundSchema(db *sql.DB) (bool, error) {
+	expected, err := expectedGroupBackgroundObjects()
+	if err != nil {
+		return false, err
+	}
+	required := len(expected)
+	// Reserve the whole namespace case-insensitively, but require canonical
+	// names and definitions when matching its objects.
+	rows, err := db.Query(`SELECT name,type,tbl_name,coalesce(sql,'') FROM main.sqlite_schema
+	 WHERE lower(name) GLOB 'group_background_*'`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var found, matched int
+	for rows.Next() {
+		var name, kind, owner, definition string
+		if err := rows.Scan(&name, &kind, &owner, &definition); err != nil {
+			return false, err
+		}
+		found++
+		if want, ok := expected[name]; ok && kind == want.kind && owner == want.owner &&
+			canonicalBackgroundDDL(definition) == want.definition {
+			matched++
+			delete(expected, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if found == required && matched == required {
+		return true, nil
+	}
+	// Open calls this only after migrate commits, so every schema in the
+	// current registry is already recorded in the ledger, at any position.
+	if found == 0 && !slices.Contains(migrations, groupBackgroundDispatchSchema) {
+		return false, nil
+	}
+	return false, fmt.Errorf("群组后台调度数据库结构不完整：应有 %d 个对象，找到 %d 个，匹配 %d 个", required, found, matched)
+}
 
 // EnableGroupBackgroundDispatch is startup wiring for the same Store used by
 // trusted LocalUser and the scheduler. It does not bind legacy groups or probe
@@ -94,7 +191,8 @@ func groupBackgroundOneRow(result sql.Result, err error) error {
 // RunGroupBackgroundDispatch replaces the process-local approval/readiness
 // snapshot even with no unrouted intents. Trusted composition must deliver a
 // freshly qualified snapshot every scheduler cycle (empty on loss of evidence).
-// An omitted pass cannot sustain readiness beyond backgroundReadyLifetime.
+// Readiness expires at the earlier of ReadyUntil (when set) and the Store TTL
+// measured from the start of this pass.
 func (s *Store) RunGroupBackgroundDispatch(ctx context.Context, options BackgroundDispatchOptions) error {
 	const action = "群组后台调度失败"
 	if !s.background.enabled.Load() {
@@ -105,14 +203,25 @@ func (s *Store) RunGroupBackgroundDispatch(ctx context.Context, options Backgrou
 	if err == nil {
 		err = ctx.Err()
 	}
-	var ready *backgroundReadySnapshot
-	if err == nil && len(profilesReady) != 0 {
-		ready = &backgroundReadySnapshot{profiles: profilesReady, expires: sampled.Add(backgroundReadyLifetime)}
+	wallDeadline := options.ReadyUntil.Round(0)
+	lifetime := backgroundReadyLifetime
+	if !wallDeadline.IsZero() {
+		// With no monotonic reading on wallDeadline, Sub uses the wall delta.
+		// Apply it to the local sample so a wall correction cannot extend readiness.
+		lifetime = min(lifetime, wallDeadline.Sub(sampled))
 	}
+	var ready *backgroundReadySnapshot
 	// Publication is independent of the routing lock: revocation is not lost
 	// if a pass is busy. The claim transaction pins the current snapshot only
 	// for its short final admission/commit, never for external execution.
 	s.background.readyMu.Lock()
+	if err == nil && len(profilesReady) != 0 {
+		snapshot := &backgroundReadySnapshot{profiles: profilesReady,
+			monotonicDeadline: sampled.Add(lifetime), wallDeadline: wallDeadline}
+		if snapshot.validAt(sampled) && snapshot.validAt(time.Now()) {
+			ready = snapshot
+		}
+	}
 	s.background.ready = ready
 	s.background.readyMu.Unlock()
 	if err != nil {
@@ -213,7 +322,7 @@ func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, 
 	defer tx.Rollback()
 	s.background.readyMu.RLock()
 	defer s.background.readyMu.RUnlock()
-	if s.background.ready != ready || !time.Now().Before(ready.expires) {
+	if s.background.ready != ready || !ready.validAt(time.Now()) {
 		return nil // Do not route using a replaced or expired observation.
 	}
 	var m MessageRequest
@@ -278,6 +387,10 @@ func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, 
 	 WHERE sequence=? AND delivery_id IS NULL`, delivery, member, kind, stamp, sequence)
 	if err := groupBackgroundOneRow(result, err); err != nil {
 		return err
+	}
+	// The snapshot is still pinned, but may have expired during the writes.
+	if !ready.validAt(time.Now()) {
+		return nil // Roll back the join and delivery; leave the intent pending.
 	}
 	return tx.Commit()
 }
