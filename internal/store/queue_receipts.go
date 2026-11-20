@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"strings"
@@ -176,7 +177,43 @@ func publishSettledTurnReply(ctx context.Context, tx *sql.Tx, turn *domain.Turn)
 	if duplicate {
 		return nil // The structured publication keeps its own provenance, not a native reply link.
 	}
+	if turn.AcceptedAt != nil {
+		duplicate, err := hasMatchingOrdinaryTurnSend(ctx, tx, turn, topicID)
+		if err != nil {
+			return err
+		}
+		if duplicate {
+			return nil // Keep the explicit send without linking it as a native reply.
+		}
+	}
 	return insertTurnReply(ctx, tx, turn, topicID)
+}
+
+// Start with sources for this Turn only; every other lookup uses a message key
+// or the exact mutation receipt key. Any delivery row vetoes a public-only match.
+const ordinaryTurnReplyMatch = `SELECT EXISTS(
+ SELECT 1 FROM message_command_sources s INDEXED BY message_command_sources_turn
+ CROSS JOIN messages m ON m.id=s.message_id
+ WHERE s.turn_id=? AND s.kind='member' AND s.claim_digest=?
+   AND m.group_id=? AND m.sender_id=? AND m.topic_id=? AND m.content COLLATE BINARY=?
+   AND s.payload IN (?,?)
+   AND NOT EXISTS(SELECT 1 FROM chat_discussion_events e WHERE e.message_id=m.id)
+   AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.message_id=m.id)
+   AND EXISTS(SELECT 1 FROM mutation_idempotency r WHERE r.operation=? AND r.actor_id=m.sender_id
+     AND r.group_id=m.group_id AND r.idempotency_key=s.idempotency_key AND r.record_id=m.id AND r.payload=s.payload)
+)`
+
+func hasMatchingOrdinaryTurnSend(ctx context.Context, tx *sql.Tx, turn *domain.Turn, topicID string) (bool, error) {
+	// Unlike structured resolves, ordinary sends must prove the current claim and
+	// their exact send_message fingerprint (omitted or explicitly empty recipients).
+	digest := sha256.Sum256([]byte(turn.ClaimToken))
+	r := MessageRequest{GroupID: turn.GroupID, TopicID: topicID, ActorID: turn.MemberID, Content: turn.CandidateText}
+	omitted := r.payload()
+	r.RecipientIDs = []string{}
+	var duplicate bool
+	err := tx.QueryRowContext(ctx, ordinaryTurnReplyMatch, turn.ID, digest[:], r.GroupID, r.ActorID, r.TopicID, r.Content,
+		omitted, r.payload(), r.scope().operation).Scan(&duplicate)
+	return duplicate, err
 }
 
 func publishTurnReply(ctx context.Context, tx *sql.Tx, turn *domain.Turn) error {
