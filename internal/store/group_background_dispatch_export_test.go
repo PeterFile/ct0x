@@ -24,6 +24,13 @@ func OpenGroupBackgroundFixture(t *testing.T, path string) *Store {
 	return db
 }
 
+// EnableThreadRoutingForBackgroundFixture registers E before the fixture adds
+// A1, and keeps E registered for subsequent reads, writes and restarts.
+func EnableThreadRoutingForBackgroundFixture(t *testing.T) {
+	t.Helper()
+	enableThreadRoutingFixture(t)
+}
+
 // BeforeGroupBackgroundFixtureWrite runs f immediately before a row write to
 // table on the Store fixture's single SQLite connection, until it is closed.
 func BeforeGroupBackgroundFixtureWrite(t *testing.T, s *Store, table string, f func()) {

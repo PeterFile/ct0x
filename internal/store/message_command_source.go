@@ -5,22 +5,25 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"strings"
 
 	"agentworkspace/internal/domain"
 )
 
 // CreateLocalUserMessage is a trusted command with already resolved recipients.
-// Only PostLocalUserMessage resolves the ordinary Web/local-human default route.
+// Only a new command creates proof; replaying legacy data never upgrades it.
 func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, recipients []string) (domain.Message, error) {
 	return s.createLocalUserMessage(ctx, r, recipients, false)
 }
 
+// PostLocalUserMessage is the normal local chat entry. A caller supplying
+// authoritative deliveries directly continues to use CreateLocalUserMessage.
 func (s *Store) PostLocalUserMessage(ctx context.Context, r MessageRequest) (domain.Message, error) {
 	return s.createLocalUserMessage(ctx, r, r.RecipientIDs, true)
 }
 
-func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, recipients []string, routeDefault bool) (domain.Message, error) {
+func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, recipients []string, normalPost bool) (domain.Message, error) {
 	if r.ActorID != "user" {
 		return domain.Message{}, ErrMemberToolDenied
 	}
@@ -32,53 +35,29 @@ func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, re
 	if err := requireMessageActor(ctx, tx, r.GroupID, "user"); err != nil {
 		return domain.Message{}, storeError("验证用户消息失败", err)
 	}
-	id, replay, err := lookupMutation(ctx, tx, r.scope(), r.payload())
+	payload := r.payload()
+	reservation := payload
+	bindSelector := normalPost && r.TopicID == "" && r.IdempotencyKey != ""
+	if bindSelector {
+		reservation = r.topicSelectionPayload()
+	}
+	id, replay, err := reserveMutation(ctx, tx, r.scope(), reservation)
+	if bindSelector && errors.Is(err, ErrConflict) {
+		// Exact legacy reservations are still replayable; this only reads
+		// and cannot create an unversioned key or rewrite its source proof.
+		id, replay, err = lookupMutation(ctx, tx, r.scope(), payload)
+	}
 	if err != nil {
 		return domain.Message{}, storeError("读取用户消息回执失败", err)
 	}
+	var message domain.Message
 	if replay { // Never add provenance, deliveries or a new intent on replay.
-		message, err := messageReceiptInTx(ctx, tx, r.GroupID, id)
-		if err != nil {
-			return domain.Message{}, storeError("读取用户消息回执失败", err)
-		}
-		if err := tx.Commit(); err != nil {
-			return domain.Message{}, storeError("读取用户消息回执失败", err)
-		}
-		return message, nil
+		message, err = localMessageReceiptInTx(ctx, tx, r, id, normalPost)
+	} else {
+		message, err = s.publishLocalMessageInTx(ctx, tx, r, id, payload, recipients, normalPost)
 	}
-	var deferred bool
-	if routeDefault && r.RecipientIDs == nil {
-		// An existing binding survives disabled startup. Only legacy groups
-		// can use the legacy default route; the bound request can safely wait.
-		if s.background.installed {
-			err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_background_bindings WHERE group_id=?)`, r.GroupID).Scan(&deferred)
-			if err != nil {
-				return domain.Message{}, storeError("读取群组后台绑定失败", err)
-			}
-		}
-		if !deferred {
-			id, err := earliestActiveMemberID(ctx, tx, r.GroupID)
-			if err != nil {
-				return domain.Message{}, storeError("读取消息默认接收者失败", err)
-			}
-			if id != "" {
-				recipients = []string{id}
-			}
-		}
-	}
-	message, err := createMessageInTx(ctx, tx, r, recipients)
 	if err != nil {
 		return domain.Message{}, storeError("创建用户消息失败", err)
-	}
-	sourceID, err := messageCommandSourceInTx(ctx, tx, message.ID, "local_user_chat", r.payload(), r.IdempotencyKey, nil)
-	if err != nil {
-		return domain.Message{}, storeError("记录用户命令来源失败", err)
-	}
-	message.SourceID, message.SourceKind = sourceID, "local_user_chat"
-	if deferred {
-		if err := recordGroupBackgroundIntent(ctx, tx, message); err != nil {
-			return domain.Message{}, storeError("保存后台调度意图失败", err)
-		}
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Message{}, storeError("保存用户消息失败", err)

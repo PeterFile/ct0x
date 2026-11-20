@@ -347,10 +347,14 @@ func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, 
 	if err != nil {
 		return err
 	}
-	if !valid || !bytes.Equal(payload, m.payload()) { // Exact omitted-recipient source; topic is opaque.
+	if !valid {
 		return ErrMemberToolDenied
 	}
-	member, err := existingBackgroundMember(ctx, tx, m.GroupID, profiles)
+	exclude, err := backgroundSourceExclusionInTx(ctx, tx, messageID, m, payload)
+	if err != nil {
+		return err
+	}
+	member, err := existingBackgroundMember(ctx, tx, m.GroupID, profiles, exclude)
 	if err != nil {
 		return err
 	}
@@ -395,13 +399,53 @@ func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, 
 	return tx.Commit()
 }
 
-func existingBackgroundMember(ctx context.Context, tx *sql.Tx, groupID, profiles string) (string, error) {
+func backgroundSourceExclusionInTx(ctx context.Context, tx *sql.Tx, messageID string, r MessageRequest, payload []byte) (string, error) {
+	installed, err := threadRoutingInstalledInTx(ctx, tx)
+	if err != nil {
+		return "", err
+	}
+	var quotedSender sql.NullString
+	if installed {
+		err := tx.QueryRowContext(ctx, `SELECT coalesce(l.reply_to_message_id,''),coalesce(l.task_id,''),q.sender_id
+		 FROM main.thread_routing_links l LEFT JOIN main.messages q
+		 ON (q.id,q.group_id,q.topic_id)=(l.reply_to_message_id,l.group_id,l.reply_to_topic_id)
+		 WHERE (l.message_id,l.group_id,l.topic_id)=(?,?,?)`, messageID, r.GroupID, r.TopicID).
+			Scan(&r.ReplyToMessageID, &r.RelatedTaskID, &quotedSender)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		if r.ReplyToMessageID != "" && !quotedSender.Valid {
+			return "", ErrMemberToolDenied
+		}
+	}
+	// The intent, message and log already agree on the saved scope. E can
+	// resolve an omitted input topic to that scope; the immutable source still
+	// encodes the original topic and links, never the inferred topic. Verify
+	// the exact omitted-recipient payload without re-running thread routing.
+	if !bytes.Equal(payload, r.payload()) {
+		if !installed || r.TopicID == "" {
+			return "", ErrMemberToolDenied
+		}
+		r.TopicID = ""
+		if !bytes.Equal(payload, r.payload()) {
+			return "", ErrMemberToolDenied
+		}
+	}
+	// A deferred fallback must not wake an author cited only for comparison,
+	// including a quote whose body exceeded E's classification budget.
+	if r.ReplyToMessageID != "" && (len(r.Content) > maxThreadTextBytes || threadComparisonReply(r.Content)) {
+		return quotedSender.String, nil
+	}
+	return "", nil
+}
+
+func existingBackgroundMember(ctx context.Context, tx *sql.Tx, groupID, profiles, exclude string) (string, error) {
 	var id string
 	err := tx.QueryRowContext(ctx, `SELECT id FROM members WHERE id IN (
 	 SELECT (SELECT w.id FROM members w WHERE w.group_id=? AND w.status='active' AND w.workspace=''
 	     AND w.provider_id=json_extract(p.value,'$.ProviderID') AND w.model=json_extract(p.value,'$.Model')
-	     ORDER BY w.created_at,w.id LIMIT 1) FROM json_each(?) p
-	 ) ORDER BY created_at,id LIMIT 1`, groupID, profiles).Scan(&id)
+	     AND (?='' OR w.id<>?) ORDER BY w.created_at,w.id LIMIT 1) FROM json_each(?) p
+	 ) ORDER BY created_at,id LIMIT 1`, groupID, exclude, exclude, profiles).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = nil
 	}

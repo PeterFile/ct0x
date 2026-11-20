@@ -3,7 +3,7 @@ import { ApiError } from "./api";
 import { ChatDiscussionPolicySettings } from "./ChatDiscussionPolicySettings";
 import { ChatInvestigationSettings } from "./ChatInvestigationSettings";
 import type { InvestigationDraft } from "./ChatInvestigationSettings";
-import { chatInvestigationLimits, getChatPolicy, hasChatPolicyMetadata, isChatInvestigationPolicy,
+import { chatInvestigationLimits, getChatPolicy, hasChatPolicyMetadata, isChatInvestigationClueTerms, isChatInvestigationPolicy,
   isChatPolicyDefinitiveRejection, sameChatInvestigation, setChatPolicy } from "./chat-api";
 import type { ChatInvestigationPolicy, ChatPolicy, ChatPolicyInput } from "./chat-api";
 
@@ -16,6 +16,7 @@ type State = {
 };
 const investigationDraftOf = (scope: ChatPolicy["investigation"]): InvestigationDraft => ({ enabled: scope != null,
   objective: scope?.objective ?? "", allowTopicMessages: scope?.allow_topic_messages ?? false, maxDelegations: scope?.max_delegations ?? 0,
+  clueTerms: scope?.clue_terms?.join("\n") ?? "",
   artifactVersions: scope?.artifact_versions?.map((ref, index) => ({ row: index + 1, ...ref })) ?? [] });
 // Preserve existing authorization independently of capability; submit still requires confirmed support.
 const draftOf = (policy?: ChatPolicy): Draft => ({ enabled: policy?.enabled ?? false, allowPreparation: policy?.allow_preparation ?? false,
@@ -112,8 +113,14 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
         if (previous.policy.investigation_supported !== true) {
           update(value => ({ ...value, error: "调查配置能力未确认或不可用，不能保存带有只读调查权限的策略。请重新读取，或明确移除调查权限。" })); return;
         }
+        const clueTerms = scope.clueTerms === "" ? undefined : Object.freeze(scope.clueTerms.split("\n"));
+        if (clueTerms && !isChatInvestigationClueTerms(clueTerms)) {
+          const { clueTerms: maxTerms, clueTermBytes } = chatInvestigationLimits;
+          update(value => ({ ...value, error: `调查线索词组必须逐行填写，最多 ${maxTerms} 个，每个最多 ${clueTermBytes} UTF-8 字节，不得为空或重复。` })); return;
+        }
         investigation = Object.freeze({ objective: scope.objective, allow_topic_messages: scope.allowTopicMessages, max_delegations: scope.maxDelegations,
-          artifact_versions: Object.freeze(scope.artifactVersions.map(({ artifact_id, version_id }) => Object.freeze({ artifact_id, version_id }))) });
+          artifact_versions: Object.freeze(scope.artifactVersions.map(({ artifact_id, version_id }) => Object.freeze({ artifact_id, version_id }))),
+          ...(clueTerms ? { clue_terms: clueTerms } : {}) });
         if (!isChatInvestigationPolicy(investigation)) {
           const { objectiveBytes, artifactVersions, idBytes, maxDelegations } = chatInvestigationLimits;
           update(value => ({ ...value, error: `请填写非空调查目标（最多 ${objectiveBytes} UTF-8 字节）；资料须包括本话题消息或不重复的确切成果版本（最多 ${artifactVersions} 对，每个 ID 最多 ${idBytes} UTF-8 字节）；委派上限为 0 至 ${maxDelegations}。` })); return;
@@ -185,6 +192,9 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
           {observed ? "" : `（版本 ${lastRecorded.revision}）`}。</p> : null}
         {recordedScope ? <dl>
           <dt>记录的调查目标</dt><dd className="tasks-copy">{recordedScope.objective}</dd>
+          <dt>记录的调查线索词组</dt><dd>{recordedScope.clue_terms ? <ul>
+            {recordedScope.clue_terms.map(term => <li key={term} className="tasks-copy">{term}</li>)}
+          </ul> : "未配置"}</dd>
           <dt>本群主话题已保存消息</dt><dd>{recordedScope.allow_topic_messages ? "允许使用" : "不允许使用"}</dd>
           <dt>确切成果版本</dt><dd>{recordedScope.artifact_versions?.length ? <ul aria-label="记录的确切成果版本">
             {recordedScope.artifact_versions.map(ref => <li key={JSON.stringify([ref.artifact_id, ref.version_id])} className="tasks-meta">

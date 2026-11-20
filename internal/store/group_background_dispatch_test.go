@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -119,15 +120,20 @@ func backgroundHTTP[T any](t *testing.T, handler http.Handler, method, path, bod
 	return result
 }
 
-func TestGroupBackgroundDispatchHTTP(t *testing.T) {
-	f := newBackgroundFixture(t, "", true)
+func backgroundHandler(t *testing.T, f backgroundFixture) http.Handler {
+	t.Helper()
 	routes := append(httpapi.LocalUserRoutes(f.local), httpapi.MessageRoutes(f.local)...)
 	server, err := httpapi.NewServer(httpapi.DefaultAddress, routes...)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return server.Handler
+}
+
+func TestGroupBackgroundDispatchHTTP(t *testing.T) {
+	f := newBackgroundFixture(t, "", true)
 	const groups = "/api/v1/groups"
-	h := server.Handler
+	h := backgroundHandler(t, f)
 	backgroundHTTP[any](t, h, "POST", groups, `{"name":"伪造","background_dispatch":true}`, "", 400)
 	g := backgroundHTTP[domain.Group](t, h, "POST", groups, `{"name":"空群"}`, "group", 201)
 	members := groups + "/" + g.ID + "/members"
@@ -199,6 +205,93 @@ func TestGroupBackgroundDispatchHTTP(t *testing.T) {
 	f.assertCount(t, 0, `SELECT count(*) FROM tasks`)
 }
 
+func TestGroupBackgroundDispatchHTTPThreadRouting(t *testing.T) {
+	store.EnableThreadRoutingForBackgroundFixture(t)
+	f := newBackgroundFixture(t, "", true)
+	g := f.group(t, "")
+	quotedAuthor := backgroundMember(t, f, g.ID, discussionProfile)
+	quoted, err := f.db.CreateMessage(t.Context(), store.MessageRequest{
+		GroupID: g.ID, ActorID: quotedAuthor.ID, TopicID: "previous", Content: "旧结果",
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/api/v1/groups/" + g.ID + "/messages"
+	h := backgroundHandler(t, f)
+	const content = "  新议题：OPS-498 锁等待。\n引用仅作对照。  "
+	const key = "topic-only"
+	body := fmt.Sprintf(`{"content":%q,"reply_to_message_id":%q}`, content, quoted.ID)
+	first := backgroundHTTP[domain.Message](t, h, "POST", path, body, key, 201)
+	if first.GroupID != g.ID || first.TopicID == "" || first.TopicID == quoted.TopicID || first.Content != content ||
+		first.ReplyToMessageID != quoted.ID || first.SourceKind != "local_user_chat" || first.SourceID == "" || len(first.Deliveries) != 0 {
+		t.Fatalf("E topic-only result did not preserve the original A1 receipt: %+v", first)
+	}
+	inputPayload := func(mode string) []byte {
+		var payload []byte
+		for _, field := range []string{g.ID, "", content, mode, quoted.ID, ""} {
+			payload = binary.BigEndian.AppendUint64(payload, uint64(len(field)))
+			payload = append(payload, field...)
+		}
+		return payload
+	}
+	const mode = "omitted+thread-links/v1"
+	f.assertCount(t, 1, `SELECT count(*) FROM message_command_sources WHERE message_id=? AND id=? AND idempotency_key=?
+	 AND payload=? AND turn_id IS NULL AND claim_digest IS NULL`, first.ID, first.SourceID, key, inputPayload(mode))
+	f.assertCount(t, 1, `SELECT count(*) FROM mutation_idempotency WHERE record_id=? AND group_id=? AND actor_id='user'
+	 AND idempotency_key=? AND payload=?`, first.ID, g.ID, key, inputPayload(mode+"+topic-selector/v1:auto"))
+	f.assertCount(t, 1, `SELECT count(*) FROM group_background_intents i
+	 JOIN message_log l ON (l.sequence,l.message_id,l.group_id,l.topic_id)=(i.sequence,i.message_id,i.group_id,i.topic_id)
+	 JOIN thread_routing_links r ON (r.message_id,r.group_id,r.topic_id)=(i.message_id,i.group_id,i.topic_id)
+	 WHERE i.message_id=? AND i.source_id=? AND i.group_id=? AND i.topic_id=? AND i.delivery_id IS NULL
+	 AND r.reply_to_message_id=? AND r.reply_to_topic_id=?`, first.ID, first.SourceID, g.ID, first.TopicID, quoted.ID, quoted.TopicID)
+
+	cfg := backgroundOptions()
+	f.pass(t, cfg)
+	d := backgroundDelivery(t, f, first).Delivery
+	if d.RecipientID == quotedAuthor.ID {
+		t.Fatal("A1 woke the ready author of a comparison-only quote")
+	}
+	f.assertCount(t, 1, `SELECT count(*) FROM deliveries d
+	 JOIN conversations c ON (c.id,c.group_id,c.topic_id,c.member_id)=(d.conversation_id,d.group_id,d.topic_id,d.recipient_id)
+	 JOIN group_background_joins j ON (j.origin_message_id,j.group_id,j.topic_id,j.member_id)=(d.message_id,d.group_id,d.topic_id,d.recipient_id)
+	 JOIN messages n ON (n.id,n.group_id,n.topic_id)=(j.notice_message_id,j.group_id,j.topic_id)
+	 WHERE d.id=? AND d.group_id=? AND d.topic_id=? AND j.kind='create' AND n.sender_id='platformnotice'`, d.ID, g.ID, first.TopicID)
+
+	// Once the origin has a recipient, E's issue match takes the normal path.
+	for _, tc := range []struct{ key, body, recipient string }{
+		{"e-default", `{"content":"跟进 OPS-498"}`, d.RecipientID},
+		{"explicit", fmt.Sprintf(`{"content":"跟进 OPS-498","recipient_ids":[%q]}`, quotedAuthor.ID), quotedAuthor.ID},
+		{"public", `{"content":"跟进 OPS-498","recipient_ids":[]}`, ""},
+	} {
+		m := backgroundHTTP[domain.Message](t, h, "POST", path, tc.body, tc.key, 201)
+		if m.TopicID != first.TopicID || (tc.recipient == "" && len(m.Deliveries) != 0) ||
+			(tc.recipient != "" && (len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != tc.recipient)) {
+			t.Fatalf("%s did not respect the verified topic and recipient choice: %+v", tc.key, m)
+		}
+	}
+	request := store.MessageRequest{GroupID: g.ID, ActorID: "user", Content: content, IdempotencyKey: key,
+		ThreadLinks: domain.ThreadLinks{ReplyToMessageID: quoted.ID}}
+	if m, found, err := f.db.LookupMessageReceipt(t.Context(), request); err != nil || !found || !reflect.DeepEqual(m, first) {
+		t.Fatalf("lookup lost the deferred receipt: %+v, %t, %v", m, found, err)
+	}
+	if err := f.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f = newBackgroundFixture(t, f.path, true)
+	h = backgroundHandler(t, f)
+	if m := backgroundHTTP[domain.Message](t, h, "POST", path, body, key, 201); !reflect.DeepEqual(m, first) {
+		t.Fatalf("reopen did not replay the saved topic, link and source without a delivery: %+v", m)
+	}
+	mainBody := fmt.Sprintf(`{"content":%q,"reply_to_message_id":%q,"topic_id":""}`, content, quoted.ID)
+	backgroundHTTP[any](t, h, "POST", path, mainBody, key, 409)
+	f.pass(t, cfg)
+	f.assertCount(t, 1, `SELECT count(*) FROM group_background_intents WHERE delivery_id=? AND source_id=?`, d.ID, first.SourceID)
+	f.assertCount(t, 1, `SELECT count(*) FROM group_background_intents`)
+	f.assertCount(t, 1, `SELECT count(*) FROM group_background_joins`)
+	f.assertCount(t, 3, `SELECT count(*) FROM deliveries`)
+	f.assertCount(t, 4, `SELECT count(*) FROM message_command_sources`)
+}
+
 func TestGroupBackgroundDispatchCompetingPasses(t *testing.T) {
 	first := newBackgroundFixture(t, "", true)
 	second := newBackgroundFixture(t, first.path, true)
@@ -206,20 +299,32 @@ func TestGroupBackgroundDispatchCompetingPasses(t *testing.T) {
 	cfg := backgroundOptions()
 	cfg.MaxActiveMembers = 1
 	cfg.Presets = []store.BackgroundDispatchTemplate{{ID: "no-match", Name: "不合适", Role: "讨论", Profile: store.BackgroundDispatchProfile{ProviderID: "not-ready", Model: "not-ready"}}}
-	start, posted, done := make(chan struct{}), make(chan domain.Message, 2), make(chan error, 2)
-	for i, f := range []backgroundFixture{first, second} {
+	const posters = 4
+	start, posted, done := make(chan struct{}), make(chan domain.Message, posters), make(chan error, posters)
+	for i := range posters {
+		f := [2]backgroundFixture{first, second}[i%2]
 		go func() {
 			<-start
-			m, err := f.local.CreateMessage(context.Background(), g.ID, platform.MessageInput{Content: fmt.Sprintf("讨论 %d", i), TopicID: "同话题"}, fmt.Sprintf("post-%d", i))
+			m, err := f.local.CreateMessage(context.Background(), g.ID, platform.MessageInput{Content: fmt.Sprintf("讨论 %d", i/2), TopicID: "同话题"}, fmt.Sprintf("post-%d", i/2))
 			posted <- m
 			done <- err
 		}()
 	}
 	close(start)
-	if a, b := <-done, <-done; a != nil || b != nil {
-		t.Fatalf("competing posts: %v / %v", a, b)
+	originals := make(map[string]domain.Message)
+	for range posters {
+		if err := <-done; err != nil {
+			t.Fatalf("competing posts: %v", err)
+		}
+		m := <-posted
+		if prior, ok := originals[m.ID]; ok && !reflect.DeepEqual(m, prior) {
+			t.Fatalf("concurrent receipts diverged: %+v / %+v", m, prior)
+		}
+		originals[m.ID] = m
 	}
-	originals := []domain.Message{<-posted, <-posted}
+	if len(originals) != 2 {
+		t.Fatalf("expected one receipt per key, got %d messages", len(originals))
+	}
 	start = make(chan struct{})
 	for _, f := range []backgroundFixture{first, second} {
 		go func() { <-start; done <- f.db.RunGroupBackgroundDispatch(context.Background(), cfg) }()
@@ -242,6 +347,8 @@ func TestGroupBackgroundDispatchCompetingPasses(t *testing.T) {
 	first.assertCount(t, 1, `SELECT count(*) FROM group_background_joins WHERE kind='create' AND template_id=?`, cfg.Create.ID)
 	first.assertCount(t, 1, `SELECT count(*) FROM conversations`)
 	first.assertCount(t, 2, `SELECT count(*) FROM deliveries`)
+	first.assertCount(t, 2, `SELECT count(*) FROM group_background_intents WHERE delivery_id IS NOT NULL`)
+	first.assertCount(t, 2, `SELECT count(*) FROM message_command_sources`)
 }
 
 func TestGroupBackgroundDispatchRestartCapacityAndFairness(t *testing.T) {
