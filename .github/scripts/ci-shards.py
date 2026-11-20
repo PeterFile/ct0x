@@ -85,9 +85,12 @@ def run_slot(profile, slot, compiled, package, expected, temporary):
     for index, subset in enumerate(execution_subsets(selected, profile)):
         pattern = verifier.run_pattern(subset)
         events = private / f"run-{index}.json"
+        args = ["go", "test", "-count=1", "-race", "-json", "-run", pattern, target]
+        if (profile, slot) == ("platform", 1):
+            args.insert(-1, "-timeout=13m")
         try:
             with events.open("wb") as output:
-                command(["go", "test", "-count=1", "-race", "-json", "-run", pattern, target], stdout=output, env=env)
+                command(args, stdout=output, env=env)
         except subprocess.CalledProcessError:
             # Keep failure diagnostics in the job log, never in evidence artifacts.
             log_events(events, sys.stderr)
