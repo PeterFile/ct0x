@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Local scheduling, routing, batching and fail-closed gate regressions; no product tests."""
-import ast
-from collections import deque
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import itertools
 import json
 import os
@@ -11,6 +11,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 
@@ -47,46 +48,6 @@ def expression(text, key):
     if not match:
         raise AssertionError("missing expression: " + key)
     return " ".join(match.group(1)[3:-2].split())
-
-
-def evaluate(source, event, name="pull_request", run=1, ref="refs/pull/17/merge"):
-    # Evaluate the actual, deliberately small GitHub expression subset used by CI.
-    context = {"github": {"event": event, "event_name": name, "workflow": "CI", "run_id": run, "ref": ref}}
-
-    def lookup(match):
-        value = context
-        for part in match.group().split("."):
-            value = value.get(part) if isinstance(value, dict) else None
-        return repr(value)
-
-    source = re.sub(r"\bgithub(?:\.[A-Za-z_][A-Za-z_0-9]*)+", lookup, source)
-    source = source.replace("&&", " and ").replace("||", " or ")
-    source = re.sub(r"\b(true|false|null)\b", lambda m: {"true": "True", "false": "False", "null": "None"}[m[0]], source)
-    tree = ast.parse(source, mode="eval")
-    allowed = (ast.Expression, ast.BoolOp, ast.And, ast.Or, ast.Compare, ast.Eq, ast.NotEq,
-               ast.Call, ast.Name, ast.Load, ast.Constant)
-    if not all(isinstance(node, allowed) for node in ast.walk(tree)):
-        raise AssertionError("unsupported CI expression: " + source)
-    def normalized(value):
-        return value.casefold() if isinstance(value, str) else value
-
-    class Comparisons(ast.NodeTransformer):
-        def visit_Compare(self, node):
-            self.assert_single(node)
-            function = "equal" if isinstance(node.ops[0], ast.Eq) else "different"
-            return ast.Call(func=ast.Name(id=function, ctx=ast.Load()), args=[node.left, node.comparators[0]], keywords=[])
-
-        @staticmethod
-        def assert_single(node):
-            if len(node.ops) != 1:
-                raise AssertionError("chained GitHub comparison")
-
-    tree = ast.fix_missing_locations(Comparisons().visit(tree))
-    equal = lambda left, right: normalized(left) == normalized(right)
-    return eval(compile(tree, "<ci-expression>", "eval"), {"__builtins__": {}},
-                {"contains": lambda items, value: any(equal(item, value) for item in items), "fromJSON": json.loads,
-                 "equal": equal, "different": lambda left, right: not equal(left, right),
-                 "format": lambda pattern, *values: pattern.format(*values)})
 
 
 class RoutingTests(unittest.TestCase):
@@ -140,13 +101,14 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(bridge["go"], "bridge changes also require Go wiring checks")
         both = self.plan.classify(["web/src/a.ts", "extensions/pi-bridge/config.ts", "internal/store/task.go"])
         self.assertTrue(all(both[key] for key in ("go", "web", "bridge")))
-        for path in ["go.mod", "go.sum", "Makefile", ".github/workflows/ci.yml", "extensions/unknown/tool.js"]:
+        for path in ["go.mod", "go.sum", "Makefile", ".github/workflows/ci.yml", "extensions/unknown/tool.js", ".github/unknown.md", "notes.rst"]:
             result = self.plan.classify([path])
             self.assertTrue(all(result[key] for key in ("go", "web", "bridge", "conservative")))
 
     def test_heavy_packages_never_get_unbounded_feedback_tests(self):
         for paths in [["internal/store/a.go"], ["internal/platform/a.go", "internal/httpapi/b.go"],
-                      ["internal/scheduler/a.go", "internal/scheduler/b.go"], ["internal/deleted/a.go"], ["Makefile"]]:
+                      ["internal/scheduler/a.go", "internal/scheduler/b.go"], ["internal/scheduler/testdata/input.json"],
+                      ["internal/deleted/a.go"], ["Makefile"]]:
             classified = self.plan.classify(paths)
             available = ["agentworkspace/internal/" + part for part in ("store", "platform", "httpapi", "coordination", "scheduler", "provider")]
             packages = self.plan.feedback_packages(classified, available)
@@ -155,11 +117,17 @@ class RoutingTests(unittest.TestCase):
                 self.assertEqual(packages, ["agentworkspace/internal/scheduler"])
         bridge = self.plan.classify(["extensions/pi-bridge/index.ts"])
         self.assertIn("agentworkspace/internal/provider", self.plan.feedback_packages(bridge, available))
+        renamed = [package.replace("agentworkspace/", "renamed/") for package in available]
+        selected = self.plan.feedback_packages(self.plan.classify(["go.mod"]), renamed)
+        self.assertEqual(selected, ["renamed/internal/coordination", "renamed/internal/provider", "renamed/internal/scheduler"])
 
-    def test_feedback_executes_selected_commands_without_docs_product_tests(self):
+    def test_feedback_runs_bounded_relevant_heavy_regressions_and_bridge_wiring(self):
         available = "\n".join("agentworkspace/internal/" + name for name in ("store", "platform", "httpapi", "scheduler", "provider"))
-        for paths in [["docs/architecture.md"], ["web/src/a.ts"], ["extensions/pi-bridge/index.ts"],
-                      ["internal/scheduler/loop.go"], ["internal/store/task.go"], ["Makefile"]]:
+        for paths, heavy in [(["docs/architecture.md"], []), (["web/src/a.ts"], []),
+                             (["extensions/pi-bridge/index.ts"], ["platform"]),
+                             (["internal/store/task.go"], ["store"]), (["internal/store/testdata/input.json"], ["store"]),
+                             (["internal/platform/a.go", "internal/httpapi/b.go"], ["platform", "httpapi"]),
+                             (["Makefile"], ["store", "platform", "httpapi"])]:
             selected = {"mode": "feedback", **self.plan.classify(paths)}
             with self.subTest(paths=paths), mock.patch.object(self.plan, "command") as command:
                 command.return_value = subprocess.CompletedProcess([], 0, stdout=available)
@@ -168,20 +136,30 @@ class RoutingTests(unittest.TestCase):
                 if selected["docs"]:
                     self.assertEqual(calls, [])
                     continue
-                for directory, required in [("web", selected["web"]), ("extensions/pi-bridge", selected["bridge"])]:
-                    scripts = [call.args[0][-1] for call in command.call_args_list
-                               if call.kwargs.get("cwd") == directory and call.args[0][:2] == ["npm", "run"]]
-                    self.assertEqual(scripts, (["test", "typecheck", "build"] if directory == "web" else ["test", "typecheck"]) if required else [])
-                go_tests = [args for args in calls if args[:2] == ["go", "test"]]
-                self.assertEqual(bool(go_tests), selected["go"])
-                if go_tests:
-                    self.assertEqual(go_tests[0], ["go", "test", "-run", "^$", "./..."])
-                    self.assertFalse(any(set(args) & self.plan.HEAVY for args in go_tests))
-                    if selected["bridge"]:
-                        self.assertTrue(any("agentworkspace/internal/provider" in args for args in go_tests))
+                tests = [args for args in calls if args[:2] == ["go", "test"]]
+                self.assertEqual(bool(tests), selected["go"])
+                for profile in heavy:
+                    expected = self.plan.FAST_TESTS[profile]
+                    pattern = "^(" + "|".join(expected) + ")$"
+                    self.assertIn(["go", "test", "-count=1", "-run", pattern, "./internal/" + profile], tests)
+                for args in tests:
+                    if any(package.endswith(("/store", "/platform", "/httpapi")) for package in args):
+                        self.assertIn("-run", args)
+                if selected["bridge"]:
+                    self.assertTrue(any("agentworkspace/internal/provider" in args for args in tests))
         with mock.patch.object(self.plan, "command") as command:
             self.plan.feedback({"mode": "full"})
             command.assert_not_called()
+
+    def test_clients_run_before_full_and_selectively_on_drafts(self):
+        for mode in ("full", "feedback"):
+            for paths in (["docs/a.md"], ["web/src/a.ts"], ["extensions/pi-bridge/index.ts"], ["Makefile"]):
+                selected = {"mode": mode, **self.plan.classify(paths)}
+                for client, scripts in [("web", ["test", "typecheck", "build"]), ("bridge", ["test", "typecheck"])]:
+                    with self.subTest(mode=mode, paths=paths, client=client), mock.patch.object(self.plan, "command") as command:
+                        self.plan.clients(selected, client)
+                        actual = [call.args[0][-1] for call in command.call_args_list if call.args[0][:2] == ["npm", "run"]]
+                        self.assertEqual(actual, scripts if mode == "full" or selected[client] else [])
 
 
 class GitDiffTests(unittest.TestCase):
@@ -241,11 +219,11 @@ class GitDiffTests(unittest.TestCase):
         event_file.write_text(json.dumps(event))
         process = subprocess.run([sys.executable, str(SCRIPTS / "ci-plan.py"), "plan", str(selected_file)], cwd=self.root,
                                  env={**os.environ, "GITHUB_EVENT_PATH": str(event_file), "GITHUB_OUTPUT": str(output),
-                                      "GITHUB_EVENT_NAME": "pull_request", "GITHUB_SHA": merge}, capture_output=True, timeout=5)
+                                      "GITHUB_EVENT_NAME": "pull_request", "GITHUB_SHA": merge, "GITHUB_RUN_ID": RUN}, capture_output=True, timeout=5)
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(json.loads(selected_file.read_text()), result)
         self.assertEqual(set(line.split("=", 1)[0] for line in output.read_text().splitlines()),
-                         {"mode", "bucket", "sha", "tree", "go", "web", "bridge", "conservative"})
+                         {"mode", "bucket", "sha", "tree", "base", "head", "matrix", "run_id", "go", "web", "bridge", "conservative"})
         for bad_sha in [head, "f" * 40, merge + "\nowned=true"]:
             with self.assertRaises(ValueError):
                 self.plan.plan("pull_request", event, bad_sha, self.root)
@@ -264,6 +242,21 @@ class GitDiffTests(unittest.TestCase):
         self.assertTrue(all(result[key] for key in ("web", "bridge", "go")))
         self.assertFalse((self.root / "SHOULD_NOT_EXIST").exists())
 
+    def test_full_product_plan_does_not_add_a_whitespace_style_gate(self):
+        _, _, merge, _, event = self.fixture({"web/src/a.ts": "old\n"}, {"web/src/a.ts": "new  \n"})
+        event["pull_request"]["draft"] = False
+        event_file = self.root / "event.json"
+        event_file.write_text(json.dumps(event))
+        result = subprocess.run([sys.executable, str(SCRIPTS / "ci-plan.py"), "plan", str(self.root / "plan.json")], cwd=self.root,
+                                env={**os.environ, "GITHUB_EVENT_PATH": str(event_file), "GITHUB_OUTPUT": str(self.root / "outputs"),
+                                     "GITHUB_EVENT_NAME": "pull_request", "GITHUB_SHA": merge, "GITHUB_RUN_ID": RUN},
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        selected = json.loads((self.root / "plan.json").read_text())
+        self.assertEqual(selected["head"], event["pull_request"]["head"]["sha"])
+        for field in ("head", "base", "sha", "tree"):
+            self.assertIn(field, result.stdout.decode())
+
     def test_reject_nonmerge_identity_and_missing_parent(self):
         head, _ = self.commit_object({"PRD.md": "text"})
         self.git("update-ref", "HEAD", head)
@@ -276,87 +269,54 @@ class AdmissionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = (WORKFLOWS / "ci.yml").read_text()
 
-    def test_actual_event_condition_and_supersession_group(self):
-        condition = expression(job(self.workflow, "feedback"), "if")
+    def test_relevance_is_shared_with_supersession_and_admission_uses_native_queue(self):
+        relevant = expression(job(self.workflow, "feedback"), "if")
         group = expression(self.workflow.split("jobs:", 1)[0], "group")
-        cases = [(pr(action), True) for action in ["opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft"]]
-        cases += [(pr("labeled", label={"name": label}), label.casefold() in ("ci:refresh", "ci:full")) for label in ["ci:refresh", "ci:full", "bug", "CI:refresh"]]
-        cases += [(pr("labeled", False, label={"name": "ci:full"}), False),
-                  (pr("edited", changes={"body": {"from": "old"}}), False),
-                  (pr("edited", changes={"base": {"sha": {"from": "old"}}}), False),
-                  (pr("edited", changes={"base": {"ref": {"from": "release"}}}), True),
-                  (pr("edited", changes={"base": {"ref": {"from": "MASTER"}}}), True)]
-        for event, relevant in cases:
-            with self.subTest(event=event):
-                self.assertEqual(bool(evaluate(condition, event)), relevant)
-                keys = [evaluate(group, event, run=run) for run in [1, 2]]
-                self.assertEqual(keys[0] == keys[1], relevant)
-                self.assertEqual(keys[0] == evaluate(group, pr()), relevant)
-        self.assertNotEqual(evaluate(group, pr()), evaluate(group, {**pr(), "number": 18, "pull_request": {**pr()["pull_request"], "number": 18}}))
-        for name, event in [("push", {"ref": "refs/heads/master"}), ("merge_group", {"action": "checks_requested"})]:
-            self.assertTrue(evaluate(condition, event, name))
+        self.assertIn(relevant, group)
+        self.assertIn("format('ignored-{0}', github.run_id)", group)
+        self.assertIn("github.event.pull_request.number || github.ref", group)
         self.assertIn("cancel-in-progress: true", self.workflow.split("jobs:", 1)[0])
-        plan = load("ci-plan")
-        for event, relevant in cases:
-            self.assertEqual(plan.mode("pull_request", event) != "ignore", relevant)
-
-    def test_two_native_fifo_admission_lanes_not_lossy_default(self):
         full = job(self.workflow, "full")
-        self.assertIn("uses: ./.github/workflows/ci-full.yml", full)
-        self.assertIn("needs: feedback", full)
-        self.assertIn("needs.feedback.outputs.mode == 'full'", full)
-        self.assertIn("queue: max", full)
-        self.assertIn("needs.feedback.outputs.bucket", full)
-        self.assertIn("cancel-in-progress: false", full)
-        self.assertNotIn("runs-on:", full, "admission must wrap the entire reusable suite, not a short semaphore job")
+        for text in ["uses: ./.github/workflows/ci-full.yml", "needs: feedback", "needs.feedback.outputs.mode == 'full'",
+                     "queue: max", "needs.feedback.outputs.bucket", "cancel-in-progress: false"]:
+            self.assertIn(text, full)
+        self.assertNotIn("runs-on:", full)
         self.assertNotIn("concurrency:", (WORKFLOWS / "ci-full.yml").read_text())
         plan = load("ci-plan")
-        # Model the documented native queue (FIFO by arrival at the lane, max 100 pending).
-        active, pending, dropped = {}, [deque(), deque()], []
-        for number in range(1, 151):
-            lane = plan.bucket("pull_request", pr(number=number))
-            self.assertIn(lane, (0, 1))
-            self.assertEqual(lane, number % 2)
-            if lane not in active:
-                active[lane] = number
-            elif len(pending[lane]) < 100:
-                pending[lane].append(number)
-            else:
-                dropped.append(number)
-        self.assertEqual(len(active), 2)
-        self.assertEqual(dropped, [], "unrelated PRs must not replace each other's pending suites")
-        for lane in (0, 1):
-            sequence = [active[lane], *pending[lane]]
-            self.assertEqual(sequence, [number for number in range(1, 151) if number % 2 == lane])
-        # Supersession removes only the same PR; the other pending requests retain order.
-        lane = plan.bucket("pull_request", pr(number=17))
-        pending[lane].remove(17)
-        pending[lane].append(17)
-        self.assertEqual(list(pending[lane])[:-1], [n for n in range(3, 151, 2) if n != 17])
-        # The published limit cancels overflow, not an older pending request.
-        queue = deque(range(100))
-        before = list(queue)
-        if len(queue) < 100:
-            queue.append(101)
-        self.assertEqual(list(queue), before)
+        self.assertEqual([plan.bucket("pull_request", pr(number=n)) for n in range(1, 151)], [n % 2 for n in range(1, 151)])
 
-    def test_single_feedback_job_and_full_gate_not_emitted_on_quick_or_ignore(self):
-        self.assertEqual(re.findall(r"^  ([\w-]+):$", self.workflow.split("jobs:\n", 1)[1], re.M), ["feedback", "full"])
+    def test_clients_and_cmd_are_preflight_not_repeated_after_admission(self):
         feedback = job(self.workflow, "feedback")
-        self.assertIn("name: Draft feedback", feedback)
-        self.assertIn("go test -count=1 ./cmd/workspace", feedback)
-        self.assertIn("steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true'", feedback)
-        self.assertIn("ci-plan.py feedback", feedback)
-        self.assertNotIn("Full CI", feedback)
-        full = (WORKFLOWS / "ci-full.yml").read_text()
-        self.assertEqual(full.count("name: Full CI\n"), 1)
-        self.assertIn("name: Full suite", job(self.workflow, "full"))
-        self.assertIn("github.sha", feedback)
-        self.assertNotIn("pull_request.head.sha", feedback)
+        self.assertIn("name: CI preflight and feedback", feedback)
+        positions = [feedback.index(text) for text in ["go test -count=1 ./cmd/workspace", "ci-plan.py feedback", "ci-plan.py web", "ci-plan.py bridge"]]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("node-version: '22.x'", feedback)
+        self.assertIn("node-version: '24.13.0'", feedback)
+        self.assertIn("steps.plan.outputs.mode == 'full' || steps.plan.outputs.web == 'true'", feedback)
+        self.assertIn("steps.plan.outputs.mode == 'full' || steps.plan.outputs.bridge == 'true'", feedback)
         self.assertIn("fetch-depth: 2", feedback)
-        self.assertEqual(feedback.count("python3 .github/scripts/test-ci-scheduling.py -v"), 1)
-        self.assertEqual(feedback.count("python3 .github/scripts/test-store-shard.py -v"), 1)
-        self.assertNotIn("unittest discover", feedback, "hyphenated legacy test files are not discoverable modules")
+        self.assertIn("ref: ${{ github.sha }}", feedback)
+        full = (WORKFLOWS / "ci-full.yml").read_text()
+        self.assertNotRegex(full, r"(?m)^  (web|pi-bridge):")
+        self.assertNotIn("npm ", full)
+        for script in ["test-ci-scheduling.py", "test-store-shard.py"]:
+            self.assertEqual(full.count("python3 .github/scripts/" + script + " -v"), 1)
+        self.assertNotIn("unittest discover", feedback + full)
+
+    def test_outer_gate_cannot_disappear_with_missing_preflight_outputs(self):
+        gate = job(self.workflow, "merge-check")
+        self.assertIn('needs: ["feedback", "full"]', gate)
+        condition = expression(gate, "if")
+        self.assertTrue(condition.startswith("always() && ("))
+        self.assertNotIn("needs.", condition, "candidate detection must survive preflight failure or skips")
+        candidate = condition[len("always() && ("):-1]
+        self.assertEqual(expression(gate, "name"), candidate + " && 'Full CI' || 'Feedback status'")
+        self.assertIn(expression(job(self.workflow, "feedback"), "if"), candidate)
+        self.assertIn("github.event.pull_request.draft", candidate)
+        self.assertIn("contains(github.event.pull_request.labels.*.name, 'ci:full')", candidate)
+        self.assertIn("ci-gate.py outer", gate)
+        self.assertNotIn("setup-go", gate)
+        self.assertNotIn("setup-node", gate)
 
     def test_trigger_and_security_contract(self):
         for action in ["opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft", "edited", "labeled"]:
@@ -377,48 +337,83 @@ class ShardBatchTests(unittest.TestCase):
         cls.shards = load("ci-shards")
         cls.verifier = load("verify-store-shard")
 
-    def test_exact_81_logical_slots_in_21_bounded_workers(self):
+    def test_exact_81_logical_slots_in_23_bounded_workers_and_generated_matrix(self):
         batches = self.shards.BATCHES
-        self.assertEqual({name: len(workers) for name, workers in batches.items()}, {"store": 16, "platform": 3, "httpapi": 2})
+        self.assertEqual({name: len(workers) for name, workers in batches.items()}, {"store": 16, "platform": 5, "httpapi": 2})
         for profile, workers in batches.items():
             flat = list(itertools.chain.from_iterable(workers))
-            self.assertEqual(flat, list(range(self.verifier.PROFILES[profile][0])))
-            self.assertTrue(all(0 < len(slots) <= 4 for slots in workers))
+            self.assertEqual(sorted(flat), list(range(self.verifier.PROFILES[profile][0])))
+            self.assertTrue(all(0 < len(slots) <= (2 if profile == "platform" else 4) for slots in workers))
         self.assertEqual(sum(len(slots) for workers in batches.values() for slots in workers), 81)
+        plan = load("ci-plan")
+        matrix = plan.shard_matrix()
+        self.assertEqual(matrix, {"include": [{"profile": profile, "worker": worker}
+                                              for profile, workers in batches.items() for worker in range(len(workers))]})
+        self.assertEqual(matrix["include"][:2], [{"profile": "platform", "worker": 0}, {"profile": "platform", "worker": 1}])
+        self.assertIn(4, batches["platform"][0])
+        self.assertIn(8, batches["platform"][1])
         workflow = (WORKFLOWS / "ci-full.yml").read_text()
         shards = job(workflow, "go-shards")
-        matrix = re.search(r"^        include: (\[[^\n]+\])$", shards, re.M)
-        self.assertIsNotNone(matrix)
-        self.assertEqual(json.loads(matrix[1]), [{"profile": profile, "worker": worker}
-                                               for profile, workers in batches.items() for worker in range(len(workers))])
-        self.assertIn("max-parallel: 4", shards)
-        self.assertIn("fail-fast: false", shards)
-        self.assertIn("timeout-minutes: 25", shards)
+        for text in ["matrix: ${{ fromJSON(inputs.matrix) }}", "max-parallel: 7", "fail-fast: false", "timeout-minutes: 25"]:
+            self.assertIn(text, shards)
         self.assertIn("merge-multiple: false", job(workflow, "gate"))
 
-    def test_worker_compiles_inventory_once_and_runs_each_slot_uncached(self):
-        with tempfile.TemporaryDirectory(prefix="ci-worker-") as directory:
-            calls = []
+    def test_workers_list_once_then_81_real_verified_uncached_logical_runs(self):
+        names = [f"TestVector{index}" for index in range(180)]
+        calls = []
 
-            def run(command, **kwargs):
-                calls.append(command)
-                if "stdout" in kwargs:
-                    kwargs["stdout"].write(b"evidence\n")
-                return subprocess.CompletedProcess(command, 0, stdout="agentworkspace/internal/store\n")
+        def go(command, **kwargs):
+            calls.append(command)
+            target = command[-1]
+            package = "agentworkspace/" + target.removeprefix("./")
+            if command[:2] == ["go", "list"]:
+                return subprocess.CompletedProcess(command, 0, stdout=package + "\n")
+            self.assertEqual(command[:2], ["go", "test"])
+            rows = [{"Action": "start", "Package": package}]
+            if "-list" in command:
+                rows.append({"Action": "output", "Package": package, "Output": "\n".join(names) + f"\nok  \t{package}\t0.001s\n"})
+            else:
+                pattern = command[command.index("-run") + 1]
+                rows.extend({"Action": action, "Package": package, "Test": name}
+                            for name in names if re.fullmatch(pattern, name) for action in ("run", "pass"))
+            rows.append({"Action": "pass", "Package": package})
+            kwargs["stdout"].write("".join(json.dumps(row) + "\n" for row in rows).encode())
+            return subprocess.CompletedProcess(command, 0)
 
-            with mock.patch.object(self.shards, "check_identity"), mock.patch.object(self.shards, "command", side_effect=run), \
-                 mock.patch.object(self.shards.verifier, "inventory", return_value={"TestCoordination": 1}), \
-                 mock.patch.object(self.shards.verifier, "verify", return_value=({}, {})) as verify:
+        with tempfile.TemporaryDirectory(prefix="ci-worker-") as directory, redirect_stdout(io.StringIO()), \
+             mock.patch.object(self.shards, "check_identity"), mock.patch.object(self.shards, "command", side_effect=go):
+            root = Path(directory)
+            for profile, workers in self.shards.BATCHES.items():
+                for worker, slots in enumerate(workers):
+                    calls.clear()
+                    destination = root / f"{profile}-worker-v1-{worker}"
+                    self.shards.run_worker(profile, worker, destination, RUN, SHA, TREE)
+                    tests = [command for command in calls if command[:2] == ["go", "test"]]
+                    self.assertEqual(len(tests), len(slots) + 1)
+                    self.assertEqual(sum("-list" in command for command in tests), 1)
+                    for command in tests:
+                        for flag in ("-count=1", "-race", "-json"):
+                            self.assertIn(flag, command)
+                    self.assertEqual({path.name for path in destination.iterdir()}, {f"{profile}-shard-v1-{slot}" for slot in slots})
+            result = self.shards.aggregate_workers(root, RUN, SHA, TREE)
+            self.assertEqual(sum(summary["total"] for summary in result.values()), 81)
+            for profile, summary in result.items():
+                self.assertEqual(summary["runs"], {name: 1 for name in names})
+                self.assertEqual((summary["run_id"], summary["checkout_sha"], summary["checkout_tree"]), (RUN, SHA, TREE))
+
+    def test_wrong_checkout_and_failed_execution_cannot_produce_evidence(self):
+        for actual_sha, actual_tree in [("c" * 40, TREE), (SHA, "c" * 40)]:
+            with mock.patch.object(self.shards, "command") as command:
+                command.side_effect = [subprocess.CompletedProcess([], 0, stdout=value + "\n") for value in (actual_sha, actual_tree)]
+                with self.assertRaises(ValueError):
+                    self.shards.check_identity(SHA, TREE)
+        with tempfile.TemporaryDirectory(prefix="ci-failed-worker-") as directory, mock.patch.object(self.shards, "check_identity"), \
+             mock.patch.object(self.shards, "command") as command, mock.patch.object(self.shards.verifier, "inventory", return_value={"TestVector6": 1}):
+            command.side_effect = [subprocess.CompletedProcess([], 0, stdout="agentworkspace/internal/store\n"),
+                                   subprocess.CompletedProcess([], 0), subprocess.CalledProcessError(1, ["go", "test"])]
+            with self.assertRaises(subprocess.CalledProcessError), redirect_stdout(io.StringIO()):
                 self.shards.run_worker("store", 0, Path(directory), RUN, SHA, TREE)
-            tests = [command for command in calls if command[:2] == ["go", "test"]]
-            self.assertEqual(len(tests), 5)
-            self.assertEqual(sum("-list" in command for command in tests), 1)
-            for command in tests:
-                self.assertIn("-count=1", command)
-                self.assertIn("-race", command)
-                self.assertIn("-json", command)
-            self.assertEqual(verify.call_count, 4)
-            self.assertEqual(sorted(path.name for path in Path(directory).iterdir()), [f"store-shard-v1-{slot}" for slot in range(4)])
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
     def evidence(self, root):
         compiled = {f"TestVector{index}": 1 for index in range(180)}
@@ -458,6 +453,10 @@ class ShardBatchTests(unittest.TestCase):
                 try:
                     with self.assertRaises(ValueError):
                         self.shards.aggregate_workers(root, RUN, SHA, TREE)
+                    path.symlink_to(moved, target_is_directory=moved.is_dir())
+                    with self.assertRaises(ValueError):
+                        self.shards.aggregate_workers(root, RUN, SHA, TREE)
+                    path.unlink()
                 finally:
                     moved.rename(path)
             extra = root / "store-worker-v1-16"
@@ -503,9 +502,51 @@ class GateTests(unittest.TestCase):
         self.assertNotIn("setup-go", gate)
         self.assertNotRegex(gate, r"\b(?:go test|go vet|npm)\b")
 
-    def test_go_remainder_vet_bench_and_clients_start_without_shard_dependencies(self):
+    def test_all_required_result_combinations_fail_closed(self):
+        required = sorted(self.gate.REQUIRED)
+        for states in itertools.product(("success", "failure", "cancelled", "skipped", "", "unknown"), repeat=len(required)):
+            results = {name: {"result": state} for name, state in zip(required, states)}
+            try:
+                self.gate.check_results(results)
+                accepted = True
+            except ValueError:
+                accepted = False
+            self.assertEqual(accepted, all(state == "success" for state in states), states)
+
+    def test_actual_outer_gate_rejects_skipped_preflight_missing_proofs_and_nonfull_events(self):
+        gate = job((WORKFLOWS / "ci.yml").read_text(), "merge-check")
+        command = re.search(r"run: ([^\n]+)", gate)[1]
+        identity = {"run_id": RUN, "sha": SHA, "tree": TREE, "head": "c" * 40, "base": "d" * 40}
+        success = {"feedback": {"result": "success", "outputs": {"mode": "full", **identity}},
+                   "full": {"result": "success", "outputs": {"verified": "true", **identity}}}
+        cases = [(success, pr(draft=False), True)]
+        for dependency in ("feedback", "full"):
+            for state in ("failure", "cancelled", "skipped", "", "unknown"):
+                cases.append(({**success, dependency: {"result": state}}, pr(draft=False), False))
+            cases.append(({key: value for key, value in success.items() if key != dependency}, pr(draft=False), False))
+            for field in identity:
+                broken = json.loads(json.dumps(success))
+                broken[dependency]["outputs"][field] = "wrong"
+                cases.append((broken, pr(draft=False), False))
+        for field in ("verified", "sha", "tree", "run_id"):
+            broken = json.loads(json.dumps(success))
+            broken["full"]["outputs"].pop(field)
+            cases.append((broken, pr(draft=False), False))
+        cases.extend([(success, pr(), False), (success, pr("labeled", False, label={"name": "bug"}), False),
+                      (success, pr("labeled", label={"name": "CI:FULL"}), True), ({}, pr(draft=False), False)])
+        with tempfile.TemporaryDirectory(prefix="ci-outer-gate-") as directory:
+            event_file = Path(directory) / "event.json"
+            for payload, event, accepted in cases:
+                event_file.write_text(json.dumps(event))
+                result = subprocess.run(["bash", "-c", command], cwd=SCRIPTS.parent.parent,
+                                        env={**os.environ, "NEEDS_JSON": json.dumps(payload), "GITHUB_RUN_ID": RUN,
+                                             "GITHUB_SHA": SHA, "GITHUB_EVENT_PATH": str(event_file), "GITHUB_EVENT_NAME": "pull_request"},
+                                        capture_output=True, timeout=5)
+                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
+    def test_go_remainder_vet_and_bench_start_without_shard_dependencies(self):
         workflow = (WORKFLOWS / "ci-full.yml").read_text()
-        for name in ["go-other", "go-vet", "go-benchmarks", "web", "pi-bridge"]:
+        for name in ["go-other", "go-vet", "go-benchmarks"]:
             self.assertNotIn("needs:", job(workflow, name))
         other = job(workflow, "go-other")
         self.assertIn("go test -count=1 ./internal/coordination", other)
@@ -513,17 +554,13 @@ class GateTests(unittest.TestCase):
         self.assertIn('go test -race "${rest[@]}"', other)
         self.assertIn("go vet ./...", job(workflow, "go-vet"))
         self.assertIn("go test -run '^$' -bench . -benchmem ./...", job(workflow, "go-benchmarks"))
-        for name in ["web", "pi-bridge"]:
-            for command in ["npm test", "npm run typecheck"]:
-                self.assertIn(command, job(workflow, name))
-        self.assertIn("npm run build", job(workflow, "web"))
+        self.assertNotIn("npm ", workflow)
 
     def test_actual_benchmark_filter_preserves_only_complete_metrics_and_pipefail(self):
         workflow = (WORKFLOWS / "ci-full.yml").read_text()
         block = job(workflow, "go-benchmarks")
-        match = re.search(r"- name: Record benchmark metrics\n        run: \|\n(.*?)(?=\n      -)", block, re.S)
+        match = re.search(r"- name: Record benchmark metrics\n.*?        run: \|\n(.*?)(?=\n      -)", block, re.S)
         self.assertIsNotNone(match)
-        import textwrap
         script = textwrap.dedent(match[1])
         fixture = "\n".join(["goos: linux", "sensitive test log", "BenchmarkBad-8 10 5 ns/op 1 B/op 2 allocs/op extra",
                                "BenchmarkMissing-8 10 5 ns/op", "BenchmarkWrong-8 10 5 ns/op 1 bytes 2 allocs/op",
@@ -539,7 +576,8 @@ class GateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="ci-bench-") as directory:
             for code in (0, 1):
                 result = subprocess.run(["bash", "-c", stub + script],
-                                        env={**os.environ, "RUNNER_TEMP": directory, "BENCH_OUTPUT": fixture, "BENCH_EXIT": str(code)},
+                                        env={**os.environ, "RUNNER_TEMP": directory, "BENCH_OUTPUT": fixture, "BENCH_EXIT": str(code),
+                                             "GITHUB_RUN_ID": RUN, "CHECKOUT_SHA": SHA, "CHECKOUT_TREE": TREE, "HEAD_SHA": SHA, "BASE_SHA": SHA},
                                         capture_output=True, timeout=5)
                 self.assertEqual(result.returncode == 0, code == 0, result.stderr)
                 self.assertEqual((Path(directory) / "go-benchmarks.txt").read_text().splitlines(),

@@ -14,9 +14,10 @@ from types import SimpleNamespace
 _spec = importlib.util.spec_from_file_location("store_shard_verifier", Path(__file__).with_name("verify-store-shard.py"))
 verifier = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(verifier)
+# Admit the historically long Platform slots first; never batch more than two.
 BATCHES = {
+    "platform": ((4,), (8, 0), (1, 2), (3, 5), (6, 7)),
     "store": tuple(tuple(range(start, start + 4)) for start in range(0, 64, 4)),
-    "platform": ((0, 1, 2), (3, 4, 5), (6, 7, 8)),
     "httpapi": ((0, 1, 2, 3), (4, 5, 6, 7)),
 }
 

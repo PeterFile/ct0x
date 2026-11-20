@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Route native CI events and run bounded, single-runner draft feedback."""
 import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -10,7 +11,12 @@ import sys
 
 
 PR_ACTIONS = {"opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft"}
-HEAVY = {"agentworkspace/internal/" + name for name in ("store", "platform", "httpapi")}
+FAST_TESTS = {
+    "store": ("TestOpenMigratesAndConfiguresConnections", "TestMissingAndCrossGroupReferences"),
+    "platform": ("TestNativeSessionPreparePiIntakeBridgeSchemaCompatibility",),
+    "httpapi": ("TestCoordinationReadinessHTTPExactlyOneOptInRoute",),
+}
+FAST_EXCLUDED = tuple("/internal/" + name for name in FAST_TESTS) + ("/cmd/workspace",)
 SHA_PATTERN = r"[0-9a-f]{40}"
 
 
@@ -63,14 +69,14 @@ def classify(paths):
     result = {"docs": True, "web": False, "bridge": False, "go": False, "conservative": False, "directories": []}
     directories = set()
     for path in paths:
-        if path.startswith("docs/") or path.endswith((".md", ".rst")):
+        if path.startswith("docs/") or "/" not in path and path.endswith(".md"):
             continue
         result["docs"] = False
         if path.startswith("web/"):
             result["web"] = True
         elif path.startswith("extensions/pi-bridge/"):
             result["bridge"] = result["go"] = True
-            directories.add("internal/provider")
+            directories.update(("internal/provider", "internal/platform"))
         elif path.startswith(("internal/", "cmd/")):
             directory = path.rsplit("/", 1)[0]
             if re.fullmatch(r"(?:internal|cmd)(?:/[A-Za-z0-9_-]+)+", directory):
@@ -102,14 +108,23 @@ def plan(event_name, event, sha, root):
         paths = changed_paths(base, sha, root)
     elif event_name == "merge_group":
         check(event["merge_group"]["head_sha"] == sha, "合并队列 SHA 不符")
+    head = parents[1] if event_name == "pull_request" else sha
     return {"mode": selected_mode, "bucket": bucket(event_name, event), "sha": sha, "tree": tree, "base": base,
-            **classify(paths)}
+            "head": head, "matrix": shard_matrix(), **classify(paths)}
+
+
+def shard_matrix():
+    spec = importlib.util.spec_from_file_location("ci_shards", Path(__file__).with_name("ci-shards.py"))
+    shards = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(shards)
+    return {"include": [{"profile": profile, "worker": worker}
+                        for profile, workers in shards.BATCHES.items() for worker in range(len(workers))]}
 
 
 def feedback_packages(selected, available):
     directories = {"agentworkspace/" + directory for directory in selected["directories"]}
     return sorted(package for package in available
-                  if package not in HEAVY and package != "agentworkspace/cmd/workspace" and
+                  if not package.endswith(FAST_EXCLUDED) and
                   (selected["conservative"] or package in directories))
 
 
@@ -122,7 +137,7 @@ def feedback(selected):
     if selected["mode"] != "feedback":
         return
     if selected["docs"]:
-        print("仅文档变更：路径与差异检查通过，不执行产品测试。")
+        print("仅文档变更：差异检查通过，不执行产品测试。")
         return
     if selected["go"]:
         # Compile every package, but never run an unsharded heavy suite in feedback.
@@ -131,32 +146,47 @@ def feedback(selected):
         packages = feedback_packages(selected, available)
         if packages:
             command(["go", "test", "-count=1", *packages])
-    if selected["web"]:
-        command(["npm", "ci"], cwd="web")
-        for script in ("test", "typecheck", "build"):
-            command(["npm", "run", script], cwd="web")
-    if selected["bridge"]:
-        command(["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"], cwd="extensions/pi-bridge")
-        for script in ("test", "typecheck"):
-            command(["npm", "run", script], cwd="extensions/pi-bridge")
+        for profile, names in FAST_TESTS.items():
+            if selected["conservative"] or "internal/" + profile in selected["directories"]:
+                pattern = "^(" + "|".join(names) + ")$"
+                command(["go", "test", "-count=1", "-run", pattern, "./internal/" + profile])
+
+
+def clients(selected, client):
+    if selected["mode"] != "full" and not selected[client]:
+        return
+    directory = "web" if client == "web" else "extensions/pi-bridge"
+    install = ["npm", "ci"] if client == "web" else ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+    command(install, cwd=directory)
+    for script in (("test", "typecheck", "build") if client == "web" else ("test", "typecheck")):
+        command(["npm", "run", script], cwd=directory)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("plan", "feedback"))
+    parser.add_argument("command", choices=("plan", "feedback", "web", "bridge"))
     parser.add_argument("file", type=Path)
     args = parser.parse_args()
-    if args.command == "feedback":
-        feedback(json.loads(args.file.read_text(encoding="utf-8")))
+    if args.command != "plan":
+        selected = json.loads(args.file.read_text(encoding="utf-8"))
+        if args.command == "feedback":
+            feedback(selected)
+        else:
+            clients(selected, args.command)
         return
     event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text(encoding="utf-8"))
     selected = plan(os.environ["GITHUB_EVENT_NAME"], event, os.environ["GITHUB_SHA"], Path.cwd())
-    git(Path.cwd(), "diff", "--check", selected["base"], selected["sha"], "--")
+    if selected["mode"] == "feedback" and selected["docs"]:
+        git(Path.cwd(), "diff", "--check", selected["base"], selected["sha"], "--")
     args.file.write_text(json.dumps(selected, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(selected, sort_keys=True))
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-        for key in ("mode", "bucket", "sha", "tree", "go", "web", "bridge", "conservative"):
-            output.write(f"{key}={json.dumps(selected[key]) if isinstance(selected[key], bool) else selected[key]}\n")
+        run_id = os.environ["GITHUB_RUN_ID"]
+        check(re.fullmatch(r"[1-9][0-9]{0,63}", run_id), "run 身份非法")
+        output.write(f"run_id={run_id}\n")
+        for key in ("mode", "bucket", "sha", "tree", "head", "base", "matrix", "go", "web", "bridge", "conservative"):
+            value = selected[key]
+            output.write(f"{key}={json.dumps(value) if isinstance(value, (bool, dict)) else value}\n")
 
 
 if __name__ == "__main__":

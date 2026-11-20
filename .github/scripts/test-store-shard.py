@@ -867,7 +867,7 @@ class WorkflowTests(unittest.TestCase):
         match = re.search(r"\n  gate:\n(.*)", self.workflow, re.S)
         self.assertIsNotNone(match)
         job = match[1]
-        for text in ["name: Full CI\n", "if: ${{ always() }}", "toJSON(needs)", "ci-gate.py",
+        for text in ["name: Full suite evidence\n", "if: ${{ always() }}", "toJSON(needs)", "ci-gate.py",
                      "ci-shards.py aggregate", "merge-multiple: false",
                      '--run-id "$GITHUB_RUN_ID" --sha "$CHECKOUT_SHA" --tree "$CHECKOUT_TREE"']:
             self.assertIn(text, job)
@@ -885,7 +885,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_batched_workers_keep_real_uncached_runs_and_isolated_evidence(self):
         block = re.search(r"\n  go-shards:\n(.*?)(?=\n  go-other:)", self.workflow, re.S)[1]
-        for text in ["fail-fast: false", "timeout-minutes: 25", "max-parallel: 4", "actions/setup-go@v7",
+        for text in ["fail-fast: false", "timeout-minutes: 25", "max-parallel: 7", "actions/setup-go@v7",
                      "ci-shards.py run", "actions/upload-artifact@v7", "overwrite: true", "if-no-files-found: error",
                      "name: ${{ matrix.profile }}-worker-v1-${{ matrix.worker }}", "retention-days: 7"]:
             self.assertIn(text, block)
@@ -898,7 +898,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("-timeout", self.worker)
         self.assertNotIn("STORE_RACE_GROUP", self.workflow)
         self.assertIn("pattern: '*-worker-v1-*'", self.workflow)
-        self.assertEqual(self.parent_workflow.count("python3 .github/scripts/test-store-shard.py -v"), 1)
+        self.assertEqual(self.workflow.count("python3 .github/scripts/test-store-shard.py -v"), 1)
         self.assertIn("name: go-benchmarks", self.workflow)
         self.assertNotIn("fixture", self.workflow.lower())
 
@@ -914,7 +914,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('directory_entries(artifact, [f"{prefix}{slot}" for slot in slots])', self.worker)
 
     def test_remaining_package_exclusion_executes_actual_shell_without_go(self):
-        match = re.search(r"- name: Race test all other packages\n        run: \|\n(.*?)(?=\n      -)", self.workflow, re.S)
+        match = re.search(r"- name: Race test all other packages\n        run: \|\n(.*?)(?=\n      -|\n  [\w-]+:|\Z)", self.workflow, re.S)
         self.assertIsNotNone(match)
         script = textwrap.dedent(match.group(1))
         # PATH is empty, and every go invocation is handled here or rejected.
