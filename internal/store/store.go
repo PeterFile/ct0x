@@ -33,6 +33,7 @@ const (
 
 type Store struct {
 	db                     *sql.DB
+	schemaVersion          int // Known migration prefix at Open, not a later ledger observation.
 	investigationExecution atomic.Bool
 	taskWorkExecution      atomic.Bool
 	background             groupBackgroundDispatch
@@ -89,7 +90,7 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, storeError("检查群组后台调度迁移状态失败", errors.Join(err, db.Close()))
 	}
-	return &Store{db: db, background: groupBackgroundDispatch{installed: installed}}, nil
+	return &Store{db: db, schemaVersion: len(migrations), background: groupBackgroundDispatch{installed: installed}}, nil
 }
 
 func (s *Store) Close() error { return storeError("关闭数据库失败", s.db.Close()) }
