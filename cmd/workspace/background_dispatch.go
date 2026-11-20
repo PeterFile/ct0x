@@ -134,6 +134,11 @@ func (c config) withBackgroundDispatchPass(db *store.Store, preparer *platform.P
 			profile := approval.profile()
 			live, statErr := os.Stat(selected.Path)
 			if statErr == nil && sameBackgroundFile(pinned, live) && preparer.SupportsBackgroundDiscussionAdapter(profile) && approval.qualified(selected, time.Now()) {
+				deadline := approval.ApprovalExpires
+				if observedUntil := approval.Qualification.ObservedAt.Add(backgroundQualificationLifetime); observedUntil.Before(deadline) {
+					deadline = observedUntil
+				}
+				options.ReadyUntil = deadline.UTC()
 				options.ReadyProfiles = []store.BackgroundDispatchProfile{profile}
 				options.Presets = []store.BackgroundDispatchTemplate{{ID: approval.Preset.ID, Name: approval.Preset.Name, Role: approval.Preset.Role, Profile: profile}}
 			}
