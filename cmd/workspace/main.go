@@ -126,6 +126,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	routes = append(routes, httpapi.TaskRoutes(local)...)
 	routes = append(routes, httpapi.TaskLifecycleRoutes(local)...)
 	routes = append(routes, httpapi.HistoryRoutes(local)...)
+	routes = append(routes, httpapi.ProjectExperienceRoutes(local)...)
 	if preparer != nil {
 		routes = append(routes, httpapi.WorkspaceGrantRoutes(preparer)...)
 	}
