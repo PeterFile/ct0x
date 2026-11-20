@@ -1,7 +1,7 @@
 import type { ComponentPropsWithRef, ReactNode, Ref } from "react";
 
 export type ShellContext = "members" | "tasks" | "history";
-export type ShellPage = { id: string; label: string; content: ReactNode };
+export type ShellPage = { id: string; label: string; content: ReactNode; reminder?: string };
 
 /** App owns state, read activity, mutations, visibility, and focus recovery. */
 export interface AppShellProps {

@@ -17,7 +17,7 @@ const errorText = (error: unknown) => error instanceof ApiError ? error.message 
 const itemKey = (item: PendingReview) => item.submission.id;
 const outcomeText = { accepted: "接纳", rejected: "拒收" };
 
-export function PendingReviews({ active }: { active: boolean }) {
+export function PendingReviews({ active, onSaved }: { active: boolean; onSaved?: () => void }) {
   const [page, setPage] = useState<Page>({ items: [], next: "", pending: true, error: "", before: "" });
   const [drafts, setDrafts] = useState(() => new Map<string, string>());
   const [writes, setWrites] = useState(() => new Map<string, WriteState>());
@@ -104,6 +104,7 @@ export function PendingReviews({ active }: { active: boolean }) {
       if (card?.contains(document.activeElement)) focusReceipt.current = true;
       record(id, { kind: "saved", item: source, receipt });
       setDrafts(previous => { const next = new Map(previous); next.delete(id); return next; });
+      onSaved?.();
     } catch (error) {
       if (!mounted.current) return;
       const uncertain = retry || !isDefinitiveRejection(error);

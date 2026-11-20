@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import { ApiError, isDefinitiveRejection } from "./api";
-import { decisionHistory, decisionKey, decisionProjects, decisionReference, decisionWriteSlot, listPendingDecisions, prepareDecisionAnswer,
-  readDecisionAnswer, requestKey, validDecisionText } from "./decision-api";
+import { decisionHistory, decisionKey, decisionProjects, decisionReference, decisionWriteSlot, isDecisionAnswersUnavailable,
+  isPendingDecisionsUnavailable, listPendingDecisions, prepareDecisionAnswer, readDecisionAnswer, requestKey, validDecisionText } from "./decision-api";
 import type { DecisionAnswerView, DecisionAttempt, DecisionJournalEntry, DecisionProject, DecisionReference, DecisionSelection, PendingDecision } from "./decision-api";
 import { journalDecisionAttempt, journalLimit, loadDecisionJournal, settleDecisionAttempt } from "./decision-journal";
 import "./pending-decisions.css";
@@ -55,19 +55,21 @@ function restoreJournal() {
 }
 
 async function confirmAnswer(expected: Write, record: DecisionJournalEntry, view: DecisionAnswerView,
-  signal?: AbortSignal, beforeSave?: () => void) {
+  { signal, beforeSave, onSaved }: { signal?: AbortSignal; beforeSave?: () => void; onSaved?: () => void }) {
   const history = "key" in record ? await decisionHistory(record.ref, view.receipt).catch(() => undefined) : undefined;
   if ((signal && (signal.aborted || !visible())) || interactions.get(decisionKey(record.ref))?.write !== expected) return false;
   const pointer = history && "key" in record && settleDecisionAttempt(record, history) ? history : record;
   beforeSave?.();
   remember(record.ref, { draft: undefined, write: { kind: "saved", record: pointer, ...view } });
+  // Restoring a previously saved receipt does not confirm a new write.
+  if ("key" in record) onSaved?.();
   return true;
 }
 
 const lastStatusCheck = new WeakMap<DecisionReference, number>();
 let statusSequence = 0;
 
-async function checkAnswer(key: string, signal: AbortSignal) {
+async function checkAnswer(key: string, signal: AbortSignal, onSaved?: () => void) {
   const entry = interactions.get(key), write = entry?.write;
   if (!entry || !write || (write.kind !== "uncertain" && write.kind !== "saved") || (write.kind === "saved" && write.handling)) return false;
   lastStatusCheck.set(entry.reference, ++statusSequence);
@@ -77,7 +79,7 @@ async function checkAnswer(key: string, signal: AbortSignal) {
     if (!answer) return write.kind === "uncertain" && "key" in write.record;
     if (write.kind === "saved") {
       if (answer.handling) remember(entry.reference, { write: { ...write, handling: answer.handling } });
-    } else if (!await confirmAnswer(write, write.record, answer, signal)) return false;
+    } else if (!await confirmAnswer(write, write.record, answer, { signal, onSaved })) return false;
     return answer.handling === null;
   } catch {
     // Stop automatic reads for this reference on an error. Neither an error nor
@@ -88,7 +90,7 @@ async function checkAnswer(key: string, signal: AbortSignal) {
 
 const statusBackoff = [2000, 4000, 8000, 12000, 20000, 20000];
 const statusBatch = 4;
-function useAnswerChecks(groupId: string | undefined, refreshVersion: number) {
+function useAnswerChecks(groupId: string | undefined, refreshVersion: number, onSaved?: () => void) {
   useEffect(() => {
     let wave: AbortController | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -111,7 +113,7 @@ function useAnswerChecks(groupId: string | undefined, refreshVersion: number) {
       const firstPass = keys.slice(0, immediate);
       const queue = keys.slice(immediate);
       async function checkBatch(batch: string[]) {
-        const repeat = await Promise.all(batch.map(key => checkAnswer(key, signal)));
+        const repeat = await Promise.all(batch.map(key => checkAnswer(key, signal, onSaved)));
         queue.push(...batch.filter((_, index) => repeat[index]));
       }
       function poll(round: number, limit: number) {
@@ -146,24 +148,22 @@ function useAnswerChecks(groupId: string | undefined, refreshVersion: number) {
     document.addEventListener("visibilitychange", visibility);
     start();
     return () => { stop(); checkOnWrite.delete(afterWrite); document.removeEventListener("visibilitychange", visibility); };
-  }, [groupId, refreshVersion]);
+  }, [groupId, refreshVersion, onSaved]);
 }
 
 type Read = { rows: PendingDecision[]; next: string; before: string; state: "loading" | "ready" | "error" | "unavailable"; message?: string };
 const loading = (before = "", rows: PendingDecision[] = []): Read => ({ rows, before, next: "", state: "loading" });
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请重试。";
-const migrationUnavailable = (error: unknown) => error instanceof ApiError
-  && error.status === 503 && error.code === "decision_answers_unavailable";
-const listUnavailable = (error: unknown) => error instanceof ApiError
-  && (error.status === 404 || error.status === 405 || migrationUnavailable(error));
 const sourceLabel = ({ item, project }: Row) => `${project?.name ?? "项目未确认"} · ${item.group_name}`;
 const originTitle = (item: PendingDecision) => item.task?.task_title ?? (item.topic_id === "" ? "主话题" : `话题 ${item.topic_id}`);
 
-export function PendingDecisions({ active, groupId }: { active: boolean; groupId?: string }) {
-  return active ? <DecisionInbox key={JSON.stringify(groupId ?? null)} groupId={groupId} /> : null;
+type DecisionInboxProps = { groupId?: string; onSaved?: () => void };
+
+export function PendingDecisions({ active, groupId, onSaved }: DecisionInboxProps & { active: boolean }) {
+  return active ? <DecisionInbox key={JSON.stringify(groupId ?? null)} groupId={groupId} onSaved={onSaved} /> : null;
 }
 
-function DecisionInbox({ groupId }: { groupId?: string }) {
+function DecisionInbox({ groupId, onSaved }: DecisionInboxProps) {
   const sectionId = useId();
   const [page, setRead] = useState(() => loading());
   const [projects, setProjects] = useState(() => new Map<string, DecisionProject>());
@@ -191,7 +191,7 @@ function DecisionInbox({ groupId }: { groupId?: string }) {
       });
       projectLookup.current?.(items.map(item => item.group_id));
     } catch (error) {
-      if (!signal.aborted) setRead(previous => listUnavailable(error)
+      if (!signal.aborted) setRead(previous => isPendingDecisionsUnavailable(error)
         ? { ...loading(), state: "unavailable" }
         : { ...previous, state: "error", message: errorText(error) });
     }
@@ -205,7 +205,7 @@ function DecisionInbox({ groupId }: { groupId?: string }) {
     void load();
     return () => { scope.abort(); reading.current?.abort(); };
   }, [load]);
-  useAnswerChecks(groupId, statusVersion);
+  useAnswerChecks(groupId, statusVersion, onSaved);
   useEffect(() => {
     if (focusOnSave.current) receiptList.current?.focus();
     focusOnSave.current = false;
@@ -253,7 +253,7 @@ function DecisionInbox({ groupId }: { groupId?: string }) {
         }
         const found = await readDecisionAnswer(attempt, new AbortController().signal);
         if (found) {
-          if (await confirmAnswer(posting, attempt, found, undefined, focus)) wake();
+          if (await confirmAnswer(posting, attempt, found, { beforeSave: focus, onSaved })) wake();
           return;
         }
       } else {
@@ -265,10 +265,10 @@ function DecisionInbox({ groupId }: { groupId?: string }) {
       }
       sent = true;
       const receipt = await post();
-      if (await confirmAnswer(posting, attempt, { receipt, handling: null }, undefined, focus)) wake();
+      if (await confirmAnswer(posting, attempt, { receipt, handling: null }, { beforeSave: focus, onSaved })) wake();
     } catch (error) {
       const stale = error instanceof ApiError && (error.status === 404 || error.status === 409);
-      const reason = migrationUnavailable(error) ? "待决答复暂不可用。"
+      const reason = isDecisionAnswersUnavailable(error) ? "待决答复暂不可用。"
         : error instanceof ApiError && error.code === "decision_relay_unsupported" ? "当前服务不支持回送此话题的答复。"
         : errorText(error);
       if (attempt && (replay || (sent && !isDefinitiveRejection(error)))) {

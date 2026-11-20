@@ -95,11 +95,16 @@ async function request<T>(path: string, init: RequestInit, valid: (value: unknow
   return value;
 }
 
-export function listPendingDecisions(before: string, signal: AbortSignal) {
-  const query = new URLSearchParams({ limit: "50" });
+export const isDecisionAnswersUnavailable = (error: unknown) => error instanceof ApiError
+  && error.status === 503 && error.code === "decision_answers_unavailable";
+export const isPendingDecisionsUnavailable = (error: unknown) => error instanceof ApiError
+  && (error.status === 404 || error.status === 405 || isDecisionAnswersUnavailable(error));
+
+export function listPendingDecisions(before: string, signal: AbortSignal, limit: 1 | 50 = 50) {
+  const query = new URLSearchParams({ limit: String(limit) });
   if (before) query.set("before", before);
   return request(`/api/v1/me/pending-decisions?${query}`, { signal }, (value): value is DecisionPage => record(value)
-    && Array.isArray(value.items) && value.items.length <= 50 && value.items.every(pendingDecision)
+    && Array.isArray(value.items) && value.items.length <= limit && value.items.every(pendingDecision)
     && new Set(value.items.map(item => item.id)).size === value.items.length
     && typeof value.next_cursor === "string" && (value.next_cursor === "" || value.next_cursor !== before));
 }
