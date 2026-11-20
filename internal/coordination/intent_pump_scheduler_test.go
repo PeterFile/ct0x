@@ -875,8 +875,9 @@ func TestIntentPumpSchedulerBeginBusyRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := make(chan provider.ExecuteRequest, 1)
-	e := pumpSchedulerExecutor(func(_ context.Context, request provider.ExecuteRequest, _ func(provider.Event) error) provider.ExecutionReceipt {
+	e := pumpSchedulerExecutor(func(ctx context.Context, request provider.ExecuteRequest, _ func(provider.Event) error) provider.ExecutionReceipt {
 		started <- request
+		<-ctx.Done()
 		return pumpSchedulerSuccess()
 	})
 	r := pumpSchedulerStart(t, f, options, pumpSchedulerPrepare(e))
