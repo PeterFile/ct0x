@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { ComponentPropsWithoutRef, ReactNode, RefObject } from "react";
 import { getAgentRun, listAgentRuns } from "./agent-runs-api";
 import type {
   AgentRunDetail, AgentRunDispatchDecision, AgentRunEntry, AgentRunIdentity, AgentRunMessage, AgentRunPage,
@@ -59,14 +59,40 @@ function useLogRead<T>(active: boolean, fetchPage: (window: ReadWindow, signal: 
   }, [active, fetchPage, merge, request]);
   function load(window: ReadWindow = {}) {
     if (!active) return;
-    setState(previous => previous.request?.pending ? previous : { ...previous, error: "", request: { window, pending: true } });
+    // Keep the retry control mounted until the new read settles.
+    setState(previous => previous.request?.pending ? previous : { ...previous, request: { window, pending: true } });
   }
   return { value: state.value, error: state.error, pending: request?.pending ?? false, load, retry: () => load(request?.window) };
 }
-function ReadFeedback({ subject, pending, error, retry }: { subject: string; pending: boolean; error: string; retry: () => void }) {
-  return pending ? <p role="status">正在读取{subject}…</p> : error ? <div className="run-log-error">
-    <p role="alert">{error}</p><button type="button" onClick={retry}>重试读取{subject}</button>
-  </div> : null;
+
+type FocusTarget = RefObject<HTMLElement | null>;
+function ReadButton({ active, show, focusTarget, ...props }: ComponentPropsWithoutRef<"button"> & {
+  active: boolean; show: boolean; focusTarget: FocusTarget;
+}) {
+  const ref = useRef<HTMLButtonElement>(null);
+  const [retained, setRetained] = useState(show);
+  useLayoutEffect(() => {
+    if (show === retained) return;
+    const button = ref.current;
+    // Check actual focus while the outgoing control still exists, before paint.
+    if (!show && active && button && button.ownerDocument.activeElement === button) focusTarget.current?.focus();
+    setRetained(show);
+  }, [active, focusTarget, retained, show]);
+  return show || retained ? <button {...props} ref={ref} type="button" /> : null;
+}
+
+function ReadFeedback({ active, subject, pending, error, retry, focusTarget, initial }: {
+  active: boolean; subject: string; pending: boolean; error: string; retry: () => void; focusTarget: FocusTarget;
+  initial?: { label: string; load: () => void };
+}) {
+  return <>
+    {pending ? <p role="status">正在读取{subject}…</p> : null}
+    {!pending && error ? <p role="alert">{error}</p> : null}
+    <ReadButton active={active} show={Boolean(error || initial)} focusTarget={focusTarget} aria-disabled={pending}
+      aria-label={error ? undefined : initial?.label} onClick={error ? retry : initial?.load}>
+      {error ? `重试读取${subject}` : `读取${subject}`}
+    </ReadButton>
+  </>;
 }
 
 function unique<T>(items: T[], key: (item: T) => string) {
@@ -75,32 +101,59 @@ function unique<T>(items: T[], key: (item: T) => string) {
 function mergeRuns(previous: AgentRunPage<AgentRunSummary> | null, next: AgentRunPage<AgentRunSummary>, { before }: ReadWindow): AgentRunPage<AgentRunSummary> {
   return before && previous ? { ...next, items: unique([...previous.items, ...next.items], runKey) } : next;
 }
-function mergeTimeline(previous: AgentRunDetail | null, next: AgentRunDetail, { before }: ReadWindow): AgentRunDetail {
-  // Append older pages in wire order. On overlap keep the first exact event ID.
-  const rows = before && previous ? [...previous.timeline.items, ...next.timeline.items] : next.timeline.items;
+type TimelineRead = AgentRunDetail & { pollHead: boolean };
+function runStatusChanged(head: AgentRunDetail, older: AgentRunDetail) {
+  return head.run.state !== older.run.state
+    || (head.receipt?.observed_terminal ?? "") !== (older.receipt?.observed_terminal ?? "");
+}
+function mergeTimeline(previous: TimelineRead | null, next: TimelineRead, { before, through }: ReadWindow): TimelineRead {
+  // Older observations can request a recheck, but only a newest read supplies run metadata.
+  const head = before && previous ? previous : next;
+  let pollHead = head.pollHead;
+  let { items, next_cursor } = next.timeline;
+  if (before && previous) {
+    pollHead ||= runStatusChanged(previous, next);
+    items = [...previous.timeline.items, ...items];
+  } else if (!through && previous && next_cursor) {
+    // Only retain a cached tail when the fresh window ends at an exact shared event.
+    // Otherwise start pagination at the fresh cursor rather than leaving an unverified gap.
+    const boundary = items.at(-1)?.id;
+    const frontier = previous.timeline.items.findIndex(item => item.id === boundary);
+    if (frontier >= 0 && frontier < previous.timeline.items.length - 1) {
+      items = [...items, ...previous.timeline.items.slice(frontier + 1)];
+      next_cursor = previous.timeline.next_cursor;
+    }
+  }
+  // Keep the first occurrence of each exact event ID in wire order.
   const seen = new Set<string>();
-  const items = rows.filter(({ id }) => {
+  items = items.filter(({ id }) => {
     if (seen.has(id)) return false;
     seen.add(id);
     return true;
   });
-  return { ...next, timeline: { ...next.timeline, items } };
+  return { ...head, pollHead, timeline: { items, next_cursor } };
 }
-async function readTimeline(run: AgentRunIdentity, { before, through }: ReadWindow, signal: AbortSignal): Promise<AgentRunDetail> {
-  let detail = await getAgentRun(run, before, signal);
-  if (!through) return detail;
-  // Refresh the loaded range from the head, including new entries and receipts on older pages.
-  const items = [...detail.timeline.items];
+async function readTimeline(run: AgentRunIdentity, { before, through }: ReadWindow, signal: AbortSignal): Promise<TimelineRead> {
+  const head = await getAgentRun(run, before, signal);
+  // A newest-only read consumes any recheck hint and bases further polling on its own evidence.
+  let pollHead = hasPendingEvidence(head);
+  if (!through) return { ...head, pollHead };
+  // Explicit refresh revisits the loaded range for older action receipts. The first
+  // page supplies run metadata; later pages may observe completion before that page does.
+  let timeline = head.timeline;
+  const items = [...timeline.items];
   const cursors = new Set<string>();
-  while (detail.timeline.next_cursor && !detail.timeline.items.some(item => item.id === through)) {
+  while (timeline.next_cursor && !timeline.items.some(item => item.id === through)) {
     signal.throwIfAborted();
-    const cursor = detail.timeline.next_cursor;
+    const cursor = timeline.next_cursor;
     if (cursors.has(cursor)) throw new ApiError("运行时间线无法继续分页，请重试。", 200, "invalid_response");
     cursors.add(cursor);
-    detail = await getAgentRun(run, cursor, signal);
-    items.push(...detail.timeline.items);
+    const older = await getAgentRun(run, cursor, signal);
+    pollHead ||= runStatusChanged(head, older);
+    timeline = older.timeline;
+    items.push(...timeline.items);
   }
-  return { ...detail, timeline: { ...detail.timeline, items } };
+  return { ...head, pollHead, timeline: { ...timeline, items } };
 }
 function hasPendingEvidence({ run, timeline }: AgentRunDetail) {
   return run.state === "starting" || run.state === "running" || run.state === "cancel_requested"
@@ -159,7 +212,7 @@ function RunScope({ active, memberId, rememberAgents }: { active: boolean; membe
       <header className="run-log-bar"><h2 id={listId} ref={listHeading} tabIndex={-1}>运行轮次</h2>
         <button type="button" aria-disabled={read.pending} onClick={() => read.load()}>刷新运行列表</button>
       </header>
-      <ReadFeedback subject="运行轮次" {...read} />
+      <ReadFeedback active={active} subject="运行轮次" focusTarget={listHeading} {...read} />
       {!read.pending && !read.error && !byMember.size ? <p className="run-log-note">
         {memberId ? "此 Agent 暂无可查看的运行记录。" : "暂无可查看的运行记录。"}
       </p> : null}
@@ -179,26 +232,29 @@ function RunScope({ active, memberId, rememberAgents }: { active: boolean; membe
           })}
         </ul>
       </div>)}
-      {cursor ? <button type="button" aria-disabled={read.pending} onClick={() => read.load({ before: cursor })}>加载更早轮次</button> : null}
+      <ReadButton active={active} show={Boolean(cursor)} focusTarget={listHeading} aria-disabled={read.pending}
+        onClick={() => { if (cursor) read.load({ before: cursor }); }}>加载更早轮次</ReadButton>
     </section>
     <section className="run-log-detail-pane" id={detailId} aria-labelledby={`${detailId}-heading`}>
       <header className="run-log-bar"><h2 id={`${detailId}-heading`} ref={detailHeading} tabIndex={-1}>本轮证据</h2>
         {selected ? <button type="button" onClick={() => (selectedButton.current ?? listHeading.current)?.focus()}>返回轮次列表</button> : null}
       </header>
-      {selected ? <RunEvidence key={selectedKey} active={active} selected={selected} />
+      {selected ? <RunEvidence key={selectedKey} active={active} selected={selected} heading={detailHeading} />
         : <p className="run-log-note">选择一轮查看运行证据。</p>}
     </section>
   </div>;
 }
 
-function RunEvidence({ active, selected }: { active: boolean; selected: AgentRunSummary }) {
+function RunEvidence({ active, selected, heading }: { active: boolean; selected: AgentRunSummary; heading: FocusTarget }) {
+  const timelineHeading = useRef<HTMLHeadingElement>(null);
   const { group_id, run_id, member_id } = selected;
   const fetchTimeline = useCallback((window: ReadWindow, signal: AbortSignal) => readTimeline({ group_id, run_id, member_id }, window, signal),
     [group_id, run_id, member_id]);
   const read = useLogRead(active, fetchTimeline, mergeTimeline);
   const detail = read.value;
   const refresh = () => read.load({ through: detail?.timeline.items.at(-1)?.id });
-  useActiveRefresh(active && !read.error && Boolean(detail && hasPendingEvidence(detail)), read.pending, refresh);
+  // Poll at most one newest-page request per tick. Old action receipts can be revalidated explicitly.
+  useActiveRefresh(active && !read.error && Boolean(detail?.pollHead), read.pending, () => read.load());
   const cursor = detail?.timeline.next_cursor;
   const displayEntries = detail ? [...detail.timeline.items].reverse() : [];
   return <>
@@ -206,7 +262,7 @@ function RunEvidence({ active, selected }: { active: boolean; selected: AgentRun
       <p><strong>{memberName(detail?.run ?? selected)}</strong> · {groupName(detail?.run ?? selected)}</p>
       <button type="button" aria-disabled={read.pending} onClick={refresh}>刷新本轮证据</button>
     </div>
-    <ReadFeedback subject="本轮证据" {...read} />
+    <ReadFeedback active={active} subject="本轮证据" focusTarget={heading} {...read} />
     {detail ? <>
       <p className="run-log-state" role="status">{runStatus[detail.run.state]}</p>
       <details><summary>查看轮次标识</summary><Facts items={[
@@ -214,10 +270,13 @@ function RunEvidence({ active, selected }: { active: boolean; selected: AgentRun
         ["创建时间", <Time value={detail.run.created_at} />], ["更新时间", <Time value={detail.run.updated_at} />],
       ]} /></details>
       <RunReceipt detail={detail} />
-      <h3>事件时间线</h3>
-      {cursor ? <button type="button" aria-disabled={read.pending} onClick={() => read.load({ before: cursor })}>加载更早证据</button> : null}
+      <h3 ref={timelineHeading} tabIndex={-1}>事件时间线</h3>
+      <ReadButton active={active} show={Boolean(cursor)} focusTarget={timelineHeading} aria-disabled={read.pending}
+        onClick={() => { if (cursor) read.load({ before: cursor }); }}>加载更早证据</ReadButton>
       {displayEntries.length ? <ol className="run-log-timeline" aria-label="事件时间线" role="list">
-        {displayEntries.map(entry => <li key={entry.id}><EvidenceEntry entry={entry} groupId={group_id} active={active} /></li>)}
+        {displayEntries.map(entry => <li key={entry.id}>
+          <EvidenceEntry entry={entry} groupId={group_id} active={active} focusTarget={timelineHeading} />
+        </li>)}
       </ol> : <p className="run-log-note">本轮暂无可查看的时间线记录。</p>}
     </> : null}
   </>;
@@ -243,8 +302,18 @@ function RunReceipt({ detail }: { detail: AgentRunDetail }) {
   </details>;
 }
 
-function EvidenceEntry({ entry, groupId, active }: { entry: AgentRunEntry; groupId: string; active: boolean }) {
-  return <article aria-label={`${entryTitle[entry.kind]} ${entry.id}`}>
+function EvidenceEntry({ entry, groupId, active, focusTarget }: {
+  entry: AgentRunEntry; groupId: string; active: boolean; focusTarget: FocusTarget;
+}) {
+  const article = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    const row = article.current;
+    return () => {
+      // Check focus before a window reset removes this event, not when the read starts.
+      if (row?.contains(row.ownerDocument.activeElement) && !row.closest("[hidden], [inert]")) focusTarget.current?.focus();
+    };
+  }, [focusTarget]);
+  return <article ref={article} aria-label={`${entryTitle[entry.kind]} ${entry.id}`}>
     <header className="run-log-bar"><h4>{entryTitle[entry.kind]}</h4><Time value={entry.created_at} /></header>
     {entry.kind === "trigger_message" || entry.kind === "published_reply" ? <>
       <MessageEvidence message={entry.message} groupId={groupId} active={active} />
@@ -268,6 +337,7 @@ function EvidenceEntry({ entry, groupId, active }: { entry: AgentRunEntry; group
 }
 
 function MessageEvidence({ message, groupId, active }: { message: AgentRunMessage; groupId: string; active: boolean }) {
+  const fullText = useRef<HTMLParagraphElement>(null);
   const { message_id, sender_id, preview, truncated } = message;
   const fetchFull = useCallback(async (_window: ReadWindow, signal: AbortSignal) => {
     // The run projection binds a group and message ID, but does not project a topic selector.
@@ -280,10 +350,9 @@ function MessageEvidence({ message, groupId, active }: { message: AgentRunMessag
   const read = useLogRead(active, fetchFull, undefined, false);
   return <>
     {truncated ? <p className="run-log-note">{read.value === null ? "群消息摘录" : "完整群消息"}</p> : null}
-    <p className="run-log-copy">{read.value ?? preview}</p>
-    <ReadFeedback subject="完整消息" {...read} />
-    {truncated && read.value === null && !read.error ? <button type="button" aria-label={`读取完整消息 ${message_id}`}
-      aria-disabled={read.pending} onClick={() => read.load()}>读取完整消息</button> : null}
+    <p className="run-log-copy" ref={fullText} tabIndex={read.value === null ? undefined : -1}>{read.value ?? preview}</p>
+    <ReadFeedback active={active} subject="完整消息" focusTarget={fullText} {...read}
+      initial={truncated && read.value === null ? { label: `读取完整消息 ${message_id}`, load: () => read.load() } : undefined} />
   </>;
 }
 

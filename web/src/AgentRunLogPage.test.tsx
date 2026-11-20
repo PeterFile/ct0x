@@ -49,6 +49,8 @@ function operation(id: string, state: AgentRunWorkspaceOperation["state"], secon
 const view = (run: AgentRunSummary, items: AgentRunEntry[], next_cursor = "", receipt: AgentRunDetail["receipt"] = null) => ({
   run, accepted_at: null, cancel_requested_at: null, receipt, timeline: { items, next_cursor },
 });
+const successReceipt = { outcome: "succeeded", observed_terminal: "succeeded", started: true,
+  accepted: true, delivery_failed: false, direct_child_reaped: true, output_complete: true } satisfies AgentRunDetail["receipt"];
 function expand(summary: HTMLElement) {
   const region = summary.closest("details")!;
   expect(region).not.toHaveAttribute("open");
@@ -81,8 +83,13 @@ it("groups same-name Agents by member ID and paginates global and member scopes 
   expect(firstList.getByText("原群")).toBeVisible();
   expect(secondList.getByText("另一群")).toBeVisible();
   expect(firstList.getByRole("button").querySelector("time")).toHaveAttribute("datetime", first.created_at);
-  fireEvent.click(screen.getByRole("button", { name: "加载更早轮次" }));
+  const olderButton = screen.getByRole("button", { name: "加载更早轮次" });
+  olderButton.focus();
+  fireEvent.click(olderButton);
+  expect(olderButton).toHaveFocus();
   expect(await firstList.findByRole("button", { name: "原群 · 运行 older-1" })).toBeVisible();
+  expect(olderButton).not.toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "运行轮次" })).toHaveFocus();
   expect(secondList.getAllByRole("button")).toHaveLength(1);
   expect(urlAt(1).searchParams.get("before")).toBe("all+cursor/&");
   expect(urlAt(1).searchParams.has("member_id")).toBe(false);
@@ -178,35 +185,54 @@ it("reverses combined newest-first pages, deduplicates exact IDs and preserves t
   const otherReply = reply(assigned.dispatch_decision.decision_id, "另一条群内发言", first, published.created_at);
   const full = { id: published.message.message_id, group_id: first.group_id, sender_id: first.member_id, topic_id: "原话题", content: original,
     created_at: published.created_at, deliveries: [] };
-  const more = reply("reply-2", "新增群发言", first, stamp(5));
-  transport.mockResolvedValueOnce(page([first])).mockResolvedValueOnce(json(view(first, [assigned, otherReply], "older+/&")))
+  const live = { ...first, state: "running" as const }, completed = { ...first, state: "succeeded" as const, updated_at: stamp(11) };
+  const more = reply("reply-2", "新增群发言", live, stamp(5));
+  const olderOp = operation("older-op", "pending", 1), fullRead = deferred<Response>();
+  transport.mockResolvedValueOnce(page([live])).mockResolvedValueOnce(json(view(live, [assigned, otherReply], "older+/&")))
     // An overlapping boundary row must not hide either the other same-time reply or the decision with the same source ID.
-    .mockResolvedValueOnce(json(view(first, [otherReply, published, input]))).mockResolvedValueOnce(json({ ...full, id: "unrelated" }))
-    .mockResolvedValueOnce(json(full)).mockResolvedValueOnce(json(view(first, [more, assigned], "newer-anchor")))
-    .mockResolvedValueOnce(json(view(first, [otherReply, published], "oldest-anchor"))).mockResolvedValueOnce(json(view(first, [input])));
+    .mockResolvedValueOnce(json(view(live, [otherReply, published, olderOp, input]))).mockResolvedValueOnce(json({ ...full, id: "unrelated" }))
+    .mockReturnValueOnce(fullRead.promise).mockResolvedValueOnce(json(view(live, [more, assigned], "newer-anchor")))
+    .mockResolvedValueOnce(json(view(live, [otherReply, published], "oldest-anchor")))
+    .mockResolvedValueOnce(json(view(completed, [operation("older-op", "unknown", 1), input], "", successReceipt)));
   render(<AgentRunLogPage active />);
   fireEvent.click(await screen.findByRole("button", { name: `原群 · 运行 ${first.run_id}` }));
   const olderButton = await evidence().findByRole("button", { name: "加载更早证据" });
   const headLabels = [`群内发言 ${otherReply.id}`, `分派决定 ${assigned.id}`];
   expect(timelineLabels()).toEqual(headLabels);
+  olderButton.focus();
   fireEvent.click(olderButton);
   const publication = within(await timeline().findByRole("article", { name: `群内发言 ${published.id}` }));
+  expect(olderButton).not.toBeInTheDocument();
+  expect(evidence().getByRole("heading", { name: "事件时间线" })).toHaveFocus();
   expect(urlAt(2).searchParams.get("before")).toBe("older+/&");
   expect(urlAt(2).searchParams.get("group_id")).toBe(first.group_id);
-  const labels = [`触发消息 ${input.id}`, `群内发言 ${published.id}`, ...headLabels];
+  const labels = [`触发消息 ${input.id}`, `工作区动作 ${olderOp.id}`, `群内发言 ${published.id}`, ...headLabels];
   expect(timelineLabels()).toEqual(labels);
-  fireEvent.click(publication.getByRole("button", { name: `读取完整消息 ${full.id}` }));
+  expect(timeline().getByText(/已登记，尚无操作回执/)).toBeVisible();
+  const fullButton = publication.getByRole("button", { name: `读取完整消息 ${full.id}` });
+  fullButton.focus();
+  fireEvent.click(fullButton);
   expect(await publication.findByRole("alert")).toHaveTextContent("服务响应不符合约定");
   expect(publication.queryByText(/完整内容/)).not.toBeInTheDocument();
   expect(urlAt(3).pathname).toBe(`/api/v1/groups/${encodeURIComponent(first.group_id)}/history/${encodeURIComponent(full.id)}`);
   expect(urlAt(3).search).toBe("");
-  fireEvent.click(publication.getByRole("button", { name: "重试读取完整消息" }));
-  const text = await publication.findByText(/完整内容/);
+  const retry = publication.getByRole("button", { name: "重试读取完整消息" });
+  expect(retry).toHaveFocus();
+  fireEvent.click(retry);
+  expect(retry).toHaveAttribute("aria-disabled", "true");
+  expect(retry).toHaveFocus();
+  await act(async () => fullRead.resolve(json(full)));
+  const text = publication.getByText(/完整内容/);
   expect(text.textContent).toBe(original);
   expect(text.querySelector("b")).toBeNull();
+  expect(text).toHaveFocus();
   fireEvent.click(evidence().getByRole("button", { name: "刷新本轮证据" }));
   expect(await evidence().findByText("新增群发言")).toBeVisible();
   expect(evidence().getByText(/完整内容/)).toBe(text);
+  expect(evidence().getByText("运行中")).toBeVisible();
+  expect(evidence().getByText("运行回执（未提供）")).toBeVisible();
+  expect(timeline().getByText(/操作结果未知，待核对/)).toBeVisible();
+  expect(timeline().queryByText(/已登记，尚无操作回执/)).not.toBeInTheDocument();
   expect(timelineLabels()).toEqual([...labels, `群内发言 ${more.id}`]);
   expect(urlAt(5).searchParams.has("before")).toBe(false);
   expect(urlAt(6).searchParams.get("before")).toBe("newer-anchor");
@@ -214,11 +240,32 @@ it("reverses combined newest-first pages, deduplicates exact IDs and preserves t
   expect(transport.mock.calls.every(([, init]) => (init?.method ?? "GET") === "GET")).toBe(true);
 });
 
+it.each([false, true])("moves focus to the full message only if its control still has focus (moved away: %s)", async (movedAway) => {
+  const published = reply("long", "消息摘录", first, stamp(3), true), fullRead = deferred<Response>();
+  transport.mockResolvedValueOnce(page([first])).mockResolvedValueOnce(json(view(first, [published])))
+    .mockReturnValueOnce(fullRead.promise);
+  render(<AgentRunLogPage active />);
+  fireEvent.click(await screen.findByRole("button", { name: `${first.group_name} · 运行 ${first.run_id}` }));
+  const button = await evidence().findByRole("button", { name: "读取完整消息 long" });
+  button.focus();
+  fireEvent.click(button);
+  expect(button).toHaveFocus();
+  const refresh = evidence().getByRole("button", { name: "刷新本轮证据" });
+  if (movedAway) refresh.focus();
+  await act(async () => fullRead.resolve(json({ id: published.message.message_id, group_id: first.group_id, sender_id: first.member_id,
+    topic_id: "", content: "消息摘录和完整正文", created_at: published.created_at, deliveries: [] })));
+  const text = evidence().getByText("消息摘录和完整正文");
+  expect(text).toBeVisible();
+  expect(button).not.toBeInTheDocument();
+  expect(movedAway ? refresh : text).toHaveFocus();
+});
+
 it("discards late reads from a previous Agent or exact run selection even if transport ignores abort", async () => {
   const oldAgent = deferred<Response>(), oldRun = deferred<Response>();
   transport.mockResolvedValueOnce(page([first, second])).mockReturnValueOnce(oldAgent.promise)
     .mockResolvedValueOnce(page([second])).mockResolvedValueOnce(page([first, second])).mockReturnValueOnce(oldRun.promise)
-    .mockResolvedValueOnce(json(view(second, [trigger("current-trigger", "当前触发消息")])));
+    .mockResolvedValueOnce(json(view(second, [trigger("current-trigger", "当前触发消息")])))
+    .mockResolvedValueOnce(json(view(first, [trigger("reopened", "重新打开的轮次")])));
   render(<AgentRunLogPage active />);
   await screen.findByRole("option", { name: "同名 Agent · 另一群 · agent-2" });
   chooseAgent(first.member_id);
@@ -235,8 +282,236 @@ it("discards late reads from a previous Agent or exact run selection even if tra
   fireEvent.click(pick(second));
   expect(transport.mock.calls[4][1]?.signal?.aborted).toBe(true);
   expect(await evidence().findByText("当前触发消息")).toBeVisible();
+  fireEvent.click(pick(first));
+  expect(await evidence().findByText("重新打开的轮次")).toBeVisible();
   await act(async () => oldRun.resolve(json(view(first, [trigger("stale", "过期触发消息")]))));
+  expect(evidence().getByText("重新打开的轮次")).toBeVisible();
   expect(evidence().queryByText("过期触发消息")).not.toBeInTheDocument();
+});
+
+it("does not finalize a live head on an older terminal observation, including after a hidden read resumes", async () => {
+  vi.useFakeTimers();
+  const live = { ...first, state: "running" as const };
+  const completed = { ...live, state: "succeeded" as const, updated_at: stamp(11) };
+  const prior = reply("prior", "先前发言", live), input = trigger("input", "更早的触发消息");
+  const abandoned = deferred<Response>(), resumed = deferred<Response>(), newest = deferred<Response>();
+  transport.mockResolvedValueOnce(page([live])).mockResolvedValueOnce(json(view(live, [prior], "before+/&")))
+    .mockReturnValueOnce(abandoned.promise).mockReturnValueOnce(resumed.promise).mockReturnValueOnce(newest.promise);
+  const pageView = render(<AgentRunLogPage active />);
+  await flush();
+  fireEvent.click(pick(live));
+  await flush();
+  fireEvent.click(evidence().getByRole("button", { name: "加载更早证据" }));
+  pageView.rerender(<AgentRunLogPage active={false} />);
+  expect(transport.mock.calls[2][1]?.signal?.aborted).toBe(true);
+  await tick(10000);
+  expect(transport).toHaveBeenCalledTimes(3);
+  pageView.rerender(<AgentRunLogPage active />);
+  await flush();
+  expect(urlAt(3).href).toBe(urlAt(2).href);
+  await act(async () => abandoned.resolve(json(view(completed, [trigger("stale", "过期的更早响应")], "", successReceipt))));
+  expect(evidence().queryByText("过期的更早响应")).not.toBeInTheDocument();
+  expect(evidence().getByText("正在读取本轮证据…")).toBeVisible();
+  await act(async () => resumed.resolve(json(view(completed, [input], "", successReceipt))));
+  expect(evidence().getByText("更早的触发消息")).toBeVisible();
+  expect(evidence().getByText("运行中")).toBeVisible();
+  expect(evidence().getByText("运行回执（未提供）")).toBeVisible();
+  await tick();
+  expect(transport).toHaveBeenCalledTimes(5);
+  expect(urlAt(4).searchParams.has("before")).toBe(false);
+  expect(evidence().getByText("运行中")).toBeVisible();
+  const final = reply("final", "实际最终发言", completed, stamp(10));
+  await act(async () => newest.resolve(json(view(completed, [final, prior], "after-prior", successReceipt))));
+  expect(evidence().getByText("实际最终发言")).toBeVisible();
+  expect(evidence().getByText("运行成功", { selector: ".run-log-state" })).toBeVisible();
+  expect(within(expand(evidence().getByText("查看运行回执"))).getByText("报告成功")).toBeVisible();
+  expect(timelineLabels()).toEqual([`触发消息 ${input.id}`, `群内发言 ${prior.id}`, `群内发言 ${final.id}`]);
+  await tick(10000);
+  expect(transport).toHaveBeenCalledTimes(5);
+});
+
+it.each(["older", "through"])("rechecks an idle unknown head when a %s read observes reconciliation", async (mode) => {
+  vi.useFakeTimers();
+  const through = mode === "through", cursor = "older+/?";
+  const completed = { ...first, state: "succeeded" as const, updated_at: stamp(11) };
+  const prior = reply("prior", "先前发言", first), input = trigger("input", "较早的触发消息");
+  const final = reply("final", "对账后的最终发言", completed, stamp(11)), recheck = deferred<Response>();
+  transport.mockResolvedValueOnce(page([first])).mockResolvedValueOnce(json(view(first, [prior], cursor)));
+  if (through) {
+    // Load the refresh anchor; the explicit refresh's first page still has the unknown head.
+    transport.mockResolvedValueOnce(json(view(first, [input], "past-input")))
+      .mockResolvedValueOnce(json(view(first, [prior], cursor)));
+  }
+  transport.mockResolvedValueOnce(json(view(completed, [input], "past-input", successReceipt)))
+    .mockReturnValueOnce(recheck.promise);
+  render(<AgentRunLogPage active />);
+  await flush();
+  fireEvent.click(pick(first));
+  await flush();
+  const olderButton = evidence().getByRole("button", { name: "加载更早证据" });
+  if (through) {
+    fireEvent.click(olderButton);
+    await flush();
+    expect(timeline().getByText(input.message.preview)).toBeVisible();
+  }
+  await tick(10000);
+  expect(transport).toHaveBeenCalledTimes(through ? 3 : 2);
+
+  fireEvent.click(through ? evidence().getByRole("button", { name: "刷新本轮证据" }) : olderButton);
+  await flush();
+  const observedAt = through ? 4 : 2;
+  expect(transport).toHaveBeenCalledTimes(observedAt + 1);
+  if (through) expect(urlAt(observedAt - 1).href).toBe(urlAt(1).href);
+  expect(urlAt(observedAt).searchParams.get("before")).toBe(cursor);
+  expect(timeline().getByText(input.message.preview)).toBeVisible();
+  expect(evidence().getByText("运行结果未知", { selector: ".run-log-state" })).toBeVisible();
+  expect(evidence().getByText("运行回执（未提供）")).toBeVisible();
+  expect(timeline().queryByText(final.message.preview)).not.toBeInTheDocument();
+
+  await tick();
+  expect(transport).toHaveBeenCalledTimes(observedAt + 2);
+  expect(urlAt(observedAt + 1).href).toBe(urlAt(1).href);
+  await act(async () => recheck.resolve(json(view(completed, [final, prior], "after-prior", successReceipt))));
+  expect(evidence().getByText("运行成功", { selector: ".run-log-state" })).toBeVisible();
+  expect(timeline().getByText(final.message.preview)).toBeVisible();
+  expect(within(expand(evidence().getByText("查看运行回执"))).getByText("报告成功")).toBeVisible();
+  expect(timelineLabels()).toEqual([`触发消息 ${input.id}`, `群内发言 ${prior.id}`, `群内发言 ${final.id}`]);
+  await tick(15000);
+  expect(transport).toHaveBeenCalledTimes(observedAt + 2);
+});
+
+it("does not repeat the newest recheck if it does not confirm an older terminal observation", async () => {
+  vi.useFakeTimers();
+  const unknown = { ...successReceipt, outcome: "unknown" as const, observed_terminal: "" as const, output_complete: false };
+  const observed = { ...unknown, observed_terminal: "succeeded" as const };
+  const head = view(first, [reply("prior", "先前发言", first)], "older", unknown);
+  transport.mockResolvedValueOnce(page([first])).mockResolvedValueOnce(json(head))
+    .mockResolvedValueOnce(json(view(first, [trigger("input", "触发消息")], "", observed))).mockResolvedValueOnce(json(head));
+  render(<AgentRunLogPage active />);
+  await flush();
+  fireEvent.click(pick(first));
+  await flush();
+  fireEvent.click(evidence().getByRole("button", { name: "加载更早证据" }));
+  await flush();
+  await tick();
+  expect(transport).toHaveBeenCalledTimes(4);
+  expect(urlAt(3).href).toBe(urlAt(1).href);
+  expect(evidence().getByText("运行结果未知", { selector: ".run-log-state" })).toBeVisible();
+  const receipt = within(expand(evidence().getByText("查看运行回执")));
+  expect(receipt.getByText("未记录")).toBeVisible();
+  expect(receipt.queryByText("报告成功")).not.toBeInTheDocument();
+  await tick(15000);
+  expect(transport).toHaveBeenCalledTimes(4);
+});
+
+it("only polls the newest page after loading deep history and reuses the verified older frontier", async () => {
+  vi.useFakeTimers();
+  const live = { ...first, state: "running" as const };
+  const cancelling = { ...live, state: "cancel_requested" as const, updated_at: stamp(30) };
+  const completed = { ...live, state: "succeeded" as const, updated_at: stamp(31) };
+  const newestOp = operation("recent", "pending", 22), unknown = operation("recent", "unknown", 22);
+  const older = Array.from({ length: 8 }, (_, index) => operation(`deep-${index}`, index === 7 ? "pending" : "done", 20 - index));
+  const cursor = (index: number) => `deep+${index}/?`;
+  const progress = reply("progress", "新进度", live, stamp(23)), final = reply("complete", "最后输出", live, stamp(24));
+  transport.mockResolvedValueOnce(page([live])).mockResolvedValueOnce(json(view(live, [newestOp], cursor(0))));
+  older.forEach((entry, index) => transport.mockResolvedValueOnce(json(view(live, [entry], cursor(index + 1)))));
+  transport.mockResolvedValueOnce(json(view(cancelling, [progress, unknown], "recent-progress")))
+    .mockResolvedValueOnce(json(view(completed, [final, progress, unknown], "recent-complete", successReceipt)))
+    .mockResolvedValueOnce(json(view(completed, [trigger("first-event", "最早的触发消息")], "", successReceipt)));
+  render(<AgentRunLogPage active />);
+  await flush();
+  fireEvent.click(pick(live));
+  await flush();
+  const olderButton = evidence().getByRole("button", { name: "加载更早证据" });
+  olderButton.focus();
+  for (const [index] of older.entries()) {
+    fireEvent.click(olderButton);
+    await flush();
+    expect(urlAt(index + 2).searchParams.get("before")).toBe(cursor(index));
+    expect(olderButton).toHaveFocus();
+  }
+  const loaded = older.length + 2;
+  expect(transport).toHaveBeenCalledTimes(loaded);
+  await tick();
+  expect(transport).toHaveBeenCalledTimes(loaded + 1);
+  expect(urlAt(loaded).searchParams.has("before")).toBe(false);
+  expect(evidence().getByText("已请求取消，尚未确认停止")).toBeVisible();
+  expect(timeline().getByText(/操作结果未知，待核对/)).toBeVisible();
+  expect(timeline().getByText(/已登记，尚无操作回执/)).toBeVisible();
+  await tick();
+  expect(transport).toHaveBeenCalledTimes(loaded + 2);
+  expect(urlAt(loaded + 1).searchParams.has("before")).toBe(false);
+  expect(evidence().getByText("运行成功", { selector: ".run-log-state" })).toBeVisible();
+  expect(timelineLabels()).toEqual([
+    ...[...older].reverse().map(entry => `工作区动作 ${entry.id}`),
+    `工作区动作 ${newestOp.id}`, `群内发言 ${progress.id}`, `群内发言 ${final.id}`,
+  ]);
+  await tick(10000);
+  expect(transport).toHaveBeenCalledTimes(loaded + 2);
+  expect(olderButton).toHaveFocus();
+  fireEvent.click(olderButton);
+  await flush();
+  expect(urlAt(loaded + 2).searchParams.get("before")).toBe(cursor(older.length));
+  expect(evidence().getByText("最早的触发消息")).toBeVisible();
+});
+
+it("uses the new cursor rather than joining disjoint timeline windows", async () => {
+  vi.useFakeTimers();
+  const live = { ...first, state: "running" as const };
+  const prior = reply("prior", "之前的发言", live), input = trigger("input", "更早的消息");
+  const newest = reply("newest", "最新发言", live, stamp(5)), middle = reply("middle", "中间的发言", live, stamp(4));
+  transport.mockResolvedValueOnce(page([live])).mockResolvedValueOnce(json(view(live, [prior], "old-cursor")))
+    .mockResolvedValueOnce(json(view(live, [input]))).mockResolvedValueOnce(json(view(live, [newest], "new-cursor")))
+    .mockResolvedValueOnce(json(view(live, [middle, prior, input])));
+  render(<AgentRunLogPage active />);
+  await flush();
+  fireEvent.click(pick(live));
+  await flush();
+  fireEvent.click(evidence().getByRole("button", { name: "加载更早证据" }));
+  await flush();
+  expect(timelineLabels()).toEqual([`触发消息 ${input.id}`, `群内发言 ${prior.id}`]);
+  await tick();
+  expect(transport).toHaveBeenCalledTimes(4);
+  expect(timelineLabels()).toEqual([`群内发言 ${newest.id}`]);
+  fireEvent.click(evidence().getByRole("button", { name: "加载更早证据" }));
+  await flush();
+  expect(urlAt(4).searchParams.get("before")).toBe("new-cursor");
+  expect(timelineLabels()).toEqual([`触发消息 ${input.id}`, `群内发言 ${prior.id}`, `群内发言 ${middle.id}`, `群内发言 ${newest.id}`]);
+});
+
+it.each([false, true])("hands off focus on a disjoint newest window only when still in the removed event (moved away: %s)", async (movedAway) => {
+  vi.useFakeTimers();
+  const live = { ...first, state: "running" as const };
+  const old = reply("old-long", "旧消息摘录", live, stamp(3), true);
+  const newest = reply("new", "新窗口的发言", live, stamp(5));
+  const fullRead = deferred<Response>(), poll = deferred<Response>();
+  transport.mockResolvedValueOnce(page([live])).mockResolvedValueOnce(json(view(live, [old], "old-cursor")))
+    .mockReturnValueOnce(fullRead.promise).mockReturnValueOnce(poll.promise);
+  render(<AgentRunLogPage active />);
+  await flush();
+  fireEvent.click(pick(live));
+  await flush();
+  const oldEvent = timeline().getByRole("article", { name: `群内发言 ${old.id}` });
+  const fullButton = within(oldEvent).getByRole("button", { name: "读取完整消息 old-long" });
+  fullButton.focus();
+  fireEvent.click(fullButton);
+  expect(fullButton).toHaveFocus();
+  const fullSignal = transport.mock.calls[2][1]?.signal;
+  expect(fullSignal?.aborted).toBe(false);
+  const eventControl = movedAway ? within(oldEvent).getByText("查看消息标识") : fullButton;
+  eventControl.focus();
+
+  await tick();
+  expect(transport).toHaveBeenCalledTimes(4);
+  expect(urlAt(3).href).toBe(urlAt(1).href);
+  expect(eventControl).toHaveFocus();
+  const refresh = evidence().getByRole("button", { name: "刷新本轮证据" });
+  if (movedAway) refresh.focus();
+  await act(async () => poll.resolve(json(view(live, [newest], "new-cursor"))));
+  expect(oldEvent).not.toBeInTheDocument();
+  expect(timelineLabels()).toEqual([`群内发言 ${newest.id}`]);
+  expect(fullSignal?.aborted).toBe(true);
+  expect(movedAway ? refresh : evidence().getByRole("heading", { name: "事件时间线" })).toHaveFocus();
 });
 
 it("suspends pending-result refresh while hidden, then updates from a real action receipt and keeps the disclosure", async () => {
@@ -272,13 +547,20 @@ it.each([
     items: [{ ...assigned, dispatch_decision: { ...assigned.dispatch_decision, assignment_id: undefined } }],
   } } },
 ])("rejects $label and retries the exact selection", async ({ invalid }) => {
-  transport.mockResolvedValueOnce(page([first])).mockResolvedValueOnce(json(invalid))
-    .mockResolvedValueOnce(json(view(first, [trigger("verified", "真实触发消息")])));
+  const retryRead = deferred<Response>();
+  transport.mockResolvedValueOnce(page([first])).mockResolvedValueOnce(json(invalid)).mockReturnValueOnce(retryRead.promise);
   render(<AgentRunLogPage active />);
   fireEvent.click(await screen.findByRole("button", { name: `原群 · 运行 ${first.run_id}` }));
   expect(await evidence().findByRole("alert")).toHaveTextContent("运行记录响应不符合约定");
   expect(evidence().queryByRole("list", { name: "事件时间线" })).not.toBeInTheDocument();
-  fireEvent.click(evidence().getByRole("button", { name: "重试读取本轮证据" }));
-  expect(await evidence().findByText("真实触发消息")).toBeVisible();
+  const retry = evidence().getByRole("button", { name: "重试读取本轮证据" });
+  retry.focus();
+  fireEvent.click(retry);
+  expect(retry).toHaveAttribute("aria-disabled", "true");
+  expect(retry).toHaveFocus();
+  await act(async () => retryRead.resolve(json(view(first, [trigger("verified", "真实触发消息")]))));
+  expect(evidence().getByText("真实触发消息")).toBeVisible();
+  expect(retry).not.toBeInTheDocument();
+  expect(evidence().getByRole("heading", { name: "本轮证据" })).toHaveFocus();
   expect(urlAt(2).href).toBe(urlAt(1).href);
 });
