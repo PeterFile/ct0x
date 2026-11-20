@@ -41,10 +41,10 @@ func MemberRoleToolRoutes(tools *platform.MemberTools) []Route {
 	if tools.InvestigationOwnerManagementEnabled() {
 		// Native HTTP only. Do not add these operations to MCP discovery or
 		// let an ordinary role's capability select an owner wire profile.
-		routes = append(routes,
-			Route{http.MethodPost, "/api/v1/member-tools/" + platform.DelegateWorkOperation, memberToolNative(a.delegateWork)},
-			Route{http.MethodPost, "/api/v1/member-tools/" + platform.HandbackWorkOperation, memberToolNative(a.handbackWork)},
-		)
+		routes = append(routes, Route{http.MethodPost, "/api/v1/member-tools/" + platform.DelegateWorkOperation, memberToolNative(a.delegateWork)})
+	}
+	if tools.InvestigationHandbackEnabled() {
+		routes = append(routes, Route{http.MethodPost, "/api/v1/member-tools/" + platform.HandbackWorkOperation, memberToolNative(a.handbackWork)})
 	}
 	return routes
 }
