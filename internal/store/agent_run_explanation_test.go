@@ -32,6 +32,8 @@ func agentRunExplanationFixture(t *testing.T) (messageFixture, MemberToolScope) 
 func TestAgentRunPublicExplanationExactFact(t *testing.T) {
 	f, scope := agentRunExplanationFixture(t)
 	s, claim := f.s, scope.Claim
+	// An ordinary index must not disable publication or timeline readback.
+	coordinationDecideExec(t, s, `CREATE INDEX main.agent_run_explanations_created_at ON agent_run_explanations(created_at)`)
 	const candidate = "PRIVATE unconfirmed response, not an explanation"
 	queueEvent(t, s, claim, provider.AcceptedEvent, "", "")
 	queueEvent(t, s, claim, provider.ResponseEvent, candidate, "")
@@ -188,6 +190,40 @@ func TestAgentRunPublicExplanationCommitUnconfirmed(t *testing.T) {
 	}
 }
 
+func TestAgentRunPublicExplanationPartialSchema(t *testing.T) {
+	for _, tc := range []struct {
+		name, change string
+	}{
+		{"missing_trigger", `DROP TRIGGER agent_run_explanations_no_delete`},
+		{"missing_column", `ALTER TABLE agent_run_explanations DROP COLUMN text`},
+		{"missing_constraint", `DROP TABLE agent_run_explanations;` +
+			strings.Replace(agentRunExplanationSchema, "    UNIQUE(group_id,member_id,idempotency_key),\n", "", 1)},
+		{"extra_unique_index", `CREATE UNIQUE INDEX main.agent_run_explanations_extra_unique ON agent_run_explanations(id)`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, scope := agentRunExplanationFixture(t)
+			s, claim := f.s, scope.Claim
+			before, err := s.GetAgentRun(ctx, claim.GroupID, claim.TurnID, ListOptions{})
+			if err != nil || len(before.Timeline.Items) != 1 || before.Timeline.Items[0].Kind != "trigger_message" {
+				t.Fatalf("read ordinary Run history: %+v, %v", before, err)
+			}
+			const text, key = "Public explanation", "partial-schema"
+			if _, err := s.PublishAgentRunExplanation(ctx, scope, text, key); err != nil {
+				t.Fatal(err)
+			}
+			coordinationDecideExec(t, s, tc.change)
+			if supported, err := s.AgentRunExplanationSupported(ctx); err != nil || supported {
+				t.Errorf("partial schema advertised explanation support: %t, %v", supported, err)
+			}
+			if now, err := s.GetAgentRun(ctx, claim.GroupID, claim.TurnID, ListOptions{}); err != nil || !reflect.DeepEqual(now, before) {
+				t.Errorf("partial schema changed ordinary Run history: %+v, %v", now, err)
+			}
+			got, err := s.PublishAgentRunExplanation(ctx, scope, text, key)
+			requestDispatchZero(t, got, err, ErrAgentRunExplanationUnavailable)
+		})
+	}
+}
+
 func TestAgentRunPublicExplanationV30Compatibility(t *testing.T) {
 	original := migrations
 	landing := agentRunExplanationTestMigrations()
@@ -223,4 +259,9 @@ func TestAgentRunPublicExplanationV30Compatibility(t *testing.T) {
 		t.Fatalf("append did not enable an explicit publication: %+v, %v", got, err)
 	}
 	dispatchAssertFK(t, s)
+	var withoutRowID bool
+	if err := s.db.QueryRow(`SELECT wr FROM pragma_table_list('agent_run_explanations')
+	 WHERE schema='main' AND type='table'`).Scan(&withoutRowID); err != nil || !withoutRowID {
+		t.Fatalf("explanation table is not WITHOUT ROWID: %t, %v", withoutRowID, err)
+	}
 }

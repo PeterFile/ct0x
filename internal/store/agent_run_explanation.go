@@ -34,9 +34,19 @@ func (s *Store) AgentRunExplanationSupported(ctx context.Context) (bool, error) 
 func agentRunExplanationSupported(ctx context.Context, db interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }) (bool, error) {
+	// Match the table and all three guards from the append's CREATE definitions.
+	// Explicit unique indexes can impose conflicts beyond the built-in keys.
 	var supported bool
-	err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
-	 WHERE type='table' AND name='agent_run_explanations')`).Scan(&supported)
+	err := db.QueryRowContext(ctx, `SELECT count(*)=4 AND NOT EXISTS(
+	 SELECT 1 FROM pragma_index_list('agent_run_explanations','main')
+	 WHERE origin='c' AND "unique"=1)
+	 FROM main.sqlite_schema
+	 WHERE tbl_name='agent_run_explanations' AND (type,name,sql) IN (
+	 ('table','agent_run_explanations',?),
+	 ('trigger','agent_run_explanations_no_replace',?),
+	 ('trigger','agent_run_explanations_no_update',?),
+	 ('trigger','agent_run_explanations_no_delete',?))`,
+		agentRunExplanationTable, agentRunExplanationNoReplace, agentRunExplanationNoUpdate, agentRunExplanationNoDelete).Scan(&supported)
 	return supported, err
 }
 
