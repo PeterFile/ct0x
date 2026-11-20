@@ -34,3 +34,27 @@ CREATE TRIGGER delivery_artifact_read_grants_update BEFORE UPDATE ON delivery_ar
 BEGIN SELECT RAISE(ABORT, '投递成果读取许可不可修改'); END;
 CREATE TRIGGER delivery_artifact_read_grants_delete BEFORE DELETE ON delivery_artifact_read_grants
 BEGIN SELECT RAISE(ABORT, '投递成果读取许可不可删除'); END;
+
+-- Block both a second delivery and replacement by message, delivery ID or
+-- rowid, even when recursive delete triggers are disabled. Grant insertion
+-- itself takes place after the one allowed delivery is created.
+CREATE TRIGGER delivery_artifact_read_grant_deliveries_insert BEFORE INSERT ON deliveries
+WHEN EXISTS(SELECT 1 FROM delivery_artifact_read_grants WHERE delivery_id=NEW.id OR message_id=NEW.message_id)
+ OR EXISTS(SELECT 1 FROM deliveries d JOIN delivery_artifact_read_grants g ON g.delivery_id=d.id WHERE d.rowid=NEW.rowid)
+BEGIN SELECT RAISE(ABORT, '成果读取许可的投递集合不可修改'); END;
+
+-- Check both sides: no moving the authorized delivery away or moving an
+-- existing delivery into the authorized message. Queue state and turn writes
+-- do not change identity and remain on the usual lifecycle path.
+CREATE TRIGGER delivery_artifact_read_grant_deliveries_identity
+BEFORE UPDATE OF rowid,_rowid_,oid,id,message_id,group_id,topic_id,conversation_id,recipient_id ON deliveries
+WHEN (NEW.rowid IS NOT OLD.rowid OR NEW.id IS NOT OLD.id OR NEW.message_id IS NOT OLD.message_id
+ OR NEW.group_id IS NOT OLD.group_id OR NEW.topic_id IS NOT OLD.topic_id
+ OR NEW.conversation_id IS NOT OLD.conversation_id OR NEW.recipient_id IS NOT OLD.recipient_id)
+ AND (EXISTS(SELECT 1 FROM delivery_artifact_read_grants
+    WHERE delivery_id IN (OLD.id,NEW.id) OR message_id IN (OLD.message_id,NEW.message_id))
+ OR EXISTS(SELECT 1 FROM deliveries d JOIN delivery_artifact_read_grants g ON g.delivery_id=d.id WHERE d.rowid=NEW.rowid))
+BEGIN SELECT RAISE(ABORT, '成果读取许可的投递身份不可修改'); END;
+CREATE TRIGGER delivery_artifact_read_grant_deliveries_delete BEFORE DELETE ON deliveries
+WHEN EXISTS(SELECT 1 FROM delivery_artifact_read_grants WHERE delivery_id=OLD.id)
+BEGIN SELECT RAISE(ABORT, '成果读取许可的投递不可删除'); END;

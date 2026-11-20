@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"strings"
+	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
 )
@@ -24,22 +25,26 @@ func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, re
 	if err := requireMessageActor(ctx, tx, r.GroupID, "user"); err != nil {
 		return domain.Message{}, storeError("验证用户消息失败", err)
 	}
-	if pin := r.ArtifactReadGrant; pin != nil {
-		if len(r.RecipientIDs) != 1 || r.RecipientIDs[0] == "" || !ValidArtifactReadPin(*pin) {
-			return domain.Message{}, ErrInvalid
-		}
-		installed, err := artifactReadGrantInstalled(ctx, tx)
-		if err != nil {
-			return domain.Message{}, storeError("验证成果读取许可失败", err)
-		}
-		if !installed {
-			return domain.Message{}, ErrArtifactReadGrantUnavailable
-		}
+	pin := r.ArtifactReadGrant
+	if pin != nil && (len(r.RecipientIDs) != 1 || r.RecipientIDs[0] == "" || !ValidArtifactReadPin(*pin) || !utf8.ValidString(r.Content)) {
+		return domain.Message{}, ErrInvalid
 	}
 	payload := r.payload()
 	_, replay, err := lookupMutation(ctx, tx, r.scope(), payload)
 	if err != nil {
 		return domain.Message{}, storeError("读取用户消息回执失败", err)
+	}
+	if pin != nil {
+		installed, _, err := artifactReadGrantStorage(ctx, tx)
+		if err != nil {
+			return domain.Message{}, storeError("验证成果读取许可失败", err)
+		}
+		if !installed {
+			if replay {
+				return domain.Message{}, ErrArtifactReadGrantIncomplete
+			}
+			return domain.Message{}, ErrArtifactReadGrantUnavailable
+		}
 	}
 	message, err := createMessageInTx(ctx, tx, r, recipients)
 	if err != nil {
@@ -51,10 +56,14 @@ func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, re
 			return domain.Message{}, storeError("记录用户命令来源失败", err)
 		}
 		message.SourceID, message.SourceKind = sourceID, "local_user_chat"
-		if pin := r.ArtifactReadGrant; pin != nil {
+		if pin != nil {
 			if err := insertDeliveryArtifactReadGrant(ctx, tx, message, *pin); err != nil {
 				return domain.Message{}, storeError("保存成果读取许可失败", err)
 			}
+		}
+	} else if pin != nil {
+		if err := verifyArtifactReadGrantReplay(ctx, tx, message, r, payload); err != nil {
+			return domain.Message{}, storeError("验证成果读取许可回执失败", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {

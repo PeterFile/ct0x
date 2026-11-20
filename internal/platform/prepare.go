@@ -299,7 +299,9 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 		!intakeSchema.investigation && !(intake && p.memberTools.tools.continueWorkEnabled())
 	var artifactRead *preparedDeliveryArtifactRead
 	var artifactReadPin *domain.ArtifactVersionRef
-	if projectExperience && trigger.SenderID == "user" && trigger.SourceKind == "local_user_chat" {
+	// Even if provenance is missing, a persisted grant for this user message
+	// must fail closed rather than silently falling back to lookup only.
+	if projectExperience && trigger.SenderID == "user" {
 		pin, err := p.store.QueuedDeliveryArtifactReadGrant(ctx, group.ID, d, conversation.TopicID)
 		if err != nil {
 			return empty, preparationReadError(ctx, err)

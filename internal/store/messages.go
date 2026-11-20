@@ -40,7 +40,7 @@ func (r MessageRequest) payload() []byte {
 	if pin := r.ArtifactReadGrant; pin != nil {
 		// A distinct recipient mode separates grant payloads from all old
 		// explicit sets. Keep the no-grant payload byte-for-byte unchanged.
-		fields[3] = "explicit_artifact_read_grant/v1"
+		fields[3] = artifactReadGrantMode
 		fields = append(fields, pin.ArtifactID, pin.VersionID)
 	}
 	return mutationPayload(fields...)

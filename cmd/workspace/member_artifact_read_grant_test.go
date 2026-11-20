@@ -36,6 +36,11 @@ func artifactGrantSend(t *testing.T, h http.Handler, path string, input any, key
 	t.Helper()
 	body, err := json.Marshal(input)
 	artifactCmdMust(t, err)
+	return artifactGrantSendRaw(t, h, path, body, key, bearer, want)
+}
+
+func artifactGrantSendRaw(t *testing.T, h http.Handler, path string, body []byte, key, bearer string, want int) []byte {
+	t.Helper()
 	r := httptest.NewRequest(http.MethodPost, "http://"+httpapi.DefaultAddress+path, bytes.NewReader(body))
 	r.RemoteAddr = "127.0.0.1:12345"
 	r.Header.Set("Content-Type", "application/json")
@@ -102,12 +107,48 @@ func newArtifactGrantFixture(t *testing.T) *artifactGrantFixture {
 func installArtifactReadGrantFixture(t *testing.T, db *sql.DB) {
 	t.Helper()
 	// Private fixture only. Do not assign a public schema_migrations version.
+	installArtifactReadGrantDDL(t, db, artifactReadGrantDDL(t))
+}
+
+func artifactReadGrantDDL(t *testing.T) string {
+	t.Helper()
 	ddl, err := os.ReadFile("../../internal/store/delivery_artifact_read_grant.sql")
 	artifactCmdMust(t, err)
+	return string(ddl)
+}
+
+func installArtifactReadGrantDDL(t *testing.T, db *sql.DB, ddl string) {
+	t.Helper()
 	tx, err := db.BeginTx(t.Context(), nil)
 	artifactCmdMust(t, err)
 	defer tx.Rollback()
-	_, err = tx.ExecContext(t.Context(), string(ddl))
+	_, err = tx.ExecContext(t.Context(), ddl)
+	artifactCmdMust(t, err)
+	artifactCmdMust(t, tx.Commit())
+}
+
+func (f *artifactGrantFixture) reopen(t *testing.T) {
+	t.Helper()
+	artifactCmdMust(t, f.db.Close())
+	db, err := store.Open(filepath.Join(f.dir, "workspace.db"))
+	artifactCmdMust(t, err)
+	f.db, f.local = db, platform.NewLocalUser(db)
+}
+
+// Simulate already-lost evidence while leaving the full schema present for
+// the checks under test. Only the private fixture's listed guard is bypassed.
+func (f *artifactGrantFixture) loseEvidence(t *testing.T, guard, change string, args ...any) {
+	t.Helper()
+	tx, err := f.raw.BeginTx(t.Context(), nil)
+	artifactCmdMust(t, err)
+	defer tx.Rollback()
+	var ddl string
+	artifactCmdMust(t, tx.QueryRow(`SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?`, guard).Scan(&ddl))
+	_, err = tx.Exec("DROP TRIGGER " + guard)
+	artifactCmdMust(t, err)
+	_, err = tx.Exec(change, args...)
+	artifactCmdMust(t, err)
+	_, err = tx.Exec(ddl)
 	artifactCmdMust(t, err)
 	artifactCmdMust(t, tx.Commit())
 }
@@ -232,12 +273,241 @@ func TestLocalMessageArtifactReadGrant(t *testing.T) {
 	}
 }
 
+func TestLocalMessageArtifactReadGrantContent(t *testing.T) {
+	f := newArtifactGrantFixture(t)
+	installArtifactReadGrantFixture(t, f.raw)
+	member := f.member(t, f.group, "")
+	server, err := httpapi.NewServer(httpapi.DefaultAddress, httpapi.MessageRoutes(f.local)...)
+	artifactCmdMust(t, err)
+	path := "/api/v1/groups/" + f.group + "/messages"
+	template, err := json.Marshal(artifactGrantMessage(member, f.pin))
+	artifactCmdMust(t, err)
+	post := func(content string, want int) []byte {
+		t.Helper()
+		raw := bytes.Replace(template, []byte(`"`+artifactGrantBody+`"`), []byte(content), 1)
+		return artifactGrantSendRaw(t, server.Handler, path, raw, "scalar", "", want)
+	}
+	const invalidSurrogate = `" before \ud800 after "`
+	const invalidUTF8 = "\" before \xff after \""
+	for _, bad := range []string{invalidSurrogate, `"\udc00"`, `"\ud800\u0041"`, invalidUTF8} {
+		if body := post(bad, http.StatusBadRequest); !bytes.Contains(body, []byte(`"code":"invalid_json"`)) {
+			t.Fatalf("expected invalid JSON, got %s", body)
+		}
+	}
+	// The trusted Go entry point also rejects invalid bytes before reserving a key.
+	in := platform.MessageInput{Content: "invalid\xff", TopicID: artifactGrantTopic, RecipientIDs: []string{member}, ArtifactReadGrant: &f.pin}
+	if _, err := f.local.CreateMessage(t.Context(), f.group, in, "scalar"); !errors.Is(err, store.ErrInvalid) {
+		t.Fatalf("explicit grant accepted invalid in-process content: %v", err)
+	}
+	for _, table := range []string{"messages", "deliveries", "message_command_sources", "delivery_artifact_read_grants", "mutation_idempotency"} {
+		var n int
+		artifactCmdMust(t, f.raw.QueryRow("SELECT count(*) FROM "+table).Scan(&n))
+		if n != 0 {
+			t.Fatalf("invalid grant body left %d rows in %s", n, table)
+		}
+	}
+
+	// A scalar replacement character is not an invalid surrogate. A proper
+	// pair and a literal backslash-u also survive byte-for-byte, even above
+	// the unrelated member-tool frame limit.
+	pad := strings.Repeat("x", 64<<10)
+	want := ` before � after 😀 \ud800 ` + pad
+	first := post(`" before � after 😀 \\ud800 `+pad+`"`, http.StatusCreated)
+	var m domain.Message
+	artifactCmdMust(t, json.Unmarshal(first, &m))
+	if m.Content != want {
+		t.Fatal("valid explicit grant content was altered")
+	}
+	if retry := post(`" before \uFFFD after \ud83d\ude00 \\ud800 `+pad+`"`, http.StatusCreated); !bytes.Equal(retry, first) {
+		t.Fatal("equivalent scalar content did not replay the original command")
+	}
+	post(`" before \ud800 after 😀 \\ud800 `+pad+`"`, http.StatusBadRequest)
+
+	// Do not tighten the historical no-grant surrogate decoder; raw invalid
+	// UTF-8 was already invalid in that path, too.
+	plain := func(content string, want int) []byte {
+		return artifactGrantSendRaw(t, server.Handler, path, []byte(`{"content":`+content+`}`), "ordinary", "", want)
+	}
+	plain(invalidUTF8, http.StatusBadRequest)
+	ordinary := plain(invalidSurrogate, http.StatusCreated)
+	artifactCmdMust(t, json.Unmarshal(ordinary, &m))
+	if m.Content != " before � after " || !bytes.Equal(ordinary, plain(`" before � after "`, http.StatusCreated)) {
+		t.Fatal("ordinary message decoding or replay changed")
+	}
+}
+
+func TestDeliveryArtifactReadGrantSchema(t *testing.T) {
+	for _, fault := range []struct{ name, sql string }{
+		{"absent", ""},
+		{"stub table", `CREATE TABLE delivery_artifact_read_grants(delivery_id TEXT)`},
+		{"missing unique message key", ""},
+		{"missing grant table with remaining triggers", `DROP TABLE delivery_artifact_read_grants`},
+		{"missing grant insert guard", `DROP TRIGGER delivery_artifact_read_grants_insert`},
+		{"missing grant immutability guard", `DROP TRIGGER delivery_artifact_read_grants_update`},
+		{"missing delivery identity guard", `DROP TRIGGER delivery_artifact_read_grant_deliveries_identity`},
+		{"missing delivery insert guard", `DROP TRIGGER delivery_artifact_read_grant_deliveries_insert`},
+		{"missing message identity guard", `DROP TRIGGER messages_identity`},
+		{"missing command source guard", `DROP TRIGGER message_command_sources_update`},
+		{"missing version immutability guard", `DROP TRIGGER artifact_versions_no_update`},
+		{"missing delivery FK key", `DROP INDEX deliveries_turn_identity`},
+	} {
+		t.Run(fault.name, func(t *testing.T) {
+			f := newArtifactGrantFixture(t)
+			member := f.member(t, f.group, "")
+			plain := platform.MessageInput{Content: "explicit_artifact_read_grant/v1", TopicID: artifactGrantTopic, RecipientIDs: []string{member}}
+			old, err := f.local.CreateMessage(t.Context(), f.group, plain, "ordinary")
+			artifactCmdMust(t, err)
+			want := store.ErrArtifactReadGrantIncomplete
+			switch fault.name {
+			case "absent":
+				want = store.ErrArtifactReadGrantUnavailable
+			case "stub table":
+				_, err = f.raw.Exec(fault.sql)
+				artifactCmdMust(t, err)
+			case "missing unique message key":
+				ddl := strings.Replace(artifactReadGrantDDL(t), "message_id TEXT NOT NULL UNIQUE", "message_id TEXT NOT NULL", 1)
+				installArtifactReadGrantDDL(t, f.raw, ddl)
+			default:
+				installArtifactReadGrantFixture(t, f.raw)
+				_, err = f.raw.Exec(fault.sql)
+				artifactCmdMust(t, err)
+			}
+			approved := plain
+			approved.ArtifactReadGrant = &f.pin
+			if got, err := f.local.CreateMessage(t.Context(), f.group, approved, "exact"); !errors.Is(err, want) || got.ID != "" {
+				t.Fatalf("grant send on %s: %+v, %v (want %v)", fault.name, got, err, want)
+			}
+			pin, err := f.db.QueuedDeliveryArtifactReadGrant(t.Context(), f.group, old.Deliveries[0], old.TopicID)
+			if fault.name == "absent" {
+				want = nil // The mode string was only ordinary content, not evidence.
+			}
+			if !errors.Is(err, want) || pin != (domain.ArtifactVersionRef{}) {
+				t.Fatalf("queued lookup on %s: %+v, %v (want %v)", fault.name, pin, err, want)
+			}
+			for _, table := range []string{"messages", "deliveries", "message_command_sources", "mutation_idempotency"} {
+				var n int
+				artifactCmdMust(t, f.raw.QueryRow("SELECT count(*) FROM "+table).Scan(&n))
+				if n != 1 {
+					t.Fatalf("denied grant changed %s: rows=%d", table, n)
+				}
+			}
+		})
+	}
+}
+
+func TestDeliveryArtifactReadGrantEvidenceAfterReopen(t *testing.T) {
+	for _, mode := range []string{"complete", "missing row", "changed pin", "missing fragment"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newArtifactGrantFixture(t)
+			installArtifactReadGrantFixture(t, f.raw)
+			member := f.member(t, f.group, "")
+			ctx := t.Context()
+			in := platform.MessageInput{Content: artifactGrantBody, TopicID: artifactGrantTopic, RecipientIDs: []string{member}, ArtifactReadGrant: &f.pin}
+			message, err := f.local.CreateMessage(ctx, f.group, in, "exact")
+			artifactCmdMust(t, err)
+			d := message.Deliveries[0]
+			switch mode {
+			case "missing row":
+				f.loseEvidence(t, "delivery_artifact_read_grants_delete", "DELETE FROM delivery_artifact_read_grants WHERE delivery_id=?", d.ID)
+			case "changed pin":
+				f.loseEvidence(t, "delivery_artifact_read_grants_update", "UPDATE delivery_artifact_read_grants SET version_id=? WHERE delivery_id=?", f.head.VersionID, d.ID)
+			case "missing fragment":
+				// Use the immutable provenance of even a keyless send to detect
+				// known grant evidence after every grant object disappears.
+				message, err = f.local.CreateMessage(ctx, f.group, in, "")
+				artifactCmdMust(t, err)
+				d = message.Deliveries[0]
+				_, err = f.raw.Exec(`DROP TRIGGER delivery_artifact_read_grant_deliveries_insert;
+				 DROP TRIGGER delivery_artifact_read_grant_deliveries_identity;
+				 DROP TRIGGER delivery_artifact_read_grant_deliveries_delete;
+				 DROP TABLE delivery_artifact_read_grants;`)
+				artifactCmdMust(t, err)
+			}
+			f.reopen(t)
+			pin, prepErr := f.db.QueuedDeliveryArtifactReadGrant(ctx, f.group, d, message.TopicID)
+			replay, err := f.local.CreateMessage(ctx, f.group, in, "exact")
+			if mode == "complete" {
+				if err != nil || replay.ID != message.ID || prepErr != nil || pin != f.pin {
+					t.Fatalf("complete grant changed across reopen: replay=%v preparation=%v, pin=%+v", err, prepErr, pin)
+				}
+				return
+			}
+			if !errors.Is(err, store.ErrArtifactReadGrantIncomplete) || replay.ID != "" {
+				t.Fatalf("replayed without the same durable grant: %+v, %v", replay, err)
+			}
+			want := store.ErrArtifactReadGrantIncomplete
+			if mode == "changed pin" {
+				want = store.ErrMemberToolDenied
+			}
+			if !errors.Is(prepErr, want) {
+				t.Fatalf("invalid evidence treated as absent: %v, want %v", prepErr, want)
+			}
+			if pin != (domain.ArtifactVersionRef{}) {
+				t.Fatalf("incomplete approval produced pin %+v", pin)
+			}
+		})
+	}
+}
+
+func TestDeliveryArtifactReadGrantIdentity(t *testing.T) {
+	f := newArtifactGrantFixture(t)
+	installArtifactReadGrantFixture(t, f.raw)
+	member, peer := f.member(t, f.group, ""), f.member(t, f.group, "")
+	ctx := t.Context()
+	in := platform.MessageInput{Content: artifactGrantBody, TopicID: artifactGrantTopic, RecipientIDs: []string{member}, ArtifactReadGrant: &f.pin}
+	approved, err := f.local.CreateMessage(ctx, f.group, in, "exact")
+	artifactCmdMust(t, err)
+	d := approved.Deliveries[0]
+	other, err := f.local.CreateMessage(ctx, f.group, platform.MessageInput{Content: "other", TopicID: artifactGrantTopic, RecipientIDs: []string{peer}}, "")
+	artifactCmdMust(t, err)
+	neighbor := other.Deliveries[0]
+	for _, attack := range []struct {
+		query string
+		args  []any
+	}{
+		{`UPDATE deliveries SET message_id=? WHERE id=?`, []any{other.ID, d.ID}},
+		{`UPDATE deliveries SET conversation_id=?,recipient_id=? WHERE id=?`, []any{neighbor.ConversationID, peer, d.ID}},
+		{`UPDATE deliveries SET message_id=? WHERE id=?`, []any{approved.ID, neighbor.ID}},
+		{`INSERT INTO deliveries(id,message_id,conversation_id,recipient_id,group_id,topic_id,created_at)
+		 SELECT 'second',?,conversation_id,recipient_id,group_id,topic_id,created_at FROM deliveries WHERE id=?`, []any{approved.ID, neighbor.ID}},
+		{`INSERT OR REPLACE INTO deliveries(id,message_id,conversation_id,recipient_id,group_id,topic_id,created_at)
+		 SELECT id,?,conversation_id,recipient_id,group_id,topic_id,created_at FROM deliveries WHERE id=?`, []any{other.ID, d.ID}},
+		{`UPDATE OR REPLACE deliveries SET rowid=(SELECT rowid FROM deliveries WHERE id=?) WHERE id=?`, []any{d.ID, neighbor.ID}},
+	} {
+		if _, err := f.raw.Exec(attack.query, attack.args...); err == nil || !strings.Contains(err.Error(), "成果读取许可") {
+			t.Fatalf("grant delivery guard did not reject %s: %v", attack.query, err)
+		}
+	}
+	turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group, DeliveryID: d.ID, ResourceKeys: []string{"grant-fixture"}, MaxActive: 1})
+	artifactCmdMust(t, err)
+	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	artifactCmdMust(t, f.db.RecordTurnEvent(ctx, claim, provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: "fixture"}))
+	replay, err := f.local.CreateMessage(ctx, f.group, in, "exact")
+	artifactCmdMust(t, err)
+	if replay.ID != approved.ID || len(replay.Deliveries) != 1 || replay.Deliveries[0].ID != d.ID ||
+		replay.Deliveries[0].State != domain.DeliveryStateAccepted || replay.Deliveries[0].TurnID != turn.ID {
+		t.Fatalf("identity guard or replay interfered with accepted state: %+v", replay)
+	}
+	var n int
+	artifactCmdMust(t, f.raw.QueryRow(`SELECT count(*) FROM resource_claims WHERE turn_id=? AND resource_key='grant-fixture'`, turn.ID).Scan(&n))
+	if n != 1 {
+		t.Fatal("claim did not retain the usual delivery resource")
+	}
+	settled, err := f.db.ApplyTurnReceipt(ctx, claim, provider.ExecutionReceipt{Outcome: provider.OutcomeSucceeded, Terminal: provider.OutcomeSucceeded,
+		Started: true, Accepted: true, OutputComplete: true, DirectChildReaped: true, NativeSessionID: "fixture"})
+	artifactCmdMust(t, err)
+	artifactCmdMust(t, f.raw.QueryRow(`SELECT count(*) FROM resource_claims WHERE turn_id=?`, turn.ID).Scan(&n))
+	if n != 0 || settled.State != domain.TurnStateSucceeded {
+		t.Fatalf("settlement did not release the usual delivery resource: %s, claims=%d", settled.State, n)
+	}
+}
+
 // The production runner and Go Pi adapter are used with a fake CLI and an
 // in-memory HTTP handler. No listener, scheduler, Pi or provider is started.
 func TestStartupArtifactReadGrant(t *testing.T) {
 	f := newArtifactGrantFixture(t)
 	installed := false
-	for _, mode := range []string{"v30 lookup only", "installed pin", "another delivery", "legacy with pin", "chat intake pin", "stale claim backlink"} {
+	for _, mode := range []string{"v30 lookup only", "installed pin", "another delivery", "legacy with pin", "chat intake pin", "wrong provenance before prepare", "stale claim backlink"} {
 		t.Run(mode, func(t *testing.T) {
 			if !installed && mode != "v30 lookup only" {
 				installArtifactReadGrantFixture(t, f.raw)
@@ -295,6 +565,16 @@ while [ -f "$root/hold" ]`), 1)
 			d := message.Deliveries[0]
 			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 			defer cancel()
+			if mode == "wrong provenance before prepare" {
+				f.loseEvidence(t, "message_command_sources_update", `UPDATE message_command_sources SET kind='local_user_policy' WHERE message_id=?`, message.ID)
+				if _, err := f.db.QueuedDeliveryArtifactReadGrant(ctx, f.group, d, message.TopicID); !errors.Is(err, store.ErrArtifactReadGrantIncomplete) {
+					t.Fatalf("missing local-user proof: %v", err)
+				}
+				if _, err := preparer.Prepare(ctx, store.PendingDelivery{GroupID: f.group, Delivery: d}); err == nil {
+					t.Fatal("preparation silently downgraded an approved delivery with missing local-user proof")
+				}
+				return
+			}
 			prepared, err := preparer.Prepare(ctx, store.PendingDelivery{GroupID: f.group, Delivery: d})
 			artifactCmdMust(t, err)
 			turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group, DeliveryID: d.ID, ResourceKeys: prepared.ResourceKeys, MaxActive: 1})
@@ -377,6 +657,18 @@ while [ -f "$root/hold" ]`), 1)
 				}
 				tool(provider.ReadArtifactTool, f.head, 403)
 				tool(provider.ReadArtifactTool, f.foreign, 403)
+				if mode == "installed pin" {
+					// The live bearer and Turn claim alone cannot authorize bytes
+					// after the delivery backlink or persisted approval is lost.
+					_, err := f.raw.Exec("UPDATE deliveries SET turn_id='wrong' WHERE id=?", d.ID)
+					artifactCmdMust(t, err)
+					tool(provider.ReadArtifactTool, f.pin, 403)
+					_, err = f.raw.Exec("UPDATE deliveries SET turn_id=? WHERE id=?", claim.TurnID, d.ID)
+					artifactCmdMust(t, err)
+					tool(provider.ReadArtifactTool, f.pin, 200)
+					f.loseEvidence(t, "delivery_artifact_read_grants_delete", "DELETE FROM delivery_artifact_read_grants WHERE delivery_id=?", d.ID)
+					tool(provider.ReadArtifactTool, f.pin, 403)
+				}
 			} else {
 				tool(provider.ReadArtifactTool, f.pin, 403)
 			}

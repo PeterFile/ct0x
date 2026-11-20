@@ -169,8 +169,11 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 		candidate = &captured
 	}
 	if experience.enabled {
-		if experience.deliveryID != "" && s.db.ValidateClaimedDeliveryArtifactReadGrant(ctx, scope, experience.deliveryID, experience.pin) != nil {
-			return "", store.ErrMemberToolDenied
+		if experience.deliveryID != "" {
+			if s.db.ValidateClaimedDeliveryArtifactReadGrant(ctx, scope, experience.deliveryID, experience.pin) != nil {
+				return "", store.ErrMemberToolDenied
+			}
+			grants.Artifacts.deliveryID = experience.deliveryID // Frozen on the cloned grant only.
 		}
 		if err := ctx.Err(); err != nil {
 			return "", err

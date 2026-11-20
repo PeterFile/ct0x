@@ -23,6 +23,6 @@
 {"content":"跟进那个导出 BUG","topic_id":"export-bug","recipient_ids":["member-id"],"artifact_read_grant":{"artifact_id":"artifact-id","version_id":"version-id"}}
 ```
 
-群组由 URL 确定，话题以实际消息为准，发送者由 LocalUser 绑定。许可与实际消息、投递和幂等回执在同一事务提交；同一幂等键更换或省略许可会冲突。准备时仅查看本次待认领的投递，签发前在当前 claim 下重验投递及确切版本。模型只在符合现有全新 Pi profile 且实际签发读取权时得到该工具。不附批准仍保持原来的检索权限；同话题的其他投递、成员消息、成果当前版本及调查授权都不能补上批准。
+群组由 URL 确定，话题以实际消息为准，发送者由 LocalUser 绑定。带许可的正文拒绝无效 UTF-8 及未配对的 Unicode 代理项；有效内容按原字节保留，无许可的解码不变。许可与实际消息、投递和幂等回执在同一事务提交；同一幂等键更换或省略许可会冲突，匹配的重放仍须验证原持久许可。准备时仅查看本次待认领的投递；签发前及实际读取时，在当前 claim 下重验投递及确切版本。已授权的投递不得改绑，也不能为同一消息追加接收者。模型只在符合现有全新 Pi profile 且实际签发读取权时得到该工具。不附批准仍保持原来的检索权限；同话题的其他投递、成员消息、成果当前版本及调查授权都不能补上批准。
 
-B 须将 `internal/store/delivery_artifact_read_grant.sql` 作为独立追加迁移登记。它依赖 v3 的消息/投递、v4 的 `deliveries_turn_identity`、v6 的 `artifact_versions`、v8 的不可变消息及 v17 的 `message_command_sources`；无需 D2 或 E3 表。未安装时，旧消息和经验检索保持原状，新的批准请求返回 `503 artifact_read_grant_unavailable`，不写任何消息或投递。测试仅在私有 SQLite 夹具安装该片段，不改公共登记。若另行登记项目经验，仍由 B 在 #218 的 `projectIdentitySchema` 之后登记 #214 的 `projectExperienceSchema`。
+B 须将 `internal/store/delivery_artifact_read_grant.sql` 作为独立追加迁移登记。它依赖 v3 的消息/投递、v4 的 `deliveries_turn_identity`、v6 的 `artifact_versions`、v8 的不可变消息及 v17 的 `message_command_sources`；无需 D2 或 E3 表。确实未安装时，旧消息和经验检索保持原状，新的批准请求返回 `503 artifact_read_grant_unavailable`，不写任何消息或投递。若安装不完整或已有批准却缺少持久证据，则拒绝使用，不降级为无批准消息。测试仅在私有 SQLite 夹具安装该片段，不改公共登记。若另行登记项目经验，仍由 B 在 #218 的 `projectIdentitySchema` 之后登记 #214 的 `projectExperienceSchema`。
