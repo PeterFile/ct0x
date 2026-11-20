@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"agentworkspace/internal/platform"
@@ -16,8 +17,8 @@ import (
 	"agentworkspace/internal/store"
 )
 
-func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
-	ctx := context.Background()
+func newBackgroundPreviewPassFixture(t *testing.T) (config, *store.Store, *platform.Preparer, []provider.Provider) {
+	t.Helper()
 	f, dir := newExecutionFixture(t, "1.4.0"), t.TempDir()
 	if err := os.Chmod(dir, 0700); err != nil {
 		t.Fatal(err)
@@ -25,12 +26,10 @@ func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
 	dbPath, approvalPath := filepath.Join(dir, "workspace.db"), filepath.Join(dir, "a1.json")
 	installBackgroundPreviewFixture(t, dbPath)
 	db := openBackgroundPreviewTestDB(t, dbPath)
-	defer db.Close()
-	if err := db.EnableGroupBackgroundDispatch(ctx); err != nil {
+	t.Cleanup(func() { db.Close() })
+	if err := db.EnableGroupBackgroundDispatch(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	grant := backgroundPreviewFixtureApproval(t, f.path)
-	writeBackgroundPreviewFixtureApproval(t, approvalPath, grant)
 	providers := provider.Discover(provider.Search{Explicit: []provider.Location{{Name: provider.Pi, Path: f.path}}})
 	providers[0].Version = "1.4.0"
 	p, err := platform.NewPreparer(db, platform.PrepareOptions{Providers: providers, PrivateWorkspaceRoot: dir})
@@ -38,6 +37,14 @@ func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := config{enableExecution: true, piPath: f.path, groupBackgroundDispatchPreview: approvalPath}
+	return c, db, p, providers
+}
+
+func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
+	ctx := context.Background()
+	c, db, p, providers := newBackgroundPreviewPassFixture(t)
+	piPath, approvalPath := c.piPath, c.groupBackgroundDispatchPreview
+	writeBackgroundPreviewFixtureApproval(t, approvalPath, backgroundPreviewFixtureApproval(t, piPath))
 	var output bytes.Buffer
 	var previousCalls int
 	pass, err := c.withBackgroundDispatchPass(db, p, providers, func(runCtx context.Context) {
@@ -60,8 +67,8 @@ func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
 	}
 	writeReady := func(t *testing.T) map[string]any {
 		t.Helper()
-		current := backgroundPreviewFixtureApproval(t, f.path)
-		current["qualification"] = backgroundPreviewQualification(current, f.path, time.Now())
+		current := backgroundPreviewFixtureApproval(t, piPath)
+		current["qualification"] = backgroundPreviewQualification(current, piPath, time.Now())
 		writeBackgroundPreviewFixtureApproval(t, approvalPath, current)
 		return current
 	}
@@ -93,7 +100,7 @@ func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
 		{"future evidence", func(_, q map[string]any) { q["observed_at"] = time.Now().Add(time.Minute) }, false},
 		{"different model", func(_, q map[string]any) { q["model"] = "fixture-provider/other-model" }, false},
 		{"different provider", func(_, q map[string]any) { q["provider_id"] = "other-installation" }, false},
-		{"different path", func(_, q map[string]any) { q["path"] = f.path + ".other" }, false},
+		{"different path", func(_, q map[string]any) { q["path"] = piPath + ".other" }, false},
 		{"different version", func(_, q map[string]any) { q["version"] = "1.4.1" }, false},
 		{"different transport", func(_, q map[string]any) { q["transport"] = provider.CodexOneShotAdapterID }, false},
 		{"withdrawn approval file", nil, false},
@@ -116,10 +123,10 @@ func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
 					t.Fatal(err)
 				}
 			case tc.name == "replaced Pi":
-				if err := os.Rename(f.path, f.path+".old"); err != nil {
+				if err := os.Rename(piPath, piPath+".old"); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(f.path, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+				if err := os.WriteFile(piPath, []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -141,6 +148,100 @@ func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
 			if _, err := db.ClaimTurn(ctx, claim); !errors.Is(err, store.ErrTurnBusy) {
 				t.Fatalf("stale prepared profile could still claim: %v", err)
 			}
+		})
+	}
+}
+
+func TestBackgroundDispatchPreviewClockRollback(t *testing.T) {
+	for _, atExpiry := range []string{"unchanged", "withdrawn", "replaced", "paused"} {
+		t.Run(atExpiry, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx := t.Context()
+				c, db, p, providers := newBackgroundPreviewPassFixture(t)
+				path := c.groupBackgroundDispatchPreview
+				grant := backgroundPreviewFixtureApproval(t, c.piPath)
+				writeBackgroundPreviewFixtureApproval(t, path, grant)
+				start := time.Now()
+				var wallOffset time.Duration
+				sample := func() (time.Time, time.Duration) {
+					now := time.Now()
+					return now.UTC().Add(wallOffset), now.Sub(start)
+				}
+				var output bytes.Buffer
+				pass, err := c.withBackgroundDispatchPassClock(db, p, providers, nil, &output, sample)
+				if err != nil {
+					t.Fatal(err)
+				}
+				profile := store.BackgroundDispatchProfile{ProviderID: providers[0].ID, Model: backgroundFixtureModel}
+				check := func(stage string, want bool) {
+					t.Helper()
+					if got := db.BackgroundDispatchProfileReady(profile); got != want {
+						t.Errorf("%s: profile ready = %t, want %t", stage, got, want)
+					}
+				}
+				run := func(stage string, want bool) {
+					t.Helper()
+					pass(ctx)
+					if output.Len() != 0 {
+						t.Fatalf("%s: unexpected pass error: %s", stage, &output)
+					}
+					check(stage, want)
+				}
+				attest := func(at time.Time) {
+					grant["qualification"] = backgroundPreviewQualification(grant, c.piPath, at)
+					writeBackgroundPreviewFixtureApproval(t, path, grant)
+				}
+
+				const step = 10 * time.Second
+				wallOffset = step // Calibrate again when the wall jumps forward from startup.
+				attest(time.Now().Add(wallOffset))
+				original, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				run("initial qualification", true)
+				time.Sleep(2 * step)
+				run("before wall rollback", true)
+				wallOffset = 0 // Align the rolled-back sample with the Store's virtual wall.
+				run("qualified with less time remaining than raw wall suggests", true)
+				time.Sleep(step - time.Nanosecond)
+				check("one nanosecond before the effective expiry", true)
+				time.Sleep(time.Nanosecond)
+				check("at the exclusive effective expiry", false)
+				time.Sleep(time.Nanosecond)
+
+				// A full qualification lifetime has elapsed, even when no pass
+				// sees the original grant expire against the raw wall.
+				switch atExpiry {
+				case "unchanged":
+					wallOffset = step // Both wall and elapsed clocks have passed expiry.
+				case "withdrawn":
+					if err := os.Remove(path); err != nil {
+						t.Fatal(err)
+					}
+				case "replaced":
+					attest(time.Now()) // A different valid observation, not the old one.
+				case "paused":
+					grant["paused"] = true
+					writeBackgroundPreviewFixtureApproval(t, path, grant)
+					delete(grant, "paused")
+				}
+				run("pass after a full qualification lifetime elapsed", atExpiry == "replaced")
+				wallOffset = 0
+				if err := os.WriteFile(path+".replay", original, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(path+".replay", path); err != nil {
+					t.Fatal(err)
+				}
+				run("expired bytes restored under rolled-back wall", false)
+
+				attest(time.Now().Add(step / 2))
+				run("observation in the raw wall's future but not the effective clock's", false)
+				wallOffset = step
+				attest(time.Now().Add(wallOffset))
+				run("fresh observation after wall recovery", true)
+			})
 		})
 	}
 }

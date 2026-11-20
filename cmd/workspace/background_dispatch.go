@@ -53,11 +53,26 @@ func (a backgroundDispatchApproval) profile() store.BackgroundDispatchProfile {
 	return store.BackgroundDispatchProfile{ProviderID: a.ProviderID, Model: a.Model}
 }
 
-func (a backgroundDispatchApproval) qualified(selected provider.Provider, now time.Time) bool {
+func (a backgroundDispatchApproval) readyUntil(selected provider.Provider, wall, effective time.Time) time.Time {
 	q := a.Qualification
-	return !a.Paused && now.Before(a.ApprovalExpires) && q != nil && q.ProviderID == a.ProviderID && q.Model == a.Model &&
-		q.Path == selected.Path && q.Version == selected.Version && q.Transport == provider.PiOneShotAdapterID &&
-		!q.ObservedAt.IsZero() && !now.Before(q.ObservedAt) && now.Before(q.ObservedAt.Add(backgroundQualificationLifetime))
+	if a.Paused || q == nil || q.ProviderID != a.ProviderID || q.Model != a.Model ||
+		q.Path != selected.Path || q.Version != selected.Version || q.Transport != provider.PiOneShotAdapterID ||
+		q.ObservedAt.IsZero() || wall.Before(q.ObservedAt) {
+		return time.Time{}
+	}
+	deadline := a.ApprovalExpires
+	if observedUntil := q.ObservedAt.Add(backgroundQualificationLifetime); observedUntil.Before(deadline) {
+		deadline = observedUntil
+	}
+	if !effective.Before(deadline) {
+		return time.Time{}
+	}
+	// Translate the effective remaining time back to a Store wall ceiling,
+	// never later than the original absolute expiry.
+	if until := wall.Add(deadline.Sub(effective)); until.Before(deadline) {
+		deadline = until
+	}
+	return deadline.UTC()
 }
 
 func readBackgroundDispatchApproval(path, providerID string) (a backgroundDispatchApproval, err error) {
@@ -99,9 +114,21 @@ func sameBackgroundFile(initial, live os.FileInfo) bool {
 // Compose one synchronous callback; sample A1 last, immediately before the
 // scheduler scans for claims. Disabled startup never reads an approval file.
 func (c config) withBackgroundDispatchPass(db *store.Store, preparer *platform.Preparer, providers []provider.Provider, intentPass func(context.Context), output io.Writer) (func(context.Context), error) {
+	return c.withBackgroundDispatchPassClock(db, preparer, providers, intentPass, output, nil)
+}
+
+// sample returns a wall-only reading and elapsed time from a monotonic origin.
+func (c config) withBackgroundDispatchPassClock(db *store.Store, preparer *platform.Preparer, providers []provider.Provider, intentPass func(context.Context), output io.Writer, sample func() (wall time.Time, elapsed time.Duration)) (func(context.Context), error) {
 	if c.groupBackgroundDispatchPreview == "" {
 		return intentPass, nil
 	}
+	if sample == nil {
+		start := time.Now()
+		sample = func() (time.Time, time.Duration) {
+			return time.Now().UTC(), time.Since(start)
+		}
+	}
+	effective, lastElapsed := sample()
 	i := slices.IndexFunc(providers, func(p provider.Provider) bool {
 		return p.Name == provider.Pi && p.Path == filepath.Clean(c.piPath)
 	})
@@ -129,21 +156,29 @@ func (c config) withBackgroundDispatchPass(db *store.Store, preparer *platform.P
 		// Never retain the initial approval, preset or evidence as fallback.
 		options := store.BackgroundDispatchOptions{MaxActiveMembers: initial.MaxActiveMembers}
 		approval, readErr := read()
+		profile := approval.profile()
+		adapterOK := false
 		if readErr == nil {
 			options.MaxActiveMembers = approval.MaxActiveMembers
-			profile := approval.profile()
 			live, statErr := os.Stat(selected.Path)
-			if statErr == nil && sameBackgroundFile(pinned, live) && preparer.SupportsBackgroundDiscussionAdapter(profile) && approval.qualified(selected, time.Now()) {
-				deadline := approval.ApprovalExpires
-				if observedUntil := approval.Qualification.ObservedAt.Add(backgroundQualificationLifetime); observedUntil.Before(deadline) {
-					deadline = observedUntil
-				}
-				options.ReadyUntil = deadline.UTC()
+			adapterOK = statErr == nil && sameBackgroundFile(pinned, live) && preparer.SupportsBackgroundDiscussionAdapter(profile)
+		} else if errors.Is(readErr, os.ErrNotExist) {
+			readErr = nil // Removing the file is an explicit withdrawal, not an error.
+		}
+		// Advance on every pass, independent of the file, and only recalibrate
+		// forward. A rollback cannot replenish an earlier sample's lifetime.
+		wall, elapsed := sample()
+		effective = effective.Add(elapsed - lastElapsed)
+		if wall.After(effective) {
+			effective = wall
+		}
+		lastElapsed = elapsed
+		if adapterOK {
+			if until := approval.readyUntil(selected, wall, effective); !until.IsZero() {
+				options.ReadyUntil = until
 				options.ReadyProfiles = []store.BackgroundDispatchProfile{profile}
 				options.Presets = []store.BackgroundDispatchTemplate{{ID: approval.Preset.ID, Name: approval.Preset.Name, Role: approval.Preset.Role, Profile: profile}}
 			}
-		} else if errors.Is(readErr, os.ErrNotExist) {
-			readErr = nil // Removing the file is an explicit withdrawal, not an error.
 		}
 		if err := errors.Join(readErr, db.RunGroupBackgroundDispatch(ctx, options)); err != nil {
 			fmt.Fprintf(output, "群组后台调度扫描失败：%v\n", err)
