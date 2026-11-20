@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"strings"
 	"sync"
@@ -56,6 +57,17 @@ func ThreadDecisionHTTPFixture(t *testing.T) (*Store, string, domain.DecisionReq
 	t.Helper()
 	f, q := threadDecisionFixture(t)
 	return f.s, f.path, q, f.otherID
+}
+
+// ThreadDecisionHTTPHoldWriter acquires the fixture's immediate writer lock
+// without changing any rows. The transport test releases it with Rollback.
+func ThreadDecisionHTTPHoldWriter(t *testing.T, s *Store) *sql.Tx {
+	t.Helper()
+	tx, err := s.db.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tx
 }
 
 func TestThreadDecisionAnswerReturnsOnlyToTheAsker(t *testing.T) {

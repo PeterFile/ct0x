@@ -61,8 +61,11 @@ func TestThreadDecisionAcknowledgementIsExplicitAndDurable(t *testing.T) {
 	denyThreadDecisionAck(t, requireThreadDecisionAcknowledger(t, cold), claim, a.ID, key, ErrMemberToolDenied)
 	messageSequencePreserved(t, s, before)
 
-	// Two connections race on the same accepted Turn, including a deferred
-	// transaction. Only one call key owns the acknowledgement.
+	// Give both connections time to finish their competing acknowledgements.
+	// Either the immediate BEGIN or the deferred write fence may have to wait.
+	for _, db := range []*Store{s, cold} {
+		coordinationDecideExec(t, db, "PRAGMA busy_timeout=60000")
+	}
 	cold.EnableThreadDecisionExecution()
 	var receipts [2]domain.DecisionAnswerView
 	var failures [2]error
@@ -86,7 +89,8 @@ func TestThreadDecisionAcknowledgementIsExplicitAndDurable(t *testing.T) {
 	if failures[winner] != nil || want.Receipt != a || want.Handling == nil || want.Handling.TurnID != claim.TurnID ||
 		want.Handling.AttemptID != "" || want.Handling.ConsumedAt.Before(*turn.AcceptedAt) ||
 		!errors.Is(failures[1-winner], ErrConflict) || receipts[1-winner] != (domain.DecisionAnswerView{}) {
-		t.Fatalf("expected one Turn-only handling receipt, got %+v; errors %v", receipts, failures)
+		t.Fatalf("expected one Turn-only handling receipt, got %+v; errors %v; causes %v / %v",
+			receipts, failures, errors.Unwrap(failures[0]), errors.Unwrap(failures[1]))
 	}
 	keyWon := keys[winner]
 	if replay, err := api.AcknowledgeThreadDecision(ctx, claim, a.ID, keyWon); err != nil || !reflect.DeepEqual(replay, want) {
