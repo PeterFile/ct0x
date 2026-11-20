@@ -101,6 +101,7 @@ func (e *memberToolRuntimeRun) nativeSessionBinding(ctx context.Context, request
 		profile.MaxGroupMembers = grants.MaxGroupMembers
 	}
 	profile.Tools = slices.Clone(grants.Operations)
+	profile.PiSendMessageQuote = profile.PiSendMessageQuote && slices.Contains(profile.Tools, "send_message")
 	binding := store.NativeRunBinding{Version: store.NativeRunBindingVersion, GroupID: claim.GroupID, TurnID: claim.TurnID,
 		MemberID: scope.MemberID, ConversationID: scope.ConversationID, TopicID: scope.TopicID, Profile: profile}
 	switch {
