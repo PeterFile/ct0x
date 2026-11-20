@@ -53,8 +53,6 @@ export type ChatAdmission = Readonly<{
   dispatch_request_id: string; notice_message_id: string; created_at: string;
   source_id?: string; source_kind?: MessageSourceKind; purpose?: string; authority_evidence_verified?: boolean;
   outcome?: "" | "admitted"; reason_code?: string; question?: string; workspace_scope?: TaskWorkspaceScope; repair_link?: ChatRepairLink;
-  // Admission evidence only, not a receipt for execution, completion, or acceptance.
-  automatic_text_routing_checked?: boolean;
 }>;
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === "string" && !/[\ud800-\udfff]/u.test(value);
@@ -196,8 +194,7 @@ function isRepairLink(value: unknown, admission: Record<string, unknown>): value
     : value.authorization === "original_agreement" && positive(admission.policy_revision) && value.authorization_policy_revision <= admission.policy_revision;
 }
 function isAdmission(value: unknown, groupId: string, taskId: string): value is ChatAdmission {
-  const metadata = ["source_id", "source_kind", "purpose", "authority_evidence_verified", "outcome", "reason_code", "question", "workspace_scope", "repair_link",
-    "automatic_text_routing_checked"];
+  const metadata = ["source_id", "source_kind", "purpose", "authority_evidence_verified", "outcome", "reason_code", "question", "workspace_scope", "repair_link"];
   if (!record(value) || Object.keys(value).some(field => !admissionFields.includes(field) && !metadata.includes(field))
     || !admissionFields.every(field => Object.hasOwn(value, field))
     || value.group_id !== groupId || value.task_id !== taskId || !text(value.topic_id)
@@ -213,14 +210,10 @@ function isAdmission(value: unknown, groupId: string, taskId: string): value is 
     || (value.purpose !== undefined && value.purpose !== "" && value.purpose !== "chat_intake/v1")
     || (value.authority_evidence_verified !== undefined && typeof value.authority_evidence_verified !== "boolean")
     || (value.outcome !== undefined && value.outcome !== "" && value.outcome !== "admitted")
-    || (value.reason_code !== undefined && value.reason_code !== "") || (value.question !== undefined && value.question !== "")
-    || (value.automatic_text_routing_checked !== undefined && typeof value.automatic_text_routing_checked !== "boolean")) return false;
+    || (value.reason_code !== undefined && value.reason_code !== "") || (value.question !== undefined && value.question !== "")) return false;
   const knownSource = value.source_kind !== undefined && value.source_kind !== "unknown";
   if (knownSource ? !identifier(value.source_id) : value.source_id !== undefined && value.source_id !== "") return false;
   if (!sourceMatchesSender(value.source_kind, value.source_sender_id)) return false;
-  if (value.automatic_text_routing_checked === true && (value.outcome !== "admitted" || value.source_kind !== "local_user_chat"
-    || value.disposition !== "request_work" || value.action !== "text_submission" || value.authority_evidence_verified !== true
-    || Object.hasOwn(value, "repair_link"))) return false;
   if (Object.hasOwn(value, "repair_link")) return value.action !== "read_only_investigation" && isRepairLink(value.repair_link, value);
   if (!identifier(value.authorization_message_id)) return false;
   if (value.authority_evidence_verified === true && (value.purpose !== "chat_intake/v1"

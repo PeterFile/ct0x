@@ -192,31 +192,6 @@ it("rejects non-boolean automatic text inputs and legacy opt-ins before fetch", 
   expect(transport).not.toHaveBeenCalled();
 });
 
-const automaticTextAdmission = { ...chatAdmission, source_kind: "local_user_chat", source_id: "current-chat-command",
-  purpose: "chat_intake/v1", outcome: "admitted", authority_evidence_verified: true };
-it("reads automatic text routing on verified current text work and accepts explicit false on a legacy receipt", async () => {
-  const checked = { ...automaticTextAdmission, automatic_text_routing_checked: true };
-  const unchecked = { ...chatAdmission, automatic_text_routing_checked: false };
-  vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValueOnce(json(checked)).mockResolvedValueOnce(json(unchecked)));
-  await expect(getChatAdmission(group.id, task.id)).resolves.toEqual(checked);
-  await expect(getChatAdmission(group.id, task.id)).resolves.toEqual(unchecked);
-});
-it("rejects malformed or unbound automatic text routing evidence", async () => {
-  const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
-  for (const change of [
-    { automatic_text_routing_checked: "true" }, { automatic_text_routing_checked: null }, { automatic_text_routing_checked: 1 },
-    { outcome: undefined }, { outcome: "continued" }, { purpose: "" }, { authority_evidence_verified: false },
-    { source_kind: "local_user_policy" }, { source_id: "" }, { source_sender_id: "member-1" },
-    { authorization_message_id: "earlier-message" }, { authority: "written_preauthorization" },
-    { disposition: "prepare_work", authority: "written_preauthorization", authorization_message_id: "policy-rule" },
-    { task_id: "foreign-task" }, { group_id: "foreign-group" },
-    { action: "workspace_change", workspace_scope: workspaceScope }, investigationAdmission, chatRepair,
-  ]) {
-    transport.mockResolvedValueOnce(json({ ...automaticTextAdmission, automatic_text_routing_checked: true, ...change }));
-    await expect(getChatAdmission(group.id, task.id), JSON.stringify(change)).rejects.toMatchObject({ code: "invalid_response" });
-  }
-});
-
 it("reads optional investigation scope and capability observations separately without upgrading an old reply", async () => {
   const replies = [policy, { ...policy, investigation: null, investigation_supported: true, investigation_execution_enabled: false },
     { ...policy, enabled: false, investigation: topicInvestigation },
