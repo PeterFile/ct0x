@@ -201,7 +201,7 @@ jobs:
   gate:
     name: Full suite evidence
     needs: ["go-shards", "go-other", "go-vet", "go-benchmarks"]
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:

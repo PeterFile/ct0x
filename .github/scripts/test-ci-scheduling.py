@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Local scheduling, routing, batching and fail-closed gate regressions; no product tests."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
 import itertools
@@ -50,6 +50,21 @@ def expression(text, key):
     return " ".join(match.group(1)[3:-2].split())
 
 
+def step(text, name):
+    match = re.search(rf"^      - name: {re.escape(name)}\n(.*?)(?=^      - |\Z)", text, re.M | re.S)
+    if not match:
+        raise AssertionError("missing step: " + name)
+    return match.group(1)
+
+
+def scalar_expression(text, values):
+    # Evaluate only scalar routing/status clauses, not the full Actions language.
+    for key, value in sorted(values.items(), key=lambda item: len(item[0]), reverse=True):
+        text = text.replace(key, repr(value))
+    text = re.sub(r"!(?!=)", " not ", text.replace("&&", " and ").replace("||", " or "))
+    return eval(text, {"__builtins__": {}}, {})
+
+
 class RoutingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -91,7 +106,7 @@ class RoutingTests(unittest.TestCase):
         for paths in [["PRD.md"], ["docs/design.md", "README.md"], ["docs/picture.png"], []]:
             result = self.plan.classify(paths)
             self.assertTrue(result["docs"])
-            self.assertFalse(any(result[key] for key in ("go", "web", "bridge", "conservative")))
+            self.assertFalse(any(result[key] for key in ("go", "web", "bridge", "ci", "conservative")))
         for path, expected in [("web/src/App.tsx", "web"), ("extensions/pi-bridge/index.ts", "bridge"),
                                ("internal/store/task.go", "go"), ("cmd/workspace/main_test.go", "go")]:
             result = self.plan.classify([path])
@@ -101,9 +116,29 @@ class RoutingTests(unittest.TestCase):
         self.assertTrue(bridge["go"], "bridge changes also require Go wiring checks")
         both = self.plan.classify(["web/src/a.ts", "extensions/pi-bridge/config.ts", "internal/store/task.go"])
         self.assertTrue(all(both[key] for key in ("go", "web", "bridge")))
-        for path in ["go.mod", "go.sum", "Makefile", ".github/workflows/ci.yml", "extensions/unknown/tool.js", ".github/unknown.md", "notes.rst"]:
+        for path in ["go.mod", "go.sum", "Makefile", "extensions/unknown/tool.js", ".github/unknown.md", "notes.rst",
+                     ".github/workflows/other.yml", ".github/scripts/ci-new.py", ".github/scripts/ci-plan.py/extra"]:
             result = self.plan.classify([path])
-            self.assertTrue(all(result[key] for key in ("go", "web", "bridge", "conservative")))
+            self.assertTrue(all(result[key] for key in ("go", "web", "bridge", "ci", "conservative")))
+
+    def test_ci_policy_allowlist_is_exact_and_unions_with_product_paths(self):
+        policies = {
+            ".github/workflows/ci.yml", ".github/workflows/ci-full.yml",
+            ".github/scripts/ci-plan.py", ".github/scripts/ci-shards.py", ".github/scripts/ci-gate.py",
+            ".github/scripts/test-ci-scheduling.py", ".github/scripts/test-store-shard.py", ".github/scripts/verify-store-shard.py",
+        }
+        self.assertEqual(self.plan.CI_PATHS, policies)
+        for policy in policies:
+            with self.subTest(policy=policy):
+                selected = self.plan.classify(["docs/design.md", policy])
+                self.assertTrue(selected["ci"])
+                self.assertFalse(any(selected[key] for key in ("docs", "go", "web", "bridge", "conservative")))
+                for products in (["internal/scheduler/task.go"], ["internal/store/testdata/input.json"],
+                                 ["web/src/App.tsx"], ["extensions/pi-bridge/index.ts"],
+                                 ["internal/provider/provider.go", "web/src/App.tsx"], ["go.mod"]):
+                    expected = {**self.plan.classify(products), "ci": True}
+                    self.assertEqual(self.plan.classify([policy, *products]), expected)
+                    self.assertEqual(self.plan.classify([*products, policy]), expected)
 
     def test_heavy_packages_never_get_unbounded_feedback_tests(self):
         for paths in [["internal/store/a.go"], ["internal/platform/a.go", "internal/httpapi/b.go"],
@@ -124,6 +159,9 @@ class RoutingTests(unittest.TestCase):
     def test_feedback_runs_bounded_relevant_heavy_regressions_and_bridge_wiring(self):
         available = "\n".join("agentworkspace/internal/" + name for name in ("store", "platform", "httpapi", "scheduler", "provider"))
         for paths, heavy in [(["docs/architecture.md"], []), (["web/src/a.ts"], []),
+                             ([".github/workflows/ci.yml"], []),
+                             ([".github/scripts/ci-plan.py", "internal/scheduler/task.go"], []),
+                             ([".github/workflows/ci-full.yml", "internal/store/task.go"], ["store"]),
                              (["extensions/pi-bridge/index.ts"], ["platform"]),
                              (["internal/store/task.go"], ["store"]), (["internal/store/testdata/input.json"], ["store"]),
                              (["internal/platform/a.go", "internal/httpapi/b.go"], ["platform", "httpapi"]),
@@ -153,7 +191,10 @@ class RoutingTests(unittest.TestCase):
 
     def test_clients_run_before_full_and_selectively_on_drafts(self):
         for mode in ("full", "feedback"):
-            for paths in (["docs/a.md"], ["web/src/a.ts"], ["extensions/pi-bridge/index.ts"], ["Makefile"]):
+            for paths in (["docs/a.md"], ["web/src/a.ts"], ["extensions/pi-bridge/index.ts"], ["Makefile"],
+                          [".github/workflows/ci.yml"], [".github/scripts/ci-plan.py", "internal/scheduler/task.go"],
+                          [".github/scripts/ci-shards.py", "web/src/a.ts"],
+                          [".github/scripts/ci-gate.py", "extensions/pi-bridge/index.ts"]):
                 selected = {"mode": mode, **self.plan.classify(paths)}
                 for client, scripts in [("web", ["test", "typecheck", "build"]), ("bridge", ["test", "typecheck"])]:
                     with self.subTest(mode=mode, paths=paths, client=client), mock.patch.object(self.plan, "command") as command:
@@ -223,13 +264,24 @@ class GitDiffTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(json.loads(selected_file.read_text()), result)
         self.assertEqual(set(line.split("=", 1)[0] for line in output.read_text().splitlines()),
-                         {"mode", "bucket", "sha", "tree", "base", "head", "matrix", "run_id", "go", "web", "bridge", "conservative"})
+                         {"mode", "bucket", "sha", "tree", "base", "head", "matrix", "run_id", "go", "web", "bridge", "ci", "conservative"})
         for bad_sha in [head, "f" * 40, merge + "\nowned=true"]:
             with self.assertRaises(ValueError):
                 self.plan.plan("pull_request", event, bad_sha, self.root)
         event["pull_request"]["head"]["sha"] = "f" * 40
         with self.assertRaises(ValueError):
             self.plan.plan("pull_request", event, merge, self.root)
+
+    def test_stacked_ci_backport_and_go_diff_do_not_expand_product_selection(self):
+        _, _, merge, _, event = self.fixture({".github/workflows/ci.yml": "old"},
+                                             {".github/workflows/ci.yml": "new", "internal/scheduler/task.go": "new"})
+        for draft, expected_mode in ((True, "feedback"), (False, "full")):
+            event["pull_request"]["draft"] = draft
+            selected = self.plan.plan("pull_request", event, merge, self.root)
+            self.assertEqual(selected["mode"], expected_mode)
+            self.assertTrue(selected["ci"] and selected["go"])
+            self.assertFalse(selected["web"] or selected["bridge"] or selected["conservative"])
+            self.assertEqual(selected["directories"], ["internal/scheduler"])
 
     def test_nul_safe_rename_removal_and_over_300_files(self):
         strange = "web/src/$(touch SHOULD_NOT_EXIST)\nquoted'\t.ts"
@@ -303,20 +355,77 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(full.count("python3 .github/scripts/" + script + " -v"), 1)
         self.assertNotIn("unittest discover", feedback + full)
 
+    def test_ci_policy_feedback_runs_both_explicit_modules_and_fails_on_either(self):
+        feedback = job(self.workflow, "feedback")
+        block = step(feedback, "Test CI scheduling and shard gates")
+        condition = expression(block, "if")
+        self.assertEqual(condition, "steps.plan.outputs.mode == 'feedback' && steps.plan.outputs.ci == 'true'")
+        ordinary = expression(step(feedback, "Ordinary test cmd package"), "if")
+        plan = load("ci-plan")
+        for mode in ("feedback", "full"):
+            for paths, ci, go in [(["docs/a.md"], False, False), (["internal/scheduler/task.go"], False, True),
+                                  ([".github/workflows/ci.yml"], True, False),
+                                  ([".github/scripts/ci-shards.py", "internal/scheduler/task.go"], True, True),
+                                  ([".github/scripts/ci-plan.py", "web/src/a.ts"], True, False),
+                                  ([".github/scripts/ci-gate.py", "extensions/pi-bridge/index.ts"], True, True),
+                                  ([".github/scripts/unknown.py"], True, True)]:
+                selected = {"mode": mode, **plan.classify(paths)}
+                values = {"steps.plan.outputs." + key: json.dumps(value) if type(value) is bool else value
+                          for key, value in selected.items()}
+                with self.subTest(mode=mode, paths=paths):
+                    self.assertEqual(scalar_expression(condition, values), mode == "feedback" and ci)
+                    self.assertEqual(scalar_expression(ordinary, values), mode == "full" or go)
+        script = textwrap.dedent(re.search(r"        run: \|\n(.*)", block, re.S)[1])
+        commands = [".github/scripts/test-ci-scheduling.py -v", ".github/scripts/test-store-shard.py -v"]
+        stub = '''python3() {
+          printf '%s\\n' "$*"
+          [[ "$*" != "$CI_TEST_FAIL" ]]
+        }
+        readonly -f python3
+        '''
+        for failure in ("", *commands):
+            result = subprocess.run(["bash", "-c", stub + script],
+                                    env={**os.environ, "CI_TEST_FAIL": failure}, text=True, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode == 0, not failure, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), commands[:1] if failure == commands[0] else commands)
+        self.assertNotIn("unittest discover", block)
+
     def test_outer_gate_cannot_disappear_with_missing_preflight_outputs(self):
         gate = job(self.workflow, "merge-check")
         self.assertIn('needs: ["feedback", "full"]', gate)
         condition = expression(gate, "if")
-        self.assertTrue(condition.startswith("always() && ("))
+        self.assertTrue(condition.startswith("!cancelled() && ("))
         self.assertNotIn("needs.", condition, "candidate detection must survive preflight failure or skips")
-        candidate = condition[len("always() && ("):-1]
-        self.assertEqual(expression(gate, "name"), candidate + " && 'Full CI' || 'Feedback status'")
+        candidate = condition[len("!cancelled() && ("):-1]
+        self.assertTrue(expression(gate, "name").startswith(candidate + " && "))
         self.assertIn(expression(job(self.workflow, "feedback"), "if"), candidate)
         self.assertIn("github.event.pull_request.draft", candidate)
         self.assertIn("contains(github.event.pull_request.labels.*.name, 'ci:full')", candidate)
         self.assertIn("ci-gate.py outer", gate)
         self.assertNotIn("setup-go", gate)
         self.assertNotIn("setup-node", gate)
+
+    def test_cancelled_workflows_skip_gates_but_live_failures_keep_a_failing_required_check(self):
+        outer = job(self.workflow, "merge-check")
+        condition = expression(outer, "if")
+        name = expression(outer, "name")
+        candidate = condition[len("!cancelled() && ("):-1]
+        evidence = expression(job((WORKFLOWS / "ci-full.yml").read_text(), "gate"), "if")
+        self.assertEqual(evidence, "!cancelled()")
+        cases = [("success", "success", "Full CI"), ("failure", "skipped", "Full CI"),
+                 ("success", "failure", "Full CI"), ("skipped", "skipped", "Full CI"), ("", "", "Full CI"),
+                 ("cancelled", "skipped", "Feedback status"), ("cancelled", "success", "Feedback status"),
+                 ("success", "cancelled", "Feedback status"), ("failure", "cancelled", "Feedback status"),
+                 ("success", "skipped", "Feedback status")]
+        for feedback, full, expected_name in cases:
+            for cancelled, is_candidate in itertools.product((False, True), repeat=2):
+                values = {candidate: is_candidate, "cancelled()": cancelled,
+                          "needs.feedback.result": feedback, "needs.full.result": full}
+                with self.subTest(feedback=feedback, full=full, cancelled=cancelled, candidate=is_candidate):
+                    self.assertEqual(scalar_expression(condition, values), not cancelled and is_candidate)
+                    self.assertEqual(scalar_expression(evidence, values), not cancelled)
+                    self.assertEqual(scalar_expression(name, values), expected_name if is_candidate else "Feedback status")
+        self.assertNotIn("always()", outer)
 
     def test_trigger_and_security_contract(self):
         for action in ["opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft", "edited", "labeled"]:
@@ -374,13 +483,17 @@ class ShardBatchTests(unittest.TestCase):
                 rows.append({"Action": "output", "Package": package, "Output": "\n".join(names) + f"\nok  \t{package}\t0.001s\n"})
             else:
                 pattern = command[command.index("-run") + 1]
-                rows.extend({"Action": action, "Package": package, "Test": name}
-                            for name in names if re.fullmatch(pattern, name) for action in ("run", "pass"))
+                for name in names:
+                    if re.fullmatch(pattern, name):
+                        rows.extend([{"Action": "run", "Package": package, "Test": name},
+                                     {"Action": "pass", "Package": package, "Test": name,
+                                      "Elapsed": {"TestVector0": 303, "TestVector1": 122}.get(name, 0.001)}])
             rows.append({"Action": "pass", "Package": package})
             kwargs["stdout"].write("".join(json.dumps(row) + "\n" for row in rows).encode())
             return subprocess.CompletedProcess(command, 0)
 
-        with tempfile.TemporaryDirectory(prefix="ci-worker-") as directory, redirect_stdout(io.StringIO()), \
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory(prefix="ci-worker-") as directory, redirect_stdout(output), \
              mock.patch.object(self.shards, "check_identity"), mock.patch.object(self.shards, "command", side_effect=go):
             root = Path(directory)
             for profile, workers in self.shards.BATCHES.items():
@@ -400,6 +513,28 @@ class ShardBatchTests(unittest.TestCase):
             for profile, summary in result.items():
                 self.assertEqual(summary["runs"], {name: 1 for name in names})
                 self.assertEqual((summary["run_id"], summary["checkout_sha"], summary["checkout_tree"]), (RUN, SHA, TREE))
+        receipts = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith("{")]
+        passes = [row for row in receipts if row["Action"] == "pass" and row.get("Test")]
+        self.assertEqual(len(passes), 3 * len(names))
+        for name, elapsed in (("TestVector0", 303), ("TestVector1", 122)):
+            self.assertEqual([row["Elapsed"] for row in passes if row["Test"] == name], [elapsed] * 3)
+
+    def test_recorded_json_replay_uses_bounded_reads(self):
+        payload = (json.dumps({"Action": "pass", "Test": "TestSlow", "Elapsed": 303}) + "\n") * 4096
+        source, destination = io.StringIO(payload), io.StringIO()
+        read = source.read
+
+        def bounded_read(length=-1):
+            self.assertGreater(length, 0)
+            self.assertLessEqual(length, 64 * 1024)
+            return read(length)
+
+        path = mock.Mock()
+        path.open.return_value = source
+        with mock.patch.object(source, "read", side_effect=bounded_read) as reads:
+            self.shards.log_events(path, destination)
+        self.assertEqual(destination.getvalue(), payload)
+        self.assertGreater(reads.call_count, 2)
 
     def test_wrong_checkout_and_failed_execution_cannot_produce_evidence(self):
         for actual_sha, actual_tree in [("c" * 40, TREE), (SHA, "c" * 40)]:
@@ -407,13 +542,24 @@ class ShardBatchTests(unittest.TestCase):
                 command.side_effect = [subprocess.CompletedProcess([], 0, stdout=value + "\n") for value in (actual_sha, actual_tree)]
                 with self.assertRaises(ValueError):
                     self.shards.check_identity(SHA, TREE)
+        failure = json.dumps({"Action": "output", "Test": "TestVector6", "Output": "failure diagnostic\n"}) + "\n"
+
+        def failed_go(args, **kwargs):
+            if args[:2] == ["go", "list"]:
+                return subprocess.CompletedProcess(args, 0, stdout="agentworkspace/internal/store\n")
+            if "-list" in args:
+                return subprocess.CompletedProcess(args, 0)
+            kwargs["stdout"].write(failure.encode())
+            raise subprocess.CalledProcessError(1, args)
+
+        diagnostics = io.StringIO()
         with tempfile.TemporaryDirectory(prefix="ci-failed-worker-") as directory, mock.patch.object(self.shards, "check_identity"), \
-             mock.patch.object(self.shards, "command") as command, mock.patch.object(self.shards.verifier, "inventory", return_value={"TestVector6": 1}):
-            command.side_effect = [subprocess.CompletedProcess([], 0, stdout="agentworkspace/internal/store\n"),
-                                   subprocess.CompletedProcess([], 0), subprocess.CalledProcessError(1, ["go", "test"])]
-            with self.assertRaises(subprocess.CalledProcessError), redirect_stdout(io.StringIO()):
+             mock.patch.object(self.shards, "command", side_effect=failed_go), \
+             mock.patch.object(self.shards.verifier, "inventory", return_value={"TestVector6": 1}):
+            with self.assertRaises(subprocess.CalledProcessError), redirect_stdout(io.StringIO()), redirect_stderr(diagnostics):
                 self.shards.run_worker("store", 0, Path(directory), RUN, SHA, TREE)
             self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertEqual(diagnostics.getvalue(), failure)
 
     def evidence(self, root):
         compiled = {f"TestVector{index}": 1 for index in range(180)}
@@ -479,7 +625,7 @@ class GateTests(unittest.TestCase):
     def test_actual_gate_cli_rejects_every_missing_or_nonsuccess_result(self):
         full = (WORKFLOWS / "ci-full.yml").read_text()
         gate = job(full, "gate")
-        self.assertIn("if: ${{ always() }}", gate)
+        self.assertIn("if: ${{ !cancelled() }}", gate)
         needs = json.loads(re.search(r"^    needs: (\[[^\n]+\])$", gate, re.M)[1])
         self.assertEqual(set(needs), set(self.gate.REQUIRED))
         step = re.search(r"- name: Check required results\n(.*?)(?=\n      -)", gate, re.S)

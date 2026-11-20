@@ -64,9 +64,12 @@ jobs:
       - name: Ordinary test cmd package
         if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
         run: go test -count=1 ./cmd/workspace
-      - name: Test CI scheduling
-        if: ${{ steps.plan.outputs.mode == 'feedback' && steps.plan.outputs.conservative == 'true' }}
-        run: python3 .github/scripts/test-ci-scheduling.py -v
+      - name: Test CI scheduling and shard gates
+        if: ${{ steps.plan.outputs.mode == 'feedback' && steps.plan.outputs.ci == 'true' }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test-ci-scheduling.py -v
+          python3 .github/scripts/test-store-shard.py -v
       - name: Targeted Go feedback
         run: python3 .github/scripts/ci-plan.py feedback "$RUNNER_TEMP/ci-plan.json"
       - uses: actions/setup-node@v7
@@ -107,16 +110,19 @@ jobs:
 
   # Derive candidacy from the native event, not outputs that a failed preflight may never emit.
   # Feedback/ignored events must never publish even a skipped check under the required name.
+  # Cancelled dependencies and an unexpectedly skipped full also need a non-required name.
   merge-check:
     name: >-
       ${{ (github.event_name != 'pull_request' ||
            contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
            (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
            (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft)))) &&
-          (github.event_name != 'pull_request' || !github.event.pull_request.draft || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && 'Full CI' || 'Feedback status' }}
+          (github.event_name != 'pull_request' || !github.event.pull_request.draft || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full')) &&
+          needs.feedback.result != 'cancelled' && needs.full.result != 'cancelled' &&
+          (needs.feedback.result != 'success' || needs.full.result != 'skipped') && 'Full CI' || 'Feedback status' }}
     needs: ["feedback", "full"]
     if: >-
-      ${{ always() && ((github.event_name != 'pull_request' ||
+      ${{ !cancelled() && ((github.event_name != 'pull_request' ||
            contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
            (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
            (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft)))) &&

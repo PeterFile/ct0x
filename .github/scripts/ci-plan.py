@@ -18,6 +18,11 @@ FAST_TESTS = {
 }
 FAST_EXCLUDED = tuple("/internal/" + name for name in FAST_TESTS) + ("/cmd/workspace",)
 SHA_PATTERN = r"[0-9a-f]{40}"
+CI_PATHS = {
+    ".github/workflows/ci.yml", ".github/workflows/ci-full.yml",
+    ".github/scripts/ci-plan.py", ".github/scripts/ci-shards.py", ".github/scripts/ci-gate.py",
+    ".github/scripts/test-ci-scheduling.py", ".github/scripts/test-store-shard.py", ".github/scripts/verify-store-shard.py",
+}
 
 
 def check(condition, message):
@@ -66,13 +71,15 @@ def changed_paths(base, sha, root):
 
 
 def classify(paths):
-    result = {"docs": True, "web": False, "bridge": False, "go": False, "conservative": False, "directories": []}
+    result = {"docs": True, "web": False, "bridge": False, "go": False, "ci": False, "conservative": False, "directories": []}
     directories = set()
     for path in paths:
         if path.startswith("docs/") or "/" not in path and path.endswith(".md"):
             continue
         result["docs"] = False
-        if path.startswith("web/"):
+        if path in CI_PATHS:
+            result["ci"] = True
+        elif path.startswith("web/"):
             result["web"] = True
         elif path.startswith("extensions/pi-bridge/"):
             result["bridge"] = result["go"] = True
@@ -87,7 +94,7 @@ def classify(paths):
         else:
             result["conservative"] = True
     if result["conservative"]:
-        result.update(go=True, web=True, bridge=True)
+        result.update(go=True, web=True, bridge=True, ci=True)
     result["directories"] = sorted(directories)
     return result
 
@@ -125,7 +132,7 @@ def feedback_packages(selected, available):
     directories = {"agentworkspace/" + directory for directory in selected["directories"]}
     return sorted(package for package in available
                   if not package.endswith(FAST_EXCLUDED) and
-                  (selected["conservative"] or package in directories))
+                  (selected["conservative"] or any(directory == package or directory.startswith(package + "/") for directory in directories)))
 
 
 def command(args, cwd=None, capture=False):
@@ -147,7 +154,8 @@ def feedback(selected):
         if packages:
             command(["go", "test", "-count=1", *packages])
         for profile, names in FAST_TESTS.items():
-            if selected["conservative"] or "internal/" + profile in selected["directories"]:
+            target = "internal/" + profile
+            if selected["conservative"] or any(directory == target or directory.startswith(target + "/") for directory in selected["directories"]):
                 pattern = "^(" + "|".join(names) + ")$"
                 command(["go", "test", "-count=1", "-run", pattern, "./internal/" + profile])
 
@@ -184,7 +192,7 @@ def main():
         run_id = os.environ["GITHUB_RUN_ID"]
         check(re.fullmatch(r"[1-9][0-9]{0,63}", run_id), "run 身份非法")
         output.write(f"run_id={run_id}\n")
-        for key in ("mode", "bucket", "sha", "tree", "head", "base", "matrix", "go", "web", "bridge", "conservative"):
+        for key in ("mode", "bucket", "sha", "tree", "head", "base", "matrix", "go", "web", "bridge", "ci", "conservative"):
             value = selected[key]
             output.write(f"{key}={json.dumps(value) if isinstance(value, (bool, dict)) else value}\n")
 

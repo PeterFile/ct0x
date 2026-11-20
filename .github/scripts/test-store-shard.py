@@ -867,7 +867,7 @@ class WorkflowTests(unittest.TestCase):
         match = re.search(r"\n  gate:\n(.*)", self.workflow, re.S)
         self.assertIsNotNone(match)
         job = match[1]
-        for text in ["name: Full suite evidence\n", "if: ${{ always() }}", "toJSON(needs)", "ci-gate.py",
+        for text in ["name: Full suite evidence\n", "if: ${{ !cancelled() }}", "toJSON(needs)", "ci-gate.py",
                      "ci-shards.py aggregate", "merge-multiple: false",
                      '--run-id "$GITHUB_RUN_ID" --sha "$CHECKOUT_SHA" --tree "$CHECKOUT_TREE"']:
             self.assertIn(text, job)

@@ -27,6 +27,12 @@ def command(args, **kwargs):
     return subprocess.run(args, check=True, **kwargs)
 
 
+def log_events(path, stream):
+    with path.open(encoding="utf-8", errors="replace") as source:
+        shutil.copyfileobj(source, stream, length=64 * 1024)
+    stream.flush()
+
+
 def check_identity(sha, tree):
     actual = command(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     actual_tree = command(["git", "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
@@ -56,13 +62,14 @@ def run_worker(profile, worker, directory, run_id, sha, tree):
         for slot in BATCHES[profile][worker]:
             selected, pattern = verifier.selection(compiled, slot, profile)
             print(f"CI: {profile} 槽 {slot}/{total}，{len(selected)} 个顶层项", flush=True)
-            with events.open("wb") as output:
-                try:
+            try:
+                with events.open("wb") as output:
                     command(["go", "test", "-count=1", "-race", "-json", "-run", pattern, target], stdout=output)
-                except subprocess.CalledProcessError:
-                    # Keep failure diagnostics in the job log, never in evidence artifacts.
-                    print(events.read_text(encoding="utf-8", errors="replace"), file=sys.stderr)
-                    raise
+            except subprocess.CalledProcessError:
+                # Keep failure diagnostics in the job log, never in evidence artifacts.
+                log_events(events, sys.stderr)
+                raise
+            log_events(events, sys.stdout)
             runs, passes = verifier.verify(events, package, selected)
             summary = {"schema": verifier.SCHEMA, "slot": slot, "total": total, **expected,
                        "compiled": compiled, "selected": selected, "runs": runs, "passes": passes, "skips": {}}
