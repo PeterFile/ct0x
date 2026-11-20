@@ -6,9 +6,9 @@ import (
 	"errors"
 )
 
-// ErrTaskWorkMutationUnknown marks an unconfirmed outcome for work input
-// effects or task-work delegation, report, and handback. Check it before business
-// categories: the preserved cause may still match ErrConflict or ErrMemberToolDenied.
+// ErrTaskWorkMutationUnknown marks an unconfirmed outcome for work inputs,
+// decision answers, and task-work delegation, report, or handback. Check it
+// before business categories: the cause may still match ErrConflict or ErrMemberToolDenied.
 var ErrTaskWorkMutationUnknown = errors.New("任务工作事务结果未确认；请保留原幂等键和原请求内容用于对账")
 
 type taskWorkTransactionError struct {
@@ -29,7 +29,7 @@ func (e *taskWorkTransactionError) Is(target error) bool {
 	return target == ErrTaskWorkMutationUnknown && !e.rolledBack
 }
 
-func taskWorkMutationFailure(action, phase string, cause, rollback error) error {
+func taskWorkMutationFailure(action, phase string, cause, rollback error) *taskWorkTransactionError {
 	e := &taskWorkTransactionError{cause: cause, phase: phase, rolledBack: rollback == nil && phase != "commit"}
 	if !e.rolledBack {
 		e.message = ErrTaskWorkMutationUnknown.Error()

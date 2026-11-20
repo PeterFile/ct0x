@@ -1,6 +1,14 @@
 package domain
 
-import "time"
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"strconv"
+	"strings"
+	"time"
+	"unicode/utf8"
+)
 
 const (
 	ChatActionTextSubmission        = "text_submission"
@@ -27,10 +35,73 @@ type ChatPolicyRequest struct {
 
 // ChatInvestigationPolicy is a local-user allowlist, not a tool or delegation grant.
 type ChatInvestigationPolicy struct {
-	Objective          string               `json:"objective"`
-	AllowTopicMessages bool                 `json:"allow_topic_messages"`
-	ArtifactVersions   []ArtifactVersionRef `json:"artifact_versions"`
-	MaxDelegations     int                  `json:"max_delegations"`
+	Objective          string                     `json:"objective"`
+	AllowTopicMessages bool                       `json:"allow_topic_messages"`
+	ArtifactVersions   []ArtifactVersionRef       `json:"artifact_versions"`
+	MaxDelegations     int                        `json:"max_delegations"`
+	ClueTerms          ChatInvestigationClueTerms `json:"clue_terms,omitzero"`
+}
+
+// ChatInvestigationClueTerms is omitted for legacy rules; null must not
+// silently turn a configured boundary into the legacy investigation path.
+type ChatInvestigationClueTerms []string
+
+func (terms *ChatInvestigationClueTerms) UnmarshalJSON(data []byte) error {
+	var phrases []string
+	if err := json.Unmarshal(data, &phrases); err != nil {
+		return err
+	}
+	if phrases == nil {
+		return errors.New("只读调查线索词组必须为非空数组")
+	}
+	if !utf8.Valid(data) || !validClueTermEscapes(data) {
+		return errors.New("只读调查线索词组必须为有效的 Unicode 文本")
+	}
+	*terms = phrases
+	return nil
+}
+
+// In an already validated JSON string array, escapes can occur only inside
+// terms. Check them in the original bytes: decoded U+FFFD may be intentional.
+func validClueTermEscapes(data []byte) bool {
+	for {
+		i := bytes.IndexByte(data, '\\')
+		if i < 0 {
+			return true
+		}
+		escape := data[i+1]
+		data = data[i+2:]
+		if escape != 'u' {
+			continue
+		}
+		unit, _ := strconv.ParseUint(string(data[:4]), 16, 16) // JSON syntax guarantees four hex digits.
+		data = data[4:]
+		if unit < 0xd800 || unit > 0xdfff {
+			continue
+		}
+		if unit >= 0xdc00 || !bytes.HasPrefix(data, []byte(`\u`)) {
+			return false
+		}
+		low, _ := strconv.ParseUint(string(data[2:6]), 16, 16)
+		if low < 0xdc00 || low > 0xdfff {
+			return false
+		}
+		data = data[6:]
+	}
+}
+
+// MatchesClue checks literal containment only. A caller previewing a delivery
+// uses its persisted Message.Content; only Store can prove source and authority.
+func (p ChatInvestigationPolicy) MatchesClue(body string) bool {
+	if len(p.ClueTerms) == 0 {
+		return false
+	}
+	for _, term := range p.ClueTerms {
+		if term == "" || !strings.Contains(body, term) {
+			return false
+		}
+	}
+	return true
 }
 
 // TaskInvestigationScope is immutable admission evidence, not live permission.
@@ -79,6 +150,10 @@ type ChatCandidate struct {
 	SourceID               string            `json:"source_id"`
 	SourceKind             string            `json:"source_kind"`
 	RepairSource           *ChatRepairSource `json:"repair_source,omitempty"`
+
+	// Trusted issuance hint at capture time. A new assessment repeats all
+	// checks under its own claim fence; this flag is not a persisted receipt.
+	InvestigationClueMatched bool `json:"-"`
 
 	// Advisory live same-topic hints, not a selection or proof of authority.
 	// MessageID is the source to quote and the original reply destination.
