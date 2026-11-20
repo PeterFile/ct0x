@@ -8,7 +8,7 @@ import { ChatAdmissionDetails } from "./ChatAdmissionDetails";
 import { TaskDispatch } from "./TaskDispatch";
 import { TaskWorkDetails } from "./TaskWorkDetails";
 import { useActiveRefresh } from "./useActiveRefresh";
-import { createTask, getTask, getTaskAttempt, getTaskSubmission, listTasks, registerTaskAttempt, reviewTask, submitTask } from "./task-api";
+import { artifactContentPath, createTask, getTask, getTaskAttempt, getTaskSubmission, listTasks, registerTaskAttempt, reviewTask, submitTask } from "./task-api";
 import type { Task, TaskAttempt, TaskAttemptInput, TaskInput, TaskReview, TaskReviewInput, TaskSubmission, TaskSubmissionInput } from "./task-api";
 import "./tasks.css";
 
@@ -16,12 +16,6 @@ const statusText = { open: "待交付", submitted: "待验收", accepted: "已�
 const emptyDraft = { title: "", description: "", acceptance: "" };
 const errorText = (error: unknown) => error instanceof ApiError ? error.message : "请求未完成，请重试。";
 const mergeTasks = (items: Task[]) => [...new Map(items.map(task => [task.id, task])).values()];
-function artifactContentPath(groupId: string, ref: { artifact_id: string; version_id: string }): string | null {
-  const ids = [groupId, ref.artifact_id, ref.version_id];
-  if (ids.some(id => !id || id === "." || id === ".." || /[\ud800-\udfff]/u.test(id))) return null;
-  const [group, artifact, version] = ids.map(id => encodeURIComponent(id));
-  return `/api/v1/groups/${group}/artifacts/${artifact}/versions/${version}/content`;
-}
 
 export function Tasks({ group }: { group: Group | null }) {
   const groupId = group?.id;

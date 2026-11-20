@@ -22,7 +22,7 @@ type TaskWorkInput struct {
 	SourceSequence           int64                     `json:"source_sequence"`
 	CandidateID              string                    `json:"candidate_id"`
 	ReplyMessageID           string                    `json:"reply_message_id"`
-	Content                  string                    `json:"content"` // Original user text, not new authority.
+	Content                  string                    `json:"content"` // User text; decisions include the attributed question. Not new authority.
 	NoticeMessageID          string                    `json:"notice_message_id"`
 	BeforeConstraintRevision int64                     `json:"before_constraint_revision"`
 	BeforeConstraint         string                    `json:"before_constraint"`
