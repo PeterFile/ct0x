@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Local scheduling, routing, batching and fail-closed gate regressions; no product tests."""
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
 import importlib.util
 import io
@@ -12,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 from unittest import mock
 
@@ -446,18 +449,28 @@ class ShardBatchTests(unittest.TestCase):
         cls.shards = load("ci-shards")
         cls.verifier = load("verify-store-shard")
 
-    def test_exact_81_logical_slots_in_23_bounded_workers_and_generated_matrix(self):
+    def test_exact_81_logical_slots_in_24_bounded_workers_and_generated_matrix(self):
         batches = self.shards.BATCHES
-        self.assertEqual({name: len(workers) for name, workers in batches.items()}, {"store": 16, "platform": 5, "httpapi": 2})
+        self.assertEqual({name: len(workers) for name, workers in batches.items()}, {"store": 16, "platform": 6, "httpapi": 2})
+        self.assertEqual(batches["platform"], ((4,), (8, 0), (1,), (3, 5), (6, 7), (2,)))
+        self.assertEqual(batches["store"], tuple(tuple(range(start, start + 4)) for start in range(0, 64, 4)))
+        self.assertEqual(batches["httpapi"], ((0, 1, 2, 3), (4, 5, 6, 7)))
         for profile, workers in batches.items():
             flat = list(itertools.chain.from_iterable(workers))
             self.assertEqual(sorted(flat), list(range(self.verifier.PROFILES[profile][0])))
             self.assertTrue(all(0 < len(slots) <= (2 if profile == "platform" else 4) for slots in workers))
         self.assertEqual(sum(len(slots) for workers in batches.values() for slots in workers), 81)
         plan = load("ci-plan")
-        matrix = plan.shard_matrix()
+        with mock.patch.object(os, "sched_getaffinity", side_effect=AssertionError("matrix must not inspect host CPUs"), create=True):
+            matrix = plan.shard_matrix()
+        self.assertCountEqual(matrix["include"], [{"profile": profile, "worker": worker}
+                                                 for profile, workers in batches.items() for worker in range(len(workers))])
+        expected_order = {"platform": list(range(6)),
+                          "store": [1, 2, 9, 12, 14, 15, 0, 3, 4, 5, 6, 7, 8, 10, 11, 13],
+                          "httpapi": list(range(2))}
         self.assertEqual(matrix, {"include": [{"profile": profile, "worker": worker}
-                                              for profile, workers in batches.items() for worker in range(len(workers))]})
+                                              for profile, order in expected_order.items() for worker in order]})
+        self.assertEqual(len(matrix["include"]), 24)
         self.assertEqual(matrix["include"][:2], [{"profile": "platform", "worker": 0}, {"profile": "platform", "worker": 1}])
         self.assertIn(4, batches["platform"][0])
         self.assertIn(8, batches["platform"][1])
@@ -466,6 +479,317 @@ class ShardBatchTests(unittest.TestCase):
         for text in ["matrix: ${{ fromJSON(inputs.matrix) }}", "max-parallel: 7", "fail-fast: false", "timeout-minutes: 25"]:
             self.assertIn(text, shards)
         self.assertIn("merge-multiple: false", job(workflow, "gate"))
+
+    def slot_names(self, profile, slot, count):
+        names = []
+        for index in itertools.count():
+            name = f"TestVector{index}"
+            if self.verifier.selection({name: 1}, slot, profile)[0]:
+                names.append(name)
+                if len(names) == count:
+                    return list(reversed(names))
+
+    def worker_go(self, names, mutate=None):
+        def go(args, **kwargs):
+            package = "agentworkspace/" + args[-1].removeprefix("./")
+            if args[:2] == ["go", "list"]:
+                return subprocess.CompletedProcess(args, 0, stdout=package + "\n")
+            self.assertEqual(args[:2], ["go", "test"])
+            rows = [{"Action": "start", "Package": package}]
+            if "-list" in args:
+                rows.append({"Action": "output", "Package": package,
+                             "Output": "\n".join(names) + f"\nok  \t{package}\t0.001s\n"})
+            else:
+                pattern = args[args.index("-run") + 1]
+                for name in names:
+                    if re.fullmatch(pattern, name):
+                        rows.extend([{"Action": "run", "Package": package, "Test": name},
+                                     {"Action": "pass", "Package": package, "Test": name}])
+            rows.append({"Action": "pass", "Package": package})
+            if mutate and "-run" in args:
+                mutate(rows)
+            kwargs["stdout"].write("".join(json.dumps(row) + "\n" for row in rows).encode())
+            return subprocess.CompletedProcess(args, 0)
+        return go
+
+    def test_platform_45_and_48_roots_have_balanced_deterministic_verified_subsets(self):
+        names = self.slot_names("platform", 1, 45) + self.slot_names("platform", 2, 48)
+        compiled = Counter(names)
+        for worker, slot, sizes in [(2, 1, [23, 22]), (5, 2, [24, 24])]:
+            selected, _ = self.verifier.selection(compiled, slot, "platform")
+            ordered = sorted(selected)
+            expected_subsets = [Counter({name: 1 for name in ordered[index::2]}) for index in range(2)]
+            # Reversing the compiled-list order must not change subprocess selections.
+            for inventory in (names, list(reversed(names))):
+                with self.subTest(slot=slot, first=inventory[0]), tempfile.TemporaryDirectory(prefix="ci-platform-") as directory, \
+                     redirect_stdout(io.StringIO()), mock.patch.object(self.shards, "check_identity"), \
+                     mock.patch.object(self.shards, "command", side_effect=self.worker_go(inventory)) as command, \
+                     mock.patch.object(self.shards.verifier, "verify", wraps=self.shards.verifier.verify) as verify:
+                    self.shards.run_worker("platform", worker, directory, RUN, SHA, TREE)
+                    calls = [call.args[0] for call in command.call_args_list]
+                    self.assertEqual(sum("-list" in args for args in calls), 1)
+                    runs = [args for args in calls if "-run" in args]
+                    self.assertEqual(len(runs), 2)
+                    actual_patterns = [args[args.index("-run") + 1] for args in runs]
+                    run_calls = [call for call in command.call_args_list if "-run" in call.args[0]]
+                    self.assertEqual(len({call.kwargs["stdout"].name for call in run_calls}), 2)
+                    self.assertEqual(len({call.kwargs["env"]["TMPDIR"] for call in run_calls}), 1)
+                    self.assertEqual(actual_patterns, ["^(" + "|".join(sorted(subset)) + ")$" for subset in expected_subsets])
+                    self.assertEqual([len(subset) for subset in expected_subsets], sizes)
+                    for args in runs:
+                        self.assertEqual(args, ["go", "test", "-count=1", "-race", "-json", "-run",
+                                                args[args.index("-run") + 1], "./internal/platform"])
+                    self.assertEqual([call.args[2] for call in verify.call_args_list], expected_subsets)
+                    self.assertTrue(all(call.args[1] == "agentworkspace/internal/platform" for call in verify.call_args_list))
+                    self.assertFalse(expected_subsets[0].keys() & expected_subsets[1].keys())
+                    self.assertEqual(sum(expected_subsets, Counter()), selected)
+                    artifact = Path(directory) / f"platform-shard-v1-{slot}"
+                    self.assertEqual(list(Path(directory).iterdir()), [artifact])
+                    self.assertEqual([path.name for path in artifact.iterdir()], ["platform-summary.json"])
+                    summary = json.loads((artifact / "platform-summary.json").read_text())
+                    self.assertEqual(summary, {"schema": 1, "slot": slot, "total": 9, "run_id": RUN,
+                                              "checkout_sha": SHA, "checkout_tree": TREE,
+                                              "package": "agentworkspace/internal/platform", "compiled": compiled,
+                                              "selected": selected, "runs": selected, "passes": selected, "skips": {}})
+
+    def test_platform_subset_boundaries_and_exact_union(self):
+        for count in (0, 1, 24, 25, 45, 48, 49, 73):
+            selected = Counter({f"TestVector{index}": 1 for index in reversed(range(count))})
+            groups = max(1, (count + 23) // 24)
+            ordered = sorted(selected)
+            expected = [Counter({name: selected[name] for name in ordered[index::groups]}) for index in range(groups)]
+            with self.subTest(count=count):
+                subsets = self.shards.execution_subsets(selected, "platform")
+                self.assertEqual(subsets, expected)
+                self.assertTrue(all(len(subset) <= 24 for subset in subsets))
+                self.assertLessEqual(max(map(len, subsets)) - min(map(len, subsets)), 1)
+                self.assertEqual(sum(subsets, Counter()), selected)
+                for first, second in itertools.combinations(subsets, 2):
+                    self.assertFalse(first.keys() & second.keys())
+
+    def test_missing_or_overlapping_subsets_cannot_create_logical_receipt(self):
+        names = self.slot_names("platform", 1, 45)
+        ordered = sorted(names)
+        first, second = [Counter({name: 1 for name in ordered[index::2]}) for index in range(2)]
+        for subsets in ([first], [first, first, second]):
+            with self.subTest(sizes=list(map(len, subsets))), tempfile.TemporaryDirectory(prefix="ci-subset-union-") as directory, \
+                 redirect_stdout(io.StringIO()), mock.patch.object(self.shards, "check_identity"), \
+                 mock.patch.object(self.shards, "command", side_effect=self.worker_go(names)), \
+                 mock.patch.object(self.shards, "execution_subsets", return_value=subsets):
+                with self.assertRaises(ValueError):
+                    self.shards.run_worker("platform", 2, directory, RUN, SHA, TREE)
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_shared_run_pattern_preserves_escaping_and_byte_limit(self):
+        self.assertEqual(self.verifier.run_pattern({}), "^$")
+        self.assertEqual(self.verifier.run_pattern({"TestA.B": 1, "FuzzBytes": 1}), r"^(FuzzBytes|TestA\.B)$")
+        boundary = "Test" + "A" * (self.verifier.MAX_PATTERN_BYTES - 8)
+        self.assertEqual(len(self.verifier.run_pattern({boundary: 1}).encode("utf-8")), self.verifier.MAX_PATTERN_BYTES)
+        for name in (boundary + "A", "Test" + "界" * 20000, "TestRoot/child"):
+            with self.subTest(name=name[:20]), self.assertRaises(ValueError):
+                self.verifier.run_pattern({name: 1})
+
+    def test_platform_small_and_empty_slots_and_other_profiles_keep_canonical_runs(self):
+        for profile, worker, slot, count in [("platform", 2, 1, 1), ("platform", 2, 1, 24),
+                                             ("platform", 2, 1, 0), ("store", 0, 0, 48), ("httpapi", 0, 0, 48)]:
+            names = self.slot_names(profile, slot, count) if count else self.slot_names(profile, 0, 1)
+            compiled = Counter(names)
+            with self.subTest(profile=profile, count=count), tempfile.TemporaryDirectory(prefix="ci-canonical-") as directory, \
+                 redirect_stdout(io.StringIO()), mock.patch.object(self.shards, "check_identity"), \
+                 mock.patch.object(self.shards, "command", side_effect=self.worker_go(names)) as command, \
+                 mock.patch.object(self.shards, "worker_parallelism", return_value=1), \
+                 mock.patch.object(self.shards.verifier, "verify", wraps=self.shards.verifier.verify) as verify:
+                self.shards.run_worker(profile, worker, directory, RUN, SHA, TREE)
+                runs = [call.args[0] for call in command.call_args_list if "-run" in call.args[0]]
+                expected = [self.verifier.selection(compiled, logical, profile) for logical in self.shards.BATCHES[profile][worker]]
+                self.assertEqual(runs, [["go", "test", "-count=1", "-race", "-json", "-run", pattern, "./internal/" + profile]
+                                        for _, pattern in expected])
+                self.assertEqual([call.args[2] for call in verify.call_args_list], [selected for selected, _ in expected])
+                total, package, summary_name, prefix = self.verifier.PROFILES[profile]
+                for logical, (selected, _) in zip(self.shards.BATCHES[profile][worker], expected):
+                    summary = json.loads((Path(directory) / f"{prefix}{logical}" / summary_name).read_text())
+                    self.assertEqual(summary, {"schema": 1, "slot": logical, "total": total, "run_id": RUN,
+                                              "checkout_sha": SHA, "checkout_tree": TREE, "package": package,
+                                              "compiled": compiled, "selected": selected,
+                                              "runs": selected, "passes": selected, "skips": {}})
+
+    def test_invalid_second_platform_subset_cannot_create_logical_receipt(self):
+        names = self.slot_names("platform", 1, 45)
+        for problem in ("missing", "duplicate", "fail", "skip", "child-fail", "child-skip", "unfinished-child",
+                        "missing-start", "missing-package-pass", "package-fail", "package-skip", "foreign-package", "extra-lifecycle"):
+            invocation = itertools.count(1)
+
+            def mutate(rows):
+                if next(invocation) != 2:
+                    return
+                if problem == "missing":
+                    del rows[1:3]
+                elif problem == "duplicate":
+                    rows[1:1] = rows[1:3]
+                elif problem in ("fail", "skip"):
+                    rows[2]["Action"] = problem
+                elif problem in ("child-fail", "child-skip", "unfinished-child"):
+                    child = {**rows[1], "Test": rows[1]["Test"] + "/child"}
+                    rows[2:2] = [child] if problem == "unfinished-child" else [child, {**child, "Action": problem[6:]}]
+                elif problem == "missing-start":
+                    del rows[0]
+                elif problem == "missing-package-pass":
+                    rows.pop()
+                elif problem in ("package-fail", "package-skip"):
+                    rows[-1]["Action"] = problem[8:]
+                elif problem == "foreign-package":
+                    rows[0]["Package"] = "other/platform"
+                else:
+                    rows.extend([rows[0], rows[-1]])
+
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory(prefix="ci-invalid-subset-") as directory, \
+                 redirect_stdout(io.StringIO()), mock.patch.object(self.shards, "check_identity"), \
+                 mock.patch.object(self.shards, "command", side_effect=self.worker_go(names, mutate)):
+                with self.assertRaises(ValueError):
+                    self.shards.run_worker("platform", 2, directory, RUN, SHA, TREE)
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_store_pairing_requires_available_cpus_and_excludes_entire_slow_groups(self):
+        slow_slots = {6, 8, 38, 50, 51, 57, 62}
+        self.assertEqual(self.shards.SLOW_STORE_SLOTS, slow_slots)
+        for cpus in (set(), {0}, {2, 4, 6}, {2, 4, 6, 8}, set(range(8))):
+            with mock.patch.object(self.shards.sys, "platform", "linux"), \
+                 mock.patch.object(os, "sched_getaffinity", return_value=cpus, create=True):
+                for profile, workers in self.shards.BATCHES.items():
+                    for slots in workers:
+                        with self.subTest(profile=profile, slots=slots, cpus=len(cpus)):
+                            expected = 2 if profile == "store" and len(cpus) >= 4 and not slow_slots.intersection(slots) else 1
+                            self.assertEqual(self.shards.worker_parallelism(profile, slots), expected)
+        for error in (AttributeError, NotImplementedError, OSError):
+            with self.subTest(error=error), mock.patch.object(self.shards.sys, "platform", "linux"), \
+                 mock.patch.object(os, "sched_getaffinity", side_effect=error, create=True):
+                self.assertEqual(self.shards.worker_parallelism("store", (44, 45, 46, 47)), 1)
+        for platform in ("darwin", "win32"):
+            with self.subTest(platform=platform), mock.patch.object(self.shards.sys, "platform", platform), \
+                 mock.patch.object(os, "sched_getaffinity", return_value=set(range(8)), create=True) as affinity:
+                self.assertEqual(self.shards.worker_parallelism("store", (44, 45, 46, 47)), 1)
+                affinity.assert_not_called()
+
+    def test_logical_slots_have_private_events_and_tmpdir_without_environment_mutation(self):
+        names = [self.slot_names("store", slot, 1)[0] for slot in (44, 45, 46, 47)]
+        before = dict(os.environ)
+        with tempfile.TemporaryDirectory(prefix="ci-private-slot-") as directory, redirect_stdout(io.StringIO()), \
+             mock.patch.object(self.shards, "check_identity"), \
+             mock.patch.object(self.shards.sys, "platform", "linux"), \
+             mock.patch.object(os, "sched_getaffinity", return_value=set(range(4)), create=True), \
+             mock.patch.object(self.shards, "command", side_effect=self.worker_go(names)) as command:
+            self.shards.run_worker("store", 11, directory, RUN, SHA, TREE)
+            runs = [call for call in command.call_args_list if "-run" in call.args[0]]
+            self.assertEqual(len(runs), 4)
+            self.assertTrue(all("env" in call.kwargs and "TMPDIR" in call.kwargs["env"] for call in runs))
+            self.assertEqual(len({call.kwargs["stdout"].name for call in runs}), 4)
+            self.assertEqual(len({call.kwargs["env"]["TMPDIR"] for call in runs}), 4)
+            self.assertEqual(len({id(call.kwargs["env"]) for call in runs}), 4)
+        self.assertEqual(dict(os.environ), before)
+
+    def test_store_concurrency_is_bounded_to_two_real_verified_slots(self):
+        names = [self.slot_names("store", slot, 1)[0] for slot in (44, 45, 46, 47)]
+        base_go = self.worker_go(names)
+        barrier, lock = threading.Barrier(2, timeout=5), threading.Lock()
+        active, peak, completed = 0, 0, []
+
+        def go(args, **kwargs):
+            nonlocal active, peak
+            if "-run" not in args:
+                return base_go(args, **kwargs)
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            try:
+                barrier.wait()
+                self.assertTrue(Path(kwargs["env"]["TMPDIR"]).is_dir())
+                self.assertTrue(Path(kwargs["stdout"].name).is_file())
+                return base_go(args, **kwargs)
+            finally:
+                with lock:
+                    active -= 1
+                    completed.append(args)
+
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory(prefix="ci-paired-store-") as directory, redirect_stdout(output), \
+             mock.patch.object(self.shards, "check_identity"), \
+             mock.patch.object(self.shards.sys, "platform", "linux"), \
+             mock.patch.object(os, "sched_getaffinity", return_value=set(range(4)), create=True), \
+             mock.patch.object(self.shards.subprocess, "run", side_effect=go) as command, \
+             mock.patch.object(self.shards.verifier, "verify", wraps=self.shards.verifier.verify) as verify:
+            self.shards.run_worker("store", 11, directory, RUN, SHA, TREE)
+            self.assertEqual((peak, active, len(completed)), (2, 0, 4))
+            self.assertEqual(sum("-list" in call.args[0] for call in command.call_args_list), 1)
+            self.assertEqual(verify.call_count, 4)
+            self.assertEqual(sum((call.args[2] for call in verify.call_args_list), Counter()), Counter(names))
+            for slot in (44, 45, 46, 47):
+                selected, _ = self.verifier.selection(Counter(names), slot, "store")
+                summary = json.loads((Path(directory) / f"store-shard-v1-{slot}/store-summary.json").read_text())
+                self.assertEqual(summary, {"schema": 1, "slot": slot, "total": 64, "run_id": RUN,
+                                          "checkout_sha": SHA, "checkout_tree": TREE,
+                                          "package": "agentworkspace/internal/store", "compiled": Counter(names),
+                                          "selected": selected, "runs": selected, "passes": selected, "skips": {}})
+        rows = [json.loads(line) for line in output.getvalue().splitlines() if line.startswith("{")]
+        self.assertEqual(Counter(row["Test"] for row in rows if row["Action"] == "pass" and "Test" in row), Counter(names))
+        # Each replay is a complete, contiguous package lifecycle, not merged task output.
+        self.assertEqual([row["Action"] for row in rows], ["start", "run", "pass", "pass"] * 4)
+
+    def test_store_error_joins_all_tasks_and_cannot_publish_worker_evidence(self):
+        names = [self.slot_names("store", slot, 1)[0] for slot in (44, 45, 46, 47)]
+        for problem in ("subprocess", "coverage"):
+            failed, release = threading.Event(), threading.Event()
+            completed = []
+
+            def mutate(rows):
+                if rows[1]["Test"] == names[0] and problem == "coverage":
+                    del rows[1:3]
+
+            base_go = self.worker_go(names, mutate)
+
+            def go(args, **kwargs):
+                if "-run" not in args:
+                    return base_go(args, **kwargs)
+                pattern = args[args.index("-run") + 1]
+                failing = re.fullmatch(pattern, names[0]) is not None
+                try:
+                    if not failing:
+                        self.assertTrue(release.wait(5))
+                    result = base_go(args, **kwargs)
+                    if failing:
+                        failed.set()
+                        if problem == "subprocess":
+                            raise subprocess.CalledProcessError(1, args)
+                    return result
+                finally:
+                    completed.append(args)
+
+            diagnostics = io.StringIO()
+            with self.subTest(problem=problem), tempfile.TemporaryDirectory(prefix="ci-failed-pair-") as directory, \
+                 redirect_stdout(io.StringIO()), redirect_stderr(diagnostics), \
+                 mock.patch.object(self.shards, "check_identity"), \
+                 mock.patch.object(self.shards.sys, "platform", "linux"), \
+                 mock.patch.object(os, "sched_getaffinity", return_value=set(range(4)), create=True), \
+                 mock.patch.object(self.shards, "command", side_effect=go):
+                root = Path(directory) / "workers"
+                self.evidence(root)
+                destination = root / "store-worker-v1-11"
+                destination.rename(Path(directory) / "previous-worker")
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(self.shards.run_worker, "store", 11, destination, RUN, SHA, TREE)
+                    try:
+                        self.assertTrue(failed.wait(5))
+                        self.assertFalse(future.done(), "worker returned while sibling subprocesses were blocked")
+                    finally:
+                        release.set()
+                    with self.assertRaises(subprocess.CalledProcessError if problem == "subprocess" else ValueError):
+                        future.result(timeout=5)
+                self.assertEqual(len(completed), 4)
+                self.assertEqual(list(destination.iterdir()), [])
+                with self.assertRaises(ValueError):
+                    self.shards.aggregate_workers(root, RUN, SHA, TREE)
+            if problem == "subprocess":
+                self.assertIn('"Action": "start"', diagnostics.getvalue())
+                self.assertIn(names[0], diagnostics.getvalue())
 
     def test_workers_list_once_then_81_real_verified_uncached_logical_runs(self):
         names = [f"TestVector{index}" for index in range(180)]
@@ -502,7 +826,9 @@ class ShardBatchTests(unittest.TestCase):
                     destination = root / f"{profile}-worker-v1-{worker}"
                     self.shards.run_worker(profile, worker, destination, RUN, SHA, TREE)
                     tests = [command for command in calls if command[:2] == ["go", "test"]]
-                    self.assertEqual(len(tests), len(slots) + 1)
+                    expected_runs = sum(max(1, (len(self.verifier.selection(Counter(names), slot, profile)[0]) + 23) // 24)
+                                        if profile == "platform" else 1 for slot in slots)
+                    self.assertEqual(len(tests), expected_runs + 1)
                     self.assertEqual(sum("-list" in command for command in tests), 1)
                     for command in tests:
                         for flag in ("-count=1", "-race", "-json"):
@@ -555,6 +881,7 @@ class ShardBatchTests(unittest.TestCase):
         diagnostics = io.StringIO()
         with tempfile.TemporaryDirectory(prefix="ci-failed-worker-") as directory, mock.patch.object(self.shards, "check_identity"), \
              mock.patch.object(self.shards, "command", side_effect=failed_go), \
+             mock.patch.object(self.shards, "worker_parallelism", return_value=1), \
              mock.patch.object(self.shards.verifier, "inventory", return_value={"TestVector6": 1}):
             with self.assertRaises(subprocess.CalledProcessError), redirect_stdout(io.StringIO()), redirect_stderr(diagnostics):
                 self.shards.run_worker("store", 0, Path(directory), RUN, SHA, TREE)
