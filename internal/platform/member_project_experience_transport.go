@@ -77,10 +77,15 @@ func (s *MemberTools) projectExperienceTransport(token string) memberProjectExpe
 // grant for history. The E3 seam rechecks the live claim, history scope,
 // source visibility and, independently, any existing material authority.
 func (s *MemberTools) LookupNativeProjectExperiences(ctx context.Context, token string, query ProjectExperienceQuery) (ProjectExperiencePage, error) {
-	if !s.projectExperienceTransport(token).enabled {
+	transport := s.projectExperienceTransport(token)
+	if !transport.enabled {
 		return ProjectExperiencePage{}, store.ErrMemberToolDenied
 	}
-	return s.LookupProjectExperiences(ctx, token, query)
+	var artifactPin *domain.ArtifactVersionRef
+	if transport.pin != (domain.ArtifactVersionRef{}) {
+		artifactPin = &transport.pin
+	}
+	return s.lookupProjectExperiencesWithArtifactPin(ctx, token, query, artifactPin)
 }
 
 // ReadNativeMemberArtifact requires the issued native projection. ReadArtifact

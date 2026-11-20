@@ -614,6 +614,9 @@ while [ -f "$root/hold" ]`), 1)
 			_, runtime, preparer, err := executionRunner(cfg, f.db, coordination.New(f.db), catalog, "http://"+httpapi.DefaultAddress+"/api/v1/member-tools", io.Discard, workspace...)
 			artifactCmdMust(t, err)
 			defer runtime.Close()
+			if runtime.Tools().FreshTaskWorkEnabled() || runtime.Tools().WorkInputsEnabled() {
+				t.Fatal("project experience startup changed the default Task profile")
+			}
 			routes := append(httpapi.MessageRoutes(f.local), httpapi.MemberProjectExperienceToolRoutes(runtime.Tools())...)
 			routes = append(routes, httpapi.MemberToolRoutes(runtime.Tools())...)
 			server, err := httpapi.NewServer(httpapi.DefaultAddress, routes...)
@@ -752,23 +755,25 @@ while [ -f "$root/hold" ]`), 1)
 				}
 				tool(provider.ReadArtifactTool, f.head, 403)
 				tool(provider.ReadArtifactTool, f.foreign, 403)
-				if mode == "installed pin" {
-					// The live bearer and Turn claim alone cannot authorize bytes
-					// after the delivery backlink or persisted approval is lost.
-					_, err := f.raw.Exec("UPDATE deliveries SET turn_id='wrong' WHERE id=?", d.ID)
-					artifactCmdMust(t, err)
-					tool(provider.ReadArtifactTool, f.pin, 403)
-					_, err = f.raw.Exec("UPDATE deliveries SET turn_id=? WHERE id=?", claim.TurnID, d.ID)
-					artifactCmdMust(t, err)
-					tool(provider.ReadArtifactTool, f.pin, 200)
-					f.loseEvidence(t, "delivery_artifact_read_grants_delete", "DELETE FROM delivery_artifact_read_grants WHERE delivery_id=?", d.ID)
-					tool(provider.ReadArtifactTool, f.pin, 403)
-				}
 			} else {
 				tool(provider.ReadArtifactTool, f.pin, 403)
 			}
+			lookup := map[string]string{"query": "CSV-218"}
 			if fresh {
-				tool(provider.LookupProjectExperiencesTool, map[string]string{"query": "CSV-218"}, 200)
+				tool(provider.LookupProjectExperiencesTool, lookup, 200)
+			}
+			if mode == "installed pin" {
+				// The live bearer and Turn claim alone cannot authorize bytes
+				// after the delivery backlink or persisted approval is lost.
+				_, err := f.raw.Exec("UPDATE deliveries SET turn_id='wrong' WHERE id=?", d.ID)
+				artifactCmdMust(t, err)
+				tool(provider.ReadArtifactTool, f.pin, 403)
+				_, err = f.raw.Exec("UPDATE deliveries SET turn_id=? WHERE id=?", claim.TurnID, d.ID)
+				artifactCmdMust(t, err)
+				tool(provider.ReadArtifactTool, f.pin, 200)
+				f.loseEvidence(t, "delivery_artifact_read_grants_delete", "DELETE FROM delivery_artifact_read_grants WHERE delivery_id=?", d.ID)
+				tool(provider.ReadArtifactTool, f.pin, 403)
+				tool(provider.LookupProjectExperiencesTool, lookup, 403)
 			}
 			invalid := artifactGrantSend(t, server.Handler, "/api/v1/member-tools/send_message",
 				map[string]any{"content": artifactGrantBody, "artifact_read_grant": f.pin}, "no-model-grant", manifest.Token, 400)

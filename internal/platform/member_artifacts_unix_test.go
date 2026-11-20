@@ -209,7 +209,7 @@ func TestMemberProjectExperienceArtifactPinFencesLookupVerification(t *testing.T
 			ProjectExperience: domain.ProjectExperience{AcceptedOutcome: &domain.ProjectExperienceOutcome{ArtifactVersionRef: ref}},
 		}}}
 		return f.tools.withAuthorized(ctx, token, "read_history", func(scope store.MemberToolScope, grants MemberToolGrants) error {
-			return f.tools.verifyProjectExperienceArtifacts(ctx, scope, grants.Artifacts, page)
+			return f.tools.verifyProjectExperienceArtifacts(ctx, scope, grants.Artifacts, page, nil)
 		})
 	}
 	for _, v := range []domain.ArtifactVersion{head, other} {

@@ -48,6 +48,11 @@ func (s *MemberTools) lookupProjectExperiencesWithArtifactPin(ctx context.Contex
 		if err == nil {
 			err = s.verifyProjectExperienceArtifacts(ctx, scope, grant, page, artifactPin)
 		}
+		if err == nil && artifactPin != nil && grant != nil && grant.deliveryID != "" {
+			// Even pages without artifacts must re-prove the native delivery grant.
+			// The grant validator includes the final member scope fence.
+			return s.db.ValidateDeliveryArtifactReadGrantForTool(ctx, scope, grant.deliveryID, *artifactPin)
+		}
 		// A committed scope change during blob I/O wins even over a read error.
 		if authErr := s.db.ValidateMemberTool(ctx, scope); authErr != nil {
 			return authErr
