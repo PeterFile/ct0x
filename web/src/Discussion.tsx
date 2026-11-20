@@ -32,8 +32,8 @@ function shortTime(value: string) {
 
 export type RecipientSelection = { groupId: string; memberId: string; version: number };
 
-export function Discussion({ groupId, members, recipientSelection }: {
-  groupId?: string; members: Record<string, Member[]>; recipientSelection?: RecipientSelection;
+export function Discussion({ groupId, active = true, members, recipientSelection }: {
+  groupId?: string; active?: boolean; members: Record<string, Member[]>; recipientSelection?: RecipientSelection;
 }) {
   const [visited, setVisited] = useState<string[]>([]);
   useEffect(() => {
@@ -42,14 +42,15 @@ export function Discussion({ groupId, members, recipientSelection }: {
   return <>
     {!groupId ? <p className="empty-panel">请先选择群组，再查看讨论和发送消息。</p> : null}
     {visited.map(id => <div key={id} className="discussion-scope" hidden={id !== groupId}>
-      <DiscussionScope groupId={id} active={id === groupId} members={members[id] ?? emptyMembers} recipientSelection={recipientSelection} />
+      <DiscussionScope groupId={id} active={id === groupId && active} paused={id === groupId && !active}
+        members={members[id] ?? emptyMembers} recipientSelection={recipientSelection} />
     </div>)}
   </>;
 }
-function DiscussionScope({ groupId, active, members, recipientSelection }: {
-  groupId: string; active: boolean; members: Member[]; recipientSelection?: RecipientSelection;
+function DiscussionScope({ groupId, active, paused, members, recipientSelection }: {
+  groupId: string; active: boolean; paused: boolean; members: Member[]; recipientSelection?: RecipientSelection;
 }) {
-  const formId = useId(), feed = useMessageFeed(groupId, active);
+  const formId = useId(), feed = useMessageFeed(groupId, active, paused);
   const scroll = useMessageScroll(active, feed.items, feed.page);
   const loaded = useMemo(() => new Map(feed.items.map(message => [message.id, message])), [feed.items]);
   const [content, setContent] = useState("");

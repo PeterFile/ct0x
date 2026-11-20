@@ -16,6 +16,12 @@ export type TaskSubmission = {
   id: string; group_id: string; task_id: string; task_revision: number; attempt_id: string;
   summary: string; artifact_versions: ArtifactVersionRef[]; submitted_by: string; created_at: string;
 };
+export type PendingReview = {
+  group: { id: string; name: string };
+  task: { id: string; title: string; acceptance: string };
+  topic_id?: string;
+  submission: TaskSubmission;
+};
 export type TaskReview = {
   id: string; group_id: string; task_id: string; task_revision: number; submission_id: string;
   outcome: "accepted" | "rejected"; reason: string; reviewed_by: string; artifact_versions: ArtifactVersionRef[]; created_at: string;
@@ -82,6 +88,13 @@ const attemptIn = (groupId: string, taskId: string) => (value: unknown): value i
   && typeof value.turn_id === "string" && (value.turn_id === "" || nonblank(value.turn_id));
 const submissionIn = (groupId: string, taskId: string) => (value: unknown): value is TaskSubmission => evidenceIn(groupId, taskId)(value)
   && nonblank(value.attempt_id) && nonblank(value.summary) && nonblank(value.submitted_by) && validRefs(value.artifact_versions);
+const pathID = (value: unknown): value is string => nonblank(value)
+  && value !== "." && value !== ".." && !/[\ud800-\udfff]/u.test(value);
+const pendingReviewIn = (value: unknown): value is PendingReview => isRecord(value)
+  && isRecord(value.group) && pathID(value.group.id) && nonblank(value.group.name)
+  && isRecord(value.task) && pathID(value.task.id) && nonblank(value.task.title) && nonblank(value.task.acceptance)
+  && (value.topic_id === undefined || typeof value.topic_id === "string")
+  && submissionIn(value.group.id, value.task.id)(value.submission);
 const reviewIn = (groupId: string, taskId: string) => (value: unknown): value is TaskReview => evidenceIn(groupId, taskId)(value)
   && nonblank(value.submission_id) && nonblank(value.reviewed_by) && typeof value.reason === "string"
   && (value.outcome === "accepted" || value.outcome === "rejected") && validRefs(value.artifact_versions);
@@ -125,6 +138,12 @@ function post<T>(path: string, body: object, key: string, valid: (value: unknown
 }
 const tasksPath = (groupId: string) => `/api/v1/groups/${encodeURIComponent(groupId)}/tasks`;
 const taskPath = (groupId: string, taskId: string) => `${tasksPath(groupId)}/${encodeURIComponent(taskId)}`;
+export function artifactContentPath(groupId: string, ref: ArtifactVersionRef): string | null {
+  const ids = [groupId, ref.artifact_id, ref.version_id];
+  if (ids.some(id => !id || id === "." || id === ".." || /[\ud800-\udfff]/u.test(id))) return null;
+  const [group, artifact, version] = ids.map(id => encodeURIComponent(id));
+  return `/api/v1/groups/${group}/artifacts/${artifact}/versions/${version}/content`;
+}
 export function registerTaskAttempt(groupId: string, taskId: string, input: TaskAttemptInput, key: string, signal?: AbortSignal) {
   const body = { expected_revision: input.expected_revision, expected_active_attempt_id: input.expected_active_attempt_id };
   return post(`${taskPath(groupId, taskId)}/attempts`, body, key,
@@ -194,6 +213,14 @@ export function listTaskWorkReports(groupId: string, taskId: string, before = ""
   const scoped = workRecordIn(groupId, taskId);
   return listTaskWorkPage(groupId, taskId, "work-reports", before, signal, (value): value is TaskWorkReport => scoped(value)
     && ["kind", "summary", "actor_id", "owner_member_id"].every(key => nonblank(value[key])));
+}
+export function listPendingReviews(before = "", signal?: AbortSignal) {
+  const query = new URLSearchParams({ limit: "50" });
+  if (before) query.set("before", before);
+  return request(`/api/v1/me/pending-reviews?${query}`, { signal }, (value): value is TaskPage<PendingReview> => isRecord(value)
+    && Array.isArray(value.items) && value.items.length <= 50 && value.items.every(pendingReviewIn)
+    && new Set(value.items.map(item => item.submission.id)).size === value.items.length
+    && typeof value.next_cursor === "string");
 }
 export function listTasks(groupId: string, before = "", signal?: AbortSignal) {
   const query = new URLSearchParams({ limit: "50" });
