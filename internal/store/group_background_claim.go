@@ -30,7 +30,7 @@ const groupBackgroundEarlierSQL = `EXISTS(
  ))`
 
 // BackgroundDispatchProfileReady is a preparation hint, not a claim. ClaimTurn
-// checks the same snapshot again after binding the exact durable delivery.
+// rechecks the current snapshot and its expiry at final admission.
 func (s *Store) BackgroundDispatchProfileReady(profile BackgroundDispatchProfile) bool {
 	s.background.readyMu.RLock()
 	defer s.background.readyMu.RUnlock()

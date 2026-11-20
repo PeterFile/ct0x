@@ -29,6 +29,7 @@ type BackgroundDispatchTemplate struct {
 type BackgroundDispatchOptions struct {
 	MaxActiveMembers int // 1..200. A full group can still reuse a suitable member.
 	ReadyProfiles    []BackgroundDispatchProfile
+	ReadyUntil       time.Time                    // Exclusive readiness ceiling; zero keeps the Store's TTL.
 	Presets          []BackgroundDispatchTemplate // First suitable, in configured order.
 	Create           *BackgroundDispatchTemplate  // Nil forbids auto-creation.
 }
@@ -94,7 +95,8 @@ func groupBackgroundOneRow(result sql.Result, err error) error {
 // RunGroupBackgroundDispatch replaces the process-local approval/readiness
 // snapshot even with no unrouted intents. Trusted composition must deliver a
 // freshly qualified snapshot every scheduler cycle (empty on loss of evidence).
-// An omitted pass cannot sustain readiness beyond backgroundReadyLifetime.
+// Readiness expires at the earlier of ReadyUntil (when set) and the Store TTL
+// measured from the start of this pass.
 func (s *Store) RunGroupBackgroundDispatch(ctx context.Context, options BackgroundDispatchOptions) error {
 	const action = "群组后台调度失败"
 	if !s.background.enabled.Load() {
@@ -105,14 +107,22 @@ func (s *Store) RunGroupBackgroundDispatch(ctx context.Context, options Backgrou
 	if err == nil {
 		err = ctx.Err()
 	}
-	var ready *backgroundReadySnapshot
-	if err == nil && len(profilesReady) != 0 {
-		ready = &backgroundReadySnapshot{profiles: profilesReady, expires: sampled.Add(backgroundReadyLifetime)}
+	expires := sampled.Add(backgroundReadyLifetime)
+	if !options.ReadyUntil.IsZero() {
+		// Compare absolute wall-clock deadlines, not monotonic readings.
+		expires = expires.Round(0)
+		if until := options.ReadyUntil.Round(0); until.Before(expires) {
+			expires = until
+		}
 	}
+	var ready *backgroundReadySnapshot
 	// Publication is independent of the routing lock: revocation is not lost
 	// if a pass is busy. The claim transaction pins the current snapshot only
 	// for its short final admission/commit, never for external execution.
 	s.background.readyMu.Lock()
+	if err == nil && len(profilesReady) != 0 && sampled.Before(expires) && time.Now().Before(expires) {
+		ready = &backgroundReadySnapshot{profiles: profilesReady, expires: expires}
+	}
 	s.background.ready = ready
 	s.background.readyMu.Unlock()
 	if err != nil {
@@ -278,6 +288,10 @@ func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, 
 	 WHERE sequence=? AND delivery_id IS NULL`, delivery, member, kind, stamp, sequence)
 	if err := groupBackgroundOneRow(result, err); err != nil {
 		return err
+	}
+	// The snapshot is still pinned, but may have expired during the writes.
+	if !time.Now().Before(ready.expires) {
+		return nil // Roll back the join and delivery; leave the intent pending.
 	}
 	return tx.Commit()
 }
