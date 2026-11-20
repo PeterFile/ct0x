@@ -213,7 +213,22 @@ func hasMatchingOrdinaryTurnSend(ctx context.Context, tx *sql.Tx, turn *domain.T
 	var duplicate bool
 	err := tx.QueryRowContext(ctx, ordinaryTurnReplyMatch, turn.ID, digest[:], r.GroupID, r.ActorID, r.TopicID, r.Content,
 		omitted, r.payload(), r.scope().operation).Scan(&duplicate)
-	return duplicate, err
+	if err != nil || !duplicate {
+		return false, err
+	}
+
+	// Typed TaskWork deliveries keep their native reply separate from member
+	// commands. WorkReport uses the delegated Turn's actual reply as evidence.
+	supported, err := taskWorkSchemaSupportedInTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	if !supported {
+		return true, nil // A valid older schema has no TaskWork delivery markers.
+	}
+	var untyped bool
+	err = tx.QueryRowContext(ctx, `SELECT NOT EXISTS(SELECT 1 FROM task_work_deliveries WHERE delivery_id=?)`, turn.DeliveryID).Scan(&untyped)
+	return untyped, err
 }
 
 func publishTurnReply(ctx context.Context, tx *sql.Tx, turn *domain.Turn) error {

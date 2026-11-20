@@ -36,13 +36,20 @@ func queueOrdinaryReplySend(t *testing.T, s *Store, scope MemberToolScope, recip
 
 func TestQueueOrdinaryPublicSendSuppressesDuplicateNativeReply(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		recipients []string
+		name            string
+		recipients      []string
+		preTaskWorkWake bool
 	}{
-		{"omitted-recipients", nil},
-		{"empty-recipients", []string{}},
+		{"omitted-recipients", nil, false},
+		{"empty-recipients", []string{}, false},
+		{"pre-typed-delivery-schema", nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.preTaskWorkWake {
+				prior := migrations
+				migrations = prior[:taskWorkInputVersion]
+				defer func() { migrations = prior }()
+			}
 			f, _, claim := queueClaimFixture(t)
 			s := f.s
 			scope := queueOrdinaryReplyScope(t, s, claim)
