@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select, verify and aggregate fixed Store64/Platform8/HTTPAPI8 race shards from Go JSON evidence."""
+"""Select, verify and aggregate fixed Store64/Platform9/HTTPAPI8 race shards from Go JSON evidence."""
 import argparse
 from collections import Counter
 import hashlib
@@ -20,7 +20,7 @@ SUMMARY = "store-summary.json"
 ARTIFACT_PREFIX = "store-shard-v1-"
 PROFILES = {
     "store": (TOTAL, "agentworkspace/internal/store", SUMMARY, ARTIFACT_PREFIX),
-    "platform": (8, "agentworkspace/internal/platform", "platform-summary.json", "platform-shard-v1-"),
+    "platform": (9, "agentworkspace/internal/platform", "platform-summary.json", "platform-shard-v1-"),
     "httpapi": (8, "agentworkspace/internal/httpapi", "httpapi-summary.json", "httpapi-shard-v1-"),
 }
 
@@ -124,9 +124,17 @@ def inventory(path, package):
     return compiled
 
 
-def selection(compiled, slot, total=TOTAL):
-    selected = Counter({name: count for name, count in compiled.items()
-                        if int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big") % total == slot})
+def selection(compiled, slot, profile):
+    modulus = 8 if profile == "platform" else PROFILES[profile][0]
+    selected = Counter()
+    for name, count in compiled.items():
+        hash_value = int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big")
+        bucket = hash_value % modulus
+        # Only the upper half of legacy Platform slot 4 moves to slot 8.
+        if profile == "platform" and hash_value % 16 == 12:
+            bucket = 8
+        if bucket == slot:
+            selected[name] = count
     pattern = "^(" + "|".join(re.escape(name) for name in sorted(selected)) + ")$" if selected else "^$"
     check("/" not in pattern and len(pattern.encode("utf-8")) <= MAX_PATTERN_BYTES, "分片表达式过长或包含 slash；拒绝截断")
     return selected, pattern
@@ -213,7 +221,7 @@ def aggregate(directory, expected, profile="store"):
         if common is None:
             common = compiled
         check(compiled == common, "跨片 compiled 不一致")
-        check(selected == selection(compiled, slot, total)[0] and runs == selected and passes == selected and not skips,
+        check(selected == selection(compiled, slot, profile)[0] and runs == selected and passes == selected and not skips,
               "summary 哈希选片或 run/pass/skip 覆盖不符")
         check(not (combined.keys() & selected.keys()), "分片重复覆盖")
         combined.update(selected)
@@ -249,7 +257,7 @@ def main():
         result = aggregate(args.directory, identity(args), args.profile)
     else:
         compiled = inventory(args.inventory, args.package)
-        selected, pattern = selection(compiled, args.slot, total)
+        selected, pattern = selection(compiled, args.slot, args.profile)
         if args.command == "select":
             print(pattern)
             return
