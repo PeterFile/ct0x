@@ -19,6 +19,9 @@ import (
 func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
 	ctx := context.Background()
 	f, dir := newExecutionFixture(t, "1.4.0"), t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
 	dbPath, approvalPath := filepath.Join(dir, "workspace.db"), filepath.Join(dir, "a1.json")
 	installBackgroundPreviewFixture(t, dbPath)
 	db := openBackgroundPreviewTestDB(t, dbPath)
