@@ -8,7 +8,8 @@ import { isAbsolute } from "node:path";
 const CONFIG_ERROR = "任务续办配置无效，未启用任何工具。";
 const UNKNOWN = "执行结果未知；请保留原调用标识、幂等键和内容先对账，不要自动重试。";
 const BYTE_LIMIT = 64 * 1024;
-const statuses = new Map([["read_work_inputs", 200], ["ack_work_input", 200], ["hand_back_work_input", 200], ["submit_result", 201]]);
+const decisionOperation = "propose_task_decision";
+const statuses = new Map([["read_work_inputs", 200], ["ack_work_input", 200], ["hand_back_work_input", 200], ["submit_result", 201], [decisionOperation, 201]]);
 const definiteRejections = new Map([
   [400, ["invalid_input", "invalid_json"]], [403, ["forbidden", "invalid_host", "invalid_origin"]],
   [404, ["not_found"]], [405, ["method_not_allowed"]], [409, ["conflict"]],
@@ -74,13 +75,16 @@ function readConfig(path, expectedSHA256) {
     const bytes = buffer.subarray(0, size);
     if (size > limit || sha256(bytes) !== expectedSHA256) throw new Error();
     const config = JSON.parse(decode(bytes));
-    if (!record(config) || !hasKeys(config, "endpoint,token") || typeof config.token !== "string" ||
-        config.token !== config.token.trim() || config.token.length > 256 || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token) ||
+    if (!record(config)) throw new Error();
+    const proof = config.task_decision_proof;
+    if ((proof === undefined ? !hasKeys(config, "endpoint,token") :
+        !hasKeys(config, "endpoint,task_decision_proof,token") || typeof proof !== "string" || !/^[a-f0-9]{64}$/.test(proof) || proof === config.token) ||
+        typeof config.token !== "string" || config.token !== config.token.trim() || config.token.length > 256 || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token) ||
         typeof config.endpoint !== "string" || config.endpoint !== config.endpoint.trim() ||
         !/^http:\/\/(127\.0\.0\.1|\[::1\]):[0-9]{1,5}\/api\/v1\/member-tools$/.test(config.endpoint)) throw new Error();
     const endpoint = new URL(config.endpoint);
     if (endpoint.port === "0") throw new Error();
-    return { endpoint, token: config.token };
+    return { endpoint, token: config.token, proof: /** @type {string | undefined} */ (proof) };
   } catch {
     throw new Error(CONFIG_ERROR);
   } finally {
@@ -116,6 +120,12 @@ function fixedReceipt(text, count) {
 /** @param {string} name @param {unknown} value @param {Record<string, unknown>} sent @param {string} wire */
 function validReply(name, value, sent, wire) {
   if (!record(value)) return false;
+  if (name === decisionOperation) {
+    const v = value.version, expected = Number(sent.expected_version);
+    return hasKeys(value, "decision_request_id,kind,version") && fixedReceipt(wire, 3) &&
+      validWorkInputID(value.decision_request_id) && value.kind === sent.kind && typeof v === "number" &&
+      Number.isSafeInteger(v) && v > 0 && (expected === 0 || v === expected || v === expected + 1);
+  }
   if (name === "submit_result") {
     return hasKeys(value, "artifact_version_count,created_at,submission_id,summary_omitted") && fixedReceipt(wire, 4) &&
       validWorkInputID(value.submission_id) && validTime(value.created_at) && value.artifact_version_count === 0 && value.summary_omitted === true;
@@ -185,23 +195,27 @@ function exchange(endpoint, name, body, headers, signal) {
 
 /** @param {string | undefined} path @param {string | undefined} digest */
 export function createFreshTaskWorkClient(path, digest) {
-  const { endpoint, token } = readConfig(path, digest);
+  const { endpoint, token, proof } = readConfig(path, digest);
   /** @type {{key: string, fingerprint: string, error: Error} | undefined} */
   let uncertain;
   let writing = false;
+  /** @param {string} value */
+  const hasSecret = value => value.includes(token) || (proof !== undefined && value.includes(proof));
   /** @param {string} message */
-  const safe = message => new Error(message.replaceAll(token, "〔已隐藏〕"));
+  const safe = message => new Error(proof === undefined ? message.replaceAll(token, "〔已隐藏〕") :
+    message.replaceAll(proof, "〔已隐藏〕").replaceAll(token, "〔已隐藏〕"));
   /** @param {string} name @param {Record<string, unknown>} params @param {string} id @param {AbortSignal} [signal] */
-  return async (name, params, id, signal) => {
+  const invoke = async (name, params, id, signal) => {
     const expected = statuses.get(name);
     const write = name !== "read_work_inputs";
-    if (!expected || typeof id !== "string" || !id.trim() || !unicode(id) || (write && !validTypedWriteCallID(id, token))) {
+    if (!expected || name === decisionOperation && proof === undefined || typeof id !== "string" || !id.trim() || !unicode(id) ||
+        (write && (!validTypedWriteCallID(id, token) || hasSecret(id)))) {
       throw safe("成员工具调用无效，未发送请求。");
     }
     // The entry has already snapshotted and checked the argument shape.
     const json = JSON.stringify(params);
     const body = Buffer.from(json, "utf8");
-    if (body.length > BYTE_LIMIT || json.includes(token)) throw safe("成员工具参数无效，未发送请求。");
+    if (body.length > BYTE_LIMIT || hasSecret(json)) throw safe("成员工具参数无效，未发送请求。");
     const key = write ? sha256(name + id) : "";
     const fingerprint = write ? sha256(body) : "";
     if (write && uncertain) {
@@ -213,6 +227,10 @@ export function createFreshTaskWorkClient(path, digest) {
     /** @type {Record<string, string | number>} */
     const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Content-Length": body.length };
     if (write) headers["Idempotency-Key"] = key;
+    if (name === decisionOperation && proof !== undefined) {
+      headers["X-Agent-Workspace-Tool-Call-Id"] = id;
+      headers["X-Agent-Workspace-Task-Decision-Proof"] = proof;
+    }
     if (write) writing = true;
     let failure = UNKNOWN;
     try {
@@ -221,7 +239,7 @@ export function createFreshTaskWorkClient(path, digest) {
         if (["__proto__", "constructor", "prototype"].includes(key)) throw new Error();
         return value;
       });
-      if (text.includes(token) || JSON.stringify(result).includes(token)) throw new Error();
+      if (hasSecret(text) || hasSecret(JSON.stringify(result))) throw new Error();
       if (status === expected && validReply(name, result, params, text)) return { text: JSON.stringify(result) };
       const envelope = /^\s*\{\s*"error"\s*:\s*(\{[\s\S]*\})\s*\}\s*$/.exec(text);
       if (envelope && record(result.error) && typeof result.error.code === "string" && typeof result.error.message === "string" &&
@@ -238,4 +256,5 @@ export function createFreshTaskWorkClient(path, digest) {
     }
     throw error;
   };
+  return Object.assign(invoke, { taskDecision: proof !== undefined });
 }

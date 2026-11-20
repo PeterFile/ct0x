@@ -72,6 +72,8 @@ func (p *piTypedWorkOutput) boundWrite(name string) bool {
 	switch name {
 	case "ack_work_input", "hand_back_work_input", "submit_result", "report_work":
 		return true
+	case ProposeTaskDecisionTool:
+		return p.role == "followup"
 	case DelegateWorkTool:
 		return domain.TaskWorkSourceKind(p.role) == PiInitialInvestigationOwnerRole || domain.TaskWorkSourceKind(p.role).IsOwnerContinuation()
 	case HandbackWorkTool:

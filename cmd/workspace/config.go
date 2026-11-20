@@ -26,6 +26,7 @@ type config struct {
 	executionMaxActive, memberToolsMaxMembers                   int
 	piFreshTaskWorkExtension, piFreshInvestigationWorkExtension string
 	enableInvestigationOwnerManagement                          bool
+	enablePiTaskDecisionProposals                               bool
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {

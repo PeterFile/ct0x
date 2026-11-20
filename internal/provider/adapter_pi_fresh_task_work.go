@@ -1,30 +1,35 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
 const piFreshTaskWorkTools = "read_work_inputs,ack_work_input,hand_back_work_input,submit_result"
+const ProposeTaskDecisionTool = "propose_task_decision"
 
 // Independent from the ordinary index.ts/bridge.mjs pair used by native resume.
-// Update both digests together after offline Pi 1.4.0 loader/config checks.
+// Qualify complete pairs, not the Cartesian product of accepted file digests.
 const (
 	piFreshTaskWorkEntrySHA = "834dced6bdfbcd6bae9ca04ca9a1501a980407d02995efbaa9743ca6e701c866"
 	piFreshTaskWorkImplSHA  = "0da78b82aa74e0d3f2cdd38131dc62997b4d67d6041a2efe8b247bc3d789fa6f"
+	piTaskDecisionEntrySHA  = "106638ddee12a5efbf653853070ee123a6614f1ed84907026e13338558cb5ab6"
+	piTaskDecisionImplSHA   = "aca7d329999f26cc9bf1e1c4900ee8cdf6d5f4f33ede4ba584b9463e6d067f5f"
 )
 
 func PiFreshTaskWorkToolNames() []string { return strings.Split(piFreshTaskWorkTools, ",") }
+
+func PiFreshTaskDecisionToolNames() []string {
+	return append(PiFreshTaskWorkToolNames(), ProposeTaskDecisionTool)
+}
 
 // FreshTaskWorkBinding comes only from the claimed runtime, never tool input.
 // Only the private file contains the endpoint and capability.
@@ -51,8 +56,25 @@ func (a PiFreshTaskWorkAdapter) Supports(selected Provider) bool {
 	return selected.Name == Pi && ValidateExecutor(selected, a.timeout) == nil && a.qualifiedBridge() != ""
 }
 
+// SupportsTaskDecision qualifies the optional schema on the same typed path.
+// Old releases and ordinary/native-resume adapters do not understand it.
+func (a PiFreshTaskWorkAdapter) SupportsTaskDecision(selected Provider) bool {
+	return selected.Name == Pi && ValidateExecutor(selected, a.timeout) == nil && a.bridgeForProfile(true) != ""
+}
+
 func (a PiFreshTaskWorkAdapter) NewExecutor(ctx context.Context, selected Provider, binding FreshTaskWorkBinding) (Executor, error) {
+	return a.newExecutor(ctx, selected, binding, false)
+}
+
+func (a PiFreshTaskWorkAdapter) NewTaskDecisionExecutor(ctx context.Context, selected Provider, binding FreshTaskWorkBinding) (Executor, error) {
+	return a.newExecutor(ctx, selected, binding, true)
+}
+
+func (a PiFreshTaskWorkAdapter) newExecutor(ctx context.Context, selected Provider, binding FreshTaskWorkBinding, decision bool) (Executor, error) {
 	names := PiFreshTaskWorkToolNames()
+	if decision {
+		names = PiFreshTaskDecisionToolNames()
+	}
 	if ctx.Err() != nil || selected.Name != Pi || !executionID.MatchString(binding.RunID) || !slices.Equal(binding.Operations, names) {
 		return nil, errPiMemberToolConfiguration
 	}
@@ -60,20 +82,17 @@ func (a PiFreshTaskWorkAdapter) NewExecutor(ctx context.Context, selected Provid
 	if err != nil {
 		return nil, err
 	}
-	bridge := a.qualifiedBridge()
+	bridge := a.bridgeForProfile(decision)
 	if bridge == "" || binding.ConfigSHA256 == ([sha256.Size]byte{}) {
 		return nil, errPiMemberToolConfiguration
 	}
-	config, err := readMemberToolConfig(binding.ConfigPath)
-	if err != nil || config.digest != binding.ConfigSHA256 {
-		return nil, errPiMemberToolConfiguration
-	}
-	if FreshTaskWorkConfigSHA256(config.endpoint, config.token) != config.digest || ctx.Err() != nil {
+	config, err := readFreshTaskWorkConfig(binding.ConfigPath, decision)
+	if err != nil || config.digest != binding.ConfigSHA256 || ctx.Err() != nil {
 		return nil, errPiMemberToolConfiguration
 	}
 	pi := baseline.(piExecutor)
 	pi.memberTools = &piMemberToolOptions{extensionPath: bridge, configPath: filepath.Clean(binding.ConfigPath),
-		toolNames: names, configSHA256: binding.ConfigSHA256, typedWorkRole: "followup"}
+		toolNames: names, configSHA256: binding.ConfigSHA256, typedWorkRole: "followup", taskDecision: decision}
 	return &piFreshTaskWorkExecutor{pi: pi, adapter: a, runID: binding.RunID, configFile: config.file}, nil
 }
 
@@ -93,6 +112,42 @@ func FreshTaskWorkConfigMatches(path string, digest [sha256.Size]byte) bool {
 	return err == nil && config.digest == digest
 }
 
+type piFreshTaskDecisionConfig struct {
+	Endpoint string `json:"endpoint"`
+	Token    string `json:"token"`
+	Proof    string `json:"task_decision_proof"`
+}
+
+// PiFreshTaskDecisionConfig encodes an issued credential, not model input.
+// The additional proof is never set by the ordinary configuration codec.
+func PiFreshTaskDecisionConfig(endpoint, token, proof string) ([]byte, error) {
+	if memberToolConfigOrigin(endpoint, token) == "" || !piTypedWriteRequestSHA.MatchString(proof) || token == proof {
+		return nil, errPiMemberToolConfiguration
+	}
+	data, err := json.Marshal(piFreshTaskDecisionConfig{Endpoint: endpoint, Token: token, Proof: proof})
+	return append(data, '\n'), err
+}
+
+func readFreshTaskWorkConfig(path string, decision bool) (memberToolConfig, error) {
+	if !decision {
+		config, err := readMemberToolConfig(path)
+		if err != nil || FreshTaskWorkConfigSHA256(config.endpoint, config.token) != config.digest {
+			return memberToolConfig{}, errPiMemberToolConfiguration
+		}
+		return config, nil
+	}
+	raw, file, err := readMemberToolConfigFile(path)
+	var issued piFreshTaskDecisionConfig
+	if err != nil || json.Unmarshal(raw, &issued) != nil {
+		return memberToolConfig{}, errPiMemberToolConfiguration
+	}
+	canonical, err := PiFreshTaskDecisionConfig(issued.Endpoint, issued.Token, issued.Proof)
+	if err != nil || !bytes.Equal(raw, canonical) {
+		return memberToolConfig{}, errPiMemberToolConfiguration
+	}
+	return memberToolConfig{digest: sha256.Sum256(raw), file: file}, nil
+}
+
 type piFreshTaskWorkExecutor struct {
 	pi         piExecutor
 	adapter    PiFreshTaskWorkAdapter
@@ -104,10 +159,10 @@ type piFreshTaskWorkExecutor struct {
 func (e *piFreshTaskWorkExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error) ExecutionReceipt {
 	unknown := ExecutionReceipt{Outcome: OutcomeUnknown, ExitCode: -1, Reason: "任务续办传输绑定无法确认，未调用进程，需对账"}
 	opts := e.pi.memberTools
-	if e.used.Swap(true) || ctx.Err() != nil || request.RunID != e.runID || e.adapter.qualifiedBridge() != opts.extensionPath {
+	if e.used.Swap(true) || ctx.Err() != nil || request.RunID != e.runID || e.adapter.bridgeForProfile(opts.taskDecision) != opts.extensionPath {
 		return unknown
 	}
-	config, err := readMemberToolConfig(opts.configPath)
+	config, err := readFreshTaskWorkConfig(opts.configPath, opts.taskDecision)
 	if err != nil || config.digest != opts.configSHA256 || !os.SameFile(e.configFile, config.file) || ctx.Err() != nil {
 		return unknown
 	}
@@ -116,31 +171,21 @@ func (e *piFreshTaskWorkExecutor) Execute(ctx context.Context, request ExecuteRe
 	return e.pi.Execute(ctx, request, onEvent)
 }
 
-func (a PiFreshTaskWorkAdapter) qualifiedBridge() string {
+func (a PiFreshTaskWorkAdapter) qualifiedBridge() string { return a.bridgeForProfile(false) }
+
+func (a PiFreshTaskWorkAdapter) bridgeForProfile(decision bool) string {
 	if !filepath.IsAbs(a.extensionPath) {
 		return ""
 	}
 	// Pass the physical entry so the loader resolves the same relative import.
 	entry, err := filepath.EvalSymlinks(a.extensionPath)
-	if err != nil || filepath.Base(entry) != "fresh-task-work.ts" || !freshTaskWorkBridgeBytesMatch(entry, piFreshTaskWorkEntrySHA) ||
-		!freshTaskWorkBridgeBytesMatch(filepath.Join(filepath.Dir(entry), "fresh-task-work.mjs"), piFreshTaskWorkImplSHA) {
+	if err != nil || filepath.Base(entry) != "fresh-task-work.ts" {
 		return ""
 	}
-	return entry
-}
-
-func freshTaskWorkBridgeBytesMatch(path, digest string) bool {
-	const maxSize = 64 << 10
-	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return false
+	impl := filepath.Join(filepath.Dir(entry), "fresh-task-work.mjs")
+	if piBridgeBytesMatch(entry, piTaskDecisionEntrySHA) && piBridgeBytesMatch(impl, piTaskDecisionImplSHA) ||
+		!decision && piBridgeBytesMatch(entry, piFreshTaskWorkEntrySHA) && piBridgeBytesMatch(impl, piFreshTaskWorkImplSHA) {
+		return entry
 	}
-	defer file.Close()
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0444 == 0 || info.Size() > maxSize {
-		return false
-	}
-	data, err := io.ReadAll(io.LimitReader(file, maxSize+1))
-	sum := sha256.Sum256(data)
-	return err == nil && len(data) <= maxSize && hex.EncodeToString(sum[:]) == digest
+	return ""
 }

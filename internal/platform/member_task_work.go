@@ -18,6 +18,7 @@ import (
 type taskWorkToolBinding struct {
 	delivery domain.TaskWorkDelivery
 	attempt  domain.TaskAttempt
+	decision *taskDecisionGrant // Nil for the original four-tool profile.
 }
 
 func (s *MemberTools) FreshTaskWorkEnabled() bool {
@@ -51,17 +52,31 @@ func taskWorkOwnerMatchesScope(scope store.MemberToolScope, work domain.TaskWork
 		work.MemberID == scope.MemberID && work.OwnerMemberID == scope.MemberID && work.ConversationID == scope.ConversationID && work.TopicID == scope.TopicID
 }
 
+func (b *taskWorkToolBinding) operations() []string {
+	if b.decision != nil {
+		return provider.PiFreshTaskDecisionToolNames()
+	}
+	return provider.PiFreshTaskWorkToolNames()
+}
+
 func (entry memberToolRegistration) taskWorkProfileValid() bool {
 	b := entry.taskWork
 	return b != nil && entry.role == (store.CoordinationToolScope{}) && entry.purpose == "" && entry.investigationOwner == nil && entry.workReport == nil &&
-		taskWorkMatchesScope(entry.scope, b.delivery) && slices.Equal(entry.grants.Operations, provider.PiFreshTaskWorkToolNames()) &&
+		taskWorkMatchesScope(entry.scope, b.delivery) && slices.Equal(entry.grants.Operations, b.operations()) &&
 		memberToolRuntimeText(b.attempt.ID) && b.attempt.GroupID == b.delivery.GroupID && b.attempt.TaskID == b.delivery.TaskID &&
 		b.attempt.TaskRevision == b.delivery.TaskRevision && b.attempt.TurnID == entry.scope.Claim.TurnID
 }
 
-func (s *MemberTools) issueFreshTaskWork(ctx context.Context, scope store.MemberToolScope, work domain.TaskWorkDelivery) (string, *taskWorkToolBinding, error) {
-	if !s.FreshTaskWorkEnabled() || !taskWorkMatchesScope(scope, work) {
+func (s *MemberTools) issueFreshTaskWork(ctx context.Context, scope store.MemberToolScope, work domain.TaskWorkDelivery, decision bool) (string, *taskWorkToolBinding, error) {
+	if !s.FreshTaskWorkEnabled() || !taskWorkMatchesScope(scope, work) || decision && !s.TaskDecisionProposalsEnabled() {
 		return "", nil, store.ErrMemberToolDenied
+	}
+	if decision {
+		checkCtx, cancel := context.WithTimeout(ctx, memberToolRuntimeVerificationTimeout)
+		defer cancel()
+		if err := s.checkTaskDecisionSchema(checkCtx); err != nil {
+			return "", nil, err
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -83,7 +98,10 @@ func (s *MemberTools) issueFreshTaskWork(ctx context.Context, scope store.Member
 		return "", nil, err
 	}
 	b := &taskWorkToolBinding{delivery: work, attempt: attempt}
-	entry := memberToolRegistration{scope: scope, taskWork: b, grants: MemberToolGrants{Operations: provider.PiFreshTaskWorkToolNames()}}
+	if decision {
+		b.decision = newTaskDecisionGrant()
+	}
+	entry := memberToolRegistration{scope: scope, taskWork: b, grants: MemberToolGrants{Operations: b.operations()}}
 	if ctx.Err() != nil || !entry.taskWorkProfileValid() {
 		return "", nil, store.ErrMemberToolDenied
 	}
@@ -101,6 +119,13 @@ func (s *MemberTools) withFreshTaskWork(token, op string, use func(*coordination
 		return store.ErrMemberToolDenied
 	}
 	if s.FreshTaskWorkEnabled() && entry.taskWorkProfileValid() {
+		if g := entry.taskWork.decision; g != nil && op != "read_work_inputs" {
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			if g.uncertain {
+				return ErrTaskDecisionProposalUnknown
+			}
+		}
 		return use(s.chatEngine, entry.scope)
 	}
 	if s.TaskWorkReportsEnabled() && entry.investigationWorkOwnerValid() {

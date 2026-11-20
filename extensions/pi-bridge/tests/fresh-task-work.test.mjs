@@ -15,6 +15,8 @@ import { loadExtensions, loadSessionSDK, runJSONPrint } from "./pi-loader.mjs";
 const typed = fileURLToPath(new URL("../fresh-task-work.ts", import.meta.url));
 const ordinary = fileURLToPath(new URL("../index.ts", import.meta.url));
 const profile = ["read_work_inputs", "ack_work_input", "hand_back_work_input", "submit_result"];
+const proposal = "propose_task_decision";
+const proposalProof = "a1".repeat(32);
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 const stamp = "2026-11-18T00:00:00.123456789Z";
 const id = "call_fresh|fc_task";
@@ -25,12 +27,15 @@ const payloads = {
   ack_work_input: { input_id: "fixture" },
   hand_back_work_input: { input_id: "other", reason: "超出文本授权" },
   submit_result: { summary: "文本交付" },
+  [proposal]: { kind: "authorization", expected_version: 1, question: "需要周末样本吗？", facts: "已读工作日🧪",
+    recommendation: "先给工作日摘要", choices: ["仅工作日", "加入周末"], authorization: { scope: "读样本", impact: "多两天" } },
 };
 const replies = {
   read_work_inputs: { input_id: "fixture", offset: 5, next_offset: 9, byte_count: 4, complete: false, text: "🧪" },
   ack_work_input: { input_id: "fixture", disposition: "confirmed" },
   hand_back_work_input: { input_id: "other", disposition: "returned" },
   submit_result: { submission_id: "submission", created_at: stamp, artifact_version_count: 0, summary_omitted: true },
+  [proposal]: { decision_request_id: "proposal-fixture", kind: "authorization", version: 2 },
 };
 
 async function load(entry, path, digest) {
@@ -51,7 +56,7 @@ function definitions(loaded) {
 }
 
 function reply(name) {
-  return [name === "submit_result" ? 201 : 200, JSON.stringify(replies[name])];
+  return [name === "submit_result" || name === proposal ? 201 : 200, JSON.stringify(replies[name])];
 }
 
 // Replace http.request before the real SDK loads the extension. No bind(),
@@ -70,7 +75,9 @@ function fakeHTTP(t, respond = name => reply(name)) {
     const req = new EventEmitter();
     req.destroy = () => {};
     req.end = bytes => {
-      sent.push({ name, body: bytes.toString(), key: options.headers["Idempotency-Key"] });
+      sent.push({ name, body: bytes.toString(), key: options.headers["Idempotency-Key"],
+        ...(name === proposal ? { proof: options.headers["X-Agent-Workspace-Task-Decision-Proof"],
+          callID: options.headers["X-Agent-Workspace-Tool-Call-Id"] } : {}) });
       queueMicrotask(() => {
         const [statusCode, body, headers = {}] = respond(name);
         const res = Object.assign(new EventEmitter(), { statusCode, complete: false, destroy() {},
@@ -89,15 +96,16 @@ function fakeHTTP(t, respond = name => reply(name)) {
   return sent;
 }
 
-async function fixture(t) {
-  const path = await privateConfig(t);
+async function fixture(t, decision = false) {
+  const names = decision ? [...profile, proposal] : profile;
+  const path = await privateConfig(t, decision ? { task_decision_proof: proposalProof } : {});
   const issued = await readFile(path);
   const loaded = await load(typed, path, sha(issued));
   const tools = definitions(loaded);
-  assert.deepEqual([...tools.keys()], profile);
+  assert.deepEqual([...tools.keys()], names);
   const invoke = (name, args = payloads[name], toolID = id, signal) => tools.get(name).execute(toolID, args, signal,
     undefined, { sessionManager: { getSessionId: () => runID } });
-  return { path, loaded, invoke };
+  return { path, loaded, invoke, names };
 }
 
 function check(result, value) {
@@ -112,6 +120,7 @@ function checkUnknown(result, sent) {
   });
   assert.match(result.content[0].text, /未知.*不要自动重试/);
   assert.ok(!JSON.stringify(result).includes(TOKEN));
+  assert.ok(!JSON.stringify(result).includes(proposalProof));
   assert.ok(!JSON.stringify(result.details).includes("input_id"));
 }
 
@@ -124,7 +133,7 @@ async function sdkSession(t, fx, modelRuntime) {
     cwd: dir, agentDir: dir,
     model: { id: "fixture", name: "Synthetic", provider: "synthetic", api: "synthetic-no-network", baseUrl: "http://127.0.0.1:1",
       reasoning: false, input: ["text"], contextWindow: 8192, maxTokens: 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
-    thinkingLevel: "off", noTools: "builtin", tools: profile,
+    thinkingLevel: "off", noTools: "builtin", tools: fx.names,
     modelRuntime: modelRuntime ?? new Proxy({}, { get: (_target, name) => deny(String(name)) }),
     sessionManager: SessionManager.inMemory(dir, { id: runID }),
     settingsManager: SettingsManager.inMemory({ retry: { enabled: false }, cacheWarming: "off", enableInstallTelemetry: false }),
@@ -155,6 +164,40 @@ test("real Pi 1.4.0 loader and SDK activate only the four typed tools", async t 
   assert.deepEqual(session.messages, []);
   assert.deepEqual(sent, profile.map(name => ({ name, body: JSON.stringify(payloads[name]),
     key: name === profile[0] ? undefined : sha(name + id) })));
+});
+
+test("Pi SDK activates the proposal only on the exact opted-in fresh text profile", async t => {
+  const sent = fakeHTTP(t);
+  const fx = await fixture(t, true);
+  const session = await sdkSession(t, fx);
+  await session.bindExtensions({ mode: "print" });
+  session.setActiveToolsByName([...fx.names, "list_members", "report_work", "read"]);
+  assert.deepEqual(session.getCallableToolNames(), fx.names);
+  const tool = session.agent.state.tools.find(t => t.name === proposal);
+  const input = payloads[proposal];
+  for (const args of [
+    { ...input, task_id: "forged" }, { ...input, authorization: { ...input.authorization, grant: true } },
+    { ...input, expected_version: Number.MAX_SAFE_INTEGER + 1 }, { ...input, question: "two\nlines" },
+    { ...input, choices: ["同一", " 同一 "] }, { ...input, facts: "字".repeat(683) },
+  ]) assert.throws(() => tool.prepareArguments(args), /参数.*未发送/);
+  check(await tool.execute(id, tool.prepareArguments(input)), replies[proposal]);
+  check(await tool.execute(id, tool.prepareArguments(input)), replies[proposal]);
+  assert.deepEqual(sent, Array.from({ length: 2 }, () => ({ name: proposal, body: JSON.stringify(input),
+    key: sha(proposal + id), callID: id, proof: proposalProof })));
+  assert.deepEqual(session.messages, []);
+});
+
+test("an unknown proposal retains the exact wire identity and locks all later writes", async t => {
+  const sent = fakeHTTP(t, name => name === proposal ? [500, '{"error":{"code":"internal_error","message":"uncertain"}}'] : reply(name));
+  const { invoke } = await fixture(t, true);
+  const first = await invoke(proposal);
+  checkUnknown(first, sent[0]);
+  assert.equal(sent[0].body, JSON.stringify(payloads[proposal]));
+  await assert.rejects(invoke(proposal), error => error.message === first.content[0].text);
+  await assert.rejects(invoke(proposal, { ...payloads[proposal], question: "changed?" }), /阻止后续写入/);
+  check(await invoke("read_work_inputs"), replies.read_work_inputs);
+  for (const name of profile.slice(1)) await assert.rejects(invoke(name), /阻止后续写入/);
+  assert.deepEqual(sent.map(call => call.name), [proposal, "read_work_inputs"]);
 });
 
 // Optional raw, synthetic SDK fixtures for the real Go fixed-adapter tests.

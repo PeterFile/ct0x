@@ -18,11 +18,17 @@ import (
 type FreshTaskWorkLaunch struct {
 	Supports  func(provider.Provider) bool
 	Construct func(context.Context, provider.Provider, provider.FreshTaskWorkBinding) (provider.Executor, error)
+	// A generic builder/preflight cannot be upgraded to proposal authority.
+	taskDecisionAdapter *provider.PiFreshTaskWorkAdapter
 }
 
 func NewPiFreshTaskWorkLaunch(extensionPath string, timeout time.Duration) *FreshTaskWorkLaunch {
 	a := provider.NewPiFreshTaskWorkAdapter(extensionPath, timeout)
-	return &FreshTaskWorkLaunch{Supports: a.Supports, Construct: a.NewExecutor}
+	return &FreshTaskWorkLaunch{Supports: a.Supports, Construct: a.NewExecutor, taskDecisionAdapter: &a}
+}
+
+func (l *FreshTaskWorkLaunch) SupportsTaskDecision(selected provider.Provider) bool {
+	return l != nil && l.taskDecisionAdapter != nil && l.taskDecisionAdapter.SupportsTaskDecision(selected)
 }
 
 type taskWorkRun struct {
@@ -80,7 +86,7 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 		return unknown
 	}
 	if investigation == nil {
-		if !s.freshTaskWork.Supports(e.plan.selected) {
+		if !e.supportsTextProfile() {
 			return unknown
 		}
 	} else if r.investigationTaskWork == nil || !r.investigationTaskWork.Supports(e.plan.selected, copyPiFreshInvestigationProfile(investigation.profile)) {
@@ -101,7 +107,7 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	var token string
 	var bound *taskWorkToolBinding
 	if investigation == nil {
-		token, bound, err = s.issueFreshTaskWork(ctx, scope, e.plan.delivery)
+		token, bound, err = s.issueFreshTaskWork(ctx, scope, e.plan.delivery, e.plan.taskDecision)
 		if err == nil {
 			launch.AttemptID = bound.attempt.ID
 		}
@@ -123,27 +129,49 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	validStartupFiles := func() bool { return validRunFiles() && workspace.valid(cwd) }
 	var native provider.Executor
 	if investigation == nil {
-		config, err = r.createConfig(token)
-		if err != nil {
-			return unknown
+		var digest [sha256.Size]byte
+		construct := s.freshTaskWork.Construct
+		if grant := bound.decision; grant != nil {
+			data, err := provider.PiFreshTaskDecisionConfig(r.endpoint, token, grant.proof)
+			if err != nil {
+				return unknown
+			}
+			config, err = r.writeConfig(data)
+			if err != nil {
+				return unknown
+			}
+			digest, construct = config.digest, s.freshTaskWork.taskDecisionAdapter.NewTaskDecisionExecutor
+		} else {
+			config, err = r.createConfig(token)
+			if err != nil {
+				return unknown
+			}
+			digest = provider.FreshTaskWorkConfigSHA256(r.endpoint, token)
 		}
 		bootstrap := provider.FreshTaskWorkBinding{
-			ConfigPath: filepath.Join(r.configRoot, config.name), ConfigSHA256: provider.FreshTaskWorkConfigSHA256(r.endpoint, token),
-			RunID: claim.TurnID, Operations: provider.PiFreshTaskWorkToolNames(),
+			ConfigPath: filepath.Join(r.configRoot, config.name), ConfigSHA256: digest,
+			RunID: claim.TurnID, Operations: bound.operations(),
 		}
 		validTextFiles := func() bool {
+			if bound.decision != nil {
+				return config.digestMatches() && validStartupFiles()
+			}
 			return config.valid() && provider.FreshTaskWorkConfigMatches(bootstrap.ConfigPath, bootstrap.ConfigSHA256) &&
 				config.valid() && validStartupFiles()
 		}
 		if !e.preflight(ctx, launch, token, bound, validTextFiles, nil) {
 			return unknown
 		}
-		native, err = s.freshTaskWork.Construct(ctx, e.plan.selected, bootstrap)
-		if err != nil || nilTaskWorkExecutor(native) || !s.freshTaskWork.Supports(e.plan.selected) {
+		native, err = construct(ctx, e.plan.selected, bootstrap)
+		if err != nil || nilTaskWorkExecutor(native) || !e.supportsTextProfile() {
 			return unknown
 		}
 		if !e.preflight(ctx, launch, token, bound, validTextFiles, owner) {
 			native = nil
+		} else if bound.decision != nil {
+			// Set only after the final commit, never on the construction/preflight
+			// path. The HTTP gate additionally requires durable native acceptance.
+			bound.decision.admitted.Store(true)
 		}
 	} else {
 		issued, err := e.createInvestigationTaskWorkConfig(ctx, launch, token)
@@ -178,7 +206,20 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	if investigation != nil {
 		raw.NativeRef = nil // This profile must not record a #193 session binding.
 	}
+	// Revoke drained the callbacks. Even a missing native marker or later
+	// successful terminal cannot turn an opaque Engine error into settlement.
+	if bound != nil && bound.decision != nil && bound.decision.uncertain {
+		raw.Outcome, raw.Reason = provider.OutcomeUnknown, ErrTaskDecisionProposalUnknown.Error()
+	}
 	return raw
+}
+
+func (e *taskWorkRun) supportsTextProfile() bool {
+	launch := &e.base.runtime.tools.freshTaskWork
+	if e.plan.taskDecision {
+		return launch.SupportsTaskDecision(e.plan.selected)
+	}
+	return launch.Supports(e.plan.selected)
 }
 
 func nilTaskWorkExecutor(executor provider.Executor) bool {
