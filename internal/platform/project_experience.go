@@ -31,6 +31,12 @@ func (s *LocalUser) SearchProjectExperiences(ctx context.Context, groupID string
 // is not registered as an HTTP/MCP tool. Lookup is not authorization for later
 // source reads; use the unchanged exact readers with their own fences.
 func (s *MemberTools) LookupProjectExperiences(ctx context.Context, token string, query ProjectExperienceQuery) (ProjectExperiencePage, error) {
+	return s.lookupProjectExperiencesWithArtifactPin(ctx, token, query, nil)
+}
+
+// lookupProjectExperiencesWithArtifactPin is for trusted native composition.
+// A non-nil pin is independently approved and only narrows an existing grant.
+func (s *MemberTools) lookupProjectExperiencesWithArtifactPin(ctx context.Context, token string, query ProjectExperienceQuery, artifactPin *domain.ArtifactVersionRef) (ProjectExperiencePage, error) {
 	var page ProjectExperiencePage
 	err := s.withAuthorized(ctx, token, "read_history", func(scope store.MemberToolScope, grants MemberToolGrants) error {
 		var grant *MemberArtifactGrant
@@ -38,9 +44,9 @@ func (s *MemberTools) LookupProjectExperiences(ctx context.Context, token string
 			grant = grants.Artifacts
 		}
 		var err error
-		page, err = s.db.SearchProjectExperiencesForTool(ctx, scope, grant != nil, query)
+		page, err = s.db.SearchProjectExperiencesForTool(ctx, scope, grant != nil, query, artifactPin)
 		if err == nil {
-			err = s.verifyProjectExperienceArtifacts(ctx, scope, grant, page)
+			err = s.verifyProjectExperienceArtifacts(ctx, scope, grant, page, artifactPin)
 		}
 		// A committed scope change during blob I/O wins even over a read error.
 		if authErr := s.db.ValidateMemberTool(ctx, scope); authErr != nil {
@@ -58,7 +64,7 @@ func (s *MemberTools) LookupProjectExperiences(ctx context.Context, token string
 // page rather than dropping only an unreadable retirement or altering ranking.
 const maxProjectExperienceArtifactChecks = 4
 
-func (s *MemberTools) verifyProjectExperienceArtifacts(ctx context.Context, scope store.MemberToolScope, grant *MemberArtifactGrant, page ProjectExperiencePage) error {
+func (s *MemberTools) verifyProjectExperienceArtifacts(ctx context.Context, scope store.MemberToolScope, grant *MemberArtifactGrant, page ProjectExperiencePage, artifactPin *domain.ArtifactVersionRef) error {
 	seen := make(map[domain.ArtifactVersionRef]bool)
 	var refs []domain.ArtifactVersionRef
 	add := func(pin *domain.ProjectExperienceOutcome) {
@@ -77,7 +83,7 @@ func (s *MemberTools) verifyProjectExperienceArtifacts(ctx context.Context, scop
 		return fmt.Errorf("%w：项目经验包含过多成果版本，请缩小检索范围", store.ErrInvalid)
 	}
 	for _, ref := range refs {
-		if grant == nil {
+		if grant == nil || (artifactPin != nil && ref != *artifactPin) {
 			return store.ErrMemberToolDenied
 		}
 		if _, err := s.readMemberArtifact(ctx, scope, grant, MemberArtifactReadInput{
