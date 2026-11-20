@@ -79,6 +79,7 @@ type Preparer struct {
 	investigation             *investigationPreparationSettings
 	enableNativeSessionResume bool
 	nativePiThinking          string
+	threadDecisionHandoff     bool // Set only by trusted startup, before serving.
 }
 
 var (
@@ -257,12 +258,16 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			return empty, err
 		}
 	}
+	if intake && p.threadDecisionHandoff && selection.Protocol == provider.CodexAppServerProtocol &&
+		member.Workspace == "" && trigger.SourceKind == "local_user_chat" && trigger.SenderID == "user" && trigger.SourceID != "" && len(trigger.Deliveries) == 1 {
+		intakeSchema.threadDecision = &threadDecisionIntakeGrant{}
+	}
 	// Native text bindings record tool names, not dynamic intake schemas.
 	// Keep Pi intake on the fresh path when it changes the #193 send_message contract.
 	piText := p.piNativeSessionConfigured(selected) && !intakeSchema.requiresIssuedPiConfig() &&
 		!(intake && p.memberTools.tools.continueWorkEnabled())
 	// Only the ordinary v30 Codex intake can resume, never Review-derived repair.
-	codexIntake := intake && p.codexNativeIntakeConfigured(selected) && preparationRepairReviewID(trigger) == ""
+	codexIntake := intake && p.codexNativeIntakeConfigured(selected) && intakeSchema.threadDecision == nil && preparationRepairReviewID(trigger) == ""
 	if useMemberTools && (piText || codexIntake) {
 		names, maxMembers = p.memberTools.operations, p.memberTools.maxGroupMembers
 		if intake {
@@ -277,7 +282,7 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			return empty, err
 		}
 	}
-	prompt, err := p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, nativeText, intakeSchema.investigation, repairSource)
+	prompt, err := p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, nativeText, intakeSchema, repairSource)
 	if err != nil {
 		return empty, err
 	}
@@ -416,11 +421,12 @@ func preparationReadError(ctx context.Context, err error) error {
 
 func (p *Preparer) buildContext(group domain.Group, member domain.Member, conversation domain.Conversation,
 	trigger domain.Message, history []domain.Message, useMemberTools bool, repairs ...*domain.ChatRepairSource) ([]byte, error) {
-	return p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, false, false, repairs...)
+	return p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, false, memberToolIntakeSchema{}, repairs...)
 }
 
 func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Member, conversation domain.Conversation,
-	trigger domain.Message, history []domain.Message, useMemberTools, nativeText, investigationIntake bool, repairs ...*domain.ChatRepairSource) ([]byte, error) {
+	trigger domain.Message, history []domain.Message, useMemberTools, nativeText bool, intakeSchema memberToolIntakeSchema, repairs ...*domain.ChatRepairSource) ([]byte, error) {
+	investigationIntake := intakeSchema.investigation
 	metadata := struct {
 		Group        domain.Group        `json:"group"`
 		Conversation domain.Conversation `json:"conversation"`
@@ -491,6 +497,9 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 				"评估持久化后仍可公开讨论/提案。仅真实用户聊天触发的discuss轮可按list_members返回的实际同群成员ID邀请一个同伴一次；随后成员轮只公开回应，不能递归邀请。每轮额外公开消息最多一条，邀请最多一条；不按姓名猜ID。该讨论路径不授用户权限。",
 				"根据工具outcome区分admitted、not_admitted、discuss、clarify；not_admitted的reason_code/question和原话题说明是持久事实，不能自动加额度、换key重复准入或用模型最终文字改称成功。真正HTTP结果未知时保留原key对账，不自动重试业务操作。",
 				"intake本轮不授予文件IO、Artifact发布或外部动作权限；语义评估登记Task不等于工作成员获准执行。CWD不是主机读取沙箱。Task/分派持久化不等于执行成功，具体Submission不等于用户接纳或Review；最终文字必须有效UTF-8且最多65536字节。",
+			}
+			if intakeSchema.threadDecision != nil {
+				in.Permissions = append(in.Permissions, "仅当本轮获签发的 send_message.intent_assessment 提供 decision_context、原消息是单独发给你的本机用户命令且确需用户决定时，选 clarify 并附 facts、recommendation 和可选 choices。只提一个真实问题；保存待决请求不等于答复、确认已处理或新授权。操作结果未知时保留原调用 id 和内容，先对账，不更换 id 重提。")
 			}
 			if selected := p.providers[member.ProviderID]; selected.Name == provider.Codex || p.piDiscussionSchema {
 				in.Permissions = append(in.Permissions, "若 chat_candidate.message_id 对应的本机用户原文明确要求本次只讨论，优先用 discuss 和 discussion_only_excerpt 逐字引用连续原文，保留空白和标点。不新建或续办工作，不引用历史或成员转述，不自行补写。")

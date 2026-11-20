@@ -22,6 +22,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
 		return nil, nil, nil, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
 	}
+	if err := config.validateThreadDecisionHandoff(); err != nil {
+		return nil, nil, nil, err
+	}
 	if err := config.validateInvestigationOption(); err != nil {
 		return nil, nil, nil, err
 	}
@@ -138,6 +141,12 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 				err = errors.Join(err, tools.Close())
 			}
 			return nil, nil, nil, err
+		}
+	}
+	if config.enableThreadDecisionHandoff {
+		schedulerOptions.PrepareThreadDecision, err = preparer.EnableThreadDecisionHandoff(context.Background())
+		if err != nil {
+			return nil, nil, nil, errors.Join(err, tools.Close())
 		}
 	}
 	if freshTaskWork != nil || investigationTaskWork != nil {

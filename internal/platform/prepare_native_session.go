@@ -178,7 +178,8 @@ func (p *Preparer) piIntakeChangesNativeSchema() bool {
 // Provider-wide reporting describes the process configuration only. It cannot
 // assert any member's model, claim, resources, or resumable history.
 func (p *Preparer) nativeReportTools(selected provider.Provider) []string {
-	if p.codexNativeIntakeConfigured(selected) {
+	if p.codexNativeIntakeConfigured(selected) && !p.threadDecisionHandoff {
+		// The opt-in handoff schema on eligible turns is not the v30 profile.
 		return chatIntakeOperations()
 	}
 	if !p.piNativeSessionConfigured(selected) {

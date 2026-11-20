@@ -111,20 +111,21 @@ func validWorkInputID(id string) bool {
 
 // Select strict scalar decoding before Go JSON replacement characters can
 // alias verbatim source text or an MCP request binding.
-func memberToolSendAssessmentFields(body []byte) (continuation, excerpt bool) {
+func memberToolSendAssessmentFields(body []byte) (continuation, excerpt, decision bool) {
 	var probe struct {
 		Assessment struct {
 			Disposition string          `json:"disposition"`
 			Excerpt     json.RawMessage `json:"discussion_only_excerpt"`
+			Decision    json.RawMessage `json:"decision_context"`
 		} `json:"intent_assessment"`
 	}
 	err := json.Unmarshal(body, &probe)
-	return err == nil && probe.Assessment.Disposition == "continue_work", probe.Assessment.Excerpt != nil
+	return err == nil && probe.Assessment.Disposition == "continue_work", probe.Assessment.Excerpt != nil, probe.Assessment.Decision != nil
 }
 
 func sendMessageNeedsScalars(body []byte) bool {
-	continuation, excerpt := memberToolSendAssessmentFields(body)
-	return continuation || excerpt
+	continuation, excerpt, decision := memberToolSendAssessmentFields(body)
+	return continuation || excerpt || decision
 }
 
 func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Request, token string, raw json.RawMessage, content memberToolField[string], key string) (domain.ChatAssessmentReceipt, bool) {
