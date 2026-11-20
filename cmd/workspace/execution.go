@@ -99,6 +99,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			options.RoleThinking = config.roleThinking
 		}
 		toolOptions.FreshTaskWork = freshTaskWork
+		toolOptions.EnablePiTaskDecisionProposals = config.enablePiTaskDecisionProposals
 		switch {
 		case config.enableInvestigationOwnerManagement:
 			tools, err = platform.NewMemberToolRuntimeWithInvestigationOwnerManagement(db, toolOptions, engine,
