@@ -875,8 +875,9 @@ func TestIntentPumpSchedulerBeginBusyRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	started := make(chan provider.ExecuteRequest, 1)
-	e := pumpSchedulerExecutor(func(_ context.Context, request provider.ExecuteRequest, _ func(provider.Event) error) provider.ExecutionReceipt {
+	e := pumpSchedulerExecutor(func(ctx context.Context, request provider.ExecuteRequest, _ func(provider.Event) error) provider.ExecutionReceipt {
 		started <- request
+		<-ctx.Done()
 		return pumpSchedulerSuccess()
 	})
 	r := pumpSchedulerStart(t, f, options, pumpSchedulerPrepare(e))
@@ -910,6 +911,10 @@ func TestIntentPumpSchedulerBeginBusyRecovery(t *testing.T) {
 	}
 	pumpSchedulerAdvance(t, r, advance)
 	call := pumpSchedulerReceive(t, started)
+	// Let the next intent scan finish and park the scheduler at its callback gate.
+	if report := pumpSchedulerReceive(t, reports); report.err != nil {
+		t.Fatalf("post-start intent pass failed: %v", report.err)
+	}
 	r.cancel()
 	pumpSchedulerReceive(t, r.done)
 	turn, err := f.s.GetTurn(context.Background(), request.GroupID, call.RunID)
