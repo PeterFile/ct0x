@@ -24,12 +24,37 @@ func (s *Store) ApplyChatAssessmentDormant(ctx context.Context, scope MemberTool
 	return s.applyChatAssessment(ctx, scope, candidateID, input, content, key, true, nil)
 }
 
-func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, dormant bool, clarification *decisionClarificationCapture) (domain.ChatAssessmentReceipt, error) {
-	tx, err := s.beginMemberToolTx(ctx, scope)
+func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, dormant bool, clarification *decisionClarificationCapture) (_ domain.ChatAssessmentReceipt, err error) {
+	const action = "记录聊天评估失败"
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return domain.ChatAssessmentReceipt{}, memberToolOperationError("记录聊天评估失败", err)
+		return domain.ChatAssessmentReceipt{}, memberToolOperationError(action, err)
 	}
-	defer tx.Rollback()
+	// The first-write scope fence must be inside the checked rollback boundary.
+	phase := "scope"
+	defer func() {
+		rollback := tx.Rollback()
+		// Leave confirmed rejections in their original categories for all callers.
+		if err != nil && (phase == "commit" || rollback != nil) {
+			err = taskWorkMutationFailure(action, phase, err, rollback)
+		}
+	}()
+	if err := memberToolScopeInTx(ctx, tx, scope); err != nil {
+		return domain.ChatAssessmentReceipt{}, memberToolOperationError(action, err)
+	}
+	phase = "mutation"
+	receipt, err := s.applyChatAssessmentInTx(ctx, tx, scope, candidateID, input, content, key, dormant, clarification)
+	if err != nil {
+		return domain.ChatAssessmentReceipt{}, err
+	}
+	phase = "commit" // Also covers lookups of an original idempotent receipt.
+	if err := tx.Commit(); err != nil {
+		return domain.ChatAssessmentReceipt{}, err
+	}
+	return receipt, nil
+}
+
+func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, dormant bool, clarification *decisionClarificationCapture) (domain.ChatAssessmentReceipt, error) {
 	if err := denyTaskWorkFallbackInTx(ctx, tx, scope.Claim.TurnID); err != nil {
 		return domain.ChatAssessmentReceipt{}, memberToolOperationError("验证聊天轮次失败", err)
 	}
@@ -85,9 +110,6 @@ func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, 
 				return domain.ChatAssessmentReceipt{}, decisionRequestError("读取话题待决事项失败", err)
 			}
 		}
-		if err := tx.Commit(); err != nil {
-			return domain.ChatAssessmentReceipt{}, admissionError("读取聊天评估回执失败", err)
-		}
 		return receipt, nil
 	}
 	if err := chatIntakePurposeInTx(ctx, tx, scope, candidateID); err != nil {
@@ -119,7 +141,7 @@ func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, 
 					return domain.ChatAssessmentReceipt{}, err
 				}
 				// Reserve this transport key, not a second evaluation or notice.
-				return commitChatAssessmentInTx(ctx, tx, mutation, payload, prior)
+				return recordChatAssessmentKeyInTx(ctx, tx, mutation, payload, prior)
 			}
 			if !errors.Is(err, sql.ErrNoRows) {
 				return domain.ChatAssessmentReceipt{}, admissionError("读取原工作输入回执失败", err)
@@ -297,16 +319,13 @@ func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		}
 		receipt.WorkDeliveryID, receipt.WorkWakeMessageID = wake.DeliveryID, wake.MessageID
 	}
-	return commitChatAssessmentInTx(ctx, tx, mutation, payload, receipt)
+	return recordChatAssessmentKeyInTx(ctx, tx, mutation, payload, receipt)
 }
 
-func commitChatAssessmentInTx(ctx context.Context, tx *sql.Tx, mutation mutationScope, payload []byte, receipt domain.ChatAssessmentReceipt) (domain.ChatAssessmentReceipt, error) {
+func recordChatAssessmentKeyInTx(ctx context.Context, tx *sql.Tx, mutation mutationScope, payload []byte, receipt domain.ChatAssessmentReceipt) (domain.ChatAssessmentReceipt, error) {
 	if err := coordinationDispatchWrite(ctx, tx, `INSERT INTO mutation_idempotency(operation,actor_id,group_id,idempotency_key,payload,record_id) VALUES(?,?,?,?,?,?)`,
 		mutation.operation, mutation.actorID, mutation.groupID, mutation.key, payload, receipt.ID); err != nil {
 		return domain.ChatAssessmentReceipt{}, admissionError("保存聊天评估回执失败", err)
-	}
-	if err := tx.Commit(); err != nil {
-		return domain.ChatAssessmentReceipt{}, admissionError("保存聊天准入失败", err)
 	}
 	return receipt, nil
 }
