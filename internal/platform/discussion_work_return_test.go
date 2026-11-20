@@ -119,6 +119,7 @@ func TestDiscussionWorkReturnPreparerNoFallback(t *testing.T) {
 	r, message := f.seedReturn(t)
 
 	private, cli := t.TempDir(), filepath.Join(t.TempDir(), "metadata-only-pi")
+	roleOK(t, os.Chmod(private, 0700))
 	roleOK(t, os.WriteFile(cli, nil, 0700))
 	prep, err := platform.NewPreparer(f.db, platform.PrepareOptions{PrivateWorkspaceRoot: private,
 		Providers: []provider.Provider{{ID: f.worker.ProviderID, Name: provider.Pi, Version: "1.4.0", Installation: provider.Installed, Path: cli}}})
