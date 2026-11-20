@@ -438,7 +438,7 @@ func coordinationDecideWrapped(t *testing.T, path string, mode string, cause err
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, schemaVersion: len(migrations)}
 	t.Cleanup(func() { s.Close() })
 	return s, d
 }

@@ -123,7 +123,7 @@ func assignmentQueryStore(t *testing.T, path string) *assignmentRecorder {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	r.s = &Store{db: db}
+	r.s = &Store{db: db, schemaVersion: len(migrations)}
 	t.Cleanup(func() { r.s.Close() })
 	return r
 }
