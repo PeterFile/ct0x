@@ -910,6 +910,10 @@ func TestIntentPumpSchedulerBeginBusyRecovery(t *testing.T) {
 	}
 	pumpSchedulerAdvance(t, r, advance)
 	call := pumpSchedulerReceive(t, started)
+	// Let the next intent scan finish and park the scheduler at its callback gate.
+	if report := pumpSchedulerReceive(t, reports); report.err != nil {
+		t.Fatalf("post-start intent pass failed: %v", report.err)
+	}
 	r.cancel()
 	pumpSchedulerReceive(t, r.done)
 	turn, err := f.s.GetTurn(context.Background(), request.GroupID, call.RunID)
