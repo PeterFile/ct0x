@@ -582,8 +582,17 @@ while [ -f "$root/hold" ]`), 1)
 			claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
 			request := prepared.Request
 			request.RunID, request.RuntimeDir = turn.ID, filepath.Join(f.dir, "runtime")
-			if strings.Contains(request.Prompt, f.pin.VersionID) != (fresh && approved) || !strings.Contains(request.Prompt, artifactGrantBody) {
-				t.Fatal("prompt lost the original body or leaked a pin from another delivery/profile")
+			if !strings.Contains(request.Prompt, artifactGrantBody) {
+				t.Fatal("startup prompt lost the original body")
+			}
+			for _, value := range []string{"artifact_read_grant", f.pin.ArtifactID, f.pin.VersionID} {
+				if strings.Contains(request.Prompt, value) {
+					t.Fatal("startup prompt exposed the server-side artifact approval")
+				}
+			}
+			const orderedRead = "先用 lookup_project_experiences 检索，从返回结果确认来源及成果版本，再用 read_artifact"
+			if strings.Contains(request.Prompt, orderedRead) != (fresh && approved) {
+				t.Fatal("lookup-before-read guidance did not match the issued profile")
 			}
 			if mode == "stale claim backlink" {
 				_, err := f.raw.Exec("UPDATE deliveries SET turn_id='wrong' WHERE id=?", d.ID)

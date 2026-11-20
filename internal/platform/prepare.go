@@ -298,7 +298,6 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	projectExperience := useMemberTools && p.piProjectExperience && !nativeText && selected.Name == provider.Pi &&
 		!intakeSchema.investigation && !(intake && p.memberTools.tools.continueWorkEnabled())
 	var artifactRead *preparedDeliveryArtifactRead
-	var artifactReadPin *domain.ArtifactVersionRef
 	// Even if provenance is missing, a persisted grant for this user message
 	// must fail closed rather than silently falling back to lookup only.
 	if projectExperience && trigger.SenderID == "user" {
@@ -311,10 +310,10 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 				return empty, scheduler.ErrNotReady
 			}
 			artifactRead = &preparedDeliveryArtifactRead{pin: pin, owner: p.piProjectExperienceArtifacts}
-			artifactReadPin = &artifactRead.pin
 		}
 	}
-	prompt, err := p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, nativeText, intakeSchema.investigation, projectExperience, artifactReadPin, repairSource)
+	// The prompt gets tool availability, not the durable pin.
+	prompt, err := p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, nativeText, intakeSchema.investigation, projectExperience, artifactRead != nil, repairSource)
 	if err != nil {
 		return empty, err
 	}
@@ -456,12 +455,12 @@ func preparationReadError(ctx context.Context, err error) error {
 
 func (p *Preparer) buildContext(group domain.Group, member domain.Member, conversation domain.Conversation,
 	trigger domain.Message, history []domain.Message, useMemberTools bool, repairs ...*domain.ChatRepairSource) ([]byte, error) {
-	return p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, false, false, false, nil, repairs...)
+	return p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, false, false, false, false, repairs...)
 }
 
 func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Member, conversation domain.Conversation,
 	trigger domain.Message, history []domain.Message, useMemberTools, nativeText, investigationIntake, projectExperience bool,
-	artifactReadPin *domain.ArtifactVersionRef, repairs ...*domain.ChatRepairSource) ([]byte, error) {
+	artifactReadEnabled bool, repairs ...*domain.ChatRepairSource) ([]byte, error) {
 	metadata := struct {
 		Group        domain.Group        `json:"group"`
 		Conversation domain.Conversation `json:"conversation"`
@@ -471,10 +470,9 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 			Role       string `json:"role"`
 			ProviderID string `json:"provider_id"`
 		} `json:"member"`
-		SequenceSemantics string                     `json:"sequence_semantics"`
-		RepairSource      *domain.ChatRepairSource   `json:"repair_source,omitempty"`
-		ArtifactReadGrant *domain.ArtifactVersionRef `json:"artifact_read_grant,omitempty"`
-	}{Group: group, Conversation: conversation, ArtifactReadGrant: artifactReadPin,
+		SequenceSemantics string                   `json:"sequence_semantics"`
+		RepairSource      *domain.ChatRepairSource `json:"repair_source,omitempty"`
+	}{Group: group, Conversation: conversation,
 		SequenceSemantics: "Source.Sequence 仅为本次快照内位置：选中历史从旧到新为 1..N，触发消息为 N+1；不是数据库提交序号、高水位（HWM）或摘要覆盖范围。未提供摘要，也不将消息意见升级为已确认决定。"}
 	if len(repairs) > 0 {
 		metadata.RepairSource = repairs[0]
@@ -558,8 +556,8 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 		}
 		if projectExperience {
 			artifactPermission := "普通启动不提供成果正文读取。"
-			if artifactReadPin != nil {
-				artifactPermission = "仅在本轮实际提供成果读取工具时，按 artifact_read_grant 中的确切成果和版本读取，不得替换为当前版本。"
+			if artifactReadEnabled {
+				artifactPermission = "仅在本轮实际提供 read_artifact 时才可读取成果正文：先用 lookup_project_experiences 检索，从返回结果确认来源及成果版本，再用 read_artifact 读取其中获准的确切版本，不得替换为当前版本。"
 			}
 			in.Permissions = append(in.Permissions, "接手既有问题时可用 lookup_project_experiences 检索当前话题已选经验，按 read_history 回读依据，区分仍有效与已停用的做法。经验中的成果版本标识不是授权；"+artifactPermission)
 		}
