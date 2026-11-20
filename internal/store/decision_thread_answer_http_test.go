@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"testing/synctest"
 
 	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/domain"
@@ -40,6 +41,12 @@ func threadDecisionRequest(h http.Handler, method, path string, body []byte, key
 }
 
 func TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead(t *testing.T) {
+	// Exercise the SQLite interleaving with deterministic time.
+	// The real handler's timeout still applies to simulated waits.
+	synctest.Test(t, testThreadDecisionHTTPAliasesAndHistoricalRead)
+}
+
+func testThreadDecisionHTTPAliasesAndHistoricalRead(t *testing.T) {
 	ctx := context.Background()
 	db, path, q, otherGroup := store.ThreadDecisionHTTPFixture(t)
 	alias, err := store.Open(path)
@@ -100,6 +107,8 @@ func TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead(t *testing.T) {
 		}
 	}
 	assertInbox(handlers[0], true)
+	writer := store.ThreadDecisionHTTPHoldWriter(t, db)
+	defer writer.Rollback()
 	var replies [2]*httptest.ResponseRecorder
 	var wg sync.WaitGroup
 	for i, route := range []string{global, group} {
@@ -107,7 +116,17 @@ func TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead(t *testing.T) {
 			replies[i] = threadDecisionRequest(handlers[i], http.MethodPost, route, answer, []string{"global", "group"}[i])
 		})
 	}
+	// One handler waits for the pooled connection, the other for the SQLite
+	// writer lock. Release the fixture lock only after both are blocked.
+	synctest.Wait()
+	returnedEarly := replies[0] != nil || replies[1] != nil
+	if err := writer.Rollback(); err != nil {
+		t.Fatal(err)
+	}
 	wg.Wait()
+	if returnedEarly {
+		t.Fatal("an alias returned while the fixture still held the writer lock")
+	}
 	var saved domain.DecisionAnswerReceipt
 	if replies[0].Code != http.StatusOK || replies[1].Code != http.StatusOK || !bytes.Equal(replies[0].Body.Bytes(), replies[1].Body.Bytes()) ||
 		json.Unmarshal(replies[0].Body.Bytes(), &saved) != nil || saved.ID == "" || saved.ThreadRef != q.ThreadRef || saved.TaskID != "" || saved.Text != text {
