@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -185,6 +186,9 @@ func publishSettledTurnReply(ctx context.Context, tx *sql.Tx, turn *domain.Turn)
 		if duplicate {
 			return nil // Keep the explicit send without linking it as a native reply.
 		}
+		if duplicate, err := hasMatchingDiscussNotice(ctx, tx, turn, topicID); err != nil || duplicate {
+			return err // An assessment notice keeps its own provenance, too.
+		}
 	}
 	return insertTurnReply(ctx, tx, turn, topicID)
 }
@@ -229,6 +233,60 @@ func hasMatchingOrdinaryTurnSend(ctx context.Context, tx *sql.Tx, turn *domain.T
 	var untyped bool
 	err = tx.QueryRowContext(ctx, `SELECT NOT EXISTS(SELECT 1 FROM task_work_deliveries WHERE delivery_id=?)`, turn.DeliveryID).Scan(&untyped)
 	return untyped, err
+}
+
+// Start from the unique candidate for this Turn and follow the assessment's
+// notice link. The assessment was fenced against the original intake claim;
+// a recovered Turn's current token need not match that historical claim.
+// Legacy input without a command row must stay unknown with an empty source
+// ID. Only that path can match a receipt with its source ID absent or null.
+const discussNoticeTurnReplyMatch = `SELECT EXISTS(
+ SELECT 1 FROM chat_candidates c
+ CROSS JOIN chat_assessments a ON a.candidate_id=c.id
+ CROSS JOIN chat_intake_executions i ON i.candidate_id=c.id AND i.turn_id=c.turn_id AND i.purpose='` + domain.ChatIntakePurpose + `'
+ LEFT JOIN message_command_sources source ON source.message_id=c.message_id
+ CROSS JOIN deliveries incoming ON incoming.id=? AND incoming.turn_id=c.turn_id AND incoming.conversation_id=?
+    AND (incoming.message_id,incoming.group_id,incoming.topic_id,incoming.recipient_id)=(c.message_id,c.group_id,c.topic_id,c.member_id)
+ CROSS JOIN messages m ON m.id=a.notice_message_id AND m.group_id=c.group_id AND m.topic_id=c.topic_id AND m.sender_id=c.member_id
+ WHERE c.turn_id=? AND c.group_id=? AND c.topic_id=? AND c.member_id=?
+   AND incoming.state='accepted'
+   AND ((source.message_id IS NULL AND i.source_kind='unknown' AND i.source_id='')
+     OR (i.source_id<>'' AND source.kind IN ('local_user_chat','member') AND source.id=i.source_id AND source.kind=i.source_kind))
+   AND typeof(i.claim_digest)='blob' AND length(i.claim_digest)=32
+   AND m.content COLLATE BINARY=?
+   AND a.decision_id IS NULL AND a.dispatch_request_id IS NULL
+   AND json_extract(a.receipt_json,'$.disposition') IS 'discuss'
+   AND json_extract(a.receipt_json,'$.outcome') IS 'discuss'
+   AND json_extract(a.receipt_json,'$.id') IS a.id
+   AND json_extract(a.receipt_json,'$.notice_message_id') IS m.id
+   AND json_extract(a.receipt_json,'$.candidate_id') IS c.id
+   AND json_extract(a.receipt_json,'$.turn_id') IS c.turn_id
+   AND json_extract(a.receipt_json,'$.group_id') IS c.group_id
+   AND json_extract(a.receipt_json,'$.topic_id') IS c.topic_id
+   AND json_extract(a.receipt_json,'$.assessed_by') IS c.member_id
+   AND json_extract(a.receipt_json,'$.message_id') IS c.message_id
+   AND json_extract(a.receipt_json,'$.purpose') IS i.purpose
+   AND coalesce(json_extract(a.receipt_json,'$.source_id'),'') IS i.source_id
+   AND json_extract(a.receipt_json,'$.source_kind') IS i.source_kind
+   AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.message_id=m.id)
+   AND NOT EXISTS(SELECT 1 FROM coordination_dispatch_state WHERE delivery_id=incoming.id)
+   AND NOT EXISTS(SELECT 1 FROM coordination_assignment_dispatch WHERE delivery_id=incoming.id)
+)`
+
+func hasMatchingDiscussNotice(ctx context.Context, tx *sql.Tx, turn *domain.Turn, topicID string) (bool, error) {
+	var duplicate bool
+	err := tx.QueryRowContext(ctx, discussNoticeTurnReplyMatch, turn.DeliveryID, turn.ConversationID,
+		turn.ID, turn.GroupID, topicID, turn.MemberID, turn.CandidateText).Scan(&duplicate)
+	if err != nil || !duplicate {
+		return false, err
+	}
+	// Even a damaged typed marker vetoes suppression. The shared check also
+	// handles schemas installed before typed work deliveries existed.
+	err = denyTaskWorkFallbackInTx(ctx, tx, turn.ID)
+	if errors.Is(err, ErrMemberToolDenied) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func publishTurnReply(ctx context.Context, tx *sql.Tx, turn *domain.Turn) error {

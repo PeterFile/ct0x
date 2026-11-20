@@ -84,6 +84,18 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 			return domain.ChatCandidate{}, memberToolOperationError("读取原任务提示失败", err)
 		}
 	}
+	if p := candidate.Policy.Investigation; p != nil && len(p.ClueTerms) > 0 && s.investigationExecution.Load() {
+		proposal := domain.ChatAssessment{Disposition: "prepare_work", Action: domain.ChatActionReadOnlyInvestigation}
+		err := chatAdmissionGateInTx(ctx, tx, candidate, proposal)
+		if err == nil {
+			_, err = s.chatInvestigationAdmissionInTx(ctx, tx, scope, candidate, proposal)
+		}
+		var denial *chatNonAdmission
+		if err != nil && !errors.As(err, &denial) && !errors.Is(err, ErrMemberToolDenied) {
+			return domain.ChatCandidate{}, memberToolOperationError("核对只读调查线索失败", err)
+		}
+		candidate.InvestigationClueMatched = err == nil
+	}
 	if err := tx.Commit(); err != nil {
 		return domain.ChatCandidate{}, memberToolOperationError("保存聊天候选失败", err)
 	}

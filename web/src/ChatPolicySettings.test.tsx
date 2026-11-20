@@ -366,6 +366,35 @@ it("explicitly saves a same-group exact version scope before runtime readiness w
   expect(currentPolicy()).toHaveTextContent("调查运行时：未启用");
   expect(currentPolicy()).not.toHaveTextContent(/调查已执行|调查已提交|调查已接纳/);
 });
+it("preserves configured clue boundaries on a budget-only edit and an exact unknown retry", async () => {
+  const clue_terms = [" 导出", "只有表头"];
+  const investigation = { ...topicScope, clue_terms };
+  saved.set(policyURL(), { ...workspacePolicy(1, false), ...opts, investigation });
+  await open();
+  const terms = form().getByRole("textbox", { name: "调查线索词组（可选）" });
+  expect(terms).toHaveValue(clue_terms.join("\n"));
+  expect(currentPolicy()).toHaveTextContent("只有表头");
+  budget("4");
+  writes.mockRejectedValueOnce(new TypeError("Lost receipt"));
+  submit(); await flush(); const original = attempt(0);
+  expect(JSON.parse(original.body).investigation.clue_terms).toEqual(clue_terms);
+  expect(terms).toBeDisabled();
+  saved.set(policyURL(), { ...workspacePolicy(9, false), ...opts, investigation: { ...topicScope, clue_terms: ["另一组"] } });
+  await readPolicy();
+  expect(terms).toHaveValue(clue_terms.join("\n"));
+  writes.mockResolvedValueOnce(json(receipt(original.body))); submit(); await flush();
+  expect(attempt(1)).toEqual(original);
+  expect(currentPolicy()).toHaveTextContent("另一组");
+});
+it("saves nonempty literal clue phrases without silently stripping blanks or whitespace", async () => {
+  saved.set(policyURL(), { ...workspacePolicy(1, false), ...opts, investigation: topicScope }); await open();
+  const terms = form().getByRole("textbox", { name: "调查线索词组（可选）" });
+  fill(terms, "导出\n\n只有表头"); submit(); await flush();
+  expect(writes).not.toHaveBeenCalled();
+  expect(screen.getByRole("alert")).toHaveTextContent("线索词组");
+  fill(terms, "导出\n只有表头 "); submit(); await flush();
+  expect(JSON.parse(attempt(0).body).investigation.clue_terms).toEqual(["导出", "只有表头 "]);
+});
 it("requires explicit valid materials and prevents overlong objectives or more than 16 exact pairs", async () => {
   saved.set(policyURL(), { ...blank(), ...opts }); await open(); check(investigationChoice);
   fill(goal(), topicScope.objective); submit(); expect(writes).not.toHaveBeenCalled(); expect(screen.getByRole("alert")).toHaveTextContent("资料");

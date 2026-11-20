@@ -180,11 +180,7 @@ func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope M
 	if wantsWork {
 		err := chatAdmissionGateInTx(ctx, tx, candidate, input)
 		if err == nil && input.Action == domain.ChatActionReadOnlyInvestigation {
-			investigationAuthorization, err = s.chatInvestigationAdmissionInTx(ctx, tx, candidate, input)
-			if err == nil {
-				// Keep the live delivery/source fence for unstructured investigations too.
-				_, err = chatDiscussionArrivalInTx(ctx, tx, scope, candidate.ID)
-			}
+			investigationAuthorization, err = s.chatInvestigationAdmissionInTx(ctx, tx, scope, candidate, input)
 		}
 		if err == nil && input.Repair != nil {
 			repair, err = chatRepairAdmissionInTx(ctx, tx, candidate, input)
@@ -212,6 +208,9 @@ func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope M
 		if input.Action == domain.ChatActionReadOnlyInvestigation {
 			input.Title, input.Description, input.Acceptance = chatInvestigationTask(candidate)
 			input.Reason = "按本机用户的当前只读调查策略准备文本交付。"
+			if len(candidate.Policy.Investigation.ClueTerms) > 0 {
+				input.Reason = "原消息符合本机用户配置的只读调查线索词组，仅按本版策略范围准备文本交付。"
+			}
 			receipt.Authority, receipt.AuthorizationMessageID = "written_preauthorization", investigationAuthorization
 		} else if input.Disposition == "prepare_work" {
 			input.Title, input.Description, input.Acceptance = chatSummaryTask(candidate)
@@ -260,6 +259,9 @@ func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope M
 			receipt.RepairLink, receipt.AuthorizationMessageID = link, link.AuthorizationMessageID
 		}
 		kind := "文本任务"
+		if input.Action == domain.ChatActionReadOnlyInvestigation && len(candidate.Policy.Investigation.ClueTerms) > 0 {
+			kind = "只读调查"
+		}
 		if workspace != nil {
 			workspace.TaskID, workspace.TaskRevision, workspace.MandateID = admission.Task.ID, admission.Task.RevisionAtAdmission, admission.Mandate.ID
 			workspace.AssessmentID, workspace.DispatchRequestID = receipt.ID, dispatch.ID
@@ -442,6 +444,19 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 	}
 	if err := chatDiscussionWorkGateInTx(ctx, tx, c); err != nil {
 		return err
+	}
+	if p := current.Investigation; p != nil && len(p.ClueTerms) > 0 && (c.SourceKind == "local_user_chat" || c.SourceKind == "member") {
+		// Omitting the typed excerpt or proposing another action cannot turn
+		// an explicitly discussion-only clue into work.
+		body, err := chatInvestigationClueBodyInTx(ctx, tx, c, input.Disposition != domain.ChatDispositionContinueWork)
+		if err != nil {
+			return err
+		}
+		if input.Disposition == "prepare_work" && input.Action == domain.ChatActionReadOnlyInvestigation && !p.MatchesClue(body) {
+			return chatDeny("preparation_scope_mismatch",
+				fmt.Sprintf("消息 %s（来源 %s）的原文未包含本话题策略版本%d配置的全部只读调查线索词组。", c.MessageID, c.SourceID, current.Revision),
+				"是否先继续讨论，并由本机用户确认是否需要调整本话题调查规则？")
+		}
 	}
 	if input.Disposition == domain.ChatDispositionContinueWork {
 		// An existing binding does not spend another admission slot.
