@@ -101,14 +101,52 @@ func installExplanationFixtureDDL(t *testing.T, db *sql.DB) {
 		t.Fatal("missing string constant agentRunExplanationSchema")
 	}
 	if _, err := db.Exec(constant.StringVal(schema.Val())); err != nil {
-		t.Fatalf("install F fixture DDL: %v", err)
+		t.Fatalf("install explanation fixture DDL: %v", err)
+	}
+}
+
+func configureExplanationFixtureStorage(t *testing.T, db *sql.DB, dbPath string, withExplanation bool) {
+	t.Helper()
+	hasObjects := func() bool {
+		t.Helper()
+		var exists bool
+		if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM main.sqlite_schema
+			WHERE lower(tbl_name) = 'agent_run_explanations' OR lower(name) GLOB 'agent_run_explanations*')`).Scan(&exists); err != nil {
+			t.Fatalf("inspect explanation fixture schema: %v", err)
+		}
+		return exists
+	}
+	present := hasObjects()
+	if withExplanation && !present {
+		installExplanationFixtureDDL(t, db)
+	}
+	// A partial installation must fail rather than being repaired or dropped.
+	if present || withExplanation {
+		s, err := store.Open(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close()
+		if supported, err := s.AgentRunExplanationSupported(t.Context()); err != nil || !supported {
+			t.Fatalf("expected complete explanation fixture schema: supported=%t, err=%v", supported, err)
+		}
+	}
+	if !withExplanation {
+		// Remove only the optional schema from this fresh, normally migrated database.
+		if _, err := db.Exec("DROP TABLE IF EXISTS main.agent_run_explanations"); err != nil {
+			t.Fatalf("remove explanation fixture table: %v", err)
+		}
+		if hasObjects() {
+			t.Fatal("explanation schema objects remain in the absent fixture")
+		}
 	}
 }
 
 func TestRunExplanationNativeHTTP(t *testing.T) {
 	const op = provider.PublishRunExplanationTool
 	const id = "original-native-call"
-	for _, mode := range []string{"confirmed", "receipt-lost", "commit-unconfirmed", "v30", "pre-attempt-loss", "pre-attempt-aborted", "replay-response-lost", "unpaired-replay"} {
+	const schemaAbsent = "schema-absent"
+	for _, mode := range []string{"confirmed", "receipt-lost", "commit-unconfirmed", schemaAbsent, "pre-attempt-loss", "pre-attempt-aborted", "replay-response-lost", "unpaired-replay"} {
 		t.Run(mode, func(t *testing.T) {
 			f, dir := newExecutionFixture(t, "1.4.0"), t.TempDir()
 			t.Setenv("RUN_EXPLANATION_FIXTURE", f.root)
@@ -121,26 +159,20 @@ func TestRunExplanationNativeHTTP(t *testing.T) {
 			}
 			must(os.WriteFile(f.path, []byte(runExplanationCLIFixture), 0700))
 			seed := seedMemberTools(t, f, dir, mode)
-			db, err := sql.Open("sqlite", filepath.Join(dir, "workspace.db"))
+			dbPath := filepath.Join(dir, "workspace.db")
+			db, err := sql.Open("sqlite", dbPath)
 			must(err)
 			defer db.Close()
-			exec := func(sql string) { t.Helper(); _, err := db.Exec(sql); must(err) }
-			if mode != "v30" {
-				installExplanationFixtureDDL(t, db)
-			} else {
-				var version int
-				must(db.QueryRow("SELECT max(version) FROM schema_migrations").Scan(&version))
-				if version != 30 {
-					t.Fatalf("old schema fixture must be v30, got v%d", version)
-				}
-			}
+			withExplanation := mode != schemaAbsent
+			configureExplanationFixtureStorage(t, db, dbPath, withExplanation)
 			if mode == "commit-unconfirmed" {
 				// The write and readback succeed but SQLite refuses COMMIT. Let F
 				// classify that unconfirmed transaction; no mocked Engine/store.
-				exec(`CREATE TABLE explanation_test_parent (id INTEGER PRIMARY KEY);
+				_, err := db.Exec(`CREATE TABLE explanation_test_parent (id INTEGER PRIMARY KEY);
 				CREATE TABLE explanation_test_child (id INTEGER REFERENCES explanation_test_parent(id) DEFERRABLE INITIALLY DEFERRED);
 				CREATE TRIGGER explanation_test_commit AFTER INSERT ON agent_run_explanations
 				BEGIN INSERT INTO explanation_test_child VALUES (1); END;`)
+				must(err)
 			}
 			base, stop := startRun(t, append(memberToolsArgs(t, dir, f.path), "--enable-run-explanation")...)
 			read := func(name string) string {
@@ -163,7 +195,7 @@ func TestRunExplanationNativeHTTP(t *testing.T) {
 			must(err)
 			wantTools := "list_members,read_channel,send_message,create_member,search_history,read_history"
 			wantDigest := ""
-			if mode != "v30" {
+			if withExplanation {
 				wantTools += "," + op
 				wantDigest = fmt.Sprintf("%x", sha256.Sum256(configBytes))
 			}
@@ -171,8 +203,8 @@ func TestRunExplanationNativeHTTP(t *testing.T) {
 			argv := strings.Split(read("argv"), "\n")
 			toolIndex := slices.Index(argv, "--tools")
 			if toolIndex < 0 || argv[toolIndex+1] != wantTools || slices.Contains(argv, "--session") || read("digest") != wantDigest ||
-				(mode == "v30" && (len(config) != 2 || config["run_explanation"] != "")) ||
-				(mode != "v30" && (len(config) != 5 || config["run_explanation"] != runID || config["run_explanation_journal"] != journal || config["run_explanation_claim_fingerprint"] == "")) {
+				(!withExplanation && (len(config) != 2 || config["run_explanation"] != "")) ||
+				(withExplanation && (len(config) != 5 || config["run_explanation"] != runID || config["run_explanation_journal"] != journal || config["run_explanation_claim_fingerprint"] == "")) {
 				t.Fatal("native argv and exact issued bytes did not follow schema/claim qualification")
 			}
 			if config["endpoint"] != base+"/api/v1/member-tools" || config["token"] == "" {
@@ -198,7 +230,7 @@ func TestRunExplanationNativeHTTP(t *testing.T) {
 				must(db.QueryRow("SELECT (SELECT count(*) FROM messages), (SELECT count(*) FROM deliveries)").Scan(&c[0], &c[1]))
 				return c
 			}
-			if mode != "v30" {
+			if withExplanation {
 				// This CLI uses synthetic stdout and parent-issued HTTP calls.
 				// The separate physical bridge test exercises real reservation I/O.
 				must(os.WriteFile(journal, []byte(key+"\n"+text), 0600))
@@ -230,7 +262,7 @@ func TestRunExplanationNativeHTTP(t *testing.T) {
 				if _, err := os.Stat(attemptPath); !os.IsNotExist(err) {
 					t.Fatal("pre-attempt loss fixture already has a server journal")
 				}
-			case "v30":
+			case schemaAbsent:
 				call(input, key, 403, "forbidden")
 				memberToolsHTTP(t, config["endpoint"], config["token"], "read_channel", map[string]any{}, "", 200, "")
 			case "commit-unconfirmed":
@@ -434,7 +466,7 @@ await invoke('publish_run_explanation', {text:env.RUN_EXPLANATION_TEXT}, 'actual
 	sqlDB, err := sql.Open("sqlite", dbPath)
 	must(err)
 	defer sqlDB.Close()
-	installExplanationFixtureDDL(t, sqlDB)
+	configureExplanationFixtureStorage(t, sqlDB, dbPath, true)
 	db, err := store.Open(dbPath)
 	must(err)
 	defer db.Close()
