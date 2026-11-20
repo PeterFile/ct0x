@@ -44,11 +44,7 @@ func testInvestigationOwnerManagementHTTP(t *testing.T, kind domain.TaskWorkSour
 	// initial-owner rejection and scope checks only in the report case.
 	isReport := kind == domain.TaskWorkSourceReport
 	if isReport {
-		var version int
-		roleOK(t, f.raw.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version))
-		if version != 30 {
-			t.Fatalf("fixture did not open v30: %d", version)
-		}
+		requireInvestigationOwnerV30Migration(t, f)
 	}
 	child := ownerFixtureMember(t, f, f.group, "child")
 	peer := ownerFixtureMember(t, f, f.group, "second child")
@@ -333,6 +329,12 @@ func ownerWorkContinuation(t *testing.T, f *boundWorkReportFixture, kind domain.
 	roleOK(t, err)
 	f.expectHTTP(t, token, delegateWorkOp, nextBody, nextKey, http.StatusForbidden)
 	f.expectHTTP(t, token, handbackWorkOp, handback, backKey, http.StatusForbidden)
+}
+
+func requireInvestigationOwnerV30Migration(t *testing.T, f *boundWorkReportFixture) {
+	t.Helper()
+	// The fixture opens the latest Store, so v30 need not be the last ledger entry.
+	ownerNativeRows(t, f, 1, `SELECT count(*) FROM schema_migrations WHERE version=30`)
 }
 
 func ownerFixtureMember(t *testing.T, f *boundWorkReportFixture, group, name string) domain.Member {

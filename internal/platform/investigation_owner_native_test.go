@@ -180,7 +180,7 @@ func TestPiInvestigationOwnerNativeSQLiteRoundTrip(t *testing.T) {
 	// Do not overlap this round trip with the SQLite-heavy race fixtures;
 	// keep the production HTTP deadline on its scoped tool calls.
 	f := newBoundWorkReportFixture(t)
-	ownerNativeRows(t, f, 1, `SELECT count(*) FROM schema_migrations WHERE version=30 AND NOT EXISTS(SELECT 1 FROM schema_migrations WHERE version>30)`)
+	requireInvestigationOwnerV30Migration(t, f)
 	assets, approved, foreign := ownerFixtureMaterials(t, f)
 	child := ownerFixtureMember(t, f, f.group, "reporter")
 	peer := ownerFixtureMember(t, f, f.group, "second reporter")
