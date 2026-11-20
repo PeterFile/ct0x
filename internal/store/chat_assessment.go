@@ -15,16 +15,16 @@ import (
 // ApplyChatAssessment is a bound assessor command, not a local-user API. The
 // semantic proposal cannot select source, caller, policy, grants or task owner.
 func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string) (domain.ChatAssessmentReceipt, error) {
-	return s.applyChatAssessment(ctx, scope, candidateID, input, content, key, false)
+	return s.applyChatAssessment(ctx, scope, candidateID, input, content, key, false, nil)
 }
 
 // ApplyChatAssessmentDormant records an official input without waking a native
 // Turn. Only trusted callers can choose this mode; it is not a model argument.
 func (s *Store) ApplyChatAssessmentDormant(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string) (domain.ChatAssessmentReceipt, error) {
-	return s.applyChatAssessment(ctx, scope, candidateID, input, content, key, true)
+	return s.applyChatAssessment(ctx, scope, candidateID, input, content, key, true, nil)
 }
 
-func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, dormant bool) (domain.ChatAssessmentReceipt, error) {
+func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, dormant bool, clarification *decisionClarificationCapture) (domain.ChatAssessmentReceipt, error) {
 	tx, err := s.beginMemberToolTx(ctx, scope)
 	if err != nil {
 		return domain.ChatAssessmentReceipt{}, memberToolOperationError("记录聊天评估失败", err)
@@ -47,7 +47,14 @@ func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, 
 	// Share the send_message namespace: adding/removing an assessment under the
 	// same transport key is a payload conflict, not a second independent write.
 	mutation := mutationScope{operation: "create_message", actorID: scope.MemberID, groupID: scope.Claim.GroupID, key: key}
-	payload := mutationPayload("chat_assessment/v1", candidateID, string(encoded), content)
+	assessmentPayload := mutationPayload("chat_assessment/v1", candidateID, string(encoded), content)
+	payload := assessmentPayload
+	if clarification != nil {
+		if err := checkDecisionClarificationSourceInTx(ctx, tx, scope, candidate); err != nil {
+			return domain.ChatAssessmentReceipt{}, decisionRequestError("验证话题待决来源失败", err)
+		}
+		payload = mutationPayload("chat_decision_clarification/v1", candidateID, string(encoded), content, clarification.body)
+	}
 	id, replay, err := lookupMutation(ctx, tx, mutation, payload)
 	if err != nil {
 		return domain.ChatAssessmentReceipt{}, admissionError("读取聊天评估回执失败", err)
@@ -71,6 +78,11 @@ func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		if receipt.WorkInputID != "" {
 			if _, err := chatDiscussionArrivalInTx(ctx, tx, scope, candidateID); err != nil {
 				return domain.ChatAssessmentReceipt{}, err
+			}
+		}
+		if clarification != nil {
+			if err := clarification.loadInTx(ctx, tx, candidate, receipt.ID); err != nil {
+				return domain.ChatAssessmentReceipt{}, decisionRequestError("读取话题待决事项失败", err)
 			}
 		}
 		if err := tx.Commit(); err != nil {
@@ -100,6 +112,9 @@ func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		if installed && candidate.SourceKind == "local_user_chat" {
 			prior, err := chatFollowupReceiptInTx(ctx, tx, candidate)
 			if err == nil {
+				if clarification != nil {
+					return domain.ChatAssessmentReceipt{}, ErrConflict
+				}
 				if _, err := chatDiscussionArrivalInTx(ctx, tx, scope, candidateID); err != nil {
 					return domain.ChatAssessmentReceipt{}, err
 				}
@@ -263,8 +278,13 @@ func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		return domain.ChatAssessmentReceipt{}, err
 	}
 	if err := coordinationDispatchWrite(ctx, tx, `INSERT INTO chat_assessments(id,candidate_id,decision_id,dispatch_request_id,notice_message_id,payload,receipt_json)
-	 VALUES(?,?,nullif(?,''),nullif(?,''),?,?,?)`, receipt.ID, candidate.ID, decisionID, receipt.DispatchRequestID, notice.ID, payload, string(data)); err != nil {
+	 VALUES(?,?,nullif(?,''),nullif(?,''),?,?,?)`, receipt.ID, candidate.ID, decisionID, receipt.DispatchRequestID, notice.ID, assessmentPayload, string(data)); err != nil {
 		return domain.ChatAssessmentReceipt{}, admissionError("保存聊天评估失败", err)
+	}
+	if clarification != nil {
+		if err := clarification.persistInTx(ctx, tx, candidate, receipt); err != nil {
+			return domain.ChatAssessmentReceipt{}, decisionRequestError("保存话题待决事项失败", err)
+		}
 	}
 	if err := followup.persistInTx(ctx, tx, receipt); err != nil {
 		return domain.ChatAssessmentReceipt{}, admissionError("保存原任务后续输入失败", err)
