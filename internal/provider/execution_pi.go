@@ -50,6 +50,7 @@ type executionOutput struct {
 	piSession                  *piSessionTracker
 	piTypedWork                *piTypedWorkOutput
 	piInvestigation            *piInvestigationStartup
+	piRunExplanation           bool
 }
 
 func (o *executionOutput) Write(p []byte) (int, error) {
@@ -124,10 +125,10 @@ func (o *executionOutput) recordPi(line []byte) {
 		}
 	}
 	var event struct {
-		Type, ID, CWD string
-		Version       int
-		Aborted       *bool
-		Message       struct {
+		Type, ID, CWD, ToolName string
+		Version                 int
+		Aborted                 *bool
+		Message                 struct {
 			Role, StopReason string
 			Content          json.RawMessage
 		}
@@ -173,6 +174,16 @@ func (o *executionOutput) recordPi(line []byte) {
 			o.damaged = true
 		}
 	case "tool_execution_end":
+		if o.piRunExplanation && event.ToolName == PublishRunExplanationTool && r.Accepted && !o.settled {
+			if key := piRunExplanationAckKey(line, o.runID); key != "" {
+				if r.RunExplanationAckKey == "" {
+					r.RunExplanationAckKey = key
+				} else if r.RunExplanationAckKey != key {
+					// Conflicting acknowledgements cannot validate the attempt.
+					r.RunExplanationAckKey, o.piRunExplanation, o.damaged = "", false, true
+				}
+			}
+		}
 		if o.piTypedWork != nil && !o.piTypedWork.observeEnd(line, o.runID, r.Accepted && !o.settled) {
 			// A bad pair denies settlement but does not erase native terminal evidence.
 			o.damaged = true

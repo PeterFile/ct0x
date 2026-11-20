@@ -6,16 +6,19 @@ import { request } from "node:http";
 export const INVESTIGATION_ASSESSMENT_ACTION = "read_only_investigation";
 export const INVESTIGATION_CHANNEL = "read_investigation_channel";
 export const INVESTIGATION_ARTIFACT = "read_investigation_artifact";
+export const PUBLISH_RUN_EXPLANATION = "publish_run_explanation";
+export const RUN_EXPLANATION_ACK = "agent_workspace_run_explanation_ack_v1";
+export const RUN_EXPLANATION_BYTES = 1024;
 
 const CONFIG_LIMIT = 4096;
 const BYTE_LIMIT = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 25_000;
-export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", "read_work_inputs", "ack_work_input", "hand_back_work_input", INVESTIGATION_CHANNEL, INVESTIGATION_ARTIFACT]);
+export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", "read_work_inputs", "ack_work_input", "hand_back_work_input", INVESTIGATION_CHANNEL, INVESTIGATION_ARTIFACT, PUBLISH_RUN_EXPLANATION]);
 
-/** @typedef {{ text: string, json: unknown }} Reply */
+/** @typedef {{ text: string, json: unknown, explanationKey?: string }} Reply */
 /** @typedef {(toolName: string, params: unknown, toolCallId: string, signal?: AbortSignal) => Promise<Reply>} Client */
 /** @typedef {"not_sent" | "rejected" | "unknown"} FailureOutcome */
-/** @typedef {{ unknown?: { toolName: string, toolCallId: string, fingerprint: string, error: Error } }} WriteState */
+/** @typedef {{ active?: boolean, unknown?: { toolName: string, toolCallId: string, fingerprint: string, error: Error, body?: Buffer } }} WriteState */
 const REJECTION_CODES = new Map([
   [400, ["invalid_input", "invalid_json"]], [403, ["forbidden", "invalid_host", "invalid_origin"]],
   [405, ["method_not_allowed"]],
@@ -57,7 +60,7 @@ function endpointURL(value) {
  * selects the bound profile; it covers exactly the bytes this bridge consumes.
  * @param {string | undefined} path
  * @param {string} [expectedSHA256]
- * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[] }}
+ * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[], runExplanation?: string }}
  */
 export function openBridge(path, expectedSHA256) {
   let fd;
@@ -82,18 +85,28 @@ export function openBridge(path, expectedSHA256) {
         (!/^[0-9a-f]{64}$/.test(expectedSHA256) || createHash("sha256").update(bytes).digest("hex") !== expectedSHA256)) {
       throw new Error(CONFIG_ERROR);
     }
-    const config = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
+    const wire = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+    const config = JSON.parse(wire);
     if (!isRecord(config)) throw new Error(CONFIG_ERROR);
     const continueWork = Object.hasOwn(config, "continue_work");
     const discussionOnlyExcerpt = Object.hasOwn(config, "discussion_only_excerpt");
     const investigationIntake = Object.hasOwn(config, "intake_assessment_action");
     const strict = Object.hasOwn(config, "investigation_tools");
+    const explanation = Object.hasOwn(config, "run_explanation");
     if (!Object.hasOwn(config, "endpoint") || !Object.hasOwn(config, "token") ||
-        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) + Number(strict) ||
+        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) + Number(strict) + Number(explanation) ||
         (continueWork && config.continue_work !== true) || (discussionOnlyExcerpt && config.discussion_only_excerpt !== true) ||
         (investigationIntake && config.intake_assessment_action !== INVESTIGATION_ASSESSMENT_ACTION) ||
         typeof config.token !== "string" || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token)) {
       throw new Error(CONFIG_ERROR);
+    }
+    /** @type {string | undefined} */
+    let runExplanation;
+    if (explanation) {
+      if (!expectedSHA256 || strict || continueWork || discussionOnlyExcerpt || investigationIntake ||
+          !validRoleReceiptWire(wire, 3) || typeof config.run_explanation !== "string" ||
+          !/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$/.test(config.run_explanation)) throw new Error(CONFIG_ERROR);
+      runExplanation = config.run_explanation;
     }
     /** @type {string[] | undefined} */
     let investigationTools;
@@ -111,12 +124,13 @@ export function openBridge(path, expectedSHA256) {
     const writes = {};
     return {
       invoke: async (toolName, params, toolCallId, signal) => {
-        if (investigationTools ? !investigationTools.includes(toolName) : toolName === INVESTIGATION_CHANNEL || toolName === INVESTIGATION_ARTIFACT) {
+        if (investigationTools ? !investigationTools.includes(toolName) : toolName === INVESTIGATION_CHANNEL || toolName === INVESTIGATION_ARTIFACT ||
+            toolName === PUBLISH_RUN_EXPLANATION && !runExplanation) {
           throw new Error("工具不在本轮授权范围内，未发送请求。");
         }
-        return requestTool(endpoint, token, writes, toolName, params, toolCallId, signal);
+        return requestTool(endpoint, token, writes, toolName, params, toolCallId, signal, runExplanation);
       },
-      continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools,
+      continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools, ...(runExplanation ? { runExplanation } : {}),
     };
   } catch {
     throw new Error(CONFIG_ERROR);
@@ -248,18 +262,21 @@ function validWriteReceipt(toolName, status, value, requestValue) {
  * @param {unknown} params
  * @param {string} toolCallId
  * @param {AbortSignal | undefined} signal
+ * @param {string | undefined} runExplanation
  * @returns {Promise<Reply>}
  */
-async function requestTool(endpoint, token, writes, toolName, params, toolCallId, signal) {
+async function requestTool(endpoint, token, writes, toolName, params, toolCallId, signal, runExplanation) {
   /** @param {string} message */
   const safeError = message => new Error(message.replaceAll(token, "〔已隐藏〕"));
   if (!TOOL_NAMES.some(name => name === toolName)) throw safeError("成员工具名称无效，未发送请求。");
   const workInputWrite = isWorkInputWrite(toolName);
   const roleWrite = toolName === "decide_dispatch" || toolName === "submit_result" || workInputWrite;
   const workspaceWrite = toolName === "workspace_write" || toolName === "publish_workspace_artifact";
-  const write = roleWrite || workspaceWrite || toolName === "send_message" || toolName === "create_member";
+  const explanationWrite = toolName === PUBLISH_RUN_EXPLANATION;
+  const write = roleWrite || workspaceWrite || explanationWrite || toolName === "send_message" || toolName === "create_member";
   // Hashing malformed UTF-16 as UTF-8 would alias valid replacement characters.
-  if (typeof toolCallId !== "string" || !toolCallId.trim() || (write && !validUnicode(toolCallId))) {
+  if (typeof toolCallId !== "string" || !toolCallId.trim() || (write && !validUnicode(toolCallId)) ||
+      (explanationWrite && (!/^[!-~]{1,256}$/.test(toolCallId) || toolCallId.includes(token)))) {
     throw safeError("工具调用标识无效，未发送请求。");
   }
   let body;
@@ -273,6 +290,12 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
       const snapshot = JSON.parse(text);
       if (isRecord(snapshot)) requestValue = workInputWrite ? snapshot.input_id : snapshot.kind;
     }
+    if (explanationWrite) {
+      const snapshot = JSON.parse(text);
+      if (!isRecord(snapshot) || Object.keys(snapshot).join(",") !== "text" || typeof snapshot.text !== "string" ||
+          !validUnicode(snapshot.text) || Buffer.byteLength(snapshot.text, "utf8") > RUN_EXPLANATION_BYTES ||
+          !/\P{White_Space}/u.test(snapshot.text) || snapshot.text.includes("\x00")) throw new Error();
+    }
   } catch {
     throw safeError("成员工具参数无效，未发送请求。");
   }
@@ -280,13 +303,19 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
   const fingerprint = write ? createHash("sha256").update(body).digest("hex") : "";
   if (write && writes.unknown) {
     const previous = writes.unknown;
-    if (previous.toolName === toolName && previous.toolCallId === toolCallId && previous.fingerprint === fingerprint) {
+    if (previous.toolName === toolName && previous.toolCallId === toolCallId &&
+        (previous.body ? previous.body.equals(body) : previous.fingerprint === fingerprint)) {
       throw previous.error;
     }
     throw safeError("成员工具先前写入结果未知，当前实例已阻止后续写入；请先对账，不要自动重试。");
   }
   // Local validation and pre-abort are not_sent; only transport outcomes can latch.
+  // Only the opted-in profile serializes writes, so no concurrent call can
+  // pass the uncertainty gate while the explanation is on the wire.
+  if (runExplanation && write && writes.active) throw safeError("前一写入尚未完成，未发送请求。");
   if (signal?.aborted) throw safeError("工具调用已取消，请求尚未发送。");
+  const key = write ? createHash("sha256").update(explanationWrite ? `${toolName}\0${runExplanation}\0${toolCallId}` : toolName + toolCallId).digest("hex") : "";
+  if (runExplanation && write) writes.active = true;
 
   return new Promise((resolve, reject) => {
     /** @type {import('node:http').ClientRequest | undefined} */
@@ -297,11 +326,13 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
     let timer;
     let sent = false;
     let settled = false;
-    const unknown = "执行结果未知；请先对账，不要自动重试。";
+    const unknown = explanationWrite ? "运行说明保存结果未知；请保留原工具调用标识、幂等键和原文，先对账，不要自动重试。" :
+      "执行结果未知；请先对账，不要自动重试。";
     const invalidResponse = `成员工具返回无效响应，${unknown}`;
     const overflow = `工具结果超过 64 KiB 限制（tool_result_too_large），${unknown}`;
     const interrupted = () => sent ? `成员工具请求中断，${unknown}` : "成员工具连接失败，请求尚未发送。";
     const cleanup = () => {
+      if (runExplanation && write) writes.active = false;
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
     };
@@ -311,7 +342,7 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
       settled = true;
       const error = safeError(message);
       if (write && outcome === "unknown" && !writes.unknown) {
-        writes.unknown = { toolName, toolCallId, fingerprint, error };
+        writes.unknown = { toolName, toolCallId, fingerprint, error, ...(explanationWrite ? { body } : {}) };
       }
       cleanup();
       response?.destroy();
@@ -322,9 +353,7 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
     try {
       /** @type {Record<string, string | number>} */
       const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Content-Length": body.length };
-      if (write) {
-        headers["Idempotency-Key"] = createHash("sha256").update(toolName + toolCallId).digest("hex");
-      }
+      if (write) headers["Idempotency-Key"] = key;
       req = request({
         hostname: endpoint.hostname.replace(/^\[|\]$/g, ""), port: endpoint.port || 80,
         path: `${endpoint.pathname}/${toolName}`, method: "POST", headers, agent: false, maxHeaderSize: 8192,
@@ -350,30 +379,42 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
           if (settled) return;
           let result;
           try { result = parseJSON(Buffer.concat(chunks, size)); } catch { return fail(invalidResponse); }
-          const success = roleWrite || workspaceWrite || toolName === "send_message" ? status === 201 :
+          const success = roleWrite || workspaceWrite || explanationWrite || toolName === "send_message" ? status === 201 :
             toolName === "create_member" ? status === 200 || status === 201 : status === 200;
           const sensitive = result.text.includes(token) || JSON.stringify(result.json)?.includes(token);
           if (!success) {
             const message = status >= 400 && status <= 599 ? serverError(result.json, token, roleWrite, toolName) : undefined;
             const error = isRecord(result.json) && isRecord(result.json.error) ? result.json.error : undefined;
             const code = error?.code;
+            // A malformed response cannot prove definite rejection of the
+            // optional publication. Keep the legacy receipt rules untouched.
+            const envelope = explanationWrite && /^\s*\{\s*"error"\s*:\s*(\{[\s\S]*\})\s*\}\s*$/.exec(result.text);
             const rejected = !sensitive && typeof code === "string" && typeof error?.message === "string" &&
+              (!explanationWrite || envelope && validRoleReceiptWire(envelope[1], 2)) &&
               (REJECTION_CODES.get(status)?.includes(code) ||
                 (toolName === "read_work_inputs" && status === 413 && code === "tool_result_too_large") ||
                 (toolName !== "decide_dispatch" && ((status === 404 && code === "not_found") || (status === 409 && code === "conflict"))) ||
-                (!roleWrite && status === 409 && code === "member_capacity"));
-            const suffix = rejected || code === "request_canceled" || code === "deadline_exceeded" ? "" : ` ${unknown}`;
+                (!roleWrite && status === 409 && code === "member_capacity") ||
+                (explanationWrite && status === 503 && code === "run_explanation_unavailable"));
+            const suffix = rejected || !explanationWrite && (code === "request_canceled" || code === "deadline_exceeded") ? "" : ` ${unknown}`;
             return fail(message ? message + suffix : invalidResponse, rejected ? "rejected" : "unknown");
           }
           if (sensitive) return fail(`成员工具返回了敏感数据，已拒绝显示；${unknown}`);
           if (!validWriteReceipt(toolName, status, result.json, requestValue)) return fail(invalidResponse);
+          if (explanationWrite) {
+            const { json: ack, text } = result;
+            if (!isRecord(ack) || Object.keys(ack).sort().join(",") !== "created_at,explanation_id,text_omitted" ||
+                ack.explanation_id !== `public_explanation:${runExplanation}` || ack.text_omitted !== true ||
+                !validReceiptTime(ack.created_at) || !validRoleReceiptWire(text, 3)) return fail(invalidResponse);
+            result = { text: JSON.stringify(ack), json: ack };
+          }
           if (roleWrite || workspaceWrite) {
             if (!validRoleReceiptWire(result.text, workInputWrite ? 1 : workspaceWrite ? 5 : 4)) return fail(invalidResponse);
             result = { text: JSON.stringify(result.json), json: result.json };
           }
           settled = true;
           cleanup();
-          resolve(result);
+          resolve(explanationWrite ? { ...result, explanationKey: key } : result);
         });
       });
       req.on("error", () => fail(interrupted()));

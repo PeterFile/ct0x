@@ -316,6 +316,13 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			if err := p.bindNativeSessionPreparation(executor, selected, selection, member, workspace, thinking, names, maxMembers, &request); err != nil {
 				return empty, err
 			}
+		} else if !intake && p.memberTools.tools.runExplanation != nil && selected.Name == provider.Pi && selected.Version == "1.4.0" &&
+			provider.PiRunExplanationBridgeSupported(p.piMemberToolsExtension) {
+			// Advertising is solely through the issued native schema/allowlist.
+			// The claimed wrapper checks storage support before issuing that config.
+			executor.(*memberToolRuntimeRun).explanationBuilder = func(config provider.NativeMemberToolConfig, runID string, names []string) (provider.Executor, error) {
+				return provider.NewPiRunExplanationExecutor(selected, p.piMemberToolsExtension, config, runID, names, p.executionTimeout)
+			}
 		}
 	}
 	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{workspace.key}, Request: request}, nil

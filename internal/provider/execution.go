@@ -85,6 +85,9 @@ type ExecutionReceipt struct {
 	Reason            string  `json:"reason"`
 
 	NativeRef *NativeSessionReference `json:"-"`
+	// Acknowledgement from the exact fresh Pi bridge. Only the live runtime
+	// can match it to a confirmed Store result; it is never a public receipt.
+	RunExplanationAckKey string `json:"-"`
 	// NativePreflightFailure is set only by the trusted native launch wrapper
 	// before invocation. Apply may preserve a prior receipt instead of treating
 	// this result as new execution or reconciliation evidence.
@@ -204,7 +207,8 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	if e.memberTools != nil {
 		frameLimit, toolFlag = piMemberToolFrameLimit, "--no-builtin-tools"
 	}
-	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex, frameLimit: frameLimit}
+	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex, frameLimit: frameLimit,
+		piRunExplanation: e.memberTools != nil && e.memberTools.runExplanation != ""}
 	if opts := e.memberTools; opts != nil && opts.typedWorkRole != "" {
 		out.piTypedWork = &piTypedWorkOutput{role: opts.typedWorkRole, tools: opts.toolNames}
 		outLog.tailReserve = piTypedWriteLogReserve

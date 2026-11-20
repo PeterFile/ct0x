@@ -81,10 +81,14 @@ func PiInvestigationBridgeSupported(extensionPath string) bool {
 // PiCombinedIntakeBridgeSupported requires the pair whose tool descriptions
 // distinguish investigation from fresh Task Work continuation.
 func PiCombinedIntakeBridgeSupported(extensionPath string) bool {
-	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA) != ""
+	return PiRunExplanationBridgeSupported(extensionPath) ||
+		qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA) != ""
 }
 
 func qualifyPiInvestigationBridge(extensionPath string) string {
+	if entry := qualifyPiRunExplanationBridge(extensionPath); entry != "" {
+		return entry
+	}
 	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA, piInvestigationBridgeEntry200SHA)
 }
 
@@ -222,7 +226,13 @@ func (e piDigestBoundExecutor) Execute(ctx context.Context, request ExecuteReque
 	// selected CLI/loader, its environment and the trusted extension ancestry
 	// must still be stable through load; this is not a same-UID code sandbox.
 	qualify := qualifyPiNativeBridge
-	if e.investigationBridge {
+	switch {
+	case e.memberTools.runExplanation != "":
+		if request.RunID != e.memberTools.runExplanation {
+			return ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "公开运行说明的运行绑定不匹配，执行未启动"}
+		}
+		qualify = qualifyPiRunExplanationBridge
+	case e.investigationBridge:
 		qualify = qualifyPiInvestigationBridge
 	}
 	if qualify(e.configuredBridge) != e.memberTools.extensionPath {

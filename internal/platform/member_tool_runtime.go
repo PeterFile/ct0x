@@ -38,6 +38,9 @@ type MemberToolRuntimeOptions struct {
 	NativeExecutionRoot string
 	// ChatIntake reuses the same Engine and requires the role execution path.
 	ChatIntake *coordination.Engine
+	// RunExplanation opts into publication only for qualified fresh ordinary Pi turns.
+	// It must borrow the same Store and never enables chat intake or roles.
+	RunExplanation *coordination.Engine
 	// WorkInputs opts into the legacy preview. A typed nil is a configuration
 	// error. Its ContinueWork implementation takes precedence and requires ChatIntake.
 	WorkInputs MemberWorkInputService
@@ -132,7 +135,11 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 	if options.WorkInputs != nil && (roleFence == nil || nilWorkInputService(options.WorkInputs)) {
 		return nil, errMemberToolRuntimeConfig
 	}
+	if options.RunExplanation != nil && !options.RunExplanation.UsesStore(db) {
+		return nil, errMemberToolRuntimeConfig
+	}
 	tools := NewMemberTools(db)
+	tools.runExplanation = options.RunExplanation
 	tools.workInputs = options.WorkInputs
 	if launch := options.FreshTaskWork; launch != nil {
 		if roleFence == nil || !options.ChatIntake.UsesStore(db) || launch.Supports == nil || launch.Construct == nil {
@@ -207,16 +214,17 @@ func (schema memberToolIntakeSchema) requiresIssuedPiConfig() bool {
 }
 
 type memberToolRuntimeRun struct {
-	runtime       *MemberToolRuntime
-	binding       MemberToolRunBinding
-	factory       MemberToolExecutorFactory
-	used          atomic.Bool
-	role          *store.CoordinationRoleProvenance
-	intake        bool
-	intakeSchema  memberToolIntakeSchema
-	intakeBuilder func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
-	investigation *investigationRolePreparation
-	nativeSession *memberToolNativeSessionPlan
+	runtime            *MemberToolRuntime
+	binding            MemberToolRunBinding
+	factory            MemberToolExecutorFactory
+	used               atomic.Bool
+	role               *store.CoordinationRoleProvenance
+	intake             bool
+	intakeSchema       memberToolIntakeSchema
+	intakeBuilder      func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
+	explanationBuilder func(provider.NativeMemberToolConfig, string, []string) (provider.Executor, error)
+	investigation      *investigationRolePreparation
+	nativeSession      *memberToolNativeSessionPlan
 	// Cloned at trusted wrapping and again when the claimed token is registered.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
@@ -251,10 +259,15 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	}
 	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
 	var token string
+	var explanation *memberRunExplanation
 	if e.intake {
 		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema)
 	} else {
-		token, err = r.tools.Issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers, ProviderID: e.binding.ProviderID, Model: e.binding.Model})
+		if e.explanationBuilder != nil && e.nativeSession == nil && r.tools.runExplanationSupported(ctx) {
+			explanation = &memberRunExplanation{path: filepath.Join(request.RuntimeDir, request.RunID, runExplanationAttemptFile)}
+		}
+		token, err = r.tools.issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers,
+			ProviderID: e.binding.ProviderID, Model: e.binding.Model}, "generic", memberToolIntakeSchema{}, explanation)
 	}
 	if err != nil {
 		// Duplicate authority, stale generation and uncertain reads are not proof
@@ -293,13 +306,16 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	if !e.commitNativeLaunch(ctx, token, session, nil) {
 		return e.startupFailure(ctx, request, claim, token, "原生会话启动绑定无法确认，执行未启动")
 	}
-	// Once invoked, only the adapter owns execution classification and evidence.
+	// Only the adapter reports native lifecycle. Drain the selected authority
+	// before checking its binding or folding in an unconfirmed tool write.
 	raw := native.Execute(ctx, nativeRequest, onEvent)
-	if session == nil {
-		return raw
+	if session != nil || explanation != nil {
+		r.tools.Revoke(token)
+		token = ""
 	}
-	r.tools.Revoke(token)
-	token = ""
+	if explanation != nil {
+		return explanation.receipt(raw)
+	}
 	return session.receipt(ctx, e, claim, raw)
 }
 
@@ -399,6 +415,10 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 	if entry.purpose == memberInvestigationRolePurpose {
 		strictTools = entry.grants.Operations
 	}
+	var explanationRun string
+	if entry.runExplanation != nil {
+		explanationRun = entry.scope.Claim.TurnID
+	}
 	data, err := json.Marshal(struct {
 		Endpoint               string   `json:"endpoint"`
 		Token                  string   `json:"token"`
@@ -406,7 +426,8 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 		DiscussionOnlyExcerpt  bool     `json:"discussion_only_excerpt,omitempty"`
 		IntakeAssessmentAction string   `json:"intake_assessment_action,omitempty"`
 		InvestigationTools     []string `json:"investigation_tools,omitempty"`
-	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools})
+		RunExplanation         string   `json:"run_explanation,omitempty"`
+	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools, explanationRun})
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}
