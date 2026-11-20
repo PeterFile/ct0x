@@ -14,6 +14,8 @@ type localAPI struct{ local *platform.LocalUser }
 func LocalUserRoutes(local *platform.LocalUser) []Route {
 	a := localAPI{local}
 	return []Route{
+		{http.MethodGet, "/api/v1/me/agent-runs", a.listAgentRuns},
+		{http.MethodGet, "/api/v1/me/agent-runs/{run}", a.getAgentRun},
 		{http.MethodGet, "/api/v1/groups", a.listGroups},
 		{http.MethodPost, "/api/v1/groups", noQuery(a.createGroup)},
 		{http.MethodGet, "/api/v1/groups/{group}", noQuery(a.getGroup)},
