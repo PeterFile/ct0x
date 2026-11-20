@@ -1,8 +1,10 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -85,42 +87,24 @@ func TestPiFreshTaskWorkFlagRequiresSeparateExplicitProfile(t *testing.T) {
 	}
 }
 
-// #200 (04cdc956) used the same parser and differed only in these descriptions.
-// Reconstruct the released entry in a temp dir without a second bridge pack.
-func pi200MemberToolsEntry(t *testing.T, current string) string {
+func pi200MemberToolsEntry(t *testing.T) string {
 	t.Helper()
-	data, err := os.ReadFile(current)
+	archive, err := zip.OpenReader("testdata/pi-bridge-200.zip")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open released #200 bridge fixture: %v", err)
 	}
-	const start = `  ], { description: "仅受信chat_intake/v1`
-	const end = "    ...chatAssessmentFields,"
-	prefix, rest, found := strings.Cut(string(data), start)
-	_, suffix, ended := strings.Cut(rest, end)
-	if !found || !ended {
-		t.Fatal("cannot reconstruct the #200 intake descriptions")
-	}
-	legacy := prefix + start + "解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。prepare_work仅限受支持的topic_summary。\" +\n" +
-		"    (continueWork ? `continue_work仅用于当前本机用户的明确续办请求；续办理由不得为空白，最多 ${workInputBytes.reason} UTF-8 字节。` : \"\") });\n" +
-		`  const assessment = Type.Object({
-    disposition,
-    action: Type.Optional(Type.Union([Type.Literal("text_submission"), Type.Literal("workspace_change"),
-      ...(investigation ? [Type.Literal(INVESTIGATION_ASSESSMENT_ACTION)] : []),
-    ], { description: investigation ? "仅为语义建议；只读调查使用 prepare_work 和 reason，目标和资料由服务器绑定。模型不能授予权限。" :
-      "结合可信来源和上下文提出文本交付或目录文件修改；只是一项语义建议，当前 Policy、目录授权和 Task 范围由服务器核定，模型不能授予 IO 权限。" })),
-` + end + suffix
-	impl, err := os.ReadFile(filepath.Join(filepath.Dir(current), "bridge.mjs"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	defer archive.Close()
 	root := t.TempDir()
+	for _, name := range []string{"index.ts", "bridge.mjs"} {
+		data, err := fs.ReadFile(archive, "extensions/pi-bridge/"+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	entry := filepath.Join(root, "index.ts")
-	if err := os.WriteFile(entry, []byte(legacy), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "bridge.mjs"), impl, 0600); err != nil {
-		t.Fatal(err)
-	}
 	if !provider.PiInvestigationBridgeSupported(entry) {
 		t.Fatal("fixture does not match the released #200 pair")
 	}
@@ -143,7 +127,7 @@ func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 		t.Fatal("missing synthetic Pi metadata")
 	}
 	current := memberToolsEntry(t)
-	old := pi200MemberToolsEntry(t, current)
+	old := pi200MemberToolsEntry(t)
 	fresh := filepath.Join(filepath.Dir(current), "fresh-task-work.ts")
 	for _, tc := range []struct {
 		name, entry                    string
