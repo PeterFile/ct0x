@@ -38,7 +38,7 @@ func decisionQuestionJSON(q domain.DecisionQuestion, kind domain.DecisionRequest
 
 // ProposeTaskDecisionRequest is a trusted Engine-facing command; scope is not
 // an input DTO. It records a question, never a grant, delivery or Task action.
-func (s *Store) ProposeTaskDecisionRequest(ctx context.Context, scope MemberToolScope, input domain.TaskDecisionRequestInput, key string) (domain.DecisionRequest, error) {
+func (s *Store) ProposeTaskDecisionRequest(ctx context.Context, scope MemberToolScope, input domain.TaskDecisionRequestInput, key string) (_ domain.DecisionRequest, err error) {
 	const action = "记录任务待决事项失败"
 	var zero domain.DecisionRequest
 	switch input.Kind {
@@ -53,24 +53,40 @@ func (s *Store) ProposeTaskDecisionRequest(ctx context.Context, scope MemberTool
 	if err != nil {
 		return zero, decisionRequestError(action, err)
 	}
-	tx, err := s.beginMemberToolTx(ctx, scope)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return zero, decisionRequestError(action, err)
 	}
-	defer tx.Rollback()
+	phase := "scope"
+	defer func() {
+		rollback := tx.Rollback()
+		if err != nil {
+			failure := taskWorkMutationFailure(action, phase, err, rollback)
+			if failure.RollbackConfirmed() {
+				failure.message = decisionRequestError(action, err).Error()
+			}
+			err = failure
+		}
+	}()
+	// The scope fence is itself a write and must run first inside this boundary.
+	if err := memberToolScopeInTx(ctx, tx, scope); err != nil {
+		return zero, err
+	}
+	phase = "mutation"
 	if err := requireDecisionRequestsInTx(ctx, tx); err != nil {
-		return zero, decisionRequestError(action, err)
+		return zero, err
 	}
 	role, owner, err := s.workInputHandlingOwnerInTx(ctx, tx, scope, false)
 	if err != nil {
-		return zero, decisionRequestError(action, err)
+		return zero, err
 	}
 	out, err := taskDecisionRequestInTx(ctx, tx, role, owner, input, body, key)
 	if err != nil {
-		return zero, decisionRequestError(action, err)
+		return zero, err
 	}
+	phase = "commit"
 	if err := tx.Commit(); err != nil {
-		return zero, decisionRequestError("保存待决事项的结果未确认", err)
+		return zero, err
 	}
 	return out, nil
 }
