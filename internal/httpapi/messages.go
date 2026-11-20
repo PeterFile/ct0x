@@ -1,9 +1,14 @@
 package httpapi
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"net/http"
 
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/platform"
+	"agentworkspace/internal/store"
 )
 
 func MessageRoutes(local *platform.LocalUser) []Route {
@@ -19,12 +24,31 @@ func MessageRoutes(local *platform.LocalUser) []Route {
 }
 
 func (a localAPI) createMessage(w http.ResponseWriter, r *http.Request) {
-	var input platform.MessageInput
+	// Keep the legacy message decoder, but require an object (not null) and
+	// exact scalar IDs whenever the new field is present.
+	var input struct {
+		platform.MessageInput
+		Grant json.RawMessage `json:"artifact_read_grant"`
+	}
 	key, ok := requestKey(w, r)
 	if !ok || !DecodeJSON(w, r, &input) {
 		return
 	}
-	message, err := a.local.CreateMessage(r.Context(), r.PathValue("group"), input, key)
+	if input.Grant != nil {
+		var pin domain.ArtifactVersionRef
+		decoder := json.NewDecoder(bytes.NewReader(input.Grant))
+		decoder.DisallowUnknownFields()
+		if !bytes.HasPrefix(bytes.TrimSpace(input.Grant), []byte("{")) || !validMemberToolJSONStrings(input.Grant) || decoder.Decode(&pin) != nil {
+			WriteError(w, http.StatusBadRequest, "invalid_json", "成果读取许可必须是包含确切成果和版本标识的 JSON 对象")
+			return
+		}
+		input.MessageInput.ArtifactReadGrant = &pin
+	}
+	message, err := a.local.CreateMessage(r.Context(), r.PathValue("group"), input.MessageInput, key)
+	if errors.Is(err, store.ErrArtifactReadGrantUnavailable) {
+		WriteError(w, http.StatusServiceUnavailable, "artifact_read_grant_unavailable", "数据库尚未启用消息成果读取许可")
+		return
+	}
 	operationResult(w, http.StatusCreated, message, err)
 }
 

@@ -169,6 +169,9 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 		candidate = &captured
 	}
 	if experience.enabled {
+		if experience.deliveryID != "" && s.db.ValidateClaimedDeliveryArtifactReadGrant(ctx, scope, experience.deliveryID, experience.pin) != nil {
+			return "", store.ErrMemberToolDenied
+		}
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}

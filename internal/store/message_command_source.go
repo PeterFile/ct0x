@@ -24,7 +24,20 @@ func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, re
 	if err := requireMessageActor(ctx, tx, r.GroupID, "user"); err != nil {
 		return domain.Message{}, storeError("验证用户消息失败", err)
 	}
-	_, replay, err := lookupMutation(ctx, tx, r.scope(), r.payload())
+	if pin := r.ArtifactReadGrant; pin != nil {
+		if len(r.RecipientIDs) != 1 || r.RecipientIDs[0] == "" || !ValidArtifactReadPin(*pin) {
+			return domain.Message{}, ErrInvalid
+		}
+		installed, err := artifactReadGrantInstalled(ctx, tx)
+		if err != nil {
+			return domain.Message{}, storeError("验证成果读取许可失败", err)
+		}
+		if !installed {
+			return domain.Message{}, ErrArtifactReadGrantUnavailable
+		}
+	}
+	payload := r.payload()
+	_, replay, err := lookupMutation(ctx, tx, r.scope(), payload)
 	if err != nil {
 		return domain.Message{}, storeError("读取用户消息回执失败", err)
 	}
@@ -33,11 +46,16 @@ func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, re
 		return domain.Message{}, storeError("创建用户消息失败", err)
 	}
 	if !replay {
-		sourceID, err := messageCommandSourceInTx(ctx, tx, message.ID, "local_user_chat", r.payload(), r.IdempotencyKey, nil)
+		sourceID, err := messageCommandSourceInTx(ctx, tx, message.ID, "local_user_chat", payload, r.IdempotencyKey, nil)
 		if err != nil {
 			return domain.Message{}, storeError("记录用户命令来源失败", err)
 		}
 		message.SourceID, message.SourceKind = sourceID, "local_user_chat"
+		if pin := r.ArtifactReadGrant; pin != nil {
+			if err := insertDeliveryArtifactReadGrant(ctx, tx, message, *pin); err != nil {
+				return domain.Message{}, storeError("保存成果读取许可失败", err)
+			}
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Message{}, storeError("保存用户消息失败", err)

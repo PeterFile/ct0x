@@ -38,15 +38,17 @@ type PrepareOptions struct {
 	MemberTools            *MemberToolRuntime
 	PiMemberToolsExtension string
 	// EnablePiProjectExperience selects only the exact fresh Pi transport.
-	// It never requests or issues an Artifact grant.
-	EnablePiProjectExperience bool
-	EnableCodexAppServer      bool          // Default false; requires the role-enabled runtime.
-	HistoryLimit              int           // Zero defaults to 50; explicit range is 1..200.
-	MaxContextBytes           int           // Zero: 16 KiB ordinary, RoleMaxContextBytes for trusted chat intake; maximum 1 MiB.
-	RoleHistoryLimit          int           // Zero defaults to 50; explicit range is 1..200.
-	RoleMaxContextBytes       int           // Zero defaults to 256 KiB; maximum is 1 MiB.
-	RoleThinking              string        // Trusted role-only Pi thinking level; empty preserves CLI defaults.
-	ExecutionTimeout          time.Duration // Zero uses the provider default.
+	// The optional reader borrows the existing same-Store blob owner; it does
+	// not grant anything without a durable LocalUser approval.
+	EnablePiProjectExperience    bool
+	PiProjectExperienceArtifacts *MemberArtifactGrant
+	EnableCodexAppServer         bool          // Default false; requires the role-enabled runtime.
+	HistoryLimit                 int           // Zero defaults to 50; explicit range is 1..200.
+	MaxContextBytes              int           // Zero: 16 KiB ordinary, RoleMaxContextBytes for trusted chat intake; maximum 1 MiB.
+	RoleHistoryLimit             int           // Zero defaults to 50; explicit range is 1..200.
+	RoleMaxContextBytes          int           // Zero defaults to 256 KiB; maximum is 1 MiB.
+	RoleThinking                 string        // Trusted role-only Pi thinking level; empty preserves CLI defaults.
+	ExecutionTimeout             time.Duration // Zero uses the provider default.
 
 	Investigation             *InvestigationPreparationOptions
 	EnableNativeSessionResume bool   // Experimental, default false; requires member tools and an opted-in adapter.
@@ -60,25 +62,26 @@ type preparationRecipient struct{ group, member string }
 // root ancestors trusted and directory identities stable while runs are claimed.
 // This is local coordination, not protection against hostile host filesystem edits.
 type Preparer struct {
-	store                  *store.Store
-	providers              map[string]provider.Provider
-	grants                 map[preparationRecipient]int
-	privateRoot            string
-	privateDataRoot        string
-	privateDataKey         string
-	roots, rootKeys        []string
-	historyLimit           int
-	maxContextBytes        int
-	defaultContextBudget   bool
-	roleHistoryLimit       int
-	roleMaxContextBytes    int
-	roleThinking           string
-	executionTimeout       time.Duration
-	memberTools            *MemberToolRuntime
-	piMemberToolsExtension string
-	piDiscussionSchema     bool
-	piProjectExperience    bool
-	enableCodexAppServer   bool
+	store                        *store.Store
+	providers                    map[string]provider.Provider
+	grants                       map[preparationRecipient]int
+	privateRoot                  string
+	privateDataRoot              string
+	privateDataKey               string
+	roots, rootKeys              []string
+	historyLimit                 int
+	maxContextBytes              int
+	defaultContextBudget         bool
+	roleHistoryLimit             int
+	roleMaxContextBytes          int
+	roleThinking                 string
+	executionTimeout             time.Duration
+	memberTools                  *MemberToolRuntime
+	piMemberToolsExtension       string
+	piDiscussionSchema           bool
+	piProjectExperience          bool
+	piProjectExperienceArtifacts *MemberArtifactGrant
+	enableCodexAppServer         bool
 
 	investigation             *investigationPreparationSettings
 	enableNativeSessionResume bool
@@ -150,7 +153,7 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 	if opts.NativePiThinking != "" && (!opts.EnableNativeSessionResume || path == "" || !validNativePiThinking(opts.NativePiThinking)) {
 		return errPrepareConfig
 	}
-	if r == nil && path == "" && !opts.EnableCodexAppServer && !opts.EnableNativeSessionResume && !opts.EnablePiProjectExperience {
+	if r == nil && path == "" && !opts.EnableCodexAppServer && !opts.EnableNativeSessionResume && !opts.EnablePiProjectExperience && opts.PiProjectExperienceArtifacts == nil {
 		return nil
 	}
 	if r == nil || path == "" && !opts.EnableCodexAppServer || r.tools == nil || r.tools.db != p.store || r.tools.capabilities == nil ||
@@ -197,6 +200,13 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 		return errPrepareConfig
 	}
 	p.piProjectExperience = opts.EnablePiProjectExperience
+	if reader := opts.PiProjectExperienceArtifacts; reader != nil {
+		if !p.piProjectExperience || reader.db != p.store || reader.open == nil || reader.pin != (domain.ArtifactVersionRef{}) {
+			return errPrepareConfig
+		}
+		borrowed := *reader
+		p.piProjectExperienceArtifacts = &borrowed
+	}
 	p.enableNativeSessionResume, p.nativePiThinking = opts.EnableNativeSessionResume, opts.NativePiThinking
 	return nil
 }
@@ -287,7 +297,22 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	}
 	projectExperience := useMemberTools && p.piProjectExperience && !nativeText && selected.Name == provider.Pi &&
 		!intakeSchema.investigation && !(intake && p.memberTools.tools.continueWorkEnabled())
-	prompt, err := p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, nativeText, intakeSchema.investigation, projectExperience, repairSource)
+	var artifactRead *preparedDeliveryArtifactRead
+	var artifactReadPin *domain.ArtifactVersionRef
+	if projectExperience && trigger.SenderID == "user" && trigger.SourceKind == "local_user_chat" {
+		pin, err := p.store.QueuedDeliveryArtifactReadGrant(ctx, group.ID, d, conversation.TopicID)
+		if err != nil {
+			return empty, preparationReadError(ctx, err)
+		}
+		if pin != (domain.ArtifactVersionRef{}) {
+			if p.piProjectExperienceArtifacts == nil {
+				return empty, scheduler.ErrNotReady
+			}
+			artifactRead = &preparedDeliveryArtifactRead{pin: pin, owner: p.piProjectExperienceArtifacts}
+			artifactReadPin = &artifactRead.pin
+		}
+	}
+	prompt, err := p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, nativeText, intakeSchema.investigation, projectExperience, artifactReadPin, repairSource)
 	if err != nil {
 		return empty, err
 	}
@@ -316,6 +341,7 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 		run := executor.(*memberToolRuntimeRun)
 		run.intakeSchema = intakeSchema
 		if projectExperience {
+			run.projectExperienceArtifactRead = artifactRead
 			run.projectExperienceBuilder = func(config provider.NativeMemberToolConfig) (provider.Executor, error) {
 				return provider.NewPiProjectExperienceExecutor(selected, p.piMemberToolsExtension, config, p.executionTimeout)
 			}
@@ -428,11 +454,12 @@ func preparationReadError(ctx context.Context, err error) error {
 
 func (p *Preparer) buildContext(group domain.Group, member domain.Member, conversation domain.Conversation,
 	trigger domain.Message, history []domain.Message, useMemberTools bool, repairs ...*domain.ChatRepairSource) ([]byte, error) {
-	return p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, false, false, false, repairs...)
+	return p.buildExecutionContext(group, member, conversation, trigger, history, useMemberTools, false, false, false, nil, repairs...)
 }
 
 func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Member, conversation domain.Conversation,
-	trigger domain.Message, history []domain.Message, useMemberTools, nativeText, investigationIntake, projectExperience bool, repairs ...*domain.ChatRepairSource) ([]byte, error) {
+	trigger domain.Message, history []domain.Message, useMemberTools, nativeText, investigationIntake, projectExperience bool,
+	artifactReadPin *domain.ArtifactVersionRef, repairs ...*domain.ChatRepairSource) ([]byte, error) {
 	metadata := struct {
 		Group        domain.Group        `json:"group"`
 		Conversation domain.Conversation `json:"conversation"`
@@ -442,9 +469,10 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 			Role       string `json:"role"`
 			ProviderID string `json:"provider_id"`
 		} `json:"member"`
-		SequenceSemantics string                   `json:"sequence_semantics"`
-		RepairSource      *domain.ChatRepairSource `json:"repair_source,omitempty"`
-	}{Group: group, Conversation: conversation,
+		SequenceSemantics string                     `json:"sequence_semantics"`
+		RepairSource      *domain.ChatRepairSource   `json:"repair_source,omitempty"`
+		ArtifactReadGrant *domain.ArtifactVersionRef `json:"artifact_read_grant,omitempty"`
+	}{Group: group, Conversation: conversation, ArtifactReadGrant: artifactReadPin,
 		SequenceSemantics: "Source.Sequence 仅为本次快照内位置：选中历史从旧到新为 1..N，触发消息为 N+1；不是数据库提交序号、高水位（HWM）或摘要覆盖范围。未提供摘要，也不将消息意见升级为已确认决定。"}
 	if len(repairs) > 0 {
 		metadata.RepairSource = repairs[0]
@@ -527,7 +555,11 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 			}
 		}
 		if projectExperience {
-			in.Permissions = append(in.Permissions, "接手既有问题时可用 lookup_project_experiences 检索当前话题已选经验，按 read_history 回读依据，区分仍有效与已停用的做法。经验中的成果版本标识不是授权；普通启动不提供成果正文读取。")
+			artifactPermission := "普通启动不提供成果正文读取。"
+			if artifactReadPin != nil {
+				artifactPermission = "仅在本轮实际提供成果读取工具时，按 artifact_read_grant 中的确切成果和版本读取，不得替换为当前版本。"
+			}
+			in.Permissions = append(in.Permissions, "接手既有问题时可用 lookup_project_experiences 检索当前话题已选经验，按 read_history 回读依据，区分仍有效与已停用的做法。经验中的成果版本标识不是授权；"+artifactPermission)
 		}
 		if selected, ok := p.providers[member.ProviderID]; ok {
 			if selection, enabled := p.memberToolAdapter(selected); enabled && selection.Protocol == provider.CodexAppServerProtocol {

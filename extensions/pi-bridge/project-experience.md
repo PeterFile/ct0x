@@ -11,12 +11,18 @@
 
 二者是只读 POST，复用回环成员工具 transport、当前 bearer、64 KiB 请求及完整响应预算；无写入幂等键、不截断、不重试、不经 MCP。超预算先减小检索范围、`limit` 或 `max_bytes`。原消息继续按 ID 用 `read_history` 回读。不接受身份、权限、路径或当前版本选择。与 `read_investigation_artifact` 的正式角色、允许版本清单及响应契约独立，不能相互替代。
 
-## 发行与已知阻塞
+## 签发与本机用户批准
 
-可信运行时在构造或启动适配器前，用持久 Turn claim 签发新 bearer，同时固定本轮的原生传输投影。已签发的 bearer 不可重新绑定或扩权，即使还没有首个原生事件。私有配置中的 `project_experience_tools` 是已签发权限的有序投影，不是授权。Go 和 Pi 均校验同一份 0600 配置的 SHA-256，并拒绝同时出现 `continue_work`、`intake_assessment_action` 或 `investigation_tools` 的经验配置；保留 `discussion_only_excerpt`。Pi 的原生 `--tools` 与扩展注册使用同一精确名单。不修改历史原文或经验 Store，不增加授权表或迁移。
+可信运行时在构造或启动适配器前，用持久 Turn claim 签发新 bearer，同时固定本轮的原生传输投影。已签发的 bearer 不可重新绑定或扩权，即使还没有首个原生事件。私有配置中的 `project_experience_tools` 是已签发权限的有序投影，不是授权。Go 和 Pi 均校验同一份 0600 配置的 SHA-256，并拒绝同时出现 `continue_work`、`intake_assessment_action` 或 `investigation_tools` 的经验配置；保留 `discussion_only_excerpt`。Pi 的原生 `--tools` 与扩展注册使用同一精确名单。不修改历史原文、经验 Store 或既有工具 ABI。
 
 若启用成果读取，可信进程内 `MemberTools.IssueFreshPiProjectExperience` 要求独立批准的 `ArtifactVersionRef`、`read_artifact` 操作及同一 Store 的真实 `MemberArtifactGrant`。签发时在 claim 群组中核对确切版本的存在性，并将 pin 固定在 grant 副本上。直接成果读取与 E3 的经验验证共用读取边界，在访问 blob 前拒绝不匹配的版本；如果经验页包含未批准的引用，则整页拒绝，不改变筛选或排名。匹配的读取仍须校验现有版本、blob 哈希及授权；撤销 bearer 或持久 claim 失效后拒绝后续读取。命中、评审记录、群组成员资格和用户下载均不授予字节读取权限。
 
-**普通启动没有成果批准来源。** 它只签发历史权限，成果 pin 为空，不向模型注册 `read_artifact`。调查启动借用的 blob 服务有独立的正式调查范围，不能借给普通轮。受控测试在真实 SQLite claim 上签发一个独立批准的固定 tuple；不提供产品批准策略。普通轮的完整原生接手验收仍需可信批准来源接入此签发接缝；不能用 `read_history`、经验命中或当前成果指针补上。
+本机用户可在 `POST /api/v1/groups/{group}/messages` 的普通消息中附上独立批准。`recipient_ids` 必须明确列出恰好一个本群成员；不接受默认接收者、公开消息或群发的批准。请求示例：
 
-安装态测试依赖 #218 `372cc69e13345e82739a91552286f8b99772afb4` 的 `projectIdentitySchema` 先于 #214 `a091ea68ff93b61c47ba38ba404195148a5c78da` 的 `projectExperienceSchema`。公共登记和编号仍由 B 决定。本片基于 #214 的冻结 `MemberTools.LookupProjectExperiences`，不要求修改 E 或 D 的文件。
+```json
+{"content":"跟进那个导出 BUG","topic_id":"export-bug","recipient_ids":["member-id"],"artifact_read_grant":{"artifact_id":"artifact-id","version_id":"version-id"}}
+```
+
+群组由 URL 确定，话题以实际消息为准，发送者由 LocalUser 绑定。许可与实际消息、投递和幂等回执在同一事务提交；同一幂等键更换或省略许可会冲突。准备时仅查看本次待认领的投递，签发前在当前 claim 下重验投递及确切版本。模型只在符合现有全新 Pi profile 且实际签发读取权时得到该工具。不附批准仍保持原来的检索权限；同话题的其他投递、成员消息、成果当前版本及调查授权都不能补上批准。
+
+B 须将 `internal/store/delivery_artifact_read_grant.sql` 作为独立追加迁移登记。它依赖 v3 的消息/投递、v4 的 `deliveries_turn_identity`、v6 的 `artifact_versions`、v8 的不可变消息及 v17 的 `message_command_sources`；无需 D2 或 E3 表。未安装时，旧消息和经验检索保持原状，新的批准请求返回 `503 artifact_read_grant_unavailable`，不写任何消息或投递。测试仅在私有 SQLite 夹具安装该片段，不改公共登记。若另行登记项目经验，仍由 B 在 #218 的 `projectIdentitySchema` 之后登记 #214 的 `projectExperienceSchema`。

@@ -207,17 +207,18 @@ func (schema memberToolIntakeSchema) requiresIssuedPiConfig() bool {
 }
 
 type memberToolRuntimeRun struct {
-	runtime                  *MemberToolRuntime
-	binding                  MemberToolRunBinding
-	factory                  MemberToolExecutorFactory
-	used                     atomic.Bool
-	role                     *store.CoordinationRoleProvenance
-	intake                   bool
-	intakeSchema             memberToolIntakeSchema
-	intakeBuilder            func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
-	projectExperienceBuilder func(provider.NativeMemberToolConfig) (provider.Executor, error)
-	investigation            *investigationRolePreparation
-	nativeSession            *memberToolNativeSessionPlan
+	runtime                       *MemberToolRuntime
+	binding                       MemberToolRunBinding
+	factory                       MemberToolExecutorFactory
+	used                          atomic.Bool
+	role                          *store.CoordinationRoleProvenance
+	intake                        bool
+	intakeSchema                  memberToolIntakeSchema
+	intakeBuilder                 func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
+	projectExperienceBuilder      func(provider.NativeMemberToolConfig) (provider.Executor, error)
+	projectExperienceArtifactRead *preparedDeliveryArtifactRead
+	investigation                 *investigationRolePreparation
+	nativeSession                 *memberToolNativeSessionPlan
 	// Cloned at trusted wrapping and again when the claimed token is registered.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
@@ -262,11 +263,11 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	grants := MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers, ProviderID: e.binding.ProviderID, Model: e.binding.Model}
 	var token string
 	switch {
+	case freshPiExperience && e.projectExperienceArtifactRead != nil:
+		token, err = e.issueFreshPiDeliveryArtifactRead(ctx, claim, grants)
 	case e.intake:
 		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema, freshPiExperience)
 	case freshPiExperience:
-		// Ordinary startup issues history, not an artifact grant or an approved
-		// version. Never obtain either from the context or lookup results.
 		token, err = r.tools.IssueFreshPiProjectExperience(ctx, claim, grants, domain.ArtifactVersionRef{})
 	default:
 		token, err = r.tools.Issue(ctx, claim, grants)

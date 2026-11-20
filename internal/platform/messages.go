@@ -8,16 +8,22 @@ import (
 )
 
 type MessageInput struct {
-	Content      string   `json:"content"`
-	RecipientIDs []string `json:"recipient_ids"`
-	TopicID      string   `json:"topic_id"`
+	Content           string                     `json:"content"`
+	RecipientIDs      []string                   `json:"recipient_ids"`
+	TopicID           string                     `json:"topic_id"`
+	ArtifactReadGrant *domain.ArtifactVersionRef `json:"artifact_read_grant,omitempty"`
 }
 
 func (s *LocalUser) CreateMessage(ctx context.Context, groupID string, input MessageInput, key string) (domain.Message, error) {
 	// Preserve original recipient intent for both idempotency checks.
 	request := store.MessageRequest{
 		GroupID: groupID, ActorID: "user", Content: input.Content, TopicID: input.TopicID,
-		RecipientIDs: input.RecipientIDs, IdempotencyKey: key,
+		RecipientIDs: input.RecipientIDs, IdempotencyKey: key, ArtifactReadGrant: input.ArtifactReadGrant,
+	}
+	if input.ArtifactReadGrant != nil {
+		// No routing or generic message path can create a grant. The Store
+		// validates the single explicit recipient and reserves the receipt in-tx.
+		return s.db.CreateLocalUserMessage(ctx, request, input.RecipientIDs)
 	}
 	if receipt, found, err := s.db.LookupMessageReceipt(ctx, request); err != nil || found {
 		return receipt, err

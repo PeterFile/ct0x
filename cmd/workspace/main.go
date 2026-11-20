@@ -82,13 +82,9 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		return err
 	}
 	defer func() { err = errors.Join(err, artifactCloser.Close()) }()
-	var workspaceOptions []platform.MemberWorkspaceOptions
-	if config.enableExecution && config.enableMemberTools && config.enableCoordinationRoles {
-		options, err := workspaceRuntimeOptions(config.dataDir, artifactCloser)
-		if err != nil {
-			return err
-		}
-		workspaceOptions = append(workspaceOptions, options)
+	workspaceOptions, err := executionArtifactOptions(config, artifactCloser)
+	if err != nil {
+		return err
 	}
 	var schedule func(context.Context) error
 	var memberTools *platform.MemberToolRuntime
@@ -139,7 +135,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		routes = append(routes, httpapi.MemberHistoryToolRoutes(memberTools.Tools())...)
 		if config.enablePiProjectExperience {
 			routes = append(routes, httpapi.MemberProjectExperienceToolRoutes(memberTools.Tools())...)
-			toolStatus += "；使用受信扩展的全新 Pi 历史轮可检索当前话题的项目经验，普通启动不签发成果读取权限"
+			toolStatus += "；使用受信扩展的全新 Pi 历史轮可检索当前话题的项目经验；仅在数据库已启用相应架构且本机用户对此投递明确批准时，才签发确切成果版本的读取权限"
 		}
 		if config.enableInvestigationExecution {
 			routes = append(routes, httpapi.MemberInvestigationToolRoutes(memberTools.Tools())...)
