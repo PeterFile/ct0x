@@ -237,6 +237,7 @@ BEGIN SELECT RAISE(ABORT, '接纳任务必须有明确接纳的评审'); END;
 `, artifactSchemaV6, taskArtifactSchemaV7, messageSequenceSchemaV8, coordinationTriggerSchemaV9, coordinationAdmissionSchemaV10, coordinatorSchemaV11, coordinationDispatchSchemaV12, coordinationAssignmentSchemaV13, coordinationAssignmentResolutionSchemaV14, workspaceGrantSchemaV15, chatIntentSchemaV16, chatAuthoritySchemaV17, chatReviewNoticeSchemaV18, workspaceWriteGrantSchemaV19, chatWorkspaceSchemaV20, workspaceOperationSchemaV21, chatRepairSchemaV22, nativeRunBindingsSchemaV23, chatDiscussionSchema, taskArtifactDependencySchema, chatDiscussionPolicySchema, chatInvestigationSchema,
 	taskWorkInputSchema, taskWorkDeliverySchema,
 	taskWorkReportSchema,
+	chatDiscussionWorkReturnSchema,
 	projectIdentitySchema,
 	projectDirectorySchema,
 }

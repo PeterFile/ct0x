@@ -33,6 +33,7 @@ const (
 
 type Store struct {
 	db                     *sql.DB
+	schemaVersion          int // Known migration prefix at Open, not a later ledger observation.
 	investigationExecution atomic.Bool
 	taskWorkExecution      atomic.Bool
 }
@@ -84,7 +85,7 @@ func Open(path string) (*Store, error) {
 	if err := migrate(db); err != nil {
 		return nil, storeError("初始化数据库失败", errors.Join(err, db.Close()))
 	}
-	return &Store{db: db}, nil
+	return &Store{db: db, schemaVersion: len(migrations)}, nil
 }
 
 func (s *Store) Close() error { return storeError("关闭数据库失败", s.db.Close()) }

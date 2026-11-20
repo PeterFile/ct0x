@@ -34,10 +34,12 @@ SLOTS = {"TestCoordination": 23, "TestAlpha": 27, "TestBeta": 51, "TestGamma": 1
          "TestVector123": 62, "TestVector151": 54, "TestVector152": 9, "TestVector194": 29,
          "TestVector201": 32, "TestVector202": 63, "TestVector282": 59, "TestVector283": 4}
 PLATFORM_PACKAGE = "agentworkspace/internal/platform"
+PLATFORM_TOTAL = 9
 HTTPAPI_PACKAGE = "agentworkspace/internal/httpapi"
 COORDINATION_PACKAGE = "agentworkspace/internal/coordination"
-# Fixed SHA-256 first-eight-byte big-endian mod-8 vectors.
-PLATFORM_SLOTS = {"TestCoordination": 7, "TestAlpha": 3, "TestBeta": 3, "TestGamma": 4,
+# Fixed SHA-256 first-eight-byte big-endian vectors: mod 8 except for legacy slot 4,
+# where mod 16 = 4 stays and mod 16 = 12 moves to slot 8.
+PLATFORM_SLOTS = {"TestCoordination": 7, "TestAlpha": 3, "TestBeta": 3, "TestGamma": 8,
                   "Test新入口": 2, "Example": 5, "FuzzBytes": 4,
                   "TestVector6": 0, "TestVector0": 1, "TestIota": 6}
 # Fixed SHA-256 first-eight-byte big-endian mod-8 vectors.
@@ -96,7 +98,7 @@ class VerifierTests(unittest.TestCase):
     def artifacts(self, names=tuple(SLOTS), profile=None):
         directory = self.directory / "summaries"
         suite = profile or "store"
-        slots, total = (HTTPAPI_SLOTS, 8) if profile == "httpapi" else ((PLATFORM_SLOTS, 8) if profile == "platform" else (SLOTS, 64))
+        slots, total = (HTTPAPI_SLOTS, 8) if profile == "httpapi" else ((PLATFORM_SLOTS, PLATFORM_TOTAL) if profile == "platform" else (SLOTS, 64))
         make_event = httpapi_event if profile == "httpapi" else (platform_event if profile == "platform" else event)
         for slot in range(total):
             selected = [name for name in names if slots[name] == slot]
@@ -496,7 +498,7 @@ class VerifierTests(unittest.TestCase):
 
     def test_platform_fixed_vectors_full_coverage_and_empty_slots(self):
         listed = self.inventory(PLATFORM_SLOTS, PLATFORM_PACKAGE)
-        for slot in range(8):
+        for slot in range(PLATFORM_TOTAL):
             result = self.invoke("select", slot, PLATFORM_PACKAGE, listed, "--profile", "platform")
             self.assertEqual(result.returncode, 0, result.stderr)
             expected = sorted(name for name, assigned in PLATFORM_SLOTS.items() if assigned == slot)
@@ -504,26 +506,44 @@ class VerifierTests(unittest.TestCase):
             self.assertIsNone(re.fullmatch(result.stdout.strip(), expected[0] + "Extra"))
         directory = self.artifacts(PLATFORM_SLOTS, "platform")
         summary = self.success(self.aggregate(directory, profile="platform"))
-        self.assertEqual((summary["schema"], summary["total"], summary["package"]), (1, 8, PLATFORM_PACKAGE))
+        self.assertEqual((summary["schema"], summary["total"], summary["package"]), (1, PLATFORM_TOTAL, PLATFORM_PACKAGE))
         for field in ["compiled", "runs", "passes"]:
             self.assertEqual(summary[field], {name: 1 for name in PLATFORM_SLOTS})
         self.assertEqual(summary["skips"], {})
         directory.rename(self.directory / "full-slots")
         directory = self.artifacts([ROOT], "platform")
         self.success(self.aggregate(directory, profile="platform"))
-        empty = json.loads((directory / "platform-shard-v1-0/platform-summary.json").read_text())
-        self.assertEqual(empty["compiled"], {ROOT: 1})
-        for field in ["selected", "runs", "passes", "skips"]:
-            self.assertEqual(empty[field], {})
-        (directory / "platform-shard-v1-0").rename(self.directory / "empty-slot")
-        self.reject(self.aggregate(directory, profile="platform"))
+        for slot in [0, 8]:
+            with self.subTest(missing_empty_slot=slot):
+                artifact = directory / f"platform-shard-v1-{slot}"
+                empty = json.loads((artifact / "platform-summary.json").read_text())
+                self.assertEqual(empty["compiled"], {ROOT: 1})
+                for field in ["selected", "runs", "passes", "skips"]:
+                    self.assertEqual(empty[field], {})
+                moved = self.directory / artifact.name
+                artifact.rename(moved)
+                result = self.aggregate(directory, profile="platform")
+                self.reject(result)
+                self.assertIn("9 个 artifact 目录", result.stderr)
+                moved.rename(artifact)
+
+    def test_platform_split_rejects_misrouted_or_missing_execution(self):
+        names = ["FuzzBytes", "TestGamma"]
+        # Running both in slot 4 used to pass; TestGamma must now run in slot 8.
+        rows = [platform_event(action, name) for name in names for action in ("run", "pass")]
+        misrouted = self.verify(rows, names, slot=4, profile="platform")
+        self.reject(misrouted)
+        self.assertIn("未列出或不属于此分片的顶层项：TestGamma", misrouted.stderr)
+        omitted = self.verify([], names, slot=8, profile="platform")
+        self.reject(omitted)
+        self.assertIn("顶层 run/pass 覆盖计数不符", omitted.stderr)
 
     def test_profiles_are_bounded_and_cross_package_select_verify_fail(self):
         listed = self.inventory([ROOT], PLATFORM_PACKAGE)
         run = self.json_lines("run.json", [platform_event("start"), platform_event("run", ROOT),
                                             platform_event("pass", ROOT), platform_event("pass")])
         for command, args in [("select", [listed]), ("verify", [listed, run, *IDENTITY])]:
-            for slot in [-1, 8, 18]:
+            for slot in [-1, PLATFORM_TOTAL, 18]:
                 with self.subTest(command=command, slot=slot):
                     result = self.invoke(command, slot, PLATFORM_PACKAGE, *args, "--profile", "platform")
                     self.assertEqual(result.returncode, 2, result.stderr)
@@ -579,19 +599,19 @@ class VerifierTests(unittest.TestCase):
             self.reject(self.aggregate(directory, identity=identity, profile="platform"))
         for field, value, original in [("run_id", "42566516009", IDENTITY[1]), ("checkout_sha", "c" * 40, IDENTITY[3]),
                                        ("checkout_tree", "d" * 40, IDENTITY[5]), ("package", PACKAGE, PLATFORM_PACKAGE)]:
-            for slot in range(8):
+            for slot in range(PLATFORM_TOTAL):
                 self.mutate(directory, slot, lambda summary: summary.update({field: value}), "platform")
             self.reject(self.aggregate(directory, profile="platform"))
             if field == "package":
                 self.reject(self.aggregate(directory, package=PACKAGE, profile="platform"))
-            for slot in range(8):
+            for slot in range(PLATFORM_TOTAL):
                 self.mutate(directory, slot, lambda summary: summary.update({field: original}), "platform")
         self.reject(self.aggregate(directory))
         path = directory / "platform-shard-v1-0/platform-summary.json"
         path.rename(path.with_name("store-summary.json"))
         self.reject(self.aggregate(directory, profile="platform"))
         path.with_name("store-summary.json").rename(path)
-        for slot in range(8):
+        for slot in range(PLATFORM_TOTAL):
             (directory / f"platform-shard-v1-{slot}").rename(directory / f"store-shard-v1-{slot}")
         self.reject(self.aggregate(directory, profile="platform"))
 
@@ -604,28 +624,31 @@ class VerifierTests(unittest.TestCase):
         self.mutate(directory, 1, lambda summary: summary.update(slot=0), "platform")
         self.reject(self.aggregate(directory, profile="platform"))
         self.mutate(directory, 1, lambda summary: summary.update(slot=1), "platform")
-        extra = directory / "platform-shard-v1-8"
+        extra = directory / f"platform-shard-v1-{PLATFORM_TOTAL}"
         extra.mkdir()
         self.reject(self.aggregate(directory, profile="platform"))
         extra.rmdir()
         self.mutate(directory, 0, lambda summary: summary["compiled"].pop(ROOT), "platform")
         self.reject(self.aggregate(directory, profile="platform"))
-        for slot in range(8):
+        for slot in range(PLATFORM_TOTAL):
             self.mutate(directory, slot, lambda summary: summary.update(compiled={}, selected={}, runs={}, passes={}), "platform")
         self.reject(self.aggregate(directory, profile="platform"))
 
     def test_platform_aggregate_recomputes_hash_despite_complete_union(self):
         directory = self.artifacts(PLATFORM_SLOTS, "platform")
-        # Both wrong assignments still partition the complete inventory exactly once.
+        # All wrong assignments still partition the complete inventory exactly once.
         assignments = [{"TestCoordination": 3, "TestAlpha": 1, "TestBeta": 1, "TestGamma": 2,
                         "Test新入口": 0, "Example": 1, "FuzzBytes": 0,
-                        "TestVector6": 0, "TestVector0": 1, "TestIota": 0},  # Legacy Store18 mod 4, not Platform8.
-                       {name: (slot + 1) % 8 for name, slot in PLATFORM_SLOTS.items()}]
+                        "TestVector6": 0, "TestVector0": 1, "TestIota": 0},  # Legacy Store18 mod 4, not the Platform split.
+                       {name: (slot + 1) % PLATFORM_TOTAL for name, slot in PLATFORM_SLOTS.items()},
+                       {**PLATFORM_SLOTS, "TestGamma": 4}]  # Pre-split routing.
         for assigned in assignments:
-            for slot in range(8):
+            for slot in range(PLATFORM_TOTAL):
                 selected = {name: 1 for name in assigned if assigned[name] == slot}
                 self.mutate(directory, slot, lambda summary: summary.update(selected=selected, runs=selected, passes=selected), "platform")
-            self.reject(self.aggregate(directory, profile="platform"))
+            result = self.aggregate(directory, profile="platform")
+            self.reject(result)
+            self.assertIn("summary 哈希选片或 run/pass/skip 覆盖不符", result.stderr)
 
 
     def test_httpapi_fixed_vectors_full_coverage_and_empty_slots(self):
@@ -902,7 +925,11 @@ class WorkflowTests(unittest.TestCase):
     def test_platform_matrix_and_independent_aggregate(self):
         platform = re.search(r"\n  go-platform:\n(.*?)(?=\n  go-httpapi:)", self.workflow, re.S)
         self.assertIsNotNone(platform)
-        for text in ["fail-fast: false", "slot: [0, 1, 2, 3, 4, 5, 6, 7]", "timeout-minutes: 15",
+        job = platform.group(1)
+        matrices = re.findall(r"^        slot: (\[[^\n]+\])$", job, re.M)
+        self.assertEqual(len(matrices), 1)
+        self.assertEqual(json.loads(matrices[0]), list(range(PLATFORM_TOTAL)))
+        for text in ["fail-fast: false", "timeout-minutes: 15",
                      "go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/platform",
                      'go test -count=1 -race -json -run "$pattern" ./internal/platform',
                      'package=$(go list ./internal/platform)', 'git rev-parse HEAD', 'git rev-parse HEAD^{tree}',
@@ -910,8 +937,8 @@ class WorkflowTests(unittest.TestCase):
                      'verify-store-shard.py verify --profile platform "$PLATFORM_SLOT"',
                      "name: platform-shard-v1-${{ matrix.slot }}", "overwrite: true", "if-no-files-found: error",
                      "path: ${{ runner.temp }}/platform-summary.json"]:
-            self.assertIn(text, platform.group(1))
-        self.assertNotIn("-timeout", platform.group(1))
+            self.assertIn(text, job)
+        self.assertNotIn("-timeout", job)
         for suite in ["store", "platform"]:
             download = re.search(rf"pattern: {suite}-shard-v1-\*\n          path: \$\{{\{{ runner.temp \}}\}}/{suite}-shards\n          merge-multiple: false", self.workflow)
             self.assertIsNotNone(download)
