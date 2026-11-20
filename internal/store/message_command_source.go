@@ -26,8 +26,15 @@ func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, re
 		return domain.Message{}, storeError("验证用户消息失败", err)
 	}
 	pin := r.ArtifactReadGrant
-	if pin != nil && (len(r.RecipientIDs) != 1 || r.RecipientIDs[0] == "" || !ValidArtifactReadPin(*pin) || !utf8.ValidString(r.Content)) {
-		return domain.Message{}, ErrInvalid
+	if pin != nil {
+		if len(r.RecipientIDs) != 1 || r.RecipientIDs[0] == "" || !ValidArtifactReadPin(*pin) {
+			return domain.Message{}, ErrInvalid
+		}
+		for _, text := range [...]string{r.GroupID, r.TopicID, r.Content, r.RecipientIDs[0]} {
+			if !utf8.ValidString(text) {
+				return domain.Message{}, ErrInvalid
+			}
+		}
 	}
 	payload := r.payload()
 	_, replay, err := lookupMutation(ctx, tx, r.scope(), payload)

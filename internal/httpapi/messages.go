@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 
-	"agentworkspace/internal/domain"
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/store"
 )
@@ -23,34 +22,30 @@ func MessageRoutes(local *platform.LocalUser) []Route {
 	}
 }
 
-func (a localAPI) createMessage(w http.ResponseWriter, r *http.Request) {
-	// Keep content raw until we know whether it is part of an explicit grant.
-	// The ordinary message path retains encoding/json's string decoding.
-	var input struct {
-		platform.MessageInput
-		Content json.RawMessage `json:"content"`
-		Grant   json.RawMessage `json:"artifact_read_grant"`
+type createMessageRequest struct{ platform.MessageInput }
+
+func (input *createMessageRequest) UnmarshalJSON(body []byte) error {
+	// Detect an explicit grant (even null) using the same field matching as
+	// the DTO, before decoding any values that could lose invalid surrogates.
+	var fields struct {
+		Grant json.RawMessage `json:"artifact_read_grant"`
 	}
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return err
+	}
+	if fields.Grant != nil && (len(fields.Grant) > memberToolJSONBytes ||
+		!bytes.HasPrefix(fields.Grant, []byte("{")) || !validGrantMessageJSONStrings(body)) {
+		return store.ErrInvalid
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(&input.MessageInput)
+}
+
+func (a localAPI) createMessage(w http.ResponseWriter, r *http.Request) {
+	var input createMessageRequest
 	key, ok := requestKey(w, r)
 	if !ok || !DecodeJSON(w, r, &input) {
-		return
-	}
-	if input.Grant != nil {
-		if !validGrantMessageContent(input.Content) {
-			WriteError(w, http.StatusBadRequest, "invalid_json", "带有成果读取许可的消息内容必须使用有效的 Unicode 字符")
-			return
-		}
-		var pin domain.ArtifactVersionRef
-		decoder := json.NewDecoder(bytes.NewReader(input.Grant))
-		decoder.DisallowUnknownFields()
-		if !bytes.HasPrefix(bytes.TrimSpace(input.Grant), []byte("{")) || !validMemberToolJSONStrings(input.Grant) || decoder.Decode(&pin) != nil {
-			WriteError(w, http.StatusBadRequest, "invalid_json", "成果读取许可必须是包含确切成果和版本标识的 JSON 对象")
-			return
-		}
-		input.MessageInput.ArtifactReadGrant = &pin
-	}
-	if input.Content != nil && json.Unmarshal(input.Content, &input.MessageInput.Content) != nil {
-		WriteError(w, http.StatusBadRequest, "invalid_json", "请求体必须是有效的单个 JSON 对象，且不得含有未知或重复字段")
 		return
 	}
 	message, err := a.local.CreateMessage(r.Context(), r.PathValue("group"), input.MessageInput, key)
@@ -61,10 +56,10 @@ func (a localAPI) createMessage(w http.ResponseWriter, r *http.Request) {
 	operationResult(w, http.StatusCreated, message, err)
 }
 
-// DecodeJSON already validated syntax, raw UTF-8 and the message body limit.
-// Reject only unpaired surrogate escapes before the string decoder can replace
-// them. A literal U+FFFD, a valid pair and an escaped backslash are unchanged.
-func validGrantMessageContent(raw []byte) bool {
+// With valid JSON syntax, backslashes occur only in strings. DecodeJSON owns
+// raw UTF-8, the body limit and duplicate keys; this checks scalar escapes
+// without changing literal U+FFFD, paired surrogates or escaped backslashes.
+func validGrantMessageJSONStrings(raw []byte) bool {
 	for {
 		slash := bytes.IndexByte(raw, '\\')
 		if slash < 0 {

@@ -336,6 +336,73 @@ func TestLocalMessageArtifactReadGrantContent(t *testing.T) {
 	}
 }
 
+func TestLocalMessageArtifactReadGrantSelectors(t *testing.T) {
+	f := newArtifactGrantFixture(t)
+	installArtifactReadGrantFixture(t, f.raw)
+	// Make the repaired recipient a real match, not an incidental 404.
+	const member = "reader-�"
+	const topic = "topic-�"
+	_, err := f.raw.Exec(`INSERT INTO members(id,group_id,name,role,created_at) VALUES(?,?,'reader','review',?)`,
+		member, f.group, "2026-01-01T00:00:00.000000000Z")
+	artifactCmdMust(t, err)
+	server, err := httpapi.NewServer(httpapi.DefaultAddress, httpapi.MessageRoutes(f.local)...)
+	artifactCmdMust(t, err)
+	path := "/api/v1/groups/" + f.group + "/messages"
+	pin, err := json.Marshal(f.pin)
+	artifactCmdMust(t, err)
+	const validTopic, validMember = `"` + topic + `"`, `"` + member + `"`
+	grant := `,"Artifact_Read_Grant":` + string(pin)
+	post := func(topic, recipient, extra, key string, want int) []byte {
+		t.Helper()
+		body := fmt.Sprintf(`{"content":%q,"topic_id":%s,"recipient_ids":[%s]%s}`, artifactGrantBody, topic, recipient, extra)
+		return artifactGrantSendRaw(t, server.Handler, path, []byte(body), key, "", want)
+	}
+	const key = "scalar-selectors"
+	for _, tc := range []struct{ topic, recipient string }{
+		{`"topic-\ud800"`, validMember},
+		{validTopic, `"reader-\udc00"`},
+		{"\"topic-\xff\"", validMember},
+		{validTopic, "\"reader-\xff\""},
+	} {
+		if body := post(tc.topic, tc.recipient, grant, key, http.StatusBadRequest); !bytes.Contains(body, []byte(`"code":"invalid_json"`)) {
+			t.Fatalf("expected invalid JSON, got %s", body)
+		}
+	}
+	for _, in := range []platform.MessageInput{
+		{Content: artifactGrantBody, TopicID: "topic-\xff", RecipientIDs: []string{member}, ArtifactReadGrant: &f.pin},
+		{Content: artifactGrantBody, TopicID: topic, RecipientIDs: []string{"reader-\xff"}, ArtifactReadGrant: &f.pin},
+	} {
+		if _, err := f.local.CreateMessage(t.Context(), f.group, in, key); !errors.Is(err, store.ErrInvalid) {
+			t.Fatalf("explicit grant accepted invalid in-process selectors: %v", err)
+		}
+	}
+	for _, table := range []string{"messages", "deliveries", "conversations", "message_command_sources", "delivery_artifact_read_grants", "mutation_idempotency"} {
+		var count int
+		artifactCmdMust(t, f.raw.QueryRow("SELECT count(*) FROM "+table).Scan(&count))
+		if count != 0 {
+			t.Fatalf("rejected selectors left %d rows in %s", count, table)
+		}
+	}
+	first := post(validTopic, validMember, grant, key, http.StatusCreated)
+	var message domain.Message
+	artifactCmdMust(t, json.Unmarshal(first, &message))
+	if message.TopicID != topic || len(message.Deliveries) != 1 || message.Deliveries[0].RecipientID != member {
+		t.Fatalf("valid U+FFFD selectors were altered: %+v", message)
+	}
+	if pin, err := f.db.QueuedDeliveryArtifactReadGrant(t.Context(), f.group, message.Deliveries[0], topic); err != nil || pin != f.pin {
+		t.Fatalf("durable grant did not bind the exact decoded selectors: %v", err)
+	}
+	if replay := post(`"topic-\ufffd"`, `"reader-\ufffd"`, grant, key, http.StatusCreated); !bytes.Equal(first, replay) {
+		t.Fatal("equivalent scalar selectors did not replay")
+	}
+	post(`"topic-\ud800"`, validMember, grant, key, http.StatusBadRequest)
+	post(validTopic, `"reader-\udc00"`, grant, key, http.StatusBadRequest)
+	plain := post(`"topic-\ud800"`, `"reader-\udc00"`, "", "ordinary", http.StatusCreated)
+	if !bytes.Equal(plain, post(validTopic, validMember, "", "ordinary", http.StatusCreated)) {
+		t.Fatal("ordinary selector decoding or replay changed")
+	}
+}
+
 func TestDeliveryArtifactReadGrantSchema(t *testing.T) {
 	for _, fault := range []struct{ name, sql string }{
 		{"absent", ""},
@@ -350,6 +417,10 @@ func TestDeliveryArtifactReadGrantSchema(t *testing.T) {
 		{"missing command source guard", `DROP TRIGGER message_command_sources_update`},
 		{"missing version immutability guard", `DROP TRIGGER artifact_versions_no_update`},
 		{"missing delivery FK key", `DROP INDEX deliveries_turn_identity`},
+		{"same-name no-op grant guard", `DROP TRIGGER delivery_artifact_read_grants_update;
+		 CREATE TRIGGER delivery_artifact_read_grants_update BEFORE UPDATE ON delivery_artifact_read_grants BEGIN SELECT 1; END`},
+		{"same-name wrong delivery FK key", `DROP INDEX deliveries_turn_identity;
+		 CREATE UNIQUE INDEX deliveries_turn_identity ON deliveries(id, group_id, recipient_id)`},
 	} {
 		t.Run(fault.name, func(t *testing.T) {
 			f := newArtifactGrantFixture(t)
@@ -507,7 +578,7 @@ func TestDeliveryArtifactReadGrantIdentity(t *testing.T) {
 func TestStartupArtifactReadGrant(t *testing.T) {
 	f := newArtifactGrantFixture(t)
 	installed := false
-	for _, mode := range []string{"v30 lookup only", "installed pin", "another delivery", "legacy with pin", "chat intake pin", "wrong provenance before prepare", "stale claim backlink"} {
+	for _, mode := range []string{"v30 lookup only", "installed pin", "another delivery", "legacy with pin", "chat intake pin", "wrong provenance before prepare", "wrong sender before prepare", "stale claim backlink"} {
 		t.Run(mode, func(t *testing.T) {
 			if !installed && mode != "v30 lookup only" {
 				installArtifactReadGrantFixture(t, f.raw)
@@ -565,13 +636,28 @@ while [ -f "$root/hold" ]`), 1)
 			d := message.Deliveries[0]
 			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 			defer cancel()
-			if mode == "wrong provenance before prepare" {
+			switch mode {
+			case "wrong provenance before prepare":
 				f.loseEvidence(t, "message_command_sources_update", `UPDATE message_command_sources SET kind='local_user_policy' WHERE message_id=?`, message.ID)
-				if _, err := f.db.QueuedDeliveryArtifactReadGrant(ctx, f.group, d, message.TopicID); !errors.Is(err, store.ErrArtifactReadGrantIncomplete) {
-					t.Fatalf("missing local-user proof: %v", err)
+			case "wrong sender before prepare":
+				peer := f.member(t, f.group, items[0].ID)
+				f.loseEvidence(t, "messages_identity", `UPDATE messages SET sender_id=? WHERE id=?`, peer, message.ID)
+			}
+			if mode == "wrong provenance before prepare" || mode == "wrong sender before prepare" {
+				assertIncomplete := func() {
+					t.Helper()
+					if pin, err := f.db.QueuedDeliveryArtifactReadGrant(ctx, f.group, d, message.TopicID); pin != (domain.ArtifactVersionRef{}) || !errors.Is(err, store.ErrArtifactReadGrantIncomplete) {
+						t.Fatalf("missing local-user proof: %v", err)
+					}
+					if _, err := preparer.Prepare(ctx, store.PendingDelivery{GroupID: f.group, Delivery: d}); err == nil {
+						t.Fatal("preparation silently downgraded an approved delivery with missing local-user proof")
+					}
 				}
-				if _, err := preparer.Prepare(ctx, store.PendingDelivery{GroupID: f.group, Delivery: d}); err == nil {
-					t.Fatal("preparation silently downgraded an approved delivery with missing local-user proof")
+				assertIncomplete()
+				if mode == "wrong sender before prepare" {
+					// The keyless command source alone still witnesses the grant.
+					f.loseEvidence(t, "delivery_artifact_read_grants_delete", `DELETE FROM delivery_artifact_read_grants WHERE delivery_id=?`, d.ID)
+					assertIncomplete()
 				}
 				return
 			}

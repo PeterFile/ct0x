@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	_ "embed"
 	"encoding/binary"
 	"errors"
 	"strings"
@@ -32,11 +33,29 @@ func ValidArtifactReadPin(ref domain.ArtifactVersionRef) bool {
 	return true
 }
 
-// Detect the private fragment in the transaction that uses it. No ledger
-// ordinal, cached result or scan of existing messages/grants is needed.
+//go:embed delivery_artifact_read_grant.sql
+var deliveryArtifactReadGrantSQL string
+
+// Use the existing definitions for the shared guards and FK indexes. Find
+// the latter by name in the canonical source, independent of registry order.
+var artifactReadGrantPrerequisiteSQL = func() string {
+	ddl := messageSequenceSchemaV8 + chatAuthoritySchemaV17 + artifactSchemaV6
+	for _, migration := range migrations {
+		if strings.Contains(migration, "\nCREATE UNIQUE INDEX deliveries_turn_identity ") ||
+			strings.Contains(migration, "\nCREATE UNIQUE INDEX conversations_delivery_identity ") {
+			ddl += "\n" + migration + "\n"
+		}
+	}
+	return ddl
+}()
+
+// Detect the private fragment in the transaction that uses it. Match the
+// CREATE statements as stored by SQLite (no leading comments or final ';'),
+// not just object names. This caches only the expected source, not the check.
 func artifactReadGrantStorage(ctx context.Context, tx *sql.Tx) (installed, hasSource bool, err error) {
 	var present bool
-	err = tx.QueryRowContext(ctx, artifactReadGrantSchemaCheck).Scan(&present, &hasSource, &installed)
+	err = tx.QueryRowContext(ctx, artifactReadGrantSchemaCheck, deliveryArtifactReadGrantSQL, artifactReadGrantPrerequisiteSQL).
+		Scan(&present, &hasSource, &installed)
 	if err == nil && present && !installed {
 		err = ErrArtifactReadGrantIncomplete
 	}
@@ -66,7 +85,9 @@ const artifactReadGrantSchemaCheck = `WITH required(type,tbl_name,name) AS (VALU
     EXISTS(SELECT 1 FROM main.sqlite_schema WHERE name GLOB 'delivery_artifact_read_grant*'),
     EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='message_command_sources'))
  SELECT present,source,CASE WHEN present THEN source AND (SELECT foreign_keys FROM pragma_foreign_keys)=1
-   AND NOT EXISTS(SELECT * FROM required EXCEPT SELECT type,tbl_name,name FROM main.sqlite_schema)
+   AND NOT EXISTS(SELECT 1 FROM required r LEFT JOIN main.sqlite_schema s USING(type,tbl_name,name)
+     WHERE s.sql IS NULL OR instr(char(10)||CASE WHEN r.name GLOB 'delivery_artifact_read_grant*' THEN ?1 ELSE ?2 END||char(10),
+       char(10)||s.sql||';'||char(10))=0)
    AND EXISTS(SELECT 1 FROM pragma_table_list('delivery_artifact_read_grants') WHERE schema='main' AND wr=1 AND ncol=8)
    AND (SELECT count(*) FROM pragma_table_xinfo('delivery_artifact_read_grants','main')
      WHERE type='TEXT' AND "notnull"=1 AND hidden=0 AND pk=(name='delivery_id')
@@ -216,6 +237,9 @@ func (s *Store) QueuedDeliveryArtifactReadGrant(ctx context.Context, groupID str
 	if hasGrant || hasArtifactReadGrantMode(payload) {
 		return pin, ErrArtifactReadGrantIncomplete
 	}
+	// If offline damage erases both the grant and its immutable command
+	// evidence, this Delivery is indistinguishable here from a legacy send.
+	// A keyed replay still has to re-prove the grant; absence never grants it.
 	return pin, tx.Commit()
 }
 

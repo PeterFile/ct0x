@@ -298,9 +298,9 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 	projectExperience := useMemberTools && p.piProjectExperience && !nativeText && selected.Name == provider.Pi &&
 		!intakeSchema.investigation && !(intake && p.memberTools.tools.continueWorkEnabled())
 	var artifactRead *preparedDeliveryArtifactRead
-	// Even if provenance is missing, a persisted grant for this user message
-	// must fail closed rather than silently falling back to lookup only.
-	if projectExperience && trigger.SenderID == "user" {
+	// Sender and source metadata are part of the proof, not preconditions for
+	// looking for it. A damaged grant must not fall back to lookup only.
+	if projectExperience {
 		pin, err := p.store.QueuedDeliveryArtifactReadGrant(ctx, group.ID, d, conversation.TopicID)
 		if err != nil {
 			return empty, preparationReadError(ctx, err)
