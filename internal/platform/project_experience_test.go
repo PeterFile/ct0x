@@ -165,6 +165,20 @@ func TestMemberProjectExperienceLookupRequiresCurrentEvidenceAuthority(t *testin
 		}
 
 		opened = nil
+		got, err = lookup(ProjectExperienceQuery{Query: old.ID, Version: "v2.9"})
+		if err != nil || len(got.Items) != 1 || got.NextCursor != "" || !slices.Equal(opened, []string{v.BlobHash}) {
+			t.Fatalf("approved retirement must return one record and verify only its replacement blob once: %+v, %v; opened=%v", got, err, opened)
+		}
+		hit := got.Items[0]
+		retired := hit.Retirement
+		if hit.ID != old.ID || hit.Status != domain.ProjectExperienceRetired || hit.ApplicableVersion != "v2.8" ||
+			hit.OriginalMessageID != proposal.ID || hit.ConfirmationMessageID != proposal.ID || hit.AcceptedOutcome != nil ||
+			retired == nil || retired.ExperienceID != old.ID || retired.MessageID != retirement.ID || retired.ReplacementVersion != "v2.9" ||
+			retired.ReplacementOutcome == nil || *retired.ReplacementOutcome != accepted {
+			t.Fatalf("approved retired record lost its exact source or replacement: hit=%+v retirement=%+v", hit, retired)
+		}
+
+		opened = nil
 		if got, err := lookup(ProjectExperienceQuery{Query: superseded.ID}); err != nil || len(got.Items) != 0 || got.NextCursor != "" || len(opened) != 0 {
 			t.Fatalf("unapproved replacement must withhold the entire retired record: %+v, %v; opened=%v", got, err, opened)
 		}
