@@ -30,7 +30,8 @@ function receipt(body: string, groupId = group.id) {
     preparation_scope_kind: input.preparation_scope_kind ?? "", preparation_supported: input.allow_preparation,
     configuration_source_id: "actual-policy-command", preauthorization_message_id: input.allow_preparation ? "generated-rule-message" : "",
     ...(input.allow_preparation ? { preauthorization_text: "本群主话题已有消息的纯文本摘要；目标与验收由服务端固定" } : {}),
-    ...(input.investigation ? { investigation: input.investigation } : {}) };
+    ...(input.investigation ? { investigation: input.investigation } : {}),
+    ...(input.automatic_text_dispatch === true ? { automatic_text_dispatch: true } : {}) };
 }
 async function open() {
   const view = render(<Tasks group={group} />);
@@ -326,6 +327,30 @@ const summaryScope = { allow_preparation: true, preparation_scope_kind: "topic_s
 const adoptLabel = "采用当前授权，保留任务上限草稿";
 const adopt = () => fireEvent.click(form().getByRole("button", { name: adoptLabel }));
 const saveButton = () => form().getByRole("button", { name: "保存聊天策略" });
+
+it.each([true, false])("preserves recorded automatic text dispatch in a budget save with chat policy enabled=%s", async enabled => {
+  saved.set(policyURL(), { ...workspacePolicy(1, false), enabled, automatic_text_dispatch: true }); await open();
+  budget("4"); submit(); await flush();
+  expect(writes).toHaveBeenCalledTimes(1);
+  expect(attempt(0).body).toBe(JSON.stringify({ enabled, allow_preparation: false, action: "text_submission",
+    max_admissions: 4, expected_revision: 1, automatic_text_dispatch: true }));
+  expect(screen.getByText(/保存已确认.*历史版本 2/)).toBeVisible();
+  expect(currentPolicy()).toHaveTextContent("自动文本分派：已记录");
+  expect(form().queryByRole("checkbox", { name: /自动文本分派/ })).not.toBeInTheDocument();
+});
+it.each([true, false])("requires adoption when automatic text dispatch changes to %s while a draft is dirty", async automatic_text_dispatch => {
+  saved.set(policyURL(), { ...workspacePolicy(1, false), automatic_text_dispatch: !automatic_text_dispatch }); await open();
+  budget("5");
+  saved.set(policyURL(), { ...workspacePolicy(2, false), automatic_text_dispatch }); await readPolicy();
+  expect(currentPolicy()).toHaveTextContent("版本 2");
+  if (!automatic_text_dispatch) expect(currentPolicy()).not.toHaveTextContent("自动文本分派");
+  expect(saveButton()).toBeDisabled(); submit(); await flush(); expect(writes).not.toHaveBeenCalled();
+  adopt();
+  expect(form().getByRole("spinbutton")).toHaveValue(5);
+  submit(); await flush();
+  expect(JSON.parse(attempt(0).body)).toEqual({ enabled: true, allow_preparation: false, action: "text_submission",
+    max_admissions: 5, expected_revision: 2, ...(automatic_text_dispatch ? { automatic_text_dispatch } : {}) });
+});
 
 it.each([undefined, false])("keeps old policy writes unchanged when investigation capability is %s", async investigation_supported => {
   saved.set(policyURL(), { ...blank(), investigation_supported }); await open();

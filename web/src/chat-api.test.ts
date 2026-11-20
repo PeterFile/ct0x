@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { getChatAdmission, getChatPolicy, isChatPolicyDefinitiveRejection, setChatPolicy } from "./chat-api";
+import type { ChatPolicyInput } from "./chat-api";
 import { group, json } from "./test/groups";
 import { task } from "./test/tasks";
 import { chatAdmission } from "./test/chat";
@@ -148,6 +149,73 @@ const topicInvestigation = { ...investigationScope, allow_topic_messages: true, 
 const investigationAdmission = { ...chatAdmission, action: "read_only_investigation", disposition: "prepare_work",
   authority: "written_preauthorization", authorization_message_id: "policy-rule", purpose: "chat_intake/v1", outcome: "admitted",
   source_kind: "member", source_id: "member-command", source_sender_id: "member-1", authority_evidence_verified: true };
+
+it.each([
+  { automatic_text_dispatch: true }, { enabled: false, automatic_text_dispatch: true }, { automatic_text_dispatch: false },
+])("reads the optional automatic text policy flag %j", async change => {
+  const actual = { ...policy, ...change };
+  vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValueOnce(json(actual)));
+  await expect(getChatPolicy(group.id)).resolves.toEqual(actual);
+});
+it("requires an existing, source-bound policy and a boolean for automatic text dispatch", async () => {
+  const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
+  for (const change of [
+    { automatic_text_dispatch: "true" }, { automatic_text_dispatch: null }, { automatic_text_dispatch: 1 },
+    { enabled: false, revision: 0, authorized_by: "", action: "", max_admissions: 0, configuration_source_id: "" },
+    { configuration_source_id: undefined, preparation_supported: undefined }, { configuration_source_id: "" },
+    { configuration_source_id: "invalid\nsource" }, { group_id: "foreign-group" }, { topic_id: "foreign-topic" },
+  ]) {
+    transport.mockResolvedValueOnce(json({ ...policy, automatic_text_dispatch: true, ...change }));
+    await expect(getChatPolicy(group.id), JSON.stringify(change)).rejects.toMatchObject({ code: "invalid_response" });
+  }
+});
+it("sends an automatic text opt-in even on a disabled policy and checks the receipt's flag", async () => {
+  const command = { ...input, enabled: false, automatic_text_dispatch: true };
+  const actual = { ...policy, enabled: false, automatic_text_dispatch: true };
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(json(actual)); vi.stubGlobal("fetch", transport);
+  await expect(setChatPolicy(group.id, command, "automatic-text")).resolves.toEqual(actual);
+  expect(transport.mock.calls[0][1]?.body).toBe(JSON.stringify(command));
+  for (const [sent, received] of [[true, undefined], [true, false], [false, true]] as const) {
+    transport.mockResolvedValueOnce(json({ ...actual, automatic_text_dispatch: received }));
+    const error = await setChatPolicy(group.id, { ...command, automatic_text_dispatch: sent }, "automatic-text").catch(error => error);
+    expect(error).toMatchObject({ code: "invalid_response" }); expect(isChatPolicyDefinitiveRejection(error)).toBe(false);
+  }
+});
+it("rejects non-boolean automatic text inputs and legacy opt-ins before fetch", async () => {
+  const transport = vi.fn<typeof fetch>().mockImplementation(async () => json(policy)); vi.stubGlobal("fetch", transport);
+  for (const automatic_text_dispatch of ["true", null, 1]) {
+    const malformed = { ...input, automatic_text_dispatch } as unknown as ChatPolicyInput;
+    await expect(setChatPolicy(group.id, malformed, "malformed-opt-in")).rejects.toMatchObject({ code: "invalid_input" });
+  }
+  await expect(setChatPolicy(group.id, { ...input, preauthorization_message_id: "", automatic_text_dispatch: true }, "legacy-opt-in"))
+    .rejects.toMatchObject({ code: "invalid_input" });
+  expect(transport).not.toHaveBeenCalled();
+});
+
+const automaticTextAdmission = { ...chatAdmission, source_kind: "local_user_chat", source_id: "current-chat-command",
+  purpose: "chat_intake/v1", outcome: "admitted", authority_evidence_verified: true };
+it("reads automatic text routing on verified current text work and accepts explicit false on a legacy receipt", async () => {
+  const checked = { ...automaticTextAdmission, automatic_text_routing_checked: true };
+  const unchecked = { ...chatAdmission, automatic_text_routing_checked: false };
+  vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValueOnce(json(checked)).mockResolvedValueOnce(json(unchecked)));
+  await expect(getChatAdmission(group.id, task.id)).resolves.toEqual(checked);
+  await expect(getChatAdmission(group.id, task.id)).resolves.toEqual(unchecked);
+});
+it("rejects malformed or unbound automatic text routing evidence", async () => {
+  const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
+  for (const change of [
+    { automatic_text_routing_checked: "true" }, { automatic_text_routing_checked: null }, { automatic_text_routing_checked: 1 },
+    { outcome: undefined }, { outcome: "continued" }, { purpose: "" }, { authority_evidence_verified: false },
+    { source_kind: "local_user_policy" }, { source_id: "" }, { source_sender_id: "member-1" },
+    { authorization_message_id: "earlier-message" }, { authority: "written_preauthorization" },
+    { disposition: "prepare_work", authority: "written_preauthorization", authorization_message_id: "policy-rule" },
+    { task_id: "foreign-task" }, { group_id: "foreign-group" },
+    { action: "workspace_change", workspace_scope: workspaceScope }, investigationAdmission, chatRepair,
+  ]) {
+    transport.mockResolvedValueOnce(json({ ...automaticTextAdmission, automatic_text_routing_checked: true, ...change }));
+    await expect(getChatAdmission(group.id, task.id), JSON.stringify(change)).rejects.toMatchObject({ code: "invalid_response" });
+  }
+});
 
 it("reads optional investigation scope and capability observations separately without upgrading an old reply", async () => {
   const replies = [policy, { ...policy, investigation: null, investigation_supported: true, investigation_execution_enabled: false },
@@ -333,11 +401,13 @@ it("does not collapse duplicate workspace scope group IDs into trusted admission
   await expect(getChatAdmission(group.id, task.id)).rejects.toMatchObject({ code: "invalid_response" });
 });
 
-it("omits false workspace input without changing either v17 or v16 bytes", async () => {
+it("omits false workspace and automatic text inputs without changing either v17 or v16 bytes", async () => {
   const old = { enabled: true, allow_preparation: false, preauthorization_message_id: "", action: "text_submission" as const, max_admissions: 2, expected_revision: 0 };
-  const transport = vi.fn<typeof fetch>().mockImplementation(async () => json(policy)); vi.stubGlobal("fetch", transport);
-  await setChatPolicy(group.id, { ...input, allow_workspace_changes: false }, "v17-key");
-  await setChatPolicy(group.id, { ...old, allow_workspace_changes: false }, "v16-key");
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(json({ ...policy, automatic_text_dispatch: false }))
+    .mockResolvedValueOnce(json(policy)); vi.stubGlobal("fetch", transport);
+  const off = { allow_workspace_changes: false, automatic_text_dispatch: false };
+  await setChatPolicy(group.id, { ...input, ...off }, "v17-key");
+  await setChatPolicy(group.id, { ...old, ...off }, "v16-key");
   expect(transport.mock.calls[0][1]?.body).toBe(JSON.stringify(input)); expect(transport.mock.calls[1][1]?.body).toBe(JSON.stringify(old));
 });
 it("preserves an unknown v17 snapshot after a newer workspace-enabled read", async () => {

@@ -18,10 +18,11 @@ export type ChatPolicy = Readonly<{
   allow_workspace_changes?: boolean; workspace_changes_supported?: boolean;
   investigation?: ChatInvestigationPolicy | null;
   investigation_supported?: boolean; investigation_execution_enabled?: boolean;
+  automatic_text_dispatch?: boolean;
 }>;
 export type ChatPolicyInput = Readonly<{
   enabled: boolean; allow_preparation: boolean; preparation_scope_kind?: "topic_summary"; allow_workspace_changes?: boolean;
-  investigation?: ChatInvestigationPolicy | null;
+  investigation?: ChatInvestigationPolicy | null; automatic_text_dispatch?: boolean;
   // Retained only for an already-submitted v16 operation; new UI commands never populate this field.
   preauthorization_message_id?: string;
   action: "text_submission"; max_admissions: number; expected_revision: number;
@@ -52,6 +53,8 @@ export type ChatAdmission = Readonly<{
   dispatch_request_id: string; notice_message_id: string; created_at: string;
   source_id?: string; source_kind?: MessageSourceKind; purpose?: string; authority_evidence_verified?: boolean;
   outcome?: "" | "admitted"; reason_code?: string; question?: string; workspace_scope?: TaskWorkspaceScope; repair_link?: ChatRepairLink;
+  // Admission evidence only, not a receipt for execution, completion, or acceptance.
+  automatic_text_routing_checked?: boolean;
 }>;
 const record = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
 const text = (value: unknown): value is string => typeof value === "string" && !/[\ud800-\udfff]/u.test(value);
@@ -67,7 +70,8 @@ const policyFields = ["group_id", "topic_id", "enabled", "allow_preparation", "p
 export const hasChatPolicyMetadata = (policy: ChatPolicy) => typeof policy.preparation_supported === "boolean"
   && typeof policy.configuration_source_id === "string";
 const policyMetadata = ["preauthorization_text", "preparation_scope_kind", "preparation_supported", "configuration_source_id",
-  "allow_workspace_changes", "workspace_changes_supported", "investigation", "investigation_supported", "investigation_execution_enabled"];
+  "allow_workspace_changes", "workspace_changes_supported", "investigation", "investigation_supported", "investigation_execution_enabled",
+  "automatic_text_dispatch"];
 const investigationFields = ["objective", "allow_topic_messages", "artifact_versions", "max_delegations"];
 export function isChatInvestigationPolicy(value: unknown): value is ChatInvestigationPolicy {
   const limits = chatInvestigationLimits;
@@ -104,6 +108,8 @@ function isPolicy(value: unknown, groupId: string, topicId: string): value is Ch
     || (value.allow_workspace_changes !== undefined && typeof value.allow_workspace_changes !== "boolean")
     || (value.workspace_changes_supported !== undefined && typeof value.workspace_changes_supported !== "boolean")
     || (value.allow_workspace_changes === true && value.workspace_changes_supported === false)
+    || (value.automatic_text_dispatch !== undefined && typeof value.automatic_text_dispatch !== "boolean")
+    || (value.automatic_text_dispatch === true && (!positive(value.revision) || !identifier(value.configuration_source_id)))
     || (value.investigation_supported !== undefined && typeof value.investigation_supported !== "boolean")
     || (value.investigation_execution_enabled !== undefined && typeof value.investigation_execution_enabled !== "boolean")
     || (value.investigation != null && (!positive(value.revision) || !identifier(value.configuration_source_id)
@@ -190,7 +196,8 @@ function isRepairLink(value: unknown, admission: Record<string, unknown>): value
     : value.authorization === "original_agreement" && positive(admission.policy_revision) && value.authorization_policy_revision <= admission.policy_revision;
 }
 function isAdmission(value: unknown, groupId: string, taskId: string): value is ChatAdmission {
-  const metadata = ["source_id", "source_kind", "purpose", "authority_evidence_verified", "outcome", "reason_code", "question", "workspace_scope", "repair_link"];
+  const metadata = ["source_id", "source_kind", "purpose", "authority_evidence_verified", "outcome", "reason_code", "question", "workspace_scope", "repair_link",
+    "automatic_text_routing_checked"];
   if (!record(value) || Object.keys(value).some(field => !admissionFields.includes(field) && !metadata.includes(field))
     || !admissionFields.every(field => Object.hasOwn(value, field))
     || value.group_id !== groupId || value.task_id !== taskId || !text(value.topic_id)
@@ -206,10 +213,14 @@ function isAdmission(value: unknown, groupId: string, taskId: string): value is 
     || (value.purpose !== undefined && value.purpose !== "" && value.purpose !== "chat_intake/v1")
     || (value.authority_evidence_verified !== undefined && typeof value.authority_evidence_verified !== "boolean")
     || (value.outcome !== undefined && value.outcome !== "" && value.outcome !== "admitted")
-    || (value.reason_code !== undefined && value.reason_code !== "") || (value.question !== undefined && value.question !== "")) return false;
+    || (value.reason_code !== undefined && value.reason_code !== "") || (value.question !== undefined && value.question !== "")
+    || (value.automatic_text_routing_checked !== undefined && typeof value.automatic_text_routing_checked !== "boolean")) return false;
   const knownSource = value.source_kind !== undefined && value.source_kind !== "unknown";
   if (knownSource ? !identifier(value.source_id) : value.source_id !== undefined && value.source_id !== "") return false;
   if (!sourceMatchesSender(value.source_kind, value.source_sender_id)) return false;
+  if (value.automatic_text_routing_checked === true && (value.outcome !== "admitted" || value.source_kind !== "local_user_chat"
+    || value.disposition !== "request_work" || value.action !== "text_submission" || value.authority_evidence_verified !== true
+    || Object.hasOwn(value, "repair_link"))) return false;
   if (Object.hasOwn(value, "repair_link")) return value.action !== "read_only_investigation" && isRepairLink(value.repair_link, value);
   if (!identifier(value.authorization_message_id)) return false;
   if (value.authority_evidence_verified === true && (value.purpose !== "chat_intake/v1"
@@ -307,7 +318,9 @@ export async function setChatPolicy(groupId: string, input: ChatPolicyInput, key
   // The server checks persisted replay before validating a new command against the new scope contract.
   const legacy = Object.hasOwn(input, "preauthorization_message_id") && input.preparation_scope_kind === undefined;
   const investigation = input.investigation;
-  if (investigation != null && (legacy || !isChatInvestigationPolicy(investigation))) throw invalid();
+  if ((input.automatic_text_dispatch !== undefined && typeof input.automatic_text_dispatch !== "boolean")
+    || (legacy && input.automatic_text_dispatch === true)
+    || (investigation != null && (legacy || !isChatInvestigationPolicy(investigation)))) throw invalid();
   const sent: ChatPolicyInput = Object.freeze({ enabled: input.enabled, allow_preparation: input.allow_preparation,
     ...(legacy ? { preauthorization_message_id: input.preauthorization_message_id }
       : input.preparation_scope_kind === undefined ? {} : { preparation_scope_kind: input.preparation_scope_kind }),
@@ -315,7 +328,8 @@ export async function setChatPolicy(groupId: string, input: ChatPolicyInput, key
     ...(input.allow_workspace_changes === true ? { allow_workspace_changes: true } : {}),
     ...(investigation == null ? {} : { investigation: { objective: investigation.objective, allow_topic_messages: investigation.allow_topic_messages,
       artifact_versions: investigation.artifact_versions?.map(({ artifact_id, version_id }) => ({ artifact_id, version_id })) ?? null,
-      max_delegations: investigation.max_delegations } }) });
+      max_delegations: investigation.max_delegations } }),
+    ...(input.automatic_text_dispatch === true ? { automatic_text_dispatch: true } : {}) });
   if (typeof sent.enabled !== "boolean" || typeof sent.allow_preparation !== "boolean" || sent.action !== "text_submission"
     || !budget(sent.max_admissions) || !integer(sent.expected_revision) || sent.expected_revision >= Number.MAX_SAFE_INTEGER
     || (input.allow_workspace_changes !== undefined && typeof input.allow_workspace_changes !== "boolean")) throw invalid();
@@ -330,6 +344,7 @@ export async function setChatPolicy(groupId: string, input: ChatPolicyInput, key
       && (value.allow_workspace_changes ?? false) === (sent.allow_workspace_changes ?? false)
       && (!sent.allow_workspace_changes || value.workspace_changes_supported === true)
       && sameChatInvestigation(value.investigation, sent.investigation)
+      && (value.automatic_text_dispatch ?? false) === (sent.automatic_text_dispatch ?? false)
       && (legacy ? value.preauthorization_message_id === sent.preauthorization_message_id && !value.preparation_scope_kind && !value.preparation_supported
         : hasChatPolicyMetadata(value) && identifier(value.configuration_source_id)
           && (value.preparation_scope_kind ?? "") === (sent.preparation_scope_kind ?? "") && value.preparation_supported === sent.allow_preparation));
