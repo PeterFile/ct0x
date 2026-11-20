@@ -18,9 +18,9 @@ func TestGroupBackgroundDispatchSchemaStartup(t *testing.T) {
 	if i := slices.Index(legacy, groupBackgroundDispatchSchema); i >= 0 {
 		legacy = legacy[:i]
 	}
-	// Keep unrelated applied entries to exercise schema identity, not position.
-	legacy = append(slices.Clone(legacy), "SELECT 1;")
-	registered := append(slices.Clone(legacy), groupBackgroundDispatchSchema, "SELECT 2;")
+	// Use the real pre-A registry for legacy. Flank A with unrelated entries
+	// only in the registered fixture to exercise schema identity, not position.
+	registered := append(slices.Clone(legacy), "SELECT 1;", groupBackgroundDispatchSchema, "SELECT 2;")
 
 	t.Run("legacy", func(t *testing.T) {
 		migrations = legacy
@@ -66,6 +66,7 @@ func TestGroupBackgroundDispatchSchemaStartup(t *testing.T) {
 			CREATE INDEX group_background_pending ON group_background_intents(sequence) WHERE delivery_id IS null;`},
 		{name: "noncanonical_name", ddl: `DROP INDEX group_background_pending;
 			CREATE INDEX GROUP_BACKGROUND_PENDING ON group_background_intents(sequence) WHERE delivery_id IS NULL;`},
+		{name: "extra_reserved_view", ddl: `CREATE VIEW GROUP_BACKGROUND_EXTRA AS SELECT 1;`},
 		{name: "all_absent", ddl: `DROP TRIGGER group_background_delivery_insert;
 			DROP INDEX group_background_active_profiles;
 			DROP INDEX group_background_queued_topic;
@@ -74,6 +75,10 @@ func TestGroupBackgroundDispatchSchemaStartup(t *testing.T) {
 			DROP TABLE group_background_bindings;`},
 		{name: "orphan_guard", unregistered: true, ddl: `
 			CREATE TRIGGER GROUP_BACKGROUND_DELIVERY_INSERT BEFORE INSERT ON deliveries BEGIN SELECT 1; END;`},
+		{name: "renamed_orphan_guard", unregistered: true, ddl: `
+			CREATE TRIGGER group_background_delivery_insertt BEFORE INSERT ON deliveries
+			WHEN EXISTS(SELECT 1 FROM group_background_intents WHERE message_id=NEW.message_id)
+			BEGIN SELECT RAISE(ABORT,'orphan delivery guard'); END;`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			migrations = registered

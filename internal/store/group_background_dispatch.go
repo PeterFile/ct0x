@@ -119,14 +119,10 @@ func checkGroupBackgroundSchema(db *sql.DB) (bool, error) {
 		return false, err
 	}
 	required := len(expected)
-	names := make([]any, 0, required)
-	for name := range expected {
-		names = append(names, name)
-	}
-	// Find case-insensitive collisions, but match the case and definition
-	// exactly, as required by the transaction-local probe and queries.
+	// Reserve the whole namespace case-insensitively, but require canonical
+	// names and definitions when matching its objects.
 	rows, err := db.Query(`SELECT name,type,tbl_name,coalesce(sql,'') FROM main.sqlite_schema
-	 WHERE name COLLATE NOCASE IN (`+strings.Repeat("?,", required-1)+`?)`, names...)
+	 WHERE lower(name) GLOB 'group_background_*'`)
 	if err != nil {
 		return false, err
 	}
