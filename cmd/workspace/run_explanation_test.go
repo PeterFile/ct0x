@@ -6,6 +6,11 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"fmt"
+	"go/ast"
+	"go/constant"
+	"go/parser"
+	"go/token"
+	"go/types"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -81,18 +86,22 @@ while [ ! -f "$root/exit" ]; do sleep 0.01; done
 
 func installExplanationFixtureDDL(t *testing.T, db *sql.DB) {
 	t.Helper()
-	// Install F's exact DDL into this disposable fixture only, not the migration list.
-	source, err := os.ReadFile("../../internal/store/agent_run_explanation_schema.go")
+	// Resolve F's composed DDL and apply it only to this fixture, not the migration list.
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "../../internal/store/agent_run_explanation_schema.go", nil, parser.SkipObjectResolution)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, rest, begin := strings.Cut(string(source), "`")
-	ddl, _, end := strings.Cut(rest, "`")
-	if !begin || !end {
-		t.Fatal("missing F fixture DDL")
-	}
-	if _, err := db.Exec(ddl); err != nil {
+	pkg, err := (&types.Config{}).Check(file.Name.Name, fset, []*ast.File{file}, nil)
+	if err != nil {
 		t.Fatal(err)
+	}
+	schema, ok := pkg.Scope().Lookup("agentRunExplanationSchema").(*types.Const)
+	if !ok || schema.Val().Kind() != constant.String {
+		t.Fatal("missing string constant agentRunExplanationSchema")
+	}
+	if _, err := db.Exec(constant.StringVal(schema.Val())); err != nil {
+		t.Fatalf("install F fixture DDL: %v", err)
 	}
 }
 
