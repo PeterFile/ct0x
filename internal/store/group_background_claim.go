@@ -38,7 +38,7 @@ func (s *Store) BackgroundDispatchProfileReady(profile BackgroundDispatchProfile
 }
 
 func (b *groupBackgroundDispatch) profileReadyLocked(profile BackgroundDispatchProfile) bool {
-	return b.ready != nil && time.Now().Before(b.ready.expires) && b.ready.profiles[profile]
+	return b.ready.validAt(time.Now()) && b.ready.profiles[profile]
 }
 
 // The existing claim transaction owns the write lock. A member's provider/model

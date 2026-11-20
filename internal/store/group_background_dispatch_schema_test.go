@@ -40,6 +40,14 @@ func TestGroupBackgroundDispatchSchemaStartup(t *testing.T) {
 		}
 	})
 
+	t.Run("complete", func(t *testing.T) {
+		migrations = registered
+		s, _ := openTestStore(t)
+		if err := s.EnableGroupBackgroundDispatch(t.Context()); err != nil {
+			t.Fatalf("authentic migrated schema must enable background dispatch: %v", err)
+		}
+	})
+
 	for _, tc := range []struct {
 		name, ddl    string
 		unregistered bool
@@ -51,6 +59,13 @@ func TestGroupBackgroundDispatchSchemaStartup(t *testing.T) {
 			CREATE VIEW group_background_pending AS SELECT 1;`},
 		{name: "wrong_owner", ddl: `DROP TRIGGER group_background_delivery_insert;
 			CREATE TRIGGER group_background_delivery_insert BEFORE INSERT ON messages BEGIN SELECT 1; END;`},
+		{name: "renamed_notice_column", ddl: `ALTER TABLE group_background_joins RENAME COLUMN notice_message_id TO renamed_notice_message_id;`},
+		{name: "noop_delivery_guard", ddl: `DROP TRIGGER group_background_delivery_insert;
+			CREATE TRIGGER group_background_delivery_insert BEFORE INSERT ON deliveries BEGIN SELECT 1; END;`},
+		{name: "noncanonical_definition", ddl: `DROP INDEX group_background_pending;
+			CREATE INDEX group_background_pending ON group_background_intents(sequence) WHERE delivery_id IS null;`},
+		{name: "noncanonical_name", ddl: `DROP INDEX group_background_pending;
+			CREATE INDEX GROUP_BACKGROUND_PENDING ON group_background_intents(sequence) WHERE delivery_id IS NULL;`},
 		{name: "all_absent", ddl: `DROP TRIGGER group_background_delivery_insert;
 			DROP INDEX group_background_active_profiles;
 			DROP INDEX group_background_queued_topic;

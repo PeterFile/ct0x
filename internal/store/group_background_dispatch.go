@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,8 +47,14 @@ type groupBackgroundDispatch struct {
 }
 
 type backgroundReadySnapshot struct {
-	profiles map[BackgroundDispatchProfile]bool
-	expires  time.Time
+	profiles          map[BackgroundDispatchProfile]bool
+	monotonicDeadline time.Time
+	wallDeadline      time.Time // Optional absolute ceiling, without a monotonic reading.
+}
+
+func (r *backgroundReadySnapshot) validAt(now time.Time) bool {
+	return r != nil && now.Before(r.monotonicDeadline) &&
+		(r.wallDeadline.IsZero() || now.Before(r.wallDeadline))
 }
 
 const (
@@ -60,31 +67,84 @@ const (
 // Open verifies the complete schema so transaction-local readers can use this probe.
 const groupBackgroundSchemaExists = `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='group_background_bindings')`
 
+type backgroundSchemaObject struct {
+	kind, owner, definition string
+}
+
+func canonicalBackgroundDDL(definition string) string {
+	return strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(definition), ";"))
+}
+
+func expectedGroupBackgroundObjects() (map[string]backgroundSchemaObject, error) {
+	// Only top-level declarations in this Go migration start with unindented
+	// CREATE. Splitting on semicolons would split the bodies of triggers.
+	const create = "\nCREATE "
+	ddl, ok := strings.CutPrefix(groupBackgroundDispatchSchema, create)
+	invalid := errors.New("无法解析群组后台调度迁移定义")
+	if !ok {
+		return nil, invalid
+	}
+	expected := make(map[string]backgroundSchemaObject)
+	for body := range strings.SplitSeq(ddl, create) {
+		header, _, _ := strings.Cut(body, "\n")
+		fields := strings.Fields(strings.TrimPrefix(header, "UNIQUE "))
+		if len(fields) < 2 {
+			return nil, invalid
+		}
+		kind, name := fields[0], fields[1]
+		owner := name
+		switch kind {
+		case "TABLE":
+		case "INDEX", "TRIGGER":
+			on := slices.Index(fields, "ON")
+			if on < 2 || on+1 >= len(fields) {
+				return nil, invalid
+			}
+			owner, _, _ = strings.Cut(fields[on+1], "(")
+		default:
+			return nil, invalid
+		}
+		if _, duplicate := expected[name]; duplicate || owner == "" {
+			return nil, invalid
+		}
+		expected[name] = backgroundSchemaObject{kind: strings.ToLower(kind), owner: owner,
+			definition: canonicalBackgroundDDL("CREATE " + body)}
+	}
+	return expected, nil
+}
+
 func checkGroupBackgroundSchema(db *sql.DB) (bool, error) {
-	// Detect any of the reserved names, even in a different case. Require the
-	// canonical objects to agree with the exact-name probe used in transactions.
-	var found, matched, required int
-	err := db.QueryRow(`WITH required(name, type, owner) AS (VALUES
-	 ('group_background_bindings', 'table', 'group_background_bindings'),
-	 ('group_background_intents', 'table', 'group_background_intents'),
-	 ('group_background_joins', 'table', 'group_background_joins'),
-	 ('group_background_pending', 'index', 'group_background_intents'),
-	 ('group_background_pending_topic', 'index', 'group_background_intents'),
-	 ('group_background_queued_topic', 'index', 'deliveries'),
-	 ('group_background_active_profiles', 'index', 'members'),
-	 ('group_background_preset_membership', 'index', 'group_background_joins'),
-	 ('group_background_intent_insert', 'trigger', 'group_background_intents'),
-	 ('group_background_intent_finish', 'trigger', 'group_background_intents'),
-	 ('group_background_intent_delete', 'trigger', 'group_background_intents'),
-	 ('group_background_join_insert', 'trigger', 'group_background_joins'),
-	 ('group_background_join_update', 'trigger', 'group_background_joins'),
-	 ('group_background_join_delete', 'trigger', 'group_background_joins'),
-	 ('group_background_delivery_insert', 'trigger', 'deliveries')
-	)
-	SELECT count(s.name), count(CASE WHEN s.name=r.name AND s.type=r.type AND s.tbl_name=r.owner THEN 1 END),
-	       (SELECT count(*) FROM required)
-	FROM required r LEFT JOIN main.sqlite_schema s ON s.name=r.name COLLATE NOCASE`).Scan(&found, &matched, &required)
+	expected, err := expectedGroupBackgroundObjects()
 	if err != nil {
+		return false, err
+	}
+	required := len(expected)
+	names := make([]any, 0, required)
+	for name := range expected {
+		names = append(names, name)
+	}
+	// Find case-insensitive collisions, but match the case and definition
+	// exactly, as required by the transaction-local probe and queries.
+	rows, err := db.Query(`SELECT name,type,tbl_name,coalesce(sql,'') FROM main.sqlite_schema
+	 WHERE name COLLATE NOCASE IN (`+strings.Repeat("?,", required-1)+`?)`, names...)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	var found, matched int
+	for rows.Next() {
+		var name, kind, owner, definition string
+		if err := rows.Scan(&name, &kind, &owner, &definition); err != nil {
+			return false, err
+		}
+		found++
+		if want, ok := expected[name]; ok && kind == want.kind && owner == want.owner &&
+			canonicalBackgroundDDL(definition) == want.definition {
+			matched++
+			delete(expected, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
 		return false, err
 	}
 	if found == required && matched == required {
@@ -147,21 +207,24 @@ func (s *Store) RunGroupBackgroundDispatch(ctx context.Context, options Backgrou
 	if err == nil {
 		err = ctx.Err()
 	}
-	expires := sampled.Add(backgroundReadyLifetime)
-	if !options.ReadyUntil.IsZero() {
-		// Compare absolute wall-clock deadlines, not monotonic readings.
-		expires = expires.Round(0)
-		if until := options.ReadyUntil.Round(0); until.Before(expires) {
-			expires = until
-		}
+	wallDeadline := options.ReadyUntil.Round(0)
+	lifetime := backgroundReadyLifetime
+	if !wallDeadline.IsZero() {
+		// With no monotonic reading on wallDeadline, Sub uses the wall delta.
+		// Apply it to the local sample so a wall correction cannot extend readiness.
+		lifetime = min(lifetime, wallDeadline.Sub(sampled))
 	}
 	var ready *backgroundReadySnapshot
 	// Publication is independent of the routing lock: revocation is not lost
 	// if a pass is busy. The claim transaction pins the current snapshot only
 	// for its short final admission/commit, never for external execution.
 	s.background.readyMu.Lock()
-	if err == nil && len(profilesReady) != 0 && sampled.Before(expires) && time.Now().Before(expires) {
-		ready = &backgroundReadySnapshot{profiles: profilesReady, expires: expires}
+	if err == nil && len(profilesReady) != 0 {
+		snapshot := &backgroundReadySnapshot{profiles: profilesReady,
+			monotonicDeadline: sampled.Add(lifetime), wallDeadline: wallDeadline}
+		if snapshot.validAt(sampled) && snapshot.validAt(time.Now()) {
+			ready = snapshot
+		}
 	}
 	s.background.ready = ready
 	s.background.readyMu.Unlock()
@@ -263,7 +326,7 @@ func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, 
 	defer tx.Rollback()
 	s.background.readyMu.RLock()
 	defer s.background.readyMu.RUnlock()
-	if s.background.ready != ready || !time.Now().Before(ready.expires) {
+	if s.background.ready != ready || !ready.validAt(time.Now()) {
 		return nil // Do not route using a replaced or expired observation.
 	}
 	var m MessageRequest
@@ -330,7 +393,7 @@ func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, 
 		return err
 	}
 	// The snapshot is still pinned, but may have expired during the writes.
-	if !time.Now().Before(ready.expires) {
+	if !ready.validAt(time.Now()) {
 		return nil // Roll back the join and delivery; leave the intent pending.
 	}
 	return tx.Commit()
