@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,7 +57,46 @@ const (
 	backgroundReadyLifetime  = 30 * time.Second
 )
 
+// Open verifies the complete schema so transaction-local readers can use this probe.
 const groupBackgroundSchemaExists = `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='group_background_bindings')`
+
+func checkGroupBackgroundSchema(db *sql.DB) (bool, error) {
+	// Detect any of the reserved names, even in a different case. Require the
+	// canonical objects to agree with the exact-name probe used in transactions.
+	var found, matched, required int
+	err := db.QueryRow(`WITH required(name, type, owner) AS (VALUES
+	 ('group_background_bindings', 'table', 'group_background_bindings'),
+	 ('group_background_intents', 'table', 'group_background_intents'),
+	 ('group_background_joins', 'table', 'group_background_joins'),
+	 ('group_background_pending', 'index', 'group_background_intents'),
+	 ('group_background_pending_topic', 'index', 'group_background_intents'),
+	 ('group_background_queued_topic', 'index', 'deliveries'),
+	 ('group_background_active_profiles', 'index', 'members'),
+	 ('group_background_preset_membership', 'index', 'group_background_joins'),
+	 ('group_background_intent_insert', 'trigger', 'group_background_intents'),
+	 ('group_background_intent_finish', 'trigger', 'group_background_intents'),
+	 ('group_background_intent_delete', 'trigger', 'group_background_intents'),
+	 ('group_background_join_insert', 'trigger', 'group_background_joins'),
+	 ('group_background_join_update', 'trigger', 'group_background_joins'),
+	 ('group_background_join_delete', 'trigger', 'group_background_joins'),
+	 ('group_background_delivery_insert', 'trigger', 'deliveries')
+	)
+	SELECT count(s.name), count(CASE WHEN s.name=r.name AND s.type=r.type AND s.tbl_name=r.owner THEN 1 END),
+	       (SELECT count(*) FROM required)
+	FROM required r LEFT JOIN main.sqlite_schema s ON s.name=r.name COLLATE NOCASE`).Scan(&found, &matched, &required)
+	if err != nil {
+		return false, err
+	}
+	if found == required && matched == required {
+		return true, nil
+	}
+	// Open calls this only after migrate commits, so every schema in the
+	// current registry is already recorded in the ledger, at any position.
+	if found == 0 && !slices.Contains(migrations, groupBackgroundDispatchSchema) {
+		return false, nil
+	}
+	return false, fmt.Errorf("群组后台调度数据库结构不完整：应有 %d 个对象，找到 %d 个，匹配 %d 个", required, found, matched)
+}
 
 // EnableGroupBackgroundDispatch is startup wiring for the same Store used by
 // trusted LocalUser and the scheduler. It does not bind legacy groups or probe

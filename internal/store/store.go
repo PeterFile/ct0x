@@ -85,11 +85,11 @@ func Open(path string) (*Store, error) {
 	if err := migrate(db); err != nil {
 		return nil, storeError("初始化数据库失败", errors.Join(err, db.Close()))
 	}
-	s := &Store{db: db}
-	if err := db.QueryRow("SELECT " + groupBackgroundSchemaExists).Scan(&s.background.installed); err != nil {
-		return nil, storeError("读取群组后台调度迁移状态失败", errors.Join(err, db.Close()))
+	installed, err := checkGroupBackgroundSchema(db)
+	if err != nil {
+		return nil, storeError("检查群组后台调度迁移状态失败", errors.Join(err, db.Close()))
 	}
-	return s, nil
+	return &Store{db: db, background: groupBackgroundDispatch{installed: installed}}, nil
 }
 
 func (s *Store) Close() error { return storeError("关闭数据库失败", s.db.Close()) }
