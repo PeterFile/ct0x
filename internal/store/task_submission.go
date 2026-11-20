@@ -79,6 +79,11 @@ func (s *Store) submitTaskInTx(ctx context.Context, tx *sql.Tx, input SubmitTask
 	if actorID != input.ActorID || (input.ActorID != "user" && attempt.TurnID != turnID) {
 		return domain.Submission{}, ErrMemberToolDenied
 	}
+	if len(task.DependencyIDs) != 0 {
+		if err := requireFreshTaskPinsInTx(ctx, tx, task.GroupID, task.ID); err != nil {
+			return domain.Submission{}, err
+		}
+	}
 	investigation, err := s.chatTextSubmissionInTx(ctx, tx, input)
 	if err != nil {
 		return domain.Submission{}, err
