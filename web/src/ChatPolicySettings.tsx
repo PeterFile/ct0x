@@ -27,6 +27,7 @@ const errorText = (error: unknown) => error instanceof ApiError ? error.message 
 const sameAuthority = (left: ChatPolicy, right: ChatPolicy) => left.enabled === right.enabled && left.allow_preparation === right.allow_preparation
   && (left.preparation_scope_kind ?? "") === (right.preparation_scope_kind ?? "")
   && (left.allow_workspace_changes ?? false) === (right.allow_workspace_changes ?? false)
+  && (left.automatic_text_dispatch ?? false) === (right.automatic_text_dispatch ?? false)
   && sameChatInvestigation(left.investigation, right.investigation)
   && (!left.allow_preparation || left.preparation_scope_kind === "topic_summary"
     || (left.preauthorization_message_id === right.preauthorization_message_id
@@ -136,7 +137,8 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
       operation = Object.freeze({ key, input: Object.freeze({ enabled: previous.draft.enabled, allow_preparation: previous.draft.allowPreparation,
         ...(previous.draft.allowPreparation ? { preparation_scope_kind: "topic_summary" as const } : {}), action: "text_submission",
         max_admissions: maxAdmissions, expected_revision: previous.policy.revision,
-        ...(previous.draft.allowWorkspaceChanges ? { allow_workspace_changes: true } : {}), ...(investigation ? { investigation } : {}) }) });
+        ...(previous.draft.allowWorkspaceChanges ? { allow_workspace_changes: true } : {}), ...(investigation ? { investigation } : {}),
+        ...(previous.policy.automatic_text_dispatch === true ? { automatic_text_dispatch: true } : {}) }) });
     }
     update(value => ({ ...value, operation, phase: "pending", dirty: true, error: "" }));
     try {
@@ -188,6 +190,7 @@ export function ChatPolicySettings({ groupId, active }: { groupId: string; activ
             {policy.preauthorization_message_id ? <><dt>规范规则 / 历史书面消息 ID（只读）</dt><dd className="tasks-meta">{policy.preauthorization_message_id}</dd></> : null}</dl>
           {policy.preauthorization_text ? <p className="tasks-copy">{policy.preparation_supported ? "服务端规范书面规则" : "历史书面规则（不作为当前支持的准备授权）"}：{policy.preauthorization_text}</p> : null}
         </> : <p role="status">当前策略未确认。{state.readError}</p>}
+        {lastRecorded?.automatic_text_dispatch === true ? <p>自动文本分派：已记录（版本 {lastRecorded.revision}，仅在聊天策略启用时适用）。</p> : null}
         {lastRecorded ? <p>{observed ? "只读调查记录" : "上次确认的只读调查记录"}：{recordedScope ? "已配置" : lastRecorded.investigation_supported === true ? "未配置" : "未确认"}
           {observed ? "" : `（版本 ${lastRecorded.revision}）`}。</p> : null}
         {recordedScope ? <dl>
