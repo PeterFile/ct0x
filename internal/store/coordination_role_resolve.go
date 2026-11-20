@@ -95,6 +95,9 @@ func (s *Store) ResolveCoordinationDelivery(ctx context.Context, groupID, delive
 // Raw candidates precede parent joins. A broken second relation still counts;
 // only successful absence from BOTH unique delivery indexes permits ordinary.
 func coordinationQueuedProvenanceInTx(ctx context.Context, tx *sql.Tx, base CoordinationRoleProvenance, sender string) (CoordinationRoleProvenance, error) {
+	if isThreadDecisionRef(base.DeliveryID) || isThreadDecisionRef(base.MessageID) {
+		return CoordinationRoleProvenance{}, ErrMemberToolDenied
+	}
 	rows, err := tx.QueryContext(ctx, `WITH source AS (
  SELECT 'coordinator' kind,s.request_id,s.task_id,s.group_id,s.delivery_id,s.message_id,s.conversation_id,
  s.delivered_member_id,'' assignment_id,s.status IN ('enqueued','assigned','declined') linked
