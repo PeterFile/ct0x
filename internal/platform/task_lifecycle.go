@@ -61,6 +61,11 @@ func (s *LocalUser) ListTaskWorkInputs(ctx context.Context, groupID, taskID stri
 	return s.db.ListTaskWorkInputs(ctx, groupID, taskID, options)
 }
 
+// ListTaskImpacts is read-only; it does not accept work or answer decisions.
+func (s *LocalUser) ListTaskImpacts(ctx context.Context, groupID, taskID string, options store.ListOptions) (store.Page[domain.TaskImpact], error) {
+	return s.db.ListTaskImpacts(ctx, groupID, taskID, options)
+}
+
 func (s *LocalUser) ListTaskWorkReports(ctx context.Context, groupID, taskID string, options store.ListOptions) (store.Page[domain.TaskWorkReport], error) {
 	return s.db.ListTaskWorkReports(ctx, groupID, taskID, options)
 }

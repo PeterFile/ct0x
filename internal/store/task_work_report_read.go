@@ -267,7 +267,14 @@ func (s *Store) GetWorkReportForMember(ctx context.Context, scope MemberToolScop
 		if err != nil {
 			return out, err
 		}
-		return taskWorkReportInTx(ctx, tx, p.GroupID, reportID, &p)
+		report, err := taskWorkReportInTx(ctx, tx, p.GroupID, reportID, &p)
+		if err != nil {
+			return out, err
+		}
+		if err := requireCurrentWorkReportInTx(ctx, tx, p.GroupID, reportID); err != nil {
+			return out, err
+		}
+		return report, nil
 	})
 }
 
@@ -330,6 +337,13 @@ func taskWorkReportPageInTx(ctx context.Context, tx *sql.Tx, groupID, taskID str
 	if owner != nil {
 		query += ` AND (p.assignment_id,p.topic_id,p.task_revision,p.owner_member_id,p.mandate_id,p.authority_generation)=(?,?,?,?,?,?)`
 		args = append(args, owner.AssignmentID, owner.TopicID, owner.TaskRevision, owner.OwnerMemberID, owner.MandateID, owner.AuthorityGeneration)
+		impact, err := taskImpactSchemaInTx(ctx, tx)
+		if err != nil {
+			return page, err
+		}
+		if impact {
+			query += ` AND NOT EXISTS(SELECT 1 FROM task_constraint_impacts x WHERE (x.group_id,x.kind,x.ref_id)=(r.group_id,'stale_work_report',r.id))`
+		}
 	}
 	if c := opts.Before; c != nil {
 		query += ` AND (r.created_at,r.id)<(?,?)`
