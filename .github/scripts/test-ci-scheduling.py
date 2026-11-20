@@ -504,9 +504,15 @@ class ShardBatchTests(unittest.TestCase):
                     tests = [command for command in calls if command[:2] == ["go", "test"]]
                     self.assertEqual(len(tests), len(slots) + 1)
                     self.assertEqual(sum("-list" in command for command in tests), 1)
+                    run_slots = iter(slots)
                     for command in tests:
                         for flag in ("-count=1", "-race", "-json"):
                             self.assertIn(flag, command)
+                        slot = None if "-list" in command else next(run_slots)
+                        timeouts = [arg for arg in command if arg.partition("=")[0] in
+                                    ("-timeout", "--timeout", "-test.timeout", "--test.timeout")]
+                        expected = ["-timeout=13m"] if (profile, slot) == ("platform", 1) else []
+                        self.assertEqual(timeouts, expected, f"{profile} slot {slot}")
                     self.assertEqual({path.name for path in destination.iterdir()}, {f"{profile}-shard-v1-{slot}" for slot in slots})
             result = self.shards.aggregate_workers(root, RUN, SHA, TREE)
             self.assertEqual(sum(summary["total"] for summary in result.values()), 81)
