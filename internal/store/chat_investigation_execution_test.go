@@ -22,7 +22,8 @@ func TestChatInvestigationScopedReadsAndFormalReview(t *testing.T) {
 				t.Fatalf("fixture did not produce conflict metadata: %+v", approved)
 			}
 			ref := domain.ArtifactVersionRef{ArtifactID: approved.ArtifactID, VersionID: approved.ID}
-			config := domain.ChatInvestigationPolicy{Objective: investigationObjective, AllowTopicMessages: name == "artifact-and-topic", ArtifactVersions: []domain.ArtifactVersionRef{ref}, MaxDelegations: 2}
+			config := clueInvestigationConfig(t, investigationClueTermsJSON)
+			config.AllowTopicMessages, config.ArtifactVersions, config.MaxDelegations = name == "artifact-and-topic", []domain.ArtifactVersionRef{ref}, 2
 			allowed, excluded, wantVersion := base.ID, head.ID, approved
 			wantVersion.ObservedVersionID = ""
 			if config.AllowTopicMessages {
@@ -32,18 +33,26 @@ func TestChatInvestigationScopedReadsAndFormalReview(t *testing.T) {
 			config.ArtifactVersions = append(config.ArtifactVersions, domain.ArtifactVersionRef{ArtifactID: ref.ArtifactID, VersionID: allowed})
 			policy := investigationPolicy(t, f, config, 2)
 			f.s.EnableInvestigationExecution()
-			// Capture a real member suggestion, not a user-labelled message body.
-			message, err := f.s.SendMessageForTool(ctx, f.scope, MemberToolMessageInput{Content: "建议仅按配置调查。", RecipientIDs: []string{f.b}}, "peer-investigation")
+			// Capture a real member observation, not a local-user work command.
+			message, err := f.s.SendMessageForTool(ctx, f.scope, MemberToolMessageInput{Content: investigationClue, RecipientIDs: []string{f.b}}, "peer-investigation")
 			if err != nil {
 				t.Fatal(err)
 			}
 			investigationFinishTurn(t, f)
 			investigationBindCandidate(t, &f, message.Deliveries[0])
+			if !f.candidate.InvestigationClueMatched || f.candidate.MessageID != message.ID || f.candidate.SourceID != message.SourceID {
+				t.Fatalf("trusted issuance lost the actual member clue: %+v", f.candidate)
+			}
+			foreign := f.scope
+			foreign.Claim.GroupID = f.otherID
+			if c, err := f.s.CaptureChatCandidate(ctx, foreign); !errors.Is(err, ErrMemberToolDenied) || c.InvestigationClueMatched {
+				t.Fatalf("foreign-group scope captured the member clue: %v", err)
+			}
 			f.input = investigationProposal()
 			role := investigationBindWorker(t, f)
 			id := role.Provenance.TaskID
 			receipt, err := f.s.GetChatAdmission(ctx, f.groupID, id)
-			if err != nil || receipt.Action != domain.ChatActionReadOnlyInvestigation || receipt.SourceKind != "member" || receipt.SourceID != message.SourceID || receipt.SourceSenderID != f.a ||
+			if err != nil || receipt.MessageID != message.ID || receipt.Action != domain.ChatActionReadOnlyInvestigation || receipt.SourceKind != "member" || receipt.SourceID != message.SourceID || receipt.SourceSenderID != f.a ||
 				receipt.Authority != "written_preauthorization" || receipt.AuthorizationMessageID == message.ID || !receipt.AuthorityEvidenceVerified {
 				t.Fatalf("wrong member intake or written authority: %+v, %v", receipt, err)
 			}
@@ -65,7 +74,7 @@ func TestChatInvestigationScopedReadsAndFormalReview(t *testing.T) {
 				!strings.Contains(mandate.Scope.Description, policy.ConfigurationSourceID) || !strings.Contains(mandate.Scope.Acceptance, "纯文本") {
 				t.Fatalf("model replaced the user's objective, materials or acceptance: %+v", mandate)
 			}
-			if dispatch, err := f.s.GetDispatchRequest(ctx, f.groupID, receipt.DispatchRequestID); err != nil || dispatch.Request.Reason != "按本机用户的当前只读调查策略准备文本交付。" {
+			if dispatch, err := f.s.GetDispatchRequest(ctx, f.groupID, receipt.DispatchRequestID); err != nil || !strings.Contains(dispatch.Request.Reason, "原消息符合本机用户配置的只读调查线索词组") {
 				t.Fatalf("dispatch lost the server's reason: %+v, %v", dispatch.Request, err)
 			}
 			if _, err := f.s.GetTaskInvestigationScope(ctx, f.otherID, id); !errors.Is(err, ErrNotFound) {

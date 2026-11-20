@@ -20,7 +20,7 @@ func (s *Store) EnableInvestigationExecution() { s.investigationExecution.Store(
 
 // The common chat gate has already checked the live revision, source, budget
 // and routing. Both fresh policy and material checks are in that same tx.
-func (s *Store) chatInvestigationAdmissionInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, input domain.ChatAssessment) (string, error) {
+func (s *Store) chatInvestigationAdmissionInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, c domain.ChatCandidate, input domain.ChatAssessment) (string, error) {
 	if input.Disposition != "prepare_work" || input.Repair != nil {
 		return "", chatDeny("investigation_prepare_required", "只读调查只允许在本机用户配置的范围内自主准备。", "是否按本话题已配置的只读调查目标准备？")
 	}
@@ -45,7 +45,9 @@ func (s *Store) chatInvestigationAdmissionInTx(ctx context.Context, tx *sql.Tx, 
 		return "", err
 	}
 	var authorization string
-	if err := tx.QueryRowContext(ctx, `SELECT message_id FROM message_command_sources WHERE id=? AND kind='local_user_policy'`, p.ConfigurationSourceID).Scan(&authorization); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT m.id FROM message_command_sources src JOIN messages m ON m.id=src.message_id
+	 WHERE src.id=? AND src.kind='local_user_policy' AND (m.group_id,m.topic_id,m.sender_id)=(?,?,'user')`,
+		p.ConfigurationSourceID, c.GroupID, c.TopicID).Scan(&authorization); err != nil {
 		return "", err
 	}
 	followup, err := chatInvestigationReferencesExistingWorkInTx(ctx, tx, c)
@@ -54,6 +56,10 @@ func (s *Store) chatInvestigationAdmissionInTx(ctx context.Context, tx *sql.Tx, 
 	}
 	if followup {
 		return "", chatDeny("investigation_followup_requires_clarification", "本机用户消息指向本话题已有工作，不应作为新调查准入。", "请确认要在本话题继续哪项已有任务，以及是否沿用原范围？")
+	}
+	// Keep the live delivery/source fence for unstructured investigations too.
+	if _, err := chatDiscussionArrivalInTx(ctx, tx, scope, c.ID); err != nil {
+		return "", err
 	}
 	return authorization, nil
 }
