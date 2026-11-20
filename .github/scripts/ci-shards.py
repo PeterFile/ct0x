@@ -1,36 +1,63 @@
 #!/usr/bin/env python3
 """Batch fixed logical race shards without weakening their existing evidence contract."""
 import argparse
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+from threading import Lock
 from types import SimpleNamespace
 
 
 _spec = importlib.util.spec_from_file_location("store_shard_verifier", Path(__file__).with_name("verify-store-shard.py"))
 verifier = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(verifier)
-# Admit the historically long Platform slots first; never batch more than two.
+# Admit the historically long Platform slots first; isolate slots 1 and 2.
 BATCHES = {
-    "platform": ((4,), (8, 0), (1, 2), (3, 5), (6, 7)),
+    "platform": ((4,), (8, 0), (1,), (3, 5), (6, 7), (2,)),
     "store": tuple(tuple(range(start, start + 4)) for start in range(0, 64, 4)),
     "httpapi": ((0, 1, 2, 3), (4, 5, 6, 7)),
 }
+PLATFORM_RUN_LIMIT = 24
+# Pairing A/B: run 44712299768. Preserve isolation for #225 slots and #240 package times >=330s.
+SLOW_STORE_SLOTS = {6, 8, 38, 50, 51, 57, 62}
+LOG_LOCK = Lock()
+
+
+def worker_parallelism(profile, slots):
+    if profile != "store" or SLOW_STORE_SLOTS.intersection(slots) or sys.platform != "linux":
+        return 1
+    try:
+        return 2 if len(os.sched_getaffinity(0)) >= 4 else 1
+    except (AttributeError, NotImplementedError, OSError):
+        return 1
+
+
+def execution_subsets(selected, profile):
+    if profile != "platform" or len(selected) <= PLATFORM_RUN_LIMIT:
+        return [selected]
+    names = sorted(selected)
+    groups = (len(names) + PLATFORM_RUN_LIMIT - 1) // PLATFORM_RUN_LIMIT
+    return [Counter({name: selected[name] for name in names[index::groups]}) for index in range(groups)]
 
 
 def command(args, **kwargs):
-    print("CI:", json.dumps(args), flush=True)
+    with LOG_LOCK:
+        print("CI:", json.dumps(args), flush=True)
     return subprocess.run(args, check=True, **kwargs)
 
 
 def log_events(path, stream):
-    with path.open(encoding="utf-8", errors="replace") as source:
-        shutil.copyfileobj(source, stream, length=64 * 1024)
-    stream.flush()
+    with LOG_LOCK:
+        with path.open(encoding="utf-8", errors="replace") as source:
+            shutil.copyfileobj(source, stream, length=64 * 1024)
+        stream.flush()
 
 
 def check_identity(sha, tree):
@@ -43,8 +70,44 @@ def identity(run_id, sha, tree, package):
     return verifier.identity(SimpleNamespace(run_id=run_id, sha=sha, tree=tree, package=package))
 
 
+def run_slot(profile, slot, compiled, package, expected, temporary):
+    total = verifier.PROFILES[profile][0]
+    target = "./internal/" + profile
+    private = Path(temporary) / f"slot-{slot}"
+    private.mkdir()
+    scratch = private / "tmp"
+    scratch.mkdir()
+    env = {**os.environ, "TMPDIR": str(scratch)}
+    selected, _ = verifier.selection(compiled, slot, profile)
+    with LOG_LOCK:
+        print(f"CI: {profile} 槽 {slot}/{total}，{len(selected)} 个顶层项", flush=True)
+    runs, passes = Counter(), Counter()
+    for index, subset in enumerate(execution_subsets(selected, profile)):
+        pattern = verifier.run_pattern(subset)
+        events = private / f"run-{index}.json"
+        args = ["go", "test", "-count=1", "-race", "-json", "-run", pattern, target]
+        if (profile, slot) == ("platform", 1):
+            args.insert(-1, "-timeout=13m")
+        try:
+            with events.open("wb") as output:
+                command(args, stdout=output, env=env)
+        except subprocess.CalledProcessError:
+            # Keep failure diagnostics in the job log, never in evidence artifacts.
+            log_events(events, sys.stderr)
+            raise
+        log_events(events, sys.stdout)
+        subset_runs, subset_passes = verifier.verify(events, package, subset)
+        verifier.check(not (runs.keys() & subset_runs.keys()) and not (passes.keys() & subset_passes.keys()),
+                       "逻辑槽子集重复覆盖")
+        runs.update(subset_runs)
+        passes.update(subset_passes)
+    verifier.check(runs == passes == selected, "逻辑槽子集 run/pass 覆盖计数不符")
+    return {"schema": verifier.SCHEMA, "slot": slot, "total": total, **expected,
+            "compiled": compiled, "selected": selected, "runs": runs, "passes": passes, "skips": {}}
+
+
 def run_worker(profile, worker, directory, run_id, sha, tree):
-    total, expected_package, summary_name, prefix = verifier.PROFILES[profile]
+    _, expected_package, summary_name, prefix = verifier.PROFILES[profile]
     verifier.check(type(worker) is int and worker in range(len(BATCHES[profile])), "worker 编号非法")
     expected = identity(run_id, sha, tree, expected_package)
     check_identity(sha, tree)
@@ -55,30 +118,23 @@ def run_worker(profile, worker, directory, run_id, sha, tree):
     package = command(["go", "list", target], capture_output=True, text=True).stdout.strip()
     verifier.check(package == expected_package, "实际 Go 包与固定分片配置不符")
     with tempfile.TemporaryDirectory(prefix="ci-shard-") as temporary:
-        listed, events = Path(temporary) / "list.json", Path(temporary) / "run.json"
+        listed = Path(temporary) / "list.json"
         with listed.open("wb") as output:
-            command(["go", "test", "-count=1", "-race", "-json", "-list", "^(Test|Example|Fuzz)", target], stdout=output)
+            command(["go", "test", "-count=1", "-race", "-json", "-list", "^(Test|Example|Fuzz)", target],
+                    stdout=output, env={**os.environ, "TMPDIR": temporary})
         compiled = verifier.inventory(listed, package)
-        for slot in BATCHES[profile][worker]:
-            selected, pattern = verifier.selection(compiled, slot, profile)
-            print(f"CI: {profile} 槽 {slot}/{total}，{len(selected)} 个顶层项", flush=True)
-            args = ["go", "test", "-count=1", "-race", "-json", "-run", pattern, target]
-            if (profile, slot) == ("platform", 1):
-                args.insert(-1, "-timeout=13m")
-            try:
-                with events.open("wb") as output:
-                    command(args, stdout=output)
-            except subprocess.CalledProcessError:
-                # Keep failure diagnostics in the job log, never in evidence artifacts.
-                log_events(events, sys.stderr)
-                raise
-            log_events(events, sys.stdout)
-            runs, passes = verifier.verify(events, package, selected)
-            summary = {"schema": verifier.SCHEMA, "slot": slot, "total": total, **expected,
-                       "compiled": compiled, "selected": selected, "runs": runs, "passes": passes, "skips": {}}
-            artifact = directory / f"{prefix}{slot}"
-            artifact.mkdir()
-            (artifact / summary_name).write_text(json.dumps(summary, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+        slots = BATCHES[profile][worker]
+        if worker_parallelism(profile, slots) == 2:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(run_slot, profile, slot, compiled, package, expected, temporary) for slot in slots]
+                summaries = [future.result() for future in futures]
+        else:
+            summaries = [run_slot(profile, slot, compiled, package, expected, temporary) for slot in slots]
+    # Publish nothing until every subprocess and coverage check has finished successfully.
+    for summary in summaries:
+        artifact = directory / f"{prefix}{summary['slot']}"
+        artifact.mkdir()
+        (artifact / summary_name).write_text(json.dumps(summary, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def directory_entries(directory, names):
