@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ApiError, getMessage, listMessages } from "./api";
-import type { Message } from "./api";
+import { ApiError, getMessage, listMessages, matchesMessageQuote } from "./api";
+import type { Message, MessageQuote } from "./api";
 
 type FeedRecord = { message: Message; source: "read" | "receipt"; dataVersion: number; presenceVersion: number };
 type Feed = { entries: Map<string, FeedRecord>; floor: number };
@@ -66,6 +66,21 @@ export function useMessageFeed(groupId: string, active: boolean) {
     } catch (error) {
       if (read.valid()) setDetails(previous => ({ ...previous, [id]: { pending: false, error: errorText(error) } }));
     } finally { if (read.valid()) detailBusy.current.delete(id); read.close(); }
+  }, [groupId, beginRead]);
+  const loadQuote = useCallback(async (quote: MessageQuote, isCurrent: () => boolean) => {
+    if (!running.current || quote.group_id !== groupId) return false;
+    const window = windowVersion.current, read = beginRead();
+    const valid = () => read.valid() && window === windowVersion.current && isCurrent();
+    try {
+      const original = await getMessage(groupId, quote.message_id, read.signal);
+      if (!valid()) return false;
+      if (!matchesMessageQuote(quote, original)) throw new ApiError("被引原消息与引用不符。");
+      setFeed(previous => merge(previous, [original], read.version));
+      return true;
+    } catch (error) {
+      if (valid()) throw error;
+      return false;
+    } finally { read.close(); }
   }, [groupId, beginRead]);
   useEffect(() => {
     running.current = active; ++epoch.current;
@@ -144,6 +159,6 @@ export function useMessageFeed(groupId: string, active: boolean) {
     timer = setTimeout(() => void cycle(), 5000);
     return () => { stopped = true; clearTimeout(timer); };
   }, [active, groupId, beginRead, refreshDetail]);
-  return { items, page, pollError, details, loadPage, refreshDetail, beginSend, confirm, preserveReference,
+  return { items, page, pollError, details, loadPage, refreshDetail, loadQuote, beginSend, confirm, preserveReference,
     retry: () => loadPage(lastRequest.current.before, lastRequest.current.reset) };
 }
