@@ -59,10 +59,23 @@ type Message struct {
 	Content    string             `json:"content"`
 	CreatedAt  time.Time          `json:"created_at"`
 	Deliveries []Delivery         `json:"deliveries"`
+	ReplyTo    *MessageQuote      `json:"reply_to,omitempty"`
 	Discussion *MessageDiscussion `json:"discussion,omitempty"`
 	// Read projections on the discussion head, not publication receipts.
 	DiscussionClosureReason string              `json:"discussion_closure_reason,omitempty"`
 	DiscussionWork          *ChatDiscussionWork `json:"discussion_work,omitempty"`
+}
+
+// MessageQuote identifies the original and supplies its bounded display text.
+// It does not assign the reply to a topic or confer authority on its sender.
+type MessageQuote struct {
+	MessageID  string `json:"message_id"`
+	GroupID    string `json:"group_id"`
+	TopicID    string `json:"topic_id"`
+	SenderID   string `json:"sender_id"`
+	SenderName string `json:"sender_name"`
+	SourceKind string `json:"source_kind"`
+	Excerpt    string `json:"excerpt"`
 }
 
 // MessageDiscussion is the read-only projection of a published handoff. The

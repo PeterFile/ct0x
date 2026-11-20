@@ -35,6 +35,20 @@ it.each([
   expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toStrictEqual(input);
   expect(transport).toHaveBeenCalledTimes(1);
 });
+it("sends only the quote ID and does not confirm a receipt for a different or cross-group reference", async () => {
+  const quote = { message_id: "old-message", group_id: group.id, topic_id: "old-topic", sender_id: "old-member",
+    sender_name: "乙", source_kind: "unknown", excerpt: "只看本季度" };
+  const input = { content, reply_to_message_id: quote.message_id, reply_to: { ...quote, sender_name: "伪造" } };
+  const receipt = { ...message, reply_to: quote };
+  transport.mockResolvedValueOnce(json(receipt, 201));
+  expect(await sendMessage(group.id, input, "quote")).toEqual(receipt);
+  expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toEqual({ content, reply_to_message_id: quote.message_id });
+  for (const reply_to of [undefined, { ...quote, group_id: other.id }, { ...quote, message_id: "wrong" }]) {
+    transport.mockResolvedValueOnce(json({ ...message, reply_to }, 201));
+    await expect(sendMessage(group.id, input, "quote")).rejects.toMatchObject({ status: 201, code: "invalid_response" });
+  }
+  expect(decodeMessage({ ...message, reply_to: { ...quote, group_id: other.id } })).toEqual(message);
+});
 it.each([undefined, "", "opaque-topic /?+"])("passes topic %s through without inventing a default", async topic => {
   const input = topic === undefined ? { content } : { content, topic_id: topic };
   transport.mockResolvedValueOnce(json({ ...message, topic_id: topic ?? "" }, 201));

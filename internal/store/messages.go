@@ -17,6 +17,7 @@ type MessageRequest struct {
 	GroupID, TopicID, Content, IdempotencyKey string
 	ActorID                                   string   `json:"-"`
 	RecipientIDs                              []string // Nil permits routing; non-nil (even empty) is an explicit set.
+	ReplyToMessageID                          string
 }
 
 type MessageListOptions struct {
@@ -34,6 +35,11 @@ func (r MessageRequest) payload() []byte {
 	fields := []string{r.GroupID, r.TopicID, r.Content, "omitted"}
 	if r.RecipientIDs != nil {
 		fields[3] = "explicit"
+	}
+	if r.ReplyToMessageID != "" {
+		// A distinct marker cannot alias a legacy suffix of recipient IDs.
+		fields[3] += "/quote"
+		fields = append(fields, r.ReplyToMessageID)
 	}
 	return mutationPayload(append(fields, recipientSet(r.RecipientIDs)...)...)
 }
@@ -59,7 +65,7 @@ func (s *Store) LookupMessageReceipt(ctx context.Context, request MessageRequest
 	}
 	var m domain.Message
 	if found {
-		m, err = messageInTx(ctx, tx, request.GroupID, id)
+		m, err = messageReceiptInTx(ctx, tx, request, id, request.ActorID == "user")
 		if err != nil {
 			return domain.Message{}, false, storeError("读取消息回执失败", err)
 		}
@@ -98,6 +104,11 @@ func insertMessageRow(ctx context.Context, tx *sql.Tx, message domain.Message) e
 }
 
 func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolved []string) (domain.Message, error) {
+	return createMessageWithQuoteInTx(ctx, tx, r, resolved, false)
+}
+
+// localUser is set only by CreateLocalUserMessage, never inferred from a member identity.
+func createMessageWithQuoteInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolved []string, localUser bool) (domain.Message, error) {
 	// Access precedes receipt lookup, so inaccessible actors cannot probe keys or conflicts.
 	if err := requireMessageActor(ctx, tx, r.GroupID, r.ActorID); err != nil {
 		return domain.Message{}, err
@@ -107,10 +118,25 @@ func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolv
 		return domain.Message{}, err
 	}
 	if replay {
-		return messageInTx(ctx, tx, r.GroupID, id)
+		return messageReceiptInTx(ctx, tx, r, id, localUser)
 	}
 	if strings.TrimSpace(r.Content) == "" {
 		return domain.Message{}, fmt.Errorf("%w：消息内容不能为空", ErrInvalid)
+	}
+	var quote *domain.MessageQuote
+	if r.ReplyToMessageID != "" {
+		var activeAuthor bool
+		quote, activeAuthor, err = resolveMessageQuoteInTx(ctx, tx, r, localUser)
+		if err != nil {
+			return domain.Message{}, err
+		}
+		if localUser && r.RecipientIDs == nil {
+			// The original author is resolved under the write lock, never substituted.
+			resolved = nil
+			if activeAuthor {
+				resolved = []string{quote.SenderID}
+			}
+		}
 	}
 	resolved = recipientSet(resolved)
 	// Nil permits routing; every explicit set, including an empty one, is authoritative.
@@ -130,6 +156,11 @@ func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolv
 	if err := insertMessageRow(ctx, tx, message); err != nil {
 		return domain.Message{}, err
 	}
+	if quote != nil {
+		if err := insertMessageQuoteInTx(ctx, tx, message, quote); err != nil {
+			return domain.Message{}, err
+		}
+	}
 	stamp := message.CreatedAt.Format(timestampLayout)
 	for _, recipient := range resolved {
 		c, err := conversationInTx(ctx, tx, r.GroupID, recipient, r.TopicID)
@@ -142,7 +173,28 @@ func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolv
 			return domain.Message{}, err
 		}
 	}
-	return messageInTx(ctx, tx, r.GroupID, id)
+	message, err = messageInTx(ctx, tx, r.GroupID, id)
+	message.ReplyTo = quote
+	return message, err
+}
+
+func messageReceiptInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id string, localUser bool) (domain.Message, error) {
+	m, err := messageInTx(ctx, tx, r.GroupID, id)
+	if err != nil || r.ReplyToMessageID == "" {
+		return m, err
+	}
+	var topicID *string
+	if !localUser {
+		topicID = &r.TopicID
+	}
+	messages := []domain.Message{m}
+	if err := projectMessageQuotesInTx(ctx, tx, r.GroupID, topicID, messages); err != nil {
+		return domain.Message{}, err
+	}
+	if q := messages[0].ReplyTo; q == nil || q.MessageID != r.ReplyToMessageID {
+		return domain.Message{}, fmt.Errorf("已保存的消息与引用回执不符")
+	}
+	return messages[0], nil
 }
 
 func requireMessageActor(ctx context.Context, tx *sql.Tx, groupID, actorID string) error {
@@ -164,6 +216,9 @@ func (s *Store) GetMessage(ctx context.Context, groupID, messageID string) (doma
 		return domain.Message{}, storeError("读取消息失败", err)
 	}
 	messages := []domain.Message{m}
+	if err := projectMessageQuotesInTx(ctx, tx, groupID, nil, messages); err != nil {
+		return domain.Message{}, storeError("读取消息引用失败", err)
+	}
 	if err := projectMessageDiscussionsInTx(ctx, tx, groupID, messages); err != nil {
 		return domain.Message{}, err
 	}
