@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
@@ -24,10 +27,10 @@ var runExplanationKey = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // This is a reservation for one issued Pi capability, not a new Store receipt.
 // The exact first potentially committed request outlives the child on disk.
 type memberRunExplanation struct {
-	mu      sync.Mutex
-	path    string
-	attempt *runExplanationAttempt
-	unknown bool
+	mu               sync.Mutex
+	path, bridgePath string
+	attempt          *runExplanationAttempt
+	unknown          bool
 }
 
 type runExplanationAttempt struct {
@@ -105,7 +108,7 @@ func (s *MemberTools) PublishRunExplanation(ctx context.Context, token, text, ke
 func validRunExplanationAttempt(text, key, token, claimToken string) bool {
 	return utf8.ValidString(text) && len(text) <= store.AgentRunExplanationMaxBytes && strings.TrimSpace(text) != "" &&
 		!strings.ContainsRune(text, 0) && !strings.Contains(text, token) && !strings.Contains(text, claimToken) &&
-		runExplanationKey.MatchString(key)
+		runExplanationKey.MatchString(key) && !strings.Contains(key, token) && !strings.Contains(key, claimToken)
 }
 
 func runExplanationRejected(err error) bool {
@@ -133,28 +136,70 @@ func (a runExplanationAttempt) reserve(path string) error {
 	return err
 }
 
-// Called after process/stream join and uncancelled capability revocation. Even
-// a valid native terminal cannot confirm an unconfirmed Store/HTTP result.
-func (b *memberRunExplanation) receipt(raw provider.ExecutionReceipt, token, claimToken string) provider.ExecutionReceipt {
-	unknown := raw.RunExplanationUnknown
-	if unknown != nil && b.attempt == nil {
-		// The request may have been lost before the server could reserve it.
-		// Keep exact, hash-matched native bytes privately for reconciliation,
-		// without granting retry authority. Missing bytes or a journal error
-		// cannot make the outcome known.
-		text, key := unknown.ReconciliationText(), unknown.IdempotencyKey
-		if validRunExplanationAttempt(text, key, token, claimToken) {
-			_ = (runExplanationAttempt{Key: key, Text: text}).reserve(b.path)
+// After child, event and handler join, read bounded evidence only in the
+// trusted run directory. Do not synthesize the possibly sent text from stdout.
+func (b *memberRunExplanation) bridgeAttempt(token, claimToken string) (*runExplanationAttempt, os.FileInfo, error) {
+	dir, err := os.Lstat(filepath.Dir(b.bridgePath))
+	if err != nil {
+		return nil, nil, err
+	}
+	if dir.Mode() != os.ModeDir|0700 {
+		return nil, nil, errMemberToolRuntimeBinding
+	}
+	file, err := os.OpenFile(b.bridgePath, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if os.IsNotExist(err) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	defer file.Close()
+	const maxSize = sha256.Size*2 + 1 + store.AgentRunExplanationMaxBytes
+	info, err := file.Stat()
+	if err != nil || info.Mode() != 0600 || info.Size() > maxSize {
+		return nil, nil, errMemberToolRuntimeBinding
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != uint32(os.Geteuid()) || stat.Nlink != 1 {
+		return nil, nil, errMemberToolRuntimeBinding
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxSize+1))
+	key, text, sep := strings.Cut(string(data), "\n")
+	if err != nil || !sep || int64(len(data)) != info.Size() || !validRunExplanationAttempt(text, key, token, claimToken) {
+		return nil, nil, errMemberToolRuntimeBinding
+	}
+	return &runExplanationAttempt{Key: key, Text: text}, info, nil
+}
+
+func (b *memberRunExplanation) receipt(raw provider.ExecutionReceipt, token, claimToken string, trustedRoot, liveContext bool) provider.ExecutionReceipt {
+	var journal *runExplanationAttempt
+	var info os.FileInfo
+	err := errMemberToolRuntimeBinding
+	if trustedRoot {
+		journal, info, err = b.bridgeAttempt(token, claimToken)
+		if !raw.Started && os.IsNotExist(err) {
+			err = nil // A definite preflight failure need not have made the directory.
 		}
 	}
-	if unknown != nil || b.unknown || b.attempt != nil && raw.RunExplanationAckKey != b.attempt.Key {
+	hasAttempt := journal != nil || b.attempt != nil || raw.RunExplanationAckKey != ""
+	confirmed := hasAttempt && !b.unknown && !raw.RunExplanationUnknown && err == nil &&
+		liveContext && raw.Accepted && raw.DirectChildReaped && raw.OutputComplete && !raw.DeliveryFailed &&
+		raw.Terminal != "" && raw.Outcome == raw.Terminal && journal != nil && b.attempt != nil && *journal == *b.attempt &&
+		raw.RunExplanationAckKey == journal.Key && raw.RunExplanationAckTextSHA256 == fmt.Sprintf("%x", sha256.Sum256([]byte(journal.Text)))
+	if confirmed {
+		current, statErr := os.Lstat(b.bridgePath)
+		if statErr != nil || current.Mode() != 0600 || !os.SameFile(info, current) {
+			confirmed = false
+		} else {
+			// On cleanup failure leftover evidence is safe; never replace it.
+			_ = os.Remove(b.bridgePath)
+			_ = os.Remove(b.path)
+		}
+	}
+	if err != nil || raw.RunExplanationUnknown || b.unknown || hasAttempt && !confirmed {
 		raw.Outcome = provider.OutcomeUnknown
 		raw.Reason = store.ErrAgentRunExplanationUnknown.Error()
-	} else if b.attempt != nil && raw.Outcome != provider.OutcomeUnknown {
-		// A prior ACK cannot justify cleanup on a damaged/interrupted stream
-		// that could have lost the end of a later exact replay.
-		_ = os.Remove(b.path)
 	}
-	raw.RunExplanationAckKey, raw.RunExplanationUnknown = "", nil
+	raw.RunExplanationAckKey, raw.RunExplanationAckTextSHA256, raw.RunExplanationUnknown = "", "", false
 	return raw
 }

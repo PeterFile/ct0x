@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -34,7 +35,7 @@ type MemberToolRuntimeOptions struct {
 	RoleMaxActive     int
 	RoleExecutionRoot string
 	// NativeExecutionRoot is the trusted scheduler RuntimeDir for native text
-	// sessions. When roles are configured, the same pinned root is reused.
+	// sessions and the fresh Pi explanation journal. Roles reuse the same root.
 	NativeExecutionRoot string
 	// ChatIntake reuses the same Engine and requires the role execution path.
 	ChatIntake *coordination.Engine
@@ -135,7 +136,7 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 	if options.WorkInputs != nil && (roleFence == nil || nilWorkInputService(options.WorkInputs)) {
 		return nil, errMemberToolRuntimeConfig
 	}
-	if options.RunExplanation != nil && !options.RunExplanation.UsesStore(db) {
+	if options.RunExplanation != nil && (executionRoot == nil || !options.RunExplanation.UsesStore(db)) {
 		return nil, errMemberToolRuntimeConfig
 	}
 	tools := NewMemberTools(db)
@@ -264,7 +265,9 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema)
 	} else {
 		if e.explanationBuilder != nil && e.nativeSession == nil && r.tools.runExplanationSupported(ctx) {
-			explanation = &memberRunExplanation{path: filepath.Join(request.RuntimeDir, request.RunID, runExplanationAttemptFile)}
+			dir := filepath.Join(request.RuntimeDir, request.RunID)
+			explanation = &memberRunExplanation{path: filepath.Join(dir, runExplanationAttemptFile),
+				bridgePath: filepath.Join(dir, provider.PiRunExplanationJournalName)}
 		}
 		token, err = r.tools.issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers,
 			ProviderID: e.binding.ProviderID, Model: e.binding.Model}, "generic", memberToolIntakeSchema{}, explanation)
@@ -311,7 +314,7 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	raw := native.Execute(ctx, nativeRequest, onEvent)
 	if explanation != nil {
 		r.tools.Revoke(token)
-		receipt := explanation.receipt(raw, token, claim.Token)
+		receipt := explanation.receipt(raw, token, claim.Token, r.executionRoot.rootValid(request.RuntimeDir), ctx.Err() == nil)
 		token = ""
 		return receipt
 	}
@@ -366,7 +369,7 @@ func (e *memberToolRuntimeRun) preflight(ctx context.Context, request provider.E
 
 func (e *memberToolRuntimeRun) clearRunDirectory(request provider.ExecuteRequest) bool {
 	r := e.runtime
-	return (e.nativeSession == nil || r.executionRoot.rootValid(request.RuntimeDir)) && r.clearRunDirectory(request)
+	return (e.nativeSession == nil && e.explanationBuilder == nil || r.executionRoot.rootValid(request.RuntimeDir)) && r.clearRunDirectory(request)
 }
 
 // Only inspect: the adapter still reserves RuntimeDir/RunID exclusively itself.
@@ -418,9 +421,13 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 	if entry.purpose == memberInvestigationRolePurpose {
 		strictTools = entry.grants.Operations
 	}
-	var explanationRun string
+	var explanationRun, explanationJournal, explanationClaim string
 	if entry.runExplanation != nil {
-		explanationRun = entry.scope.Claim.TurnID
+		claim := entry.scope.Claim
+		explanationRun, explanationJournal = claim.TurnID, entry.runExplanation.bridgePath
+		// This fingerprint detects accidental credential material in exact bytes;
+		// it neither conveys the claim token nor grants authority to the bridge.
+		explanationClaim = fmt.Sprintf("%d:%x", len(claim.Token), sha256.Sum256([]byte(claim.Token)))
 	}
 	data, err := json.Marshal(struct {
 		Endpoint               string   `json:"endpoint"`
@@ -430,7 +437,10 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 		IntakeAssessmentAction string   `json:"intake_assessment_action,omitempty"`
 		InvestigationTools     []string `json:"investigation_tools,omitempty"`
 		RunExplanation         string   `json:"run_explanation,omitempty"`
-	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools, explanationRun})
+		ExplanationJournal     string   `json:"run_explanation_journal,omitempty"`
+		ExplanationClaim       string   `json:"run_explanation_claim_fingerprint,omitempty"`
+	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools, explanationRun,
+		explanationJournal, explanationClaim})
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}

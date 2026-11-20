@@ -29,12 +29,13 @@ type piMemberToolOptions struct {
 	// from tool names, ordinary digest options, the child stream or the prompt.
 	typedWorkRole string
 
-	extensionPath  string
-	configPath     string
-	toolNames      []string
-	configSHA256   [sha256.Size]byte // Nonzero only for runtime-bound profiles.
-	investigation  bool              // Strict first-investigation config and argv.
-	runExplanation string            // Bound RunID for the fresh public-explanation profile only.
+	extensionPath         string
+	configPath            string
+	toolNames             []string
+	configSHA256          [sha256.Size]byte // Nonzero only for runtime-bound profiles.
+	investigation         bool              // Strict first-investigation config and argv.
+	runExplanation        string            // Bound RunID for the fresh public-explanation profile only.
+	runExplanationJournal string            // Bound absolute path under that run's directory.
 
 	// Only typed investigation uses its own wire schema and in-memory session.
 	investigationConfigFile os.FileInfo
@@ -164,7 +165,7 @@ func (o *piMemberToolOptions) launchConfigMatches() bool {
 		return true
 	}
 	if o.runExplanation != "" {
-		return piRunExplanationConfigMatches(o.configPath, o.configSHA256, o.runExplanation)
+		return piRunExplanationConfigJournal(o.configPath, o.configSHA256, o.runExplanation) == o.runExplanationJournal
 	}
 	if o.investigationConfigFile == nil {
 		return piMemberToolConfigMatches(o.configPath, o.configSHA256, o.investigation)

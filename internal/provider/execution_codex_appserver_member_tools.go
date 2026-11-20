@@ -31,7 +31,6 @@ type memberToolConfig struct {
 	file               os.FileInfo
 	digest             [32]byte
 	investigationTools []string // Pi strict mode only.
-	runExplanation     string   // Pi fresh ordinary mode only.
 }
 
 // Trusted, stable ancestors are required. Descriptor and path checks detect
@@ -72,14 +71,14 @@ func readMemberToolConfigFile(path string) ([]byte, os.FileInfo, error) {
 }
 
 func readMemberToolConfig(path string) (memberToolConfig, error) {
-	return readMemberToolConfigMode(path, false, false, false)
+	return readMemberToolConfigMode(path, false, false)
 }
 
 func readPiMemberToolConfig(path string, strict bool) (memberToolConfig, error) {
-	return readMemberToolConfigMode(path, true, strict, false)
+	return readMemberToolConfigMode(path, true, strict)
 }
 
-func readMemberToolConfigMode(path string, pi, strict, explanation bool) (memberToolConfig, error) {
+func readMemberToolConfigMode(path string, pi, strict bool) (memberToolConfig, error) {
 	raw, file, err := readMemberToolConfigFile(path)
 	if err != nil {
 		return memberToolConfig{}, err
@@ -87,18 +86,12 @@ func readMemberToolConfigMode(path string, pi, strict, explanation bool) (member
 	var config memberToolConfig
 	fields, err := codexAppServerMap(raw)
 	count := 2
-	switch {
-	case explanation:
-		count++
-		if json.Unmarshal(fields["run_explanation"], &config.runExplanation) != nil || !executionID.MatchString(config.runExplanation) {
-			return memberToolConfig{}, errPiMemberToolConfiguration
-		}
-	case strict:
+	if strict {
 		count++
 		if json.Unmarshal(fields["investigation_tools"], &config.investigationTools) != nil || len(config.investigationTools) == 0 {
 			return memberToolConfig{}, errPiMemberToolConfiguration
 		}
-	default:
+	} else {
 		// Optional schema hints are not authority. Codex discovers its schema
 		// through MCP, and never accepts the strict config or investigation hint.
 		if string(fields["continue_work"]) == "true" {

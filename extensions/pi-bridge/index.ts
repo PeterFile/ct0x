@@ -241,7 +241,7 @@ export default function piBridge(pi: ExtensionAPI) {
       return { text: args.text };
     }
     pi.registerTool({ name: PUBLISH_RUN_EXPLANATION, label: "发布公开运行说明",
-      description: "可选：为本轮发布一条不可修改、只在运行记录中显示的公开说明，不发聊天消息或唤醒成员；不是执行凭证。结果未知时保留原调用标识和原文，先对账，不重试。",
+      description: "可选：为本轮发布一条不可修改、只在运行记录中显示的公开说明，不发聊天消息或唤醒成员；不是执行凭证。发送前私下留存原幂等键及原文用于对账；结果未知时不要重试。",
       parameters, prepareArguments: checked,
       async execute(toolCallId, args, signal, _onUpdate, _ctx) {
         try {

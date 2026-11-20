@@ -99,7 +99,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			}
 			toolOptions.RunExplanation = engine
 		}
-		if config.enableNativeSessionResume {
+		if config.enableNativeSessionResume || config.enableRunExplanation {
 			toolOptions.NativeExecutionRoot = schedulerOptions.RuntimeDir
 		}
 		if config.enableCoordinationRoles {

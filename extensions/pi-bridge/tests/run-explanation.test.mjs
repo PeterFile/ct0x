@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { chmod, mkdir, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createClient, openBridge, PUBLISH_RUN_EXPLANATION as op, RUN_EXPLANATION_ACK } from "../bridge.mjs";
@@ -15,6 +15,8 @@ const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 const expectedKey = sha(`${op}\0${runID}\0${id}`);
 const ack = { explanation_id: `public_explanation:${runID}`, created_at: "2026-11-20T00:00:00.012345678Z", text_omitted: true };
 const payload = { text: ` \n${"🙂".repeat(255)} \t` };
+const claim = "synthetic-claim-for-private-evidence-only";
+const journalName = "run-explanation-bridge-attempt";
 
 async function load(path, digest) {
   const keys = ["AGENT_WORKSPACE_MEMBER_TOOL_CONFIG", "AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256"];
@@ -27,8 +29,14 @@ async function load(path, digest) {
 }
 
 async function issued(t, endpoint, extra = {}) {
-  const path = await privateConfig(t, { endpoint, run_explanation: runID, ...extra });
-  return { path, digest: sha(await readFile(path)) };
+  const path = await privateConfig(t);
+  const runDir = join(dirname(path), runID);
+  await mkdir(runDir, { mode: 0o700 });
+  const journal = join(runDir, journalName);
+  const config = { endpoint, token: TOKEN, run_explanation: runID, run_explanation_journal: journal,
+    run_explanation_claim_fingerprint: `${Buffer.byteLength(claim)}:${sha(claim)}`, ...extra };
+  await writeFile(path, JSON.stringify(config));
+  return { path, digest: sha(await readFile(path)), journal, runDir };
 }
 
 test("public explanation registers in the real Pi loader only from an exact issued config", async t => {
@@ -45,7 +53,9 @@ test("public explanation registers in the real Pi loader only from an exact issu
     assert.equal(denied.errors.length, 1);
   }
   for (const extra of [{ run_explanation: true }, { continue_work: true }, { discussion_only_excerpt: true },
-    { intake_assessment_action: "read_only_investigation" }, { investigation_tools: ["read_investigation_channel", "submit_result"] }]) {
+    { intake_assessment_action: "read_only_investigation" }, { investigation_tools: ["read_investigation_channel", "submit_result"] },
+    { run_explanation_journal: undefined }, { run_explanation_journal: "/other-run/run-explanation-bridge-attempt" },
+    { run_explanation_claim_fingerprint: undefined }, { run_explanation_claim_fingerprint: claim }]) {
     const { path, digest } = await issued(t, server.endpoint, extra);
     assert.throws(() => openBridge(path, digest), error => safeFailure(error, /配置/));
   }
@@ -54,11 +64,15 @@ test("public explanation registers in the real Pi loader only from an exact issu
   const tool = loaded.extensions[0].tools.get(op).definition;
   assert.deepEqual(tool.parameters.required, ["text"]);
   assert.equal(tool.parameters.additionalProperties, false);
-  for (const bad of [{ ...payload, member_id: "forged" }, { ...payload, idempotency_key: "forged" },
+  for (const bad of [{ ...payload, member_id: "forged" }, { ...payload, idempotency_key: "forged" }, { ...payload, path: fx.journal },
     { text: 42 }, { text: null }, { text: "" }, { text: "\u0085" }, { text: "\ud800" }, { text: "no\x00" }, { text: payload.text + "x" }]) {
     assert.throws(() => tool.prepareArguments(bad), error => safeFailure(error, /参数/));
     await assert.rejects(tool.execute(id, bad), error => safeFailure(error, /未发送/));
   }
+  for (const sensitive of [TOKEN, claim]) {
+    await assert.rejects(tool.execute(id, { text: ` \n${sensitive}\t` }), /未发送/);
+  }
+  assert.deepEqual(await readdir(fx.runDir), []);
   assert.equal(server.requests.length, 0);
   for (let i = 0; i < 2; i++) {
     const reply = await tool.execute(id, payload);
@@ -69,6 +83,9 @@ test("public explanation registers in the real Pi loader only from an exact issu
     assert.equal(sent.headers["idempotency-key"], expectedKey);
     assert.equal(sent.body.toString(), JSON.stringify(payload));
   }
+  assert.equal(await readFile(fx.journal, "utf8"), `${expectedKey}\n${payload.text}`);
+  await assert.rejects(tool.execute("different-call", payload), /原运行说明.*未发送/);
+  assert.equal(server.requests.length, 2);
   await writeFile(fx.path, "\n", { flag: "a" });
   assert.throws(() => openBridge(fx.path, fx.digest), error => safeFailure(error, /配置/));
 });
@@ -124,14 +141,18 @@ for (const mode of ["unconfirmed storage", "abort after send", "unmatched acknow
         else json(response, { ...ack, explanation_id: "public_explanation:wrong-turn" }, 201);
       });
     });
-    const { path, digest } = await issued(t, server.endpoint);
+    const { path, digest, runDir, journal } = await issued(t, server.endpoint);
     const { invoke } = openBridge(path, digest);
     const mutable = { ...payload };
     const first = invoke(op, mutable, id, abort.signal).catch(error => error);
     const resolve = await pending;
     mutable.text = "changed";
-    await assert.rejects(invoke(op, payload, "parallel-id"), error => safeFailure(error, /尚未完成.*未发送/));
+    // Exceed the native frame count limit while one request is on the wire.
+    for (let i = 0; i < 600; i++) {
+      await assert.rejects(invoke(op, { text: `rejected ${i}` }, `parallel-${i}`), error => safeFailure(error, /尚未完成.*未发送/));
+    }
     await assert.rejects(invoke("send_message", { content: "second write" }, id), error => safeFailure(error, /尚未完成.*未发送/));
+    assert.equal(await readFile(journal, "utf8"), `${expectedKey}\n${payload.text}`);
     resolve();
     const original = await first;
     safeFailure(original, /结果未知.*幂等键和原文.*不要自动重试/);
@@ -143,6 +164,43 @@ for (const mode of ["unconfirmed storage", "abort after send", "unmatched acknow
     assert.equal(server.requests.length, 1);
     assert.equal(server.requests[0].body.toString(), JSON.stringify(payload));
     assert.equal(server.requests[0].headers["idempotency-key"], expectedKey);
+    assert.deepEqual(await readdir(runDir), [journalName]);
+    assert.equal((await stat(journal)).mode & 0o777, 0o600);
+    assert.equal(await readFile(journal, "utf8"), `${expectedKey}\n${payload.text}`);
     assert.deepEqual((await invoke("read_channel", {}, "read")).json, { items: [], next_cursor: "" });
   });
 }
+
+test("explanation cannot send without a private exclusive journal; ordinary tools do not use it", async t => {
+  const server = await loopback(t, (_, response) => json(response, { items: [] }));
+  const { path, digest, runDir, journal } = await issued(t, server.endpoint);
+  const { invoke } = openBridge(path, digest);
+  await chmod(runDir, 0o755);
+  await assert.rejects(invoke(op, payload, id), /无法安全保留.*未发送/);
+  await chmod(runDir, 0o700);
+  const target = join(dirname(runDir), "must-not-touch");
+  await writeFile(target, "original", { mode: 0o600 });
+  await symlink(target, journal);
+  await assert.rejects(invoke(op, payload, id), /无法安全保留.*未发送/);
+  assert.equal(await readFile(target, "utf8"), "original");
+  assert.equal(server.requests.length, 0);
+  assert.deepEqual((await invoke("read_channel", {}, "read")).json, { items: [] });
+  assert.equal(server.requests.length, 1);
+});
+
+test("definite rejection clears only a first reservation, not a previously sent attempt", async t => {
+  const server = await loopback(t, (_, response) => {
+    if (server.requests.length === 2) json(response, ack, 201);
+    else json(response, { error: { code: "conflict", message: "definite test rejection" } }, 409);
+  });
+  const { path, digest, runDir, journal } = await issued(t, server.endpoint);
+  const { invoke } = openBridge(path, digest);
+  await assert.rejects(invoke(op, payload, "not-sent", AbortSignal.abort()), /尚未发送/);
+  assert.deepEqual(await readdir(runDir), []);
+  await assert.rejects(invoke(op, { text: "first rejected" }, "rejected-id"), /conflict/);
+  assert.deepEqual(await readdir(runDir), []);
+  assert.equal((await invoke(op, payload, id)).explanationKey, expectedKey);
+  await assert.rejects(invoke(op, payload, id), /conflict/);
+  assert.equal(await readFile(journal, "utf8"), `${expectedKey}\n${payload.text}`);
+  assert.equal(server.requests.length, 3);
+});
