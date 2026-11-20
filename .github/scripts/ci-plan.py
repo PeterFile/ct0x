@@ -124,8 +124,13 @@ def shard_matrix():
     spec = importlib.util.spec_from_file_location("ci_shards", Path(__file__).with_name("ci-shards.py"))
     shards = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(shards)
-    return {"include": [{"profile": profile, "worker": worker}
-                        for profile, workers in shards.BATCHES.items() for worker in range(len(workers))]}
+    include = []
+    for profile, workers in shards.BATCHES.items():
+        order = range(len(workers))
+        if profile == "store":
+            order = sorted(order, key=lambda worker: not shards.SLOW_STORE_SLOTS.intersection(workers[worker]))
+        include.extend({"profile": profile, "worker": worker} for worker in order)
+    return {"include": include}
 
 
 def feedback_packages(selected, available):
