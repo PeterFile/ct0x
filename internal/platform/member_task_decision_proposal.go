@@ -21,7 +21,7 @@ const ProposeTaskDecisionOperation = provider.ProposeTaskDecisionTool
 
 var (
 	ErrTaskDecisionProposalUnknown = errors.New("待决问题保存结果未确认；请保留原调用标识和内容用于对账")
-	errTaskDecisionProposalSchema  = errors.New("Pi 任务待决问题需要已安装的待决事项记录结构")
+	errTaskDecisionProposalSchema  = errors.New("Pi 任务待决问题需要已安装的待决事项与决定回送记录结构")
 )
 
 // The distinct proof never leaves the digest-bound private native config except
@@ -44,15 +44,15 @@ func (s *MemberTools) TaskDecisionProposalsEnabled() bool {
 }
 
 func (s *MemberTools) checkTaskDecisionSchema(ctx context.Context) error {
-	// F owns the installed-schema predicate. Use its bounded trusted read,
-	// never a migration number or probe write. No rows leave this check.
-	if _, err := s.chatEngine.ListPendingDecisionRequests(ctx, store.ListOptions{Limit: 1}); err != nil {
+	// Use the same bounded read as F's public pending inbox, which requires
+	// both the request and answer schemas. No rows leave this check.
+	if _, err := s.chatEngine.ListPendingTaskDecisions(ctx, store.ListOptions{Limit: 1}); err != nil {
 		return errors.Join(errTaskDecisionProposalSchema, err)
 	}
 	return nil
 }
 
-func taskDecisionCallMatches(token, proof, id, key string) bool {
+func taskDecisionCallMatches(runID, token, proof, id, key string) bool {
 	if len(id) == 0 || len(id) > 256 || strings.Contains(id, token) || strings.Contains(id, proof) {
 		return false
 	}
@@ -61,15 +61,14 @@ func taskDecisionCallMatches(token, proof, id, key string) bool {
 			return false
 		}
 	}
-	digest := sha256.Sum256([]byte(ProposeTaskDecisionOperation + id))
-	return key == hex.EncodeToString(digest[:])
+	return key == provider.PiTaskDecisionWriteKey(runID, id)
 }
 
 // ProposeTaskDecision uses the exact fresh text owner's credential and holds
 // revocation exclusion through F. Model data cannot choose any scope field.
 func (s *MemberTools) ProposeTaskDecision(ctx context.Context, token, proof, callID, key string, input domain.TaskDecisionRequestInput) (domain.DecisionRequest, error) {
 	var zero domain.DecisionRequest
-	if !s.TaskDecisionProposalsEnabled() || len(proof) != 64 || !taskDecisionCallMatches(token, proof, callID, key) {
+	if !s.TaskDecisionProposalsEnabled() || len(proof) != 64 {
 		return zero, store.ErrMemberToolDenied
 	}
 	s.mu.RLock()
@@ -80,7 +79,9 @@ func (s *MemberTools) ProposeTaskDecision(ctx context.Context, token, proof, cal
 	}
 	binding, scope := entry.taskWork, entry.scope
 	grant := binding.decision
-	if grant == nil || subtle.ConstantTimeCompare([]byte(grant.proof), []byte(proof)) != 1 || !grant.admitted.Load() {
+	// Recompute from the registered Turn, not any caller-supplied run ID.
+	if grant == nil || subtle.ConstantTimeCompare([]byte(grant.proof), []byte(proof)) != 1 || !grant.admitted.Load() ||
+		!taskDecisionCallMatches(scope.Claim.TurnID, token, proof, callID, key) {
 		return zero, store.ErrMemberToolDenied
 	}
 	grant.mu.Lock()

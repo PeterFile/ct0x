@@ -115,8 +115,11 @@ export default function freshTaskWork(pi: ExtensionAPI) {
       // Check original values before Pi can coerce or drop optional fields.
       prepareArguments(raw) { return checkedArgs(tool, raw); },
       async execute(toolCallId, params, signal, _onUpdate, ctx) {
-        const result = await invoke(tool.name, checkedArgs(tool, params), toolCallId, signal);
-        return freshTypedToolResult(result, "followup", result.writeUnknown ? ctx.sessionManager.getSessionId() : "");
+        // Use the same SDK identity before sending the proposal and in its
+        // native reconciliation marker, even if the session changes later.
+        const runID = tool.name === decisionTool.name ? ctx.sessionManager.getSessionId() : undefined;
+        const result = await invoke(tool.name, checkedArgs(tool, params), toolCallId, signal, runID);
+        return freshTypedToolResult(result, "followup", result.writeUnknown ? runID ?? ctx.sessionManager.getSessionId() : "");
       },
     });
   }

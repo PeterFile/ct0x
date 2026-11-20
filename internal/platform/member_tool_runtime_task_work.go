@@ -132,7 +132,7 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 		var digest [sha256.Size]byte
 		construct := s.freshTaskWork.Construct
 		if grant := bound.decision; grant != nil {
-			data, err := provider.PiFreshTaskDecisionConfig(r.endpoint, token, grant.proof)
+			data, err := provider.PiFreshTaskDecisionConfig(r.endpoint, token, grant.proof, claim.TurnID)
 			if err != nil {
 				return unknown
 			}

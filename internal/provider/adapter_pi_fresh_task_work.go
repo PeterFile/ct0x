@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -21,14 +22,24 @@ const ProposeTaskDecisionTool = "propose_task_decision"
 const (
 	piFreshTaskWorkEntrySHA = "834dced6bdfbcd6bae9ca04ca9a1501a980407d02995efbaa9743ca6e701c866"
 	piFreshTaskWorkImplSHA  = "0da78b82aa74e0d3f2cdd38131dc62997b4d67d6041a2efe8b247bc3d789fa6f"
-	piTaskDecisionEntrySHA  = "106638ddee12a5efbf653853070ee123a6614f1ed84907026e13338558cb5ab6"
-	piTaskDecisionImplSHA   = "aca7d329999f26cc9bf1e1c4900ee8cdf6d5f4f33ede4ba584b9463e6d067f5f"
+	// The pre-scoping pair remains usable without proposal authority.
+	piUnscopedTaskDecisionEntrySHA = "106638ddee12a5efbf653853070ee123a6614f1ed84907026e13338558cb5ab6"
+	piUnscopedTaskDecisionImplSHA  = "aca7d329999f26cc9bf1e1c4900ee8cdf6d5f4f33ede4ba584b9463e6d067f5f"
+	piTaskDecisionEntrySHA         = "c6415a0b3b39c4b5b561582571aaeccab9ea5371bbae87b6697f9b9b3e3a0bcd"
+	piTaskDecisionImplSHA          = "d58fab46b47f41db1922bdac8886cf71018e5fa55bc672ce79fe1e29404d3e3d"
 )
 
 func PiFreshTaskWorkToolNames() []string { return strings.Split(piFreshTaskWorkTools, ",") }
 
 func PiFreshTaskDecisionToolNames() []string {
 	return append(PiFreshTaskWorkToolNames(), ProposeTaskDecisionTool)
+}
+
+// PiTaskDecisionWriteKey binds the proposal to the exact Run and native call.
+// Both IDs exclude NUL, so the framing is unambiguous and needs no credential.
+func PiTaskDecisionWriteKey(runID, callID string) string {
+	digest := sha256.Sum256([]byte(ProposeTaskDecisionTool + "\x00" + runID + "\x00" + callID))
+	return hex.EncodeToString(digest[:])
 }
 
 // FreshTaskWorkBinding comes only from the claimed runtime, never tool input.
@@ -86,13 +97,17 @@ func (a PiFreshTaskWorkAdapter) newExecutor(ctx context.Context, selected Provid
 	if bridge == "" || binding.ConfigSHA256 == ([sha256.Size]byte{}) {
 		return nil, errPiMemberToolConfiguration
 	}
-	config, err := readFreshTaskWorkConfig(binding.ConfigPath, decision)
+	var decisionRunID string
+	if decision {
+		decisionRunID = binding.RunID
+	}
+	config, err := readFreshTaskWorkConfig(binding.ConfigPath, decisionRunID)
 	if err != nil || config.digest != binding.ConfigSHA256 || ctx.Err() != nil {
 		return nil, errPiMemberToolConfiguration
 	}
 	pi := baseline.(piExecutor)
 	pi.memberTools = &piMemberToolOptions{extensionPath: bridge, configPath: filepath.Clean(binding.ConfigPath),
-		toolNames: names, configSHA256: binding.ConfigSHA256, typedWorkRole: "followup", taskDecision: decision}
+		toolNames: names, configSHA256: binding.ConfigSHA256, typedWorkRole: "followup", taskDecisionRunID: decisionRunID}
 	return &piFreshTaskWorkExecutor{pi: pi, adapter: a, runID: binding.RunID, configFile: config.file}, nil
 }
 
@@ -116,20 +131,21 @@ type piFreshTaskDecisionConfig struct {
 	Endpoint string `json:"endpoint"`
 	Token    string `json:"token"`
 	Proof    string `json:"task_decision_proof"`
+	RunID    string `json:"run_id"`
 }
 
-// PiFreshTaskDecisionConfig encodes an issued credential, not model input.
-// The additional proof is never set by the ordinary configuration codec.
-func PiFreshTaskDecisionConfig(endpoint, token, proof string) ([]byte, error) {
-	if memberToolConfigOrigin(endpoint, token) == "" || !piTypedWriteRequestSHA.MatchString(proof) || token == proof {
+// PiFreshTaskDecisionConfig encodes the issued credential and exact claimed
+// Run, not model input. The ordinary codec has no proof or Run ID field.
+func PiFreshTaskDecisionConfig(endpoint, token, proof, runID string) ([]byte, error) {
+	if memberToolConfigOrigin(endpoint, token) == "" || !piTypedWriteRequestSHA.MatchString(proof) || token == proof || !executionID.MatchString(runID) {
 		return nil, errPiMemberToolConfiguration
 	}
-	data, err := json.Marshal(piFreshTaskDecisionConfig{Endpoint: endpoint, Token: token, Proof: proof})
+	data, err := json.Marshal(piFreshTaskDecisionConfig{Endpoint: endpoint, Token: token, Proof: proof, RunID: runID})
 	return append(data, '\n'), err
 }
 
-func readFreshTaskWorkConfig(path string, decision bool) (memberToolConfig, error) {
-	if !decision {
+func readFreshTaskWorkConfig(path, decisionRunID string) (memberToolConfig, error) {
+	if decisionRunID == "" {
 		config, err := readMemberToolConfig(path)
 		if err != nil || FreshTaskWorkConfigSHA256(config.endpoint, config.token) != config.digest {
 			return memberToolConfig{}, errPiMemberToolConfiguration
@@ -141,7 +157,7 @@ func readFreshTaskWorkConfig(path string, decision bool) (memberToolConfig, erro
 	if err != nil || json.Unmarshal(raw, &issued) != nil {
 		return memberToolConfig{}, errPiMemberToolConfiguration
 	}
-	canonical, err := PiFreshTaskDecisionConfig(issued.Endpoint, issued.Token, issued.Proof)
+	canonical, err := PiFreshTaskDecisionConfig(issued.Endpoint, issued.Token, issued.Proof, decisionRunID)
 	if err != nil || !bytes.Equal(raw, canonical) {
 		return memberToolConfig{}, errPiMemberToolConfiguration
 	}
@@ -159,10 +175,10 @@ type piFreshTaskWorkExecutor struct {
 func (e *piFreshTaskWorkExecutor) Execute(ctx context.Context, request ExecuteRequest, onEvent func(Event) error) ExecutionReceipt {
 	unknown := ExecutionReceipt{Outcome: OutcomeUnknown, ExitCode: -1, Reason: "任务续办传输绑定无法确认，未调用进程，需对账"}
 	opts := e.pi.memberTools
-	if e.used.Swap(true) || ctx.Err() != nil || request.RunID != e.runID || e.adapter.bridgeForProfile(opts.taskDecision) != opts.extensionPath {
+	if e.used.Swap(true) || ctx.Err() != nil || request.RunID != e.runID || e.adapter.bridgeForProfile(opts.taskDecisionRunID != "") != opts.extensionPath {
 		return unknown
 	}
-	config, err := readFreshTaskWorkConfig(opts.configPath, opts.taskDecision)
+	config, err := readFreshTaskWorkConfig(opts.configPath, opts.taskDecisionRunID)
 	if err != nil || config.digest != opts.configSHA256 || !os.SameFile(e.configFile, config.file) || ctx.Err() != nil {
 		return unknown
 	}
@@ -184,7 +200,8 @@ func (a PiFreshTaskWorkAdapter) bridgeForProfile(decision bool) string {
 	}
 	impl := filepath.Join(filepath.Dir(entry), "fresh-task-work.mjs")
 	if piBridgeBytesMatch(entry, piTaskDecisionEntrySHA) && piBridgeBytesMatch(impl, piTaskDecisionImplSHA) ||
-		!decision && piBridgeBytesMatch(entry, piFreshTaskWorkEntrySHA) && piBridgeBytesMatch(impl, piFreshTaskWorkImplSHA) {
+		!decision && (piBridgeBytesMatch(entry, piFreshTaskWorkEntrySHA) && piBridgeBytesMatch(impl, piFreshTaskWorkImplSHA) ||
+			piBridgeBytesMatch(entry, piUnscopedTaskDecisionEntrySHA) && piBridgeBytesMatch(impl, piUnscopedTaskDecisionImplSHA)) {
 		return entry
 	}
 	return ""

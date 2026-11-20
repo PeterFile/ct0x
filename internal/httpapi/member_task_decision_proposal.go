@@ -101,6 +101,8 @@ func (a memberToolAPI) proposeTaskDecision(w http.ResponseWriter, r *http.Reques
 		memberRoleToolError(w, "propose_task_decision", err)
 		return
 	}
+	// Echo only the verified run-scoped key, not the credential or request.
+	w.Header().Set("Idempotency-Key", key)
 	WriteJSON(w, http.StatusCreated, struct {
 		ID      string                     `json:"decision_request_id"`
 		Kind    domain.DecisionRequestKind `json:"kind"`

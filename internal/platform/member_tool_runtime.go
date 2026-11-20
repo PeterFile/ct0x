@@ -45,7 +45,7 @@ type MemberToolRuntimeOptions struct {
 	// the role execution fence. It does not install the legacy preview.
 	FreshTaskWork *FreshTaskWorkLaunch
 	// EnablePiTaskDecisionProposals is a separate native-only opt-in. It needs
-	// the exact proposal-capable fresh text adapter and F's question schema.
+	// the exact proposal-capable fresh text adapter and F's pending/answer path.
 	EnablePiTaskDecisionProposals bool
 }
 

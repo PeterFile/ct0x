@@ -23,6 +23,7 @@ import (
 	"agentworkspace/internal/httpapi"
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/provider"
+	"agentworkspace/internal/scheduler"
 	"agentworkspace/internal/store"
 )
 
@@ -31,36 +32,76 @@ const decisionCallHeader = "X-Agent-Workspace-Tool-Call-Id"
 const decisionOp = "propose_task_decision"
 const decisionQuestion = `{"kind":"authorization","expected_version":0,"question":"是否纳入周末样本？","facts":"只验证了工作日。 🧪","recommendation":"先交付工作日。","choices":["仅工作日","加入周末"],"authorization":{"scope":"只读样本","impact":"增加两天"}}`
 
-// F #221 provides the exact SQL but intentionally leaves it out of the public
-// migration registry. Install its unchanged proposal fragment in a private
-// test DB; no SQL/schema is copied into the runtime or replicated in fixtures.
-func installTaskDecisionProposalFixture(t *testing.T, f *roleRuntimeFixture, engine *coordination.Engine) {
+// F's schema fragments are not in the public registry at v30. Expand the
+// actual Go string constants (the answer DDL references shared predicates),
+// rather than copying SQL, stubbing a table or assigning a migration slot.
+func installTaskDecisionSchemaFixture(t *testing.T, f *roleRuntimeFixture, schema string) {
 	t.Helper()
-	if _, err := engine.ListPendingDecisionRequests(t.Context(), store.ListOptions{Limit: 1}); !errors.Is(err, store.ErrDecisionRequestsUnavailable) {
-		roleOK(t, err) // Works unchanged when the real migration is registered.
-		return
-	}
-	file, err := parser.ParseFile(token.NewFileSet(), "../store/decision_request_schema.go", nil, 0)
+	files, err := filepath.Glob("../store/*.go")
 	roleOK(t, err)
-	for _, decl := range file.Decls {
-		if d, ok := decl.(*ast.GenDecl); ok && d.Tok == token.CONST {
-			for _, spec := range d.Specs {
-				v := spec.(*ast.ValueSpec)
-				if len(v.Names) == 1 && v.Names[0].Name == "decisionRequestSchema" {
-					literal, ok := v.Values[0].(*ast.BasicLit)
-					if !ok || literal.Kind != token.STRING {
-						t.Fatal("expected F's proposal schema string")
+	constants := make(map[string]ast.Expr)
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
+		roleOK(t, err)
+		for _, decl := range file.Decls {
+			if d, ok := decl.(*ast.GenDecl); ok && d.Tok == token.CONST {
+				for _, spec := range d.Specs {
+					v := spec.(*ast.ValueSpec)
+					if len(v.Names) == len(v.Values) {
+						for i, name := range v.Names {
+							constants[name.Name] = v.Values[i]
+						}
 					}
-					ddl, err := strconv.Unquote(literal.Value)
-					roleOK(t, err)
-					_, err = f.raw.Exec(ddl)
-					roleOK(t, err)
-					return
 				}
 			}
 		}
 	}
-	t.Fatal("could not find F's proposal schema")
+	var expand func(ast.Expr) string
+	expand = func(expr ast.Expr) string {
+		switch e := expr.(type) {
+		case *ast.BasicLit:
+			if e.Kind == token.STRING {
+				text, err := strconv.Unquote(e.Value)
+				roleOK(t, err)
+				return text
+			}
+		case *ast.Ident:
+			if ref := constants[e.Name]; ref != nil {
+				return expand(ref)
+			}
+			t.Fatalf("missing schema constant %s", e.Name)
+		case *ast.BinaryExpr:
+			if e.Op == token.ADD {
+				return expand(e.X) + expand(e.Y)
+			}
+		}
+		t.Fatalf("unsupported expression %T in %s", expr, schema)
+		return ""
+	}
+	ddl := expand(constants[schema])
+	tx, err := f.raw.Begin()
+	roleOK(t, err)
+	defer tx.Rollback()
+	_, err = tx.Exec(ddl)
+	roleOK(t, err)
+	roleOK(t, tx.Commit())
+}
+
+func installTaskDecisionProposalFixture(t *testing.T, f *roleRuntimeFixture, engine *coordination.Engine) {
+	t.Helper()
+	if _, err := engine.ListPendingDecisionRequests(t.Context(), store.ListOptions{Limit: 1}); errors.Is(err, store.ErrDecisionRequestsUnavailable) {
+		installTaskDecisionSchemaFixture(t, f, "decisionRequestSchema")
+	} else {
+		roleOK(t, err)
+	}
+	if _, err := engine.ListPendingTaskDecisions(t.Context(), store.ListOptions{Limit: 1}); errors.Is(err, store.ErrDecisionAnswersUnavailable) {
+		installTaskDecisionSchemaFixture(t, f, "decisionAnswerSchema")
+	} else {
+		roleOK(t, err)
+	}
 }
 
 func TestPiTaskDecisionProposalNeedsExplicitExactLaunchAndSchema(t *testing.T) {
@@ -77,37 +118,72 @@ func TestPiTaskDecisionProposalNeedsExplicitExactLaunchAndSchema(t *testing.T) {
 	}
 	entry, err := filepath.Abs("../../extensions/pi-bridge/fresh-task-work.ts")
 	roleOK(t, err)
-	f.options.FreshTaskWork = platform.NewPiFreshTaskWorkLaunch(entry, 0)
-	if _, err := engine.ListPendingDecisionRequests(t.Context(), store.ListOptions{Limit: 1}); errors.Is(err, store.ErrDecisionRequestsUnavailable) {
+	strong := platform.NewPiFreshTaskWorkLaunch(entry, 0)
+	f.options.FreshTaskWork = strong
+	t.Run("v30-opt-out", func(t *testing.T) {
+		if _, err := engine.ListPendingTaskDecisions(t.Context(), store.ListOptions{Limit: 1}); !errors.Is(err, store.ErrDecisionRequestsUnavailable) {
+			roleOK(t, err)
+			t.Skip("F's schemas are now in the public registry")
+		}
 		if runtime, err := platform.NewMemberToolRuntime(f.db, f.options); runtime != nil || !errors.Is(err, store.ErrDecisionRequestsUnavailable) {
 			t.Fatalf("v30 incorrectly enabled proposals: %v", err)
 		}
+		off := f.options
+		off.EnablePiTaskDecisionProposals = false
+		runtime, err := platform.NewMemberToolRuntime(f.db, off)
+		roleOK(t, err)
+		defer runtime.Close()
+		if runtime.Tools().TaskDecisionProposalsEnabled() || !runtime.Tools().FreshTaskWorkEnabled() {
+			t.Fatal("v30 did not retain ordinary fresh Task Work without proposals")
+		}
+		for _, route := range httpapi.MemberRoleToolRoutes(runtime.Tools()) {
+			if strings.HasSuffix(route.Pattern, "/"+decisionOp) {
+				t.Fatal("proposal mounted by default")
+			}
+		}
+	})
+	if _, err := engine.ListPendingDecisionRequests(t.Context(), store.ListOptions{Limit: 1}); errors.Is(err, store.ErrDecisionRequestsUnavailable) {
+		installTaskDecisionSchemaFixture(t, f, "decisionRequestSchema")
 	} else {
 		roleOK(t, err)
 	}
-	installTaskDecisionProposalFixture(t, f, engine)
-	strong := f.options.FreshTaskWork
-	f.options.FreshTaskWork = weak
-	if runtime, err := platform.NewMemberToolRuntime(f.db, f.options); runtime != nil || err == nil {
-		t.Fatal("unqualified builder enabled proposals even with F's schema")
-	}
-	f.options.FreshTaskWork = strong
-	f.options.EnablePiTaskDecisionProposals = false
-	runtime, err := platform.NewMemberToolRuntime(f.db, f.options)
-	roleOK(t, err)
-	t.Cleanup(func() { _ = runtime.Close() })
-	if runtime.Tools().TaskDecisionProposalsEnabled() || !runtime.Tools().FreshTaskWorkEnabled() {
-		t.Fatal("proposal support was not a separate opt-in")
-	}
-	for _, route := range httpapi.MemberRoleToolRoutes(runtime.Tools()) {
-		if strings.HasSuffix(route.Pattern, "/"+decisionOp) {
-			t.Fatal("proposal mounted by default")
+	t.Run("request-only", func(t *testing.T) {
+		_, err := engine.ListPendingDecisionRequests(t.Context(), store.ListOptions{Limit: 1})
+		roleOK(t, err) // The old startup check alone would enable the proposal.
+		if _, err := engine.ListPendingTaskDecisions(t.Context(), store.ListOptions{Limit: 1}); !errors.Is(err, store.ErrDecisionAnswersUnavailable) {
+			roleOK(t, err)
+			t.Skip("F's answer schema is now in the public registry")
 		}
-	}
+		if runtime, err := platform.NewMemberToolRuntime(f.db, f.options); runtime != nil || !errors.Is(err, store.ErrDecisionAnswersUnavailable) {
+			t.Fatalf("request-only startup did not fail closed: %v", err)
+		}
+	})
+	t.Run("request-and-answer", func(t *testing.T) {
+		installTaskDecisionProposalFixture(t, f, engine)
+		_, err := engine.ListPendingTaskDecisions(t.Context(), store.ListOptions{Limit: 1})
+		roleOK(t, err)
+		unqualified := f.options
+		unqualified.FreshTaskWork = weak
+		if runtime, err := platform.NewMemberToolRuntime(f.db, unqualified); runtime != nil || err == nil {
+			t.Fatal("unqualified builder enabled proposals even with F's schemas")
+		}
+		runtime, err := platform.NewMemberToolRuntime(f.db, f.options)
+		roleOK(t, err)
+		defer runtime.Close()
+		if !runtime.Tools().TaskDecisionProposalsEnabled() || !runtime.Tools().FreshTaskWorkEnabled() {
+			t.Fatal("exact opt-in did not enable proposals with the public pending/answer path installed")
+		}
+		for _, route := range httpapi.MemberRoleToolRoutes(runtime.Tools()) {
+			if strings.HasSuffix(route.Pattern, "/"+decisionOp) {
+				return
+			}
+		}
+		t.Fatal("proposal route not mounted")
+	})
 }
 
 func TestPiTaskDecisionProposalExactAcceptedContinuation(t *testing.T) {
-	for _, mode := range []string{"confirmed", "stale-replay", "unproven-commit"} {
+	for _, mode := range []string{"confirmed-two-turns", "stale-replay", "unproven-commit"} {
 		t.Run(mode, func(t *testing.T) { testPiTaskDecisionProposal(t, mode) })
 	}
 }
@@ -120,7 +196,8 @@ func testPiTaskDecisionProposal(t *testing.T, mode string) {
 	f.options.ChatIntake, f.options.EnablePiTaskDecisionProposals = engine, true
 	entry, err := filepath.Abs("../../extensions/pi-bridge/fresh-task-work.ts")
 	roleOK(t, err)
-	f.options.FreshTaskWork = platform.NewPiFreshTaskWorkLaunch(entry, 20*time.Second)
+	const runTimeout = 45 * time.Second
+	f.options.FreshTaskWork = platform.NewPiFreshTaskWorkLaunch(entry, runTimeout)
 	rt, err := platform.NewMemberToolRuntime(f.db, f.options)
 	roleOK(t, err)
 	t.Cleanup(func() { _ = rt.Close() })
@@ -129,8 +206,7 @@ func testPiTaskDecisionProposal(t *testing.T, mode string) {
 	srv, err := httpapi.NewServer(httpapi.DefaultAddress, routes...)
 	roleOK(t, err)
 	engine.EnableTaskWorkExecution()
-	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Second)
-	defer cancel()
+	ctx := t.Context()
 
 	root := t.TempDir()
 	cli, ordinary, workspaces := filepath.Join(root, "fake-pi"), filepath.Join(root, "index.ts"), filepath.Join(root, "workspaces")
@@ -197,22 +273,28 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 	roleOK(t, err)
 	settle(old)
 
-	intake, followup := capture("请继续 " + admit.TaskID + "。注明依据。")
-	wake, err := engine.AssessChatIntent(ctx, intake, followup.ID, domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork,
-		Reason: "续办", Followup: &domain.ChatFollowupAssessment{TaskID: admit.TaskID, Constraint: "注明依据"}}, "记录续办。", "continue")
-	roleOK(t, err)
-	settle(intake)
-	msg, err := f.db.GetMessage(ctx, f.group, wake.WorkWakeMessageID)
-	roleOK(t, err)
-	prepared, err := prep.Prepare(ctx, store.PendingDelivery{GroupID: f.group, SenderID: msg.SenderID, Delivery: msg.Deliveries[0]})
-	roleOK(t, err)
-	if !strings.Contains(prepared.Request.Prompt, decisionOp) {
-		t.Fatal("the exact enabled profile did not explain proposal semantics")
+	prepareFollowup := func(constraint, key string) (scheduler.PreparedExecution, store.MemberToolScope, string) {
+		t.Helper()
+		intake, followup := capture("请继续 " + admit.TaskID + "。" + constraint + "。")
+		wake, err := engine.AssessChatIntent(ctx, intake, followup.ID, domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork,
+			Reason: "续办", Followup: &domain.ChatFollowupAssessment{TaskID: admit.TaskID, Constraint: constraint}}, "记录续办。", key)
+		roleOK(t, err)
+		settle(intake)
+		msg, err := f.db.GetMessage(ctx, f.group, wake.WorkWakeMessageID)
+		roleOK(t, err)
+		prepared, err := prep.Prepare(ctx, store.PendingDelivery{GroupID: f.group, SenderID: msg.SenderID, Delivery: msg.Deliveries[0]})
+		roleOK(t, err)
+		if !strings.Contains(prepared.Request.Prompt, decisionOp) {
+			t.Fatal("the exact enabled profile did not explain proposal semantics")
+		}
+		live := claim(msg.Deliveries[0].ID, prepared.ResourceKeys)
+		prepared.Request.RuntimeDir, prepared.Request.RunID = f.root, live.Claim.TurnID
+		return prepared, live, wake.WorkInputID
 	}
-	live := claim(msg.Deliveries[0].ID, prepared.ResourceKeys)
-	req := prepared.Request
-	req.RuntimeDir, req.RunID = f.root, live.Claim.TurnID
-	otherMsg, err := f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: thread.TopicID, Content: "另一成员的普通消息", RecipientIDs: []string{f.lead.ID}}, "")
+	prepared, live, inputID := prepareFollowup("注明依据", "continue")
+	observer, err := f.local.CreateMember(ctx, f.group, platform.MemberInput{Name: "ordinary", Role: "untrusted", ProviderID: selected.ID, Model: f.worker.Model}, "")
+	roleOK(t, err)
+	otherMsg, err := f.local.CreateMessage(ctx, f.group, platform.MessageInput{TopicID: thread.TopicID, Content: "另一成员的普通消息", RecipientIDs: []string{observer.ID}}, "")
 	roleOK(t, err)
 	other := claim(otherMsg.Deliveries[0].ID, nil)
 	roleOK(t, f.db.RecordTurnEvent(ctx, other.Claim, provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: other.Claim.TurnID}))
@@ -223,68 +305,94 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 	roleOK(t, err)
 	defer tools.Revoke(generic)
 
-	checkpoints := make(chan provider.EventKind)
-	advance := make(chan struct{})
-	finished := make(chan struct{})
-	var receipt provider.ExecutionReceipt
-	go func() {
-		defer close(finished)
-		receipt = prepared.Executor.Execute(ctx, req, func(event provider.Event) error {
-			if err := f.db.RecordTurnEvent(ctx, live.Claim, event); err != nil {
-				return err
-			}
-			if event.Kind == provider.SessionEvent || event.Kind == provider.AcceptedEvent {
-				select {
-				case checkpoints <- event.Kind:
-				case <-ctx.Done():
-					return ctx.Err()
+	startNative := func(prepared scheduler.PreparedExecution, live store.MemberToolScope) (func(provider.EventKind), func(), func() provider.ExecutionReceipt) {
+		// Bound each native run separately from admission and fixture setup.
+		ctx, cancel := context.WithTimeout(ctx, runTimeout)
+		checkpoints := make(chan provider.EventKind)
+		advance := make(chan struct{})
+		finished := make(chan struct{})
+		var receipt provider.ExecutionReceipt
+		go func() {
+			defer close(finished)
+			receipt = prepared.Executor.Execute(ctx, prepared.Request, func(event provider.Event) error {
+				if err := f.db.RecordTurnEvent(ctx, live.Claim, event); err != nil {
+					return err
 				}
-				select {
-				case <-advance:
-				case <-ctx.Done():
-					return ctx.Err()
+				if event.Kind == provider.SessionEvent || event.Kind == provider.AcceptedEvent || event.Kind == provider.TerminalEvent {
+					select {
+					case checkpoints <- event.Kind:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+					select {
+					case <-advance:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
 				}
+				return nil
+			})
+		}()
+		t.Cleanup(func() { cancel(); <-finished })
+		wait := func(kind provider.EventKind) {
+			t.Helper()
+			select {
+			case got := <-checkpoints:
+				if got != kind {
+					t.Fatalf("event %s, want %s", got, kind)
+				}
+			case <-finished:
+				t.Fatalf("missing %s: %+v", kind, receipt)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
 			}
-			return nil
-		})
-	}()
-	defer func() { cancel(); <-finished }()
-	wait := func(kind provider.EventKind) {
-		t.Helper()
-		select {
-		case got := <-checkpoints:
-			if got != kind {
-				t.Fatalf("event %s, want %s", got, kind)
-			}
-		case <-finished:
-			t.Fatalf("missing %s: %+v", kind, receipt)
-		case <-ctx.Done():
-			t.Fatal(ctx.Err())
 		}
+		resume := func() {
+			t.Helper()
+			select {
+			case advance <- struct{}{}:
+			case <-finished:
+				t.Fatalf("native run finished at a paused checkpoint: %+v", receipt)
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+		}
+		return wait, resume, func() provider.ExecutionReceipt { <-finished; return receipt }
 	}
-	wait(provider.SessionEvent)
-	files, err := os.ReadDir(f.options.ConfigRoot)
-	roleOK(t, err)
-	if len(files) != 1 {
-		t.Fatal("missing exact native config")
-	}
-	data, err := os.ReadFile(filepath.Join(f.options.ConfigRoot, files[0].Name()))
-	roleOK(t, err)
-	var config struct {
+	type nativeConfig struct {
 		Token string `json:"token"`
 		Proof string `json:"task_decision_proof"`
+		RunID string `json:"run_id"`
 	}
-	roleOK(t, json.Unmarshal(data, &config))
-	if config.Token == "" || config.Token == live.Claim.Token || len(config.Proof) != 64 {
-		t.Fatal("missing distinct native proposal credential")
+	readConfig := func(live store.MemberToolScope) nativeConfig {
+		t.Helper()
+		files, err := os.ReadDir(f.options.ConfigRoot)
+		roleOK(t, err)
+		if len(files) != 1 {
+			t.Fatal("missing exact native config")
+		}
+		data, err := os.ReadFile(filepath.Join(f.options.ConfigRoot, files[0].Name()))
+		roleOK(t, err)
+		var config nativeConfig
+		roleOK(t, json.Unmarshal(data, &config))
+		if config.Token == "" || config.Token == live.Claim.Token || len(config.Proof) != 64 || config.RunID != live.Claim.TurnID {
+			t.Fatal("native proposal credential did not bind the actual Turn")
+		}
+		return config
 	}
-	call := func(bearer, proof, op, id, body string, code int) string {
+	wait, resume, finish := startNative(prepared, live)
+	wait(provider.SessionEvent)
+	config := readConfig(live)
+	proposalKey := func(runID, id string) string {
+		return fmt.Sprintf("%x", sha256.Sum256([]byte(decisionOp+"\x00"+runID+"\x00"+id)))
+	}
+	call := func(bearer, proof, op, id, key, body string, code int) string {
 		t.Helper()
 		r := httptest.NewRequest(http.MethodPost, "http://"+httpapi.DefaultAddress+"/api/v1/member-tools/"+op, strings.NewReader(body))
 		r.RemoteAddr = "127.0.0.1:12345"
 		r.Header.Set("Authorization", "Bearer "+bearer)
 		r.Header.Set("Content-Type", "application/json")
-		r.Header.Set("Idempotency-Key", fmt.Sprintf("%x", sha256.Sum256([]byte(op+id))))
+		r.Header.Set("Idempotency-Key", key)
 		if proof != "" {
 			r.Header.Set(decisionProofHeader, proof)
 			r.Header.Set(decisionCallHeader, id)
@@ -294,20 +402,35 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 		if w.Code != code || strings.Contains(w.Body.String(), config.Proof) || strings.Contains(w.Body.String(), config.Token) {
 			t.Fatalf("%s: got status %d, want %d, or response leaked config", op, w.Code, code)
 		}
+		wantReceiptKey := ""
+		if op == decisionOp && code == http.StatusCreated {
+			wantReceiptKey = key
+		}
+		if w.Header().Get("Idempotency-Key") != wantReceiptKey {
+			t.Fatalf("%s: receipt did not match verified write identity", op)
+		}
 		return w.Body.String()
 	}
 	propose := func(id, body string, code int) string {
 		t.Helper()
-		return call(config.Token, config.Proof, decisionOp, id, body, code)
+		return call(config.Token, config.Proof, decisionOp, id, proposalKey(config.RunID, id), body, code)
+	}
+	workInput := func(op, id, body string, code int) string {
+		t.Helper()
+		key := fmt.Sprintf("%x", sha256.Sum256([]byte(op+id)))
+		return call(config.Token, "", op, id, key, body, code)
 	}
 	const originalCall = "native|proposal"
+	firstKey := proposalKey(live.Claim.TurnID, originalCall)
 	propose(originalCall, decisionQuestion, 403) // Session id is not acceptance.
-	advance <- struct{}{}
+	resume()
 	wait(provider.AcceptedEvent)
-	call(generic, config.Proof, decisionOp, originalCall, decisionQuestion, 403)
-	call(config.Token, "", decisionOp, originalCall, decisionQuestion, 403)
-	call(config.Token, strings.Repeat("0", 64), decisionOp, originalCall, decisionQuestion, 403)
-	call(config.Token, "", "mcp", "other-wire", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, 403)
+	call(generic, config.Proof, decisionOp, originalCall, firstKey, decisionQuestion, 403)
+	call(config.Token, "", decisionOp, originalCall, firstKey, decisionQuestion, 403)
+	call(config.Token, strings.Repeat("0", 64), decisionOp, originalCall, firstKey, decisionQuestion, 403)
+	legacyKey := fmt.Sprintf("%x", sha256.Sum256([]byte(decisionOp+originalCall)))
+	call(config.Token, config.Proof, decisionOp, originalCall, legacyKey, decisionQuestion, 403)
+	workInput("mcp", "other-wire", `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, 403)
 	for _, invalid := range []string{
 		strings.Replace(decisionQuestion, `"expected_version":0`, `"expected_version":null`, 1),
 		strings.Replace(decisionQuestion, `"expected_version":0`, `"expected_version":9007199254740992`, 1),
@@ -329,6 +452,7 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 	}
 	before := counts()
 	var versions int
+	var firstProposal domain.DecisionRequest
 	if mode == "unproven-commit" {
 		_, err := f.raw.Exec(`CREATE TABLE proposal_fault (group_id TEXT REFERENCES groups(id) DEFERRABLE INITIALLY DEFERRED);
 			CREATE TRIGGER proposal_fixture_commit_fault AFTER INSERT ON decision_request_versions
@@ -351,7 +475,7 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 			ID string `json:"decision_request_id"`
 		}
 		roleOK(t, json.Unmarshal([]byte(first), &saved))
-		page, err := engine.ListPendingDecisionRequests(ctx, store.ListOptions{Limit: 2})
+		page, err := engine.ListPendingTaskDecisions(ctx, store.ListOptions{Limit: 2})
 		roleOK(t, err)
 		if len(page.Items) != 1 {
 			t.Fatal("proposal didn't coalesce to one pending question")
@@ -364,7 +488,7 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 			q.Facts != "只验证了工作日。 🧪" || q.Authorization == nil || q.Authorization.Impact != "增加一天" {
 			t.Fatal("question was not persisted with F's exact server-derived scope and payload")
 		}
-		versions = 2
+		firstProposal, versions = q, 2
 		if mode == "stale-replay" {
 			propose(originalCall, decisionQuestion, 500) // F gives no rollback proof on stale replay.
 		}
@@ -377,28 +501,30 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 	if stored != versions {
 		t.Fatalf("unexpected persisted proposal versions: %d, want %d", stored, versions)
 	}
-	input := fmt.Sprintf(`{"input_id":%q}`, wake.WorkInputID)
-	call(config.Token, "", "read_work_inputs", "read", input, 200)
-	if mode == "confirmed" {
-		call(config.Token, "", "ack_work_input", "ack", input, 200)
+	input := fmt.Sprintf(`{"input_id":%q}`, inputID)
+	workInput("read_work_inputs", "read", input, 200)
+	if mode == "confirmed-two-turns" {
+		workInput("ack_work_input", "ack", input, 200)
 		tools.Revoke(config.Token)
 		propose("revoked", decisionQuestion, 403)
 	} else {
 		propose(originalCall, decisionQuestion, 500)
 		propose("new-key", strings.Replace(decisionQuestion, "两天", "三天", 1), 500)
-		call(config.Token, "", "ack_work_input", "ack", input, 500)
-		call(config.Token, "", "hand_back_work_input", "return", strings.TrimSuffix(input, "}")+`,"reason":"return"}`, 500)
-		call(config.Token, "", "submit_result", "submit", `{"summary":"not allowed"}`, 500)
+		workInput("ack_work_input", "ack", input, 500)
+		workInput("hand_back_work_input", "return", strings.TrimSuffix(input, "}")+`,"reason":"return"}`, 500)
+		workInput("submit_result", "submit", `{"summary":"not allowed"}`, 500)
 		var handled int
-		roleOK(t, f.raw.QueryRow(`SELECT count(*) FROM task_work_input_consumptions WHERE input_id=?`, wake.WorkInputID).Scan(&handled))
+		roleOK(t, f.raw.QueryRow(`SELECT count(*) FROM task_work_input_consumptions WHERE input_id=?`, inputID).Scan(&handled))
 		if handled != 0 {
 			t.Fatal("unconfirmed proposal allowed a later WorkInput mutation")
 		}
 	}
-	advance <- struct{}{}
-	<-finished
+	resume()
+	wait(provider.TerminalEvent)
+	resume()
+	receipt := finish()
 	want := provider.OutcomeUnknown
-	if mode == "confirmed" {
+	if mode == "confirmed-two-turns" {
 		want = provider.OutcomeSucceeded
 	}
 	if receipt.Outcome != want || receipt.Terminal != provider.OutcomeSucceeded || !receipt.Accepted || !receipt.OutputComplete || receipt.NativeRef != nil {
@@ -412,4 +538,49 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 		t.Fatal("unknown proposal released work or published a reply")
 	}
 	propose("after-drain", decisionQuestion, 403)
+	if mode != "confirmed-two-turns" {
+		return
+	}
+
+	// Same group, owner, Task slot and native call ID; a new accepted Turn
+	// can amend the question, but cannot enter F using the previous key.
+	next, nextLive, _ := prepareFollowup("核对页码", "continue-again")
+	wait, resume, finish = startNative(next, nextLive)
+	wait(provider.SessionEvent)
+	config = readConfig(nextLive)
+	resume()
+	wait(provider.AcceptedEvent)
+	amend := strings.Replace(strings.Replace(decisionQuestion, `"expected_version":0`, `"expected_version":2`, 1), "两天", "三天", 1)
+	call(config.Token, config.Proof, decisionOp, originalCall, firstKey, amend, 403)
+	second := propose(originalCall, amend, 201)
+	if second != propose(originalCall, amend, 201) {
+		t.Fatal("second Turn's exact replay was not stable")
+	}
+	page, err := engine.ListPendingTaskDecisions(ctx, store.ListOptions{Limit: 2})
+	roleOK(t, err)
+	if len(page.Items) != 1 {
+		t.Fatal("amendment did not keep the same pending question")
+	}
+	q := page.Items[0]
+	if q.ID != firstProposal.ID || q.Version != 3 || q.Authorization == nil || q.Authorization.Impact != "增加三天" ||
+		q.AuthorMemberID != firstProposal.AuthorMemberID || q.AuthorTurnID != nextLive.Claim.TurnID || q.AuthorTurnID == firstProposal.AuthorTurnID ||
+		q.AuthorAttemptID == "" || q.AuthorAttemptID == firstProposal.AuthorAttemptID {
+		t.Fatal("reused call ID did not bind the amendment to the second Turn and Attempt")
+	}
+	roleOK(t, f.raw.QueryRow(`SELECT count(*) FROM mutation_idempotency
+	 WHERE operation='task_decision_request' AND group_id=? AND actor_id=? AND idempotency_key IN (?,?)`,
+		f.group, f.worker.ID, firstKey, proposalKey(nextLive.Claim.TurnID, originalCall)).Scan(&stored))
+	if stored != 2 {
+		t.Fatal("F did not persist both verified Run keys")
+	}
+	resume()
+	wait(provider.TerminalEvent)
+	propose("after-terminal", amend, 403) // The capability has not yet been drained.
+	resume()
+	receipt = finish()
+	if receipt.Outcome != provider.OutcomeSucceeded || receipt.Terminal != provider.OutcomeSucceeded || !receipt.Accepted {
+		t.Fatalf("the second native Turn did not settle: %+v", receipt)
+	}
+	_, err = f.db.ApplyTurnReceipt(ctx, nextLive.Claim, receipt)
+	roleOK(t, err)
 }

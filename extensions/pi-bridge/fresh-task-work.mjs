@@ -76,15 +76,16 @@ function readConfig(path, expectedSHA256) {
     if (size > limit || sha256(bytes) !== expectedSHA256) throw new Error();
     const config = JSON.parse(decode(bytes));
     if (!record(config)) throw new Error();
-    const proof = config.task_decision_proof;
+    const proof = config.task_decision_proof, runID = config.run_id;
     if ((proof === undefined ? !hasKeys(config, "endpoint,token") :
-        !hasKeys(config, "endpoint,task_decision_proof,token") || typeof proof !== "string" || !/^[a-f0-9]{64}$/.test(proof) || proof === config.token) ||
+        !hasKeys(config, "endpoint,run_id,task_decision_proof,token") || typeof proof !== "string" || !/^[a-f0-9]{64}$/.test(proof) || proof === config.token ||
+        typeof runID !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$/.test(runID)) ||
         typeof config.token !== "string" || config.token !== config.token.trim() || config.token.length > 256 || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token) ||
         typeof config.endpoint !== "string" || config.endpoint !== config.endpoint.trim() ||
         !/^http:\/\/(127\.0\.0\.1|\[::1\]):[0-9]{1,5}\/api\/v1\/member-tools$/.test(config.endpoint)) throw new Error();
     const endpoint = new URL(config.endpoint);
     if (endpoint.port === "0") throw new Error();
-    return { endpoint, token: config.token, proof: /** @type {string | undefined} */ (proof) };
+    return { endpoint, token: config.token, proof: /** @type {string | undefined} */ (proof), decisionRunID: /** @type {string | undefined} */ (runID) };
   } catch {
     throw new Error(CONFIG_ERROR);
   } finally {
@@ -147,7 +148,7 @@ function validReply(name, value, sent, wire) {
     Buffer.byteLength(value.text) === count && typeof value.complete === "boolean" && (value.complete || count > 0);
 }
 
-/** @param {URL} endpoint @param {string} name @param {Buffer} body @param {Record<string, string | number>} headers @param {AbortSignal | undefined} signal @returns {Promise<{ status: number, text: string }>} */
+/** @param {URL} endpoint @param {string} name @param {Buffer} body @param {Record<string, string | number>} headers @param {AbortSignal | undefined} signal @returns {Promise<{ status: number, text: string, receiptKey: string | string[] | undefined }>} */
 function exchange(endpoint, name, body, headers, signal) {
   // No pooled socket, proxy, redirects, retry, or unbounded buffers.
   return new Promise((resolve, reject) => {
@@ -181,7 +182,7 @@ function exchange(endpoint, name, body, headers, signal) {
             if (!response.complete) return stop();
             const text = decode(Buffer.concat(chunks, size));
             cleanup();
-            resolve({ status, text });
+            resolve({ status, text, receiptKey: response.headers["idempotency-key"] });
           } catch { stop(); }
         });
       });
@@ -195,7 +196,7 @@ function exchange(endpoint, name, body, headers, signal) {
 
 /** @param {string | undefined} path @param {string | undefined} digest */
 export function createFreshTaskWorkClient(path, digest) {
-  const { endpoint, token, proof } = readConfig(path, digest);
+  const { endpoint, token, proof, decisionRunID } = readConfig(path, digest);
   /** @type {{key: string, fingerprint: string, error: Error} | undefined} */
   let uncertain;
   let writing = false;
@@ -204,11 +205,12 @@ export function createFreshTaskWorkClient(path, digest) {
   /** @param {string} message */
   const safe = message => new Error(proof === undefined ? message.replaceAll(token, "〔已隐藏〕") :
     message.replaceAll(proof, "〔已隐藏〕").replaceAll(token, "〔已隐藏〕"));
-  /** @param {string} name @param {Record<string, unknown>} params @param {string} id @param {AbortSignal} [signal] */
-  const invoke = async (name, params, id, signal) => {
+  /** @param {string} name @param {Record<string, unknown>} params @param {string} id @param {AbortSignal} [signal] @param {string} [runID] */
+  const invoke = async (name, params, id, signal, runID) => {
     const expected = statuses.get(name);
     const write = name !== "read_work_inputs";
-    if (!expected || name === decisionOperation && proof === undefined || typeof id !== "string" || !id.trim() || !unicode(id) ||
+    const decision = name === decisionOperation;
+    if (!expected || decision && (proof === undefined || runID !== decisionRunID) || typeof id !== "string" || !id.trim() || !unicode(id) ||
         (write && (!validTypedWriteCallID(id, token) || hasSecret(id)))) {
       throw safe("成员工具调用无效，未发送请求。");
     }
@@ -216,7 +218,8 @@ export function createFreshTaskWorkClient(path, digest) {
     const json = JSON.stringify(params);
     const body = Buffer.from(json, "utf8");
     if (body.length > BYTE_LIMIT || hasSecret(json)) throw safe("成员工具参数无效，未发送请求。");
-    const key = write ? sha256(name + id) : "";
+    // Only the proposal uses the issued and SDK-verified Run identity.
+    const key = decision ? sha256(`${name}\0${runID}\0${id}`) : write ? sha256(name + id) : "";
     const fingerprint = write ? sha256(body) : "";
     if (write && uncertain) {
       if (uncertain.key === key && uncertain.fingerprint === fingerprint) throw uncertain.error;
@@ -227,20 +230,20 @@ export function createFreshTaskWorkClient(path, digest) {
     /** @type {Record<string, string | number>} */
     const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Content-Length": body.length };
     if (write) headers["Idempotency-Key"] = key;
-    if (name === decisionOperation && proof !== undefined) {
+    if (decision && proof !== undefined) {
       headers["X-Agent-Workspace-Tool-Call-Id"] = id;
       headers["X-Agent-Workspace-Task-Decision-Proof"] = proof;
     }
     if (write) writing = true;
     let failure = UNKNOWN;
     try {
-      const { status, text } = await exchange(endpoint, name, body, headers, signal);
+      const { status, text, receiptKey } = await exchange(endpoint, name, body, headers, signal);
       const result = JSON.parse(text, (key, value) => {
         if (["__proto__", "constructor", "prototype"].includes(key)) throw new Error();
         return value;
       });
       if (hasSecret(text) || hasSecret(JSON.stringify(result))) throw new Error();
-      if (status === expected && validReply(name, result, params, text)) return { text: JSON.stringify(result) };
+      if (status === expected && (!decision || receiptKey === key) && validReply(name, result, params, text)) return { text: JSON.stringify(result) };
       const envelope = /^\s*\{\s*"error"\s*:\s*(\{[\s\S]*\})\s*\}\s*$/.exec(text);
       if (envelope && record(result.error) && typeof result.error.code === "string" && typeof result.error.message === "string" &&
           fixedReceipt(envelope[1], 2) && (definiteRejections.get(status)?.includes(result.error.code) ||

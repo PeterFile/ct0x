@@ -159,7 +159,7 @@ func (a PiFreshInvestigationAdapter) qualifiedBridge() string {
 	// Investigation imports only the unchanged validation and marker helpers,
 	// not the fresh-text client or its opt-in proposal codec.
 	if err != nil || filepath.Base(entry) != "fresh-investigation-work.ts" || !piBridgeBytesMatch(entry, piFreshInvestigationEntrySHA) ||
-		!piBridgeBytesMatch(filepath.Join(filepath.Dir(entry), "fresh-task-work.mjs"), piFreshTaskWorkImplSHA, piTaskDecisionImplSHA) {
+		!piBridgeBytesMatch(filepath.Join(filepath.Dir(entry), "fresh-task-work.mjs"), piFreshTaskWorkImplSHA, piUnscopedTaskDecisionImplSHA, piTaskDecisionImplSHA) {
 		return ""
 	}
 	return entry

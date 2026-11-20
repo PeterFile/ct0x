@@ -169,8 +169,14 @@ func (p *piTypedWorkOutput) observeMarker(details map[string]any, runID, name, i
 		!piTypedWriteRequestSHA.MatchString(e.RequestSHA256) {
 		return false
 	}
-	key := sha256.Sum256([]byte(e.Operation + e.ToolCallID))
-	if hex.EncodeToString(key[:]) != e.IdempotencyKey {
+	var key string
+	if name == ProposeTaskDecisionTool {
+		key = PiTaskDecisionWriteKey(runID, id)
+	} else {
+		digest := sha256.Sum256([]byte(name + id))
+		key = hex.EncodeToString(digest[:])
+	}
+	if key != e.IdempotencyKey {
 		return false
 	}
 	p.unknown = &e
