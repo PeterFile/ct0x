@@ -60,16 +60,22 @@ printf '%s' "$2" > "$root/ready"
 while [ ! -f "$root/accept" ]; do sleep 0.01; done
 printf '%s\n' '{"type":"agent_start"}'
 while [ ! -f "$root/settle" ]; do sleep 0.01; done
-if [ -f "$root/ack.json" ]; then cat "$root/ack.json"; printf '\n'; fi
+for frame in ack start unknown; do
+  if [ -f "$root/$frame.json" ]; then cat "$root/$frame.json"; printf '\n'; fi
+done
 printf '%s\n' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"正常原生最终回复"}]}}'
-printf '%s\n' '{"type":"agent_settled","aborted":false}'
+if [ -f "$root/abort" ]; then
+  printf '%s\n' '{"type":"agent_settled","aborted":true}'
+else
+  printf '%s\n' '{"type":"agent_settled","aborted":false}'
+fi
 while [ ! -f "$root/exit" ]; do sleep 0.01; done
 `
 
 func TestRunExplanationNativeHTTP(t *testing.T) {
 	const op = provider.PublishRunExplanationTool
 	const id = "original-native-call"
-	for _, mode := range []string{"confirmed", "receipt-lost", "commit-unconfirmed", "v30"} {
+	for _, mode := range []string{"confirmed", "receipt-lost", "commit-unconfirmed", "v30", "pre-attempt-loss", "pre-attempt-aborted", "replay-response-lost"} {
 		t.Run(mode, func(t *testing.T) {
 			f, dir := newExecutionFixture(t, "1.4.0"), t.TempDir()
 			t.Setenv("RUN_EXPLANATION_FIXTURE", f.root)
@@ -167,8 +173,32 @@ func TestRunExplanationNativeHTTP(t *testing.T) {
 				return c
 			}
 			before := counts()
+			claims := func() int {
+				t.Helper()
+				var n int
+				must(db.QueryRow("SELECT count(*) FROM resource_claims WHERE turn_id=?", runID).Scan(&n))
+				return n
+			}
+			beforeClaims := claims()
+			if beforeClaims == 0 {
+				t.Fatal("fixture must hold an execution resource")
+			}
+			attemptPath := filepath.Join(dir, "runtime", runID, "run-explanation-attempt.json")
+			preAttempt := mode == "pre-attempt-loss" || mode == "pre-attempt-aborted"
+			markedUnknown := preAttempt || mode == "replay-response-lost"
+			observedTerminal := domain.TurnStateSucceeded
+			if mode == "pre-attempt-aborted" {
+				observedTerminal = domain.TurnStateAborted
+				touch("abort")
+			}
 			var wantPublication bool
 			switch mode {
+			case "pre-attempt-loss", "pre-attempt-aborted":
+				// The SDK disconnect fixture drops the sent request before the
+				// application handles it. Here there must be no server attempt.
+				if _, err := os.Stat(attemptPath); !os.IsNotExist(err) {
+					t.Fatal("pre-attempt loss fixture already has a server journal")
+				}
 			case "v30":
 				call(input, key, 403, "forbidden")
 				memberToolsHTTP(t, config["endpoint"], config["token"], "read_channel", map[string]any{}, "", 200, "")
@@ -187,17 +217,33 @@ func TestRunExplanationNativeHTTP(t *testing.T) {
 				if !bytes.Contains(out, []byte("public_explanation:"+runID)) || bytes.Contains(out, []byte(key)) || bytes.Contains(out, []byte("🙂")) {
 					t.Fatal("write acknowledgement is not the bounded, text-free projection")
 				}
-				if mode == "confirmed" {
+				if mode == "confirmed" || mode == "replay-response-lost" {
+					// In the lost replay the server still returned the exact 201,
+					// but the native stream acknowledges only the original call.
 					if !bytes.Equal(out, call(input, key, 201, "")) {
 						t.Fatal("exact live replay changed the immutable acknowledgement")
 					}
-					call(map[string]string{"text": "changed"}, key, 409, "conflict")
-					call(input, strings.Repeat("c", 64), 409, "conflict")
+					if mode == "confirmed" {
+						call(map[string]string{"text": "changed"}, key, 409, "conflict")
+						call(input, strings.Repeat("c", 64), 409, "conflict")
+					}
 					memberToolsWriteJSON(t, filepath.Join(f.root, "ack.json"), map[string]any{
 						"type": "tool_execution_end", "toolName": op, "toolCallId": id, "isError": false,
 						"result": map[string]any{"details": map[string]string{"agent_workspace_run_explanation_ack_v1": key}},
 					})
 				}
+			}
+			if markedUnknown {
+				memberToolsWriteJSON(t, filepath.Join(f.root, "start.json"), map[string]any{
+					"type": "tool_execution_start", "toolName": op, "toolCallId": id, "args": input,
+				})
+				memberToolsWriteJSON(t, filepath.Join(f.root, "unknown.json"), map[string]any{
+					"type": "tool_execution_end", "toolName": op, "toolCallId": id, "isError": true,
+					"result": map[string]any{"isError": true, "content": []map[string]string{{"type": "text", "text": "运行说明保存结果未知"}},
+						"details": map[string]any{"agent_workspace_run_explanation_unknown_v1": map[string]string{
+							"idempotency_key": key, "text_sha256": fmt.Sprintf("%x", sha256.Sum256([]byte(text))),
+						}}},
+				})
 			}
 			if counts() != before {
 				t.Fatal("publication broadcast a normal message or created a delivery")
@@ -227,7 +273,7 @@ func TestRunExplanationNativeHTTP(t *testing.T) {
 			touch("settle")
 			awaitExecution(t, func() bool {
 				var terminal string
-				return db.QueryRow("SELECT candidate_terminal FROM turns WHERE id=?", runID).Scan(&terminal) == nil && terminal == "succeeded"
+				return db.QueryRow("SELECT candidate_terminal FROM turns WHERE id=?", runID).Scan(&terminal) == nil && terminal == string(observedTerminal)
 			})
 			if mode == "confirmed" {
 				// The token is still registered but the claim has observed a terminal.
@@ -235,23 +281,29 @@ func TestRunExplanationNativeHTTP(t *testing.T) {
 			}
 			touch("exit")
 			want := domain.TurnStateSucceeded
-			uncertain := mode == "receipt-lost" || mode == "commit-unconfirmed"
+			uncertain := markedUnknown || mode == "receipt-lost" || mode == "commit-unconfirmed"
 			if uncertain {
 				want = domain.TurnStateUnknown
 			}
 			awaitExecution(t, func() bool {
-				var state string
-				return db.QueryRow("SELECT state FROM turns WHERE id=?", runID).Scan(&state) == nil && state == string(want)
+				var receipt string
+				return db.QueryRow("SELECT receipt_json FROM turns WHERE id=?", runID).Scan(&receipt) == nil && receipt != ""
 			})
 			call(input, key, 403, "forbidden") // Same credential is stale after drain.
 			view = get()
 			var replyID string
 			must(db.QueryRow("SELECT reply_message_id FROM turns WHERE id=?", runID).Scan(&replyID))
-			if view.Receipt == nil || view.Receipt.Outcome != want || view.Receipt.ObservedTerminal != domain.TurnStateSucceeded ||
-				(replyID == "") != uncertain {
-				t.Fatal("native final success substituted for the tool/receipt outcome")
+			if view.Receipt == nil || view.Receipt.Outcome != want || view.Receipt.ObservedTerminal != observedTerminal ||
+				!view.Receipt.OutputComplete || !view.Receipt.DirectChildReaped || !view.Receipt.Accepted || (replyID == "") != uncertain {
+				t.Fatalf("native terminal substituted for the tool/receipt outcome: %+v", view.Receipt)
 			}
-			attemptPath := filepath.Join(dir, "runtime", runID, "run-explanation-attempt.json")
+			wantClaims := 0
+			if uncertain {
+				wantClaims = beforeClaims
+			}
+			if got := claims(); got != wantClaims {
+				t.Fatalf("execution resources after settlement: got %d, want %d", got, wantClaims)
+			}
 			if uncertain {
 				var original map[string]string
 				memberToolsReadJSON(t, attemptPath, &original)

@@ -2,7 +2,6 @@ package provider
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -13,9 +12,11 @@ import (
 const PublishRunExplanationTool = "publish_run_explanation"
 
 const (
-	piRunExplanationEntrySHA = "5e22fde2267ac407312f7d67ca5cc713615961187fd9731a5d9dfbbc0710d6ac"
-	piRunExplanationImplSHA  = "821a7ce8184c46864e51e1da23426ee1ae32e25726074f49001db1fc48cc43ea"
+	piRunExplanationEntrySHA = "dc5c17fe9f5d783d1be2becb1c47e38b01443d2f85e23e8243ddb3100853902b"
+	piRunExplanationImplSHA  = "85bfc85b5ebda50b7bcddb64966f1f730838c5437c4e2d9caef4251f0fe274d5"
 	piRunExplanationAck      = "agent_workspace_run_explanation_ack_v1"
+	piRunExplanationUnknown  = "agent_workspace_run_explanation_unknown_v1"
+	piRunExplanationMaxBytes = 1024
 )
 
 var piRunExplanationCallID = regexp.MustCompile(`^[!-~]{1,256}$`)
@@ -55,28 +56,97 @@ func piRunExplanationConfigMatches(path string, digest [sha256.Size]byte, runID 
 	return err == nil && config.runExplanation == runID && config.digest == digest
 }
 
-// Inspect only the exact tool-end acknowledgement inserted into result.details
-// by the pinned bridge. Text from the model (including tool args) is not proof.
-func piRunExplanationAckKey(line []byte, runID string) string {
+// RunExplanationUncertainty is private evidence from the pinned explanation
+// bridge, not a publication acknowledgement. The optional text is never part
+// of the marker or a serialized execution receipt.
+type RunExplanationUncertainty struct {
+	IdempotencyKey string `json:"idempotency_key"`
+	TextSHA256     string `json:"text_sha256"`
+	text           string
+}
+
+// ReconciliationText returns exact text only if a native start matched the
+// key and hash of the sent request. An absent start cannot disprove a write.
+func (e *RunExplanationUncertainty) ReconciliationText() string { return e.text }
+
+type piRunExplanationOutput struct {
+	// A bounded set of recent candidates, not a uniqueness constraint on
+	// native IDs. Parallel starts can share an ID and exact replay reuses it.
+	starts        [executionFramesCountLimit]struct{ id, text string }
+	next          int
+	ackConflicted bool
+}
+
+func (p *piRunExplanationOutput) observeStart(line []byte) {
 	value, err := nativeSessionJSON(line, 12, false)
 	event, _ := value.(map[string]any)
-	if err != nil || event["type"] != "tool_execution_end" || event["toolName"] != PublishRunExplanationTool || event["isError"] != false ||
-		piSessionHasFieldAlias(event, "type", "toolName", "toolCallId", "result", "isError") {
-		return ""
+	if err != nil || event["type"] != "tool_execution_start" || event["toolName"] != PublishRunExplanationTool ||
+		piSessionHasFieldAlias(event, "type", "toolName", "toolCallId", "args") {
+		return
 	}
 	id := piSessionString(event, "toolCallId")
+	args, _ := event["args"].(map[string]any)
+	text := piSessionString(args, "text")
+	if piRunExplanationCallID.MatchString(id) && len(args) == 1 && len(text) <= piRunExplanationMaxBytes &&
+		strings.TrimSpace(text) != "" && !strings.ContainsRune(text, 0) {
+		p.starts[p.next].id, p.starts[p.next].text = id, text
+		p.next = (p.next + 1) % len(p.starts)
+	}
+}
+
+func (p *piRunExplanationOutput) observeEnd(line []byte, runID string, r *ExecutionReceipt, allowAck bool) bool {
+	if r.RunExplanationUnknown != nil {
+		return true // No later frame can clear the first uncertainty.
+	}
+	id, key, unknown := parsePiRunExplanationEnd(line, runID)
+	if unknown != nil {
+		for _, start := range p.starts {
+			if start.id == id && piSessionBytesDigest([]byte(start.text)) == unknown.TextSHA256 {
+				unknown.text = start.text
+				break
+			}
+		}
+		clear(p.starts[:])
+		r.RunExplanationUnknown, r.RunExplanationAckKey = unknown, ""
+	} else if key != "" && allowAck && !p.ackConflicted {
+		if r.RunExplanationAckKey != "" && r.RunExplanationAckKey != key {
+			// Conflicting ACKs cannot validate the attempt, but must not disable
+			// observation of a subsequent unknown result.
+			r.RunExplanationAckKey, p.ackConflicted = "", true
+			return false
+		}
+		r.RunExplanationAckKey = key
+	}
+	return true
+}
+
+// Inspect only the exact native tool end. The pinned bridge owns its
+// result.details; args, tool/assistant text and other tools are not evidence.
+func parsePiRunExplanationEnd(line []byte, runID string) (id, ackKey string, unknown *RunExplanationUncertainty) {
+	value, err := nativeSessionJSON(line, 12, false)
+	event, _ := value.(map[string]any)
+	if err != nil || event["type"] != "tool_execution_end" || event["toolName"] != PublishRunExplanationTool ||
+		piSessionHasFieldAlias(event, "type", "toolName", "toolCallId", "result", "isError") {
+		return "", "", nil
+	}
+	id = piSessionString(event, "toolCallId")
 	result, _ := event["result"].(map[string]any)
 	details, _ := result["details"].(map[string]any)
 	if !piRunExplanationCallID.MatchString(id) || len(details) != 1 || piSessionHasFieldAlias(result, "details", "isError") {
-		return ""
+		return "", "", nil
 	}
-	if flag, present := result["isError"]; present && flag != false {
-		return ""
+	key := piSessionBytesDigest([]byte(PublishRunExplanationTool + "\x00" + runID + "\x00" + id))
+	flag, present := result["isError"]
+	if event["isError"] == false && (!present || flag == false) && details[piRunExplanationAck] == key {
+		return id, key, nil
 	}
-	key := sha256.Sum256([]byte(PublishRunExplanationTool + "\x00" + runID + "\x00" + id))
-	encoded := hex.EncodeToString(key[:])
-	if details[piRunExplanationAck] == encoded {
-		return encoded
+	if event["isError"] == true && flag == true {
+		fields, _ := details[piRunExplanationUnknown].(map[string]any)
+		textSHA256 := piSessionString(fields, "text_sha256")
+		if _, hasContent := result["content"].([]any); hasContent && len(fields) == 2 &&
+			fields["idempotency_key"] == key && nativeSessionSHA256(textSHA256) {
+			return id, "", &RunExplanationUncertainty{IdempotencyKey: key, TextSHA256: textSHA256}
+		}
 	}
-	return ""
+	return "", "", nil
 }

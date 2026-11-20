@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { INVESTIGATION_ARTIFACT, INVESTIGATION_ASSESSMENT_ACTION, INVESTIGATION_CHANNEL, PUBLISH_RUN_EXPLANATION,
-  RUN_EXPLANATION_ACK, RUN_EXPLANATION_BYTES, openBridge, validUnicode } from "./bridge.mjs";
+  RUN_EXPLANATION_ACK, RUN_EXPLANATION_BYTES, RUN_EXPLANATION_UNKNOWN, RunExplanationUnknownError, openBridge, validUnicode } from "./bridge.mjs";
 
 const discussionOnlyExcerptBytes = 4096;
 const investigationSummaryBytes = 8192;
@@ -244,8 +244,13 @@ export default function piBridge(pi: ExtensionAPI) {
       description: "可选：为本轮发布一条不可修改、只在运行记录中显示的公开说明，不发聊天消息或唤醒成员；不是执行凭证。结果未知时保留原调用标识和原文，先对账，不重试。",
       parameters, prepareArguments: checked,
       async execute(toolCallId, args, signal, _onUpdate, _ctx) {
-        const result = await invoke(PUBLISH_RUN_EXPLANATION, checked(args), toolCallId, signal);
-        return { content: [{ type: "text", text: result.text }], details: { [RUN_EXPLANATION_ACK]: result.explanationKey } };
+        try {
+          const result = await invoke(PUBLISH_RUN_EXPLANATION, checked(args), toolCallId, signal);
+          return { content: [{ type: "text", text: result.text }], details: { [RUN_EXPLANATION_ACK]: result.explanationKey } };
+        } catch (error) {
+          if (!(error instanceof RunExplanationUnknownError)) throw error;
+          return { content: [{ type: "text", text: error.message }], isError: true, details: { [RUN_EXPLANATION_UNKNOWN]: error.evidence } };
+        }
       },
     });
   }

@@ -85,9 +85,10 @@ type ExecutionReceipt struct {
 	Reason            string  `json:"reason"`
 
 	NativeRef *NativeSessionReference `json:"-"`
-	// Acknowledgement from the exact fresh Pi bridge. Only the live runtime
-	// can match it to a confirmed Store result; it is never a public receipt.
-	RunExplanationAckKey string `json:"-"`
+	// Write evidence from the exact fresh Pi bridge. Only the live runtime
+	// can match an ACK to the Store or preserve an unresolved attempt.
+	RunExplanationAckKey  string                     `json:"-"`
+	RunExplanationUnknown *RunExplanationUncertainty `json:"-"`
 	// NativePreflightFailure is set only by the trusted native launch wrapper
 	// before invocation. Apply may preserve a prior receipt instead of treating
 	// this result as new execution or reconciliation evidence.
@@ -207,8 +208,10 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 	if e.memberTools != nil {
 		frameLimit, toolFlag = piMemberToolFrameLimit, "--no-builtin-tools"
 	}
-	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex, frameLimit: frameLimit,
-		piRunExplanation: e.memberTools != nil && e.memberTools.runExplanation != ""}
+	out := &executionOutput{log: outLog, receipt: &r, delivery: delivery, runID: request.RunID, codex: codex, frameLimit: frameLimit}
+	if e.memberTools != nil && e.memberTools.runExplanation != "" {
+		out.piRunExplanation = &piRunExplanationOutput{}
+	}
 	if opts := e.memberTools; opts != nil && opts.typedWorkRole != "" {
 		out.piTypedWork = &piTypedWorkOutput{role: opts.typedWorkRole, tools: opts.toolNames}
 		outLog.tailReserve = piTypedWriteLogReserve
@@ -309,10 +312,13 @@ func (e executionCommand) execute(ctx context.Context, request ExecuteRequest, o
 		r.Reason = "调查启动证明无法确认，需对账后再处理"
 	}
 	canSettle := r.OutputComplete && ctx.Err() == nil && !r.DeliveryFailed && r.Terminal != "" &&
-		(out.piTypedWork == nil || !writeUnknown && !outLog.truncated) &&
+		(out.piTypedWork == nil || !writeUnknown && !outLog.truncated) && r.RunExplanationUnknown == nil &&
 		(session == nil || r.Accepted && r.DirectChildReaped && !session.tracker.hasUncertainExecution())
 	if writeUnknown {
 		r.Reason = "成员工具写入结果未知，需对账后再处理"
+	}
+	if r.RunExplanationUnknown != nil {
+		r.Reason = "运行说明保存结果未知，需对账后再处理"
 	}
 	if canSettle && session != nil {
 		// Only success has a supported persistence proof. Withhold publication

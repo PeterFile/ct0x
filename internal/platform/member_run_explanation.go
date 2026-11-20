@@ -59,9 +59,7 @@ func (s *MemberTools) PublishRunExplanation(ctx context.Context, token, text, ke
 	if bound.unknown {
 		return zero, store.ErrAgentRunExplanationUnknown
 	}
-	if !utf8.ValidString(text) || len(text) > store.AgentRunExplanationMaxBytes || strings.TrimSpace(text) == "" ||
-		strings.ContainsRune(text, 0) || strings.Contains(text, token) || strings.Contains(text, entry.scope.Claim.Token) ||
-		!runExplanationKey.MatchString(key) {
+	if !validRunExplanationAttempt(text, key, token, entry.scope.Claim.Token) {
 		return zero, store.ErrInvalid
 	}
 	scope, claim := entry.scope, entry.scope.Claim
@@ -104,6 +102,12 @@ func (s *MemberTools) PublishRunExplanation(ctx context.Context, token, text, ke
 	return zero, err
 }
 
+func validRunExplanationAttempt(text, key, token, claimToken string) bool {
+	return utf8.ValidString(text) && len(text) <= store.AgentRunExplanationMaxBytes && strings.TrimSpace(text) != "" &&
+		!strings.ContainsRune(text, 0) && !strings.Contains(text, token) && !strings.Contains(text, claimToken) &&
+		runExplanationKey.MatchString(key)
+}
+
 func runExplanationRejected(err error) bool {
 	return errors.Is(err, store.ErrInvalid) || errors.Is(err, store.ErrMemberToolDenied) ||
 		errors.Is(err, store.ErrConflict) || errors.Is(err, store.ErrAgentRunExplanationUnavailable)
@@ -131,15 +135,26 @@ func (a runExplanationAttempt) reserve(path string) error {
 
 // Called after process/stream join and uncancelled capability revocation. Even
 // a valid native terminal cannot confirm an unconfirmed Store/HTTP result.
-func (b *memberRunExplanation) receipt(raw provider.ExecutionReceipt) provider.ExecutionReceipt {
-	if b.attempt != nil {
-		if b.unknown || raw.RunExplanationAckKey != b.attempt.Key {
-			raw.Outcome = provider.OutcomeUnknown
-			raw.Reason = store.ErrAgentRunExplanationUnknown.Error()
-		} else {
-			_ = os.Remove(b.path)
+func (b *memberRunExplanation) receipt(raw provider.ExecutionReceipt, token, claimToken string) provider.ExecutionReceipt {
+	unknown := raw.RunExplanationUnknown
+	if unknown != nil && b.attempt == nil {
+		// The request may have been lost before the server could reserve it.
+		// Keep exact, hash-matched native bytes privately for reconciliation,
+		// without granting retry authority. Missing bytes or a journal error
+		// cannot make the outcome known.
+		text, key := unknown.ReconciliationText(), unknown.IdempotencyKey
+		if validRunExplanationAttempt(text, key, token, claimToken) {
+			_ = (runExplanationAttempt{Key: key, Text: text}).reserve(b.path)
 		}
 	}
-	raw.RunExplanationAckKey = ""
+	if unknown != nil || b.unknown || b.attempt != nil && raw.RunExplanationAckKey != b.attempt.Key {
+		raw.Outcome = provider.OutcomeUnknown
+		raw.Reason = store.ErrAgentRunExplanationUnknown.Error()
+	} else if b.attempt != nil && raw.Outcome != provider.OutcomeUnknown {
+		// A prior ACK cannot justify cleanup on a damaged/interrupted stream
+		// that could have lost the end of a later exact replay.
+		_ = os.Remove(b.path)
+	}
+	raw.RunExplanationAckKey, raw.RunExplanationUnknown = "", nil
 	return raw
 }

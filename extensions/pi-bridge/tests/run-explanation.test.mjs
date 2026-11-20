@@ -73,6 +73,44 @@ test("public explanation registers in the real Pi loader only from an exact issu
   assert.throws(() => openBridge(fx.path, fx.digest), error => safeFailure(error, /配置/));
 });
 
+for (const mode of ["pre-attempt loss", "same-call replay loss", "abort after sending"]) {
+  test(`public explanation ${mode} produces only the original typed unknown result`, async t => {
+    const abort = new AbortController();
+    let calls = 0;
+    const server = await loopback(t, (_, response) => {
+      if (++calls === 1 && mode === "same-call replay loss") return json(response, ack, 201);
+      if (mode === "abort after sending") abort.abort(new Error(TOKEN));
+      response.destroy(); // No trustworthy receipt reaches Pi.
+    });
+    const { path, digest } = await issued(t, server.endpoint);
+    const loaded = await load(path, digest);
+    assert.deepEqual(loaded.errors, []);
+    const tools = loaded.extensions[0].tools;
+    const tool = tools.get(op).definition;
+    await assert.rejects(tool.execute(id, payload, AbortSignal.abort()), error => safeFailure(error, /未发送/));
+    if (mode === "same-call replay loss") {
+      assert.deepEqual((await tool.execute(id, payload)).details, { [RUN_EXPLANATION_ACK]: expectedKey });
+    }
+    const result = await tool.execute(id, payload, abort.signal);
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /结果未知.*不要自动重试/);
+    assert.deepEqual(result.details, { agent_workspace_run_explanation_unknown_v1: {
+      idempotency_key: expectedKey, text_sha256: sha(payload.text),
+    } });
+    assert.ok(!JSON.stringify(result).includes(TOKEN) && !JSON.stringify(result).includes("🙂"));
+    assert.deepEqual(await tool.execute(id, payload, AbortSignal.abort()), result);
+    await assert.rejects(tool.execute(id, { text: payload.text.trim() }), /阻止后续写入/);
+    await assert.rejects(tool.execute("new-id", payload), /阻止后续写入/);
+    await assert.rejects(tools.get("send_message").definition.execute("later", { content: "later" }), /阻止后续写入/);
+    assert.equal(server.requests.length, mode === "same-call replay loss" ? 2 : 1);
+    for (const sent of server.requests) {
+      assert.equal(sent.url, `${BASE}/${op}`);
+      assert.equal(sent.headers["idempotency-key"], expectedKey);
+      assert.equal(sent.body.toString(), JSON.stringify(payload));
+    }
+  });
+}
+
 for (const mode of ["unconfirmed storage", "abort after send", "unmatched acknowledgement"]) {
   test(`public explanation ${mode} retains the first call and latches writes`, async t => {
     const abort = new AbortController();

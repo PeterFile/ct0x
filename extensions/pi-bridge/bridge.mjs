@@ -8,7 +8,19 @@ export const INVESTIGATION_CHANNEL = "read_investigation_channel";
 export const INVESTIGATION_ARTIFACT = "read_investigation_artifact";
 export const PUBLISH_RUN_EXPLANATION = "publish_run_explanation";
 export const RUN_EXPLANATION_ACK = "agent_workspace_run_explanation_ack_v1";
+export const RUN_EXPLANATION_UNKNOWN = "agent_workspace_run_explanation_unknown_v1";
 export const RUN_EXPLANATION_BYTES = 1024;
+
+// Only a sent explanation write with no definitive result gets this evidence.
+// The cached error survives an exact local replay; neither it nor its details
+// contains the request body, token, or an untrusted response.
+export class RunExplanationUnknownError extends Error {
+  /** @param {string} message @param {string} key @param {string} textSHA256 */
+  constructor(message, key, textSHA256) {
+    super(message);
+    this.evidence = Object.freeze({ idempotency_key: key, text_sha256: textSHA256 });
+  }
+}
 
 const CONFIG_LIMIT = 4096;
 const BYTE_LIMIT = 64 * 1024;
@@ -282,6 +294,7 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
   let body;
   /** @type {unknown} */
   let requestValue;
+  let explanationTextSHA256 = "";
   try {
     const text = JSON.stringify(params);
     if (typeof text !== "string" || text.includes(token)) throw new Error();
@@ -295,6 +308,7 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
       if (!isRecord(snapshot) || Object.keys(snapshot).join(",") !== "text" || typeof snapshot.text !== "string" ||
           !validUnicode(snapshot.text) || Buffer.byteLength(snapshot.text, "utf8") > RUN_EXPLANATION_BYTES ||
           !/\P{White_Space}/u.test(snapshot.text) || snapshot.text.includes("\x00")) throw new Error();
+      explanationTextSHA256 = createHash("sha256").update(snapshot.text, "utf8").digest("hex");
     }
   } catch {
     throw safeError("成员工具参数无效，未发送请求。");
@@ -340,7 +354,8 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
     const fail = (message, outcome = sent ? "unknown" : "not_sent") => {
       if (settled) return;
       settled = true;
-      const error = safeError(message);
+      const error = sent && outcome === "unknown" && explanationTextSHA256 ?
+        new RunExplanationUnknownError(unknown.replaceAll(token, "〔已隐藏〕"), key, explanationTextSHA256) : safeError(message);
       if (write && outcome === "unknown" && !writes.unknown) {
         writes.unknown = { toolName, toolCallId, fingerprint, error, ...(explanationWrite ? { body } : {}) };
       }

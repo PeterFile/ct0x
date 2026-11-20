@@ -309,12 +309,15 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	// Only the adapter reports native lifecycle. Drain the selected authority
 	// before checking its binding or folding in an unconfirmed tool write.
 	raw := native.Execute(ctx, nativeRequest, onEvent)
-	if session != nil || explanation != nil {
+	if explanation != nil {
+		r.tools.Revoke(token)
+		receipt := explanation.receipt(raw, token, claim.Token)
+		token = ""
+		return receipt
+	}
+	if session != nil {
 		r.tools.Revoke(token)
 		token = ""
-	}
-	if explanation != nil {
-		return explanation.receipt(raw)
 	}
 	return session.receipt(ctx, e, claim, raw)
 }

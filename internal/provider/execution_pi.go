@@ -50,7 +50,7 @@ type executionOutput struct {
 	piSession                  *piSessionTracker
 	piTypedWork                *piTypedWorkOutput
 	piInvestigation            *piInvestigationStartup
-	piRunExplanation           bool
+	piRunExplanation           *piRunExplanationOutput
 }
 
 func (o *executionOutput) Write(p []byte) (int, error) {
@@ -170,19 +170,16 @@ func (o *executionOutput) recordPi(line []byte) {
 	case "agent_start":
 		o.last = ""
 	case "tool_execution_start":
+		if o.piRunExplanation != nil && event.ToolName == PublishRunExplanationTool && r.RunExplanationUnknown == nil {
+			o.piRunExplanation.observeStart(line)
+		}
 		if o.piTypedWork != nil && !o.piTypedWork.observeStart(line, r.Accepted && !o.settled) {
 			o.damaged = true
 		}
 	case "tool_execution_end":
-		if o.piRunExplanation && event.ToolName == PublishRunExplanationTool && r.Accepted && !o.settled {
-			if key := piRunExplanationAckKey(line, o.runID); key != "" {
-				if r.RunExplanationAckKey == "" {
-					r.RunExplanationAckKey = key
-				} else if r.RunExplanationAckKey != key {
-					// Conflicting acknowledgements cannot validate the attempt.
-					r.RunExplanationAckKey, o.piRunExplanation, o.damaged = "", false, true
-				}
-			}
+		if o.piRunExplanation != nil && event.ToolName == PublishRunExplanationTool &&
+			!o.piRunExplanation.observeEnd(line, o.runID, r, r.Accepted && !o.settled) {
+			o.damaged = true
 		}
 		if o.piTypedWork != nil && !o.piTypedWork.observeEnd(line, o.runID, r.Accepted && !o.settled) {
 			// A bad pair denies settlement but does not erase native terminal evidence.
