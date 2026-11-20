@@ -1,0 +1,40 @@
+name: Store 双槽一次性计时
+
+"on":
+  push:
+    branches: [codex/ci-store-slot-timing-20261120]
+    paths:
+      - .github/workflows/ci-slot-timing.yml
+      - .github/scripts/ci-slot-timing.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-slot-timing-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  timing:
+    name: 同一 runner 串行与双槽并行 ABBA
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: 预热一次并校验四轮槽 44、45
+        run: python3 .github/scripts/ci-slot-timing.py "$RUNNER_TEMP/ci-slot-timing.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-slot-timing-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-slot-timing.json
+          if-no-files-found: error
+          retention-days: 1
