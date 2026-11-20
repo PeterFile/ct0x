@@ -184,7 +184,7 @@ func TestTaskWorkInvestigationHandbackWithoutRuntime(t *testing.T) {
 		t.Fatalf("return changed the projected original input: %+v", projected)
 	}
 	after := messageSequenceSnapshot(t, cold)
-	for _, table := range []string{"task_work_input_returns", "mutation_idempotency", "messages", "message_log"} {
+	for _, table := range []string{"task_work_input_returns", "task_constraint_impacts", "mutation_idempotency", "messages", "message_log"} {
 		if len(after[table]) != len(before[table])+1 {
 			t.Fatalf("return must add exactly one %s row", table)
 		}
