@@ -224,6 +224,10 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     }
     if (!initialized.current && !page.pending && !page.error && items.length) {
       if (!positioned) latest();
+      else if (intent?.kind === "older" && !intent.anchor) {
+        // Keep the first visible older page in place, but refresh the empty window's stale tail state.
+        remember();
+      }
       initialized.current = true; positioned = true;
     }
     if (!positioned && arrived && initialized.current && atTail.current && !page.pending && !pageIntent.current) latest();
