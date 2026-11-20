@@ -72,15 +72,16 @@ func (s *Store) SearchProjectExperiences(ctx context.Context, groupID string, q 
 	}
 	defer tx.Rollback()
 	origin, err := localExperienceOriginInTx(ctx, tx, groupID)
-	return finishExperienceSearch(ctx, tx, origin, err, nil, true, q, action)
+	return finishExperienceSearch(ctx, tx, origin, err, nil, true, q, nil, action)
 }
 
 // SearchProjectExperiencesForTool is trusted platform composition only. The
 // caller must hold the registry's read_history authorization and may pass
-// allowArtifacts only with its existing same-group read_artifact grant. This
-// method fences the Turn, member, Group and topic in SQL. Before returning any
-// candidates to a member, the platform must verify their exact blobs.
-func (s *Store) SearchProjectExperiencesForTool(ctx context.Context, scope MemberToolScope, allowArtifacts bool, q ProjectExperienceQuery) (ProjectExperiencePage, error) {
+// allowArtifacts only with its existing same-group read_artifact grant. An
+// optional artifactPin narrows that grant; it is never a query preference.
+// This method fences the Turn, member, Group and topic in SQL. Before returning
+// any candidates to a member, the platform must verify their exact blobs.
+func (s *Store) SearchProjectExperiencesForTool(ctx context.Context, scope MemberToolScope, allowArtifacts bool, q ProjectExperienceQuery, artifactPin *domain.ArtifactVersionRef) (ProjectExperiencePage, error) {
 	const action = "检索成员项目经验失败"
 	tx, err := s.beginMemberToolTx(ctx, scope)
 	if err != nil {
@@ -88,16 +89,16 @@ func (s *Store) SearchProjectExperiencesForTool(ctx context.Context, scope Membe
 	}
 	defer tx.Rollback()
 	origin, err := experienceOriginInTx(ctx, tx, scope.Claim.GroupID)
-	return finishExperienceSearch(ctx, tx, origin, err, &scope.TopicID, allowArtifacts, q, action)
+	return finishExperienceSearch(ctx, tx, origin, err, &scope.TopicID, allowArtifacts, q, artifactPin, action)
 }
 
-func finishExperienceSearch(ctx context.Context, tx *sql.Tx, origin domain.ProjectExperienceOrigin, err error, topicID *string, allowArtifacts bool, q ProjectExperienceQuery, action string) (ProjectExperiencePage, error) {
+func finishExperienceSearch(ctx context.Context, tx *sql.Tx, origin domain.ProjectExperienceOrigin, err error, topicID *string, allowArtifacts bool, q ProjectExperienceQuery, artifactPin *domain.ArtifactVersionRef, action string) (ProjectExperiencePage, error) {
 	page := ProjectExperiencePage{Items: []domain.ProjectExperienceHit{}}
 	if errors.Is(err, ErrProjectExperienceUnavailable) {
 		return page, nil
 	}
 	if err == nil {
-		page, err = searchProjectExperiencesInTx(ctx, tx, origin, topicID, allowArtifacts, q)
+		page, err = searchProjectExperiencesInTx(ctx, tx, origin, topicID, allowArtifacts, q, artifactPin)
 	}
 	if err == nil {
 		err = tx.Commit()
@@ -108,7 +109,7 @@ func finishExperienceSearch(ctx context.Context, tx *sql.Tx, origin domain.Proje
 	return page, nil
 }
 
-func searchProjectExperiencesInTx(ctx context.Context, tx *sql.Tx, origin domain.ProjectExperienceOrigin, topicID *string, allowArtifacts bool, q ProjectExperienceQuery) (ProjectExperiencePage, error) {
+func searchProjectExperiencesInTx(ctx context.Context, tx *sql.Tx, origin domain.ProjectExperienceOrigin, topicID *string, allowArtifacts bool, q ProjectExperienceQuery, artifactPin *domain.ArtifactVersionRef) (ProjectExperiencePage, error) {
 	page := ProjectExperiencePage{Items: []domain.ProjectExperienceHit{}}
 	if !validHistoryText(q.Query, 512) || q.Component != "" && !experienceLabel(q.Component, 128) ||
 		q.Version != "" && !experienceLabel(q.Version, 128) || q.Limit < 0 || q.Limit > maxProjectExperienceHits {
@@ -125,9 +126,13 @@ func searchProjectExperiencesInTx(ctx context.Context, tx *sql.Tx, origin domain
 	if topicID != nil {
 		mode, topic = "topic", *topicID
 	}
-	digest := sha256.Sum256(mutationPayload("project-experience-search/v1", origin.ProjectID, origin.ChannelID,
-		origin.GroupID, mode, topic, strconv.FormatBool(allowArtifacts), q.Query, q.Component, q.Version))
-	cursorScope := fmt.Sprintf("%x", digest)
+	scopeFields := []string{"project-experience-search/v1", origin.ProjectID, origin.ChannelID,
+		origin.GroupID, mode, topic, strconv.FormatBool(allowArtifacts), q.Query, q.Component, q.Version}
+	// Leave the scope hash unchanged for existing unpinned cursors.
+	if artifactPin != nil {
+		scopeFields = append(scopeFields, artifactPin.ArtifactID, artifactPin.VersionID)
+	}
+	cursorScope := fmt.Sprintf("%x", sha256.Sum256(mutationPayload(scopeFields...)))
 	before, err := decodeHistoryCursor(q.Before, cursorScope)
 	if err != nil {
 		return page, err
@@ -143,10 +148,14 @@ func searchProjectExperiencesInTx(ctx context.Context, tx *sql.Tx, origin domain
 		statement += ` AND e.topic_id=?`
 		args = append(args, *topicID)
 	}
+	// Withhold the whole record if either outcome needs unreadable material.
+	// Filtering the retirement join itself could resurrect a retired approach.
 	if !allowArtifacts {
-		// Do not hide just the retirement: that could present a retired approach
-		// as active. Withhold any record that depends on unreadable material.
 		statement += ` AND e.review_id IS NULL AND r.review_id IS NULL`
+	} else if artifactPin != nil {
+		statement += ` AND (e.review_id IS NULL OR (e.artifact_id,e.version_id)=(?,?))
+	 AND (r.review_id IS NULL OR (r.artifact_id,r.version_id)=(?,?))`
+		args = append(args, artifactPin.ArtifactID, artifactPin.VersionID, artifactPin.ArtifactID, artifactPin.VersionID)
 	}
 	statement += ` AND (criteria.component='' OR lower(e.component)=lower(criteria.component))
 	 AND ((criteria.term='' AND (criteria.component<>'' OR criteria.version IN (e.applicable_version,r.replacement_version)))
