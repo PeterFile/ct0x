@@ -203,7 +203,7 @@ func memberToolRuntimeText(value string) bool {
 // These qualified Pi schema hints require the issued-config builder even if
 // issuance rechecks the policy and removes the investigation action.
 func (schema memberToolIntakeSchema) requiresIssuedPiConfig() bool {
-	return schema.piDiscussionExcerpt || schema.investigation
+	return schema.piDiscussionExcerpt || schema.piDiscussionRelaySource != "" || schema.investigation
 }
 
 type memberToolRuntimeRun struct {
@@ -404,9 +404,10 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 		Token                  string   `json:"token"`
 		ContinueWork           bool     `json:"continue_work,omitempty"`
 		DiscussionOnlyExcerpt  bool     `json:"discussion_only_excerpt,omitempty"`
+		DiscussionRelay        bool     `json:"discussion_relay,omitempty"`
 		IntakeAssessmentAction string   `json:"intake_assessment_action,omitempty"`
 		InvestigationTools     []string `json:"investigation_tools,omitempty"`
-	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools})
+	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, entry.discussionRelay(), action, strictTools})
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}
