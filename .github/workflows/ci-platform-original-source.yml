@@ -1,0 +1,50 @@
+name: Platform original-source verification
+on:
+  push:
+    branches: [codex/ci-platform-slot-replay-20261120]
+permissions:
+  contents: read
+jobs:
+  platform:
+    name: Platform replay worker ${{ matrix.worker }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [platform]
+        worker: [2, 5]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm recorded product files
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --quiet HEAD^ HEAD -- . ':(exclude).github'
+          printf 'tree=%s\n' "$(git rev-parse HEAD^{tree})" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run and verify logical slots
+        env:
+          SHARD_PROFILE: ${{ matrix.profile }}
+          SHARD_WORKER: ${{ matrix.worker }}
+          CHECKOUT_SHA: ${{ github.sha }}
+          CHECKOUT_TREE: ${{ steps.identity.outputs.tree }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ci-shards.py run "$SHARD_PROFILE" "$SHARD_WORKER" "$RUNNER_TEMP/shard-evidence" \
+            --run-id "$GITHUB_RUN_ID" --sha "$CHECKOUT_SHA" --tree "$CHECKOUT_TREE"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.profile }}-worker-v1-${{ matrix.worker }}
+          path: ${{ runner.temp }}/shard-evidence
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7

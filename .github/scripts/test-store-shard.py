@@ -892,7 +892,8 @@ class WorkflowTests(unittest.TestCase):
         for text in ['["go", "test", "-count=1", "-race", "-json", "-list", "^(Test|Example|Fuzz)", target]',
                      '["go", "test", "-count=1", "-race", "-json", "-run", pattern, target]',
                      'verifier.inventory(listed, package)', 'verifier.selection(compiled, slot, profile)',
-                     'verifier.verify(events, package, selected)', 'verifier.aggregate(flattened, expected, profile)',
+                     'verifier.run_pattern(subset)', 'verifier.verify(events, package, subset)',
+                     'verifier.aggregate(flattened, expected, profile)',
                      '"git", "rev-parse", "HEAD"', '"git", "rev-parse", "HEAD^{tree}"']:
             self.assertIn(text, self.worker)
         self.assertNotIn("-timeout", self.worker)
