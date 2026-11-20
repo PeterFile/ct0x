@@ -25,12 +25,13 @@ var memberToolEndpoint = regexp.MustCompile(`^http://(127\.0\.0\.1|\[::1\]):([0-
 var memberToolBearer = regexp.MustCompile(`^[A-Za-z0-9._~+/-]+=*$`)
 
 type memberToolConfig struct {
-	endpoint           string
-	origin             string
-	token              string
-	file               os.FileInfo
-	digest             [32]byte
-	investigationTools []string // Pi strict mode only.
+	endpoint               string
+	origin                 string
+	token                  string
+	file                   os.FileInfo
+	digest                 [32]byte
+	investigationTools     []string // Pi strict mode only.
+	projectExperienceTools []string // Qualified fresh Pi only.
 }
 
 // Trusted, stable ancestors are required. Descriptor and path checks detect
@@ -71,14 +72,18 @@ func readMemberToolConfigFile(path string) ([]byte, os.FileInfo, error) {
 }
 
 func readMemberToolConfig(path string) (memberToolConfig, error) {
-	return readMemberToolConfigMode(path, false, false)
+	return readMemberToolConfigMode(path, false, false, false)
 }
 
 func readPiMemberToolConfig(path string, strict bool) (memberToolConfig, error) {
-	return readMemberToolConfigMode(path, true, strict)
+	return readMemberToolConfigMode(path, true, strict, false)
 }
 
-func readMemberToolConfigMode(path string, pi, strict bool) (memberToolConfig, error) {
+func readPiProjectExperienceConfig(path string) (memberToolConfig, error) {
+	return readMemberToolConfigMode(path, true, false, true)
+}
+
+func readMemberToolConfigMode(path string, pi, strict, projectExperience bool) (memberToolConfig, error) {
 	raw, file, err := readMemberToolConfigFile(path)
 	if err != nil {
 		return memberToolConfig{}, err
@@ -86,21 +91,27 @@ func readMemberToolConfigMode(path string, pi, strict bool) (memberToolConfig, e
 	var config memberToolConfig
 	fields, err := codexAppServerMap(raw)
 	count := 2
+	if projectExperience {
+		count++
+		if json.Unmarshal(fields["project_experience_tools"], &config.projectExperienceTools) != nil || !validPiProjectExperienceToolNames(config.projectExperienceTools) {
+			return memberToolConfig{}, errPiMemberToolConfiguration
+		}
+	}
 	if strict {
 		count++
 		if json.Unmarshal(fields["investigation_tools"], &config.investigationTools) != nil || len(config.investigationTools) == 0 {
 			return memberToolConfig{}, errPiMemberToolConfiguration
 		}
 	} else {
-		// Optional schema hints are not authority. Codex discovers its schema
-		// through MCP, and never accepts the strict config or investigation hint.
-		if string(fields["continue_work"]) == "true" {
+		// Optional schema hints are not authority. Codex discovers through MCP.
+		// The fresh experience profile accepts only the discussion hint.
+		if !projectExperience && string(fields["continue_work"]) == "true" {
 			count++
 		}
 		if pi && string(fields["discussion_only_excerpt"]) == "true" {
 			count++
 		}
-		if pi && string(fields["intake_assessment_action"]) == `"read_only_investigation"` {
+		if pi && !projectExperience && string(fields["intake_assessment_action"]) == `"read_only_investigation"` {
 			count++
 		}
 	}

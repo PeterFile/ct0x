@@ -1,6 +1,6 @@
 # 原生 Pi 成员工具扩展
 
-Pi 1.4.0 成员工具扩展。普通工具为 `list_members`、`read_channel`、`send_message`、`create_member`、`search_history`、`read_history`；角色工具另由服务端绑定。注册不代表启用：可信启动器的精确 `--tools` allowlist 决定实际可用项。
+Pi 1.4.0 成员工具扩展。普通工具为 `list_members`、`read_channel`、`send_message`、`create_member`、`search_history`、`read_history`；角色工具另由服务端绑定。注册不代表启用：可信启动器的精确 `--tools` allowlist 决定实际可用项。全新 Pi 轮的[项目经验检索和确切成果读取契约](project-experience.md)另行显式启用。
 
 ## 加载与配置
 

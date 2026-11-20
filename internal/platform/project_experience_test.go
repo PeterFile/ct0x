@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -13,6 +14,77 @@ import (
 	"agentworkspace/internal/domain"
 	"agentworkspace/internal/store"
 )
+
+func TestMemberProjectExperienceNativeLookupRevalidatesDeliveryGrant(t *testing.T) {
+	ctx := t.Context()
+	f := newArtifactsFixture(t, 64)
+	var installed bool
+	artifactsMust(t, f.raw.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='delivery_artifact_read_grants')`).Scan(&installed))
+	if !installed {
+		// Install the canonical fragment only in this temporary database.
+		ddl, err := os.ReadFile("../store/delivery_artifact_read_grant.sql")
+		artifactsMust(t, err)
+		_, err = f.raw.ExecContext(ctx, string(ddl))
+		artifactsMust(t, err)
+	}
+
+	v := f.publish(t, PublishArtifactInput{Name: "report"}, "approved bytes", "")
+	pin := domain.ArtifactVersionRef{ArtifactID: v.ArtifactID, VersionID: v.ID}
+	owner, err := NewMemberArtifactGrant(f.service)
+	artifactsMust(t, err)
+	owner.open = func(string) (io.ReadCloser, error) {
+		t.Fatal("a no-hit lookup must not open the approved blob")
+		return nil, nil
+	}
+	local := memberArtifactLocal(f)
+	member := local.member(t, f.groupID)
+	message, err := local.local.CreateMessage(ctx, f.groupID, MessageInput{Content: "review the report", TopicID: "bound-topic",
+		RecipientIDs: []string{member.ID}, ArtifactReadGrant: &pin}, "")
+	artifactsMust(t, err)
+	delivery := message.Deliveries[0]
+	turn, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.groupID, DeliveryID: delivery.ID, MaxActive: 2})
+	artifactsMust(t, err)
+	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	tools := NewMemberTools(f.db)
+	run := memberToolRuntimeRun{runtime: &MemberToolRuntime{tools: tools}, binding: MemberToolRunBinding{DeliveryID: delivery.ID},
+		projectExperienceArtifactRead: &preparedDeliveryArtifactRead{pin: pin, owner: owner}}
+	history := MemberToolGrants{Operations: []string{"search_history", "read_history"}}
+	token, err := run.issueFreshPiDeliveryArtifactRead(ctx, claim, history)
+	artifactsMust(t, err)
+	defer tools.Revoke(token)
+	q := ProjectExperienceQuery{Query: "no matching experience"}
+	assertEmpty := func(token string) {
+		t.Helper()
+		if page, err := tools.LookupNativeProjectExperiences(ctx, token, q); err != nil || page.Items == nil || len(page.Items) != 0 || page.NextCursor != "" {
+			t.Fatalf("authorized lookup did not return an empty page: %+v, %v", page, err)
+		}
+	}
+	assertEmpty(token)
+
+	// Lose just the issued delivery's grant row. Restore the exact guard so
+	// denial must be due to missing evidence, not an incomplete schema.
+	tx, err := f.raw.BeginTx(ctx, nil)
+	artifactsMust(t, err)
+	defer tx.Rollback()
+	var guard string
+	artifactsMust(t, tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='delivery_artifact_read_grants_delete'`).Scan(&guard))
+	_, err = tx.ExecContext(ctx, `DROP TRIGGER delivery_artifact_read_grants_delete`)
+	artifactsMust(t, err)
+	_, err = tx.ExecContext(ctx, `DELETE FROM delivery_artifact_read_grants WHERE delivery_id=?`, delivery.ID)
+	artifactsMust(t, err)
+	_, err = tx.ExecContext(ctx, guard)
+	artifactsMust(t, err)
+	artifactsMust(t, tx.Commit())
+
+	lookupOnly, err := tools.IssueFreshPiProjectExperience(ctx, memberCapabilityClaim(t, local, f.groupID), history, domain.ArtifactVersionRef{})
+	artifactsMust(t, err)
+	defer tools.Revoke(lookupOnly)
+	assertEmpty(lookupOnly)
+
+	if page, err := tools.LookupNativeProjectExperiences(ctx, token, q); !errors.Is(err, store.ErrMemberToolDenied) || page.Items != nil || page.NextCursor != "" {
+		t.Fatalf("lost delivery grant returned a successful lookup: %+v, %v", page, err)
+	}
+}
 
 func TestMemberProjectExperienceLookupRequiresCurrentEvidenceAuthority(t *testing.T) {
 	f := newArtifactsFixture(t, 1024)

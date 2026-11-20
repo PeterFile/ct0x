@@ -15,8 +15,9 @@ import (
 // ActorID is platform-bound; recipients describe the original request, not routing output.
 type MessageRequest struct {
 	GroupID, TopicID, Content, IdempotencyKey string
-	ActorID                                   string   `json:"-"`
-	RecipientIDs                              []string // Nil permits routing; non-nil (even empty) is an explicit set.
+	ActorID                                   string                     `json:"-"`
+	RecipientIDs                              []string                   // Nil permits routing; non-nil (even empty) is an explicit set.
+	ArtifactReadGrant                         *domain.ArtifactVersionRef `json:"-"` // Only CreateLocalUserMessage accepts it.
 }
 
 type MessageListOptions struct {
@@ -35,7 +36,14 @@ func (r MessageRequest) payload() []byte {
 	if r.RecipientIDs != nil {
 		fields[3] = "explicit"
 	}
-	return mutationPayload(append(fields, recipientSet(r.RecipientIDs)...)...)
+	fields = append(fields, recipientSet(r.RecipientIDs)...)
+	if pin := r.ArtifactReadGrant; pin != nil {
+		// A distinct recipient mode separates grant payloads from all old
+		// explicit sets. Keep the no-grant payload byte-for-byte unchanged.
+		fields[3] = artifactReadGrantMode
+		fields = append(fields, pin.ArtifactID, pin.VersionID)
+	}
+	return mutationPayload(fields...)
 }
 
 func recipientSet(ids []string) []string {
@@ -45,6 +53,9 @@ func recipientSet(ids []string) []string {
 }
 
 func (s *Store) LookupMessageReceipt(ctx context.Context, request MessageRequest) (domain.Message, bool, error) {
+	if request.ArtifactReadGrant != nil {
+		return domain.Message{}, false, ErrInvalid
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return domain.Message{}, false, storeError("读取消息回执失败", err)
@@ -71,6 +82,9 @@ func (s *Store) LookupMessageReceipt(ctx context.Context, request MessageRequest
 }
 
 func (s *Store) CreateMessage(ctx context.Context, request MessageRequest, resolvedRecipientIDs []string) (domain.Message, error) {
+	if request.ArtifactReadGrant != nil {
+		return domain.Message{}, ErrInvalid
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.Message{}, storeError("创建消息失败", err)

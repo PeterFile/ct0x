@@ -29,11 +29,12 @@ type piMemberToolOptions struct {
 	// from tool names, ordinary digest options, the child stream or the prompt.
 	typedWorkRole string
 
-	extensionPath string
-	configPath    string
-	toolNames     []string
-	configSHA256  [sha256.Size]byte // Nonzero only for runtime-bound profiles.
-	investigation bool              // Strict first-investigation config and argv.
+	extensionPath     string
+	configPath        string
+	toolNames         []string
+	configSHA256      [sha256.Size]byte // Nonzero only for runtime-bound profiles.
+	investigation     bool              // Strict first-investigation config and argv.
+	projectExperience bool              // Qualified fresh history profile; never typed or resumable.
 
 	// Only typed investigation uses its own wire schema and in-memory session.
 	investigationConfigFile os.FileInfo
@@ -161,6 +162,10 @@ func (o *piMemberToolOptions) boundConfig() bool {
 func (o *piMemberToolOptions) launchConfigMatches() bool {
 	if !o.boundConfig() {
 		return true
+	}
+	if o.projectExperience {
+		config, err := readPiProjectExperienceConfig(o.configPath)
+		return err == nil && config.digest == o.configSHA256
 	}
 	if o.investigationConfigFile == nil {
 		return piMemberToolConfigMatches(o.configPath, o.configSHA256, o.investigation)

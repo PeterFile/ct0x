@@ -8,6 +8,7 @@ import (
 	"io"
 	"unicode/utf8"
 
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/store"
 )
 
@@ -15,8 +16,14 @@ import (
 // must remain stable and open until all borrowing registrations are revoked/drained.
 // Its private values carry authority; model and transport inputs cannot supply it.
 type MemberArtifactGrant struct {
-	db   *store.Store
-	open func(string) (io.ReadCloser, error)
+	db         *store.Store
+	open       func(string) (io.ReadCloser, error)
+	pin        domain.ArtifactVersionRef // Optional exact restriction on the issued copy.
+	deliveryID string                    // Nonempty only for a persisted local-user approval.
+}
+
+func (g *MemberArtifactGrant) permitsVersion(ref domain.ArtifactVersionRef) bool {
+	return g != nil && (g.pin == (domain.ArtifactVersionRef{}) || g.pin == ref)
 }
 
 type MemberArtifactReadInput struct {
@@ -53,6 +60,9 @@ func (s *MemberTools) ReadArtifact(ctx context.Context, token string, input Memb
 	err := s.withAuthorized(ctx, token, "read_artifact", func(scope store.MemberToolScope, grants MemberToolGrants) error {
 		var readErr error
 		result, readErr = s.readMemberArtifact(ctx, scope, grants.Artifacts, input)
+		if grants.Artifacts != nil && grants.Artifacts.deliveryID != "" {
+			return readErr // The grant-specific read's final fence includes scope.
+		}
 		// Failures reveal information too. Committed scope invalidation takes
 		// precedence over every metadata, I/O, Close and JSON budget error.
 		if authErr := s.db.ValidateMemberTool(ctx, scope); authErr != nil {
@@ -68,7 +78,13 @@ func (s *MemberTools) ReadArtifact(ctx context.Context, token string, input Memb
 
 var errMemberArtifactIO = errors.New("读取成果内容失败")
 
-func (s *MemberTools) readMemberArtifact(ctx context.Context, scope store.MemberToolScope, grant *MemberArtifactGrant, input MemberArtifactReadInput) (MemberArtifactReadResult, error) {
+func (s *MemberTools) readMemberArtifact(ctx context.Context, scope store.MemberToolScope, grant *MemberArtifactGrant, input MemberArtifactReadInput) (result MemberArtifactReadResult, err error) {
+	// Both direct reads and lookup verification must honor the issued pin
+	// before resolving metadata or opening a blob.
+	pin := domain.ArtifactVersionRef{ArtifactID: input.ArtifactID, VersionID: input.VersionID}
+	if !grant.permitsVersion(pin) {
+		return MemberArtifactReadResult{}, store.ErrMemberToolDenied
+	}
 	if input.MaxBytes == 0 {
 		input.MaxBytes = 8192
 	}
@@ -77,7 +93,22 @@ func (s *MemberTools) readMemberArtifact(ctx context.Context, scope store.Member
 	}
 	// This real transaction fences scope before resolving the exact tuple and
 	// ends before any filesystem I/O. The human download path is not authority.
-	artifact, version, err := s.db.ReadArtifactForTool(ctx, scope, input.ArtifactID, input.VersionID)
+	var artifact domain.Artifact
+	var version domain.ArtifactVersion
+	if grant.deliveryID == "" {
+		artifact, version, err = s.db.ReadArtifactForTool(ctx, scope, input.ArtifactID, input.VersionID)
+	} else {
+		artifact, version, err = s.db.ReadArtifactForDeliveryGrant(ctx, scope, pin, grant.deliveryID)
+		if err == nil {
+			// Do not return bytes (or I/O errors) if approval was lost while
+			// resolving content. This also fences lookup's artifact checks.
+			defer func() {
+				if authErr := s.db.ValidateDeliveryArtifactReadGrantForTool(ctx, scope, grant.deliveryID, pin); authErr != nil {
+					result, err = MemberArtifactReadResult{}, authErr
+				}
+			}()
+		}
+	}
 	if err != nil {
 		return MemberArtifactReadResult{}, err
 	}
@@ -97,7 +128,7 @@ func (s *MemberTools) readMemberArtifact(ctx context.Context, scope store.Member
 	if !utf8.Valid(fragment) {
 		encoding, content = "base64", base64.StdEncoding.EncodeToString(fragment)
 	}
-	result := MemberArtifactReadResult{
+	result = MemberArtifactReadResult{
 		ArtifactID: artifact.ID, VersionID: version.ID, Name: artifact.Name,
 		CurrentVersionID: artifact.CurrentVersionID, SourceTaskID: version.SourceTaskID,
 		AuthorID: version.AuthorID, SHA256: version.BlobHash, RecordedSize: version.Size, Applied: version.Applied,

@@ -6,11 +6,13 @@ import { request } from "node:http";
 export const INVESTIGATION_ASSESSMENT_ACTION = "read_only_investigation";
 export const INVESTIGATION_CHANNEL = "read_investigation_channel";
 export const INVESTIGATION_ARTIFACT = "read_investigation_artifact";
+export const LOOKUP_PROJECT_EXPERIENCES = "lookup_project_experiences";
+export const READ_ARTIFACT = "read_artifact";
 
 const CONFIG_LIMIT = 4096;
 const BYTE_LIMIT = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 25_000;
-export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", "read_work_inputs", "ack_work_input", "hand_back_work_input", INVESTIGATION_CHANNEL, INVESTIGATION_ARTIFACT]);
+export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history", "decide_dispatch", "submit_result", "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", "read_work_inputs", "ack_work_input", "hand_back_work_input", INVESTIGATION_CHANNEL, INVESTIGATION_ARTIFACT, LOOKUP_PROJECT_EXPERIENCES, READ_ARTIFACT]);
 
 /** @typedef {{ text: string, json: unknown }} Reply */
 /** @typedef {(toolName: string, params: unknown, toolCallId: string, signal?: AbortSignal) => Promise<Reply>} Client */
@@ -22,6 +24,9 @@ const REJECTION_CODES = new Map([
   [413, ["body_too_large"]], [415, ["unsupported_media_type"]],
 ]);
 const CONFIG_ERROR = "成员工具配置无效，未启用任何成员工具。";
+
+/** @param {string} name */
+const isProjectExperienceRead = name => name === LOOKUP_PROJECT_EXPERIENCES || name === READ_ARTIFACT;
 const SERVER_ERROR_MESSAGES = new Map([
   ["request_canceled", "成员工具请求已取消，执行结果未知；请先对账，保留原工具调用标识及幂等键，不要自动重试"],
   ["deadline_exceeded", "成员工具请求已超时，执行结果未知；请先对账，保留原工具调用标识及幂等键，不要自动重试"],
@@ -52,12 +57,23 @@ function endpointURL(value) {
   return url;
 }
 
+/** @param {unknown} names @returns {names is string[]} */
+function validProjectExperienceTools(names) {
+  if (!Array.isArray(names) || !names.every(name => typeof name === "string")) return false;
+  const end = names.at(-1) === READ_ARTIFACT ? names.length - 1 : names.length;
+  return names[end - 1] === LOOKUP_PROJECT_EXPERIENCES && [
+    ["search_history", "read_history"],
+    ["list_members", "read_channel", "send_message", "search_history", "read_history"],
+    ["list_members", "read_channel", "send_message", "create_member", "search_history", "read_history"],
+  ].some(base => base.length === end - 1 && base.every((name, i) => names[i] === name));
+}
+
 /**
  * Read once; the launcher owns the config file's lifetime. An expected digest
  * selects the bound profile; it covers exactly the bytes this bridge consumes.
  * @param {string | undefined} path
  * @param {string} [expectedSHA256]
- * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[] }}
+ * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[], projectExperienceTools?: string[] }}
  */
 export function openBridge(path, expectedSHA256) {
   let fd;
@@ -88,8 +104,9 @@ export function openBridge(path, expectedSHA256) {
     const discussionOnlyExcerpt = Object.hasOwn(config, "discussion_only_excerpt");
     const investigationIntake = Object.hasOwn(config, "intake_assessment_action");
     const strict = Object.hasOwn(config, "investigation_tools");
+    const projectExperience = Object.hasOwn(config, "project_experience_tools");
     if (!Object.hasOwn(config, "endpoint") || !Object.hasOwn(config, "token") ||
-        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) + Number(strict) ||
+        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) + Number(strict) + Number(projectExperience) ||
         (continueWork && config.continue_work !== true) || (discussionOnlyExcerpt && config.discussion_only_excerpt !== true) ||
         (investigationIntake && config.intake_assessment_action !== INVESTIGATION_ASSESSMENT_ACTION) ||
         typeof config.token !== "string" || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token)) {
@@ -105,18 +122,28 @@ export function openBridge(path, expectedSHA256) {
           !["decide_dispatch", "submit_result"].includes(names.at(-1))) throw new Error(CONFIG_ERROR);
       investigationTools = [...names];
     }
+    /** @type {string[] | undefined} */
+    let projectExperienceTools;
+    if (projectExperience) {
+      if (expectedSHA256 === undefined || strict || continueWork || investigationIntake ||
+          !validProjectExperienceTools(config.project_experience_tools)) throw new Error(CONFIG_ERROR);
+      projectExperienceTools = [...config.project_experience_tools];
+    }
     const endpoint = endpointURL(config.endpoint);
     const token = config.token;
+    const profile = projectExperienceTools ?? investigationTools;
     /** @type {WriteState} */
     const writes = {};
     return {
       invoke: async (toolName, params, toolCallId, signal) => {
-        if (investigationTools ? !investigationTools.includes(toolName) : toolName === INVESTIGATION_CHANNEL || toolName === INVESTIGATION_ARTIFACT) {
+        if (profile ? !profile.includes(toolName) :
+          toolName === INVESTIGATION_CHANNEL || toolName === INVESTIGATION_ARTIFACT || toolName === LOOKUP_PROJECT_EXPERIENCES || toolName === READ_ARTIFACT) {
           throw new Error("工具不在本轮授权范围内，未发送请求。");
         }
         return requestTool(endpoint, token, writes, toolName, params, toolCallId, signal);
       },
       continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools,
+      projectExperienceTools: projectExperienceTools && [...projectExperienceTools],
     };
   } catch {
     throw new Error(CONFIG_ERROR);
@@ -168,6 +195,9 @@ function serverError(value, token, roleWrite, toolName) {
   const raw = value.error.code;
   let code = /^[a-z][a-z0-9_]{0,63}$/.test(raw) && !raw.includes(token) ? raw : "request_failed";
   if (code.includes(token)) code = "";
+  if (toolName === READ_ARTIFACT && raw === "tool_result_too_large") {
+    return "工具结果超过 64 KiB 限制（tool_result_too_large），请减小 max_bytes 后重新读取。";
+  }
   const message = toolName === "read_work_inputs" && raw === "tool_result_too_large" ?
     "完整工作输入超过响应上限，未返回部分内容；当前工具不支持分段读取" :
     ((!roleWrite || raw === "request_canceled" || raw === "deadline_exceeded" ?
@@ -239,6 +269,24 @@ function validWriteReceipt(toolName, status, value, requestValue) {
       status === 201 && value.reused === false && value.join_message_id.length > 0);
 }
 
+/** @param {string} name @param {unknown} value @param {unknown} sent */
+function validProjectExperienceReply(name, value, sent) {
+  if (!isRecord(value) || !isRecord(sent)) return false;
+  if (name === LOOKUP_PROJECT_EXPERIENCES) {
+    return Object.keys(value).length === 2 && Array.isArray(value.items) && value.items.every(isRecord) &&
+      value.items.length <= Number(sent.limit ?? 10) && typeof value.next_cursor === "string" &&
+      (value.next_cursor === "" || (value.items.length > 0 && value.next_cursor !== sent.before && /^[A-Za-z0-9_-]{1,2048}$/.test(value.next_cursor)));
+  }
+  if (value.artifact_id !== sent.artifact_id || value.version_id !== sent.version_id ||
+      value.offset !== (sent.offset ?? 0) || typeof value.next_offset !== "number" || !Number.isSafeInteger(value.next_offset) ||
+      typeof value.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.sha256) || typeof value.content_complete !== "boolean" ||
+      typeof value.content !== "string" || (value.encoding !== "utf8" && value.encoding !== "base64")) return false;
+  const bytes = Buffer.from(value.content, value.encoding);
+  return (value.encoding === "utf8" ? validUnicode(value.content) : bytes.toString("base64") === value.content) &&
+    bytes.length <= Number(sent.max_bytes ?? 8192) && value.next_offset === Number(value.offset) + bytes.length &&
+    value.next_offset <= (64 << 20) && (value.content_complete || bytes.length > 0);
+}
+
 /**
  * No retry or redirect: once sent, a missing receipt is an unknown outcome.
  * @param {URL} endpoint
@@ -269,7 +317,9 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
     const text = JSON.stringify(params);
     if (typeof text !== "string" || text.includes(token)) throw new Error();
     body = Buffer.from(text, "utf8");
-    if (toolName === "decide_dispatch" || workInputWrite) {
+    if (isProjectExperienceRead(toolName)) {
+      requestValue = JSON.parse(text);
+    } else if (toolName === "decide_dispatch" || workInputWrite) {
       const snapshot = JSON.parse(text);
       if (isRecord(snapshot)) requestValue = workInputWrite ? snapshot.input_id : snapshot.kind;
     }
@@ -359,14 +409,15 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
             const code = error?.code;
             const rejected = !sensitive && typeof code === "string" && typeof error?.message === "string" &&
               (REJECTION_CODES.get(status)?.includes(code) ||
-                (toolName === "read_work_inputs" && status === 413 && code === "tool_result_too_large") ||
+                ((toolName === "read_work_inputs" || isProjectExperienceRead(toolName)) && status === 413 && code === "tool_result_too_large") ||
                 (toolName !== "decide_dispatch" && ((status === 404 && code === "not_found") || (status === 409 && code === "conflict"))) ||
                 (!roleWrite && status === 409 && code === "member_capacity"));
             const suffix = rejected || code === "request_canceled" || code === "deadline_exceeded" ? "" : ` ${unknown}`;
             return fail(message ? message + suffix : invalidResponse, rejected ? "rejected" : "unknown");
           }
           if (sensitive) return fail(`成员工具返回了敏感数据，已拒绝显示；${unknown}`);
-          if (!validWriteReceipt(toolName, status, result.json, requestValue)) return fail(invalidResponse);
+          if (!validWriteReceipt(toolName, status, result.json, requestValue) ||
+              (isProjectExperienceRead(toolName) && !validProjectExperienceReply(toolName, result.json, requestValue))) return fail(invalidResponse);
           if (roleWrite || workspaceWrite) {
             if (!validRoleReceiptWire(result.text, workInputWrite ? 1 : workspaceWrite ? 5 : 4)) return fail(invalidResponse);
             result = { text: JSON.stringify(result.json), json: result.json };

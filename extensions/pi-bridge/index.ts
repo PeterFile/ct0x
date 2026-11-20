@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
-import { INVESTIGATION_ARTIFACT, INVESTIGATION_ASSESSMENT_ACTION, INVESTIGATION_CHANNEL, openBridge, validUnicode } from "./bridge.mjs";
+import { INVESTIGATION_ARTIFACT, INVESTIGATION_ASSESSMENT_ACTION, INVESTIGATION_CHANNEL,
+  LOOKUP_PROJECT_EXPERIENCES, READ_ARTIFACT, openBridge, validUnicode } from "./bridge.mjs";
 
 const discussionOnlyExcerptBytes = 4096;
 const investigationSummaryBytes = 8192;
@@ -201,6 +202,53 @@ const investigationReads = [
     }, { additionalProperties: false }) },
 ] as const;
 
+const projectExperienceLookup = Type.Object({
+  query: Type.Optional(Type.String({ maxLength: 512, description: "问题或证据的搜索词，最多 512 UTF-8 字节。" })),
+  component: Type.Optional(Type.String({ maxLength: 128, description: "组件筛选，不选择身份或授权。" })),
+  version: Type.Optional(Type.String({ maxLength: 128, description: "经验的适用版本，不是成果版本选择器。" })),
+  limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "每页 1 至 20 条（默认 10）；范围过宽时减小页数。" })),
+  before: Type.Optional(Type.String({ maxLength: 2048, description: "同检索范围上一页返回的不透明游标。" })),
+}, { additionalProperties: false });
+const exactArtifactRead = Type.Object({
+  artifact_id: Type.String({ minLength: 1, maxLength: 128 }),
+  version_id: Type.String({ minLength: 1, maxLength: 128 }),
+  offset: Type.Optional(Type.Integer({ minimum: 0, maximum: 64 << 20 })),
+  max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 16384 })),
+}, { additionalProperties: false });
+const projectExperienceReads = [
+  { name: LOOKUP_PROJECT_EXPERIENCES, label: "检索项目经验",
+    description: "搜索本轮绑定话题内已选定的经验及有效、过时或停用依据。至少提供 query、component、version 中的一项。原消息用 read_history 按标识回读；命中和证据标识不授予成果读取权限。",
+    parameters: projectExperienceLookup },
+  { name: READ_ARTIFACT, label: "读取确切成果版本",
+    description: "按 artifact_id 和 version_id 读取本轮独立获准的固定版本，不读取路径或当前版本。offset、next_offset 按字节计；按 content_complete 判断末尾，按 encoding 解码 utf8 或 base64。",
+    parameters: exactArtifactRead },
+] as const;
+
+type ProjectExperienceRead = typeof projectExperienceReads[number]["name"];
+function checkedExperienceArgs(tool: ProjectExperienceRead, raw: unknown) {
+  try {
+    // Snapshot only known own scalar data fields, both before Pi coercion and
+    // before transport. Getters, extra selectors and null never reach HTTP.
+    const schema = tool === LOOKUP_PROJECT_EXPERIENCES ? projectExperienceLookup : exactArtifactRead;
+    if (raw === null || typeof raw !== "object" || (Object.getPrototypeOf(raw) !== Object.prototype && Object.getPrototypeOf(raw) !== null)) throw new Error();
+    const args = Object.fromEntries(Reflect.ownKeys(raw).map(key => {
+      const field = Object.getOwnPropertyDescriptor(raw, key);
+      if (typeof key !== "string" || !Object.hasOwn(schema.properties, key) || !field?.enumerable ||
+          (typeof field.value !== "string" && typeof field.value !== "number")) throw new Error();
+      return [key, field.value];
+    }));
+    if (tool === READ_ARTIFACT && Value.Check(exactArtifactRead, args) && [args.artifact_id, args.version_id].every(id =>
+      utf8TextWithinBytes(id, 128) && !/^[\p{White_Space}]|[\p{White_Space}]$|[\p{Cc}/\\]/u.test(id))) return args;
+    if (tool === LOOKUP_PROJECT_EXPERIENCES && Value.Check(projectExperienceLookup, args)) {
+      const { query = "", component = "", version = "", before = "" } = args;
+      if (utf8TextWithinBytes(query, 512) && !query.includes("\0") && (/[\P{White_Space}]/u.test(query) || component !== "" || version !== "") &&
+          [component, version].every(label => utf8TextWithinBytes(label, 128) && !/^\p{White_Space}|\p{White_Space}$|\0/u.test(label)) &&
+          /^[A-Za-z0-9_-]{0,2048}$/.test(before)) return args;
+    }
+  } catch { /* Do not expose caller values or argument access errors. */ }
+  throw new Error("成员工具参数无效，未发送请求。");
+}
+
 function workspacePath(value: string, directory: boolean): boolean {
   return Buffer.byteLength(value, "utf8") <= 4096 && !/[\\\\\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(value) &&
     (directory && value === "." || value.split("/").every(part => part !== "" && part !== "." && part !== ".."));
@@ -225,18 +273,32 @@ function validWorkInputID(value: string): boolean {
 }
 
 export default function piBridge(pi: ExtensionAPI) {
-  const { invoke, continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools } = openBridge(
+  const { invoke, continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools, projectExperienceTools } = openBridge(
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG,
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256,
   );
-  if (investigationTools) {
+  const profile = projectExperienceTools ?? investigationTools;
+  if (profile) {
     // Independent of Pi's CLI allowlist. Do not register unrelated platform
     // tools and fail closed on any unexpected host or other extension call.
-    pi.on("tool_call", event => investigationTools.includes(event.toolName) ? undefined :
-      { block: true, reason: "工具不在本轮只读调查范围内。" });
+    pi.on("tool_call", event => profile.includes(event.toolName) ? undefined :
+      { block: true, reason: investigationTools ? "工具不在本轮只读调查范围内。" : "工具不在本轮签发范围内。" });
   }
-  for (const tool of investigationTools ? [...investigationReads, ...tools] : tools) {
-    if (investigationTools && !investigationTools.includes(tool.name)) continue;
+  const definitions = projectExperienceTools ? [...tools, ...projectExperienceReads] : investigationTools ? [...investigationReads, ...tools] : tools;
+  for (const tool of definitions) {
+    if (profile && !profile.includes(tool.name)) continue;
+    if (tool.name === LOOKUP_PROJECT_EXPERIENCES || tool.name === READ_ARTIFACT) {
+      const name = tool.name;
+      pi.registerTool<typeof tool.parameters>({
+        ...tool,
+        prepareArguments: raw => checkedExperienceArgs(name, raw),
+        async execute(toolCallId, params, signal, _onUpdate, _ctx) {
+          const result = await invoke(name, checkedExperienceArgs(name, params), toolCallId, signal);
+          return { content: [{ type: "text", text: result.text }], details: undefined };
+        },
+      });
+      continue;
+    }
     let parameters = tool.name === "send_message" && (continueWork || discussionOnlyExcerpt || investigationIntake) ?
       sendMessageParameters(continueWork, discussionOnlyExcerpt, investigationIntake) : tool.parameters;
     if (investigationTools && tool.name === "submit_result") parameters = investigationResult;
