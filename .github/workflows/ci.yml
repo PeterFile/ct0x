@@ -2,15 +2,25 @@ name: CI
 
 on:
   pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, edited, labeled]
   push:
     branches:
       - master
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
 
+# Irrelevant labels/title/body edits get a private group, so they cannot supersede real CI.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: >-
+    ${{ format('{0}-{1}', github.workflow,
+        (github.event_name != 'pull_request' ||
+         contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
+         (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
+         (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft)))) &&
+        (github.event.pull_request.number || github.ref) || format('ignored-{0}', github.run_id)) }}
   cancel-in-progress: true
 
 defaults:
@@ -18,281 +28,66 @@ defaults:
     shell: bash
 
 jobs:
-  go-store:
-    name: Go Store ${{ matrix.slot }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        slot: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Run and verify Store shard
-        env:
-          STORE_SLOT: ${{ matrix.slot }}
-        run: |
-          set -euo pipefail
-          package=$(go list ./internal/store)
-          sha=$(git rev-parse HEAD)
-          tree=$(git rev-parse HEAD^{tree})
-          go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/store | tee "$RUNNER_TEMP/store-list.json"
-          pattern=$(python3 .github/scripts/verify-store-shard.py select "$STORE_SLOT" "$package" "$RUNNER_TEMP/store-list.json")
-          go test -count=1 -race -json -run "$pattern" ./internal/store | tee "$RUNNER_TEMP/store-run.json"
-          python3 .github/scripts/verify-store-shard.py verify "$STORE_SLOT" "$package" "$RUNNER_TEMP/store-list.json" "$RUNNER_TEMP/store-run.json" \
-            --run-id "$GITHUB_RUN_ID" --sha "$sha" --tree "$tree" > "$RUNNER_TEMP/store-summary.json"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: store-shard-v1-${{ matrix.slot }}
-          path: ${{ runner.temp }}/store-summary.json
-          overwrite: true
-          if-no-files-found: error
-          retention-days: 7
-
-  go-platform:
-    name: Go Platform ${{ matrix.slot }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        slot: [0, 1, 2, 3, 4, 5, 6, 7, 8]
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Run and verify Platform shard
-        env:
-          PLATFORM_SLOT: ${{ matrix.slot }}
-        run: |
-          set -euo pipefail
-          package=$(go list ./internal/platform)
-          sha=$(git rev-parse HEAD)
-          tree=$(git rev-parse HEAD^{tree})
-          go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/platform | tee "$RUNNER_TEMP/platform-list.json"
-          pattern=$(python3 .github/scripts/verify-store-shard.py select --profile platform "$PLATFORM_SLOT" "$package" "$RUNNER_TEMP/platform-list.json")
-          go test -count=1 -race -json -run "$pattern" ./internal/platform | tee "$RUNNER_TEMP/platform-run.json"
-          python3 .github/scripts/verify-store-shard.py verify --profile platform "$PLATFORM_SLOT" "$package" "$RUNNER_TEMP/platform-list.json" "$RUNNER_TEMP/platform-run.json" \
-            --run-id "$GITHUB_RUN_ID" --sha "$sha" --tree "$tree" > "$RUNNER_TEMP/platform-summary.json"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: platform-shard-v1-${{ matrix.slot }}
-          path: ${{ runner.temp }}/platform-summary.json
-          overwrite: true
-          if-no-files-found: error
-          retention-days: 7
-
-  go-httpapi:
-    name: Go HTTPAPI ${{ matrix.slot }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        slot: [0, 1, 2, 3, 4, 5, 6, 7]
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@v7
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Run and verify HTTPAPI shard
-        env:
-          HTTPAPI_SLOT: ${{ matrix.slot }}
-        run: |
-          set -euo pipefail
-          package=$(go list ./internal/httpapi)
-          sha=$(git rev-parse HEAD)
-          tree=$(git rev-parse HEAD^{tree})
-          go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/httpapi | tee "$RUNNER_TEMP/httpapi-list.json"
-          pattern=$(python3 .github/scripts/verify-store-shard.py select --profile httpapi "$HTTPAPI_SLOT" "$package" "$RUNNER_TEMP/httpapi-list.json")
-          go test -count=1 -race -json -run "$pattern" ./internal/httpapi | tee "$RUNNER_TEMP/httpapi-run.json"
-          python3 .github/scripts/verify-store-shard.py verify --profile httpapi "$HTTPAPI_SLOT" "$package" "$RUNNER_TEMP/httpapi-list.json" "$RUNNER_TEMP/httpapi-run.json" \
-            --run-id "$GITHUB_RUN_ID" --sha "$sha" --tree "$tree" > "$RUNNER_TEMP/httpapi-summary.json"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: httpapi-shard-v1-${{ matrix.slot }}
-          path: ${{ runner.temp }}/httpapi-summary.json
-          overwrite: true
-          if-no-files-found: error
-          retention-days: 7
-
-  go:
-    name: Go
-    needs: [go-store, go-platform, go-httpapi]
-    if: ${{ always() }}
+  feedback:
+    name: Draft feedback
+    if: >-
+      ${{ github.event_name != 'pull_request' ||
+          contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
+          (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
+          (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      bucket: ${{ steps.plan.outputs.bucket }}
+      sha: ${{ steps.plan.outputs.sha }}
+      tree: ${{ steps.plan.outputs.tree }}
     steps:
-      - name: Check Store, Platform and HTTPAPI shards
-        env:
-          STORE_RESULT: ${{ needs.go-store.result }}
-          PLATFORM_RESULT: ${{ needs.go-platform.result }}
-          HTTPAPI_RESULT: ${{ needs.go-httpapi.result }}
-        run: test "$STORE_RESULT" = success && test "$PLATFORM_RESULT" = success && test "$HTTPAPI_RESULT" = success
       - uses: actions/checkout@v7
         with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
+      - name: Route immutable merge and check full diff
+        id: plan
+        run: python3 .github/scripts/ci-plan.py plan "$RUNNER_TEMP/ci-plan.json"
       - uses: actions/setup-go@v7
+        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      - name: Test Store shard gates
-        run: python3 .github/scripts/test-store-shard.py -v
-      - uses: actions/download-artifact@v7
-        with:
-          pattern: store-shard-v1-*
-          path: ${{ runner.temp }}/store-shards
-          merge-multiple: false
-      - name: Verify Store shard coverage
-        run: |
-          set -euo pipefail
-          package=$(go list ./internal/store)
-          python3 .github/scripts/verify-store-shard.py aggregate "$package" "$RUNNER_TEMP/store-shards" \
-            --run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"
-      - uses: actions/download-artifact@v7
-        with:
-          pattern: platform-shard-v1-*
-          path: ${{ runner.temp }}/platform-shards
-          merge-multiple: false
-      - name: Verify Platform shard coverage
-        run: |
-          set -euo pipefail
-          package=$(go list ./internal/platform)
-          python3 .github/scripts/verify-store-shard.py aggregate --profile platform "$package" "$RUNNER_TEMP/platform-shards" \
-            --run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"
-      - uses: actions/download-artifact@v7
-        with:
-          pattern: httpapi-shard-v1-*
-          path: ${{ runner.temp }}/httpapi-shards
-          merge-multiple: false
-      - name: Verify HTTPAPI shard coverage
-        run: |
-          set -euo pipefail
-          package=$(go list ./internal/httpapi)
-          python3 .github/scripts/verify-store-shard.py aggregate --profile httpapi "$package" "$RUNNER_TEMP/httpapi-shards" \
-            --run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"
-      - name: Ordinary test coordination package
-        run: go test -count=1 ./internal/coordination
-      - name: Race test coordination package
-        run: go test -count=1 -race ./internal/coordination
+      # Ordinary cmd catches composition/liveness regressions before full fanout (#218).
       - name: Ordinary test cmd package
+        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
         run: go test -count=1 ./cmd/workspace
-      - name: Race test all other packages
+      - name: Test CI scheduling and shard gates
+        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.conservative == 'true' }}
         run: |
           set -euo pipefail
-          store=$(go list ./internal/store)
-          platform=$(go list ./internal/platform)
-          httpapi=$(go list ./internal/httpapi)
-          coordination=$(go list ./internal/coordination)
-          [[ -n "$store" && "$store" != *$'\n'* &&
-             -n "$platform" && "$platform" != *$'\n'* &&
-             -n "$httpapi" && "$httpapi" != *$'\n'* &&
-             -n "$coordination" && "$coordination" != *$'\n'* &&
-             "$store" != "$platform" && "$store" != "$coordination" && "$platform" != "$coordination" &&
-             "$httpapi" != "$store" && "$httpapi" != "$platform" && "$httpapi" != "$coordination" ]] || exit 1
-          all=$(go list ./...)
-          rest=()
-          store_count=0
-          platform_count=0
-          httpapi_count=0
-          coordination_count=0
-          while IFS= read -r package; do
-            [[ -n "$package" ]] || exit 1
-            if [[ "$package" == "$store" ]]; then
-              store_count=$((store_count + 1))
-            elif [[ "$package" == "$platform" ]]; then
-              platform_count=$((platform_count + 1))
-            elif [[ "$package" == "$httpapi" ]]; then
-              httpapi_count=$((httpapi_count + 1))
-            elif [[ "$package" == "$coordination" ]]; then
-              coordination_count=$((coordination_count + 1))
-            else
-              rest+=("$package")
-            fi
-          done <<< "$all"
-          [[ "$store_count" -eq 1 && "$platform_count" -eq 1 && "$httpapi_count" -eq 1 && "$coordination_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
-          go test -race "${rest[@]}"
-      - run: go vet ./...
-      - name: Record benchmark metrics
-        run: |
-          set -euo pipefail
-          # Keep only complete standard benchmark records, never raw test output.
-          go test -run '^$' -bench . -benchmem ./... |
-            awk '
-              BEGIN { number = "^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$" }
-              $1 ~ /^Benchmark[A-Za-z0-9_.\/=+-]+$/ &&
-              $2 ~ /^[0-9]+$/ && $3 ~ number && $4 == "ns/op" {
-                if (NF == 10 && $5 ~ number && $6 == "MB/s") {
-                  bytes = 7
-                } else if (NF == 8) {
-                  bytes = 5
-                } else {
-                  next
-                }
-                if ($bytes !~ /^[0-9]+$/ || $(bytes + 1) != "B/op" ||
-                    $(bytes + 2) !~ /^[0-9]+$/ || $(bytes + 3) != "allocs/op") next
-                $1 = $1
-                print
-              }
-            ' > "$RUNNER_TEMP/go-benchmarks.txt"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: go-benchmarks
-          path: ${{ runner.temp }}/go-benchmarks.txt
-          if-no-files-found: error
-          retention-days: 7
-
-  web:
-    name: Web
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
+          python3 .github/scripts/test-ci-scheduling.py -v
+          python3 .github/scripts/test-store-shard.py -v
       - uses: actions/setup-node@v7
+        if: ${{ steps.plan.outputs.mode == 'feedback' && (steps.plan.outputs.web == 'true' || steps.plan.outputs.bridge == 'true') }}
         with:
-          node-version: '22.x'
-          check-latest: true
+          node-version: ${{ steps.plan.outputs.bridge == 'true' && '24.13.0' || '22.x' }}
           cache: npm
-          cache-dependency-path: web/package-lock.json
-      - run: npm ci
-      - run: npm test
-      - run: npm run typecheck
-      - run: npm run build
+          cache-dependency-path: |
+            web/package-lock.json
+            extensions/pi-bridge/package-lock.json
+      - name: Targeted draft feedback
+        run: python3 .github/scripts/ci-plan.py feedback "$RUNNER_TEMP/ci-plan.json"
 
-  pi-bridge:
-    name: Pi bridge
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: extensions/pi-bridge
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24.13.0'
-          cache: npm
-          cache-dependency-path: extensions/pi-bridge/package-lock.json
-      - run: npm ci --ignore-scripts --no-audit --no-fund
-      - run: npm test
-      - run: npm run typecheck
+  # Concurrency wraps the reusable call, and is held until its final gate finishes.
+  # FIFO is by admission arrival, not PR creation. Native queues retain up to 100 pending per bucket.
+  full:
+    name: Full suite
+    needs: feedback
+    if: ${{ needs.feedback.outputs.mode == 'full' }}
+    concurrency:
+      group: ci-full-${{ needs.feedback.outputs.bucket }}
+      queue: max
+      cancel-in-progress: false
+    uses: ./.github/workflows/ci-full.yml
+    with:
+      sha: ${{ needs.feedback.outputs.sha }}
+      tree: ${{ needs.feedback.outputs.tree }}

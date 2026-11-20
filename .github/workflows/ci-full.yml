@@ -1,0 +1,240 @@
+name: Full validation
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        type: string
+        required: true
+      tree:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  go-shards:
+    name: Go ${{ matrix.profile }} worker ${{ matrix.worker }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      # Two admitted suites use at most eight shard runners, leaving room for fast feedback.
+      max-parallel: 4
+      matrix:
+        include: [{"profile":"store","worker":0},{"profile":"store","worker":1},{"profile":"store","worker":2},{"profile":"store","worker":3},{"profile":"store","worker":4},{"profile":"store","worker":5},{"profile":"store","worker":6},{"profile":"store","worker":7},{"profile":"store","worker":8},{"profile":"store","worker":9},{"profile":"store","worker":10},{"profile":"store","worker":11},{"profile":"store","worker":12},{"profile":"store","worker":13},{"profile":"store","worker":14},{"profile":"store","worker":15},{"profile":"platform","worker":0},{"profile":"platform","worker":1},{"profile":"platform","worker":2},{"profile":"httpapi","worker":0},{"profile":"httpapi","worker":1}]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Run and verify logical slots
+        env:
+          SHARD_PROFILE: ${{ matrix.profile }}
+          SHARD_WORKER: ${{ matrix.worker }}
+          CHECKOUT_SHA: ${{ inputs.sha }}
+          CHECKOUT_TREE: ${{ inputs.tree }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ci-shards.py run "$SHARD_PROFILE" "$SHARD_WORKER" "$RUNNER_TEMP/shard-evidence" \
+            --run-id "$GITHUB_RUN_ID" --sha "$CHECKOUT_SHA" --tree "$CHECKOUT_TREE"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.profile }}-worker-v1-${{ matrix.worker }}
+          path: ${{ runner.temp }}/shard-evidence
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+
+  go-other:
+    name: Go ordinary and remaining race
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Ordinary test coordination package
+        run: go test -count=1 ./internal/coordination
+      - name: Race test coordination package
+        run: go test -count=1 -race ./internal/coordination
+      - name: Race test all other packages
+        run: |
+          set -euo pipefail
+          store=$(go list ./internal/store)
+          platform=$(go list ./internal/platform)
+          httpapi=$(go list ./internal/httpapi)
+          coordination=$(go list ./internal/coordination)
+          [[ -n "$store" && "$store" != *$'\n'* &&
+             -n "$platform" && "$platform" != *$'\n'* &&
+             -n "$httpapi" && "$httpapi" != *$'\n'* &&
+             -n "$coordination" && "$coordination" != *$'\n'* &&
+             "$store" != "$platform" && "$store" != "$coordination" && "$platform" != "$coordination" &&
+             "$httpapi" != "$store" && "$httpapi" != "$platform" && "$httpapi" != "$coordination" ]] || exit 1
+          all=$(go list ./...)
+          rest=()
+          store_count=0
+          platform_count=0
+          httpapi_count=0
+          coordination_count=0
+          while IFS= read -r package; do
+            [[ -n "$package" ]] || exit 1
+            if [[ "$package" == "$store" ]]; then
+              store_count=$((store_count + 1))
+            elif [[ "$package" == "$platform" ]]; then
+              platform_count=$((platform_count + 1))
+            elif [[ "$package" == "$httpapi" ]]; then
+              httpapi_count=$((httpapi_count + 1))
+            elif [[ "$package" == "$coordination" ]]; then
+              coordination_count=$((coordination_count + 1))
+            else
+              rest+=("$package")
+            fi
+          done <<< "$all"
+          [[ "$store_count" -eq 1 && "$platform_count" -eq 1 && "$httpapi_count" -eq 1 && "$coordination_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
+          go test -race "${rest[@]}"
+
+  go-vet:
+    name: Go vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: go vet ./...
+
+  go-benchmarks:
+    name: Go benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Record benchmark metrics
+        run: |
+          set -euo pipefail
+          # Keep only complete standard benchmark records, never raw test output.
+          go test -run '^$' -bench . -benchmem ./... |
+            awk '
+              BEGIN { number = "^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$" }
+              $1 ~ /^Benchmark[A-Za-z0-9_.\/=+-]+$/ &&
+              $2 ~ /^[0-9]+$/ && $3 ~ number && $4 == "ns/op" {
+                if (NF == 10 && $5 ~ number && $6 == "MB/s") {
+                  bytes = 7
+                } else if (NF == 8) {
+                  bytes = 5
+                } else {
+                  next
+                }
+                if ($bytes !~ /^[0-9]+$/ || $(bytes + 1) != "B/op" ||
+                    $(bytes + 2) !~ /^[0-9]+$/ || $(bytes + 3) != "allocs/op") next
+                $1 = $1
+                print
+              }
+            ' > "$RUNNER_TEMP/go-benchmarks.txt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: go-benchmarks
+          path: ${{ runner.temp }}/go-benchmarks.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+          check-latest: true
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
+
+  pi-bridge:
+    name: Pi bridge
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: extensions/pi-bridge
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.13.0'
+          cache: npm
+          cache-dependency-path: extensions/pi-bridge/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - run: npm run typecheck
+
+  # This stable check exists only inside an admitted full suite, never on draft-only/ignored events.
+  gate:
+    name: Full CI
+    needs: ["go-shards", "go-other", "go-vet", "go-benchmarks", "web", "pi-bridge"]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - name: Check required results
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 .github/scripts/ci-gate.py
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: '*-worker-v1-*'
+          path: ${{ runner.temp }}/shard-workers
+          merge-multiple: false
+      - name: Verify all worker shapes and logical coverage
+        env:
+          CHECKOUT_SHA: ${{ inputs.sha }}
+          CHECKOUT_TREE: ${{ inputs.tree }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ci-shards.py aggregate "$RUNNER_TEMP/shard-workers" \
+            --run-id "$GITHUB_RUN_ID" --sha "$CHECKOUT_SHA" --tree "$CHECKOUT_TREE"
