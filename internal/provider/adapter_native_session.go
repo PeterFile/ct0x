@@ -59,6 +59,10 @@ const (
 	piInvestigationBridgeImplSHA  = "c6e571fbeed7b6f78ea1a8b7b044babca691923297d1803a3aaaeb5b6c6eeb2b"
 	// #200 used the same parser and tool contracts, with older descriptions.
 	piInvestigationBridgeEntry200SHA = "39d5528abee0b6b39d0088d265dbe4d51c9c00eb9f43fe1d4d6be9d2383a7a82"
+	// The earlier explanation pair remains eligible only for legacy profiles.
+	// It cannot accept a fresh explanation grant without pre-send evidence.
+	piPreJournalBridgeEntrySHA = "dc5c17fe9f5d783d1be2becb1c47e38b01443d2f85e23e8243ddb3100853902b"
+	piPreJournalBridgeImplSHA  = "85bfc85b5ebda50b7bcddb64966f1f730838c5437c4e2d9caef4251f0fe274d5"
 )
 
 // PiNativeSessionBridgeSupported qualifies only the actual trusted native release
@@ -81,10 +85,18 @@ func PiInvestigationBridgeSupported(extensionPath string) bool {
 // PiCombinedIntakeBridgeSupported requires the pair whose tool descriptions
 // distinguish investigation from fresh Task Work continuation.
 func PiCombinedIntakeBridgeSupported(extensionPath string) bool {
-	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA) != ""
+	return PiRunExplanationBridgeSupported(extensionPath) ||
+		qualifyPiBridgePair(extensionPath, piPreJournalBridgeImplSHA, piPreJournalBridgeEntrySHA) != "" ||
+		qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA) != ""
 }
 
 func qualifyPiInvestigationBridge(extensionPath string) string {
+	if entry := qualifyPiRunExplanationBridge(extensionPath); entry != "" {
+		return entry
+	}
+	if entry := qualifyPiBridgePair(extensionPath, piPreJournalBridgeImplSHA, piPreJournalBridgeEntrySHA); entry != "" {
+		return entry
+	}
 	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA, piInvestigationBridgeEntry200SHA)
 }
 
@@ -222,7 +234,13 @@ func (e piDigestBoundExecutor) Execute(ctx context.Context, request ExecuteReque
 	// selected CLI/loader, its environment and the trusted extension ancestry
 	// must still be stable through load; this is not a same-UID code sandbox.
 	qualify := qualifyPiNativeBridge
-	if e.investigationBridge {
+	switch {
+	case e.memberTools.runExplanation != "":
+		if request.RunID != e.memberTools.runExplanation {
+			return ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "公开运行说明的运行绑定不匹配，执行未启动"}
+		}
+		qualify = qualifyPiRunExplanationBridge
+	case e.investigationBridge:
 		qualify = qualifyPiInvestigationBridge
 	}
 	if qualify(e.configuredBridge) != e.memberTools.extensionPath {

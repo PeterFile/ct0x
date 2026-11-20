@@ -28,6 +28,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if err := config.validateNativeSessionConfig(); err != nil {
 		return nil, nil, nil, err
 	}
+	if err := config.validateRunExplanationConfig(); err != nil {
+		return nil, nil, nil, err
+	}
 	if err := config.validateInvestigationDataDir(); err != nil {
 		return nil, nil, nil, err
 	}
@@ -90,7 +93,13 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			ConfigRoot: root, Endpoint: endpoint, MaxGroupMembers: config.memberToolsMaxMembers,
 			Operations: []string{"list_members", "read_channel", "send_message", "create_member", "search_history", "read_history"},
 		}
-		if config.enableNativeSessionResume {
+		if config.enableRunExplanation {
+			if !engine.UsesStore(db) {
+				return nil, nil, nil, errors.New("公开运行说明须使用同一数据库")
+			}
+			toolOptions.RunExplanation = engine
+		}
+		if config.enableNativeSessionResume || config.enableRunExplanation {
 			toolOptions.NativeExecutionRoot = schedulerOptions.RuntimeDir
 		}
 		if config.enableCoordinationRoles {
