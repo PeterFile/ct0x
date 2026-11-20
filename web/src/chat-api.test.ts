@@ -205,6 +205,46 @@ it("reads optional investigation scope and capability observations separately wi
     await expect(getChatPolicy(group.id)).resolves.toEqual(reply);
   }
 });
+it("round-trips exact investigation clue terms and rejects a PUT receipt that drops or changes them", async () => {
+  const clue_terms = [" 导出", "只有表头"];
+  const investigation = { ...topicInvestigation, clue_terms };
+  const actual = { ...policy, investigation, investigation_supported: true };
+  const command = { ...input, investigation };
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(json(actual)).mockResolvedValueOnce(json(actual));
+  vi.stubGlobal("fetch", transport);
+  await expect(getChatPolicy(group.id)).resolves.toEqual(actual);
+  await expect(setChatPolicy(group.id, command, "clue-opt-in")).resolves.toEqual(actual);
+  expect(JSON.parse(String(transport.mock.calls[1][1]?.body))).toEqual(command);
+  for (const changed of [undefined, ["导出", "只有表头"], [...clue_terms].reverse()]) {
+    transport.mockResolvedValueOnce(json({ ...actual, investigation: { ...investigation, clue_terms: changed } }));
+    await expect(setChatPolicy(group.id, command, "clue-opt-in")).rejects.toMatchObject({ code: "invalid_response" });
+    expect(transport.mock.calls.at(-1)).toEqual(transport.mock.calls[1]);
+  }
+});
+it("rejects invalid configured clue terms on reads and before PUT", async () => {
+  const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
+  for (const clue_terms of [[], [""], ["　"], ["a", "a"], ["a\nb"], ["a\rb"], ["a\0b"], ["\ud800"],
+    ["雪".repeat(22)], Array.from({ length: 9 }, (_, n) => String(n))]) {
+    const investigation = { ...topicInvestigation, clue_terms };
+    transport.mockResolvedValueOnce(json({ ...policy, investigation }));
+    await expect(getChatPolicy(group.id)).rejects.toMatchObject({ code: "invalid_response" });
+    const count = transport.mock.calls.length;
+    await expect(setChatPolicy(group.id, { ...input, investigation }, "invalid-terms")).rejects.toMatchObject({ code: "invalid_input" });
+    expect(transport).toHaveBeenCalledTimes(count);
+  }
+});
+it("sends and verifies both investigation clue terms and automatic text dispatch", async () => {
+  const investigation = { ...topicInvestigation, clue_terms: [" 导出", "只有表头"] };
+  const command = { ...input, investigation, automatic_text_dispatch: true };
+  const actual = { ...policy, investigation, automatic_text_dispatch: true, investigation_supported: true };
+  const transport = vi.fn<typeof fetch>().mockResolvedValueOnce(json(actual)); vi.stubGlobal("fetch", transport);
+  await expect(setChatPolicy(group.id, command, "combined-policy-opt-in")).resolves.toEqual(actual);
+  expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toEqual(command);
+  for (const incomplete of [{ ...actual, investigation: topicInvestigation }, { ...actual, automatic_text_dispatch: undefined }]) {
+    transport.mockResolvedValueOnce(json(incomplete));
+    await expect(setChatPolicy(group.id, command, "combined-policy-opt-in")).rejects.toMatchObject({ code: "invalid_response" });
+  }
+});
 it("rejects malformed investigation scope and capability fields in policy reads", async () => {
   const transport = vi.fn<typeof fetch>(); vi.stubGlobal("fetch", transport);
   for (const change of [
