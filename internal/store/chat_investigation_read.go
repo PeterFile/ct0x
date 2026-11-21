@@ -130,7 +130,7 @@ func (s *Store) ReadInvestigationChannel(ctx context.Context, role CoordinationT
 	if !scope.AllowTopicMessages {
 		return Page[domain.Message]{}, ErrMemberToolDenied
 	}
-	page, err := readCurrentChannelInTx(ctx, tx, role.Member, options)
+	page, err := readCurrentChannelInTx(ctx, tx, role.Member, options, storageHistory)
 	if err != nil {
 		return Page[domain.Message]{}, memberToolOperationError(action, err)
 	}

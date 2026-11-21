@@ -145,15 +145,15 @@ it("keeps submitted results, pending pagination and complete detail unchanged by
   expect(read(older.id)).toBeVisible(); expect(params(1).get("topic_id")).toBe(topic); expect(params(1).get("before")).toBe("original-cursor");
   expect(detail().getByText("原始完整消息")).toBeVisible(); expect(details).toHaveBeenCalledTimes(1);
 });
-it("finds a raw CRLF topic through entire-group fallback and retains its exact server topic in the full-read URL", async () => {
+it("finds and reads a raw CRLF topic under whole-group fallback without inventing a topic filter", async () => {
   const topic = " section\r\nline ", source = row("raw-topic-message", "含换行话题的搜索结果", topic);
   reads.mockResolvedValueOnce(page([source])); details.mockResolvedValueOnce(json({ ...source, content: "含换行话题的完整原文" }));
   open(); scope("topic"); change("话题 ID", "previous-valid-topic");
   topicEntry(panel().getByRole("textbox", { name: "话题 ID" }), "drop", topic); search("关键词"); expect(reads).not.toHaveBeenCalled();
   scope("all"); submit(); fireEvent.click(await panel().findByRole("button", { name: `读取完整消息 ${source.id}` }));
   await detail().findByText("含换行话题的完整原文"); expect(params(0).has("topic_id")).toBe(false);
-  expect(details.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history/${source.id}?topic_id=+section%0D%0Aline+`);
-  expect(new URL(String(details.mock.calls[0][0]), "http://localhost").searchParams.get("topic_id")).toBe(topic);
+  expect(detail().getByText(topic, { normalizer: text => text })).toBeVisible();
+  expect(details.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history/${source.id}`);
 });
 
 it("rejects blank keywords and missing specified IDs locally, but leaves nonblank length validation to the backend", async () => {
@@ -205,7 +205,54 @@ it("labels bounded previews as excerpts, retains source IDs and reads complete a
   await act(async () => pending.resolve(json(full)));
   expect(detail().getByText(full.content, { normalizer: text => text })).toBeVisible();
   expect(screen.getByRole("region", { name: "历史消息搜索" }).querySelector("img, b")).toBeNull();
-  expect(details.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history/%E5%8E%9F%E5%A7%8B%2F%E6%B6%88%E6%81%AF%3F%2B%23?topic_id=%E8%AF%9D%E9%A2%98%2F%E5%8E%9F%E5%A7%8B`);
+  expect(details.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history/%E5%8E%9F%E5%A7%8B%2F%E6%B6%88%E6%81%AF%3F%2B%23`);
+});
+
+it("opens a corrected-in original using the submitted topic, not its recorded topic or the changed draft", async () => {
+  const topic = " 话题/值班+ ", source = { ...row("corrected", "阈值摘要"), effective_topic_id: topic };
+  const full = { ...source, content: "完整原文：连续两次失败才通知。" };
+  reads.mockResolvedValueOnce(page([source])); details.mockResolvedValueOnce(json(full));
+  open(); scope("topic"); change("话题 ID", topic); search("阈值");
+  const hit = within(await results().findByRole("article", { name: `搜索结果 ${source.id}` }));
+  expect(hit.getByText("主频道", { exact: true })).toBeVisible();
+  change("话题 ID", "没有提交的新话题"); scope("all"); change("关键词", "新草稿");
+  fireEvent.click(read(source.id));
+  expect(await detail().findByText(full.content)).toBeVisible();
+  expect(detail().getByText("主频道", { exact: true })).toBeVisible();
+  expect(detail().getByText(source.id)).toBeVisible();
+  expect(params(0).get("topic_id")).toBe(topic);
+  expect(details.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history/${source.id}?${new URLSearchParams({ topic_id: topic })}`);
+  expect(transport).toHaveBeenCalledTimes(2);
+});
+
+it("does not broaden a stale scoped result on missing or mismatched detail; a new whole-group search can read the original", async () => {
+  const topic = "was-effective", original = row("moved", "原文摘录", "recorded-topic");
+  const full = { ...original, content: "在全群范围内可读的完整原文" };
+  reads.mockResolvedValueOnce(page([{ ...original, effective_topic_id: topic }]));
+  details.mockResolvedValueOnce(json({ error: { code: "not_found" } }, 404));
+  open(); scope("topic"); change("话题 ID", topic); search();
+  fireEvent.click(await results().findByRole("button", { name: `读取完整消息 ${original.id}` }));
+  expect(await detail().findByRole("alert")).toHaveTextContent("404");
+  expect(detail().queryByText(full.content)).not.toBeInTheDocument();
+  expect(detail().getByText(original.topic_id)).toBeVisible();
+  expect(details).toHaveBeenCalledTimes(1);
+
+  scope("all"); // Editing a draft must not broaden the retry.
+  details.mockResolvedValueOnce(json({ ...full, effective_topic_id: "moved-away" }));
+  fireEvent.click(detail().getByRole("button", { name: "重试读取完整消息" }));
+  expect(await detail().findByRole("alert")).toHaveTextContent("服务响应不符合约定");
+  expect(detail().queryByText(full.content)).not.toBeInTheDocument();
+  details.mockResolvedValueOnce(json({ ...full, topic_id: topic })); // A matching scope cannot replace recorded provenance.
+  fireEvent.click(detail().getByRole("button", { name: "重试读取完整消息" }));
+  expect(await detail().findByRole("alert")).toHaveTextContent("服务响应不符合约定");
+  expect(detail().queryByText(full.content)).not.toBeInTheDocument();
+  expect(details.mock.calls.map(([path]) => path)).toEqual(Array(3).fill(`/api/v1/groups/${group.id}/history/${original.id}?topic_id=${topic}`));
+
+  reads.mockResolvedValueOnce(page([original])); details.mockResolvedValueOnce(json(full));
+  submit(); fireEvent.click(await results().findByRole("button", { name: `读取完整消息 ${original.id}` }));
+  expect(await detail().findByText(full.content)).toBeVisible();
+  expect(params(1).has("topic_id")).toBe(false);
+  expect(details.mock.calls[3][0]).toBe(`/api/v1/groups/${group.id}/history/${original.id}`);
 });
 
 it("keeps results and detail while paging, retries the same submitted scope and appends unique older results in server order", async () => {
@@ -302,16 +349,17 @@ it.each([200, 503])("keeps detail bound to the selected result when a previous s
   const current = deferred<Response>(); details.mockReturnValueOnce(current.promise); fireEvent.click(read(b.id));
   expect(details.mock.calls[0][1]?.signal?.aborted).toBe(true); expect(detail().getByText(b.id)).toBeVisible();
   expect(detail().queryByText(a.id)).not.toBeInTheDocument();
-  expect(details.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history/${a.id}?topic_id=`);
-  expect(new URL(String(details.mock.calls[1][0]), "http://localhost").searchParams.get("topic_id")).toBe(b.topic_id);
+  expect(details.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history/${a.id}`);
+  expect(details.mock.calls[1][0]).toBe(`/api/v1/groups/${group.id}/history/${b.id}`);
   await act(async () => current.resolve(json({ ...b, content: "B 的完整消息" })));
   await act(async () => stale.resolve(status === 200 ? json({ ...a, content: "过期 A 全文" }) : json({}, status)));
   expect(detail().getByText("B 的完整消息")).toBeVisible(); expect(detail().queryByText("过期 A 全文")).not.toBeInTheDocument();
   expect(detail().queryByRole("alert")).not.toBeInTheDocument();
 });
 it("retries a failed complete read for its original result without using the search content as full detail", async () => {
-  reads.mockResolvedValueOnce(page([message])); details.mockResolvedValueOnce(json({}, 404)); open(); search();
+  reads.mockResolvedValueOnce(page([message])); details.mockResolvedValueOnce(json({}, 404)); open(); scope("main"); search();
   fireEvent.click(await panel().findByRole("button", { name: `读取完整消息 ${message.id}` }));
+  expect(details.mock.calls[0][0]).toBe(`/api/v1/groups/${group.id}/history/${message.id}?topic_id=`);
   expect(await detail().findByRole("alert")).toHaveTextContent("404");
   expect(detail().queryByText(message.content)).not.toBeInTheDocument(); expect(detail().getByText(message.id)).toBeVisible();
   scope("topic"); change("话题 ID", "未提交话题"); change("关键词", "未提交关键词");

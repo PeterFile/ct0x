@@ -4,14 +4,24 @@ import (
 	"context"
 	"database/sql"
 	"slices"
+	"time"
 
 	"agentworkspace/internal/domain"
 )
 
-// ListPreparationHistory returns the newest messages strictly before the trigger
-// in its authoritative group/topic, ordered oldest first and without deliveries.
-// Zero limit selects 50; explicit limits must be 1 through 200.
+// ListPreparationHistory uses the trigger's storage topic as the bound scope
+// and the current effective membership of ordinary history candidates. The
+// result is oldest first and without deliveries. Zero limit selects 50.
 func (s *Store) ListPreparationHistory(ctx context.Context, groupID, triggerMessageID string, limit int) ([]domain.Message, error) {
+	return s.listPreparationHistory(ctx, groupID, triggerMessageID, limit, effectiveHistory)
+}
+
+// ListStoredPreparationHistory preserves storage-scoped context for task roles.
+func (s *Store) ListStoredPreparationHistory(ctx context.Context, groupID, triggerMessageID string, limit int) ([]domain.Message, error) {
+	return s.listPreparationHistory(ctx, groupID, triggerMessageID, limit, storageHistory)
+}
+
+func (s *Store) listPreparationHistory(ctx context.Context, groupID, triggerMessageID string, limit int, mode historyScopeMode) ([]domain.Message, error) {
 	const action = "读取准备历史失败"
 	limit, err := listLimit(ListOptions{Limit: limit})
 	if err != nil {
@@ -22,15 +32,16 @@ func (s *Store) ListPreparationHistory(ctx context.Context, groupID, triggerMess
 		return nil, queueError(action, err)
 	}
 	defer tx.Rollback()
-	trigger, err := scanMessage(tx.QueryRowContext(ctx,
-		"SELECT "+messageColumns+" FROM messages WHERE group_id=? AND id=?", groupID, triggerMessageID))
+	var topic, stamp string
+	if err := tx.QueryRowContext(ctx, `SELECT topic_id,created_at FROM main.messages WHERE group_id=? AND id=?`, groupID, triggerMessageID).
+		Scan(&topic, &stamp); err != nil {
+		return nil, queueError(action, err)
+	}
+	createdAt, err := time.Parse(timestampLayout, stamp)
 	if err != nil {
 		return nil, queueError(action, err)
 	}
-	rows, err := tx.QueryContext(ctx, "SELECT "+messageColumns+` FROM messages
-	 WHERE group_id=? AND topic_id=? AND (created_at, id) < (?, ?)
-	 ORDER BY created_at DESC, id DESC LIMIT ?`,
-		groupID, trigger.TopicID, trigger.CreatedAt.UTC().Format(timestampLayout), trigger.ID, limit)
+	rows, err := scopedThreadMessagesInTx(ctx, tx, groupID, topic, mode, &Cursor{CreatedAt: createdAt, ID: triggerMessageID}, "", limit)
 	if err != nil {
 		return nil, queueError(action, err)
 	}
@@ -40,6 +51,9 @@ func (s *Store) ListPreparationHistory(ctx context.Context, groupID, triggerMess
 		m, err := scanMessage(rows)
 		if err != nil {
 			return nil, queueError(action, err)
+		}
+		if mode == effectiveHistory {
+			projectEffectiveTopic(&m, topic)
 		}
 		history = append(history, m)
 	}

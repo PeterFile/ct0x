@@ -40,6 +40,19 @@ it.each([undefined, "", " 话题 /?+ ", " \t\u3000 "])("preserves exact topic %j
   expect(detailPath).toBe(`/api/v1/groups/${group.id}/history/${message.id}${topic === undefined ? "" : `?${new URLSearchParams({ topic_id: topic })}`}`);
 });
 
+it.each([["", " 话题/🙂+ "], ["recorded-topic", ""], ["recorded-topic", `${"话".repeat(84)}🙂`]])(
+  "keeps recorded topic %j while authorizing by effective selector %j", async (recorded, effective) => {
+    const result = { ...message, topic_id: recorded, effective_topic_id: effective,
+      source_kind: "local_user_chat", source_id: "recorded-command" };
+    transport.mockResolvedValueOnce(page([result])).mockResolvedValueOnce(json(result));
+    await expect(searchHistory(group.id, { q: "词", topic_id: effective })).resolves.toEqual({ items: [result], next_cursor: "" });
+    await expect(readHistory(group.id, result.id, effective)).resolves.toEqual(result);
+    for (const [path] of transport.mock.calls) {
+      expect(new URL(String(path), "http://localhost").searchParams.get("topic_id")).toBe(effective);
+    }
+  },
+);
+
 it("encodes both detail IDs and only includes its exact topic filter and abort signal", async () => {
   const groupId = "群/组?+", id = "原文/一?+#", topic = " \t话题+ ";
   const result = { ...message, id, group_id: groupId, topic_id: topic, deliveries: [] };
@@ -82,6 +95,23 @@ it.each([["", "topic"], ["topic", ""], [" \t ", ""], [" 话题 ", "话题"]])(
     await expect(readHistory(group.id, message.id, requested)).rejects.toMatchObject({ code: "invalid_response" });
   },
 );
+it.each([null, 42, [], {}, "a\0b", "\ud800", "话".repeat(86), "\u{1f642}".repeat(65)])(
+  "rejects invalid effective selector %# even when the recorded topic would match", async effective => {
+    const invalid = { ...message, topic_id: "recorded", effective_topic_id: effective };
+    transport.mockResolvedValueOnce(page([invalid])).mockResolvedValueOnce(json(invalid));
+    await expect(searchHistory(group.id, { q: "词", topic_id: "recorded" })).rejects.toMatchObject({ status: 200, code: "invalid_response" });
+    await expect(readHistory(group.id, message.id)).rejects.toMatchObject({ status: 200, code: "invalid_response" });
+  },
+);
+it.each([
+  ["wrong effective topic despite matching recorded topic", { ...message, topic_id: "wanted", effective_topic_id: "different" }],
+  ["foreign group despite matching effective topic", { ...message, group_id: other.id, effective_topic_id: "wanted" }],
+])("rejects corrected history with %s", async (_label, invalid) => {
+  transport.mockResolvedValueOnce(page([{ ...message, id: "valid", topic_id: "wanted", deliveries: [] }, invalid]))
+    .mockResolvedValueOnce(json(invalid));
+  await expect(searchHistory(group.id, { q: "词", topic_id: "wanted" })).rejects.toMatchObject({ status: 200, code: "invalid_response" });
+  await expect(readHistory(group.id, message.id, "wanted")).rejects.toMatchObject({ status: 200, code: "invalid_response" });
+});
 it("rejects another detail ID even inside the correct group and topic", async () => {
   transport.mockResolvedValueOnce(json({ ...message, id: "another-message", deliveries: [] }));
   await expect(readHistory(group.id, message.id, "")).rejects.toMatchObject({ code: "invalid_response" });
