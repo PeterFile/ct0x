@@ -391,6 +391,10 @@ func writeMemberToolPage[T any](w http.ResponseWriter, page store.Page[T], scope
 
 func memberToolError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, store.ErrAgentRunExplanationUnknown):
+		WriteError(w, http.StatusServiceUnavailable, "run_explanation_unknown", store.ErrAgentRunExplanationUnknown.Error())
+	case errors.Is(err, store.ErrAgentRunExplanationUnavailable):
+		WriteError(w, http.StatusServiceUnavailable, "run_explanation_unavailable", store.ErrAgentRunExplanationUnavailable.Error())
 	case errors.Is(err, store.ErrMemberToolDenied):
 		WriteError(w, http.StatusForbidden, "forbidden", "无权访问成员工具")
 	case errors.Is(err, store.ErrMemberCapacity):

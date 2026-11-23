@@ -59,8 +59,14 @@ const (
 	piInvestigationBridgeImplSHA  = "c6e571fbeed7b6f78ea1a8b7b044babca691923297d1803a3aaaeb5b6c6eeb2b"
 	// #200 used the same parser and tool contracts, with older descriptions.
 	piInvestigationBridgeEntry200SHA = "39d5528abee0b6b39d0088d265dbe4d51c9c00eb9f43fe1d4d6be9d2383a7a82"
-	piDiscussionRelayBridgeEntrySHA  = "a9178ae8ad54ea8ce834c9594dbbf407222be70f60ccb35d45506cb7f9855737"
-	piDiscussionRelayBridgeImplSHA   = "17c987936c185fd11ea8c5c26855aa15c9707d393fac1152c1bbb2d1eaa035d4"
+	// The earlier explanation pair remains eligible only for legacy profiles.
+	// It cannot accept a fresh explanation grant without pre-send evidence.
+	piPreJournalBridgeEntrySHA      = "dc5c17fe9f5d783d1be2becb1c47e38b01443d2f85e23e8243ddb3100853902b"
+	piPreJournalBridgeImplSHA       = "85bfc85b5ebda50b7bcddb64966f1f730838c5437c4e2d9caef4251f0fe274d5"
+	piDiscussionRelayBridgeEntrySHA = "a9178ae8ad54ea8ce834c9594dbbf407222be70f60ccb35d45506cb7f9855737"
+	piDiscussionRelayBridgeImplSHA  = "17c987936c185fd11ea8c5c26855aa15c9707d393fac1152c1bbb2d1eaa035d4"
+	piIntegratedBridgeEntrySHA      = "35e10bcfef2635f1732747de667308ca6c79b449b73876667d819f4e501ababa"
+	piIntegratedBridgeImplSHA       = "f138eb8b5203ab2a65c71c41f0cb7e4e8eaad0a0f509f029df5ed8a804d96cde"
 )
 
 // PiNativeSessionBridgeSupported qualifies only the actual trusted native release
@@ -83,7 +89,9 @@ func PiInvestigationBridgeSupported(extensionPath string) bool {
 // PiCombinedIntakeBridgeSupported requires the pair whose tool descriptions
 // distinguish investigation from fresh Task Work continuation.
 func PiCombinedIntakeBridgeSupported(extensionPath string) bool {
-	return PiDiscussionRelayBridgeSupported(extensionPath) || qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA) != ""
+	return PiDiscussionRelayBridgeSupported(extensionPath) || PiRunExplanationBridgeSupported(extensionPath) ||
+		qualifyPiBridgePair(extensionPath, piPreJournalBridgeImplSHA, piPreJournalBridgeEntrySHA) != "" ||
+		qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA) != ""
 }
 
 // PiDiscussionRelayBridgeSupported qualifies the installed relay-aware pair,
@@ -97,7 +105,13 @@ func qualifyPiDiscussionRelayBridge(extensionPath string) string {
 }
 
 func qualifyPiInvestigationBridge(extensionPath string) string {
+	if entry := qualifyPiRunExplanationBridge(extensionPath); entry != "" {
+		return entry
+	}
 	if entry := qualifyPiDiscussionRelayBridge(extensionPath); entry != "" {
+		return entry
+	}
+	if entry := qualifyPiBridgePair(extensionPath, piPreJournalBridgeImplSHA, piPreJournalBridgeEntrySHA); entry != "" {
 		return entry
 	}
 	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA, piInvestigationBridgeEntry200SHA)
@@ -110,11 +124,21 @@ func qualifyPiBridgePair(extensionPath, implSHA string, entrySHAs ...string) str
 	// Pass the physical entry to Pi so the loader and this check agree on the
 	// base of the relative import, even with a configured symlink alias.
 	entry, err := filepath.EvalSymlinks(extensionPath)
-	if err != nil || filepath.Base(entry) != "index.ts" || !piBridgeBytesMatch(entry, entrySHAs...) ||
-		!piBridgeBytesMatch(filepath.Join(filepath.Dir(entry), "bridge.mjs"), implSHA) {
+	if err != nil || filepath.Base(entry) != "index.ts" {
 		return ""
 	}
-	return entry
+	impl := filepath.Join(filepath.Dir(entry), "bridge.mjs")
+	if piBridgeBytesMatch(entry, entrySHAs...) && piBridgeBytesMatch(impl, implSHA) {
+		return entry
+	}
+	// The integrated release is an exact alternative to either optional
+	// profile's original pair. Never accept a mix of entry and parser releases.
+	integratedOK := implSHA == piRunExplanationImplSHA && slices.Contains(entrySHAs, piRunExplanationEntrySHA) ||
+		implSHA == piDiscussionRelayBridgeImplSHA && slices.Contains(entrySHAs, piDiscussionRelayBridgeEntrySHA)
+	if integratedOK && piBridgeBytesMatch(entry, piIntegratedBridgeEntrySHA) && piBridgeBytesMatch(impl, piIntegratedBridgeImplSHA) {
+		return entry
+	}
+	return ""
 }
 
 func piBridgeBytesMatch(path string, digests ...string) bool {
@@ -239,9 +263,15 @@ func (e piDigestBoundExecutor) Execute(ctx context.Context, request ExecuteReque
 	// selected CLI/loader, its environment and the trusted extension ancestry
 	// must still be stable through load; this is not a same-UID code sandbox.
 	qualify := qualifyPiNativeBridge
-	if e.discussionRelay {
+	switch {
+	case e.memberTools.runExplanation != "":
+		if request.RunID != e.memberTools.runExplanation {
+			return ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "公开运行说明的运行绑定不匹配，执行未启动"}
+		}
+		qualify = qualifyPiRunExplanationBridge
+	case e.discussionRelay:
 		qualify = qualifyPiDiscussionRelayBridge
-	} else if e.investigationBridge {
+	case e.investigationBridge:
 		qualify = qualifyPiInvestigationBridge
 	}
 	if qualify(e.configuredBridge) != e.memberTools.extensionPath {

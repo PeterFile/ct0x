@@ -179,6 +179,16 @@ func (e *memberToolRuntimeRun) constructExecutor(ctx context.Context, request pr
 		return native, nil, err
 	}
 	if e.nativeSession == nil {
+		if e.explanationBuilder != nil && !e.intake && e.role == nil {
+			entry, found := e.runtime.nativeRegistration(token)
+			if !found {
+				return nil, nil, errMemberToolRuntimeBinding
+			}
+			if entry.runExplanation != nil {
+				native, err := e.explanationBuilder(provider.NativeMemberToolConfig{Path: configPath, SHA256: config.digest}, claim.TurnID, names)
+				return native, nil, err
+			}
+		}
 		native, err := e.factory(configPath, claim.TurnID, names)
 		return native, nil, err
 	}
