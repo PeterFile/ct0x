@@ -9,6 +9,12 @@ import { useMessageFeed } from "./useMessageFeed";
 import { useMessageScroll } from "./useMessageScroll";
 import "./discussion-presentation.css";
 const emptyMembers: Member[] = [];
+const workspaceBeginPrefix = "workspace_begin:";
+function isWorkspaceIntentTrace({ source_kind, source_id }: Message) {
+  // workspace_finish: also covers receipts that require reconciliation; the ID does not distinguish those outcomes.
+  return source_kind === "platform" && source_id !== undefined
+    && source_id.startsWith(workspaceBeginPrefix) && source_id.length > workspaceBeginPrefix.length;
+}
 const deliveryLabel = (state: string) => state === "queued" ? "已入队" : state === "accepted" ? "CLI已接收" : state === "failed" ? "投递失败" : "状态未知";
 function deliverySummary(deliveries: Delivery[]) {
   if (!deliveries.length) return "暂无投递记录";
@@ -51,7 +57,9 @@ function DiscussionScope({ groupId, active, paused, members, recipientSelection 
   groupId: string; active: boolean; paused: boolean; members: Member[]; recipientSelection?: RecipientSelection;
 }) {
   const formId = useId(), feed = useMessageFeed(groupId, active, paused);
-  const scroll = useMessageScroll(active, feed.items, feed.page);
+  const visibleItems = useMemo(() => feed.items.filter(message => !isWorkspaceIntentTrace(message)), [feed.items]);
+  const scroll = useMessageScroll(active, visibleItems, feed.page);
+  // Validate discussion relations against the full loaded window, not just rendered rows.
   const loaded = useMemo(() => new Map(feed.items.map(message => [message.id, message])), [feed.items]);
   const [content, setContent] = useState("");
   const [quote, setQuote] = useState<(Pick<Message, "id" | "sender_id" | "source_kind"> & { excerpt: string }) | null>(null);
@@ -187,15 +195,16 @@ function DiscussionScope({ groupId, active, paused, members, recipientSelection 
       <a href={`#${formId}-content`}>跳至消息输入</a>
       <span className="feed-note">最新页自动更新</span>
     </div>
-    <p className="feed-note">已载入 {feed.items.length} 条（含话题，片段可能有间隔）。</p>
+    <p className="feed-note">已载入 {visibleItems.length} 条（含话题，片段可能有间隔）。</p>
     {feed.pollError ? <p role="status">自动刷新暂不可用：{feed.pollError} 将稍后重试。</p> : null}
     {quoteError ? <p role="alert">无法跳转到被引消息：{quoteError}</p> : null}
     {feed.page.pending ? <p role="status">正在载入消息…</p> : null}
     {feed.page.error ? <div role="alert"><p>{feed.page.error}</p><button type="button" onClick={feed.retry}>重试载入消息</button></div> : null}
-    {!feed.page.pending && !feed.page.error && !feed.items.length ? <p>尚无消息，可发送第一条讨论。</p> : null}
+    {!feed.page.pending && !feed.page.error && !visibleItems.length
+      ? <p>{feed.items.length ? "当前窗口没有讨论消息。" : "尚无消息，可发送第一条讨论。"}</p> : null}
     {feed.page.next ? <button type="button" disabled={feed.page.pending} onClick={() => { scroll.beforeOlder(); void feed.loadPage(feed.page.next, false); }}>加载更早消息</button> : null}
     <RequestWork groupId={groupId} active={active} members={members} ref={requestWork} />
-    <ol className="message-list" aria-label="群组消息" ref={scroll.listRef}>{feed.items.map(message => {
+    <ol className="message-list" aria-label="群组消息" ref={scroll.listRef}>{visibleItems.map(message => {
       const discussion = discussionContextFor(message, loaded);
       const projection = message.reply_to;
       const reference = projection ?? (message.reply_to_message_id

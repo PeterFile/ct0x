@@ -1,8 +1,10 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -23,10 +25,12 @@ func TestPiFreshTaskWorkFlagRequiresSeparateExplicitProfile(t *testing.T) {
 	ordinary := memberToolsEntry(t)
 	entry := filepath.Join(filepath.Dir(ordinary), "fresh-task-work.ts")
 	const flag = "--pi-fresh-task-work-extension"
+	const proposal = "--enable-pi-task-decision-proposals"
 	dir := t.TempDir()
 	base := []string{"--data-dir", dir, "--enable-execution", "--enable-member-tools", "--pi-member-tools-extension", ordinary, "--enable-coordination-roles"}
 	for _, args := range [][]string{
 		{flag, entry},
+		append(slices.Clone(base), proposal),
 		append(slices.Clone(base[:len(base)-1]), flag, entry),
 		append(slices.Clone(base), flag+"="),
 		append(slices.Clone(base), flag, "fresh-task-work.ts"),
@@ -59,8 +63,15 @@ func TestPiFreshTaskWorkFlagRequiresSeparateExplicitProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	providers := []provider.Provider{{ID: "fixture", Name: provider.Pi, Version: "1.4.0", Installation: provider.Installed, Path: pi}}
-	if launch, err := cfg.piFreshTaskWorkLaunch(db, engine, providers); err != nil || launch == nil {
-		t.Fatalf("exact fresh pair plus ordinary entry rejected: %v", err)
+	if launch, err := cfg.piFreshTaskWorkLaunch(db, engine, providers); err != nil || launch == nil || cfg.enablePiTaskDecisionProposals {
+		t.Fatalf("exact fresh pair plus ordinary entry rejected or not separate: %v", err)
+	}
+	on, err := parseConfig(append(slices.Clone(base), flag, entry, proposal), io.Discard)
+	if err != nil || !on.enablePiTaskDecisionProposals {
+		t.Fatalf("explicit proposal opt-in was not accepted: %v", err)
+	}
+	if launch, err := on.piFreshTaskWorkLaunch(db, engine, providers); err != nil || launch == nil || !launch.SupportsTaskDecision(providers[0]) {
+		t.Fatalf("explicit exact proposal profile rejected: %v", err)
 	}
 	if launch, err := cfg.piFreshTaskWorkLaunch(db, nil, providers); err == nil || launch != nil {
 		t.Fatal("startup without B Engine did not fail closed")
@@ -80,47 +91,30 @@ func TestPiFreshTaskWorkFlagRequiresSeparateExplicitProfile(t *testing.T) {
 	}
 	var help strings.Builder
 	_, _ = parseConfig([]string{"--help"}, &help)
-	if !strings.Contains(help.String(), flag) {
-		t.Fatal("fresh option is missing from help")
+	if !strings.Contains(help.String(), flag) || !strings.Contains(help.String(), proposal) {
+		t.Fatal("fresh or proposal option is missing from help")
 	}
 }
 
-// #200 (04cdc956) used the same parser and differed only in these descriptions.
-// Reconstruct the released entry in a temp dir without a second bridge pack.
-func pi200MemberToolsEntry(t *testing.T, current string) string {
+// Use the exact #200 pair (04cdc956), not a rewrite of today's bridge.
+func pi200MemberToolsEntry(t *testing.T) string {
 	t.Helper()
-	data, err := os.ReadFile(current)
+	archive, err := zip.OpenReader("testdata/pi-bridge-200.zip")
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("open released #200 bridge fixture: %v", err)
 	}
-	const start = `  ], { description: "仅受信chat_intake/v1`
-	const end = "    ...chatAssessmentFields,"
-	prefix, rest, found := strings.Cut(string(data), start)
-	_, suffix, ended := strings.Cut(rest, end)
-	if !found || !ended {
-		t.Fatal("cannot reconstruct the #200 intake descriptions")
-	}
-	legacy := prefix + start + "解释绑定来源；Generic不能评估授权。讨论/否定/引用选discuss，范围不清选clarify。prepare_work仅限受支持的topic_summary。\" +\n" +
-		"    (continueWork ? `continue_work仅用于当前本机用户的明确续办请求；续办理由不得为空白，最多 ${workInputBytes.reason} UTF-8 字节。` : \"\") });\n" +
-		`  const assessment = Type.Object({
-    disposition,
-    action: Type.Optional(Type.Union([Type.Literal("text_submission"), Type.Literal("workspace_change"),
-      ...(investigation ? [Type.Literal(INVESTIGATION_ASSESSMENT_ACTION)] : []),
-    ], { description: investigation ? "仅为语义建议；只读调查使用 prepare_work 和 reason，目标和资料由服务器绑定。模型不能授予权限。" :
-      "结合可信来源和上下文提出文本交付或目录文件修改；只是一项语义建议，当前 Policy、目录授权和 Task 范围由服务器核定，模型不能授予 IO 权限。" })),
-` + end + suffix
-	impl, err := os.ReadFile(filepath.Join(filepath.Dir(current), "bridge.mjs"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	defer archive.Close()
 	root := t.TempDir()
+	for _, name := range []string{"index.ts", "bridge.mjs"} {
+		data, err := fs.ReadFile(archive, "extensions/pi-bridge/"+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	entry := filepath.Join(root, "index.ts")
-	if err := os.WriteFile(entry, []byte(legacy), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "bridge.mjs"), impl, 0600); err != nil {
-		t.Fatal(err)
-	}
 	if !provider.PiInvestigationBridgeSupported(entry) {
 		t.Fatal("fixture does not match the released #200 pair")
 	}
@@ -143,7 +137,7 @@ func TestPiFreshTaskWorkExecutionRunnerIntakeProfile(t *testing.T) {
 		t.Fatal("missing synthetic Pi metadata")
 	}
 	current := memberToolsEntry(t)
-	old := pi200MemberToolsEntry(t, current)
+	old := pi200MemberToolsEntry(t)
 	fresh := filepath.Join(filepath.Dir(current), "fresh-task-work.ts")
 	for _, tc := range []struct {
 		name, entry                    string

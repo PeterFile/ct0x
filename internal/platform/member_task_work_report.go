@@ -44,6 +44,12 @@ func NewMemberToolRuntimeWithTaskWorkReports(db *store.Store, options MemberTool
 		if err != nil {
 			return nil, err
 		}
+		if runtime.investigationTaskWork.EnableDiscussionWorkReturn {
+			if options.ChatIntake != engine {
+				return nil, errMemberToolRuntimeConfig
+			}
+			runtime.tools.discussionWorkReturn = true
+		}
 	}
 	runtime.tools.workReportEngine = engine
 	return runtime, nil

@@ -33,6 +33,23 @@ func NewExecutor(selected Provider, timeout time.Duration) (Executor, error) {
 	return NewCodexExecutor(selected.Path, timeout)
 }
 
+// NewPiDiscussionWorkReturnExecutor selects a tools-free, non-resuming Pi
+// text turn with explicit system prompts, not the ambient resource loader.
+func NewPiDiscussionWorkReturnExecutor(selected Provider, timeout time.Duration) (Executor, error) {
+	if selected.Name != Pi {
+		return nil, errExecutorConfiguration
+	}
+	if err := ValidateExecutor(selected, timeout); err != nil {
+		return nil, err
+	}
+	command, err := newExecutionCommand(selected.Path, timeout)
+	if err != nil {
+		return nil, err
+	}
+	command.discussionWorkReturn = true
+	return piExecutor{command}, nil
+}
+
 // ValidateExecutor performs the same metadata and path checks as NewExecutor,
 // without constructing an executor, probing a CLI or changing credentials.
 // It observes the current path only; construction must revalidate later.

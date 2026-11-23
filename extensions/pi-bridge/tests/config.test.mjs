@@ -48,6 +48,18 @@ test("bound config hashes exact JSON bytes and preserves the issued continuation
   assert.throws(() => openBridge(path, digest), error => safeFailure(error, /配置/, [TOKEN, path, digest]));
 });
 
+test("discussion relay requires its issued digest and cannot enter a strict role config", async t => {
+  const path = await privateConfig(t, { discussion_relay: true, discussion_only_excerpt: true });
+  assert.throws(() => openBridge(path), error => safeFailure(error, /配置/));
+  assert.equal(openBridge(path, sha256(await readFile(path))).discussionRelay, true);
+  for (const extra of [{ discussion_relay: null }, { discussion_relay: false }, { discussion_relay: "true" },
+    { discussion_relay: true, investigation_tools: ["read_investigation_channel", "submit_result"] }]) {
+    const invalid = await privateConfig(t, extra);
+    rejectConfig(invalid, sha256(await readFile(invalid)));
+  }
+  assert.equal(openBridge(await privateConfig(t)).discussionRelay, false);
+});
+
 test("missing, relative, or inline config fails closed without exposing input", () => {
   for (const input of [undefined, "", "relative/private.json", `{"token":"${TOKEN}"}`, `/missing/${TOKEN}`]) {
     assert.throws(() => createClient(input), error => safeFailure(error, /配置/));
