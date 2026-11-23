@@ -455,7 +455,7 @@ const handoffProposal = `{"content":"要只看工作日吗？","intent_assessmen
 // or account. It speaks the selected native protocol and only calls fixture MCP.
 func TestNativeThreadHandoffChild(t *testing.T) {
 	if os.Getenv("AW_F_HANDOFF_CHILD") != "1" {
-		t.Skip("subprocess fixture")
+		return
 	}
 	mode := os.Getenv("AW_F_HANDOFF_MODE")
 	ackMode := mode == "ack" || mode == "ack-unknown"
