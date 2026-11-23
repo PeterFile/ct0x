@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { Message } from "./api";
 import { App } from "./App";
 import { Discussion } from "./Discussion";
 import { deferred, group, json, other, page } from "./test/groups";
@@ -87,6 +88,41 @@ it("uses newly supplied members without fetching or caching a separate roster", 
   expect(within(record).getByText("未载入成员")).toBeVisible();
   expect(fetch).toHaveBeenCalledTimes(1);
 });
+
+it("hides only proved workspace intents and pages past a trace-only window", async () => {
+  const begin: Message = { ...message, id: "workspace-intent", sender_id: member.id, topic_id: "workspace-topic", deliveries: [],
+    content: "平台记录：文件操作意图已保存，实际文件结果尚未确认。", source_kind: "platform", source_id: "workspace_begin:op-1" };
+  const older = { ...begin, id: "older-intent", created_at: "2026-10-30T11:59:00Z", source_id: "workspace_begin:op-older" };
+  const visible: Message[] = [
+    { ...older, id: "user-look-alike", sender_id: "user", source_kind: "local_user_chat", source_id: "chat-command" },
+    { ...older, id: "agent-reply", source_kind: "member", source_id: "turn:agent-turn", content: "我会核对工作区的变更。" },
+    { ...older, id: "wrong-source-kind", source_kind: "member" },
+    { ...older, id: "missing-operation-id", source_id: "workspace_begin:" },
+    { ...older, id: "manual-error", source_kind: "unknown", source_id: undefined, content: "请手动检查目录权限。" },
+    { ...older, id: "workspace-outcome", source_id: "workspace_finish:op-older",
+      content: "文件操作结果未确认，须对账；保留资源占用，不自动重试或回滚。" },
+    { ...older, id: "submission", source_id: "submission:sub-1", content: "成果已提交，尚未由本机用户接纳。" },
+    { ...older, id: "review", source_id: "review:review-1", sender_id: "user", content: "平台记录：本机用户已接纳此版本成果。" },
+  ];
+  const pending = deferred<Response>(); reads.mockReturnValueOnce(pending.promise);
+  render(<main aria-label="讨论"><Discussion groupId={group.id} members={{ [group.id]: [member] }} /></main>);
+  expect(panel().getByText("正在载入消息…")).toBeVisible();
+  await act(async () => pending.resolve(page([begin], "older+/")));
+  expect(panel().getByText("当前窗口没有讨论消息。")).toBeVisible();
+  expect(panel().getByText("已载入 0 条（含话题，片段可能有间隔）。")).toBeVisible();
+  expect(panel().queryByRole("article")).not.toBeInTheDocument();
+
+  reads.mockResolvedValueOnce(page([...visible, older]));
+  fireEvent.click(panel().getByRole("button", { name: "加载更早消息" }));
+  await panel().findByRole("article", { name: `消息 ${visible[0].id}` });
+  for (const row of visible) expect(within(article(row.id)).getByText(row.content)).toBeVisible();
+  expect(panel().getAllByRole("article")).toHaveLength(visible.length);
+  expect(panel().getByText(`已载入 ${visible.length} 条（含话题，片段可能有间隔）。`)).toBeVisible();
+  expect(panel().queryByRole("button", { name: "加载更早消息" })).not.toBeInTheDocument();
+  const url = `/api/v1/groups/${group.id}/messages?limit=50`;
+  expect(reads.mock.calls.map(([path]) => path)).toEqual([url, `${url}&before=older%2B%2F`]);
+});
+
 const question = { ...message, id: "root /+%", topic_id: "discussion-topic", content: "需要核对哪些数据？", deliveries: [],
   source_kind: "local_user_chat" as const, source_id: "question-command" };
 const helper = { ...member, id: "discussion-helper", name: "复核员", status: "left" };
