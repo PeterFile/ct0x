@@ -49,7 +49,7 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     const history = historyRef.current;
     if (!history?.clientHeight) return;
     const anchor = capture();
-    saved.current = anchor ?? saved.current;
+    saved.current = listRef.current?.children.length ? anchor ?? saved.current : null;
     lastTop.current = history.scrollTop; atTail.current = isTail(history);
     return anchor;
   }
@@ -212,7 +212,7 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
       intent.started = false;
       if (!page.error) {
         if (!positioned && intent.revision === revision.current) {
-          if (intent.kind === "reset") { latest(); setWindowReset(false); }
+          if (intent.kind === "reset" || (intent.kind === "restore" && !intent.anchor)) { latest(); setWindowReset(false); }
           else if (!restore(intent.anchor) && intent.kind === "restore" && intent.anchor) {
             latest(); setWindowReset(true);
           } else {

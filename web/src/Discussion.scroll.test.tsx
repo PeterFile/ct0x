@@ -342,25 +342,32 @@ it("does not follow a poll to the tail after older paging reveals the first visi
 
 it("does not follow a poll to the tail after an initialized group resets to a trace-only window and loads older messages", async () => {
   const begin: Message = { ...row(9), source_kind: "platform", source_id: "workspace_begin:op-1" };
-  await open(initial);
+  const view = await open(initial);
   const container = screen.getByRole("region", { name: "消息记录" });
   reads.mockResolvedValueOnce(page([begin], "older+/"));
   fireEvent.click(button("刷新并重置历史窗口"));
   await flush();
   expect(within(container).queryByRole("article")).not.toBeInTheDocument();
 
+  view.rerender(<Discussion groupId={undefined} members={{}} />);
+  reads.mockResolvedValueOnce(page([begin], "older+/"));
+  view.rerender(<Discussion groupId={group.id} members={{}} />);
+  await flush();
+  expect(screen.queryByText(resetNotice)).not.toBeInTheDocument();
+
   const pending = deferred<Response>(); reads.mockReturnValueOnce(pending.promise);
   fireEvent.click(within(container).getByRole("button", { name: "加载更早消息" }));
+  tops.set(container, 10); fireEvent.scroll(container);
   await act(async () => pending.resolve(page(initial)));
   const first = initial[0].id, top = container.scrollTop, before = offset(first);
   expect(container.scrollHeight).toBeGreaterThan(container.clientHeight);
-  expect(top).toBe(0); expectVisible(first);
+  expect(top).toBe(10);
 
   const newest = row(10);
   reads.mockResolvedValueOnce(page([begin, newest])); await poll();
   expect(item(newest.id)).toBeInTheDocument();
   expect(container.scrollTop).toBe(top); expect(offset(first)).toBe(before);
-  expectRequests([latestURL(), latestURL(), olderURL, latestURL()]);
+  expectRequests([latestURL(), latestURL(), latestURL(), olderURL, latestURL()]);
 });
 
 it.each([false, true])("restores a real prepend anchor, not total height delta (native anchoring=%s)", async native => {
