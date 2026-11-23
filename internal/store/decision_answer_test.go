@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 	"strings"
@@ -32,9 +33,20 @@ func installDecisionAnswerFixture(t *testing.T, s *Store) {
 func assertDecisionAnswerView(t *testing.T, s *Store, a domain.DecisionAnswerReceipt, handling *domain.TaskWorkInputConsumption) {
 	t.Helper()
 	got, err := s.GetDecisionAnswerView(ctx, a.ThreadRef, a.RequestID, a.Version)
-	want := domain.DecisionAnswerView{Receipt: a, Handling: handling}
+	want := domain.DecisionAnswerView{Receipt: a}
+	if handling != nil {
+		value := domain.DecisionAnswerHandling(*handling)
+		want.Handling = &value
+	}
 	if err != nil || !reflect.DeepEqual(got, want) {
 		t.Fatalf("decision answer view = %+v (handling: %+v), %v; want receipt %+v, handling %+v", got, got.Handling, err, a, handling)
+	}
+	if handling != nil {
+		legacy, legacyErr := json.Marshal(handling)
+		wire, wireErr := json.Marshal(got.Handling)
+		if legacyErr != nil || wireErr != nil || string(legacy) != string(wire) {
+			t.Fatalf("Task handling JSON changed: %s (want %s, errors %v/%v)", wire, legacy, wireErr, legacyErr)
+		}
 	}
 }
 
