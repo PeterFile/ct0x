@@ -215,7 +215,13 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
           if (intent.kind === "reset") { latest(); setWindowReset(false); }
           else if (!restore(intent.anchor) && intent.kind === "restore" && intent.anchor) {
             latest(); setWindowReset(true);
-          } else setWindowReset(false);
+          } else {
+            setWindowReset(false);
+            if (intent.kind === "older" && !intent.anchor && items.length) {
+              // Refresh the empty window's stale tail state whenever older visible items arrive.
+              remember();
+            }
+          }
           positioned = true;
         }
         pageIntent.current = null;
@@ -224,10 +230,6 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     }
     if (!initialized.current && !page.pending && !page.error && items.length) {
       if (!positioned) latest();
-      else if (intent?.kind === "older" && !intent.anchor) {
-        // Keep the first visible older page in place, but refresh the empty window's stale tail state.
-        remember();
-      }
       initialized.current = true; positioned = true;
     }
     if (!positioned && arrived && initialized.current && atTail.current && !page.pending && !pageIntent.current) latest();
