@@ -32,6 +32,9 @@ func MemberRoleToolRoutes(tools *platform.MemberTools) []Route {
 			Route{http.MethodPost, "/api/v1/member-tools/hand_back_work_input", memberToolNative(a.handBackWorkInput)},
 		)
 	}
+	if tools.TaskDecisionProposalsEnabled() {
+		routes = append(routes, Route{http.MethodPost, "/api/v1/member-tools/" + platform.ProposeTaskDecisionOperation, memberToolNative(a.proposeTaskDecision)})
+	}
 	if tools.TaskWorkReportsEnabled() {
 		routes = append(routes,
 			Route{http.MethodPost, "/api/v1/member-tools/" + platform.ReportWorkOperation, memberToolNative(a.reportWork)},

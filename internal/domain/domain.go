@@ -50,15 +50,16 @@ type Conversation struct {
 }
 
 type Message struct {
-	ID         string             `json:"id"`
-	GroupID    string             `json:"group_id"`
-	TopicID    string             `json:"topic_id"`
-	SenderID   string             `json:"sender_id"`
-	SourceID   string             `json:"source_id,omitempty"`
-	SourceKind string             `json:"source_kind,omitempty"`
-	Content    string             `json:"content"`
-	CreatedAt  time.Time          `json:"created_at"`
-	Deliveries []Delivery         `json:"deliveries"`
+	ID         string     `json:"id"`
+	GroupID    string     `json:"group_id"`
+	TopicID    string     `json:"topic_id"`
+	SenderID   string     `json:"sender_id"`
+	SourceID   string     `json:"source_id,omitempty"`
+	SourceKind string     `json:"source_kind,omitempty"`
+	Content    string     `json:"content"`
+	CreatedAt  time.Time  `json:"created_at"`
+	Deliveries []Delivery `json:"deliveries"`
+	ThreadLinks
 	Discussion *MessageDiscussion `json:"discussion,omitempty"`
 	// Read projections on the discussion head, not publication receipts.
 	DiscussionClosureReason string              `json:"discussion_closure_reason,omitempty"`

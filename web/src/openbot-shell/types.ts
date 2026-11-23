@@ -1,6 +1,7 @@
 import type { ComponentPropsWithRef, ReactNode, Ref } from "react";
 
 export type ShellContext = "members" | "tasks" | "history";
+export type ShellPage = { id: string; label: string; content: ReactNode };
 
 /** App owns state, read activity, mutations, visibility, and focus recovery. */
 export interface AppShellProps {
@@ -8,6 +9,9 @@ export interface AppShellProps {
   groupsProps: ComponentPropsWithRef<"aside">;
   pane: "list" | "chat";
   context: ShellContext | null;
+  globalPages: readonly ShellPage[];
+  globalPage: string | null;
+  onGlobalPage: (id: string) => void;
   onList: () => void;
   onChat: () => void;
   onContext: (context: ShellContext) => void;

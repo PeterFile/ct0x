@@ -124,6 +124,12 @@ def inventory(path, package):
     return compiled
 
 
+def run_pattern(selected):
+    pattern = "^(" + "|".join(re.escape(name) for name in sorted(selected)) + ")$" if selected else "^$"
+    check("/" not in pattern and len(pattern.encode("utf-8")) <= MAX_PATTERN_BYTES, "分片表达式过长或包含 slash；拒绝截断")
+    return pattern
+
+
 def selection(compiled, slot, profile):
     modulus = 8 if profile == "platform" else PROFILES[profile][0]
     selected = Counter()
@@ -135,9 +141,7 @@ def selection(compiled, slot, profile):
             bucket = 8
         if bucket == slot:
             selected[name] = count
-    pattern = "^(" + "|".join(re.escape(name) for name in sorted(selected)) + ")$" if selected else "^$"
-    check("/" not in pattern and len(pattern.encode("utf-8")) <= MAX_PATTERN_BYTES, "分片表达式过长或包含 slash；拒绝截断")
-    return selected, pattern
+    return selected, run_pattern(selected)
 
 
 def verify(path, package, selected):

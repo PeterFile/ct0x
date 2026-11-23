@@ -287,12 +287,20 @@ func checkTaskInvestigationAuthorizationInTx(ctx context.Context, tx *sql.Tx, sc
 		return ErrTaskInvestigationNotReady
 	}
 	// A competing intake may have recorded a same-source limit after admission.
-	if err := chatDiscussionSourceGateInTx(ctx, tx, c, false); err != nil {
-		var limit *chatNonAdmission
-		if errors.As(err, &limit) || errors.Is(err, ErrMemberToolDenied) || errors.Is(err, ErrInvalid) {
+	sourceErr := chatDiscussionSourceGateInTx(ctx, tx, c, false)
+	if sourceErr == nil && len(scope.ClueTerms) > 0 {
+		var body string
+		body, sourceErr = chatInvestigationClueBodyInTx(ctx, tx, c, false)
+		if sourceErr == nil && !scope.MatchesClue(body) {
 			return ErrTaskInvestigationNotReady
 		}
-		return err
+	}
+	if sourceErr != nil {
+		var limit *chatNonAdmission
+		if errors.As(sourceErr, &limit) || errors.Is(sourceErr, ErrMemberToolDenied) || errors.Is(sourceErr, ErrInvalid) {
+			return ErrTaskInvestigationNotReady
+		}
+		return sourceErr
 	}
 	if err := chatInvestigationVersionsInTx(ctx, tx, scope.GroupID, scope.ArtifactVersions); err != nil {
 		if errors.Is(err, ErrNotFound) {
