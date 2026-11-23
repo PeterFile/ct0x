@@ -22,6 +22,8 @@ var (
 	threadBusiness   = regexp.MustCompile(`(?i)(?:规划|提案|报告|策略|设计|方案|复盘|验证|调查|审查|排期|迁移|预算|改进|回顾|项目|告警|故障|事故|\b(?:plan|proposal|report|strategy|design|review|migration|budget|investigation|project|alert|incident|bug))$`)
 	threadCurrent    = regexp.MustCompile(`(?i)^(?:(?:当前|现在|这次|本次)(?:只)?(?:讨论|处理|跟进)|(?:请)?(?:跟进|继续处理)(?:那个)?|current (?:subject|topic)|follow up on)[ \t]*[:：]?\s*`)
 	threadComparison = regexp.MustCompile(`(?i)(?:仅作(?:对照|比较|参考)|(?:只)?作为(?:对照|比较|参考)|仅供参考|for comparison|comparison only)`)
+	threadCompNegZh  = regexp.MustCompile(`(?:(?:并|绝|决)?不是|并非|绝非|决非|不只是?|不仅是?|不再|不能|不可|不必|无需|无须|请?不要|请?勿|别|非)$|(?:不要|请勿|别|不能|不可|不必|无需|无须|并非|不是)(?:把|将|拿|用)`)
+	threadCompNegEn  = regexp.MustCompile(`(?i)(?:^|\b)(?:not|never|no\s+longer|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|don['’]t|doesn['’]t|do\s+not|does\s+not|cannot|can['’]t)\b(?:\s+(?:just|only|merely|simply))?(?:\s+(?:use|treat|cite|quote|post|mark|consider|take|meant|intended|used|treated)(?:\s+\S+){0,4})?(?:\s+as)?$`)
 	threadIssue      = regexp.MustCompile(`(?i)[a-z][a-z0-9]{1,15}-[0-9]{1,12}`)
 	threadNonName    = regexp.MustCompile(`(?:什么|怎么样|怎么|如何|吗|一下|随便|闲聊|还好吗|可以吗|是否|^这个|^那个|^这个事|^那件事|^the (?:same|other) thing$)`)
 	threadGeneric    = regexp.MustCompile(`(?i)^(?:(?:议题|话题|任务|工作|项目|问题|进展|告警|故障|事故|复盘|规划|计划|报告|方案|topic|issue|task|work|project|status|alert|incident|bug|plan|report|review)[ \t/_-]*)+$`)
@@ -73,7 +75,25 @@ func threadClauseSeparator(r rune) bool { return strings.ContainsRune("\n。！�
 
 // Explicit storage scopes bypass topic matching but not comparison semantics.
 func threadComparisonReply(body string) bool {
-	return validHistoryText(body, maxThreadTextBytes) && threadComparison.MatchString(unquotedThreadText(body))
+	active, ok := actionableThreadText(body)
+	return ok && hasThreadComparison(active)
+}
+
+func hasThreadComparison(text string) bool {
+	for _, match := range threadComparison.FindAllStringIndex(text, -1) {
+		clauseStart := 0
+		for i, r := range text[:match[0]] {
+			if threadClauseSeparator(r) || r == '(' || r == '（' || r == ':' || r == '：' {
+				clauseStart = i + utf8.RuneLen(r)
+			}
+		}
+		prefix := strings.TrimSpace(text[clauseStart:match[0]])
+		if threadCompNegZh.MatchString(prefix) || threadCompNegEn.MatchString(prefix) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 // Strip only balanced, trailing parentheticals marked as comparison. Do this
@@ -98,7 +118,7 @@ func stripThreadComparisonSuffixes(text string) (string, bool) {
 				return "", false
 			}
 			closers = closers[:len(closers)-1]
-			if len(closers) != 0 || !threadComparison.MatchString(text[start:i]) {
+			if len(closers) != 0 || !hasThreadComparison(text[start:i]) {
 				continue
 			}
 			end := i + utf8.RuneLen(r)
@@ -123,11 +143,11 @@ func stripThreadComparisonSuffixes(text string) (string, bool) {
 
 func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) (threadTextRoute, error) {
 	var route threadTextRoute
-	if !validHistoryText(body, maxThreadTextBytes) {
+	active, ok := actionableThreadText(body)
+	if !ok {
 		return route, nil
 	}
-	active := unquotedThreadText(body)
-	route.comparison = threadComparison.MatchString(active)
+	route.comparison = hasThreadComparison(active)
 	if route.comparison {
 		var separated bool
 		active, separated = stripThreadComparisonSuffixes(active)
@@ -144,7 +164,7 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 		opening := i == 0 && threadNewSubject.MatchString(clause)
 		invite := i == 0 && threadInvite.MatchString(clause)
 		current := threadCurrent.MatchString(clause)
-		if route.comparison && threadComparison.MatchString(clause) {
+		if route.comparison && hasThreadComparison(clause) {
 			if opening || invite || current {
 				// The marked comparison and current subject are not delimited.
 				route.conflict = true
@@ -404,12 +424,36 @@ func isIssueWord(r rune) bool { return isNonHanWord(r) || r == '-' }
 
 var threadQuotes = strings.NewReplacer("“", "\x01", "”", "\x01", "「", "\x02", "」", "\x02", "『", "\x03", "』", "\x03")
 
-func unquotedThreadText(body string) string {
+func isASCIIAlphaNum(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+}
+
+func hasSameLineSingleClose(rest string, open, closeRune rune, prev rune) bool {
+	for i := 0; i < len(rest); {
+		r, w := utf8.DecodeRuneInString(rest[i:])
+		if r == closeRune {
+			next, _ := utf8.DecodeRuneInString(rest[i+w:])
+			if open != '\'' || !(isASCIIAlphaNum(prev) && isASCIIAlphaNum(next)) {
+				return true
+			}
+		}
+		prev = r
+		i += w
+	}
+	return false
+}
+
+// Extract only non-quoted prose and enforce maxThreadTextBytes on that prose
+// so >4 KiB quoted material does not erase short routing/comparison signals.
+func actionableThreadText(body string) (string, bool) {
+	if !validHistoryText(body, len(body)) {
+		return "", false
+	}
 	var active strings.Builder
 	var fence string
 	var quoted rune
-	for line := range strings.SplitSeq(body, "\n") {
-		line = strings.TrimSpace(line)
+	for rawLine := range strings.SplitSeq(body, "\n") {
+		line := strings.TrimSpace(rawLine)
 		if fence != "" {
 			if strings.HasPrefix(line, fence) {
 				fence = ""
@@ -423,22 +467,70 @@ func unquotedThreadText(body string) string {
 		case strings.HasPrefix(line, ">") || strings.HasPrefix(line, "＞"):
 			continue
 		}
-		for _, r := range threadQuotes.Replace(line) {
+		replaced := threadQuotes.Replace(line)
+		var prev rune
+		for i := 0; i < len(replaced); {
+			r, w := utf8.DecodeRuneInString(replaced[i:])
 			if quoted != 0 {
-				if r == quoted {
-					quoted = 0
+				switch quoted {
+				case '\'':
+					if r == '\'' {
+						next, _ := utf8.DecodeRuneInString(replaced[i+w:])
+						if !(isASCIIAlphaNum(prev) && isASCIIAlphaNum(next)) {
+							quoted = 0
+						}
+					}
+				case '‘':
+					if r == '’' {
+						quoted = 0
+					}
+				default:
+					if r == quoted {
+						quoted = 0
+					}
 				}
+				prev = r
+				i += w
 				continue
 			}
 			switch r {
 			case '"', '`', '\x01', '\x02', '\x03':
 				quoted = r
 				active.WriteByte(' ')
+			case '\'':
+				if !isASCIIAlphaNum(prev) && hasSameLineSingleClose(replaced[i+w:], '\'', '\'', r) {
+					quoted = '\''
+					active.WriteByte(' ')
+				} else {
+					active.WriteRune(r)
+				}
+			case '‘':
+				if hasSameLineSingleClose(replaced[i+w:], '‘', '’', r) {
+					quoted = '‘'
+					active.WriteByte(' ')
+				} else {
+					active.WriteRune(r)
+				}
 			default:
 				active.WriteRune(r)
 			}
+			if active.Len() > maxThreadTextBytes*2 && len(strings.TrimSpace(active.String())) > maxThreadTextBytes {
+				return "", false
+			}
+			prev = r
+			i += w
+		}
+		if quoted == '\'' || quoted == '‘' {
+			quoted = 0
 		}
 		active.WriteByte('\n')
+		if active.Len() > maxThreadTextBytes*2 && len(strings.TrimSpace(active.String())) > maxThreadTextBytes {
+			return "", false
+		}
 	}
-	return strings.TrimSpace(active.String())
+	trimmed := strings.TrimSpace(active.String())
+	if trimmed == "" || len(trimmed) > maxThreadTextBytes {
+		return "", false
+	}
+	return trimmed, true
 }

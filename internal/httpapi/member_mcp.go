@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/store"
@@ -31,10 +32,16 @@ var memberMCPWithReports = slices.Concat(memberMCPComposedTools, memberWorkRepor
 // No session ID, initialization state, execution queue or additional authority.
 func MemberMCPRoutes(tools *platform.MemberTools) []Route {
 	a := memberToolAPI{tools}
-	return []Route{{http.MethodPost, "/api/v1/member-tools/mcp", memberToolNative(a.memberMCP)}}
+	return []Route{{http.MethodPost, "/api/v1/member-tools/mcp", func(w http.ResponseWriter, r *http.Request) {
+		// Take the ACK cutoff at ingress, not after reading a possibly delayed body.
+		entered := time.Now()
+		memberToolNative(func(w http.ResponseWriter, r *http.Request, token string) {
+			a.memberMCP(w, r, token, entered)
+		})(w, r)
+	}}}
 }
 
-func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token string) {
+func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token string, entered time.Time) {
 	// Fresh Pi uses its own native wire. Keep #181's unpaged MCP schema and
 	// legacy receipts; never execute a fresh command through that schema.
 	if a.tools.IsFreshTaskWorkCapability(token) {
@@ -110,11 +117,15 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			memberMCPError(w, 200, id, -32602, "工具列表无需游标")
 			return
 		}
+		if slices.Contains(profile.Operations, platform.AckThreadDecisionOperation) {
+			memberMCPReply(w, id, map[string]any{"tools": []memberMCPTool{threadDecisionAckMCPTool}})
+			return
+		}
 		tools := make([]memberMCPTool, 0, len(profile.Operations))
 		for _, tool := range catalog {
 			if slices.Contains(profile.Operations, tool.Name) {
-				if tool.Name == "send_message" && (profile.ContinueWork || profile.DiscussionOnlyExcerpt || profile.InvestigationIntake) {
-					tool.InputSchema = memberMCPSendMessageSchema(profile.ContinueWork, profile.DiscussionOnlyExcerpt, profile.InvestigationIntake)
+				if tool.Name == "send_message" && (profile.ContinueWork || profile.DiscussionOnlyExcerpt || profile.InvestigationIntake || profile.ThreadDecision) {
+					tool.InputSchema = memberMCPSendMessageSchema(profile.ContinueWork, profile.DiscussionOnlyExcerpt, profile.InvestigationIntake, profile.ThreadDecision)
 				}
 				if tool.Name == "submit_result" && profile.InvestigationRole {
 					tool.Description = "提交当前调查的纯文本结论，不附成果版本；提交不代表接纳。未知结果先对账。"
@@ -144,7 +155,19 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			memberMCPError(w, 400, id, -32602, "工具名称和 arguments 对象无效")
 			return
 		}
-		continuation, excerpt := false, false
+		if name == platform.AckThreadDecisionOperation {
+			if !validMemberToolJSONStrings(frame["id"]) {
+				memberMCPError(w, 400, nil, -32602, "话题确认调用 id 包含无效的 Unicode 字符串转义")
+				return
+			}
+			if len(object) != 0 {
+				memberMCPError(w, 400, id, -32602, "话题答复确认不接受参数")
+				return
+			}
+			a.ackThreadDecisionMCP(w, r, token, id, entered)
+			return
+		}
+		continuation, excerpt, decision := false, false, false
 		if name == "send_message" {
 			// Relay is native Pi only. Check raw field presence (including null
 			// and the DTO's case-folded spellings) before projecting or binding.
@@ -157,10 +180,10 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 					return
 				}
 			}
-			continuation, excerpt = memberToolSendAssessmentFields(arguments)
+			continuation, excerpt, decision = memberToolSendAssessmentFields(arguments)
 		}
 		reportWrite := reportTools && name == platform.ReportWorkOperation
-		if name == "ack_work_input" || name == "hand_back_work_input" || continuation || excerpt || reportWrite {
+		if name == "ack_work_input" || name == "hand_back_work_input" || continuation || excerpt || decision || reportWrite {
 			// Neither the derived key nor the fingerprint may alias replacement
 			// characters. Keep legacy send_message and opaque metadata unchanged.
 			if !validMemberToolJSONStrings(frame["id"]) {
@@ -191,7 +214,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 				continue
 			}
 			fingerprintArgs := arguments
-			if continuation {
+			if continuation && !decision {
 				fingerprintArgs = memberMCPContinueWorkArguments(arguments)
 			}
 			key := memberMCPKey(token, id)

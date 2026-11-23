@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
 
 	"agentworkspace/internal/domain"
@@ -20,10 +21,19 @@ func (s *Store) MessageThreadAttribution(ctx context.Context, groupID, messageID
 	return domain.ThreadAttribution{Storage: ref, Effective: ref}, nil
 }
 
-// Exact page keys only. The one visible timeline and its cursors are unchanged.
+// Local-user projection for exact page keys, not a member history API.
+// Prefer the canonical quote, but preserve old E-only reply edges and Task links.
 func messageThreadLinksInTx(ctx context.Context, tx *sql.Tx, groupID string, items []domain.Message) error {
 	if len(items) == 0 {
 		return nil
+	}
+	if err := projectMessageQuotesInTx(ctx, tx, groupID, nil, items); err != nil {
+		return err
+	}
+	for i := range items {
+		if q := items[i].ReplyTo; q != nil {
+			items[i].ReplyToMessageID = q.MessageID
+		}
 	}
 	installed, err := threadRoutingInstalledInTx(ctx, tx)
 	if err != nil || !installed {
@@ -49,7 +59,14 @@ func messageThreadLinksInTx(ctx context.Context, tx *sql.Tx, groupID string, ite
 		if err := rows.Scan(&id, &links.ReplyToMessageID, &links.RelatedTaskID); err != nil {
 			return err
 		}
-		items[positions[id]].ThreadLinks = links
+		item := &items[positions[id]]
+		if links.ReplyToMessageID != "" {
+			if item.ReplyTo != nil {
+				return errors.New("消息存在重复引用记录")
+			}
+			item.ReplyToMessageID = links.ReplyToMessageID
+		}
+		item.RelatedTaskID = links.RelatedTaskID
 	}
 	return rows.Err()
 }

@@ -50,6 +50,7 @@ type executionOutput struct {
 	piSession                  *piSessionTracker
 	piTypedWork                *piTypedWorkOutput
 	piInvestigation            *piInvestigationStartup
+	piRunExplanation           *piRunExplanationOutput
 }
 
 func (o *executionOutput) Write(p []byte) (int, error) {
@@ -124,16 +125,16 @@ func (o *executionOutput) recordPi(line []byte) {
 		}
 	}
 	var event struct {
-		Type, ID, CWD string
-		Version       int
-		Aborted       *bool
-		Message       struct {
+		Type, ID, CWD, ToolName string
+		Version                 int
+		Aborted                 *bool
+		Message                 struct {
 			Role, StopReason string
 			Content          json.RawMessage
 		}
 	}
 	if !utf8.Valid(line) || json.Unmarshal(line, &event) != nil || event.Type == "" ||
-		o.piTypedWork != nil && !piTypedWorkHasExactType(line) {
+		(o.piTypedWork != nil || o.piRunExplanation != nil) && !piTypedWorkHasExactType(line) {
 		o.damageFrame()
 		return
 	}
@@ -168,14 +169,17 @@ func (o *executionOutput) recordPi(line []byte) {
 		o.emit(Event{Kind: SessionEvent})
 	case "agent_start":
 		o.last = ""
-	case "tool_execution_start":
-		if o.piTypedWork != nil && !o.piTypedWork.observeStart(line, r.Accepted && !o.settled) {
+	case "tool_execution_start", "tool_execution_end":
+		active := r.Accepted && !o.settled
+		if p := o.piRunExplanation; p != nil && !p.observe(line, event.Type, event.ToolName, o.runID, active) {
 			o.damaged = true
 		}
-	case "tool_execution_end":
-		if o.piTypedWork != nil && !o.piTypedWork.observeEnd(line, o.runID, r.Accepted && !o.settled) {
-			// A bad pair denies settlement but does not erase native terminal evidence.
-			o.damaged = true
+		if p := o.piTypedWork; p != nil {
+			if event.Type == "tool_execution_start" && !p.observeStart(line, active) ||
+				event.Type == "tool_execution_end" && !p.observeEnd(line, o.runID, active) {
+				// A bad pair denies settlement but does not erase native terminal evidence.
+				o.damaged = true
+			}
 		}
 	case "message_start", "message_end":
 		if event.Message.Role == "" {

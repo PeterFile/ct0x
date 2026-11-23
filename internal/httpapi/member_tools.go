@@ -235,17 +235,26 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 		operationError(w, store.ErrInvalid)
 		return
 	}
-	var input memberToolSendInput
+	var input struct {
+		// Only the plain publication accepts a quote. The assessment codecs and
+		// MCP continuation fingerprint still operate on the original narrow DTO.
+		memberToolSendInput
+		QuoteID messageQuoteID `json:"reply_to_message_id"`
+	}
 	if !decodeMemberToolJSON(w, r, &memberToolScalarJSON{dst: &input, required: sendMessageNeedsScalars}) {
 		return
 	}
-	if input.Discussion.present && (input.RecipientIDs.present || input.Assessment.present) {
+	if input.Discussion.present && (input.RecipientIDs.present || input.Assessment.present || input.QuoteID != "") {
 		memberToolError(w, store.ErrInvalid)
 		return
 	}
 	if input.Assessment.present {
-		if input.RecipientIDs.present {
+		if input.RecipientIDs.present || input.QuoteID != "" {
 			memberToolError(w, store.ErrInvalid)
+			return
+		}
+		if hasDecisionContext(input.Assessment.value) {
+			a.assessMemberThreadDecision(w, r, token, input.Assessment.value, input.Content.value, key)
 			return
 		}
 		receipt, ok := a.assessMemberChatIntent(w, r, token, input.Assessment.value, input.Content, key)
@@ -291,7 +300,9 @@ func (a memberToolAPI) sendMessage(w http.ResponseWriter, r *http.Request, token
 				recipients[i] = id.value
 			}
 		}
-		message, err = a.tools.SendMessage(r.Context(), token, platform.MemberMessageInput{Content: input.Content.value, RecipientIDs: recipients}, key)
+		message, err = a.tools.SendMessage(r.Context(), token, platform.MemberMessageInput{
+			Content: input.Content.value, RecipientIDs: recipients, ReplyToMessageID: string(input.QuoteID),
+		}, key)
 	}
 	if err != nil {
 		memberToolError(w, err)
@@ -387,6 +398,10 @@ func writeMemberToolPage[T any](w http.ResponseWriter, page store.Page[T], scope
 
 func memberToolError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, store.ErrAgentRunExplanationUnknown):
+		WriteError(w, http.StatusServiceUnavailable, "run_explanation_unknown", store.ErrAgentRunExplanationUnknown.Error())
+	case errors.Is(err, store.ErrAgentRunExplanationUnavailable):
+		WriteError(w, http.StatusServiceUnavailable, "run_explanation_unavailable", store.ErrAgentRunExplanationUnavailable.Error())
 	case errors.Is(err, store.ErrMemberToolDenied):
 		WriteError(w, http.StatusForbidden, "forbidden", "无权访问成员工具")
 	case errors.Is(err, store.ErrMemberCapacity):

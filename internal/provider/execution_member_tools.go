@@ -30,11 +30,13 @@ type piMemberToolOptions struct {
 	typedWorkRole     string
 	taskDecisionRunID string // Only for the exact fresh proposal profile.
 
-	extensionPath string
-	configPath    string
-	toolNames     []string
-	configSHA256  [sha256.Size]byte // Nonzero only for runtime-bound profiles.
-	investigation bool              // Strict first-investigation config and argv.
+	extensionPath         string
+	configPath            string
+	toolNames             []string
+	configSHA256          [sha256.Size]byte // Nonzero only for runtime-bound profiles.
+	investigation         bool              // Strict first-investigation config and argv.
+	runExplanation        string            // Bound RunID for the fresh public-explanation profile only.
+	runExplanationJournal string            // Bound absolute path under that run's directory.
 
 	// Only typed investigation uses its own wire schema and in-memory session.
 	investigationConfigFile os.FileInfo
@@ -162,6 +164,9 @@ func (o *piMemberToolOptions) boundConfig() bool {
 func (o *piMemberToolOptions) launchConfigMatches() bool {
 	if !o.boundConfig() {
 		return true
+	}
+	if o.runExplanation != "" {
+		return piRunExplanationConfigJournal(o.configPath, o.configSHA256, o.runExplanation) == o.runExplanationJournal
 	}
 	if o.taskDecisionRunID != "" {
 		config, err := readFreshTaskWorkConfig(o.configPath, o.taskDecisionRunID)

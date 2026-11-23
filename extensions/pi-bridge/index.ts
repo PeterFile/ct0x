@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
-import { INVESTIGATION_ARTIFACT, INVESTIGATION_ASSESSMENT_ACTION, INVESTIGATION_CHANNEL, openBridge, validUnicode } from "./bridge.mjs";
+import { INVESTIGATION_ARTIFACT, INVESTIGATION_ASSESSMENT_ACTION, INVESTIGATION_CHANNEL, PUBLISH_RUN_EXPLANATION,
+  RUN_EXPLANATION_ACK, RUN_EXPLANATION_BYTES, RUN_EXPLANATION_UNKNOWN, RunExplanationUnknownError, openBridge, validUnicode } from "./bridge.mjs";
 
 const discussionOnlyExcerptBytes = 4096;
 const discussionExpectedReplyJSONBytes = 1024;
@@ -252,10 +253,34 @@ function validDiscussion(message: { content: string; discussion?: Static<typeof 
 }
 
 export default function piBridge(pi: ExtensionAPI) {
-  const { invoke, continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools, discussionRelay } = openBridge(
+  const { invoke, continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools, discussionRelay, runExplanation } = openBridge(
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG,
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256,
   );
+  if (runExplanation) {
+    const parameters = Type.Object({ text: Type.String({ minLength: 1, maxLength: RUN_EXPLANATION_BYTES,
+      description: "专门写给用户看的简短公开说明，最多 1024 UTF-8 字节。不提交私密信息、内部推理或原始过程日志。" }) }, { additionalProperties: false });
+    function checked(args: unknown) {
+      // Check before Pi can coerce types. Only forward the exact explicit text.
+      if (!Value.Check(parameters, args) || !validNonBlankText(args.text, RUN_EXPLANATION_BYTES)) {
+        throw new Error("公开运行说明参数无效，未发送请求。");
+      }
+      return { text: args.text };
+    }
+    pi.registerTool({ name: PUBLISH_RUN_EXPLANATION, label: "发布公开运行说明",
+      description: "可选：为本轮发布一条不可修改、只在运行记录中显示的公开说明，不发聊天消息或唤醒成员；不是执行凭证。发送前私下留存原幂等键及原文用于对账；结果未知时不要重试。",
+      parameters, prepareArguments: checked,
+      async execute(toolCallId, args, signal, _onUpdate, _ctx) {
+        try {
+          const result = await invoke(PUBLISH_RUN_EXPLANATION, checked(args), toolCallId, signal);
+          return { content: [{ type: "text", text: result.text }], details: { [RUN_EXPLANATION_ACK]: result.explanationKey } };
+        } catch (error) {
+          if (!(error instanceof RunExplanationUnknownError)) throw error;
+          return { content: [{ type: "text", text: error.message }], isError: true, details: { [RUN_EXPLANATION_UNKNOWN]: error.evidence } };
+        }
+      },
+    });
+  }
   if (investigationTools) {
     // Independent of Pi's CLI allowlist. Do not register unrelated platform
     // tools and fail closed on any unexpected host or other extension call.

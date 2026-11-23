@@ -328,6 +328,22 @@ func (p *codexAppServerProtocol) next(id int, method string, params any) {
 	}
 }
 
+// Lifecycle IDs are projected in stdout and the thread ID also reaches the
+// receipt and Store. Check the decoded IDs before binding either one.
+func (p *codexAppServerProtocol) lifecycleID(fields map[string]json.RawMessage, key string) (string, bool) {
+	id, valid := codexAppServerString(fields, key)
+	if p.member != nil && p.member.threadDecision != nil && strings.Contains(id, p.member.threadDecision.bearer) {
+		return "", false
+	}
+	return id, valid
+}
+
+func (p *codexAppServerProtocol) observeThreadDecision(kind EventKind) {
+	if p.member != nil && p.member.threadDecision != nil {
+		p.member.threadDecision.observeLifecycle(kind)
+	}
+}
+
 func (p *codexAppServerProtocol) emit(event Event) {
 	event.NativeSessionID = p.threadID
 	if p.lifecycle != nil {
@@ -472,7 +488,7 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 		fields, err := codexRPCObject(message.Result, "thread", "approvalPolicy", "sandbox", "cwd", "model")
 		thread, threadErr := codexRPCObject(fields["thread"], "id", "turns", "ephemeral", "parentThreadId", "forkedFromId")
 		sandbox, sandboxErr := codexRPCObject(fields["sandbox"], "type", "networkAccess")
-		threadID, valid := codexAppServerString(thread, "id")
+		threadID, valid := p.lifecycleID(thread, "id")
 		var cwd, approval, policy, model string
 		if err != nil || threadErr != nil || sandboxErr != nil || !valid ||
 			json.Unmarshal(fields["cwd"], &cwd) != nil || filepath.Clean(cwd) != filepath.Clean(p.request.CWD) ||
@@ -517,7 +533,7 @@ func (p *codexAppServerProtocol) receive(message codexRPCMessage) {
 	case 5:
 		fields, err := codexRPCObject(message.Result, "turn")
 		turn, turnErr := codexRPCObject(fields["turn"], "id", "status", "items", "error")
-		turnID, valid := codexAppServerString(turn, "id")
+		turnID, valid := p.lifecycleID(turn, "id")
 		if err != nil || turnErr != nil || !valid || string(turn["status"]) != `"inProgress"` || !codexAppServerEmptyItems(turn["items"]) || !codexAppServerNoError(turn["error"]) {
 			p.fail()
 			return
@@ -717,7 +733,7 @@ func (p *codexAppServerProtocol) notification(message codexRPCMessage) {
 	}
 	if method == "thread/started" && message.ID == nil {
 		thread, err := codexRPCObject(fields["thread"], "id")
-		id, valid := codexAppServerString(thread, "id")
+		id, valid := p.lifecycleID(thread, "id")
 		if err != nil || !valid {
 			p.failResumeNotification(message, "thread_announcement_invalid")
 			return
@@ -937,6 +953,7 @@ func (p *codexAppServerProtocol) turnNotification(method string, raw json.RawMes
 			p.fail()
 			return
 		}
+		p.observeThreadDecision(AcceptedEvent)
 		p.receipt.Accepted = true
 		p.emit(Event{Kind: AcceptedEvent})
 		return
@@ -997,6 +1014,7 @@ func (p *codexAppServerProtocol) turnNotification(method string, raw json.RawMes
 			p.external = true
 		}
 	}
+	p.observeThreadDecision(TerminalEvent)
 	p.receipt.Terminal = terminal
 	p.emit(Event{Kind: TerminalEvent, Terminal: terminal})
 }
