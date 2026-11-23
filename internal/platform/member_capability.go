@@ -53,6 +53,7 @@ type MemberTools struct {
 	chatEngine       *coordination.Engine
 	workInputs       MemberWorkInputService // Immutable after runtime construction.
 	freshTaskWork    FreshTaskWorkLaunch    // Independent of the legacy work-input preview.
+	taskDecisions    bool                   // Exact fresh text continuation only.
 	workReportEngine *coordination.Engine   // Transport only; independent of either launch opt-in.
 	workspace        *memberWorkspaceRegistry
 

@@ -44,6 +44,9 @@ type MemberToolRuntimeOptions struct {
 	// FreshTaskWork composes typed continuation via the ChatIntake Engine and
 	// the role execution fence. It does not install the legacy preview.
 	FreshTaskWork *FreshTaskWorkLaunch
+	// EnablePiTaskDecisionProposals is a separate native-only opt-in. It needs
+	// the exact proposal-capable fresh text adapter and F's pending/answer path.
+	EnablePiTaskDecisionProposals bool
 }
 
 type MemberToolRunBinding struct {
@@ -148,6 +151,18 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 			return nil, errMemberToolRuntimeConfig
 		}
 	}
+	if options.EnablePiTaskDecisionProposals {
+		if tools.freshTaskWork.taskDecisionAdapter == nil {
+			return nil, errMemberToolRuntimeConfig
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), memberToolRuntimeVerificationTimeout)
+		err := tools.checkTaskDecisionSchema(ctx)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		tools.taskDecisions = true
+	}
 	return &MemberToolRuntime{tools: tools, configRoot: root, resolvedRoot: resolved,
 		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence,
 		executionRoot: executionRoot}, nil
@@ -203,7 +218,7 @@ func memberToolRuntimeText(value string) bool {
 // These qualified Pi schema hints require the issued-config builder even if
 // issuance rechecks the policy and removes the investigation action.
 func (schema memberToolIntakeSchema) requiresIssuedPiConfig() bool {
-	return schema.piDiscussionExcerpt || schema.investigation
+	return schema.piDiscussionExcerpt || schema.piDiscussionRelaySource != "" || schema.investigation
 }
 
 type memberToolRuntimeRun struct {
@@ -404,9 +419,10 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 		Token                  string   `json:"token"`
 		ContinueWork           bool     `json:"continue_work,omitempty"`
 		DiscussionOnlyExcerpt  bool     `json:"discussion_only_excerpt,omitempty"`
+		DiscussionRelay        bool     `json:"discussion_relay,omitempty"`
 		IntakeAssessmentAction string   `json:"intake_assessment_action,omitempty"`
 		InvestigationTools     []string `json:"investigation_tools,omitempty"`
-	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools})
+	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, entry.discussionRelay(), action, strictTools})
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}

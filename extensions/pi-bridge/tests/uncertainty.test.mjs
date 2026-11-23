@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { test } from "node:test";
-import { createClient } from "../bridge.mjs";
+import { createClient, openBridge } from "../bridge.mjs";
 import { BASE, BUDGET, TOKEN, json, loopback, privateConfig, safeFailure } from "./helpers.mjs";
 
 const payloads = {
@@ -78,7 +80,78 @@ test("lost receipt after simulated commit blocks the next native-new-ID write", 
   await latched(server, original);
 });
 
+test("an unknown relay write has no success receipt and cannot send again with any key", async t => {
+  const server = await loopback(t, (request, response) => {
+    if (request.url.endsWith("/send_message")) json(response, { error: { code: "internal_error", message: "simulated uncertainty" } }, 500);
+    else success(request, response);
+  });
+  const path = await privateConfig(t, { endpoint: server.endpoint, discussion_relay: true });
+  const sha256 = bytes => createHash("sha256").update(bytes).digest("hex");
+  const { invoke } = openBridge(path, sha256(await readFile(path)));
+  const params = { content: "请核对。", discussion: { kind: "invite", recipient_id: "peer" } };
+  const original = await unknown(invoke("send_message", params, "original"));
+  assert.equal(server.requests.length, 1);
+  assert.equal(server.requests[0].headers["idempotency-key"], sha256("send_messageoriginal"));
+  assert.deepEqual(JSON.parse(server.requests[0].body), params);
+  await latched({ ...server, invoke }, original, "send_message", params);
+});
+
+test("relay receipt counts depend on the action without narrowing generic sends", async t => {
+  const server = await loopback(t, (request, response, body) => {
+    if (!request.url.endsWith("/send_message")) return success(request, response);
+    const { content } = JSON.parse(body);
+    if (content === "legacy") {
+      response.writeHead(201, { "Content-Type": "application/json" });
+      return response.end(JSON.stringify({ ...message, delivery_count: 2, additive: { ok: true } }).replace('"delivery_count":2', '"delivery_count":2e0'));
+    }
+    if (content === "duplicate") {
+      response.writeHead(201, { "Content-Type": "application/json" });
+      return response.end(JSON.stringify({ ...message, delivery_count: 1 }).replace('"delivery_count":1', '"delivery_count":0,"delivery_count":1'));
+    }
+    json(response, { ...message, delivery_count: Number(content) }, 201);
+  });
+  const path = await privateConfig(t, { endpoint: server.endpoint, discussion_relay: true });
+  const digest = createHash("sha256").update(await readFile(path)).digest("hex");
+  const action = (kind, count) => ({ content: String(count), discussion: { kind, ...(kind === "invite" ? { recipient_id: "peer" } : {}) } });
+  const { invoke } = openBridge(path, digest);
+  for (const [kind, count] of [["invite", 1], ["resolve", 0], ["reply", 0], ["reply", 1]]) {
+    assert.equal((await invoke("send_message", action(kind, count), `${kind}-${count}`)).json.delivery_count, count);
+  }
+  assert.deepEqual((await invoke("send_message", { content: "legacy" }, "generic")).json,
+    { ...message, delivery_count: 2, additive: { ok: true } });
+  for (const [kind, count] of [["invite", 0], ["resolve", 1], ["invite", 2], ["resolve", 2], ["reply", 2], ["invite", "duplicate"]]) {
+    const fx = { ...server, invoke: openBridge(path, digest).invoke };
+    const params = action(kind, count);
+    const original = await unknown(fx.invoke("send_message", params, "original"));
+    await latched(fx, original, "send_message", params);
+  }
+});
+
+test("relay success requires a history-readable message ID", async t => {
+  const params = { content: "请核对。", discussion: { kind: "invite", recipient_id: "peer" } };
+  let messageID;
+  const server = await clientFor(t, (request, response) => {
+    if (request.url.endsWith("/send_message")) json(response, { ...message, message_id: messageID, delivery_count: 1 }, 201);
+    else success(request, response);
+  });
+  messageID = "🙂".repeat(64); // Exactly 256 UTF-8 bytes.
+  assert.equal((await server.invoke("send_message", params, "boundary")).json.message_id, messageID);
+  for (messageID of ["\ud800", "has\0nul", "🙂".repeat(64) + "x", " \u0085"]) {
+    const fx = { ...server, invoke: createClient(server.config) };
+    const original = await unknown(fx.invoke("send_message", params, "original"));
+    await latched(fx, original, "send_message", params);
+  }
+});
+
 const unknownCases = [
+  ...[
+    ["duplicate code", '{"error":{"code":"invalid_input","code":"invalid_input","message":"fixture"}}'],
+    ["conflicting escaped code", '{"error":{"code":"request_canceled","c\\u006fde":"invalid_input","message":"fixture"}}'],
+    ["conflicting error envelope", '{"error":{"code":"request_canceled"},"err\\u006fr":{"code":"invalid_input","message":"fixture"}}'],
+  ].map(([name, wire]) => [name, (_, response) => {
+    response.writeHead(400, { "Content-Type": "application/json" });
+    response.end(wire);
+  }]),
   ["partial receipt disconnect", (request, response) => {
     response.writeHead(201, { "Content-Type": "application/json", "Content-Length": 100 });
     response.write('{"message_id":"');

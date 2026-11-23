@@ -859,129 +859,63 @@ class VerifierTests(unittest.TestCase):
 class WorkflowTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.workflow = SCRIPT.parent.parent.joinpath("workflows/ci.yml").read_text(encoding="utf-8")
+        cls.workflow = SCRIPT.parent.parent.joinpath("workflows/ci-full.yml").read_text(encoding="utf-8")
+        cls.parent_workflow = SCRIPT.parent.parent.joinpath("workflows/ci.yml").read_text(encoding="utf-8")
+        cls.worker = SCRIPT.with_name("ci-shards.py").read_text(encoding="utf-8")
 
-    def test_matrix_success_is_first_gate_even_with_always(self):
-        match = re.search(r"\n  go:\n(?P<job>.*?)(?=\n  web:)", self.workflow, re.S)
+    def test_full_gate_checks_all_results_then_coverage_without_product_work(self):
+        match = re.search(r"\n  gate:\n(.*)", self.workflow, re.S)
         self.assertIsNotNone(match)
-        job = match.group("job")
-        self.assertIn("name: Go\n", job)
-        self.assertIn("needs: [go-store, go-platform, go-httpapi]", job)
-        self.assertIn("if: ${{ always() }}", job)
-        gate = re.search(r"steps:\n      - name: Check Store, Platform and HTTPAPI shards\n        env:\n          STORE_RESULT: \$\{\{ needs.go-store.result \}\}\n          PLATFORM_RESULT: \$\{\{ needs.go-platform.result \}\}\n          HTTPAPI_RESULT: \$\{\{ needs.go-httpapi.result \}\}\n        run: ([^\n]+)", job)
-        self.assertIsNotNone(gate, "all three matrix results must be checked in the first step")
-        states = ["success", "failure", "cancelled", "skipped", "", "unknown"]
-        for store_state in states:
-            for platform_state in states:
-                for httpapi_state in states:
-                    with self.subTest(store=store_state, platform=platform_state, httpapi=httpapi_state):
-                        result = subprocess.run(["bash", "-c", gate.group(1)],
-                                                env={**os.environ, "STORE_RESULT": store_state, "PLATFORM_RESULT": platform_state,
-                                                     "HTTPAPI_RESULT": httpapi_state}, capture_output=True, timeout=5)
-                        self.assertEqual(result.returncode == 0, store_state == platform_state == httpapi_state == "success")
-        positions = [job.index(text) for text in ["Check Store, Platform and HTTPAPI shards", "actions/checkout@v7", "actions/download-artifact@v7",
-                                                 "Verify Store shard coverage", "Verify Platform shard coverage", "Verify HTTPAPI shard coverage",
-                                                 "Ordinary test coordination package", "Race test coordination package",
-                                                 "Ordinary test cmd package", "Race test all other packages", "go vet ./...", "Record benchmark metrics"]]
-        self.assertEqual(positions, sorted(positions))
-        coordination_steps = [("Ordinary test coordination package", "go test -count=1 ./internal/coordination"),
-                              ("Race test coordination package", "go test -count=1 -race ./internal/coordination")]
-        for name, command in coordination_steps:
-            steps = re.findall(rf"^      - name: {re.escape(name)}\n        run: ([^\n]+)$", job, re.M)
-            self.assertEqual(steps, [command])
-        commands = re.findall(r"^[ \t]+(?:run: )?(go test[^\n]*)$", job, re.M)
-        self.assertEqual([command for command in commands if "./internal/coordination" in command.split()],
-                         [command for _, command in coordination_steps])
-        cmd_command = "go test -count=1 ./cmd/workspace"
-        cmd_steps = re.findall(r"^      - name: Ordinary test cmd package\n        run: ([^\n]+)$", job, re.M)
-        self.assertEqual(cmd_steps, [cmd_command])
-        self.assertEqual([command for command in commands if "./cmd/workspace" in command.split()], [cmd_command])
-        self.assertIn('--run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"', job)
-        self.assertIn('package=$(go list ./internal/store)', job)
+        job = match[1]
+        for text in ["name: Full suite evidence\n", "if: ${{ !cancelled() }}", "toJSON(needs)", "ci-gate.py",
+                     "ci-shards.py aggregate", "merge-multiple: false",
+                     '--run-id "$GITHUB_RUN_ID" --sha "$CHECKOUT_SHA" --tree "$CHECKOUT_TREE"']:
+            self.assertIn(text, job)
+        self.assertLess(job.index("ci-gate.py"), job.index("download-artifact"))
+        self.assertLess(job.index("download-artifact"), job.index("ci-shards.py aggregate"))
+        self.assertNotRegex(job, r"\b(?:go test|go vet|npm|setup-go)\b")
+        # Ordinary cmd now precedes admission; coordination/rest/vet/bench no longer wait for shards.
+        self.assertIn("go test -count=1 ./cmd/workspace", self.parent_workflow)
+        self.assertNotIn("go test -count=1 ./cmd/workspace", self.workflow)
+        for name in ["go-other", "go-vet", "go-benchmarks"]:
+            block = re.search(rf"\n  {name}:\n(.*?)(?=\n  [\w-]+:)", self.workflow, re.S)[1]
+            self.assertNotIn("needs:", block)
+        for command in ["go test -count=1 ./internal/coordination", "go test -count=1 -race ./internal/coordination"]:
+            self.assertEqual(self.workflow.count("run: " + command + "\n"), 1)
 
-    def test_workflow_sixty_four_slots_real_uncached_runs_and_artifact_isolation(self):
-        store = self.workflow.split("\n  go-store:\n", 1)
-        self.assertEqual(len(store), 2)
-        store = store[1].split("\n  go-platform:\n", 1)[0]
-        matrices = re.findall(r"^        slot: (\[[^\n]+\])$", store, re.M)
-        self.assertEqual(len(matrices), 1)
-        self.assertEqual(json.loads(matrices[0]), list(range(64)))
-        for text in ["fail-fast: false", "timeout-minutes: 15",
-                     "go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/store",
-                     'go test -count=1 -race -json -run "$pattern" ./internal/store',
-                     'package=$(go list ./internal/store)', 'git rev-parse HEAD', 'git rev-parse HEAD^{tree}',
-                     '"$GITHUB_RUN_ID"', "verify-store-shard.py select", "verify-store-shard.py verify",
-                     "actions/upload-artifact@v7", "name: store-shard-v1-${{ matrix.slot }}", "overwrite: true",
-                     "if-no-files-found: error"]:
-            self.assertIn(text, store)
-        self.assertNotIn("-timeout", store)
+    def test_batched_workers_keep_real_uncached_runs_and_isolated_evidence(self):
+        block = re.search(r"\n  go-shards:\n(.*?)(?=\n  go-other:)", self.workflow, re.S)[1]
+        for text in ["fail-fast: false", "timeout-minutes: 25", "max-parallel: 7", "actions/setup-go@v7",
+                     "ci-shards.py run", "actions/upload-artifact@v7", "overwrite: true", "if-no-files-found: error",
+                     "name: ${{ matrix.profile }}-worker-v1-${{ matrix.worker }}", "retention-days: 7"]:
+            self.assertIn(text, block)
+        for text in ['["go", "test", "-count=1", "-race", "-json", "-list", "^(Test|Example|Fuzz)", target]',
+                     '["go", "test", "-count=1", "-race", "-json", "-run", pattern, target]',
+                     'verifier.inventory(listed, package)', 'verifier.selection(compiled, slot, profile)',
+                     'verifier.run_pattern(subset)', 'verifier.verify(events, package, subset)',
+                     'verifier.aggregate(flattened, expected, profile)',
+                     '"git", "rev-parse", "HEAD"', '"git", "rev-parse", "HEAD^{tree}"']:
+            self.assertIn(text, self.worker)
+        self.assertNotIn("-timeout", self.worker)
         self.assertNotIn("STORE_RACE_GROUP", self.workflow)
-        self.assertIn("pattern: store-shard-v1-*", self.workflow)
-        self.assertIn("merge-multiple: false", self.workflow)
-        self.assertEqual(self.workflow.count("python3 .github/scripts/test-store-shard.py"), 1)
+        self.assertIn("pattern: '*-worker-v1-*'", self.workflow)
+        self.assertEqual(self.workflow.count("python3 .github/scripts/test-store-shard.py -v"), 1)
         self.assertIn("name: go-benchmarks", self.workflow)
         self.assertNotIn("fixture", self.workflow.lower())
 
-    def test_platform_matrix_and_independent_aggregate(self):
-        platform = re.search(r"\n  go-platform:\n(.*?)(?=\n  go-httpapi:)", self.workflow, re.S)
-        self.assertIsNotNone(platform)
-        job = platform.group(1)
-        matrices = re.findall(r"^        slot: (\[[^\n]+\])$", job, re.M)
-        self.assertEqual(len(matrices), 1)
-        self.assertEqual(json.loads(matrices[0]), list(range(PLATFORM_TOTAL)))
-        for text in ["fail-fast: false", "timeout-minutes: 15",
-                     "go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/platform",
-                     'go test -count=1 -race -json -run "$pattern" ./internal/platform',
-                     'package=$(go list ./internal/platform)', 'git rev-parse HEAD', 'git rev-parse HEAD^{tree}',
-                     '"$GITHUB_RUN_ID"', 'verify-store-shard.py select --profile platform "$PLATFORM_SLOT"',
-                     'verify-store-shard.py verify --profile platform "$PLATFORM_SLOT"',
-                     "name: platform-shard-v1-${{ matrix.slot }}", "overwrite: true", "if-no-files-found: error",
-                     "path: ${{ runner.temp }}/platform-summary.json"]:
-            self.assertIn(text, job)
-        self.assertNotIn("-timeout", job)
-        for suite in ["store", "platform"]:
-            download = re.search(rf"pattern: {suite}-shard-v1-\*\n          path: \$\{{\{{ runner.temp \}}\}}/{suite}-shards\n          merge-multiple: false", self.workflow)
-            self.assertIsNotNone(download)
-            aggregate = re.search(rf"- name: Verify {suite.title()} shard coverage\n        run: \|\n(.*?)(?=\n      -)", self.workflow, re.S)
-            self.assertIsNotNone(aggregate)
-            for text in [f'package=$(go list ./internal/{suite})', f'"$RUNNER_TEMP/{suite}-shards"',
-                         '--run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"']:
-                self.assertIn(text, aggregate.group(1))
-            self.assertIn("verify-store-shard.py aggregate" + (" --profile platform" if suite == "platform" else ""), aggregate.group(1))
-
-    def test_httpapi_matrix_and_independent_aggregate(self):
-        match = re.search(r"\n  go-httpapi:\n(.*?)(?=\n  go:)", self.workflow, re.S)
-        self.assertIsNotNone(match)
-        job = match.group(1)
-        matrices = re.findall(r"^        slot: (\[[^\n]+\])$", job, re.M)
-        self.assertEqual(len(matrices), 1)
-        self.assertEqual(json.loads(matrices[0]), list(range(8)))
-        for text in ["fail-fast: false", "timeout-minutes: 15", "runs-on: ubuntu-latest",
-                     "HTTPAPI_SLOT: ${{ matrix.slot }}", "set -euo pipefail", "actions/checkout@v7", "persist-credentials: false",
-                     "actions/setup-go@v7", 'package=$(go list ./internal/httpapi)', 'sha=$(git rev-parse HEAD)', 'tree=$(git rev-parse HEAD^{tree})',
-                     'verify-store-shard.py select --profile httpapi "$HTTPAPI_SLOT" "$package" "$RUNNER_TEMP/httpapi-list.json"',
-                     'verify-store-shard.py verify --profile httpapi "$HTTPAPI_SLOT" "$package" "$RUNNER_TEMP/httpapi-list.json" "$RUNNER_TEMP/httpapi-run.json"',
-                     '--run-id "$GITHUB_RUN_ID" --sha "$sha" --tree "$tree" > "$RUNNER_TEMP/httpapi-summary.json"',
-                     'tee "$RUNNER_TEMP/httpapi-list.json"', 'tee "$RUNNER_TEMP/httpapi-run.json"', "actions/upload-artifact@v7",
-                     "name: httpapi-shard-v1-${{ matrix.slot }}", "path: ${{ runner.temp }}/httpapi-summary.json",
-                     "overwrite: true", "if-no-files-found: error", "retention-days: 7"]:
-            self.assertIn(text, job)
-        commands = re.findall(r"^[ \t]+(?:run: )?(go test[^\n]*)$", self.workflow, re.M)
-        self.assertEqual([command for command in commands if "./internal/httpapi" in command.split()],
-                         ["go test -count=1 -race -json -list '^(Test|Example|Fuzz)' ./internal/httpapi | tee \"$RUNNER_TEMP/httpapi-list.json\"",
-                          'go test -count=1 -race -json -run "$pattern" ./internal/httpapi | tee "$RUNNER_TEMP/httpapi-run.json"'])
-        self.assertNotIn("-timeout", job)
-        self.assertEqual(self.workflow.count("pattern: httpapi-shard-v1-*"), 1)
-        self.assertIn("pattern: httpapi-shard-v1-*\n          path: ${{ runner.temp }}/httpapi-shards\n          merge-multiple: false", self.workflow)
-        aggregates = re.findall(r"- name: Verify HTTPAPI shard coverage\n        run: \|\n(.*?)(?=\n      -)", self.workflow, re.S)
-        self.assertEqual(len(aggregates), 1)
-        for text in ['package=$(go list ./internal/httpapi)',
-                     'verify-store-shard.py aggregate --profile httpapi "$package" "$RUNNER_TEMP/httpapi-shards"',
-                     '--run-id "$GITHUB_RUN_ID" --sha "$(git rev-parse HEAD)" --tree "$(git rev-parse HEAD^{tree})"']:
-            self.assertIn(text, aggregates[0])
+    def test_profiles_keep_independent_package_bound_aggregates(self):
+        # Physical workers changed; the three logical profiles and aggregate checks did not.
+        for profile, package, total in [("store", PACKAGE, 64), ("platform", PLATFORM_PACKAGE, 9), ("httpapi", HTTPAPI_PACKAGE, 8)]:
+            source = SCRIPT.read_text(encoding="utf-8")
+            self.assertIn(package, source)
+            self.assertIn(f'"{profile}"', self.worker)
+            self.assertIn('verifier.PROFILES[profile]', self.worker)
+        self.assertIn('package == expected_package', self.worker)
+        self.assertIn('source.is_file() and not source.is_symlink()', self.worker)
+        self.assertIn('directory_entries(artifact, [f"{prefix}{slot}" for slot in slots])', self.worker)
 
     def test_remaining_package_exclusion_executes_actual_shell_without_go(self):
-        match = re.search(r"- name: Race test all other packages\n        run: \|\n(.*?)(?=\n      -)", self.workflow, re.S)
+        match = re.search(r"- name: Race test all other packages\n        run: \|\n(.*?)(?=\n      -|\n  [\w-]+:|\Z)", self.workflow, re.S)
         self.assertIsNotNone(match)
         script = textwrap.dedent(match.group(1))
         # PATH is empty, and every go invocation is handled here or rejected.

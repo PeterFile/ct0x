@@ -19,6 +19,7 @@ const (
 	runSubmissionPrefix  = "submission:"
 	runOperationPrefix   = "workspace:"
 	runDecisionPrefix    = "dispatch_decision:"
+	runExplanationPrefix = "public_explanation:"
 )
 
 type AgentRunEntry struct {
@@ -29,6 +30,7 @@ type AgentRunEntry struct {
 	Submission         *AgentRunSubmission         `json:"submission,omitempty"`
 	WorkspaceOperation *AgentRunWorkspaceOperation `json:"workspace_operation,omitempty"`
 	DispatchDecision   *AgentRunDispatchDecision   `json:"dispatch_decision,omitempty"`
+	PublicExplanation  *AgentRunExplanation        `json:"public_explanation,omitempty"`
 }
 
 type AgentRunMessage struct {
@@ -99,7 +101,7 @@ func newAgentRunWindow(options ListOptions) (agentRunWindow, error) {
 			return agentRunWindow{}, ErrInvalid
 		}
 		switch prefix + ":" {
-		case runMessagePrefix, runSubmissionPrefix, runOperationPrefix, runDecisionPrefix:
+		case runMessagePrefix, runSubmissionPrefix, runOperationPrefix, runDecisionPrefix, runExplanationPrefix:
 		default:
 			return agentRunWindow{}, ErrInvalid
 		}
@@ -154,10 +156,17 @@ func (w agentRunWindow) timeline(ctx context.Context, tx *sql.Tx, ref agentRunRe
 	if err != nil {
 		return Page[AgentRunEntry]{}, err
 	}
+	explanation, err := w.explanation(ctx, tx, ref)
+	if err != nil {
+		return Page[AgentRunEntry]{}, err
+	}
 	items = append(items, submissions...)
 	items = append(items, operations...)
 	if decision != nil {
 		items = append(items, *decision)
+	}
+	if explanation != nil {
+		items = append(items, *explanation)
 	}
 	if w.contains(trigger) {
 		items = append(items, trigger)

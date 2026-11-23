@@ -27,7 +27,8 @@ var errPiMemberToolConfiguration = errors.New("成员工具执行配置无效")
 type piMemberToolOptions struct {
 	// Trusted only from the exact pinned fresh typed adapters, never inferred
 	// from tool names, ordinary digest options, the child stream or the prompt.
-	typedWorkRole string
+	typedWorkRole     string
+	taskDecisionRunID string // Only for the exact fresh proposal profile.
 
 	extensionPath string
 	configPath    string
@@ -161,6 +162,10 @@ func (o *piMemberToolOptions) boundConfig() bool {
 func (o *piMemberToolOptions) launchConfigMatches() bool {
 	if !o.boundConfig() {
 		return true
+	}
+	if o.taskDecisionRunID != "" {
+		config, err := readFreshTaskWorkConfig(o.configPath, o.taskDecisionRunID)
+		return err == nil && config.digest == o.configSHA256
 	}
 	if o.investigationConfigFile == nil {
 		return piMemberToolConfigMatches(o.configPath, o.configSHA256, o.investigation)
