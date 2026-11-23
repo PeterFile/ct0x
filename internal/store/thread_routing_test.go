@@ -198,21 +198,30 @@ func TestThreadRoutingReplyClassificationBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	other := postThreadMessage(t, f.s, MessageRequest{GroupID: f.groupID, ActorID: "user",
+		Content: "New topic: QA-417 Index review", RecipientIDs: []string{f.b}})
+	if other.TopicID == "" {
+		t.Fatal("fixture needs a recognized issue in a different topic")
+	}
 	const prefix = "补充细节："
 	atLimit := prefix + strings.Repeat("x", maxThreadTextBytes-len(prefix))
 	pastLimit := atLimit + "x"
 	lateMarker := atLimit + "\n引用仅作对照。"
+	longIssue := "QA-417\n" + atLimit
 	for _, tc := range []struct {
 		name, body, reply, topic, wantTopic, wantRecipient string
 		recipients                                         []string
 	}{
 		{"at_limit", atLimit, quoted.ID, "", quoted.TopicID, f.a, nil},
-		{"one_byte_over", pastLimit, quoted.ID, "", "", f.b, nil},
-		{"comparison_beyond_limit", lateMarker, quoted.ID, "", "", f.b, nil},
-		{"explicit_topic", lateMarker, quoted.ID, quoted.TopicID, quoted.TopicID, f.b, nil},
-		{"explicit_recipient", lateMarker, quoted.ID, "", "", f.a, []string{f.a}},
-		{"public_only", lateMarker, quoted.ID, "", "", "", []string{}},
-		{"without_quote", lateMarker, "", "", "", f.a, nil},
+		{"one_byte_over", pastLimit, quoted.ID, "", quoted.TopicID, f.a, nil},
+		{"comparison_beyond_limit", lateMarker, quoted.ID, "", quoted.TopicID, f.a, nil},
+		{"issue_in_long_body", longIssue, quoted.ID, "", quoted.TopicID, f.a, nil},
+		{"explicit_topic", lateMarker, quoted.ID, quoted.TopicID, quoted.TopicID, f.a, nil},
+		{"explicit_different_topic", lateMarker, quoted.ID, other.TopicID, other.TopicID, "", nil},
+		{"explicit_recipient", lateMarker, quoted.ID, "", quoted.TopicID, f.b, []string{f.b}},
+		{"public_only", lateMarker, quoted.ID, "", quoted.TopicID, "", []string{}},
+		{"bounded_issue_without_quote", "QA-417", "", "", other.TopicID, f.b, nil},
+		{"long_issue_without_quote", longIssue, "", "", "", f.a, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := postThreadMessage(t, f.s, MessageRequest{

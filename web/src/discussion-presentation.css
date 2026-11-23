@@ -39,6 +39,20 @@
   border-inline-start: 0;
   border-inline-end: var(--border-accent);
 }
+.discussion-feed .message-quote {
+  display: grid;
+  gap: var(--space-1);
+  min-inline-size: 0;
+  padding: var(--space-1) var(--space-2);
+  border-inline-start: var(--border-rule);
+  color: var(--color-muted);
+  font-size: var(--text-small);
+  overflow-wrap: anywhere;
+}
+.discussion-feed a.message-quote strong { color: var(--color-text); }
+.discussion-feed a.message-quote:hover strong { color: var(--color-accent); }
+.discussion-feed .composer-quote { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+.discussion-feed .composer-quote > span:last-child { grid-column: 1 / -1; }
 .discussion-feed .message-actions {
   display: flex;
   flex-wrap: wrap;
@@ -46,18 +60,18 @@
   gap: var(--space-1) var(--space-2);
   min-inline-size: 0;
 }
-.discussion-feed .message-actions > :is(.message-task-action, .message-discussion-refresh),
+.discussion-feed .message-actions > :is(.message-reply-action, .message-task-action, .message-discussion-refresh),
 .discussion-feed .message-actions > .message-details > summary {
   min-block-size: var(--space-6);
   padding: var(--space-1) var(--space-2);
 }
-.discussion-feed .message-actions > :is(.message-task-action, .message-discussion-refresh) {
+.discussion-feed .message-actions > :is(.message-reply-action, .message-task-action, .message-discussion-refresh) {
   border: 0;
   background: transparent;
   color: var(--color-muted);
   font-size: var(--text-small);
 }
-.discussion-feed .message-actions > :is(.message-task-action, .message-discussion-refresh):hover { color: var(--color-accent); }
+.discussion-feed .message-actions > :is(.message-reply-action, .message-task-action, .message-discussion-refresh):hover { color: var(--color-accent); }
 .discussion-feed .message-actions > .message-details[open] { flex-basis: 100%; }
 .discussion-feed .message-details {
   min-inline-size: 0;
@@ -148,6 +162,6 @@
 }
 .discussion-feed .selected-recipients span { overflow-wrap: anywhere; }
 .discussion-feed .selected-recipients button { flex-shrink: 0; font-size: var(--text-small); }
-.discussion-feed :is(.composer-options summary, .mention-suggestions button):focus-visible {
+.discussion-feed :is(.composer-options summary, .mention-suggestions button, a.message-quote, .message-reply-action):focus-visible {
   outline: var(--focus-ring); outline-offset: var(--focus-offset);
 }
