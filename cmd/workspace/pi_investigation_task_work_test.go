@@ -25,16 +25,18 @@ func TestPiFreshInvestigationWorkComposition(t *testing.T) {
 	textEntry := filepath.Join(filepath.Dir(ordinary), "fresh-task-work.ts")
 	const opt = "--pi-fresh-investigation-work-extension"
 	const ownerOpt = "--enable-investigation-owner-management"
+	const a7Opt = "--enable-discussion-work-return"
 	catalog := platform.DiscoverProviders(ctx, provider.Search{Explicit: []provider.Location{{Name: provider.Pi, Path: fake.path}}}, provider.Runner{})
 	providers, err := providerSnapshot(catalog)
 	if err != nil || len(providers) != 1 || providers[0].Version != "1.4.0" {
 		t.Fatalf("missing synthetic Pi provider: %v", err)
 	}
-	for _, mode := range []string{"first-only", "typed-only", "typed-with-text", "managed-owners", "managed-with-text-and-resume"} {
+	for _, mode := range []string{"first-only", "typed-only", "typed-with-text", "managed-owners", "managed-with-text-and-resume", "discussion-return"} {
 		t.Run(mode, func(t *testing.T) {
 			wantTyped := mode != "first-only"
 			wantOwners := mode == "managed-owners" || mode == "managed-with-text-and-resume"
-			wantText := mode == "typed-with-text" || mode == "managed-with-text-and-resume"
+			wantReturn := mode == "discussion-return"
+			wantText := mode == "typed-with-text" || mode == "managed-with-text-and-resume" || wantReturn
 			private := filepath.Join(t.TempDir(), "private")
 			if err := os.Mkdir(private, 0700); err != nil {
 				t.Fatal(err)
@@ -44,7 +46,7 @@ func TestPiFreshInvestigationWorkComposition(t *testing.T) {
 				t.Fatal("typed opt-in accepted without existing investigation startup fences")
 			}
 			base = append(base, "--enable-investigation-execution")
-			for _, wrong := range [][]string{{opt, ordinary}, {opt, "relative.ts"}, {opt, entry, opt, entry}, {ownerOpt}} {
+			for _, wrong := range [][]string{{opt, ordinary}, {opt, "relative.ts"}, {opt, entry, opt, entry}, {ownerOpt}, {a7Opt}} {
 				if _, err := parseConfig(append(slices.Clone(base), wrong...), io.Discard); err == nil {
 					t.Fatal("ambiguous typed extension option accepted")
 				}
@@ -58,7 +60,10 @@ func TestPiFreshInvestigationWorkComposition(t *testing.T) {
 			if wantOwners {
 				base = append(base, ownerOpt)
 			}
-			if mode == "managed-with-text-and-resume" {
+			if wantReturn {
+				base = append(base, a7Opt)
+			}
+			if mode == "managed-with-text-and-resume" || wantReturn {
 				base = append(base, "--enable-native-session-resume", "--native-pi-thinking", "max")
 			}
 			cfg, err := parseConfig(base, io.Discard)
@@ -76,6 +81,9 @@ func TestPiFreshInvestigationWorkComposition(t *testing.T) {
 				t.Fatalf("wrong startup descriptor: %v", err)
 			}
 			if launch != nil {
+				if launch.EnableDiscussionWorkReturn != wantReturn {
+					t.Fatal("A7 flag did not bind the typed launcher")
+				}
 				// This is the actual cmd adapter. An empty plan must be denied
 				// inside B without calling the runtime's memory callback.
 				called := false
@@ -109,7 +117,7 @@ func TestPiFreshInvestigationWorkComposition(t *testing.T) {
 			}
 			routes := httpapi.MemberRoleToolRoutes(tools)
 			for op, want := range map[string]bool{"report_work": wantTyped, "read_work_report": wantTyped, "read_work_inputs": wantTyped,
-				"delegate_work": wantOwners, "handback_work": wantOwners, "hand_back_work": false} {
+				"delegate_work": wantOwners, "handback_work": wantOwners || wantReturn, "hand_back_work": false} {
 				found := slices.ContainsFunc(routes, func(r httpapi.Route) bool { return r.Pattern == "/api/v1/member-tools/"+op })
 				if found != want {
 					t.Fatalf("wrong route availability for %s", op)

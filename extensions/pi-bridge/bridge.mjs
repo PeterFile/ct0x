@@ -15,7 +15,7 @@ export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel",
 /** @typedef {{ text: string, json: unknown }} Reply */
 /** @typedef {(toolName: string, params: unknown, toolCallId: string, signal?: AbortSignal) => Promise<Reply>} Client */
 /** @typedef {"not_sent" | "rejected" | "unknown"} FailureOutcome */
-/** @typedef {{ unknown?: { toolName: string, toolCallId: string, fingerprint: string, error: Error } }} WriteState */
+/** @typedef {{ unknown?: { toolName: string, toolCallId: string, idempotencyKey: string, body: Buffer, error: Error } }} WriteState */
 const REJECTION_CODES = new Map([
   [400, ["invalid_input", "invalid_json"]], [403, ["forbidden", "invalid_host", "invalid_origin"]],
   [405, ["method_not_allowed"]],
@@ -57,7 +57,7 @@ function endpointURL(value) {
  * selects the bound profile; it covers exactly the bytes this bridge consumes.
  * @param {string | undefined} path
  * @param {string} [expectedSHA256]
- * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[] }}
+ * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[], discussionRelay: boolean }}
  */
 export function openBridge(path, expectedSHA256) {
   let fd;
@@ -86,11 +86,13 @@ export function openBridge(path, expectedSHA256) {
     if (!isRecord(config)) throw new Error(CONFIG_ERROR);
     const continueWork = Object.hasOwn(config, "continue_work");
     const discussionOnlyExcerpt = Object.hasOwn(config, "discussion_only_excerpt");
+    const discussionRelay = Object.hasOwn(config, "discussion_relay");
     const investigationIntake = Object.hasOwn(config, "intake_assessment_action");
     const strict = Object.hasOwn(config, "investigation_tools");
     if (!Object.hasOwn(config, "endpoint") || !Object.hasOwn(config, "token") ||
-        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) + Number(strict) ||
+        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) + Number(strict) + Number(discussionRelay) ||
         (continueWork && config.continue_work !== true) || (discussionOnlyExcerpt && config.discussion_only_excerpt !== true) ||
+        (discussionRelay && (expectedSHA256 === undefined || config.discussion_relay !== true)) ||
         (investigationIntake && config.intake_assessment_action !== INVESTIGATION_ASSESSMENT_ACTION) ||
         typeof config.token !== "string" || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token)) {
       throw new Error(CONFIG_ERROR);
@@ -99,7 +101,7 @@ export function openBridge(path, expectedSHA256) {
     let investigationTools;
     if (strict) {
       const names = config.investigation_tools;
-      if (expectedSHA256 === undefined || continueWork || discussionOnlyExcerpt || investigationIntake || !Array.isArray(names)) throw new Error(CONFIG_ERROR);
+      if (expectedSHA256 === undefined || continueWork || discussionOnlyExcerpt || investigationIntake || discussionRelay || !Array.isArray(names)) throw new Error(CONFIG_ERROR);
       const reads = [INVESTIGATION_CHANNEL, INVESTIGATION_ARTIFACT].filter(name => names.includes(name));
       if (!reads.length || names.length !== reads.length + 1 || !reads.every((name, i) => names[i] === name) ||
           !["decide_dispatch", "submit_result"].includes(names.at(-1))) throw new Error(CONFIG_ERROR);
@@ -116,7 +118,7 @@ export function openBridge(path, expectedSHA256) {
         }
         return requestTool(endpoint, token, writes, toolName, params, toolCallId, signal);
       },
-      continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools,
+      continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools, discussionRelay,
     };
   } catch {
     throw new Error(CONFIG_ERROR);
@@ -160,6 +162,14 @@ function validRoleReceiptWire(text, count = 4) {
     keys.add(key);
   }
   return field.lastIndex === wire.length;
+}
+
+/** @param {string} text */
+function validRejectionWire(text) {
+  // A definite rejection requires the server's single, unambiguous error envelope.
+  // JSON.parse alone collapses duplicate keys, including escaped spellings.
+  const match = /^\s*\{\s*("(?:[^"\\]|\\.)*")\s*:\s*(\{[\s\S]*\})\s*\}\s*$/.exec(text);
+  return match !== null && JSON.parse(match[1]) === "error" && validRoleReceiptWire(match[2], 2);
 }
 
 /** @param {unknown} value @param {string} token @param {boolean} roleWrite @param {string} toolName */
@@ -228,10 +238,18 @@ function validWriteReceipt(toolName, status, value, requestValue) {
   if (toolName !== "send_message" && toolName !== "create_member") return true;
   if (!isRecord(value)) return false;
   if (toolName === "send_message") {
+    // Relay receipts must name an ID usable by read_history (Go TrimSpace semantics).
+    const id = value.message_id;
+    if (requestValue !== undefined && (typeof id !== "string" || !validUnicode(id) ||
+        !/\P{White_Space}/u.test(id) || id.includes("\0") || Buffer.byteLength(id) > 256)) return false;
     return status === 201 && typeof value.message_id === "string" && value.message_id.length > 0 &&
       validReceiptTime(value.created_at) &&
       typeof value.delivery_count === "number" && Number.isSafeInteger(value.delivery_count) &&
-      value.delivery_count >= 0 && value.content_omitted === true;
+      value.delivery_count >= 0 && value.content_omitted === true &&
+      (requestValue === undefined ||
+        (requestValue === "invite" && value.delivery_count === 1) ||
+        (requestValue === "resolve" && value.delivery_count === 0) ||
+        (requestValue === "reply" && value.delivery_count <= 1)); // A departed inviter need not be woken.
   }
   return typeof value.member_id === "string" && value.member_id.length > 0 &&
     typeof value.join_message_id === "string" && (status === 200 ?
@@ -269,18 +287,25 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
     const text = JSON.stringify(params);
     if (typeof text !== "string" || text.includes(token)) throw new Error();
     body = Buffer.from(text, "utf8");
-    if (toolName === "decide_dispatch" || workInputWrite) {
+    if (toolName === "send_message" || toolName === "decide_dispatch" || workInputWrite) {
       const snapshot = JSON.parse(text);
-      if (isRecord(snapshot)) requestValue = workInputWrite ? snapshot.input_id : snapshot.kind;
+      if (isRecord(snapshot)) {
+        if (toolName !== "send_message") requestValue = workInputWrite ? snapshot.input_id : snapshot.kind;
+        else if (Object.hasOwn(snapshot, "discussion")) {
+          requestValue = isRecord(snapshot.discussion) ? snapshot.discussion.kind ?? null : null;
+        }
+      }
     }
   } catch {
     throw safeError("成员工具参数无效，未发送请求。");
   }
   if (body.length > BYTE_LIMIT) throw safeError("工具请求超过 64 KiB 限制，未发送请求。");
-  const fingerprint = write ? createHash("sha256").update(body).digest("hex") : "";
+  const relayWrite = toolName === "send_message" && requestValue !== undefined;
+  const idempotencyKey = write ? createHash("sha256").update(toolName + toolCallId).digest("hex") : "";
   if (write && writes.unknown) {
     const previous = writes.unknown;
-    if (previous.toolName === toolName && previous.toolCallId === toolCallId && previous.fingerprint === fingerprint) {
+    if (previous.toolName === toolName && previous.toolCallId === toolCallId &&
+        previous.idempotencyKey === idempotencyKey && previous.body.equals(body)) {
       throw previous.error;
     }
     throw safeError("成员工具先前写入结果未知，当前实例已阻止后续写入；请先对账，不要自动重试。");
@@ -297,7 +322,9 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
     let timer;
     let sent = false;
     let settled = false;
-    const unknown = "执行结果未知；请先对账，不要自动重试。";
+    const unknown = relayWrite ?
+      "执行结果未知；请保留原工具调用标识、幂等键和请求内容，先对账，不要自动重试。" :
+      "执行结果未知；请先对账，不要自动重试。";
     const invalidResponse = `成员工具返回无效响应，${unknown}`;
     const overflow = `工具结果超过 64 KiB 限制（tool_result_too_large），${unknown}`;
     const interrupted = () => sent ? `成员工具请求中断，${unknown}` : "成员工具连接失败，请求尚未发送。";
@@ -311,7 +338,7 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
       settled = true;
       const error = safeError(message);
       if (write && outcome === "unknown" && !writes.unknown) {
-        writes.unknown = { toolName, toolCallId, fingerprint, error };
+        writes.unknown = { toolName, toolCallId, idempotencyKey, body, error };
       }
       cleanup();
       response?.destroy();
@@ -323,7 +350,7 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
       /** @type {Record<string, string | number>} */
       const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json", "Content-Length": body.length };
       if (write) {
-        headers["Idempotency-Key"] = createHash("sha256").update(toolName + toolCallId).digest("hex");
+        headers["Idempotency-Key"] = idempotencyKey;
       }
       req = request({
         hostname: endpoint.hostname.replace(/^\[|\]$/g, ""), port: endpoint.port || 80,
@@ -362,11 +389,13 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
                 (toolName === "read_work_inputs" && status === 413 && code === "tool_result_too_large") ||
                 (toolName !== "decide_dispatch" && ((status === 404 && code === "not_found") || (status === 409 && code === "conflict"))) ||
                 (!roleWrite && status === 409 && code === "member_capacity"));
+            if (rejected && !validRejectionWire(result.text)) return fail(invalidResponse);
             const suffix = rejected || code === "request_canceled" || code === "deadline_exceeded" ? "" : ` ${unknown}`;
             return fail(message ? message + suffix : invalidResponse, rejected ? "rejected" : "unknown");
           }
           if (sensitive) return fail(`成员工具返回了敏感数据，已拒绝显示；${unknown}`);
-          if (!validWriteReceipt(toolName, status, result.json, requestValue)) return fail(invalidResponse);
+          if (!validWriteReceipt(toolName, status, result.json, requestValue) ||
+              (relayWrite && !validRoleReceiptWire(result.text))) return fail(invalidResponse);
           if (roleWrite || workspaceWrite) {
             if (!validRoleReceiptWire(result.text, workInputWrite ? 1 : workspaceWrite ? 5 : 4)) return fail(invalidResponse);
             result = { text: JSON.stringify(result.json), json: result.json };

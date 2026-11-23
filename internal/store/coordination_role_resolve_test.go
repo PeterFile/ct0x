@@ -67,6 +67,7 @@ func coordinationRoleReadOnlyQueries(t *testing.T, s *Store, queries []assignmen
 		t.Fatal("resolver did not execute SQL, or postclaim live scope was not the first SQL")
 	}
 	indexedReceipts := map[string]bool{}
+	indexedReturns := map[string]bool{}
 	for _, q := range queries {
 		statement := strings.TrimSpace(q.query)
 		if postclaim && strings.HasPrefix(statement, fence) {
@@ -78,8 +79,12 @@ func coordinationRoleReadOnlyQueries(t *testing.T, s *Store, queries []assignmen
 		}
 		plan := resolutionPlan(t, s, q.query, q.args...)
 		for _, line := range strings.Split(plan, "\n") {
+			// Catalog metadata and its fixed manifest are not application history.
+			if statement == chatDiscussionWorkReturnSchemaSQL && (line == "SCAN main.sqlite_schema" || line == "SCAN footprint") {
+				continue
+			}
 			// p is the at-most-two raw receipt candidates; json_each reads only
-			// the captured policy. Neither is a scan of persisted history.
+			// the captured policy or fixed manifest.
 			if strings.HasPrefix(line, "SCAN ") && line != "SCAN p" && line != "SCAN CONSTANT ROW" && !strings.HasPrefix(line, "SCAN json_each ") {
 				t.Fatalf("resolver scanned a persisted table: %s", line)
 			}
@@ -88,6 +93,14 @@ func coordinationRoleReadOnlyQueries(t *testing.T, s *Store, queries []assignmen
 					indexedReceipts[table] = true
 				}
 			}
+			for _, key := range []string{"delivery_id", "message_id"} {
+				if strings.Contains(line, "sqlite_autoindex_chat_discussion_work_returns_") && strings.Contains(line, "("+key+"=?)") {
+					indexedReturns[key] = true
+				}
+			}
+		}
+		if statement == chatDiscussionWorkReturnSchemaSQL {
+			continue // Listed table names above are metadata, not reads of those tables.
 		}
 		if strings.Contains(plan, "task_attempts_group_task_created_id") ||
 			strings.Contains(plan, "messages_group_created_id") ||
@@ -109,6 +122,9 @@ func coordinationRoleReadOnlyQueries(t *testing.T, s *Store, queries []assignmen
 	}
 	if len(indexedReceipts) != 2 {
 		t.Fatal("resolver did not inspect both unique delivery receipt indexes, including before ordinary fallback")
+	}
+	if !postclaim && len(indexedReturns) != 2 {
+		t.Fatal("queued resolver must inspect both unique return keys before legacy fallback")
 	}
 }
 

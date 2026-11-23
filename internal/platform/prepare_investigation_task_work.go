@@ -17,8 +17,9 @@ import (
 type investigationTaskWorkPreparation struct {
 	profile      provider.PiFreshInvestigationProfile
 	versions     []domain.ArtifactVersionRef
-	managed      bool
+	ownerPurpose string
 	candidateIDs []string
+	invitation   investigationInvitation
 }
 
 // B's peek has already checked the wake and sampled current readiness. These
@@ -110,23 +111,38 @@ func (p *Preparer) planInvestigationTaskWork(ctx context.Context, input preparat
 	if len(versions) != 0 && r.investigationTaskWork.Artifacts == nil {
 		return empty, rolePreparationBlocked(state, "investigation_artifacts_unavailable", nil)
 	}
-	var managed bool
-	if work.SourceKind.IsOwnerContinuation() && r.investigationOwnerLaunchEnabled() {
-		// A ready B continuation can have a broader original admission. Only
-		// a definite non-strict root keeps the base profile; failed reads abort.
-		err := requireStrictInvestigationAdmissionRoot(ctx, p.store, admission)
-		if err != nil && err != errInvestigationFirstRoot {
-			return empty, preparationResolutionError(ctx, err)
-		}
-		managed = err == nil
-	}
+	var invitation investigationInvitation
+	var ownerPurpose string
 	var candidates []string
-	if managed {
-		candidates, err = r.tools.investigationDelegateCandidates(ctx, state.Provenance, scope)
-		if err != nil {
-			return empty, preparationResolutionError(ctx, err)
+	if work.SourceKind.IsOwnerContinuation() {
+		// A ready #206 continuation may have a broader B admission. Only a
+		// positively proved root adds a command; failed reads abort planning.
+		if r.tools.discussionWorkReturn && admission.SourceKind == "member" {
+			invitation, err = requireInvestigationInvitation(ctx, p.store, admission)
+			if err != nil && err != errInvestigationFirstRoot {
+				return empty, preparationResolutionError(ctx, err)
+			}
+			if err == nil {
+				if input.member.ProviderID != p.investigation.providerID {
+					return empty, rolePreparationBlocked(state, "unsupported_provider", nil)
+				}
+				ownerPurpose = memberInvestigationReturnOwnerPurpose
+				profile.Operations = append(profile.Operations, HandbackWorkOperation)
+			}
+		} else if r.investigationOwnerLaunchEnabled() {
+			err := requireStrictInvestigationAdmissionRoot(ctx, p.store, admission)
+			if err != nil && err != errInvestigationFirstRoot {
+				return empty, preparationResolutionError(ctx, err)
+			}
+			if err == nil {
+				ownerPurpose = memberContinuingInvestigationOwnerPurpose
+				candidates, err = r.tools.investigationDelegateCandidates(ctx, state.Provenance, scope)
+				if err != nil {
+					return empty, preparationResolutionError(ctx, err)
+				}
+				profile.Operations = investigationOwnerOperations(profile.Operations, candidates, true)
+			}
 		}
-		profile.Operations = investigationOwnerOperations(profile.Operations, candidates, true)
 	}
 	selected := p.providers[input.member.ProviderID]
 	if !supportsInvestigationTaskWorkMember(input.member, selected, profile, r.investigationTaskWork.Supports) {
@@ -139,7 +155,7 @@ func (p *Preparer) planInvestigationTaskWork(ctx context.Context, input preparat
 		return empty, preparationFailureWithCause(ctx, errPrepareRead, err)
 	}
 	plan := taskWorkPreparation{delivery: work, mandate: mandate, provenance: state.Provenance, selected: selected,
-		investigation: &investigationTaskWorkPreparation{profile: profile, versions: slices.Clone(versions), managed: managed, candidateIDs: candidates}}
+		investigation: &investigationTaskWorkPreparation{profile: profile, versions: slices.Clone(versions), ownerPurpose: ownerPurpose, candidateIDs: candidates, invitation: invitation}}
 	prompt, err := plan.investigationPrompt(objective, min(p.roleMaxContextBytes, investigationMaxContextBytes))
 	if err != nil {
 		return empty, err
@@ -187,8 +203,11 @@ func (p taskWorkPreparation) investigationPrompt(objective string, budget int) (
 	if d.SourceKind.IsOwnerContinuation() {
 		permissions = append(permissions, "仅处理待办（pending）输入；读取不等于确认。处理后调用 ack_work_input，超范围可用 hand_back_work_input 交回单条输入。用 submit_result 提交纯文本，不附成果版本。")
 	}
-	if investigation.managed {
+	switch investigation.ownerPurpose {
+	case memberContinuingInvestigationOwnerPurpose:
 		permissions = append(permissions, investigationOwnerPermissions(investigation.candidateIDs, true)...)
+	case memberInvestigationReturnOwnerPurpose:
+		permissions = append(permissions, "无法继续整项调查时，用 handback_work 给出原因和未决事项，而不是提交结论。该操作记录给协调员的通知、不改派；平台会在符合条件时另行向原始讨论邀请者回传。通知回执不代表对方已经响应。hand_back_work_input 仅交回单条输入，两者不可替代。")
 	}
 	raw, err := json.Marshal(metadata)
 	if err != nil {

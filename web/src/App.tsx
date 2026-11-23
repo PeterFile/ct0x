@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ComponentType } from "react";
 import type { Group, Member } from "./api";
-import type { AppShellProps, ShellContext } from "./openbot-shell/types";
+import type { AppShellProps, ShellContext, ShellPage } from "./openbot-shell/types";
+import { AgentRunLogPage } from "./AgentRunLogPage";
 import { Discussion } from "./Discussion";
 import type { RecipientSelection } from "./Discussion";
 import { Groups } from "./Groups";
 import { HistorySearch } from "./HistorySearch";
 import { Members } from "./Members";
+import { PendingReviews } from "./PendingReviews";
 import { Tasks } from "./Tasks";
 import "./im-shell.css";
 
 type Context = ShellContext;
+const pendingReviewsId = "im-pending-reviews";
+const agentRunLogId = "im-agent-run-log";
 function useMobile() {
   const [mobile, setMobile] = useState(() => window.matchMedia?.("(max-width: 56rem)").matches ?? false);
   useEffect(() => {
@@ -27,6 +31,8 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
   const mobile = useMobile();
   const [pane, setPane] = useState<"list" | "chat">("list");
   const [context, setContext] = useState<Context | null>(null);
+  const [globalPage, setGlobalPage] = useState<string | null>(null);
+  const [visitedPages, setVisitedPages] = useState<string[]>([]);
   const [tasksVisited, setTasksVisited] = useState(false);
   const [historyVisited, setHistoryVisited] = useState(false);
   const [viewVersion, setViewVersion] = useState(0);
@@ -36,10 +42,13 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
   const groups = useRef<HTMLElement>(null), groupsHeading = useRef<HTMLHeadingElement>(null);
   const chatHeading = useRef<HTMLHeadingElement>(null), contextHeading = useRef<HTMLHeadingElement>(null);
   const membersTrigger = useRef<HTMLButtonElement>(null), tasksTrigger = useRef<HTMLButtonElement>(null), historyTrigger = useRef<HTMLButtonElement>(null);
-  const focusNext = useRef<"list" | "chat" | "context" | Context | null>(null);
-  const listVisible = !mobile || pane === "list";
-  const contextVisible = context !== null && (!mobile || pane === "chat");
-  const chatVisible = !mobile || (pane === "chat" && !contextVisible);
+  const focusNext = useRef<"list" | "chat" | "restore-chat" | "context" | Context | null>(null);
+  const lastChatFocus = useRef<{ groupId?: string; target: HTMLElement } | null>(null);
+  const listVisible = !globalPage && (!mobile || pane === "list");
+  const hasContext = context !== null && (!mobile || pane === "chat");
+  const contextVisible = !globalPage && hasContext;
+  const inChatPane = !mobile || (pane === "chat" && !hasContext);
+  const chatVisible = !globalPage && inChatPane;
   const contextLabel = context === "history" ? "搜索" : context === "tasks" ? "任务" : "成员";
   const rememberMembers = useCallback((groupId: string, items: Member[]) => {
     setMembers(previous => ({ ...previous, [groupId]: items }));
@@ -48,14 +57,28 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
   useLayoutEffect(() => {
     const requested = focusNext.current;
     focusNext.current = null;
+    if (globalPage) {
+      const target = document.getElementById(globalPage);
+      if (target && !target.contains(document.activeElement)) target.focus({ preventScroll: true });
+      return;
+    }
     if (!requested && !document.activeElement?.closest("[hidden]")) return;
     const destination = requested ?? (contextVisible ? "context" : chatVisible ? "chat" : "list");
+    if (destination === "restore-chat") {
+      const saved = lastChatFocus.current;
+      if (saved && saved.groupId === selected?.id && saved.target.isConnected && !saved.target.closest("[hidden], [inert]")) {
+        saved.target.focus({ preventScroll: true });
+        if (document.activeElement === saved.target) return;
+      }
+      chatHeading.current?.focus({ preventScroll: true });
+      return;
+    }
     const target = destination === "list"
       ? groups.current?.querySelector<HTMLElement>('.group-list button[aria-pressed="true"]') ?? groupsHeading.current
       : destination === "context" ? contextHeading.current : destination === "chat" ? chatHeading.current
       : destination === "members" ? membersTrigger.current : destination === "tasks" ? tasksTrigger.current : historyTrigger.current;
     target?.focus();
-  }, [mobile, listVisible, chatVisible, contextVisible, context, viewVersion]);
+  }, [mobile, listVisible, chatVisible, contextVisible, context, viewVersion, globalPage, selected?.id]);
 
   function selectGroup(group: Group) {
     focusNext.current = "chat";
@@ -68,7 +91,8 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
     setContext(null); setViewVersion(previous => previous + 1);
   }
   function openContext(next: Context) {
-    if (context === next) { closeContext(); return; }
+    if (!globalPage && context === next) { closeContext(); return; }
+    setGlobalPage(null);
     focusNext.current = "context";
     if (next === "tasks") setTasksVisited(true);
     if (next === "history") setHistoryVisited(true);
@@ -80,16 +104,27 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
     setRecipientSelection(previous => ({ groupId, memberId, version: (previous?.version ?? 0) + 1 }));
     showChat();
   }
+  function openGlobalPage(id: string) {
+    setVisitedPages(previous => previous.includes(id) ? previous : [...previous, id]);
+    setGlobalPage(id); setViewVersion(previous => previous + 1);
+  }
   function showChat() {
-    focusNext.current = "chat";
-    setPane("chat"); setContext(null); setViewVersion(previous => previous + 1);
+    focusNext.current = globalPage ? "restore-chat" : "chat";
+    setGlobalPage(null); setPane("chat"); setContext(null); setViewVersion(previous => previous + 1);
   }
   function backToList() {
     focusNext.current = "list";
-    setPane("list"); setContext(null); setViewVersion(previous => previous + 1);
+    setGlobalPage(null); setPane("list"); setContext(null); setViewVersion(previous => previous + 1);
   }
-  const skipId = contextVisible && mobile ? "im-context" : chatVisible ? "im-chat" : "im-groups";
-  const skipLabel = contextVisible && mobile ? `${contextLabel}详情` : chatVisible ? "讨论区" : "群组列表";
+  const globalPages: ShellPage[] = [
+    { id: pendingReviewsId, label: "待我决定",
+      content: visitedPages.includes(pendingReviewsId) ? <PendingReviews active={globalPage === pendingReviewsId} /> : null },
+    { id: agentRunLogId, label: "Agent 运行日志",
+      content: visitedPages.includes(agentRunLogId) ? <AgentRunLogPage active={globalPage === agentRunLogId} /> : null },
+  ];
+  const skipId = globalPage ?? (contextVisible && mobile ? "im-context" : chatVisible ? "im-chat" : "im-groups");
+  const skipLabel = globalPages.find(page => page.id === globalPage)?.label
+    ?? (contextVisible && mobile ? `${contextLabel}详情` : chatVisible ? "讨论区" : "群组列表");
 
   const groupsProps = { id: "im-groups", ref: groups, hidden: !listVisible, tabIndex: -1, "aria-labelledby": "groups-heading" };
   const slots = {
@@ -104,7 +139,10 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
         </div>
       </>,
 
-    chat: <main className="im-chat" id="im-chat" hidden={!chatVisible} tabIndex={-1} aria-label="讨论">
+    chat: <main className="im-chat" id="im-chat" hidden={!chatVisible} tabIndex={-1} aria-label="讨论"
+      onFocusCapture={event => {
+        if (chatVisible && event.target instanceof HTMLElement) lastChatFocus.current = { groupId: selected?.id, target: event.target };
+      }}>
         <div className="im-chat-header">
           <button type="button" hidden={!mobile} onClick={backToList}>返回群组</button>
           <div className="im-chat-summary" role={selected ? "region" : undefined}
@@ -122,7 +160,7 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
           </div> : null}
         </div>
         <div className="discussion-content">
-          <Discussion groupId={chatVisible ? selected?.id : undefined} members={members} recipientSelection={recipientSelection} />
+          <Discussion groupId={inChatPane ? selected?.id : undefined} active={chatVisible} members={members} recipientSelection={recipientSelection} />
         </div>
       </main>,
 
@@ -147,6 +185,7 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
       </aside>,
   };
   if (Shell) return <Shell slots={slots} groupsProps={groupsProps} pane={pane} context={contextVisible ? context : null}
+    globalPages={globalPages} globalPage={globalPage} onGlobalPage={openGlobalPage}
     onList={backToList} onChat={showChat} onContext={openContext}
     contextTriggers={{ members: membersTrigger, tasks: tasksTrigger, history: historyTrigger }} />;
   return <div className="app im-shell" data-context={contextVisible}>

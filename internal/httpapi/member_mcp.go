@@ -169,6 +169,17 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		}
 		continuation, excerpt, decision := false, false, false
 		if name == "send_message" {
+			// Relay is native Pi only. Check raw field presence (including null
+			// and the DTO's case-folded spellings) before projecting or binding.
+			for field := range object {
+				if strings.EqualFold(field, "discussion") {
+					if !validMemberToolJSONStrings(frame["id"]) {
+						id = nil
+					}
+					memberMCPError(w, 400, id, -32602, "讨论接力仅支持原生 Pi 成员工具")
+					return
+				}
+			}
 			continuation, excerpt, decision = memberToolSendAssessmentFields(arguments)
 		}
 		reportWrite := reportTools && name == platform.ReportWorkOperation

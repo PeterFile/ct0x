@@ -12,6 +12,7 @@ import (
 // this private fixture (these tests do not simulate a host crash).
 func NativeThreadHandoffFixture(t *testing.T, installF bool) (*Store, string) {
 	t.Helper()
+	isolateDecisionFixtureRegistry(t)
 	path := filepath.Join(t.TempDir(), "handoff.sqlite")
 	dsn := url.URL{Scheme: "file", Path: path, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=synchronous(OFF)&_txlock=immediate"}
 	db, err := sql.Open("sqlite", dsn.String())
@@ -20,7 +21,7 @@ func NativeThreadHandoffFixture(t *testing.T, installF bool) (*Store, string) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	s := &Store{db: db}
+	s := &Store{db: db, schemaVersion: len(migrations)}
 	t.Cleanup(func() { _ = s.Close() })
 	if err := migrate(db); err != nil {
 		t.Fatal(err)

@@ -39,11 +39,7 @@ func testInvestigationTaskWorkOwnerTransportV30(t *testing.T, kinds ...domain.Ta
 			ctx := t.Context()
 			f := newBoundWorkReportFixture(t)
 			f.mountMemberToolHandlers(ctx)
-			var version int
-			roleOK(t, f.raw.QueryRow(`SELECT max(version) FROM schema_migrations`).Scan(&version))
-			if version != 30 {
-				t.Fatalf("fixture did not open public v30: %d", version)
-			}
+			requireInvestigationOwnerV30Migration(t, f)
 			var refs []domain.ArtifactVersionRef
 			var grant *platform.MemberArtifactGrant
 			const artifactText = "冻结的调查材料 🧪"

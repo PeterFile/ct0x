@@ -102,6 +102,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			options.RoleThinking = config.roleThinking
 		}
 		toolOptions.FreshTaskWork = freshTaskWork
+		toolOptions.EnablePiTaskDecisionProposals = config.enablePiTaskDecisionProposals
 		switch {
 		case config.enableInvestigationOwnerManagement:
 			tools, err = platform.NewMemberToolRuntimeWithInvestigationOwnerManagement(db, toolOptions, engine,
@@ -121,6 +122,8 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		}
 		options.MemberTools, options.PiMemberToolsExtension = tools, config.piMemberToolsExtension
 		options.EnableCodexAppServer = config.enableCodexAppServer
+		// Installing the qualified new bridge opts the trusted Pi intake into relay.
+		options.EnablePiDiscussionRelay = config.enableCoordinationRoles
 		options.EnableNativeSessionResume = config.enableNativeSessionResume
 		options.NativePiThinking = config.nativePiThinking
 	}

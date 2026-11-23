@@ -19,6 +19,9 @@ type InvestigationTaskWorkLaunch struct {
 	Supports  func(provider.Provider, provider.PiFreshInvestigationProfile) bool
 	Construct func(context.Context, provider.Provider, provider.PiFreshInvestigationBinding) (provider.Executor, error)
 	Artifacts *MemberArtifactGrant
+	// EnableDiscussionWorkReturn is the separate A7 slice. It never enables
+	// initial-owner management or delegation for a structured admission.
+	EnableDiscussionWorkReturn bool
 	// Commit must call B's CommitInvestigationTaskWorkLaunch. The existing
 	// descriptor is reused here only as the shape of the plan; the text Store
 	// gate cannot authorize investigation. B calls admit synchronously inside
@@ -105,21 +108,14 @@ func (e *taskWorkRun) issueInvestigationTaskWork(ctx context.Context, launch *st
 	}
 	launch.AttemptID = attempt.ID
 	role := store.CoordinationToolScope{Member: scope, Provenance: e.plan.provenance, AttemptID: attempt.ID}
-	if e.plan.investigation.managed {
-		token, _, err := r.IssueFreshInvestigationOwnerManagementTools(ctx, role, work, artifacts)
-		return token, err
-	}
-	token, _, err := r.IssueFreshInvestigationOwnerTools(ctx, role, work, artifacts)
+	plan := e.plan.investigation
+	token, _, err := r.issueFreshInvestigationOwnerTools(ctx, role, work, artifacts, plan.ownerPurpose, plan.invitation)
 	return token, err
 }
 
 func (p *investigationTaskWorkPreparation) matchesRegistration(entry memberToolRegistration, launch store.FreshTaskWorkLaunch) bool {
-	purpose := ""
-	if p.managed && launch.Delivery.SourceKind.IsOwnerContinuation() {
-		purpose = memberContinuingInvestigationOwnerPurpose
-	}
 	if entry.scope != launch.Scope || entry.role != (store.CoordinationToolScope{}) || entry.candidate != nil ||
-		entry.purpose != purpose || !slices.Equal(entry.delegateCandidateIDs, p.candidateIDs) || entry.taskWork != nil || entry.grants.Skills != nil ||
+		entry.purpose != p.ownerPurpose || !slices.Equal(entry.delegateCandidateIDs, p.candidateIDs) || entry.taskWork != nil || entry.grants.Skills != nil ||
 		!slices.Equal(entry.grants.Operations, p.profile.Operations) || (entry.grants.Artifacts != nil) != (len(p.versions) != 0) {
 		return false
 	}

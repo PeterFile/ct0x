@@ -297,6 +297,9 @@ func (r *loop) launch(turn domain.Turn, prepared PreparedExecution) {
 	prepared.Request.RunID, prepared.Request.RuntimeDir = turn.ID, r.options.RuntimeDir
 	go func() {
 		defer cancel()
+		if prepared.BindTurnClaim != nil {
+			prepared.BindTurnClaim(claim)
+		}
 		var failure error
 		receipt := prepared.Executor.Execute(ctx, prepared.Request, func(event provider.Event) error {
 			writeCtx, done := context.WithTimeout(context.WithoutCancel(r.ctx), cleanupTimeout)

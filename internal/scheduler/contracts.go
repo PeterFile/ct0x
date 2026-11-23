@@ -14,6 +14,9 @@ type PreparedExecution struct {
 	Executor     provider.Executor
 	Request      provider.ExecuteRequest
 	ResourceKeys []string
+	// BindTurnClaim optionally receives the original committed claim before Execute.
+	// The claim stays in trusted Go code, outside the provider request.
+	BindTurnClaim func(store.TurnClaim) `json:"-"`
 }
 
 type PrepareFunc func(context.Context, store.PendingDelivery) (PreparedExecution, error)
