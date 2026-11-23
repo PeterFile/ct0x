@@ -43,7 +43,25 @@ const tools = [
   },
 ] as const;
 
-type Tool = typeof tools[number];
+const decisionTool = {
+  name: "propose_task_decision",
+  label: "记录任务待决问题",
+  description: "仅为本轮绑定的当前任务记录一个待用户决定的问题，不发消息、不确认工作输入、不提交成果、不授予权限。expected_version 传 0 开启同类问题或合并相同内容；改写须精确匹配当前版本。authorization 只描述拟申请的范围和影响。结果未知须保留原调用标识和参数先对账，不重放或继续写入。",
+  parameters: Type.Object({
+    kind: Type.Union([Type.Literal("decision"), Type.Literal("authorization"), Type.Literal("unblock")]),
+    expected_version: Type.Integer({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
+    question: Type.String({ minLength: 1, maxLength: 2048, description: "一个非空单行问题（最多 2048 UTF-8 字节）。" }),
+    facts: Type.String({ minLength: 1, maxLength: 2048, description: "已知事实（最多 2048 UTF-8 字节）。" }),
+    recommendation: Type.String({ minLength: 1, maxLength: 1024, description: "建议（最多 1024 UTF-8 字节）。" }),
+    choices: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }), { maxItems: 4, description: "至多四个不同的非空单行标签，每个最多 128 UTF-8 字节。" })),
+    authorization: Type.Optional(Type.Object({
+      scope: Type.String({ minLength: 1, maxLength: 1024 }),
+      impact: Type.String({ minLength: 1, maxLength: 1024 }),
+    }, { ...closed, description: "仅 kind=authorization 时必填。scope 与 impact 各最多 1024 UTF-8 字节，不是授权。" })),
+  }, closed),
+} as const;
+
+type Tool = typeof tools[number] | typeof decisionTool;
 
 function validText(value: unknown, byteLimit: number): boolean {
   return typeof value === "string" && /\P{White_Space}/u.test(value) &&
@@ -60,6 +78,17 @@ function validArgs(tool: Tool, value: unknown): boolean {
     case "ack_work_input": return validWorkInputID(args.input_id);
     case "hand_back_work_input": return validWorkInputID(args.input_id) && validText(args.reason, 2048);
     case "submit_result": return validText(args.summary, 8192);
+    case "propose_task_decision": {
+      const input = args as { facts: string; recommendation: string; question: string; choices?: string[];
+        kind: string; authorization?: { scope: string; impact: string } };
+      const oneLine = (text: string, max: number) => validText(text, max) && !/[\r\n]/.test(text);
+      const choices = input.choices ?? [];
+      const auth = input.authorization;
+      return oneLine(input.question, 2048) && validText(input.facts, 2048) && validText(input.recommendation, 1024) &&
+        choices.every(choice => oneLine(choice, 128)) &&
+        new Set(choices.map(choice => choice.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, ""))).size === choices.length &&
+        (input.kind === "authorization" ? auth !== undefined && validText(auth.scope, 1024) && validText(auth.impact, 1024) : auth === undefined);
+    }
   }
 }
 
@@ -80,14 +109,17 @@ function checkedArgs(tool: Tool, raw: unknown): Record<string, unknown> {
 export default function freshTaskWork(pi: ExtensionAPI) {
   const invoke = createFreshTaskWorkClient(process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG,
     process.env.AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256);
-  for (const tool of tools) {
+  for (const tool of invoke.taskDecision ? [...tools, decisionTool] : tools) {
     pi.registerTool<typeof tool.parameters>({
       ...tool,
       // Check original values before Pi can coerce or drop optional fields.
       prepareArguments(raw) { return checkedArgs(tool, raw); },
       async execute(toolCallId, params, signal, _onUpdate, ctx) {
-        const result = await invoke(tool.name, checkedArgs(tool, params), toolCallId, signal);
-        return freshTypedToolResult(result, "followup", result.writeUnknown ? ctx.sessionManager.getSessionId() : "");
+        // Use the same SDK identity before sending the proposal and in its
+        // native reconciliation marker, even if the session changes later.
+        const runID = tool.name === decisionTool.name ? ctx.sessionManager.getSessionId() : undefined;
+        const result = await invoke(tool.name, checkedArgs(tool, params), toolCallId, signal, runID);
+        return freshTypedToolResult(result, "followup", result.writeUnknown ? runID ?? ctx.sessionManager.getSessionId() : "");
       },
     });
   }

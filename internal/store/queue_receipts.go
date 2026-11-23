@@ -33,7 +33,12 @@ func (s *Store) ApplyTurnReceipt(ctx context.Context, claim TurnClaim, receipt p
 		// first-evidence guard runs under the same claim lock as normal Apply.
 		turn, _, err = nativePreflightFailureInTx(ctx, tx, turn, nil)
 	} else {
-		turn, err = applyTurnReceiptInTx(ctx, tx, turn, normalizeTurnReceipt(turn, receipt))
+		normalized := normalizeTurnReceipt(turn, receipt)
+		if normalized.Outcome == provider.OutcomeNotStarted && normalized.NativeRef == nil && nativeFreshTurn(turn) && turn.ReplyMessageID == "" {
+			turn, err = applyDecisionAnswerRefusalInTx(ctx, tx, turn, normalized)
+		} else {
+			turn, err = applyTurnReceiptInTx(ctx, tx, turn, normalized)
+		}
 	}
 	if err != nil {
 		return domain.Turn{}, queueError(action, err)

@@ -63,6 +63,9 @@ func taskWorkInputHandledSQL(inputIDColumn string) string {
 }
 
 func taskWorkInputHandledInTx(ctx context.Context, tx *sql.Tx, inputID string) (bool, error) {
+	if isDecisionAnswerID(inputID) {
+		return decisionAnswerHandledInTx(ctx, tx, inputID)
+	}
 	var handled bool
 	err := tx.QueryRowContext(ctx, `SELECT `+taskWorkInputHandledSQL("i.id")+` FROM task_work_inputs i WHERE i.id=?`, inputID).Scan(&handled)
 	return handled, coordinationRoleRelationError(err)

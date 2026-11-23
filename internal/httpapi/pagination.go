@@ -25,7 +25,15 @@ type pageCursor struct {
 }
 
 func listOptions(r *http.Request, scope, groupID string) (store.ListOptions, error) {
-	limit, before, err := paginationQuery(r)
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return store.ListOptions{}, store.ErrInvalid
+	}
+	return listOptionsFromQuery(query, scope, groupID)
+}
+
+func listOptionsFromQuery(query url.Values, scope, groupID string) (store.ListOptions, error) {
+	limit, before, err := listQuery(query)
 	options := store.ListOptions{Limit: limit}
 	if err == nil && before != "" {
 		options.Before, err = decodeCursor(before, scope, groupID)
@@ -34,11 +42,15 @@ func listOptions(r *http.Request, scope, groupID string) (store.ListOptions, err
 }
 
 func paginationQuery(r *http.Request) (int, string, error) {
-	limit := 50
 	query, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
 		return 0, "", store.ErrInvalid
 	}
+	return listQuery(query)
+}
+
+func listQuery(query url.Values) (int, string, error) {
+	limit := 50
 	for key, values := range query {
 		if (key != "limit" && key != "before") || len(values) != 1 || values[0] == "" {
 			return 0, "", store.ErrInvalid
@@ -50,10 +62,11 @@ func paginationQuery(r *http.Request) (int, string, error) {
 				return 0, "", store.ErrInvalid
 			}
 		}
-		limit, err = strconv.Atoi(values[0])
-		if err != nil || limit < 1 || limit > 200 {
+		parsed, err := strconv.Atoi(values[0])
+		if err != nil || parsed < 1 || parsed > 200 {
 			return 0, "", store.ErrInvalid
 		}
+		limit = parsed
 	}
 	return limit, query.Get("before"), nil
 }
@@ -103,20 +116,26 @@ func writePage[T any](w http.ResponseWriter, page store.Page[T], scope, groupID 
 		operationError(w, err)
 		return
 	}
-	next := ""
+	response, err := listPageResponse(page, scope, groupID)
+	operationResult(w, http.StatusOK, response, err)
+}
+
+type listPage[T any] struct {
+	Items      []T    `json:"items"`
+	NextCursor string `json:"next_cursor"`
+}
+
+func listPageResponse[T any](page store.Page[T], scope, groupID string) (listPage[T], error) {
+	response := listPage[T]{Items: page.Items}
+	if response.Items == nil {
+		response.Items = []T{}
+	}
 	if cursor := page.NextCursor; cursor != nil {
 		raw, err := json.Marshal(pageCursor{1, scope, groupID, cursor.CreatedAt.UTC(), cursor.ID})
 		if err != nil {
-			operationError(w, err)
-			return
+			return listPage[T]{}, err
 		}
-		next = base64.RawURLEncoding.EncodeToString(raw)
+		response.NextCursor = base64.RawURLEncoding.EncodeToString(raw)
 	}
-	if page.Items == nil {
-		page.Items = []T{}
-	}
-	WriteJSON(w, http.StatusOK, struct {
-		Items      []T    `json:"items"`
-		NextCursor string `json:"next_cursor"`
-	}{page.Items, next})
+	return response, nil
 }

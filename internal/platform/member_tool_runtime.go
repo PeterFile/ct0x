@@ -44,6 +44,9 @@ type MemberToolRuntimeOptions struct {
 	// FreshTaskWork composes typed continuation via the ChatIntake Engine and
 	// the role execution fence. It does not install the legacy preview.
 	FreshTaskWork *FreshTaskWorkLaunch
+	// EnablePiTaskDecisionProposals is a separate native-only opt-in. It needs
+	// the exact proposal-capable fresh text adapter and F's pending/answer path.
+	EnablePiTaskDecisionProposals bool
 }
 
 type MemberToolRunBinding struct {
@@ -147,6 +150,18 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 		if err := tools.EnableChatIntake(options.ChatIntake); err != nil {
 			return nil, errMemberToolRuntimeConfig
 		}
+	}
+	if options.EnablePiTaskDecisionProposals {
+		if tools.freshTaskWork.taskDecisionAdapter == nil {
+			return nil, errMemberToolRuntimeConfig
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), memberToolRuntimeVerificationTimeout)
+		err := tools.checkTaskDecisionSchema(ctx)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		tools.taskDecisions = true
 	}
 	return &MemberToolRuntime{tools: tools, configRoot: root, resolvedRoot: resolved,
 		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence,
