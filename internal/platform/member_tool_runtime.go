@@ -333,9 +333,15 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 		token = ""
 		return receipt
 	}
-	if session != nil {
-		r.tools.Revoke(token)
-		token = ""
+	decision := e.intakeSchema.threadDecision
+	if session == nil && decision == nil {
+		return raw
+	}
+	r.tools.Revoke(token) // Drain authorized writes before reading their outcome.
+	token = ""
+	if decision != nil && decision.uncertain.Load() {
+		raw.Outcome = provider.OutcomeUnknown
+		raw.Reason = ErrThreadDecisionRequestUnknown.Error()
 	}
 	return session.receipt(ctx, e, claim, raw)
 }

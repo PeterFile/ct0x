@@ -59,6 +59,8 @@ type MemberTools struct {
 	workReportEngine *coordination.Engine   // Transport only; independent of either launch opt-in.
 	workspace        *memberWorkspaceRegistry
 
+	threadDecisionAcks map[[sha256.Size]byte]*threadDecisionAckRegistration
+
 	investigationDelegateSupport InvestigationDelegateSupport // Immutable trusted opt-in.
 	discussionWorkReturn         bool                         // Separate opt-in; no delegation grant.
 }
@@ -167,6 +169,9 @@ func (s *MemberTools) Revoke(token string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := sha256.Sum256([]byte(token))
+	if s.revokeThreadDecisionAckLocked(key) {
+		return
+	}
 	s.capabilities[key].skills.clear()
 	if s.workspace != nil {
 		_ = s.workspace.revokeLocked(key)
@@ -178,6 +183,11 @@ func (s *MemberTools) Revoke(token string) {
 func (s *MemberTools) RevokeTurn(turnID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for key, ack := range s.threadDecisionAcks {
+		if ack.claim.TurnID == turnID {
+			s.revokeThreadDecisionAckLocked(key)
+		}
+	}
 	for key, entry := range s.capabilities {
 		if entry.scope.Claim.TurnID == turnID {
 			entry.skills.clear()
