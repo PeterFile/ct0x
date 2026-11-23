@@ -14,7 +14,8 @@ const inputLifetime = 250;
 export function useMessageScroll(active: boolean, items: Message[], page: { pending: boolean; error: string }) {
   const historyRef = useRef<HTMLElement>(null), listRef = useRef<HTMLOListElement>(null);
   const [windowReset, setWindowReset] = useState(false);
-  const [quoteFocus, setQuoteFocus] = useState<{ quote: MessageQuoteTarget; revision: number } | null>(null);
+  const [quoteFocus, setQuoteFocus] = useState<{ quote: MessageQuoteTarget; revision: number; visibilityRevision: number } | null>(null);
+  const quoteVisibilityRevision = useRef(0);
   const saved = useRef<Anchor | null>(null), pageIntent = useRef<PageIntent | null>(null);
   const attempt = useRef<{ id: number; revision: number } | null>(null);
   const confirmed = useRef<{ id: string; revision: number } | null>(null);
@@ -121,9 +122,9 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
   }
   function beginQuoteNavigation(quote: MessageQuoteTarget) {
     clearInput(); remember(); recordReading();
-    const started = revision.current;
-    const isCurrent = () => revision.current === started;
-    return { isCurrent, focus: () => { if (isCurrent()) setQuoteFocus({ quote, revision: started }); } };
+    const started = revision.current, visibilityRevision = quoteVisibilityRevision.current;
+    const isCurrent = () => revision.current === started && quoteVisibilityRevision.current === visibilityRevision;
+    return { isCurrent, focus: () => { if (isCurrent()) setQuoteFocus({ quote, revision: started, visibilityRevision }); } };
   }
   function onPointerDown(event: PointerEvent<HTMLElement>) {
     const history = historyRef.current, target = event.target;
@@ -195,6 +196,8 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
 
   useLayoutEffect(() => {
     const history = historyRef.current, entering = active && !wasActive.current;
+    // Hiding Discussion must invalidate in-flight quote jumps even when feed reads stay active.
+    if (!active && wasActive.current) ++quoteVisibilityRevision.current;
     wasActive.current = active;
     const arrived = items.some(message => !previousIDs.current.has(message.id));
     previousIDs.current = new Set(items.map(message => message.id));
@@ -214,7 +217,8 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     const intent = pageIntent.current;
     if (intent && page.pending) intent.started = true;
     let positioned = false;
-    const requested = quoteFocus?.revision === revision.current ? quoteFocus.quote : undefined;
+    const requested = quoteFocus?.revision === revision.current && quoteFocus.visibilityRevision === quoteVisibilityRevision.current
+      ? quoteFocus.quote : undefined;
     const original = requested && items.find(message => message.id === requested.message_id);
     const focusQuote = requested && original && matchesMessageQuote(requested, original);
     if (quoteFocus && (!requested || original && !focusQuote)) setQuoteFocus(null);

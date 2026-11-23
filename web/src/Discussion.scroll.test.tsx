@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Message } from "./api";
 import { Discussion } from "./Discussion";
+import { useMessageScroll } from "./useMessageScroll";
 import { deferred, group, json, other, page } from "./test/groups";
 import { delivery, message } from "./test/messages";
 
@@ -350,6 +351,57 @@ it.each(["different topic", "new reading position"])("does not jump on a late ou
   expect(screen.queryByRole("article", { name: `消息 ${original.id}` })).not.toBeInTheDocument();
   if (reason === "different topic") expect(screen.getByRole("alert")).toHaveTextContent("被引原消息与引用不符");
   expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages/${original.id}`]);
+});
+
+it("ignores a late quote read after hiding Discussion and returning to the draft", async () => {
+  const original = row(1);
+  const reply: Message = { ...row(8), reply_to: { message_id: original.id, group_id: group.id, topic_id: original.topic_id,
+    sender_id: original.sender_id, sender_name: "", source_kind: "unknown", excerpt: "之前的原文" } };
+  const pending = deferred<Response>(); details.mockReturnValueOnce(pending.promise);
+  const view = await open([...initial.slice(1, 7), reply]);
+  const panel = scope();
+  fireEvent.click(within(item(reply.id)).getByRole("link", { name: /之前的原文/ }));
+  view.rerender(<Discussion groupId={group.id} active={false} members={{}} />);
+  view.rerender(<Discussion groupId={group.id} active={true} members={{}} />); await flush();
+  expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages/${original.id}`]);
+
+  const input = within(panel).getByRole("textbox", { name: "消息内容" }), draft = "继续编辑的草稿";
+  input.focus(); fireEvent.change(input, { target: { value: draft } });
+  await act(async () => pending.resolve(json(original)));
+  expect(screen.queryByRole("article", { name: `消息 ${original.id}` })).not.toBeInTheDocument();
+  expect(input).toHaveFocus();
+  expect(input).toHaveValue(draft);
+});
+
+it("invalidates a pending quote navigation handle after hiding even when the feed stays alive", () => {
+  const original = row(1), quote = { message_id: original.id, group_id: group.id, topic_id: original.topic_id, sender_id: original.sender_id };
+  let navigation: ReturnType<ReturnType<typeof useMessageScroll>["beginQuoteNavigation"]> | undefined;
+  let currentBegin: ReturnType<typeof useMessageScroll>["beginQuoteNavigation"] | undefined;
+  function Harness({ active, items }: { active: boolean; items: Message[] }) {
+    const scroll = useMessageScroll(active, items, { pending: false, error: "" });
+    currentBegin = scroll.beginQuoteNavigation;
+    return <div className="discussion-scope" hidden={!active}>
+      <section className="message-history" ref={scroll.historyRef}>
+        <ol className="message-list" ref={scroll.listRef}>
+          {items.map(entry => <li key={entry.id} data-message-id={entry.id}>
+            <article tabIndex={-1} aria-label={`消息 ${entry.id}`}>{entry.content}</article>
+          </li>)}
+        </ol>
+      </section>
+      <textarea aria-label="草稿输入" />
+    </div>;
+  }
+  const view = render(<Harness active={true} items={initial.slice(1)} />);
+  act(() => { navigation = currentBegin!(quote); });
+  expect(navigation!.isCurrent()).toBe(true);
+  view.rerender(<Harness active={false} items={initial.slice(1)} />);
+  expect(navigation!.isCurrent()).toBe(false);
+  view.rerender(<Harness active={true} items={initial} />);
+  const input = screen.getByRole("textbox", { name: "草稿输入" });
+  input.focus();
+  act(() => { navigation!.focus(); });
+  expect(input).toHaveFocus();
+  expect(screen.getByRole("article", { name: `消息 ${original.id}` })).not.toHaveFocus();
 });
 
 it("does not suppress a confirmed send merely because the reader clicked a message without scrolling", async () => {
