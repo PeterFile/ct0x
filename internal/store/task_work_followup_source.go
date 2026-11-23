@@ -25,6 +25,8 @@ func taskWorkFollowupSourceInTx(ctx context.Context, tx *sql.Tx, d domain.TaskWo
 	if !installed {
 		return "", "", ErrMemberToolDenied
 	}
+	// The unary plus keeps receipt comparisons from becoming index constraints, which
+	// makes SQLite's 11-table planner several times slower under -race without changing results.
 	err = tx.QueryRowContext(ctx, `SELECT a.id,c.turn_id FROM task_work_inputs i
 	 JOIN chat_followup_routes r ON (r.source_id,r.group_id,r.topic_id)=(i.source_id,i.group_id,i.topic_id)
 	 JOIN message_command_sources s ON s.id=r.source_id AND s.message_id=r.reply_message_id AND s.kind='local_user_chat'
@@ -39,16 +41,16 @@ func taskWorkFollowupSourceInTx(ctx context.Context, tx *sql.Tx, d domain.TaskWo
 	 (t.delivery_id,t.id,m.id,i.group_id,i.topic_id,t.conversation_id,c.member_id)
 	 AND o.state=`+taskWorkClaimDeliveryState+`
 	 WHERE (i.id,i.assignment_id,i.task_id,i.task_revision,i.mandate_id,i.worker_member_id,i.group_id,i.topic_id)=(?,?,?,?,?,?,?,?)
-	 AND c.member_id=? AND json_extract(a.receipt_json,'$.assessed_by') IS c.member_id
-	 AND json_extract(a.receipt_json,'$.id') IS a.id AND json_extract(a.receipt_json,'$.candidate_id') IS c.id
-	 AND json_extract(a.receipt_json,'$.group_id') IS c.group_id AND json_extract(a.receipt_json,'$.topic_id') IS c.topic_id
-	 AND json_extract(a.receipt_json,'$.message_id') IS m.id AND json_extract(a.receipt_json,'$.notice_message_id') IS a.notice_message_id
-	 AND json_extract(a.receipt_json,'$.candidate_generation') IS c.generation AND json_extract(a.receipt_json,'$.policy_revision') IS c.policy_revision
-	 AND json_extract(a.receipt_json,'$.purpose') IS e.purpose AND json_extract(a.receipt_json,'$.source_sender_id') IS m.sender_id
+	 AND c.member_id=? AND json_extract(a.receipt_json,'$.assessed_by') IS +c.member_id
+	 AND json_extract(a.receipt_json,'$.id') IS +a.id AND json_extract(a.receipt_json,'$.candidate_id') IS +c.id
+	 AND json_extract(a.receipt_json,'$.group_id') IS +c.group_id AND json_extract(a.receipt_json,'$.topic_id') IS +c.topic_id
+	 AND json_extract(a.receipt_json,'$.message_id') IS +m.id AND json_extract(a.receipt_json,'$.notice_message_id') IS +a.notice_message_id
+	 AND json_extract(a.receipt_json,'$.candidate_generation') IS +c.generation AND json_extract(a.receipt_json,'$.policy_revision') IS +c.policy_revision
+	 AND json_extract(a.receipt_json,'$.purpose') IS +e.purpose AND json_extract(a.receipt_json,'$.source_sender_id') IS +m.sender_id
 	 AND json_extract(a.receipt_json,'$.authority') IS 'existing_mandate' AND json_type(a.receipt_json,'$.authority_evidence_verified') IS 'true'
-	 AND json_extract(a.receipt_json,'$.turn_id') IS c.turn_id AND json_extract(a.receipt_json,'$.work_input_id') IS i.id
-	 AND json_extract(a.receipt_json,'$.source_id') IS s.id AND json_extract(a.receipt_json,'$.source_kind') IS s.kind
-	 AND json_extract(a.receipt_json,'$.task_id') IS i.task_id AND json_extract(a.receipt_json,'$.mandate_id') IS i.mandate_id
+	 AND json_extract(a.receipt_json,'$.turn_id') IS +c.turn_id AND json_extract(a.receipt_json,'$.work_input_id') IS +i.id
+	 AND json_extract(a.receipt_json,'$.source_id') IS +s.id AND json_extract(a.receipt_json,'$.source_kind') IS +s.kind
+	 AND json_extract(a.receipt_json,'$.task_id') IS +i.task_id AND json_extract(a.receipt_json,'$.mandate_id') IS +i.mandate_id
 	 AND json_extract(a.receipt_json,'$.disposition') IS 'continue_work' AND json_extract(a.receipt_json,'$.outcome') IS 'continued'
 	 AND json_type(a.receipt_json,'$.work_input_pending') IS NULL`,
 		d.SourceID, d.AssignmentID, d.TaskID, d.TaskRevision, d.MandateID, d.OwnerMemberID, d.GroupID, d.TopicID, d.SenderMemberID).Scan(&assessmentID, &actorTurn)

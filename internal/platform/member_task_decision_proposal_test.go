@@ -120,11 +120,13 @@ func TestPiTaskDecisionProposalNeedsExplicitExactLaunchAndSchema(t *testing.T) {
 	roleOK(t, err)
 	strong := platform.NewPiFreshTaskWorkLaunch(entry, 0)
 	f.options.FreshTaskWork = strong
+	_, err = f.raw.Exec(`DROP TABLE IF EXISTS decision_answer_consumptions;
+DROP TABLE IF EXISTS decision_answer_wake_replacements;
+DROP TABLE IF EXISTS decision_answers;
+DROP TABLE IF EXISTS decision_request_versions;
+DROP TABLE IF EXISTS decision_requests;`)
+	roleOK(t, err)
 	t.Run("v30-opt-out", func(t *testing.T) {
-		if _, err := engine.ListPendingTaskDecisions(t.Context(), store.ListOptions{Limit: 1}); !errors.Is(err, store.ErrDecisionRequestsUnavailable) {
-			roleOK(t, err)
-			t.Skip("F's schemas are now in the public registry")
-		}
 		if runtime, err := platform.NewMemberToolRuntime(f.db, f.options); runtime != nil || !errors.Is(err, store.ErrDecisionRequestsUnavailable) {
 			t.Fatalf("v30 incorrectly enabled proposals: %v", err)
 		}
@@ -142,18 +144,10 @@ func TestPiTaskDecisionProposalNeedsExplicitExactLaunchAndSchema(t *testing.T) {
 			}
 		}
 	})
-	if _, err := engine.ListPendingDecisionRequests(t.Context(), store.ListOptions{Limit: 1}); errors.Is(err, store.ErrDecisionRequestsUnavailable) {
-		installTaskDecisionSchemaFixture(t, f, "decisionRequestSchema")
-	} else {
-		roleOK(t, err)
-	}
+	installTaskDecisionSchemaFixture(t, f, "decisionRequestSchema")
 	t.Run("request-only", func(t *testing.T) {
 		_, err := engine.ListPendingDecisionRequests(t.Context(), store.ListOptions{Limit: 1})
 		roleOK(t, err) // The old startup check alone would enable the proposal.
-		if _, err := engine.ListPendingTaskDecisions(t.Context(), store.ListOptions{Limit: 1}); !errors.Is(err, store.ErrDecisionAnswersUnavailable) {
-			roleOK(t, err)
-			t.Skip("F's answer schema is now in the public registry")
-		}
 		if runtime, err := platform.NewMemberToolRuntime(f.db, f.options); runtime != nil || !errors.Is(err, store.ErrDecisionAnswersUnavailable) {
 			t.Fatalf("request-only startup did not fail closed: %v", err)
 		}
