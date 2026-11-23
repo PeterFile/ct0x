@@ -12,6 +12,24 @@ import (
 
 const chatDiscussionExpectedReplyJSONBytes = 1024
 
+// ErrChatDiscussionMutationUnknown takes precedence over any business cause it wraps.
+var ErrChatDiscussionMutationUnknown = errors.New("讨论接力写入结果未确认；请保留原幂等键和原请求内容用于对账")
+
+type chatDiscussionTransactionUnknown struct {
+	cause  error
+	commit bool
+}
+
+func (e *chatDiscussionTransactionUnknown) Error() string {
+	return ErrChatDiscussionMutationUnknown.Error()
+}
+func (e *chatDiscussionTransactionUnknown) Unwrap() error { return e.cause }
+func (e *chatDiscussionTransactionUnknown) Is(target error) bool {
+	return target == ErrChatDiscussionMutationUnknown
+}
+func (e *chatDiscussionTransactionUnknown) CommitOutcomeUnknown() bool { return e.commit }
+func (e *chatDiscussionTransactionUnknown) RollbackConfirmed() bool    { return false }
+
 // ApplyChatDiscussion publishes an assessed handoff step using only the bound
 // intake and the current position in the path. It never creates a member or
 // grants work authority.
@@ -26,22 +44,40 @@ func (s *Store) ApplyChatDiscussionWithMember(ctx context.Context, scope MemberT
 	return s.applyChatDiscussion(ctx, scope, candidateID, input, key, &policy)
 }
 
-func (s *Store) applyChatDiscussion(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatDiscussionAction, key string, policy *MemberToolCreatePolicy) (domain.ChatDiscussionReceipt, error) {
+func (s *Store) applyChatDiscussion(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatDiscussionAction, key string, policy *MemberToolCreatePolicy) (_ domain.ChatDiscussionReceipt, err error) {
 	const action = "保存聊天协作失败"
-	tx, err := s.beginMemberToolTx(ctx, scope)
+	// The live-scope fence itself writes, so it must be inside the boundary
+	// whose rollback we check, rather than inside beginMemberToolTx.
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.ChatDiscussionReceipt{}, memberToolOperationError(action, err)
 	}
-	defer tx.Rollback()
-	r, err := applyChatDiscussionInTx(ctx, tx, scope, candidateID, input, key, policy)
-	if err == nil {
-		err = tx.Commit()
-	}
-	if err == ErrChatDiscussionContextTooLarge {
+	commit := false
+	defer func() {
+		rollback := tx.Rollback()
+		if err == nil {
+			return
+		}
+		if commit || rollback != nil {
+			// ErrTxDone after Commit tells us nothing about its outcome.
+			if rollback != nil && !(commit && rollback == sql.ErrTxDone) {
+				err = errors.Join(err, rollback)
+			}
+			err = &chatDiscussionTransactionUnknown{cause: err, commit: commit}
+		} else if err != ErrChatDiscussionContextTooLarge {
+			err = memberToolOperationError(action, err)
+		}
+	}()
+	if err := memberToolScopeInTx(ctx, tx, scope); err != nil {
 		return domain.ChatDiscussionReceipt{}, err
 	}
+	r, err := applyChatDiscussionInTx(ctx, tx, scope, candidateID, input, key, policy)
 	if err != nil {
-		return domain.ChatDiscussionReceipt{}, memberToolOperationError(action, err)
+		return domain.ChatDiscussionReceipt{}, err
+	}
+	commit = true
+	if err := tx.Commit(); err != nil {
+		return domain.ChatDiscussionReceipt{}, err
 	}
 	return r, nil
 }
