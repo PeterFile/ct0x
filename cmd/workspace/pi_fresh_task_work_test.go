@@ -25,10 +25,12 @@ func TestPiFreshTaskWorkFlagRequiresSeparateExplicitProfile(t *testing.T) {
 	ordinary := memberToolsEntry(t)
 	entry := filepath.Join(filepath.Dir(ordinary), "fresh-task-work.ts")
 	const flag = "--pi-fresh-task-work-extension"
+	const proposal = "--enable-pi-task-decision-proposals"
 	dir := t.TempDir()
 	base := []string{"--data-dir", dir, "--enable-execution", "--enable-member-tools", "--pi-member-tools-extension", ordinary, "--enable-coordination-roles"}
 	for _, args := range [][]string{
 		{flag, entry},
+		append(slices.Clone(base), proposal),
 		append(slices.Clone(base[:len(base)-1]), flag, entry),
 		append(slices.Clone(base), flag+"="),
 		append(slices.Clone(base), flag, "fresh-task-work.ts"),
@@ -61,8 +63,15 @@ func TestPiFreshTaskWorkFlagRequiresSeparateExplicitProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	providers := []provider.Provider{{ID: "fixture", Name: provider.Pi, Version: "1.4.0", Installation: provider.Installed, Path: pi}}
-	if launch, err := cfg.piFreshTaskWorkLaunch(db, engine, providers); err != nil || launch == nil {
-		t.Fatalf("exact fresh pair plus ordinary entry rejected: %v", err)
+	if launch, err := cfg.piFreshTaskWorkLaunch(db, engine, providers); err != nil || launch == nil || cfg.enablePiTaskDecisionProposals {
+		t.Fatalf("exact fresh pair plus ordinary entry rejected or not separate: %v", err)
+	}
+	on, err := parseConfig(append(slices.Clone(base), flag, entry, proposal), io.Discard)
+	if err != nil || !on.enablePiTaskDecisionProposals {
+		t.Fatalf("explicit proposal opt-in was not accepted: %v", err)
+	}
+	if launch, err := on.piFreshTaskWorkLaunch(db, engine, providers); err != nil || launch == nil || !launch.SupportsTaskDecision(providers[0]) {
+		t.Fatalf("explicit exact proposal profile rejected: %v", err)
 	}
 	if launch, err := cfg.piFreshTaskWorkLaunch(db, nil, providers); err == nil || launch != nil {
 		t.Fatal("startup without B Engine did not fail closed")
@@ -82,8 +91,8 @@ func TestPiFreshTaskWorkFlagRequiresSeparateExplicitProfile(t *testing.T) {
 	}
 	var help strings.Builder
 	_, _ = parseConfig([]string{"--help"}, &help)
-	if !strings.Contains(help.String(), flag) {
-		t.Fatal("fresh option is missing from help")
+	if !strings.Contains(help.String(), flag) || !strings.Contains(help.String(), proposal) {
+		t.Fatal("fresh or proposal option is missing from help")
 	}
 }
 

@@ -15,22 +15,29 @@ import { loadExtensions, loadSessionSDK, runJSONPrint } from "./pi-loader.mjs";
 const typed = fileURLToPath(new URL("../fresh-task-work.ts", import.meta.url));
 const ordinary = fileURLToPath(new URL("../index.ts", import.meta.url));
 const profile = ["read_work_inputs", "ack_work_input", "hand_back_work_input", "submit_result"];
+const proposal = "propose_task_decision";
+const proposalProof = "a1".repeat(32);
 const sha = bytes => createHash("sha256").update(bytes).digest("hex");
 const stamp = "2026-11-18T00:00:00.123456789Z";
 const id = "call_fresh|fc_task";
 const runID = "fixture-fresh-turn";
+const otherRunID = "fixture-next-turn";
+const decisionKey = (run, callID = id) => sha(`${proposal}\0${run}\0${callID}`);
 const uncertaintyField = "agent_workspace_write_unknown_v1";
 const payloads = {
   read_work_inputs: { input_id: "fixture", offset: 5, max_bytes: 4 },
   ack_work_input: { input_id: "fixture" },
   hand_back_work_input: { input_id: "other", reason: "超出文本授权" },
   submit_result: { summary: "文本交付" },
+  [proposal]: { kind: "authorization", expected_version: 1, question: "需要周末样本吗？", facts: "已读工作日🧪",
+    recommendation: "先给工作日摘要", choices: ["仅工作日", "加入周末"], authorization: { scope: "读样本", impact: "多两天" } },
 };
 const replies = {
   read_work_inputs: { input_id: "fixture", offset: 5, next_offset: 9, byte_count: 4, complete: false, text: "🧪" },
   ack_work_input: { input_id: "fixture", disposition: "confirmed" },
   hand_back_work_input: { input_id: "other", disposition: "returned" },
   submit_result: { submission_id: "submission", created_at: stamp, artifact_version_count: 0, summary_omitted: true },
+  [proposal]: { decision_request_id: "proposal-fixture", kind: "authorization", version: 2 },
 };
 
 async function load(entry, path, digest) {
@@ -50,13 +57,14 @@ function definitions(loaded) {
   return new Map([...loaded.extensions[0].tools].map(([name, t]) => [name, t.definition]));
 }
 
-function reply(name) {
-  return [name === "submit_result" ? 201 : 200, JSON.stringify(replies[name])];
+function reply(name, call) {
+  return [name === "submit_result" || name === proposal ? 201 : 200, JSON.stringify(replies[name]),
+    name === proposal ? { "idempotency-key": call.key } : {}];
 }
 
 // Replace http.request before the real SDK loads the extension. No bind(),
 // sockets, subprocess, resolver or actual endpoint are used by these tests.
-function fakeHTTP(t, respond = name => reply(name)) {
+function fakeHTTP(t, respond = reply) {
   const sent = [];
   const original = http.request;
   http.request = (options, ready) => {
@@ -70,9 +78,12 @@ function fakeHTTP(t, respond = name => reply(name)) {
     const req = new EventEmitter();
     req.destroy = () => {};
     req.end = bytes => {
-      sent.push({ name, body: bytes.toString(), key: options.headers["Idempotency-Key"] });
+      const call = { name, body: bytes.toString(), key: options.headers["Idempotency-Key"],
+        ...(name === proposal ? { proof: options.headers["X-Agent-Workspace-Task-Decision-Proof"],
+          callID: options.headers["X-Agent-Workspace-Tool-Call-Id"] } : {}) };
+      sent.push(call);
       queueMicrotask(() => {
-        const [statusCode, body, headers = {}] = respond(name);
+        const [statusCode, body, headers = {}] = respond(name, call);
         const res = Object.assign(new EventEmitter(), { statusCode, complete: false, destroy() {},
           headers: { "content-type": "application/json", ...headers } });
         ready(res);
@@ -89,15 +100,16 @@ function fakeHTTP(t, respond = name => reply(name)) {
   return sent;
 }
 
-async function fixture(t) {
-  const path = await privateConfig(t);
+async function fixture(t, decision = false, issuedRunID = runID) {
+  const names = decision ? [...profile, proposal] : profile;
+  const path = await privateConfig(t, decision ? { task_decision_proof: proposalProof, run_id: issuedRunID } : {});
   const issued = await readFile(path);
   const loaded = await load(typed, path, sha(issued));
   const tools = definitions(loaded);
-  assert.deepEqual([...tools.keys()], profile);
+  assert.deepEqual([...tools.keys()], names);
   const invoke = (name, args = payloads[name], toolID = id, signal) => tools.get(name).execute(toolID, args, signal,
-    undefined, { sessionManager: { getSessionId: () => runID } });
-  return { path, loaded, invoke };
+    undefined, { sessionManager: { getSessionId: () => issuedRunID } });
+  return { path, loaded, invoke, names, issuedRunID };
 }
 
 function check(result, value) {
@@ -112,10 +124,11 @@ function checkUnknown(result, sent) {
   });
   assert.match(result.content[0].text, /未知.*不要自动重试/);
   assert.ok(!JSON.stringify(result).includes(TOKEN));
+  assert.ok(!JSON.stringify(result).includes(proposalProof));
   assert.ok(!JSON.stringify(result.details).includes("input_id"));
 }
 
-async function sdkSession(t, fx, modelRuntime) {
+async function sdkSession(t, fx, modelRuntime, sessionID = fx.issuedRunID) {
   const { createAgentSession, SessionManager, SettingsManager } = await loadSessionSDK();
   const dir = dirname(fx.path);
   const deny = name => () => assert.fail(`unexpected ${name}`);
@@ -124,9 +137,9 @@ async function sdkSession(t, fx, modelRuntime) {
     cwd: dir, agentDir: dir,
     model: { id: "fixture", name: "Synthetic", provider: "synthetic", api: "synthetic-no-network", baseUrl: "http://127.0.0.1:1",
       reasoning: false, input: ["text"], contextWindow: 8192, maxTokens: 1, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
-    thinkingLevel: "off", noTools: "builtin", tools: profile,
+    thinkingLevel: "off", noTools: "builtin", tools: fx.names,
     modelRuntime: modelRuntime ?? new Proxy({}, { get: (_target, name) => deny(String(name)) }),
-    sessionManager: SessionManager.inMemory(dir, { id: runID }),
+    sessionManager: SessionManager.inMemory(dir, { id: sessionID }),
     settingsManager: SettingsManager.inMemory({ retry: { enabled: false }, cacheWarming: "off", enableInstallTelemetry: false }),
     resourceLoader: {
       getExtensions: () => fx.loaded,
@@ -157,6 +170,62 @@ test("real Pi 1.4.0 loader and SDK activate only the four typed tools", async t 
     key: name === profile[0] ? undefined : sha(name + id) })));
 });
 
+test("Pi SDK activates the proposal only on the exact opted-in fresh text profile", async t => {
+  const sent = fakeHTTP(t);
+  const fx = await fixture(t, true);
+  const session = await sdkSession(t, fx);
+  await session.bindExtensions({ mode: "print" });
+  session.setActiveToolsByName([...fx.names, "list_members", "report_work", "read"]);
+  assert.deepEqual(session.getCallableToolNames(), fx.names);
+  const tool = session.agent.state.tools.find(t => t.name === proposal);
+  const input = payloads[proposal];
+  for (const args of [
+    { ...input, task_id: "forged" }, { ...input, run_id: otherRunID }, { ...input, authorization: { ...input.authorization, grant: true } },
+    { ...input, expected_version: Number.MAX_SAFE_INTEGER + 1 }, { ...input, question: "two\nlines" },
+    { ...input, choices: ["同一", " 同一 "] }, { ...input, facts: "字".repeat(683) },
+  ]) assert.throws(() => tool.prepareArguments(args), /参数.*未发送/);
+  check(await tool.execute(id, tool.prepareArguments(input)), replies[proposal]);
+  check(await tool.execute(id, tool.prepareArguments(input)), replies[proposal]);
+  assert.deepEqual(sent, Array.from({ length: 2 }, () => ({ name: proposal, body: JSON.stringify(input),
+    key: decisionKey(runID), callID: id, proof: proposalProof })));
+  const ack = session.agent.state.tools.find(t => t.name === "ack_work_input");
+  check(await ack.execute(id, ack.prepareArguments(payloads[ack.name])), replies[ack.name]);
+  assert.deepEqual(sent[2], { name: ack.name, key: sha(ack.name + id), body: JSON.stringify(payloads[ack.name]) });
+  assert.deepEqual(session.messages, []);
+});
+
+test("Pi SDK checks the issued Run before sending the same native call ID in another session", async t => {
+  const sent = fakeHTTP(t);
+  for (const issued of [runID, otherRunID]) {
+    const session = await sdkSession(t, await fixture(t, true, issued), undefined, otherRunID);
+    await session.bindExtensions({ mode: "print" });
+    const tool = session.agent.state.tools.find(t => t.name === proposal);
+    const execute = () => tool.execute(id, tool.prepareArguments(payloads[proposal]));
+    if (issued !== otherRunID) {
+      await assert.rejects(execute(), /调用无效.*未发送/);
+      assert.deepEqual(sent, []);
+    } else {
+      check(await execute(), replies[proposal]);
+      assert.deepEqual(sent, [{ name: proposal, key: decisionKey(otherRunID), body: JSON.stringify(payloads[proposal]),
+        callID: id, proof: proposalProof }]);
+    }
+  }
+});
+
+test("an unknown proposal retains the exact wire identity and locks all later writes", async t => {
+  const sent = fakeHTTP(t, name => name === proposal ? [500, '{"error":{"code":"internal_error","message":"uncertain"}}'] : reply(name));
+  const { invoke } = await fixture(t, true);
+  const first = await invoke(proposal);
+  checkUnknown(first, sent[0]);
+  assert.equal(sent[0].key, decisionKey(runID));
+  assert.equal(sent[0].body, JSON.stringify(payloads[proposal]));
+  await assert.rejects(invoke(proposal), error => error.message === first.content[0].text);
+  await assert.rejects(invoke(proposal, { ...payloads[proposal], question: "changed?" }), /阻止后续写入/);
+  check(await invoke("read_work_inputs"), replies.read_work_inputs);
+  for (const name of profile.slice(1)) await assert.rejects(invoke(name), /阻止后续写入/);
+  assert.deepEqual(sent.map(call => call.name), [proposal, "read_work_inputs"]);
+});
+
 // Optional raw, synthetic SDK fixtures for the real Go fixed-adapter tests.
 async function savePrintFixture(name, jsonl) {
   const dir = process.env.TEST_PI_TYPED_PRINT_FIXTURES;
@@ -165,10 +234,10 @@ async function savePrintFixture(name, jsonl) {
 
 const toolCall = (name, callID, args = payloads[name]) => ({ type: "toolCall", id: callID, name, arguments: args });
 
-async function printToolTurns(t, ...turns) {
+async function printToolTurns(t, fx, ...turns) {
   const steps = [...turns, ["stop", [{ type: "text", text: "native stop" }]]];
   let requests = 0;
-  const session = await sdkSession(t, await fixture(t), {
+  const session = await sdkSession(t, fx, {
     hasConfiguredAuth: () => true, // Synthetic provider, never credentials.
     streamSimple(model) {
       assert.ok(requests < steps.length, "unexpected synthetic model call");
@@ -193,7 +262,7 @@ async function printToolTurns(t, ...turns) {
 test("Pi JSON print keeps native write evidence even when the next assistant stops successfully", async t => {
   const sent = fakeHTTP(t, () => [200, undefined]);
   const op = "ack_work_input";
-  const { frames, jsonl } = await printToolTurns(t, ["toolUse", [toolCall(op, id)]]);
+  const { frames, jsonl } = await printToolTurns(t, await fixture(t), ["toolUse", [toolCall(op, id)]]);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].key, sha(op + id));
   const ends = frames.filter(f => f.type === "tool_execution_end");
@@ -213,12 +282,25 @@ test("Pi JSON print keeps native write evidence even when the next assistant sto
   await savePrintFixture("unknown", jsonl);
 });
 
+test("Pi JSON print keeps run-scoped evidence for a proposal receipt from the wrong Run", async t => {
+  const sent = fakeHTTP(t, () => [201, JSON.stringify(replies[proposal]), { "idempotency-key": decisionKey(otherRunID) }]);
+  const { frames, jsonl } = await printToolTurns(t, await fixture(t, true), ["toolUse", [toolCall(proposal, id)]]);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].key, decisionKey(runID));
+  const end = frames.find(f => f.type === "tool_execution_end");
+  assert.equal(end.toolName, proposal);
+  assert.equal(end.toolCallId, id);
+  assert.equal(end.isError, true);
+  checkUnknown(end.result, sent[0]);
+  await savePrintFixture("proposal-unknown", jsonl);
+});
+
 test("Pi JSON print pairs parallel writes by ID and preserves checked results and definite denials", async t => {
   const ack = "ack_work_input", rejected = "hand_back_work_input", submit = "submit_result";
   const rejectedID = "locally-rejected", truncatedID = "truncated", checkedID = "checked";
   const forged = { ...payloads[rejected], details: { [uncertaintyField]: { role: "followup", run_id: runID } } };
   const sent = fakeHTTP(t, name => name === ack ? [409, '{"error":{"code":"conflict","message":"rejected"}}'] : reply(name));
-  const { frames, jsonl } = await printToolTurns(t,
+  const { frames, jsonl } = await printToolTurns(t, await fixture(t),
     // The second call fails argument preparation before the first call ends.
     ["toolUse", [toolCall(ack, id), toolCall(rejected, rejectedID, forged)]],
     ["length", [toolCall(submit, truncatedID)]],
