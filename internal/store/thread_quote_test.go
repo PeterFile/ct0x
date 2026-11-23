@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"agentworkspace/internal/domain"
@@ -178,4 +179,93 @@ func TestThreadRoutingReplaysLegacyA3Quote(t *testing.T) {
 		t.Fatalf("A3 source or key bytes changed: %v", err)
 	}
 	threadCounts(t, f.s, map[string]int{"messages": 2, "deliveries": 1, "message_quotes": 1, "thread_routing_links": 0})
+}
+
+func TestThreadRoutingLongQuotedComparisonAndSingleQuotedNegation(t *testing.T) {
+	type mode struct {
+		name string
+		prep func(*testing.T)
+	}
+	enableAOnly := func(t *testing.T) {
+		t.Helper()
+		registry := migrations
+		t.Cleanup(func() { migrations = registry })
+		if i := slices.Index(registry, threadRoutingSchema); i >= 0 {
+			migrations = slices.Clone(registry[:i])
+		}
+		if !slices.Contains(migrations, messageQuoteSchema) {
+			migrations = append(slices.Clone(migrations), messageQuoteSchema)
+		}
+	}
+	enableAAndE := func(t *testing.T) {
+		t.Helper()
+		enableThreadRoutingFixture(t)
+		if !slices.Contains(migrations, messageQuoteSchema) {
+			original := migrations
+			t.Cleanup(func() { migrations = original })
+			migrations = append(slices.Clone(migrations), messageQuoteSchema)
+		}
+	}
+	longQuoteLine := "\n> " + strings.Repeat("q", maxThreadTextBytes+1)
+	longFenced := "\n```text\n" + strings.Repeat("f", maxThreadTextBytes+1) + "\n```"
+	longInline := "\n对照材料：\"" + strings.Repeat("i", maxThreadTextBytes+1) + "\""
+	overBudgetProse := "引用仅作对照。\n" + strings.Repeat("p", maxThreadTextBytes+1)
+
+	for _, m := range []mode{
+		{"A-only", enableAOnly},
+		{"E-only", enableEOnlyQuoteFixture},
+		{"A+E", enableAAndE},
+	} {
+		t.Run(m.name, func(t *testing.T) {
+			m.prep(t)
+			f := setupMessages(t)
+			quoted, err := f.s.CreateMessage(ctx, MessageRequest{GroupID: f.groupID, ActorID: f.a, TopicID: "t1", Content: "Member A report"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCompRecipient := f.b
+			if m.name == "A-only" {
+				wantCompRecipient = ""
+			}
+			check := func(t *testing.T, key, content, wantTopic, wantRecipient string) {
+				t.Helper()
+				got := postThreadMessage(t, f.s, MessageRequest{
+					GroupID: f.groupID, ActorID: "user", Content: content, IdempotencyKey: key,
+					ThreadLinks: domain.ThreadLinks{ReplyToMessageID: quoted.ID},
+				})
+				if got.TopicID != wantTopic {
+					t.Errorf("content=%q: topic=%q, want %q", content, got.TopicID, wantTopic)
+				}
+				switch {
+				case wantRecipient == "" && len(got.Deliveries) != 0:
+					t.Errorf("content=%q: deliveries=%+v, want empty", content, got.Deliveries)
+				case wantRecipient != "" && (len(got.Deliveries) != 1 || got.Deliveries[0].RecipientID != wantRecipient):
+					t.Errorf("content=%q: deliveries=%+v, want [%s]", content, got.Deliveries, wantRecipient)
+				}
+			}
+
+			// 1. Short comparison + >4096B quoted material must match short comparison.
+			check(t, "short-zh", "引用仅作对照。", "", wantCompRecipient)
+			check(t, "long-quote-zh", "引用仅作对照。"+longQuoteLine, "", wantCompRecipient)
+			check(t, "long-fenced-en", "For comparison."+longFenced, "", wantCompRecipient)
+			check(t, "long-inline-zh", "引用仅作对照。"+longInline, "", wantCompRecipient)
+
+			// 2. Over-budget unquoted prose must still bypass classification (stay direct reply).
+			check(t, "over-budget-prose", overBudgetProse, quoted.TopicID, f.a)
+
+			// 3. Single-quoted literals and explicit negations must stay direct replies.
+			check(t, "single-quote-en", "请解释日志字段 'for comparison'，再核对此结论。", quoted.TopicID, f.a)
+			check(t, "curly-single-zh", "请解释日志字段 ‘for comparison’，再核对此结论。", quoted.TopicID, f.a)
+			check(t, "single-quote-zh", "字段'仅供参考'的含义是什么", quoted.TopicID, f.a)
+			check(t, "negation-zh-1", "这不是仅供参考的材料，请核查原文。", quoted.TopicID, f.a)
+			check(t, "negation-zh-2", "该原文并非仅作对照，请直接答复。", quoted.TopicID, f.a)
+			check(t, "negation-zh-3", "不要把这条原文只作为参考，请核查。", quoted.TopicID, f.a)
+			check(t, "negation-en-1", "This is not for comparison, please verify.", quoted.TopicID, f.a)
+			check(t, "negation-en-2", "Not just for comparison.", quoted.TopicID, f.a)
+
+			// 4. Contractions and genuine comparison in a separate clause still classify.
+			check(t, "contraction-comp", "It's for comparison.", "", wantCompRecipient)
+			check(t, "negated-other-clause", "不要忽略正文，原消息仅供参考。", "", wantCompRecipient)
+		})
+	}
 }
