@@ -70,46 +70,53 @@ func requireStrictInvestigationAdmissionRoot(ctx context.Context, db *store.Stor
 // Historical lookup classifies a formal role delivery even if its current
 // policy is disabled. An error or mismatched investigation must not fall back
 // to ordinary role tools, context or workspace.
-func taskInvestigationForRole(ctx context.Context, db *store.Store, role store.CoordinationRoleProvenance) (*domain.TaskInvestigationScope, error) {
+func taskInvestigationForRole(ctx context.Context, db *store.Store, role store.CoordinationRoleProvenance,
+	allowInvitation bool) (*domain.TaskInvestigationScope, investigationInvitation, error) {
+	var invitation investigationInvitation
 	scope, err := db.GetTaskInvestigationScope(ctx, role.GroupID, role.TaskID)
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return nil, invitation, ctx.Err()
 	}
 	if errors.Is(err, store.ErrNotFound) {
-		return nil, nil
+		return nil, invitation, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, invitation, err
 	}
 	if scope.GroupID != role.GroupID || scope.TopicID != role.TopicID || scope.TaskID != role.TaskID ||
 		scope.TaskRevision != role.TaskRevision || scope.MandateID == "" {
-		return nil, store.ErrMemberToolDenied
+		return nil, invitation, store.ErrMemberToolDenied
 	}
 	// Use the immutable admission receipt, not the current task pointer. This
 	// also works with the B2 revision that keeps the dispatch ID private.
 	admission, err := db.GetChatAdmission(ctx, scope.GroupID, scope.TaskID)
 	if err != nil {
-		return nil, investigationReadError(ctx, err)
+		return nil, invitation, investigationReadError(ctx, err)
 	}
 	if !investigationAdmissionMatchesScope(admission, scope, role.RequestID) {
-		return nil, store.ErrMemberToolDenied
+		return nil, invitation, store.ErrMemberToolDenied
 	}
-	if err := requireStrictInvestigationAdmissionRoot(ctx, db, admission); err != nil {
-		return nil, err
+	if allowInvitation && admission.SourceKind == "member" {
+		invitation, err = requireInvestigationInvitation(ctx, db, admission)
+	} else {
+		err = requireStrictInvestigationAdmissionRoot(ctx, db, admission)
+	}
+	if err != nil {
+		return nil, invitation, err
 	}
 	if role.Kind == store.CoordinationRoleWorker {
 		// The original assignment's materialized delivery is the only worker
 		// entry. A later work delivery for the same assignment is not a first turn.
 		view, err := db.GetAssignment(ctx, role.GroupID, role.AssignmentID)
 		if err != nil {
-			return nil, investigationReadError(ctx, err)
+			return nil, invitation, investigationReadError(ctx, err)
 		}
 		d := view.Dispatch.Delivery
 		if d == nil || d.DeliveryID != role.DeliveryID || d.MessageID != role.MessageID || d.ConversationID != role.ConversationID || d.WorkerMemberID != role.MemberID {
-			return nil, errInvestigationFirstRoot
+			return nil, invitation, errInvestigationFirstRoot
 		}
 	}
-	return &scope, nil
+	return &scope, invitation, nil
 }
 
 // The formal command is separate from the material grant. Only the native
@@ -194,11 +201,12 @@ func (s *MemberTools) issueInitialInvestigationTools(ctx context.Context, scope 
 			return "", empty, store.ErrMemberToolDenied
 		}
 	}
-	saved, err := taskInvestigationForRole(ctx, s.db, scope.Provenance)
+	allowInvitation := s.discussionWorkReturn && !managed && prepared.invitation.messageID != ""
+	saved, invitation, err := taskInvestigationForRole(ctx, s.db, scope.Provenance, allowInvitation)
 	if err != nil {
 		return "", empty, err
 	}
-	if saved == nil || !managed && !prepared.matchesScope(saved) {
+	if saved == nil || !managed && (!prepared.matchesScope(saved) || prepared.invitation != invitation) {
 		return "", empty, store.ErrMemberToolDenied
 	}
 	state, err := s.resolveInvestigationRole(ctx, scope)

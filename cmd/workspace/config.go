@@ -19,14 +19,14 @@ type config struct {
 	enableNativeSessionResume bool
 	nativePiThinking          string
 
-	listen, dataDir, webDir, devOrigin, piPath, codexPath       string
-	enableExecution, enableMemberTools, enableCoordinationRoles bool
-	enableCodexAppServer, enableInvestigationExecution          bool
-	piMemberToolsExtension, roleThinking                        string
-	executionMaxActive, memberToolsMaxMembers                   int
-	piFreshTaskWorkExtension, piFreshInvestigationWorkExtension string
-	enableInvestigationOwnerManagement                          bool
-	enablePiTaskDecisionProposals                               bool
+	listen, dataDir, webDir, devOrigin, piPath, codexPath          string
+	enableExecution, enableMemberTools, enableCoordinationRoles    bool
+	enableCodexAppServer, enableInvestigationExecution             bool
+	piMemberToolsExtension, roleThinking                           string
+	executionMaxActive, memberToolsMaxMembers                      int
+	piFreshTaskWorkExtension, piFreshInvestigationWorkExtension    string
+	enableInvestigationOwnerManagement, enableDiscussionWorkReturn bool
+	enablePiTaskDecisionProposals                                  bool
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -173,6 +173,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 }
 
 func (c config) validateInvestigationOption() error {
+	if c.enableDiscussionWorkReturn && (!c.enableInvestigationExecution || c.piFreshInvestigationWorkExtension == "") {
+		return errors.New("讨论工作回传须同时启用只读调查和独立的调查后续工作扩展")
+	}
 	if c.enableInvestigationOwnerManagement && (!c.enableInvestigationExecution || c.piFreshInvestigationWorkExtension == "") {
 		return errors.New("调查负责人管理须同时启用只读调查和独立的调查后续工作扩展")
 	}

@@ -58,6 +58,7 @@ type MemberTools struct {
 	workspace        *memberWorkspaceRegistry
 
 	investigationDelegateSupport InvestigationDelegateSupport // Immutable trusted opt-in.
+	discussionWorkReturn         bool                         // Separate opt-in; no delegation grant.
 }
 
 func NewMemberTools(db *store.Store) *MemberTools {
@@ -136,12 +137,20 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 		if captured.Purpose != domain.ChatIntakePurpose {
 			return "", store.ErrMemberToolDenied
 		}
-		if schema.offersInvestigation(captured.Policy) && captured.SourceKind == "local_user_chat" && captured.SourceSenderID == "user" {
-			delivery, err := investigationRootDelivery(ctx, s.db, captured.ThreadRef, captured.MessageID, captured.SourceID, scope.MemberID, claim.TurnID)
-			if err != nil || delivery.ConversationID != scope.ConversationID {
-				schema.investigation = false // Do not add authority on ambiguous or unavailable evidence.
+		switch {
+		case !schema.offersInvestigation(captured.Policy):
+			schema.investigation = false
+		case schema.invitation != nil:
+			if !s.discussionWorkReturn {
+				return "", store.ErrMemberToolDenied
 			}
-		} else {
+			if err := schema.invitation.checkCapture(ctx, s.db, captured, scope); err != nil {
+				return "", err // A planned structured entry must not fall back on lost binding evidence.
+			}
+		case captured.SourceKind == "local_user_chat" && captured.SourceSenderID == "user":
+			delivery, err := investigationRootDelivery(ctx, s.db, captured.ThreadRef, captured.MessageID, captured.SourceID, scope.MemberID, claim.TurnID)
+			schema.investigation = err == nil && delivery.ConversationID == scope.ConversationID
+		default:
 			schema.investigation = false
 		}
 		candidate = &captured

@@ -157,7 +157,7 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 	if r.tools == nil || r.tools.db != p.store || !r.rootValid() {
 		return empty, preparationFailureWithCause(ctx, errPrepareConfig, errMemberToolRuntimeConfig)
 	}
-	investigation, err := taskInvestigationForRole(ctx, p.store, state.Provenance)
+	investigation, invitation, err := taskInvestigationForRole(ctx, p.store, state.Provenance, r.tools.discussionWorkReturn)
 	if errors.Is(err, errInvestigationFirstRoot) {
 		return empty, rolePreparationBlocked(state, "investigation_first_root_required", nil)
 	}
@@ -165,7 +165,7 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 		return empty, preparationResolutionError(ctx, err)
 	}
 	if investigation != nil {
-		return p.planInvestigationRole(ctx, state, member, *investigation)
+		return p.planInvestigationRole(ctx, state, member, *investigation, invitation)
 	}
 	workspace, err := p.taskWorkspaceForPreparation(ctx, state.Provenance)
 	if err != nil {
