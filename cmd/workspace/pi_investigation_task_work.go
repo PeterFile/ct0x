@@ -27,11 +27,13 @@ func (c *config) registerPiFreshInvestigationWorkFlag(flags *flag.FlagSet, outpu
 		return nil
 	})
 	flags.BoolVar(&c.enableInvestigationOwnerManagement, "enable-investigation-owner-management", false, "Pi 调查绑定负责人管理（默认禁用）")
+	flags.BoolVar(&c.enableDiscussionWorkReturn, "enable-discussion-work-return", false, "Pi 正式调查交回原讨论（默认禁用）")
 	usage := flags.Usage
 	flags.Usage = func() {
 		usage()
 		fmt.Fprintln(output, "  --pi-fresh-investigation-work-extension 路径  Pi 调查补充、委派和报告新轮（默认禁用；须启用只读调查并指定独立的可信扩展，不新增工作授权）")
-		fmt.Fprintln(output, "  --enable-investigation-owner-management  Pi 调查负责人有限委派及续轮整项交回（默认禁用；须同时启用前两项；仍由平台核验授权与余额）")
+		fmt.Fprintln(output, "  --enable-investigation-owner-management  Pi 调查负责人有限委派及续轮整项交回（默认禁用；须同时启用只读调查及其后续扩展；仍由平台核验授权与余额）")
+		fmt.Fprintln(output, "  --enable-discussion-work-return  实验性正式调查交回原讨论（默认禁用；须同时启用只读调查及其后续扩展；结构化邀请续轮仅新增整项交回，不授予委派）")
 	}
 }
 
@@ -47,6 +49,7 @@ func (c config) piFreshInvestigationWorkLaunch(db *store.Store, engine *coordina
 		func(ctx context.Context, plan store.FreshTaskWorkLaunch, admit func() bool) error {
 			return db.CommitInvestigationTaskWorkLaunch(ctx, store.InvestigationTaskWorkLaunch(plan), admit)
 		})
+	launch.EnableDiscussionWorkReturn = c.enableDiscussionWorkReturn
 	// Use only the same explicitly selected Pi as first investigation, even
 	// if the catalog contains other supported installations.
 	pi, supports := filepath.Clean(c.piPath), launch.Supports

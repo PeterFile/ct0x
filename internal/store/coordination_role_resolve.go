@@ -20,6 +20,8 @@ const (
 	CoordinationMemberInactive        CoordinationReadinessCode = "member_inactive"
 	CoordinationAlreadyDecided        CoordinationReadinessCode = "already_decided"
 	CoordinationAttemptConflict       CoordinationReadinessCode = "attempt_conflict"
+
+	CoordinationDiscussionWorkReturnHandlerRequired CoordinationReadinessCode = "discussion_work_return_handler_required"
 )
 
 // CoordinationRoleState is trusted process-local evidence, not a transport DTO.
@@ -32,9 +34,23 @@ type CoordinationRoleState struct {
 	Blocked           CoordinationReadinessCode  `json:"-"`
 }
 
-// ResolveCoordinationDelivery observes queued identity in one read snapshot. It
-// neither claims a Turn nor promises authorization for a later write transaction.
-func (s *Store) ResolveCoordinationDelivery(ctx context.Context, groupID, deliveryID string) (out CoordinationRoleState, err error) {
+// ResolveCoordinationDelivery observes queued identity in one read snapshot.
+// Valid discussion work returns are held for their explicit handler. This
+// read neither claims a Turn nor promises authorization for a later write.
+func (s *Store) ResolveCoordinationDelivery(ctx context.Context, groupID, deliveryID string) (CoordinationRoleState, error) {
+	return s.resolveCoordinationDelivery(ctx, groupID, deliveryID, nil)
+}
+
+// ResolveCoordinationDiscussionWorkReturnDelivery rechecks the exact receipt
+// from ResolveChatDiscussionWorkReturnDelivery against the current queued tuple
+// in one snapshot. Ready is only a preclaim hint for the trusted no-tool handler,
+// never authorization or a substitute for fencing the actual claim at launch.
+// Missing, mismatched or no longer queued evidence is not an ordinary fallback.
+func (s *Store) ResolveCoordinationDiscussionWorkReturnDelivery(ctx context.Context, groupID, deliveryID string, expected domain.ChatDiscussionWorkReturnReceipt) (CoordinationRoleState, error) {
+	return s.resolveCoordinationDelivery(ctx, groupID, deliveryID, &expected)
+}
+
+func (s *Store) resolveCoordinationDelivery(ctx context.Context, groupID, deliveryID string, expected *domain.ChatDiscussionWorkReturnReceipt) (out CoordinationRoleState, err error) {
 	phase := "input"
 	var tx *sql.Tx
 	defer func() { err = coordinationAssignmentFinish(tx, phase, err) }()
@@ -47,43 +63,87 @@ func (s *Store) ResolveCoordinationDelivery(ctx context.Context, groupID, delive
 		return out, err
 	}
 	phase = "source"
+	installed, err := s.chatDiscussionWorkReturnInstalledInTx(ctx, tx)
+	if err != nil {
+		return out, err
+	}
 	state := CoordinationRoleState{}
 	p := &state.Provenance
 	p.Kind, p.GroupID, p.DeliveryID = CoordinationRoleOrdinary, groupID, deliveryID
-	var valid bool
-	var sender string
-	err = tx.QueryRowContext(ctx, `SELECT d.message_id,d.conversation_id,d.recipient_id,d.topic_id,
+	const fields = `SELECT d.message_id,d.conversation_id,d.recipient_id,d.topic_id,
  coalesce(m.sender_id,''),coalesce(w.provider_id,''),coalesce(w.model,''),
  coalesce(d.state='queued' AND d.turn_id='' AND m.group_id=d.group_id AND m.topic_id=d.topic_id
  AND c.group_id=d.group_id AND c.member_id=d.recipient_id AND c.topic_id=d.topic_id AND w.group_id=d.group_id
  AND EXISTS(SELECT 1 FROM groups WHERE id=d.group_id)
  AND NOT EXISTS(SELECT 1 FROM turns WHERE delivery_id=d.id),0),
- CASE WHEN w.status='active' THEN '' ELSE 'member_inactive' END
+ CASE WHEN w.status='active' THEN '' ELSE 'member_inactive' END, `
+	const source = `
  FROM deliveries d LEFT JOIN messages m ON m.id=d.message_id
  LEFT JOIN conversations c ON c.id=d.conversation_id LEFT JOIN members w ON w.id=d.recipient_id
- WHERE d.id=? AND d.group_id=?`, deliveryID, groupID).Scan(&p.MessageID, &p.ConversationID, &p.MemberID, &p.TopicID,
-		&sender, &state.ProviderID, &state.Model, &valid, &state.Blocked)
+ WHERE d.id=? AND d.group_id=?`
+	query := fields + "0" + source
+	if installed {
+		// Ordinary deliveries pay only the two indexed marker probes here.
+		query = fields + `EXISTS(SELECT 1 FROM main.chat_discussion_work_returns w
+	 WHERE w.delivery_id=d.id OR w.message_id=d.message_id)` + source
+	}
+	var valid, marked bool
+	var sender string
+	err = tx.QueryRowContext(ctx, query, deliveryID, groupID).Scan(&p.MessageID, &p.ConversationID, &p.MemberID, &p.TopicID,
+		&sender, &state.ProviderID, &state.Model, &valid, &state.Blocked, &marked)
 	if errors.Is(err, sql.ErrNoRows) {
+		if expected != nil {
+			return out, ErrMemberToolDenied
+		}
+		// A missing or foreign queue row does not hide a raw return marker.
+		if installed {
+			r, err := chatDiscussionWorkReturnDeliveryInTx(ctx, tx, groupID, deliveryID)
+			if err == nil && r != nil {
+				err = ErrMemberToolDenied
+			}
+			if err != nil {
+				return out, &chatDiscussionWorkReturnReadError{err}
+			}
+		}
 		return out, ErrNotFound
 	}
 	if err != nil {
 		return out, err
 	}
-	if !valid {
-		return out, ErrMemberToolDenied
-	}
-	work, err := lookupTaskWorkDeliveryInTx(ctx, tx, groupID, deliveryID)
-	if err == nil {
-		state, err = s.taskWorkOwnerRoleInTx(ctx, tx, work, "")
-	} else if errors.Is(err, ErrNotFound) {
-		var actual CoordinationRoleProvenance
-		actual, err = coordinationQueuedProvenanceInTx(ctx, tx, *p, sender)
-		if err == nil && actual.Kind != CoordinationRoleOrdinary {
-			state, err = coordinationRoleStateInTx(ctx, tx, MemberToolScope{}, actual)
+	switch {
+	case marked:
+		// Keep return failures out of the legacy plain-denial delegation probe.
+		if !valid {
+			return out, &chatDiscussionWorkReturnReadError{ErrMemberToolDenied}
 		}
-	}
-	if err != nil {
-		return out, err
+		r, err := chatDiscussionWorkReturnDeliveryInTx(ctx, tx, groupID, deliveryID)
+		if err != nil {
+			return out, &chatDiscussionWorkReturnReadError{err}
+		}
+		if r == nil || r.GroupID != p.GroupID || r.DeliveryID != p.DeliveryID || r.TopicID != p.TopicID ||
+			r.ConversationID != p.ConversationID || r.MessageID != p.MessageID || r.RecipientID != p.MemberID || r.SenderID != sender ||
+			(expected != nil && *r != *expected) {
+			return out, &chatDiscussionWorkReturnReadError{ErrMemberToolDenied}
+		}
+		if expected == nil && state.Blocked == CoordinationReady {
+			state.Blocked = CoordinationDiscussionWorkReturnHandlerRequired
+		}
+	case expected != nil || !valid:
+		return out, ErrMemberToolDenied
+	default:
+		work, err := lookupTaskWorkDeliveryInTx(ctx, tx, groupID, deliveryID)
+		if err == nil {
+			state, err = s.taskWorkOwnerRoleInTx(ctx, tx, work, "")
+		} else if errors.Is(err, ErrNotFound) {
+			var actual CoordinationRoleProvenance
+			actual, err = coordinationQueuedProvenanceInTx(ctx, tx, *p, sender)
+			if err == nil && actual.Kind != CoordinationRoleOrdinary {
+				state, err = coordinationRoleStateInTx(ctx, tx, MemberToolScope{}, actual)
+			}
+		}
+		if err != nil {
+			return out, err
+		}
 	}
 	phase = "commit"
 	if err := tx.Commit(); err != nil {
