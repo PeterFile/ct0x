@@ -124,7 +124,13 @@ func TestB3HistoricalV29UpgradePreservesTypedWork(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := queueHandle(t, f.path, false)
+	// Exercise the v29-to-v30 upgrade without applying later migrations.
+	s := func() *Store {
+		all := migrations
+		migrations = all[:taskWorkReportVersion]
+		defer func() { migrations = all }()
+		return queueHandle(t, f.path, false)
+	}()
 	messageSequenceLedger(t, s, taskWorkReportVersion)
 	messageSequencePreserved(t, s, before)
 	if got := messageSequenceRows(t, s.db, tables); !reflect.DeepEqual(got, oldDDL) {

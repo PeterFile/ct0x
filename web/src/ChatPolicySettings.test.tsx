@@ -30,7 +30,8 @@ function receipt(body: string, groupId = group.id) {
     preparation_scope_kind: input.preparation_scope_kind ?? "", preparation_supported: input.allow_preparation,
     configuration_source_id: "actual-policy-command", preauthorization_message_id: input.allow_preparation ? "generated-rule-message" : "",
     ...(input.allow_preparation ? { preauthorization_text: "本群主话题已有消息的纯文本摘要；目标与验收由服务端固定" } : {}),
-    ...(input.investigation ? { investigation: input.investigation } : {}) };
+    ...(input.investigation ? { investigation: input.investigation } : {}),
+    ...(input.automatic_text_dispatch === true ? { automatic_text_dispatch: true } : {}) };
 }
 async function open() {
   const view = render(<Tasks group={group} />);
@@ -327,6 +328,30 @@ const adoptLabel = "采用当前授权，保留任务上限草稿";
 const adopt = () => fireEvent.click(form().getByRole("button", { name: adoptLabel }));
 const saveButton = () => form().getByRole("button", { name: "保存聊天策略" });
 
+it.each([true, false])("preserves recorded automatic text dispatch in a budget save with chat policy enabled=%s", async enabled => {
+  saved.set(policyURL(), { ...workspacePolicy(1, false), enabled, automatic_text_dispatch: true }); await open();
+  budget("4"); submit(); await flush();
+  expect(writes).toHaveBeenCalledTimes(1);
+  expect(attempt(0).body).toBe(JSON.stringify({ enabled, allow_preparation: false, action: "text_submission",
+    max_admissions: 4, expected_revision: 1, automatic_text_dispatch: true }));
+  expect(screen.getByText(/保存已确认.*历史版本 2/)).toBeVisible();
+  expect(currentPolicy()).toHaveTextContent("自动文本分派：已记录");
+  expect(form().queryByRole("checkbox", { name: /自动文本分派/ })).not.toBeInTheDocument();
+});
+it.each([true, false])("requires adoption when automatic text dispatch changes to %s while a draft is dirty", async automatic_text_dispatch => {
+  saved.set(policyURL(), { ...workspacePolicy(1, false), automatic_text_dispatch: !automatic_text_dispatch }); await open();
+  budget("5");
+  saved.set(policyURL(), { ...workspacePolicy(2, false), automatic_text_dispatch }); await readPolicy();
+  expect(currentPolicy()).toHaveTextContent("版本 2");
+  if (!automatic_text_dispatch) expect(currentPolicy()).not.toHaveTextContent("自动文本分派");
+  expect(saveButton()).toBeDisabled(); submit(); await flush(); expect(writes).not.toHaveBeenCalled();
+  adopt();
+  expect(form().getByRole("spinbutton")).toHaveValue(5);
+  submit(); await flush();
+  expect(JSON.parse(attempt(0).body)).toEqual({ enabled: true, allow_preparation: false, action: "text_submission",
+    max_admissions: 5, expected_revision: 2, ...(automatic_text_dispatch ? { automatic_text_dispatch } : {}) });
+});
+
 it.each([undefined, false])("keeps old policy writes unchanged when investigation capability is %s", async investigation_supported => {
   saved.set(policyURL(), { ...blank(), investigation_supported }); await open();
   const choice = form().getByRole("checkbox", { name: investigationChoice });
@@ -365,6 +390,35 @@ it("explicitly saves a same-group exact version scope before runtime readiness w
   expect(currentPolicy()).toHaveTextContent("只读调查记录：已配置"); expect(currentPolicy()).toHaveTextContent("精确版本 /+?旧");
   expect(currentPolicy()).toHaveTextContent("调查运行时：未启用");
   expect(currentPolicy()).not.toHaveTextContent(/调查已执行|调查已提交|调查已接纳/);
+});
+it("preserves configured clue boundaries on a budget-only edit and an exact unknown retry", async () => {
+  const clue_terms = [" 导出", "只有表头"];
+  const investigation = { ...topicScope, clue_terms };
+  saved.set(policyURL(), { ...workspacePolicy(1, false), ...opts, investigation });
+  await open();
+  const terms = form().getByRole("textbox", { name: "调查线索词组（可选）" });
+  expect(terms).toHaveValue(clue_terms.join("\n"));
+  expect(currentPolicy()).toHaveTextContent("只有表头");
+  budget("4");
+  writes.mockRejectedValueOnce(new TypeError("Lost receipt"));
+  submit(); await flush(); const original = attempt(0);
+  expect(JSON.parse(original.body).investigation.clue_terms).toEqual(clue_terms);
+  expect(terms).toBeDisabled();
+  saved.set(policyURL(), { ...workspacePolicy(9, false), ...opts, investigation: { ...topicScope, clue_terms: ["另一组"] } });
+  await readPolicy();
+  expect(terms).toHaveValue(clue_terms.join("\n"));
+  writes.mockResolvedValueOnce(json(receipt(original.body))); submit(); await flush();
+  expect(attempt(1)).toEqual(original);
+  expect(currentPolicy()).toHaveTextContent("另一组");
+});
+it("saves nonempty literal clue phrases without silently stripping blanks or whitespace", async () => {
+  saved.set(policyURL(), { ...workspacePolicy(1, false), ...opts, investigation: topicScope }); await open();
+  const terms = form().getByRole("textbox", { name: "调查线索词组（可选）" });
+  fill(terms, "导出\n\n只有表头"); submit(); await flush();
+  expect(writes).not.toHaveBeenCalled();
+  expect(screen.getByRole("alert")).toHaveTextContent("线索词组");
+  fill(terms, "导出\n只有表头 "); submit(); await flush();
+  expect(JSON.parse(attempt(0).body).investigation.clue_terms).toEqual(["导出", "只有表头 "]);
 });
 it("requires explicit valid materials and prevents overlong objectives or more than 16 exact pairs", async () => {
   saved.set(policyURL(), { ...blank(), ...opts }); await open(); check(investigationChoice);

@@ -50,7 +50,7 @@ func queueHandle(t *testing.T, path string, deferred bool) *Store {
 		db, err = sql.Open("sqlite", dsn.String())
 		if err == nil {
 			db.SetMaxOpenConns(1)
-			s = &Store{db: db}
+			s = &Store{db: db, schemaVersion: len(migrations)}
 		}
 	} else {
 		s, err = Open(path)
