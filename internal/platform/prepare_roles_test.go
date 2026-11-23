@@ -410,6 +410,9 @@ func TestPrepareRolesValidateResolvedIdentity(t *testing.T) {
 		func(s *store.CoordinationRoleState) { s.ProviderID = "drifted" },
 		func(s *store.CoordinationRoleState) { s.Model = "drifted" },
 		func(s *store.CoordinationRoleState) { s.Blocked = "unknown" },
+		func(s *store.CoordinationRoleState) {
+			s.Blocked = store.CoordinationDiscussionWorkReturnHandlerRequired
+		},
 		func(s *store.CoordinationRoleState) { s.AttemptID = "premature" },
 	} {
 		state := f.state
@@ -417,6 +420,22 @@ func TestPrepareRolesValidateResolvedIdentity(t *testing.T) {
 		if !errors.Is(validatePreparationRole(state, f.group, f.member, conversation, f.trigger, f.pending.Delivery), errPrepareBinding) {
 			t.Fatal("zero/unknown kind or mismatched resolver evidence passed validation")
 		}
+	}
+}
+
+func TestPrepareRoleAcceptsOrdinaryReturnWait(t *testing.T) {
+	group := domain.Group{ID: "group"}
+	member := domain.Member{ID: "member", GroupID: group.ID, Status: domain.MemberStatusActive, ProviderID: "provider", Model: "model"}
+	conversation := domain.Conversation{ID: "conversation", GroupID: group.ID, MemberID: member.ID, TopicID: "topic"}
+	trigger := domain.Message{ID: "message", GroupID: group.ID, TopicID: conversation.TopicID}
+	delivery := domain.Delivery{ID: "delivery", ConversationID: conversation.ID, MessageID: trigger.ID, RecipientID: member.ID, State: domain.DeliveryStateQueued}
+	state := store.CoordinationRoleState{
+		Provenance: store.CoordinationRoleProvenance{Kind: store.CoordinationRoleOrdinary, GroupID: group.ID, MemberID: member.ID,
+			ConversationID: conversation.ID, MessageID: trigger.ID, DeliveryID: delivery.ID, TopicID: trigger.TopicID},
+		ProviderID: member.ProviderID, Model: member.Model, Blocked: store.CoordinationDiscussionWorkReturnHandlerRequired,
+	}
+	if err := validatePreparationRole(state, group, member, conversation, trigger, delivery); err != nil {
+		t.Fatalf("ordinary return wait must not be a binding failure: %v", err)
 	}
 }
 

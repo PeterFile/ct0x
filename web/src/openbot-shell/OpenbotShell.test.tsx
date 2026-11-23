@@ -110,7 +110,7 @@ const reviewReceipt = (item: typeof firstReview, outcome: "accepted" | "rejected
 describe("load-time shell entry", () => {
   it.each(["", "?shell=openbot", "?shell=other", "?shell=Openbot", "?shell=Classic", "?shell=", "?shell=openbot&shell=classic"])("loads Openbot by default for %s", async search => {
     await start(search);
-    expect(navigation().getAllByRole("button")).toHaveLength(6);
+    expect(navigation().getAllByRole("button")).toHaveLength(7);
     expect(screen.getByRole("banner")).toHaveTextContent("ct0x");
     expect(screen.getByRole("main", { name: "讨论" })).toBeVisible();
     expectSingleEntryRender();
@@ -135,7 +135,7 @@ describe("load-time shell entry", () => {
   it("loads the default entry once and keeps its controller after history changes", async () => {
     await start();
     expect(navigation().getAllByRole("button").map(button => button.getAttribute("aria-label"))).toEqual([
-      "待我决定", "群组列表", "聊天", "搜索", "成员", "任务",
+      "待我决定", "Agent 运行日志", "群组列表", "聊天", "搜索", "成员", "任务",
     ]);
     const license = screen.getByRole("link", { name: "来源与许可" });
     expect(license).toHaveAttribute("href", "/licenses/openbot/index.html");
@@ -153,7 +153,7 @@ describe("load-time shell entry", () => {
     expectSingleEntryRender();
     window.history.pushState({}, "", "/?shell=classic");
     fireEvent(window, new PopStateEvent("popstate"));
-    expect(navigation().getAllByRole("button")).toHaveLength(6);
+    expect(navigation().getAllByRole("button")).toHaveLength(7);
     expect(content()).toBe(input); expect(input).toHaveValue("默认入口草稿");
     expectSingleEntryRender();
   });
@@ -787,6 +787,57 @@ it("answers the exact project Task from the real inbox and the original chat, ke
 });
 
 describe("real Openbot rail interactions", () => {
+  it.each([false, true])("opens a global Agent run from chat and restores the same chat (mobile=%s)", async mobile => {
+    const logLabel = "Agent 运行日志", runsPath = "/api/v1/me/agent-runs";
+    const network = transport.getMockImplementation()!;
+    const runReads = () => transport.mock.calls.filter(([url]) => String(url).startsWith(runsPath));
+    const run = { run_id: "run-1", group_id: other.id, group_name: other.name, member_id: "other-agent", member_name: "写作 Agent",
+      state: "unknown", created_at: other.created_at, updated_at: other.created_at };
+    const older = { ...message, content: "更早的聊天记录", deliveries: [] };
+    transport.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === `${runsPath}?limit=50`) return Promise.resolve(page([run]));
+      if (url === `${runsPath}/${run.run_id}?limit=50&group_id=${run.group_id}`) return Promise.resolve(json({
+        run, accepted_at: null, cancel_requested_at: null, receipt: null,
+        timeline: { items: [{ id: "message:run-trigger", kind: "trigger_message", created_at: run.created_at,
+          message: { message_id: "run-trigger", sender_id: "user", preview: "另一群的触发消息", truncated: false } }], next_cursor: "" },
+      }));
+      if (url.includes("/messages")) return Promise.resolve(url.includes("before=") ? page([older]) : page([], "older"));
+      return network(input, init);
+    });
+    resize(mobile); await start(); selectGroup(group.name);
+    fireEvent.click(await screen.findByRole("button", { name: "加载更早消息" }));
+    await screen.findByText(older.content);
+    const history = screen.getByRole("region", { name: "消息记录" }), input = content() as HTMLTextAreaElement;
+    expect(within(screen.getByRole("main", { name: "讨论" })).queryByRole("button", { name: /运行日志/ })).not.toBeInTheDocument();
+    history.scrollTop = 90; fireEvent.scroll(history);
+    change(input, "跨页聊天草稿");
+    const logButton = rail(logLabel);
+    act(() => { input.focus(); input.setSelectionRange(2, 2); logButton.focus(); });
+    expect(runReads()).toHaveLength(0);
+    fireEvent.click(logButton);
+    const logPage = screen.getByRole("main", { name: logLabel });
+    expect(logPage).toHaveFocus(); expect(logButton).toHaveAttribute("aria-current", "page");
+    expect(logButton).toHaveAttribute("aria-controls", logPage.id);
+    expect(screen.getByRole("link", { name: `跳至${logLabel}` })).toHaveAttribute("href", `#${logPage.id}`);
+    expect(input).not.toBeVisible();
+    fireEvent.click(await within(logPage).findByRole("button", { name: `${other.name} · 运行 ${run.run_id}` }));
+    const evidence = await within(logPage).findByText("另一群的触发消息");
+    const reads = runReads().length;
+
+    fireEvent.click(rail("聊天"));
+    expect(rail("聊天")).toHaveAttribute("aria-current", "page");
+    expect(evidence).toBeInTheDocument(); expect(evidence).not.toBeVisible();
+    expect(content()).toBe(input); expect(input).toHaveValue("跨页聊天草稿");
+    expect(input).toHaveFocus(); expect(input.selectionStart).toBe(2);
+    expect(screen.getByRole("heading", { name: group.name })).toBeVisible();
+    expect(screen.getByRole("region", { name: "消息记录" })).toBe(history);
+    expect(history.scrollTop).toBe(90); expect(screen.getByText(older.content)).toBeVisible();
+    fireEvent.click(logButton);
+    expect(evidence).toBeVisible(); expect(runReads()).toHaveLength(reads);
+    expect(writes()).toHaveLength(0);
+  });
+
   it.each([false, true])("keeps directed drafts and pending/unknown send identity through rail and group changes (mobile=%s)", async mobile => {
     resize(mobile); await start(); selectGroup(group.name);
     await screen.findByText("尚无消息，可发送第一条讨论。");

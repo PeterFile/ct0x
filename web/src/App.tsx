@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import type { ComponentType } from "react";
 import type { Group, Member } from "./api";
 import type { AppShellProps, ShellContext, ShellPage } from "./openbot-shell/types";
+import { AgentRunLogPage } from "./AgentRunLogPage";
 import { Discussion } from "./Discussion";
 import type { RecipientSelection } from "./Discussion";
 import { Groups } from "./Groups";
@@ -15,6 +16,7 @@ import "./im-shell.css";
 
 type Context = ShellContext;
 const pendingReviewsId = "im-pending-reviews";
+const agentRunLogId = "im-agent-run-log";
 function useMobile() {
   const [mobile, setMobile] = useState(() => window.matchMedia?.("(max-width: 56rem)").matches ?? false);
   useEffect(() => {
@@ -118,12 +120,16 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
   }
   const inboxActive = globalPage === pendingReviewsId;
   const { pending, onSaved } = usePendingReminder(Boolean(Shell), !inboxActive);
-  const globalPages: ShellPage[] = [{ id: pendingReviewsId, label: "待我决定",
-    reminder: pending ? "有待处理事项" : "",
-    content: visitedPages.includes(pendingReviewsId) ? <>
-      <PendingReviews active={inboxActive} onSaved={onSaved} />
-      <PendingDecisions active={inboxActive} onSaved={onSaved} />
-    </> : null }];
+  const globalPages: ShellPage[] = [
+    { id: pendingReviewsId, label: "待我决定",
+      reminder: pending ? "有待处理事项" : "",
+      content: visitedPages.includes(pendingReviewsId) ? <>
+        <PendingReviews active={inboxActive} onSaved={onSaved} />
+        <PendingDecisions active={inboxActive} onSaved={onSaved} />
+      </> : null },
+    { id: agentRunLogId, label: "Agent 运行日志",
+      content: visitedPages.includes(agentRunLogId) ? <AgentRunLogPage active={globalPage === agentRunLogId} /> : null },
+  ];
   const skipId = globalPage ?? (contextVisible && mobile ? "im-context" : chatVisible ? "im-chat" : "im-groups");
   const skipLabel = globalPages.find(page => page.id === globalPage)?.label
     ?? (contextVisible && mobile ? `${contextLabel}详情` : chatVisible ? "讨论区" : "群组列表");

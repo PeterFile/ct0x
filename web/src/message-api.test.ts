@@ -41,7 +41,13 @@ it.each([undefined, "", "opaque-topic /?+"])("passes topic %s through without in
   await sendMessage(group.id, input, "topic-key");
   expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toStrictEqual(input);
 });
-it.each([undefined, "topic-A"])("rejects a 201 receipt outside requested topic %s", async topic => {
+it("accepts a server-derived topic for an ordinary send with no selector", async () => {
+  const receipt = { ...message, topic_id: "derived-topic" };
+  transport.mockResolvedValueOnce(json(receipt, 201));
+  expect(await sendMessage(group.id, { content }, "topic-key")).toEqual(receipt);
+  expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toStrictEqual({ content });
+});
+it.each(["", "topic-A"])("rejects a 201 receipt outside requested topic %s", async topic => {
   transport.mockResolvedValueOnce(json({ ...message, topic_id: "topic-B" }, 201));
   const error: unknown = await sendMessage(group.id, { content, topic_id: topic }, "key").catch(error => error);
   expect(error).toMatchObject({ status: 201, code: "invalid_response" });

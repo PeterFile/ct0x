@@ -6,8 +6,10 @@ export type ChatInvestigationPolicy = Readonly<{
   objective: string; allow_topic_messages: boolean;
   artifact_versions: readonly Readonly<{ artifact_id: string; version_id: string }>[] | null;
   max_delegations: number;
+  clue_terms?: readonly string[];
 }>;
-export const chatInvestigationLimits = { objectiveBytes: 256, artifactVersions: 16, idBytes: 128, maxDelegations: 4 } as const;
+export const chatInvestigationLimits = { objectiveBytes: 256, artifactVersions: 16, idBytes: 128, maxDelegations: 4,
+  clueTerms: 8, clueTermBytes: 64 } as const;
 
 // Experimental local chat-authority contract; absent legacy metadata is never promoted into authority.
 export type ChatPolicy = Readonly<{
@@ -18,10 +20,11 @@ export type ChatPolicy = Readonly<{
   allow_workspace_changes?: boolean; workspace_changes_supported?: boolean;
   investigation?: ChatInvestigationPolicy | null;
   investigation_supported?: boolean; investigation_execution_enabled?: boolean;
+  automatic_text_dispatch?: boolean;
 }>;
 export type ChatPolicyInput = Readonly<{
   enabled: boolean; allow_preparation: boolean; preparation_scope_kind?: "topic_summary"; allow_workspace_changes?: boolean;
-  investigation?: ChatInvestigationPolicy | null;
+  investigation?: ChatInvestigationPolicy | null; automatic_text_dispatch?: boolean;
   // Retained only for an already-submitted v16 operation; new UI commands never populate this field.
   preauthorization_message_id?: string;
   action: "text_submission"; max_admissions: number; expected_revision: number;
@@ -67,11 +70,24 @@ const policyFields = ["group_id", "topic_id", "enabled", "allow_preparation", "p
 export const hasChatPolicyMetadata = (policy: ChatPolicy) => typeof policy.preparation_supported === "boolean"
   && typeof policy.configuration_source_id === "string";
 const policyMetadata = ["preauthorization_text", "preparation_scope_kind", "preparation_supported", "configuration_source_id",
-  "allow_workspace_changes", "workspace_changes_supported", "investigation", "investigation_supported", "investigation_execution_enabled"];
+  "allow_workspace_changes", "workspace_changes_supported", "investigation", "investigation_supported", "investigation_execution_enabled",
+  "automatic_text_dispatch"];
 const investigationFields = ["objective", "allow_topic_messages", "artifact_versions", "max_delegations"];
+export function isChatInvestigationClueTerms(value: unknown): value is readonly string[] {
+  const limits = chatInvestigationLimits;
+  if (!Array.isArray(value) || value.length < 1 || value.length > limits.clueTerms) return false;
+  const seen = new Set<string>();
+  for (const term of value) {
+    if (!nonblank(term) || /[\0\r\n]/u.test(term) || new TextEncoder().encode(term).length > limits.clueTermBytes || seen.has(term)) return false;
+    seen.add(term);
+  }
+  return true;
+}
 export function isChatInvestigationPolicy(value: unknown): value is ChatInvestigationPolicy {
   const limits = chatInvestigationLimits;
-  if (!record(value) || Object.keys(value).length !== investigationFields.length || !investigationFields.every(field => Object.hasOwn(value, field))
+  if (!record(value) || !investigationFields.every(field => Object.hasOwn(value, field))
+    || Object.keys(value).some(field => field !== "clue_terms" && !investigationFields.includes(field))
+    || (Object.hasOwn(value, "clue_terms") && !isChatInvestigationClueTerms(value.clue_terms))
     || !nonblank(value.objective) || value.objective.includes("\0") || new TextEncoder().encode(value.objective).length > limits.objectiveBytes
     || typeof value.allow_topic_messages !== "boolean" || !integer(value.max_delegations) || value.max_delegations > limits.maxDelegations) return false;
   if (value.artifact_versions === null) return value.allow_topic_messages;
@@ -91,7 +107,9 @@ export function sameChatInvestigation(left: ChatPolicy["investigation"], right: 
   if (!left || !right) return !left && !right;
   // A Go nil slice denotes no Artifact versions. Preserve all strings and pair order.
   const leftRefs = left.artifact_versions ?? [], rightRefs = right.artifact_versions ?? [];
+  const leftTerms = left.clue_terms ?? [], rightTerms = right.clue_terms ?? [];
   return left.objective === right.objective && left.allow_topic_messages === right.allow_topic_messages && left.max_delegations === right.max_delegations
+    && leftTerms.length === rightTerms.length && leftTerms.every((term, index) => term === rightTerms[index])
     && leftRefs.length === rightRefs.length && leftRefs.every((ref, index) =>
       ref.artifact_id === rightRefs[index].artifact_id && ref.version_id === rightRefs[index].version_id);
 }
@@ -104,6 +122,8 @@ function isPolicy(value: unknown, groupId: string, topicId: string): value is Ch
     || (value.allow_workspace_changes !== undefined && typeof value.allow_workspace_changes !== "boolean")
     || (value.workspace_changes_supported !== undefined && typeof value.workspace_changes_supported !== "boolean")
     || (value.allow_workspace_changes === true && value.workspace_changes_supported === false)
+    || (value.automatic_text_dispatch !== undefined && typeof value.automatic_text_dispatch !== "boolean")
+    || (value.automatic_text_dispatch === true && (!positive(value.revision) || !identifier(value.configuration_source_id)))
     || (value.investigation_supported !== undefined && typeof value.investigation_supported !== "boolean")
     || (value.investigation_execution_enabled !== undefined && typeof value.investigation_execution_enabled !== "boolean")
     || (value.investigation != null && (!positive(value.revision) || !identifier(value.configuration_source_id)
@@ -112,8 +132,8 @@ function isPolicy(value: unknown, groupId: string, topicId: string): value is Ch
   if (metadata && (typeof value.preparation_supported !== "boolean" || !text(value.configuration_source_id)
     || (value.preparation_scope_kind !== undefined && !text(value.preparation_scope_kind)))) return false;
   const scope = value.preparation_scope_kind ?? "";
-  // B fbe95f8 reflects Go-escaped investigation JSON in the topic_summary rule. Even with 6×
-  // expansion of the objective and all 32 IDs, the decoded text with its fixed prefix fits in 32 KiB.
+  // The topic_summary rule includes Go-escaped investigation JSON. Even with 6×
+  // expansion of the objective, 32 IDs and eight clue phrases, its decoded text fits in 32 KiB.
   const ruleBytes = value.allow_preparation && value.preparation_supported === true && scope === "topic_summary"
     && value.investigation != null ? 32 * 1024 : 8192;
   if (value.revision === 0) return !value.enabled && !value.allow_preparation && value.preauthorization_message_id === ""
@@ -307,7 +327,9 @@ export async function setChatPolicy(groupId: string, input: ChatPolicyInput, key
   // The server checks persisted replay before validating a new command against the new scope contract.
   const legacy = Object.hasOwn(input, "preauthorization_message_id") && input.preparation_scope_kind === undefined;
   const investigation = input.investigation;
-  if (investigation != null && (legacy || !isChatInvestigationPolicy(investigation))) throw invalid();
+  if ((input.automatic_text_dispatch !== undefined && typeof input.automatic_text_dispatch !== "boolean")
+    || (legacy && input.automatic_text_dispatch === true)
+    || (investigation != null && (legacy || !isChatInvestigationPolicy(investigation)))) throw invalid();
   const sent: ChatPolicyInput = Object.freeze({ enabled: input.enabled, allow_preparation: input.allow_preparation,
     ...(legacy ? { preauthorization_message_id: input.preauthorization_message_id }
       : input.preparation_scope_kind === undefined ? {} : { preparation_scope_kind: input.preparation_scope_kind }),
@@ -315,7 +337,9 @@ export async function setChatPolicy(groupId: string, input: ChatPolicyInput, key
     ...(input.allow_workspace_changes === true ? { allow_workspace_changes: true } : {}),
     ...(investigation == null ? {} : { investigation: { objective: investigation.objective, allow_topic_messages: investigation.allow_topic_messages,
       artifact_versions: investigation.artifact_versions?.map(({ artifact_id, version_id }) => ({ artifact_id, version_id })) ?? null,
-      max_delegations: investigation.max_delegations } }) });
+      max_delegations: investigation.max_delegations,
+      ...(investigation.clue_terms === undefined ? {} : { clue_terms: [...investigation.clue_terms] }) } }),
+    ...(input.automatic_text_dispatch === true ? { automatic_text_dispatch: true } : {}) });
   if (typeof sent.enabled !== "boolean" || typeof sent.allow_preparation !== "boolean" || sent.action !== "text_submission"
     || !budget(sent.max_admissions) || !integer(sent.expected_revision) || sent.expected_revision >= Number.MAX_SAFE_INTEGER
     || (input.allow_workspace_changes !== undefined && typeof input.allow_workspace_changes !== "boolean")) throw invalid();
@@ -330,6 +354,7 @@ export async function setChatPolicy(groupId: string, input: ChatPolicyInput, key
       && (value.allow_workspace_changes ?? false) === (sent.allow_workspace_changes ?? false)
       && (!sent.allow_workspace_changes || value.workspace_changes_supported === true)
       && sameChatInvestigation(value.investigation, sent.investigation)
+      && (value.automatic_text_dispatch ?? false) === (sent.automatic_text_dispatch ?? false)
       && (legacy ? value.preauthorization_message_id === sent.preauthorization_message_id && !value.preparation_scope_kind && !value.preparation_supported
         : hasChatPolicyMetadata(value) && identifier(value.configuration_source_id)
           && (value.preparation_scope_kind ?? "") === (sent.preparation_scope_kind ?? "") && value.preparation_supported === sent.allow_preparation));

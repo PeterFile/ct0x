@@ -18,6 +18,8 @@ func LocalUserRoutes(local *platform.LocalUser) []Route {
 		{http.MethodGet, "/api/v1/me/decisions/{decision}/answer", a.getDecisionAnswer},
 		{http.MethodPost, "/api/v1/me/decisions/{decision}/answer", noQuery(a.answerDecision)},
 		{http.MethodPost, "/api/v1/groups/{group}/decisions/{decision}/answer", noQuery(a.answerDecision)},
+		{http.MethodGet, "/api/v1/me/agent-runs", a.listAgentRuns},
+		{http.MethodGet, "/api/v1/me/agent-runs/{run}", a.getAgentRun},
 		{http.MethodGet, "/api/v1/groups", a.listGroups},
 		{http.MethodPost, "/api/v1/groups", noQuery(a.createGroup)},
 		{http.MethodGet, "/api/v1/groups/{group}", noQuery(a.getGroup)},
