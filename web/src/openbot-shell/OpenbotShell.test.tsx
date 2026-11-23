@@ -78,11 +78,29 @@ function selectGroup(name: string) {
 const content = () => screen.getByRole("textbox", { name: "消息内容" });
 const change = (field: HTMLElement, value: string) => fireEvent.change(field, { target: { value } });
 const taskPanel = () => within(screen.getByRole("region", { name: "群组任务" }));
+const inboxPath = "/api/v1/me/pending-reviews?limit=50";
+const inbox = () => within(screen.getByRole("main", { name: "待我决定" }));
+const reviewItem = (source: typeof group, revision: number) => ({
+  group: { id: source.id, name: source.name }, topic_id: "原话题",
+  task: { id: `task-${source.id}`, title: task.title, acceptance: task.acceptance },
+  submission: { id: `submission-${source.id}-${revision}`, group_id: source.id, task_id: `task-${source.id}`,
+    task_revision: revision, attempt_id: `attempt-${source.id}-${revision}`, summary: `${source.name}交付摘要`,
+    artifact_versions: [{ artifact_id: `artifact-${source.id}`, version_id: `version-${revision}` }],
+    submitted_by: "worker", created_at: task.created_at },
+});
+const firstReview = reviewItem(group, 3), secondReview = reviewItem(other, 8);
+const card = (item: typeof firstReview) => within(inbox().getByRole("article", { name: `${item.group.name} · ${item.task.title}` }));
+const reviewPath = (item: typeof firstReview) => `/api/v1/groups/${item.group.id}/tasks/${item.task.id}/reviews`;
+const reviewReceipt = (item: typeof firstReview, outcome: "accepted" | "rejected", reason: string) => ({
+  id: "review-saved", group_id: item.group.id, task_id: item.task.id,
+  task_revision: item.submission.task_revision, submission_id: item.submission.id, outcome, reason,
+  artifact_versions: item.submission.artifact_versions, created_at: task.created_at, reviewed_by: "user",
+});
 
 describe("load-time shell entry", () => {
   it.each(["", "?shell=openbot", "?shell=other", "?shell=Openbot", "?shell=Classic", "?shell=", "?shell=openbot&shell=classic"])("loads Openbot by default for %s", async search => {
     await start(search);
-    expect(navigation().getAllByRole("button")).toHaveLength(5);
+    expect(navigation().getAllByRole("button")).toHaveLength(6);
     expect(screen.getByRole("banner")).toHaveTextContent("ct0x");
     expect(screen.getByRole("main", { name: "讨论" })).toBeVisible();
     expectSingleEntryRender();
@@ -107,7 +125,7 @@ describe("load-time shell entry", () => {
   it("loads the default entry once and keeps its controller after history changes", async () => {
     await start();
     expect(navigation().getAllByRole("button").map(button => button.getAttribute("aria-label"))).toEqual([
-      "群组列表", "聊天", "搜索", "成员", "任务",
+      "待我决定", "群组列表", "聊天", "搜索", "成员", "任务",
     ]);
     const license = screen.getByRole("link", { name: "来源与许可" });
     expect(license).toHaveAttribute("href", "/licenses/openbot/index.html");
@@ -125,7 +143,7 @@ describe("load-time shell entry", () => {
     expectSingleEntryRender();
     window.history.pushState({}, "", "/?shell=classic");
     fireEvent(window, new PopStateEvent("popstate"));
-    expect(navigation().getAllByRole("button")).toHaveLength(5);
+    expect(navigation().getAllByRole("button")).toHaveLength(6);
     expect(content()).toBe(input); expect(input).toHaveValue("默认入口草稿");
     expectSingleEntryRender();
   });
@@ -155,6 +173,157 @@ describe("load-time shell entry", () => {
     change(content(), "兼容界面仍可撰写");
     expect(content()).toHaveValue("兼容界面仍可撰写");
     expectSingleEntryRender();
+  });
+});
+
+describe("global pending reviews in the production entry", () => {
+  it.each([false, true])("pages and reviews an exact same-title item without selecting a group (mobile=%s)", async mobile => {
+    const network = transport.getMockImplementation()!;
+    const loading = deferred<void>(), saved = deferred<Response>();
+    transport.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === inboxPath) return loading.promise.then(() => page([firstReview], "earlier+/"));
+      if (url === `${inboxPath}&before=earlier%2B%2F`) return Promise.resolve(page([secondReview]));
+      if (url === reviewPath(secondReview)) return saved.promise;
+      return network(input, init);
+    });
+    resize(mobile); await start();
+    expect(transport.mock.calls.some(([url]) => String(url).includes("/pending-reviews"))).toBe(false);
+    fireEvent.click(rail("待我决定"));
+    expect(rail("待我决定")).toHaveAttribute("aria-current", "page");
+    expect(rail("群组列表")).not.toHaveAttribute("aria-current");
+    expect(screen.getByRole("main", { name: "待我决定" })).toHaveFocus();
+    expect(screen.getByRole("link", { name: "跳至待我决定" })).toHaveAttribute("href", "#im-pending-reviews");
+    expect(inbox().getByRole("status")).toHaveTextContent("正在载入待验收事项");
+    await act(async () => loading.resolve());
+    fireEvent.click(inbox().getByRole("button", { name: "加载更多待验收事项" }));
+    await inbox().findByText(secondReview.submission.summary);
+    expect(card(secondReview).getByText(`来源群组：${other.name}`)).toBeVisible();
+    expect(card(secondReview).getByText(task.acceptance)).toBeVisible();
+    expect(card(secondReview).getByText("任务版本 8")).toBeVisible();
+    fireEvent.click(card(secondReview).getByText("来源与版本标识", { selector: "summary" }));
+    const download = card(secondReview).getByRole("link", { name: "下载固定成果文件" });
+    const { group_id, artifact_versions: [ref] } = secondReview.submission;
+    expect(download).toHaveAttribute("href", `/api/v1/groups/${encodeURIComponent(group_id)}/artifacts/${encodeURIComponent(ref.artifact_id)}/versions/${encodeURIComponent(ref.version_id)}/content`);
+    expect(download).toHaveAttribute("download");
+    expect(inbox().queryByText(/项目/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("main", { name: "讨论" })).not.toBeInTheDocument();
+
+    const raw = "  保留理由原文\n  ";
+    change(card(secondReview).getByRole("textbox", { name: "验收理由（可选）" }), raw);
+    fireEvent.click(card(secondReview).getByRole("button", { name: "拒收" }));
+    fireEvent.click(card(secondReview).getByRole("button", { name: "接纳" }));
+    expect(card(secondReview).getByRole("textbox")).toBeDisabled();
+    expect(card(firstReview).getByRole("button", { name: "接纳" })).toBeEnabled();
+    expect(writes()).toHaveLength(1);
+    expect(identity(writes()[0]).url).toBe(reviewPath(secondReview));
+    expect(identity(writes()[0]).key).toMatch(/^[\da-f-]{36}$/);
+    expect(JSON.parse(String(writes()[0][1]?.body))).toEqual({ expected_revision: 8,
+      submission_id: secondReview.submission.id, outcome: "rejected", reason: raw });
+    await act(async () => saved.resolve(json(reviewReceipt(secondReview, "rejected", raw), 201)));
+    expect(inbox().getByRole("status")).toHaveTextContent("已保存：拒收");
+    expect(inbox().getByText("review-saved")).toBeInTheDocument();
+    expect(card(firstReview).getByRole("button", { name: "接纳" })).toBeEnabled();
+    expect(inbox().queryByText(secondReview.submission.summary)).not.toBeInTheDocument();
+    expect(transport.mock.calls.some(([url]) => String(url).includes("/messages"))).toBe(false);
+  });
+
+  it("keeps pagination available after saving the only loaded review", async () => {
+    const network = transport.getMockImplementation()!;
+    transport.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === inboxPath) return Promise.resolve(page([firstReview], "earlier"));
+      if (url === `${inboxPath}&before=earlier`) return Promise.resolve(page([secondReview]));
+      if (url === reviewPath(firstReview)) return Promise.resolve(json(reviewReceipt(firstReview, "accepted", ""), 201));
+      return network(input, init);
+    });
+    await start(); fireEvent.click(rail("待我决定"));
+    await inbox().findByText(firstReview.submission.summary);
+    fireEvent.click(card(firstReview).getByRole("button", { name: "接纳" }));
+    await inbox().findByText(/已保存：接纳/);
+    expect(inbox().queryByRole("article")).not.toBeInTheDocument();
+    expect(inbox().queryByText("没有待验收事项。")).not.toBeInTheDocument();
+    const more = inbox().getByRole("button", { name: "加载更多待验收事项" });
+    expect(more).toBeEnabled();
+    fireEvent.click(more);
+    expect(await inbox().findByText(secondReview.submission.summary)).toBeVisible();
+  });
+
+  it("retains the loaded chat window, draft and focus, and retries an unconfirmed review with its original evidence", async () => {
+    const network = transport.getMockImplementation()!;
+    const initialWrite = deferred<Response>();
+    let pendingItems = [firstReview, secondReview];
+    const older = { ...message, id: "earlier-chat-message", content: "更早的聊天记录", deliveries: [] };
+    transport.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === inboxPath) return Promise.resolve(page(pendingItems));
+      if (url.includes("/messages")) return Promise.resolve(url.includes("before=") ? page([older]) : page([], "older"));
+      if (url === reviewPath(firstReview)) {
+        if (writes().length === 1) return initialWrite.promise;
+        if (writes().length === 2) return Promise.resolve(json({}, 409));
+        return Promise.resolve(json(reviewReceipt(firstReview, "accepted", "原决定"), 201));
+      }
+      return network(input, init);
+    });
+    await start(); selectGroup(group.name);
+    fireEvent.click(await screen.findByRole("button", { name: "加载更早消息" }));
+    await screen.findByText(older.content);
+    const input = content() as HTMLTextAreaElement, history = screen.getByRole("region", { name: "消息记录" });
+    history.scrollTop = 90; fireEvent.scroll(history);
+    change(input, "跨页聊天草稿");
+    act(() => { input.focus(); input.setSelectionRange(2, 2); rail("待我决定").focus(); });
+    fireEvent.click(rail("待我决定"));
+    await inbox().findByText(firstReview.submission.summary);
+    change(card(secondReview).getByRole("textbox"), "未提交的验收理由");
+    change(card(firstReview).getByRole("textbox"), "原决定");
+    fireEvent.click(card(firstReview).getByRole("button", { name: "接纳" }));
+    fireEvent.click(rail("聊天"));
+    expect(content()).toBe(input); expect(input).toHaveValue("跨页聊天草稿");
+    expect(input).toHaveFocus(); expect(input).toHaveProperty("selectionStart", 2);
+    expect(screen.getByRole("region", { name: "消息记录" })).toBe(history);
+    expect(history.scrollTop).toBe(90); expect(screen.getByText(older.content)).toBeVisible();
+    expect(writes()[0][1]?.signal?.aborted).not.toBe(true);
+
+    // A successful HTTP status with the wrong frozen refs is not a Review receipt.
+    pendingItems = [secondReview];
+    await act(async () => initialWrite.resolve(json({ ...reviewReceipt(firstReview, "accepted", "原决定"), artifact_versions: [] }, 201)));
+    fireEvent.click(rail("待我决定"));
+    await inbox().findByRole("button", { name: "重试同一次验收" });
+    expect(card(secondReview).getByRole("textbox")).toHaveValue("未提交的验收理由");
+    expect(inbox().getByRole("alert")).toHaveTextContent("验收结果未确认");
+    expect(inbox().queryByText(/已保存/)).not.toBeInTheDocument();
+    fireEvent.click(inbox().getByRole("button", { name: "重试同一次验收" }));
+    expect(await inbox().findByText(/HTTP 409/)).toHaveTextContent("验收结果未确认");
+    fireEvent.click(inbox().getByRole("button", { name: "重试同一次验收" }));
+    expect(await inbox().findByText(/已保存：接纳/)).toHaveAttribute("role", "status");
+    expect(writes().map(identity)).toEqual(Array(3).fill(identity(writes()[0])));
+  });
+
+  it("distinguishes read failure, a fresh conflict and a successful empty inbox", async () => {
+    const network = transport.getMockImplementation()!;
+    let reads = 0;
+    transport.mockImplementation((input, init) => {
+      const url = String(input);
+      if (url === inboxPath) {
+        // StrictMode cancels the first mount read. Count only live requests.
+        return Promise.resolve().then(() => init?.signal?.aborted ? page()
+          : ++reads === 1 ? json({}, 503) : reads === 2 ? page([firstReview]) : page());
+      }
+      if (url === reviewPath(firstReview)) return Promise.resolve(json({}, 409));
+      return network(input, init);
+    });
+    await start(); fireEvent.click(rail("待我决定"));
+    expect(await inbox().findByRole("alert")).toHaveTextContent("HTTP 503");
+    expect(inbox().queryByText("没有待验收事项。")).not.toBeInTheDocument();
+    fireEvent.click(inbox().getByRole("button", { name: "重试载入待验收事项" }));
+    await inbox().findByText(firstReview.submission.summary);
+    fireEvent.click(card(firstReview).getByRole("button", { name: "接纳" }));
+    expect(await card(firstReview).findByRole("alert")).toHaveTextContent("HTTP 409");
+    expect(card(firstReview).getByRole("button", { name: "接纳" })).toBeDisabled();
+    expect(inbox().queryByRole("button", { name: "重试同一次验收" })).not.toBeInTheDocument();
+    fireEvent.click(inbox().getByRole("button", { name: "刷新待验收事项" }));
+    expect(await inbox().findByText("没有待验收事项。")).toBeVisible();
+    expect(writes()).toHaveLength(1);
   });
 });
 

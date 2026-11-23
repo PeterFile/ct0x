@@ -94,6 +94,14 @@ func (s *Store) ListTaskWorkInputs(ctx context.Context, groupID, taskID string, 
 		if err != nil {
 			return Page[domain.TaskWorkInput]{}, taskError(action, err)
 		}
+		decisions, err := decisionAnswerInstalledInTx(ctx, tx)
+		if err == nil && decisions {
+			page, err = mergeDecisionAnswerWorkInputHistoryInTx(ctx, tx, ` WHERE (q.group_id,q.task_id)=(?,?) AND `+decisionAnswerProof,
+				[]any{groupID, taskID}, options.Before, limit, page)
+		}
+		if err != nil {
+			return Page[domain.TaskWorkInput]{}, taskError(action, err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return Page[domain.TaskWorkInput]{}, taskError(action, err)
@@ -144,6 +152,9 @@ func (s *Store) ListWorkInputHistoryForMember(ctx context.Context, scope MemberT
 	page := Page[domain.TaskWorkInput]{Items: []domain.TaskWorkInput{}}
 	if installed {
 		page, err = workInputHistoryInTx(ctx, tx, workerWorkInputWhere, workerWorkInputArgs(role.Provenance), limit, options.Before)
+		if err == nil {
+			page, err = decisionAnswerWorkInputHistoryInTx(ctx, tx, role, options, limit, page)
+		}
 		if err != nil {
 			return zero, memberToolOperationError(action, err)
 		}
@@ -228,6 +239,9 @@ func workerWorkInputArgs(p CoordinationRoleProvenance) []any {
 }
 
 func workerWorkInputInTx(ctx context.Context, tx *sql.Tx, p CoordinationRoleProvenance, inputID, mandateID string) (domain.TaskWorkInput, error) {
+	if isDecisionAnswerID(inputID) {
+		return decisionAnswerWorkInputInTx(ctx, tx, p, inputID, mandateID)
+	}
 	i, err := scanWorkInput(tx.QueryRowContext(ctx, workInputSelect+workerWorkInputWhere+" AND i.id=? AND i.mandate_id=?",
 		append(workerWorkInputArgs(p), inputID, mandateID)...))
 	return i, coordinationRoleRelationError(err)
@@ -243,15 +257,25 @@ func (s *Store) ListWorkInputsForMember(ctx context.Context, scope MemberToolSco
 		return nil, memberToolOperationError(action, err)
 	}
 	defer tx.Rollback()
-	role, err := s.workInputWorkerInTx(ctx, tx, scope)
+	role, owner, err := s.workInputHandlingOwnerInTx(ctx, tx, scope, false)
 	if err != nil {
 		return nil, memberToolOperationError(action, err)
 	}
 	items := []domain.TaskWorkInput{}
 	installed, err := workInputSchemaInTx(ctx, tx)
 	if err == nil && installed {
-		const inboxLimit = 50
-		args := workerWorkInputArgs(role.Provenance)
+		inboxLimit := 50
+		var decision []domain.TaskWorkInput
+		p := role.Provenance
+		if p.SourceKind == domain.TaskWorkSourceFollowup && isDecisionAnswerID(p.SourceID) {
+			i, err := decisionAnswerWorkInputInTx(ctx, tx, p, p.SourceID, owner.r.MandateID)
+			if err != nil {
+				return nil, memberToolOperationError(action, err)
+			}
+			decision = append(decision, i)
+			inboxLimit--
+		}
+		args := workerWorkInputArgs(p)
 		// Reserve one slot for the most recent acknowledged delta, not the
 		// before/after snapshot of an acknowledged context-only input.
 		var confirmed []domain.TaskWorkInput
@@ -271,6 +295,9 @@ func (s *Store) ListWorkInputsForMember(ctx context.Context, scope MemberToolSco
 			recent, err = workInputsInTx(ctx, tx, workerWorkInputWhere+` AND i.id<>? AND (i.after_revision=i.before_revision OR c.input_id IS NOT NULL OR h.input_id IS NOT NULL)
 			 ORDER BY (c.input_id IS NULL AND h.input_id IS NULL) DESC,i.created_at DESC,i.id DESC LIMIT ?`, append(args, first, inboxLimit-len(items))...)
 			items = append(items, recent...)
+		}
+		if len(decision) != 0 {
+			items = append(decision, items...)
 		}
 	}
 	if err != nil {

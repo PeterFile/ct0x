@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"agentworkspace/internal/domain"
 	"modernc.org/sqlite"
@@ -18,6 +19,8 @@ const (
 	investigationMaxArtifactRefs   = 16
 	investigationMaxIDBytes        = 128
 	investigationMaxDelegations    = 4
+	investigationMaxClueTerms      = 8
+	investigationMaxClueTermBytes  = 64
 )
 
 // Resolve the version from the registry, independently of the database's prefix.
@@ -82,6 +85,23 @@ func validateChatInvestigationPolicy(input domain.ChatInvestigationPolicy) error
 		}
 		seen[ref] = true
 	}
+	return validateChatInvestigationClueTerms(input.ClueTerms)
+}
+
+func validateChatInvestigationClueTerms(terms domain.ChatInvestigationClueTerms) error {
+	if terms == nil {
+		return nil // An omitted list keeps the v27 preparation path.
+	}
+	if len(terms) == 0 || len(terms) > investigationMaxClueTerms {
+		return fmt.Errorf("%w：只读调查线索必须包含1至%d个词组", ErrInvalid, investigationMaxClueTerms)
+	}
+	seen := make(map[string]bool, len(terms))
+	for _, term := range terms {
+		if !memberToolTextValid(term, investigationMaxClueTermBytes) || strings.ContainsAny(term, "\r\n") || seen[term] {
+			return fmt.Errorf("%w：只读调查线索词组不得为空、重复或换行，每个最多%d个UTF-8字节", ErrInvalid, investigationMaxClueTermBytes)
+		}
+		seen[term] = true
+	}
 	return nil
 }
 
@@ -131,6 +151,9 @@ func chatInvestigationPolicyInTx(ctx context.Context, tx *sql.Tx, thread domain.
 	}
 	var policy domain.ChatInvestigationPolicy
 	if err := json.Unmarshal([]byte(data), &policy); err != nil {
+		return nil, err
+	}
+	if err := validateChatInvestigationClueTerms(policy.ClueTerms); err != nil {
 		return nil, err
 	}
 	return &policy, nil

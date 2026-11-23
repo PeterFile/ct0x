@@ -32,7 +32,7 @@ export const TOOL_NAMES = /** @type {const} */ (["list_members", "read_channel",
 /** @typedef {"not_sent" | "rejected" | "unknown"} FailureOutcome */
 /** @typedef {{ runID: string, path: string, claimSize: number, claimSHA256: string }} ExplanationBinding */
 /** @typedef {{ bytes: Buffer, file: import('node:fs').Stats }} ExplanationReservation */
-/** @typedef {{ active?: boolean, explanation?: ExplanationReservation, unknown?: { toolName: string, toolCallId: string, fingerprint: string, error: Error, body?: Buffer } }} WriteState */
+/** @typedef {{ active?: boolean, explanation?: ExplanationReservation, unknown?: { toolName: string, toolCallId: string, key: string, body: Buffer, error: Error } }} WriteState */
 const EXPLANATION_JOURNAL = "run-explanation-bridge-attempt";
 const REJECTION_CODES = new Map([
   [400, ["invalid_input", "invalid_json"]], [403, ["forbidden", "invalid_host", "invalid_origin"]],
@@ -75,7 +75,7 @@ function endpointURL(value) {
  * selects the bound profile; it covers exactly the bytes this bridge consumes.
  * @param {string | undefined} path
  * @param {string} [expectedSHA256]
- * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[], runExplanation?: string }}
+ * @returns {{ invoke: Client, continueWork: boolean, discussionOnlyExcerpt: boolean, investigationIntake: boolean, investigationTools?: string[], discussionRelay: boolean, runExplanation?: string }}
  */
 export function openBridge(path, expectedSHA256) {
   let fd;
@@ -105,12 +105,15 @@ export function openBridge(path, expectedSHA256) {
     if (!isRecord(config)) throw new Error(CONFIG_ERROR);
     const continueWork = Object.hasOwn(config, "continue_work");
     const discussionOnlyExcerpt = Object.hasOwn(config, "discussion_only_excerpt");
+    const discussionRelay = Object.hasOwn(config, "discussion_relay");
     const investigationIntake = Object.hasOwn(config, "intake_assessment_action");
     const strict = Object.hasOwn(config, "investigation_tools");
     const explanation = Object.hasOwn(config, "run_explanation");
     if (!Object.hasOwn(config, "endpoint") || !Object.hasOwn(config, "token") ||
-        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) + Number(strict) + 3 * Number(explanation) ||
+        Object.keys(config).length !== 2 + Number(continueWork) + Number(discussionOnlyExcerpt) + Number(investigationIntake) +
+          Number(strict) + Number(discussionRelay) + 3 * Number(explanation) ||
         (continueWork && config.continue_work !== true) || (discussionOnlyExcerpt && config.discussion_only_excerpt !== true) ||
+        (discussionRelay && (expectedSHA256 === undefined || config.discussion_relay !== true)) ||
         (investigationIntake && config.intake_assessment_action !== INVESTIGATION_ASSESSMENT_ACTION) ||
         typeof config.token !== "string" || !/^[A-Za-z0-9._~+/-]+=*$/.test(config.token)) {
       throw new Error(CONFIG_ERROR);
@@ -120,7 +123,7 @@ export function openBridge(path, expectedSHA256) {
     if (explanation) {
       const { run_explanation: runID, run_explanation_journal: journal, run_explanation_claim_fingerprint: fingerprint } = config;
       const claim = typeof fingerprint === "string" && /^([1-9][0-9]{0,2}):([0-9a-f]{64})$/.exec(fingerprint);
-      if (!expectedSHA256 || strict || continueWork || discussionOnlyExcerpt || investigationIntake ||
+      if (!expectedSHA256 || strict || continueWork || discussionOnlyExcerpt || investigationIntake || discussionRelay ||
           !validRoleReceiptWire(wire, 5) || typeof runID !== "string" ||
           !/^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,62}[A-Za-z0-9])?$/.test(runID) || !claim ||
           typeof journal !== "string" || !validUnicode(journal) || journal.includes("\0") || !isAbsolute(journal) ||
@@ -133,7 +136,7 @@ export function openBridge(path, expectedSHA256) {
     let investigationTools;
     if (strict) {
       const names = config.investigation_tools;
-      if (expectedSHA256 === undefined || continueWork || discussionOnlyExcerpt || investigationIntake || !Array.isArray(names)) throw new Error(CONFIG_ERROR);
+      if (expectedSHA256 === undefined || continueWork || discussionOnlyExcerpt || investigationIntake || discussionRelay || !Array.isArray(names)) throw new Error(CONFIG_ERROR);
       const reads = [INVESTIGATION_CHANNEL, INVESTIGATION_ARTIFACT].filter(name => names.includes(name));
       if (!reads.length || names.length !== reads.length + 1 || !reads.every((name, i) => names[i] === name) ||
           !["decide_dispatch", "submit_result"].includes(names.at(-1))) throw new Error(CONFIG_ERROR);
@@ -151,7 +154,8 @@ export function openBridge(path, expectedSHA256) {
         }
         return requestTool(endpoint, token, writes, toolName, params, toolCallId, signal, publication);
       },
-      continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools, ...(publication ? { runExplanation: publication.runID } : {}),
+      continueWork, discussionOnlyExcerpt, investigationIntake, investigationTools, discussionRelay,
+      ...(publication ? { runExplanation: publication.runID } : {}),
     };
   } catch {
     throw new Error(CONFIG_ERROR);
@@ -195,6 +199,14 @@ function validRoleReceiptWire(text, count = 4) {
     keys.add(key);
   }
   return field.lastIndex === wire.length;
+}
+
+/** @param {string} text @param {boolean} exactErrorKey */
+function validRejectionWire(text, exactErrorKey) {
+  // A definite rejection requires the server's single, unambiguous error envelope.
+  // JSON.parse alone collapses duplicate keys, including escaped spellings.
+  const match = /^\s*\{\s*("(?:[^"\\]|\\.)*")\s*:\s*(\{[\s\S]*\})\s*\}\s*$/.exec(text);
+  return match !== null && (exactErrorKey ? match[1] === '"error"' : JSON.parse(match[1]) === "error") && validRoleReceiptWire(match[2], 2);
 }
 
 /** @param {unknown} value @param {string} token @param {boolean} roleWrite @param {string} toolName */
@@ -263,10 +275,18 @@ function validWriteReceipt(toolName, status, value, requestValue) {
   if (toolName !== "send_message" && toolName !== "create_member") return true;
   if (!isRecord(value)) return false;
   if (toolName === "send_message") {
+    // Relay receipts must name an ID usable by read_history (Go TrimSpace semantics).
+    const id = value.message_id;
+    if (requestValue !== undefined && (typeof id !== "string" || !validUnicode(id) ||
+        !/\P{White_Space}/u.test(id) || id.includes("\0") || Buffer.byteLength(id) > 256)) return false;
     return status === 201 && typeof value.message_id === "string" && value.message_id.length > 0 &&
       validReceiptTime(value.created_at) &&
       typeof value.delivery_count === "number" && Number.isSafeInteger(value.delivery_count) &&
-      value.delivery_count >= 0 && value.content_omitted === true;
+      value.delivery_count >= 0 && value.content_omitted === true &&
+      (requestValue === undefined ||
+        (requestValue === "invite" && value.delivery_count === 1) ||
+        (requestValue === "resolve" && value.delivery_count === 0) ||
+        (requestValue === "reply" && value.delivery_count <= 1)); // A departed inviter need not be woken.
   }
   return typeof value.member_id === "string" && value.member_id.length > 0 &&
     typeof value.join_message_id === "string" && (status === 200 ?
@@ -357,9 +377,14 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
     const text = JSON.stringify(params);
     if (typeof text !== "string" || text.includes(token)) throw new Error();
     body = Buffer.from(text, "utf8");
-    if (toolName === "decide_dispatch" || workInputWrite) {
+    if (toolName === "send_message" || toolName === "decide_dispatch" || workInputWrite) {
       const snapshot = JSON.parse(text);
-      if (isRecord(snapshot)) requestValue = workInputWrite ? snapshot.input_id : snapshot.kind;
+      if (isRecord(snapshot)) {
+        if (toolName !== "send_message") requestValue = workInputWrite ? snapshot.input_id : snapshot.kind;
+        else if (Object.hasOwn(snapshot, "discussion")) {
+          requestValue = isRecord(snapshot.discussion) ? snapshot.discussion.kind ?? null : null;
+        }
+      }
     }
     if (explanationWrite) {
       const snapshot = JSON.parse(text);
@@ -372,11 +397,11 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
     throw safeError("成员工具参数无效，未发送请求。");
   }
   if (body.length > BYTE_LIMIT) throw safeError("工具请求超过 64 KiB 限制，未发送请求。");
-  const fingerprint = write ? createHash("sha256").update(body).digest("hex") : "";
+  const relayWrite = toolName === "send_message" && requestValue !== undefined;
+  const key = write ? createHash("sha256").update(explanation ? `${toolName}\0${explanation.runID}\0${toolCallId}` : toolName + toolCallId).digest("hex") : "";
   if (write && writes.unknown) {
     const previous = writes.unknown;
-    if (previous.toolName === toolName && previous.toolCallId === toolCallId &&
-        (previous.body ? previous.body.equals(body) : previous.fingerprint === fingerprint)) {
+    if (previous.toolName === toolName && previous.toolCallId === toolCallId && previous.key === key && previous.body.equals(body)) {
       throw previous.error;
     }
     throw safeError("成员工具先前写入结果未知，当前实例已阻止后续写入；请先对账，不要自动重试。");
@@ -386,7 +411,6 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
   // pass the uncertainty gate while the explanation is on the wire.
   if (publication && write && writes.active) throw safeError("前一写入尚未完成，未发送请求。");
   if (signal?.aborted) throw safeError("工具调用已取消，请求尚未发送。");
-  const key = write ? createHash("sha256").update(explanation ? `${toolName}\0${explanation.runID}\0${toolCallId}` : toolName + toolCallId).digest("hex") : "";
   let firstReservation = false;
   if (explanation) {
     const bytes = Buffer.from(`${key}\n${explanationText}`, "utf8");
@@ -424,6 +448,7 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
     let sent = false;
     let settled = false;
     const unknown = explanationWrite ? "运行说明保存结果未知；请保留原工具调用标识、幂等键和原文，先对账，不要自动重试。" :
+      relayWrite ? "执行结果未知；请保留原工具调用标识、幂等键和请求内容，先对账，不要自动重试。" :
       "执行结果未知；请先对账，不要自动重试。";
     const invalidResponse = `成员工具返回无效响应，${unknown}`;
     const overflow = `工具结果超过 64 KiB 限制（tool_result_too_large），${unknown}`;
@@ -441,7 +466,7 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
         new RunExplanationUnknownError(unknown.replaceAll(token, "〔已隐藏〕"), key,
           createHash("sha256").update(explanationText, "utf8").digest("hex")) : safeError(message);
       if (write && outcome === "unknown" && !writes.unknown) {
-        writes.unknown = { toolName, toolCallId, fingerprint, error, ...(explanationWrite ? { body } : {}) };
+        writes.unknown = { toolName, toolCallId, key, body, error };
       }
       if (explanation && firstReservation && outcome !== "unknown") {
         // Only this invocation's definitely unsent/rejected reservation may
@@ -496,21 +521,19 @@ async function requestTool(endpoint, token, writes, toolName, params, toolCallId
             const message = status >= 400 && status <= 599 ? serverError(result.json, token, roleWrite, toolName) : undefined;
             const error = isRecord(result.json) && isRecord(result.json.error) ? result.json.error : undefined;
             const code = error?.code;
-            // A malformed response cannot prove definite rejection of the
-            // optional publication. Keep the legacy receipt rules untouched.
-            const envelope = explanationWrite && /^\s*\{\s*"error"\s*:\s*(\{[\s\S]*\})\s*\}\s*$/.exec(result.text);
             const rejected = !sensitive && typeof code === "string" && typeof error?.message === "string" &&
-              (!explanationWrite || envelope && validRoleReceiptWire(envelope[1], 2)) &&
               (REJECTION_CODES.get(status)?.includes(code) ||
                 (toolName === "read_work_inputs" && status === 413 && code === "tool_result_too_large") ||
                 (toolName !== "decide_dispatch" && ((status === 404 && code === "not_found") || (status === 409 && code === "conflict"))) ||
                 (!roleWrite && !explanationWrite && status === 409 && code === "member_capacity") ||
                 (explanationWrite && status === 503 && code === "run_explanation_unavailable"));
+            if (rejected && !validRejectionWire(result.text, explanationWrite)) return fail(invalidResponse);
             const suffix = rejected || !explanationWrite && (code === "request_canceled" || code === "deadline_exceeded") ? "" : ` ${unknown}`;
             return fail(message ? message + suffix : invalidResponse, rejected ? "rejected" : "unknown");
           }
           if (sensitive) return fail(`成员工具返回了敏感数据，已拒绝显示；${unknown}`);
-          if (!validWriteReceipt(toolName, status, result.json, requestValue)) return fail(invalidResponse);
+          if (!validWriteReceipt(toolName, status, result.json, requestValue) ||
+              (relayWrite && !validRoleReceiptWire(result.text))) return fail(invalidResponse);
           if (explanation) {
             const { json: ack, text } = result;
             if (!isRecord(ack) || Object.keys(ack).sort().join(",") !== "created_at,explanation_id,text_omitted" ||

@@ -222,7 +222,7 @@ const messagesPath = (groupId: string) => `/api/v1/groups/${encodeURIComponent(g
 export function sendMessage(groupId: string, input: MessageInput, key: string, signal?: AbortSignal) {
   const sent = Object.freeze({ content: input.content,
     recipient_ids: Array.isArray(input.recipient_ids) ? Object.freeze([...input.recipient_ids]) : input.recipient_ids, topic_id: input.topic_id });
-  return post(messagesPath(groupId), sent, key, (value): value is WireMessage => messageIn(groupId, sent.topic_id ?? "")(value)
+  return post(messagesPath(groupId), sent, key, (value): value is WireMessage => messageIn(groupId, sent.topic_id)(value)
     && value.content === sent.content, signal).then(decodeMessage);
 }
 export async function listMessages(groupId: string, before = "", signal?: AbortSignal): Promise<Page<Message>> {

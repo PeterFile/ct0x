@@ -31,6 +31,7 @@ type memberToolConfig struct {
 	file               os.FileInfo
 	digest             [32]byte
 	investigationTools []string // Pi strict mode only.
+	discussionRelay    bool     // Digest-bound Pi intake only.
 }
 
 // Trusted, stable ancestors are required. Descriptor and path checks detect
@@ -99,6 +100,10 @@ func readMemberToolConfigMode(path string, pi, strict bool) (memberToolConfig, e
 		}
 		if pi && string(fields["discussion_only_excerpt"]) == "true" {
 			count++
+		}
+		if pi && string(fields["discussion_relay"]) == "true" {
+			count++
+			config.discussionRelay = true
 		}
 		if pi && string(fields["intake_assessment_action"]) == `"read_only_investigation"` {
 			count++
