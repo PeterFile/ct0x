@@ -5,6 +5,7 @@ const outcomes = [...terminals, "not_started", "unknown"] as const;
 const runStates = [...outcomes, "starting", "running", "cancel_requested"] as const;
 const operationStates = ["pending", "done", "unchanged", "unknown", "applied_sync_error"] as const;
 const operationKinds = ["create", "replace"] as const;
+const publicExplanationMaxBytes = 1024;
 
 export type AgentRunState = typeof runStates[number];
 export type AgentRunSummary = {
@@ -33,6 +34,7 @@ export type AgentRunWorkspaceOperation = {
 };
 export type AgentRunEntry = { id: string; created_at: string } & (
   | { kind: "trigger_message" | "published_reply"; message: AgentRunMessage }
+  | { kind: "public_explanation"; public_explanation: { text: string } }
   | { kind: "submission"; submission: AgentRunSubmission }
   | { kind: "dispatch_decision"; dispatch_decision: AgentRunDispatchDecision }
   | { kind: "workspace_operation"; workspace_operation: AgentRunWorkspaceOperation }
@@ -60,7 +62,7 @@ const pageOf = <T>(value: unknown, item: (value: unknown) => value is T, before:
   && Array.isArray(value.items) && value.items.every(item) && text(value.next_cursor)
   && (!value.next_cursor || (value.items.length > 0 && value.next_cursor !== before));
 
-function entry(value: unknown, memberId: string): value is AgentRunEntry {
+function entry(value: unknown, memberId: string, runId: string): value is AgentRunEntry {
   if (!record(value) || !time(value.created_at)) return false;
   switch (value.kind) {
     case "trigger_message":
@@ -68,6 +70,14 @@ function entry(value: unknown, memberId: string): value is AgentRunEntry {
       const message = value.message;
       return record(message) && id(message.message_id) && value.id === `message:${message.message_id}`
         && id(message.sender_id) && (value.kind === "trigger_message" || message.sender_id === memberId) && preview(message);
+    }
+    case "public_explanation": {
+      const explanation = value.public_explanation;
+      if (value.id !== `public_explanation:${runId}` || !record(explanation)) return false;
+      const content = explanation.text;
+      // Match Go's nonblank text rule and reject lone surrogates before TextEncoder can replace them.
+      return text(content) && content.length <= publicExplanationMaxBytes && /\P{White_Space}/u.test(content)
+        && !/[\0\ud800-\udfff]/u.test(content) && new TextEncoder().encode(content).length <= publicExplanationMaxBytes;
     }
     case "submission": {
       const submission = value.submission;
@@ -140,5 +150,5 @@ export async function getAgentRun({ group_id, run_id, member_id }: AgentRunIdent
   return read(`${runsPath}/${encodeURIComponent(run_id)}?${query}`, signal, (value): value is AgentRunDetail => record(value)
     && summary(value.run) && value.run.run_id === run_id && value.run.group_id === group_id && value.run.member_id === member_id
     && maybeTime(value.accepted_at) && maybeTime(value.cancel_requested_at) && receipt(value.receipt, value.run.state)
-    && pageOf(value.timeline, (item): item is AgentRunEntry => entry(item, member_id), before));
+    && pageOf(value.timeline, (item): item is AgentRunEntry => entry(item, member_id, run_id), before));
 }
