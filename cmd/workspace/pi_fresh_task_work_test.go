@@ -96,6 +96,7 @@ func TestPiFreshTaskWorkFlagRequiresSeparateExplicitProfile(t *testing.T) {
 	}
 }
 
+// Use the exact #200 pair (04cdc956), not a rewrite of today's bridge.
 func pi200MemberToolsEntry(t *testing.T) string {
 	t.Helper()
 	archive, err := zip.OpenReader("testdata/pi-bridge-200.zip")

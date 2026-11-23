@@ -35,6 +35,7 @@ type memberToolRegistration struct {
 	candidate          *domain.ChatCandidate
 	purpose            string
 	intake             memberToolIntakeSchema
+	runExplanation     *memberRunExplanation
 	taskWork           *taskWorkToolBinding
 	workReport         *taskWorkReportBinding
 	investigationOwner *investigationWorkOwnerBinding
@@ -51,6 +52,7 @@ type MemberTools struct {
 	capabilities     map[[sha256.Size]byte]memberToolRegistration
 	mcpRequests      map[[sha256.Size]byte]*memberMCPRequests
 	chatEngine       *coordination.Engine
+	runExplanation   *coordination.Engine   // Independent native opt-in; immutable after construction.
 	workInputs       MemberWorkInputService // Immutable after runtime construction.
 	freshTaskWork    FreshTaskWorkLaunch    // Independent of the legacy work-input preview.
 	taskDecisions    bool                   // Exact fresh text continuation only.
@@ -68,7 +70,7 @@ func NewMemberTools(db *store.Store) *MemberTools {
 // Issue is called by the trusted runtime only AFTER ClaimTurn, never during preparation.
 // It refuses duplicate registrations rather than silently rotating a live capability.
 func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants) (string, error) {
-	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{})
+	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{}, nil)
 }
 
 // IssueChatIntake is a separate trusted runtime seam, never a tool/API input.
@@ -78,14 +80,14 @@ func (s *MemberTools) IssueChatIntake(ctx context.Context, claim store.TurnClaim
 }
 
 func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema) (string, error) {
-	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema)
+	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema, nil)
 }
 
 func chatIntakeOperations() []string {
 	return []string{"list_members", "read_channel", "send_message", "search_history", "read_history"}
 }
 
-func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema) (string, error) {
+func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema, explanation *memberRunExplanation) (string, error) {
 	grants.Operations = slices.Clone(grants.Operations)
 	if grants.Skills != nil {
 		// Freeze the source even if the caller overwrites its exported wrapper.
@@ -155,7 +157,8 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 		}
 		candidate = &captured
 	}
-	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate, purpose: purpose, intake: schema}
+	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate,
+		purpose: purpose, intake: schema, runExplanation: explanation}
 	return token, nil
 }
 
@@ -196,6 +199,15 @@ func (s *MemberTools) withAuthorized(ctx context.Context, token, operation strin
 	entry, found := s.capabilities[sha256.Sum256([]byte(token))]
 	if !found || !slices.Contains(entry.grants.Operations, operation) {
 		return store.ErrMemberToolDenied
+	}
+	if b := entry.runExplanation; b != nil && (operation == "send_message" || operation == "create_member") {
+		// Only the fresh opt-in has this gate. A known uncertain Store write
+		// stops subsequent mutations even if transport is bypassed.
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.unknown {
+			return store.ErrAgentRunExplanationUnknown
+		}
 	}
 	err := s.db.ValidateMemberTool(ctx, entry.scope)
 	if err == nil {
