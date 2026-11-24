@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"agentworkspace/internal/contextpack"
@@ -118,7 +119,7 @@ func validatePreparationRole(state store.CoordinationRoleState, group domain.Gro
 		switch state.Blocked {
 		case store.CoordinationReady, store.CoordinationDependencyNotAccepted, store.CoordinationTaskStale,
 			store.CoordinationAuthorityStale, store.CoordinationBindingStale, store.CoordinationPolicyStale,
-			store.CoordinationMemberInactive, store.CoordinationAlreadyDecided, store.CoordinationAttemptConflict:
+			store.CoordinationMemberInactive, store.CoordinationAlreadyDecided, store.CoordinationAttemptConflict, store.CoordinationAutomaticTextChanged:
 		default:
 			return errPrepareBinding
 		}
@@ -188,6 +189,9 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 	if err != nil {
 		return empty, roleExecutorPreparationError(ctx, state, err)
 	}
+	if state.AutomaticTextWorkerID != "" && (selected.Name != provider.Pi || member.Workspace != "" || workspace != nil) {
+		return empty, rolePreparationBlocked(state, string(store.CoordinationAutomaticTextChanged), nil)
+	}
 	if err := r.CheckCoordinationRoleCapacity(ctx); err != nil {
 		if errors.Is(err, errMemberToolRoleFenceCapacity) {
 			return empty, rolePreparationBlocked(state, "role_runtime_capacity", nil)
@@ -203,6 +207,14 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 		facts, err = p.sampleDispatchCandidates(ctx, group.ID, member.ID, workspace)
 		if err != nil {
 			return empty, err
+		}
+		if worker := state.AutomaticTextWorkerID; worker != "" {
+			facts = slices.DeleteFunc(facts, func(f store.DispatchWorkerCapabilityFact) bool {
+				return f.MemberID != worker || p.providers[f.ProviderID].Name != provider.Pi
+			})
+			if len(facts) != 1 {
+				return empty, rolePreparationBlocked(state, "unsupported_provider", nil)
+			}
 		}
 	}
 	in, err := rolePreparationContext(state.Provenance, group, member, conversation, trigger, history, p.roleMaxContextBytes, facts)

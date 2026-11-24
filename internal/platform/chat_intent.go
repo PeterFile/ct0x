@@ -77,7 +77,13 @@ func (s *MemberTools) AssessChatIntent(ctx context.Context, token string, input 
 		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
 	}
 	defer unlock()
-	return s.chatEngine.AssessChatIntent(ctx, entry.scope, entry.candidate.ID, input, content, key)
+	c := entry.candidate
+	if entry.automaticText != nil && c.Policy.Enabled && c.Policy.AutomaticTextDispatch && c.SourceKind == "local_user_chat" &&
+		(c.BindingRevision == 0 && c.DispatchPolicyRevision == 0 || c.BindingRevision == 1 && c.DispatchPolicyRevision == 1) &&
+		input.Disposition == "request_work" && input.Action == domain.ChatActionTextSubmission && input.Repair == nil && input.Followup == nil {
+		return s.chatEngine.AssessChatIntentWithAutomaticText(ctx, entry.scope, c.ID, input, content, key, entry.automaticText.sample(ctx))
+	}
+	return s.chatEngine.AssessChatIntent(ctx, entry.scope, c.ID, input, content, key)
 }
 
 func (s *MemberTools) withChatIntake(token string, use func(store.MemberToolScope, string) (domain.ChatAssessmentReceipt, error)) (domain.ChatAssessmentReceipt, error) {

@@ -15,16 +15,22 @@ import (
 // ApplyChatAssessment is a bound assessor command, not a local-user API. The
 // semantic proposal cannot select source, caller, policy, grants or task owner.
 func (s *Store) ApplyChatAssessment(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string) (domain.ChatAssessmentReceipt, error) {
-	return s.applyChatAssessment(ctx, scope, candidateID, input, content, key, false, nil)
+	return s.applyChatAssessment(ctx, scope, candidateID, input, content, key, false, nil, ChatAutomaticTextFacts{})
+}
+
+// ApplyChatAssessmentWithAutomaticText accepts only server-sampled role facts.
+// The capability does not substitute for the claim or a current local-user rule.
+func (s *Store) ApplyChatAssessmentWithAutomaticText(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, facts ChatAutomaticTextFacts) (domain.ChatAssessmentReceipt, error) {
+	return s.applyChatAssessment(ctx, scope, candidateID, input, content, key, false, nil, facts)
 }
 
 // ApplyChatAssessmentDormant records an official input without waking a native
 // Turn. Only trusted callers can choose this mode; it is not a model argument.
 func (s *Store) ApplyChatAssessmentDormant(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string) (domain.ChatAssessmentReceipt, error) {
-	return s.applyChatAssessment(ctx, scope, candidateID, input, content, key, true, nil)
+	return s.applyChatAssessment(ctx, scope, candidateID, input, content, key, true, nil, ChatAutomaticTextFacts{})
 }
 
-func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, dormant bool, clarification *decisionClarificationCapture) (_ domain.ChatAssessmentReceipt, err error) {
+func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, dormant bool, clarification *decisionClarificationCapture, facts ChatAutomaticTextFacts) (_ domain.ChatAssessmentReceipt, err error) {
 	const action = "记录聊天评估失败"
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -43,7 +49,7 @@ func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, 
 		return domain.ChatAssessmentReceipt{}, memberToolOperationError(action, err)
 	}
 	phase = "mutation"
-	receipt, err := s.applyChatAssessmentInTx(ctx, tx, scope, candidateID, input, content, key, dormant, clarification)
+	receipt, err := s.applyChatAssessmentInTx(ctx, tx, scope, candidateID, input, content, key, dormant, clarification, facts)
 	if err != nil {
 		return domain.ChatAssessmentReceipt{}, err
 	}
@@ -54,7 +60,7 @@ func (s *Store) applyChatAssessment(ctx context.Context, scope MemberToolScope, 
 	return receipt, nil
 }
 
-func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, dormant bool, clarification *decisionClarificationCapture) (domain.ChatAssessmentReceipt, error) {
+func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, dormant bool, clarification *decisionClarificationCapture, facts ChatAutomaticTextFacts) (domain.ChatAssessmentReceipt, error) {
 	if err := denyTaskWorkFallbackInTx(ctx, tx, scope.Claim.TurnID); err != nil {
 		return domain.ChatAssessmentReceipt{}, memberToolOperationError("验证聊天轮次失败", err)
 	}
@@ -85,25 +91,9 @@ func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope M
 		return domain.ChatAssessmentReceipt{}, admissionError("读取聊天评估回执失败", err)
 	}
 	if replay {
-		receipt, err := chatAssessmentReceiptInTx(ctx, tx, id, candidateID)
-		if errors.Is(err, sql.ErrNoRows) && candidate.SourceKind == "local_user_chat" {
-			// A keyed replay from a different candidate may refer to the one
-			// immutable follow-up receipt for this trusted source.
-			if err := chatIntakePurposeInTx(ctx, tx, scope, candidateID); err != nil {
-				return domain.ChatAssessmentReceipt{}, err
-			}
-			receipt, err = chatFollowupReceiptInTx(ctx, tx, candidate)
-			if err == nil && receipt.ID != id {
-				err = ErrConflict
-			}
-		}
+		receipt, err := chatAssessmentReplayInTx(ctx, tx, scope, candidate, id)
 		if err != nil {
 			return domain.ChatAssessmentReceipt{}, admissionError("读取聊天评估回执失败", err)
-		}
-		if receipt.WorkInputID != "" {
-			if _, err := chatDiscussionArrivalInTx(ctx, tx, scope, candidateID); err != nil {
-				return domain.ChatAssessmentReceipt{}, err
-			}
 		}
 		if clarification != nil {
 			if err := clarification.loadInTx(ctx, tx, candidate, receipt.ID); err != nil {
@@ -131,24 +121,30 @@ func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope M
 		if err != nil {
 			return domain.ChatAssessmentReceipt{}, admissionError("验证工作输入记录失败", err)
 		}
-		if installed && candidate.SourceKind == "local_user_chat" {
-			prior, err := chatFollowupReceiptInTx(ctx, tx, candidate)
-			if err == nil {
-				if clarification != nil {
-					return domain.ChatAssessmentReceipt{}, ErrConflict
-				}
-				if _, err := chatDiscussionArrivalInTx(ctx, tx, scope, candidateID); err != nil {
-					return domain.ChatAssessmentReceipt{}, err
-				}
-				// Reserve this transport key, not a second evaluation or notice.
-				return recordChatAssessmentKeyInTx(ctx, tx, mutation, payload, prior)
+	}
+	if candidate.SourceKind == "local_user_chat" {
+		prior, err := chatSourceWorkReceiptInTx(ctx, tx, scope, candidate, "", installed)
+		// Only a durable automatic outcome allows a later quote to proceed to
+		// verified discussion persistence instead of replaying prior work.
+		if err == nil && (input.DiscussionOnlyExcerpt == nil || !prior.AutomaticTextRoutingChecked) {
+			if clarification != nil {
+				return domain.ChatAssessmentReceipt{}, ErrConflict
 			}
-			if !errors.Is(err, sql.ErrNoRows) {
-				return domain.ChatAssessmentReceipt{}, admissionError("读取原工作输入回执失败", err)
-			}
+			// Reserve this transport key, not a second evaluation or notice.
+			return recordChatAssessmentKeyInTx(ctx, tx, mutation, payload, prior.ChatAssessmentReceipt)
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return domain.ChatAssessmentReceipt{}, admissionError("读取原工作评估回执失败", err)
 		}
 	}
 	wantsWork := input.Disposition == "request_work" || input.Disposition == "prepare_work"
+	var automatic *chatAutomaticTextPlan
+	if wantsWork {
+		automatic, err = chatAutomaticTextPlanInTx(ctx, tx, candidate)
+		if err != nil {
+			return domain.ChatAssessmentReceipt{}, admissionError("读取自动文本分派范围失败", err)
+		}
+	}
 	receipt := domain.ChatAssessmentReceipt{ID: rand.Text(), CandidateID: candidate.ID, ThreadRef: candidate.ThreadRef,
 		MessageID: candidate.MessageID, SourceSenderID: candidate.SourceSenderID, AssessedBy: scope.MemberID, TurnID: scope.Claim.TurnID,
 		PolicyRevision: candidate.Policy.Revision, CandidateGeneration: candidate.Generation, Disposition: input.Disposition,
@@ -193,7 +189,10 @@ func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope M
 		content, wantsWork = chatContinuedNotice(i.TaskID, dormant), false
 	}
 	if wantsWork {
-		err := chatAdmissionGateInTx(ctx, tx, candidate, input)
+		err := chatAdmissionGateInTx(ctx, tx, candidate, input, automatic)
+		if err == nil && automatic != nil {
+			err = automatic.selectActorsInTx(ctx, tx, scope, candidate, facts)
+		}
 		if err == nil && input.Action == domain.ChatActionReadOnlyInvestigation {
 			investigationAuthorization, err = s.chatInvestigationAdmissionInTx(ctx, tx, scope, candidate, input)
 		}
@@ -250,6 +249,12 @@ func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope M
 			request.NewTask.AssigneeID = repair.ParentMandate.Scope.AssigneeID
 			request.NewTask.DependencyIDs = repair.ParentMandate.Scope.DependencyIDs
 		}
+		if automatic != nil {
+			request.NewTask.AssigneeID = automatic.actors.worker.MemberID
+			if err := automatic.initializeInTx(ctx, tx, candidate.GroupID); err != nil {
+				return domain.ChatAssessmentReceipt{}, admissionError("初始化原话题文本分派失败", err)
+			}
+		}
 		// The fixed legacy gate records explicit local-user authority: either the
 		// actual request or their explicitly enabled written policy. The precise
 		// distinction and assessor remain in this immutable chat receipt.
@@ -259,6 +264,11 @@ func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope M
 		admission, err := admissionReceiptInTx(ctx, tx, candidate.GroupID, decisionID)
 		if err != nil {
 			return domain.ChatAssessmentReceipt{}, admissionError("读取聊天工作准入失败", err)
+		}
+		if automatic != nil {
+			if err := automatic.recordInTx(ctx, tx, candidate, decisionID); err != nil {
+				return domain.ChatAssessmentReceipt{}, admissionError("保存自动文本分派依据失败", err)
+			}
 		}
 		dispatch, err := coordinationDispatchCreateInTx(ctx, tx, candidate.GroupID, admission.Task.ID, admission.Task.RevisionAtAdmission, 1, input.Reason)
 		if err != nil {
@@ -295,7 +305,10 @@ func (s *Store) applyChatAssessmentInTx(ctx context.Context, tx *sql.Tx, scope M
 		return domain.ChatAssessmentReceipt{}, admissionError("保存聊天行动说明失败", err)
 	}
 	receipt.NoticeMessageID, receipt.CreatedAt = notice.ID, notice.CreatedAt
-	data, err := json.Marshal(receipt)
+	data, err := json.Marshal(storedChatAssessmentReceipt{
+		ChatAssessmentReceipt:       receipt,
+		AutomaticTextRoutingChecked: automatic != nil && candidate.SourceKind == "local_user_chat",
+	})
 	if err != nil {
 		return domain.ChatAssessmentReceipt{}, err
 	}
@@ -328,6 +341,56 @@ func recordChatAssessmentKeyInTx(ctx context.Context, tx *sql.Tx, mutation mutat
 		return domain.ChatAssessmentReceipt{}, admissionError("保存聊天评估回执失败", err)
 	}
 	return receipt, nil
+}
+
+func chatAssessmentReplayInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, c domain.ChatCandidate, id string) (domain.ChatAssessmentReceipt, error) {
+	record, err := chatAssessmentRecordInTx(ctx, tx, id, c.ID)
+	if errors.Is(err, sql.ErrNoRows) && c.SourceKind == "local_user_chat" && id != "" {
+		installed, err := workInputSchemaInTx(ctx, tx)
+		if err != nil {
+			return domain.ChatAssessmentReceipt{}, err
+		}
+		prior, err := chatSourceWorkReceiptInTx(ctx, tx, scope, c, id, installed)
+		return prior.ChatAssessmentReceipt, err
+	}
+	if err != nil {
+		return domain.ChatAssessmentReceipt{}, err
+	}
+	if record.WorkInputID != "" || record.AutomaticTextRoutingChecked {
+		if _, err := chatDiscussionArrivalInTx(ctx, tx, scope, c.ID); err != nil {
+			return domain.ChatAssessmentReceipt{}, err
+		}
+	}
+	return record.ChatAssessmentReceipt, nil
+}
+
+// Resolve only this source's durable work outcome, independent of the proposal
+// or current policy. Older writers could publish a follow-up after an automatic
+// result. New aliases prefer the first (automatic) result in that case; a saved
+// key resolves only its own recorded receipt.
+func chatSourceWorkReceiptInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, c domain.ChatCandidate, expectedID string, followupInstalled bool) (storedChatAssessmentReceipt, error) {
+	id, candidateID, err := chatAutomaticTextReceiptIDsInTx(ctx, tx, c, expectedID)
+	if errors.Is(err, sql.ErrNoRows) && followupInstalled {
+		id, candidateID, err = chatFollowupReceiptIDsInTx(ctx, tx, c, expectedID)
+	}
+	if err != nil {
+		return storedChatAssessmentReceipt{}, err
+	}
+	if _, err := chatDiscussionArrivalInTx(ctx, tx, scope, c.ID); err != nil {
+		return storedChatAssessmentReceipt{}, err
+	}
+	r, err := chatAssessmentRecordInTx(ctx, tx, id, candidateID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return storedChatAssessmentReceipt{}, ErrMemberToolDenied
+	}
+	if err != nil {
+		return storedChatAssessmentReceipt{}, err
+	}
+	if r.ID != id || r.CandidateID != candidateID || r.ThreadRef != c.ThreadRef || r.MessageID != c.MessageID || r.CandidateGeneration != c.Generation ||
+		r.Purpose != domain.ChatIntakePurpose || r.SourceID != c.SourceID || r.SourceKind != "local_user_chat" || r.SourceSenderID != "user" {
+		return storedChatAssessmentReceipt{}, ErrMemberToolDenied
+	}
+	return r, nil
 }
 
 func validateChatAssessment(input domain.ChatAssessment, content string) error {
@@ -380,7 +443,7 @@ func validateChatAssessment(input domain.ChatAssessment, content string) error {
 	return nil
 }
 
-func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, input domain.ChatAssessment) error {
+func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, input domain.ChatAssessment, automatic *chatAutomaticTextPlan) error {
 	current, err := chatPolicyInTx(ctx, tx, c.ThreadRef, 0)
 	if err != nil {
 		return err
@@ -398,7 +461,7 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 	if current.Action != domain.ChatActionTextSubmission || (input.Action != domain.ChatActionTextSubmission && input.Action != domain.ChatActionWorkspaceChange && input.Action != domain.ChatActionReadOnlyInvestigation) {
 		return chatDeny("unsupported_action", "本版策略不支持所提动作。", "是否只需要在群聊交付纯文本？")
 	}
-	if input.Action == domain.ChatActionWorkspaceChange && !current.AllowWorkspaceChanges {
+	if automatic == nil && input.Action == domain.ChatActionWorkspaceChange && !current.AllowWorkspaceChanges {
 		return chatDeny("workspace_changes_disabled", "本话题未显式允许目录工作。", "是否在本话题策略中允许已有授权目录的工作？")
 	}
 	// New work uses the actual source's committed position, not the chat head.
@@ -419,19 +482,25 @@ func chatAdmissionGateInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandida
 	if binding != c.BindingRevision || policy != c.DispatchPolicyRevision {
 		return chatDeny("stale_dispatch_configuration", "协调员绑定或分派策略已变化。", "是否按当前协调配置重新评估？")
 	}
-	if binding < 1 || policy < 1 {
-		return chatDeny("routing_unavailable", "尚未配置可用的协调员和执行成员，本次没有产生新工作。", "是否先配置协调员及允许执行的成员？")
-	}
-	configured, err := coordinatorBindingInTx(ctx, tx, c.GroupID, binding)
-	if err != nil {
-		return err
-	}
-	coordinatorActive, workerEligible, err := coordinationDispatchMembersInTx(ctx, tx, c.GroupID, configured.MemberID, policy, "", "")
-	if err != nil {
-		return err
-	}
-	if !coordinatorActive || !workerEligible {
-		return chatDeny("routing_unavailable", "协调员不可用或没有符合当前策略的执行成员，本次没有产生新工作。", "是否先调整协调员及允许执行的成员？")
+	if automatic != nil {
+		if err := automatic.checkScope(c, current, input); err != nil {
+			return err
+		}
+	} else {
+		if binding < 1 || policy < 1 {
+			return chatDeny("routing_unavailable", "尚未配置可用的协调员和执行成员，本次没有产生新工作。", "是否先配置协调员及允许执行的成员？")
+		}
+		configured, err := coordinatorBindingInTx(ctx, tx, c.GroupID, binding)
+		if err != nil {
+			return err
+		}
+		coordinatorActive, workerEligible, err := coordinationDispatchMembersInTx(ctx, tx, c.GroupID, configured.MemberID, policy, "", "")
+		if err != nil {
+			return err
+		}
+		if !coordinatorActive || !workerEligible {
+			return chatDeny("routing_unavailable", "协调员不可用或没有符合当前策略的执行成员，本次没有产生新工作。", "是否先调整协调员及允许执行的成员？")
+		}
 	}
 	if input.Repair == nil && (c.SourceID == "" || (c.SourceKind != "local_user_chat" && c.SourceKind != "member")) {
 		question := "请由本机用户说明当前需要落实的文本目标，可以吗？"
@@ -503,14 +572,26 @@ func chatSummaryTask(c domain.ChatCandidate) (string, string, string) {
 	return "本话题纯文本摘要", fmt.Sprintf("仅依据本群、本话题已经保存的消息整理摘要；绑定来源%s，策略版本%d。不得改为其他目标、附加Artifact或执行文件/外部动作。", c.MessageID, c.Policy.Revision), "提供非空、有效UTF-8且不超过8192字节的本话题纯文本摘要；区分事实、建议和未决问题，引用消息依据；不添加Artifact版本，不声称用户已经接纳。"
 }
 
+// Keep the marker in the immutable JSON used by the schema and replay, never
+// in the transport receipt. The marker's stored key and type stay unchanged.
+type storedChatAssessmentReceipt struct {
+	domain.ChatAssessmentReceipt
+	AutomaticTextRoutingChecked bool `json:"automatic_text_routing_checked,omitempty"`
+}
+
 func chatAssessmentReceiptInTx(ctx context.Context, tx *sql.Tx, id, candidateID string) (domain.ChatAssessmentReceipt, error) {
+	r, err := chatAssessmentRecordInTx(ctx, tx, id, candidateID)
+	return r.ChatAssessmentReceipt, err
+}
+
+func chatAssessmentRecordInTx(ctx context.Context, tx *sql.Tx, id, candidateID string) (storedChatAssessmentReceipt, error) {
 	var data string
 	if err := tx.QueryRowContext(ctx, "SELECT receipt_json FROM chat_assessments WHERE id=? AND candidate_id=?", id, candidateID).Scan(&data); err != nil {
-		return domain.ChatAssessmentReceipt{}, err
+		return storedChatAssessmentReceipt{}, err
 	}
-	var receipt domain.ChatAssessmentReceipt
+	var receipt storedChatAssessmentReceipt
 	if err := json.Unmarshal([]byte(data), &receipt); err != nil {
-		return domain.ChatAssessmentReceipt{}, err
+		return storedChatAssessmentReceipt{}, err
 	}
 	if receipt.Purpose == "" {
 		receipt.SourceID, receipt.SourceKind = "", "unknown"
@@ -525,14 +606,14 @@ func chatAssessmentReceiptInTx(ctx context.Context, tx *sql.Tx, id, candidateID 
 		// A dangling wake is a broken proof, not permission to create another.
 		var deliveryID string
 		if err := tx.QueryRowContext(ctx, `SELECT delivery_id FROM task_work_deliveries WHERE source_kind='followup' AND source_id=?`, receipt.WorkInputID).Scan(&deliveryID); err != nil {
-			return domain.ChatAssessmentReceipt{}, coordinationRoleRelationError(err)
+			return storedChatAssessmentReceipt{}, coordinationRoleRelationError(err)
 		}
 		f, err := lookupTaskWorkDeliveryInTx(ctx, tx, receipt.GroupID, deliveryID)
 		if err != nil {
-			return domain.ChatAssessmentReceipt{}, coordinationRoleRelationError(err)
+			return storedChatAssessmentReceipt{}, coordinationRoleRelationError(err)
 		}
 		if f.assessmentID != receipt.ID || f.sourceTurnID != receipt.TurnID || f.d.SourceID != receipt.WorkInputID {
-			return domain.ChatAssessmentReceipt{}, ErrMemberToolDenied
+			return storedChatAssessmentReceipt{}, ErrMemberToolDenied
 		}
 		receipt.WorkDeliveryID, receipt.WorkWakeMessageID = f.d.DeliveryID, f.d.MessageID
 	}
