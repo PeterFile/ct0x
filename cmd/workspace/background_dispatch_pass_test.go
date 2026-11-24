@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"agentworkspace/internal/domain"
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/scheduler"
@@ -38,6 +40,143 @@ func newBackgroundPreviewPassFixture(t *testing.T) (config, *store.Store, *platf
 	}
 	c := config{enableExecution: true, piPath: f.path, groupBackgroundDispatchPreview: approvalPath}
 	return c, db, p, providers
+}
+
+func TestBackgroundDispatchPreviewCreateOnly(t *testing.T) {
+	ctx := t.Context()
+	c, db, p, providers := newBackgroundPreviewPassFixture(t)
+	local := platform.NewLocalUser(db)
+	group, err := local.CreateGroup(ctx, platform.GroupInput{Name: "New group"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := local.CreateMessage(ctx, group.ID, platform.MessageInput{Content: "First message", TopicID: "discussion"}, "")
+	if err != nil || len(message.Deliveries) != 0 {
+		t.Fatalf("expected an unrouted original: %+v, %v", message, err)
+	}
+
+	grant := backgroundPreviewFixtureApproval(t, c.piPath)
+	delete(grant, "preset")
+	grant["create"] = map[string]string{"id": "new-discussant", "name": "New discussant", "role": "Discuss"}
+	grant["qualification"] = backgroundPreviewQualification(grant, c.piPath, time.Now())
+	writeBackgroundPreviewFixtureApproval(t, c.groupBackgroundDispatchPreview, grant)
+	var output bytes.Buffer
+	pass, err := c.withBackgroundDispatchPass(db, p, providers, nil, &output)
+	if err != nil {
+		t.Fatalf("selector rejected a trusted create-only approval: %v", err)
+	}
+	pass(ctx)
+	pass(ctx) // Repeated scheduler cycles may not duplicate the join or delivery.
+	if output.Len() != 0 {
+		t.Fatalf("unexpected pass error: %s", &output)
+	}
+	got, err := db.GetMessage(ctx, group.ID, message.ID)
+	if err != nil || got.SourceID != message.SourceID || got.TopicID != message.TopicID || len(got.Deliveries) != 1 || got.Deliveries[0].MessageID != message.ID {
+		t.Fatalf("expected one delivery of the original: %+v, %v", got, err)
+	}
+	delivery := got.Deliveries[0]
+	kind, err := db.BackgroundDiscussionKind(ctx, group.ID, delivery.ID)
+	if err != nil || kind != "create" {
+		t.Fatalf("expected create route, got %q, %v", kind, err)
+	}
+	members, err := local.ListMembers(ctx, group.ID, store.ListOptions{})
+	if err != nil || len(members.Items) != 1 {
+		t.Fatalf("expected one created member: %+v, %v", members, err)
+	}
+	member := members.Items[0]
+	if member.ID != delivery.RecipientID || member.Name != "New discussant" || member.Role != "Discuss" ||
+		member.ProviderID != providers[0].ID || member.Model != backgroundFixtureModel || member.Workspace != "" {
+		t.Fatalf("created member did not match the approved template and profile: %+v", member)
+	}
+}
+
+func TestBackgroundDispatchPreviewTemplateOrderAndReplacement(t *testing.T) {
+	ctx := t.Context()
+	c, db, p, providers := newBackgroundPreviewPassFixture(t)
+	local := platform.NewLocalUser(db)
+	group, err := local.CreateGroup(ctx, platform.GroupInput{Name: "Discussion group"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := store.BackgroundDispatchProfile{ProviderID: providers[0].ID, Model: backgroundFixtureModel}
+	existing, err := local.CreateMember(ctx, group.ID, platform.MemberInput{
+		Name: "Existing discussant", Role: "Discuss", ProviderID: profile.ProviderID, Model: profile.Model,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate members leaving in the disposable DB so an already used preset
+	// can become ineligible without changing the approved profile or capacity.
+	raw, err := sql.Open("sqlite", filepath.Join(filepath.Dir(c.groupBackgroundDispatchPreview), "workspace.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	leave := func(id string) {
+		t.Helper()
+		if _, err := raw.ExecContext(ctx, `UPDATE members SET status='left' WHERE id=?`, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	grant := backgroundPreviewFixtureApproval(t, c.piPath)
+	grant["create"] = map[string]string{"id": "original-create", "name": "Original", "role": "Discuss"}
+	writeReady := func() {
+		grant["qualification"] = backgroundPreviewQualification(grant, c.piPath, time.Now())
+		writeBackgroundPreviewFixtureApproval(t, c.groupBackgroundDispatchPreview, grant)
+	}
+	writeReady()
+	var output bytes.Buffer
+	pass, err := c.withBackgroundDispatchPass(db, p, providers, nil, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := func() domain.Message {
+		t.Helper()
+		m, err := local.CreateMessage(ctx, group.ID, platform.MessageInput{Content: "Discuss"}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	route := func(original domain.Message, wantKind string) domain.Delivery {
+		t.Helper()
+		writeReady()
+		pass(ctx)
+		if output.Len() != 0 || !db.BackgroundDispatchProfileReady(profile) {
+			t.Fatalf("expected a qualified pass: %s", &output)
+		}
+		got, err := db.GetMessage(ctx, group.ID, original.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if wantKind == "" && len(got.Deliveries) == 0 {
+			return domain.Delivery{}
+		}
+		if wantKind == "" || len(got.Deliveries) != 1 || got.Deliveries[0].MessageID != original.ID {
+			t.Fatalf("unexpected deliveries for route %q: %+v", wantKind, got.Deliveries)
+		}
+		d := got.Deliveries[0]
+		if kind, err := db.BackgroundDiscussionKind(ctx, group.ID, d.ID); err != nil || kind != wantKind {
+			t.Fatalf("want route %q, got %q, %v", wantKind, kind, err)
+		}
+		return d
+	}
+	if d := route(post(), "existing"); d.RecipientID != existing.ID {
+		t.Fatalf("did not prefer the eligible in-group member: %+v", d)
+	}
+	leave(existing.ID)
+	leave(route(post(), "preset").RecipientID)
+
+	delete(grant, "create") // Replace with a valid preset-only approval, still qualified.
+	waiting := post()
+	route(waiting, "") // The consumed preset cannot join again; no create is approved.
+	grant["create"] = map[string]string{"id": "replacement-create", "name": "Replacement", "role": "Discuss"}
+	created := route(waiting, "create")
+	var templateID string
+	if err := raw.QueryRowContext(ctx, `SELECT template_id FROM group_background_joins WHERE member_id=?`, created.RecipientID).Scan(&templateID); err != nil || templateID != "replacement-create" {
+		t.Fatalf("join used the wrong create template: %q, %v", templateID, err)
+	}
 }
 
 func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
@@ -68,6 +207,8 @@ func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
 	writeReady := func(t *testing.T) map[string]any {
 		t.Helper()
 		current := backgroundPreviewFixtureApproval(t, piPath)
+		delete(current, "preset")
+		current["create"] = map[string]string{"id": "dispatch-create", "name": "Discussant", "role": "Discuss"}
 		current["qualification"] = backgroundPreviewQualification(current, piPath, time.Now())
 		writeBackgroundPreviewFixtureApproval(t, approvalPath, current)
 		return current
@@ -93,7 +234,7 @@ func TestBackgroundDispatchPreviewClearsReadinessOnNextPass(t *testing.T) {
 		{"paused", func(a, _ map[string]any) { a["paused"] = true }, false},
 		{"expired approval", func(a, _ map[string]any) { a["approval_expires_at"] = time.Now().Add(-time.Minute) }, false},
 		{"invalid capacity", func(a, _ map[string]any) { a["max_active_members"] = 0 }, true},
-		{"invalid preset", func(a, _ map[string]any) { delete(a, "preset") }, true},
+		{"no templates", func(a, _ map[string]any) { delete(a, "create") }, true},
 		{"invalid approval provider", func(a, _ map[string]any) { a["provider_id"] = "other-installation" }, true},
 		{"no evidence", func(a, _ map[string]any) { delete(a, "qualification") }, false},
 		{"expired evidence", func(_, q map[string]any) { q["observed_at"] = time.Now().Add(-30 * time.Second) }, false},
