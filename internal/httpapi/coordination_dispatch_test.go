@@ -340,13 +340,13 @@ func TestDispatchRequestHTTPPathScopeAndSameKeyIsolation(t *testing.T) {
 
 func TestDispatchRequestHTTPOpaquePathsAndFullPositiveInt64(t *testing.T) {
 	a := openDispatchRequestAPI(t, "")
-	g := newGroup(t, a, "opaque group")
 	raw := messageSQL(t, a)
 	groupID, taskID := "group:opaque|群\tinside", "task:opaque|任务\tinside"
-	if _, err := raw.Exec("UPDATE groups SET id=? WHERE id=?", groupID, g.ID); err != nil {
+	g := domain.Group{ID: groupID, Name: "opaque group", CreatedAt: time.Now().UTC()}
+	if _, err := raw.Exec(`INSERT INTO groups(id, name, created_at) VALUES(?,?,?)`,
+		g.ID, g.Name, g.CreatedAt.Format("2006-01-02T15:04:05.000000000Z")); err != nil {
 		t.Fatal(err)
 	}
-	g.ID = groupID
 	f := dispatchRequestHTTPConfigure(t, a, g)
 	ctx := context.Background()
 	task, err := a.db.CreateTask(ctx, store.CreateTaskInput{GroupID: groupID, ActorID: "user", Title: "maximum revision", Acceptance: "exact int64"})
