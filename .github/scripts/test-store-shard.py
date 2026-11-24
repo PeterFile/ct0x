@@ -896,8 +896,7 @@ class WorkflowTests(unittest.TestCase):
                      'verifier.aggregate(flattened, expected, profile)',
                      '"git", "rev-parse", "HEAD"', '"git", "rev-parse", "HEAD^{tree}"']:
             self.assertIn(text, self.worker)
-        timeouts = re.findall(r'"-timeout=13m"|--?(?:test\.)?timeout', self.worker)
-        self.assertEqual(timeouts, ['"-timeout=13m"'])
+        self.assertNotIn("-timeout", self.worker)
         self.assertNotIn("STORE_RACE_GROUP", self.workflow)
         self.assertIn("pattern: '*-worker-v1-*'", self.workflow)
         self.assertEqual(self.workflow.count("python3 .github/scripts/test-store-shard.py -v"), 1)
