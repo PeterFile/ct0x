@@ -51,6 +51,12 @@ The default local address is `127.0.0.1:7310`, configurable by an explicit CLI f
 
 Time-based pagination is a display contract; provider and skill catalogues instead use stable IDs. SQL reads apply the cursor predicate and `LIMIT` before materializing rows. A timestamp/ID cursor is not a committed high-water mark. Durable incremental processing uses a separately defined committed sequence and a captured upper bound; a future `after` transport must preserve that distinction. A conversation is unique on `(group_id, member_id, topic_id)` with a non-null empty main topic; deliveries must match both their message topic/group and their conversation member/topic/group.
 
+The local-user Agent Run detail (`GET /api/v1/me/agent-runs/{run}?group_id={group}`) returns `timeline.items` newest first by `(created_at, id)` descending. `before` is scoped to that group and Run. For chronological display, reverse the combined pages, not each page separately.
+
+A timeline item of kind `dispatch_decision` has a `dispatch_decision` object with `decision_id` (the receipt ID), `request_id`, `task_id`, `kind` (`assign` or `decline`), `reason_preview` (a UTF-8 prefix of the recorded decision reason, at most 1024 bytes), and `truncated` (whether reason bytes were omitted). `worker_member_id` and `assignment_id` are present only for `assign`. This is a committed dispatch decision, not a Run outcome or proof of worker execution. A `submission` item continues to represent a committed Submission, not a Review, and includes those from generic member-bound Attempts.
+
+A `public_explanation` timeline item has ID `public_explanation:<run_id>` and a `public_explanation` object containing only `text`, the exact member-published statement (non-blank UTF-8, at most 1024 bytes, no NUL). It is optional and immutable, and is not a receipt, proof of tool execution, authorization, model reasoning, or a chat message. Native invocation code must supply the live server-bound `MemberToolScope` and authorized request key to `Engine.PublishAgentRunExplanation`; it must not derive the text from provider output. Only the same live claim, original key, and exact text can replay the statement through the write seam. `Engine.AgentRunExplanationSupported` checks for the append's table, not permission to publish. Pre-append databases keep their existing timeline without explanation items.
+
 Initial endpoints:
 
 | Route | Operations |

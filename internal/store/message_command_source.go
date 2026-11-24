@@ -47,6 +47,9 @@ func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, re
 		// and cannot create an unversioned key or rewrite its source proof.
 		id, replay, err = lookupMutation(ctx, tx, r.scope(), payload)
 	}
+	if errors.Is(err, ErrConflict) && r.hasLegacyQuotePayload() {
+		id, replay, err = lookupMutation(ctx, tx, r.scope(), r.encodePayload("", true))
+	}
 	if err != nil {
 		return domain.Message{}, storeError("读取用户消息回执失败", err)
 	}

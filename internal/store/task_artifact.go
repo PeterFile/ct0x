@@ -25,8 +25,13 @@ func insertTaskArtifactRefs(ctx context.Context, tx *sql.Tx, submission domain.S
 	return nil
 }
 
-// Load only returned parents, after their rows are closed. Empty sets remain [].
 func taskArtifactRefsInTx(ctx context.Context, tx *sql.Tx, groupID, taskID string, submissionIDs []string) (map[string][]domain.ArtifactVersionRef, error) {
+	return submissionArtifactRefsInTx(ctx, tx, submissionIDs, &[2]string{groupID, taskID})
+}
+
+// Load only returned parents, after their rows are closed. Empty sets remain [].
+// An unscoped batch requires authoritative Submission IDs from this same tx.
+func submissionArtifactRefsInTx(ctx context.Context, tx *sql.Tx, submissionIDs []string, scope *[2]string) (map[string][]domain.ArtifactVersionRef, error) {
 	if len(submissionIDs) > 200 {
 		return nil, fmt.Errorf("%w：单次最多读取 200 份提交的成果引用", ErrInvalid)
 	}
@@ -35,14 +40,19 @@ func taskArtifactRefsInTx(ctx context.Context, tx *sql.Tx, groupID, taskID strin
 		return refs, nil
 	}
 	placeholders := make([]string, len(submissionIDs))
-	args := []any{groupID, taskID}
+	var args []any
+	where := ""
+	if scope != nil {
+		where = "group_id=? AND task_id=? AND "
+		args = append(args, scope[0], scope[1])
+	}
 	for i, id := range submissionIDs {
 		refs[id] = []domain.ArtifactVersionRef{}
 		placeholders[i] = "?"
 		args = append(args, id)
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT submission_id,artifact_id,version_id FROM task_submission_artifacts
-		WHERE group_id=? AND task_id=? AND submission_id IN (`+strings.Join(placeholders, ",")+`)
+		WHERE `+where+`submission_id IN (`+strings.Join(placeholders, ",")+`)
 		ORDER BY submission_id,artifact_id,version_id`, args...)
 	if err != nil {
 		return nil, err

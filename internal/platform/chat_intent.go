@@ -46,9 +46,12 @@ func (s *MemberTools) ChatCandidate(ctx context.Context, token string) (*domain.
 }
 
 type memberToolIntakeSchema struct {
-	piDiscussionExcerpt bool // The paired Pi bridge can advertise this optional field.
-	investigation       bool // The exact opted-in Pi, fresh root only.
-	investigationBlobs  bool // The runtime owns a separate artifact reader.
+	piDiscussionExcerpt     bool                       // The paired Pi bridge can advertise this optional field.
+	piDiscussionRelaySource string                     // Exact source previewed for the qualified Pi ordinary intake.
+	investigation           bool                       // The exact opted-in Pi, fresh root only.
+	investigationBlobs      bool                       // The runtime owns a separate artifact reader.
+	invitation              *investigationInvitation   // Frozen route for the opt-in structured intake.
+	threadDecision          *threadDecisionIntakeGrant // Fresh, verified Codex intake only.
 }
 
 func (schema memberToolIntakeSchema) offersInvestigation(policy domain.ChatPolicy) bool {
@@ -69,6 +72,11 @@ func (s *MemberTools) AssessChatIntent(ctx context.Context, token string, input 
 	if !s.isChatIntake(entry) || input.Action == domain.ChatActionReadOnlyInvestigation && !entry.investigationIntake() {
 		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
 	}
+	unlock, ok := entry.intake.threadDecision.lockMutation()
+	if !ok {
+		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
+	}
+	defer unlock()
 	return s.chatEngine.AssessChatIntent(ctx, entry.scope, entry.candidate.ID, input, content, key)
 }
 
@@ -79,6 +87,11 @@ func (s *MemberTools) withChatIntake(token string, use func(store.MemberToolScop
 	if !s.isChatIntake(entry) {
 		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
 	}
+	unlock, ok := entry.intake.threadDecision.lockMutation()
+	if !ok {
+		return domain.ChatAssessmentReceipt{}, store.ErrMemberToolDenied
+	}
+	defer unlock()
 	return use(entry.scope, entry.candidate.ID)
 }
 

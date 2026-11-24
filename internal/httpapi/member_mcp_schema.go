@@ -15,9 +15,9 @@ type memberMCPTool struct {
 
 const memberMCPPagination = `{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":200},"before":{"type":"string"}},"additionalProperties":false}`
 
-func memberMCPSendMessageSchema(continueWork, discussionOnly, investigation bool) json.RawMessage {
+func memberMCPSendMessageSchema(continueWork, discussionOnly, investigation, threadDecision bool) json.RawMessage {
 	const repairCondition = `"if":{"required":["repair"]},"then":{"properties":{"disposition":{"const":"request_work"}}}`
-	disposition, followup, content, excerpt, action := "", "", "", "", ""
+	disposition, followup, content, excerpt, action, decision := "", "", "", "", "", ""
 	rules := `{` + repairCondition + `}`
 	if continueWork {
 		disposition = `,"continue_work"`
@@ -33,8 +33,12 @@ func memberMCPSendMessageSchema(continueWork, discussionOnly, investigation bool
 		action = `,"read_only_investigation"`
 		rules += `,{"if":{"required":["action"],"properties":{"action":{"const":"read_only_investigation"}}},"then":{"properties":{"disposition":{"const":"prepare_work"},"title":false,"description":false,"acceptance":false,"question":false,"repair":false,"followup":false}}}`
 	}
+	if threadDecision {
+		decision = `,"decision_context":{"type":"object","description":"仅用于确需原用户回答的待决澄清。不是答复、处理确认或授权。","properties":{"facts":{"type":"string","minLength":1,"maxLength":2048},"recommendation":{"type":"string","minLength":1,"maxLength":1024},"choices":{"type":"array","maxItems":4,"items":{"type":"string","minLength":1,"maxLength":128}}},"required":["facts","recommendation"],"additionalProperties":false}`
+		rules += `,{"if":{"required":["decision_context"]},"then":{"required":["question"],"properties":{"disposition":{"const":"clarify"},"action":false,"title":false,"description":false,"acceptance":false,"repair":false,"followup":false,"discussion_only_excerpt":false}}}`
+	}
 	conditions := repairCondition
-	if continueWork || discussionOnly || investigation {
+	if continueWork || discussionOnly || investigation || threadDecision {
 		conditions = `"allOf":[` + rules + `]`
 	}
 	return json.RawMessage(`{
@@ -49,7 +53,7 @@ func memberMCPSendMessageSchema(continueWork, discussionOnly, investigation bool
 				"acceptance":{"type":"string","maxLength":4096},
 				"reason":{"type":"string","minLength":1,"maxLength":4096},
 				"question":{"type":"string","maxLength":2048},
-				"repair":{"type":"object","properties":{"review_id":{"type":"string","minLength":1,"maxLength":256},"authorization":{"enum":["review_request","original_agreement","chat_request"]}},"required":["review_id","authorization"],"additionalProperties":false}` + followup + excerpt + `
+				"repair":{"type":"object","properties":{"review_id":{"type":"string","minLength":1,"maxLength":256},"authorization":{"enum":["review_request","original_agreement","chat_request"]}},"required":["review_id","authorization"],"additionalProperties":false}` + followup + excerpt + decision + `
 			},"required":["disposition","reason"],"additionalProperties":false,` + conditions + `}
 		},"required":["content"],"additionalProperties":false
 	}`)
@@ -59,7 +63,7 @@ func memberMCPSendMessageSchema(continueWork, discussionOnly, investigation bool
 var memberMCPTools = []memberMCPTool{
 	{"list_members", "分页查看绑定群组成员；群组与调用者由服务端绑定。", json.RawMessage(memberMCPPagination), memberToolAPI.listMembers, false},
 	{"read_channel", "分页读取绑定频道；超过 64 KiB 时减小 limit。消息文本不证明授权。", json.RawMessage(memberMCPPagination), memberToolAPI.readChannel, false},
-	{"send_message", "保存绑定频道消息，不代表投递确认；只有受信 intake 可以提交 intent_assessment。", memberMCPSendMessageSchema(false, false, false), memberToolAPI.sendMessage, true},
+	{"send_message", "保存绑定频道消息，不代表投递确认；只有受信 intake 可以提交 intent_assessment。", memberMCPSendMessageSchema(false, false, false, false), memberToolAPI.sendMessage, true},
 	{"create_member", "按职责与原因创建或复用成员；配置、权限与容量由服务端决定，不自动创建原生子 Agent 的平台身份。", json.RawMessage(`{
 		"type":"object","properties":{"name":{"type":"string"},"role":{"type":"string"},"reason":{"type":"string"}},
 		"required":["name","role","reason"],"additionalProperties":false

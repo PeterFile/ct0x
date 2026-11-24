@@ -12,7 +12,7 @@ Pi 1.4.0 成员工具扩展。普通工具为 `list_members`、`read_channel`、
 
 `AGENT_WORKSPACE_MEMBER_TOOL_CONFIG` 只保存该文件的**绝对路径**，不是 JSON 或 token。启动器仅在实际工作服务已接入且发行的能力绑定受信 `chat_intake/v1` 时，在同一文件写入 `"continue_work":true`。否则省略此字段并保留旧 `send_message` schema。Pi 只从该文件选择 schema，不额外发起 HTTP；Codex 的 MCP `tools/list` 按同一受信能力发布 schema。该字段不是授权，不能由模型参数或额外环境变量启用。不要把 token 放入参数、提示词、命令行或日志。启动器负责文件生命周期；扩展初始化读取一次，之后不重读、不删除。文件超过 4096 字节、末级符号链接、权限/所有者不符或配置无效时，加载失败且不注册工具。
 
-普通启动只传 `AGENT_WORKSPACE_MEMBER_TOOL_CONFIG`。显式选择原生文本会话的可信运行时还会传 `AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256`：发证配置原始字节的 SHA-256，以 64 个小写十六进制字符表示。只要该变量存在（即使为空），扩展就在解析前校验同一份字节；格式错误或摘要不匹配会拒绝注册工具，不回退到仅路径模式。摘要不是额外授权，不改变工具 allowlist、`continue_work` 或工作输入范围。原生会话保持默认关闭。
+普通启动只传 `AGENT_WORKSPACE_MEMBER_TOOL_CONFIG`。使用原生文本会话或具备专用 schema 的受信 Pi intake 时，可信运行时还会传 `AGENT_WORKSPACE_MEMBER_TOOL_CONFIG_SHA256`：发证配置原始字节的 SHA-256，以 64 个小写十六进制字符表示。只要该变量存在（即使为空），扩展就在解析前校验同一份字节；格式错误或摘要不匹配会拒绝注册工具，不回退到仅路径模式。摘要不是额外授权，不改变工具 allowlist、`continue_work` 或工作输入范围。原生会话保持默认关闭。
 
 从仓库根目录显式加载（仅说明独立扩展调用方式，不代表已有启动器）：
 
@@ -22,9 +22,17 @@ AGENT_WORKSPACE_MEMBER_TOOL_CONFIG=/absolute/private/run.json \
   --no-builtin-tools --tools list_members,read_channel,send_message,create_member
 ```
 
-旧四工具 allowlist 不激活 history；完整六工具 profile 使用 `list_members,read_channel,send_message,create_member,search_history,read_history`。profile 仅由可信运行时提供，不新增模型可选参数；默认配置文件仍只有 endpoint/token。Prepare 只接受完整四项或完整六项，不接受窄集合或只追加一项 history；产品 cmd 仍维持旧四项，六工具组合另属 H3。
+旧四工具 allowlist 不激活 history；完整六工具 profile 使用 `list_members,read_channel,send_message,create_member,search_history,read_history`。profile 仅由可信运行时提供；默认配置文件仍只有 endpoint/token。当前 cmd 提供六项基础工具；受信 chat intake 不授予 `create_member`。
 
 Pi 提供 `typebox` 和 ExtensionAPI，无需安装开发依赖即可加载。正常宿主要求 Node >=22.19。endpoint 必须精确为 `http://127.0.0.1:<port>/api/v1/member-tools` 或 `http://[::1]:<port>/api/v1/member-tools`，端口为 1–65535；不接受 DNS、其他地址、用户信息、查询、片段或末尾斜线。每次 POST 追加 `/<toolname>`。
+
+## 普通讨论接力
+
+产品入口使用 `--enable-execution --enable-member-tools --enable-coordination-roles --pi-member-tools-extension /绝对路径/index.ts`，并选择支持的 Pi 1.4.0 成员及显式模型（可用 `--pi-path` 指定 Pi）。启动器只在相邻 `index.ts` 和 `bridge.mjs` 均匹配已知接力版本、且本轮绑定真实本机用户消息或结构化接力到达时签发 `"discussion_relay":true` 和配置摘要。旧版桥接文件、Codex、普通成员令牌和正式工作角色保持原行为，不提供此参数。恢复旧行为可改回原有可信桥接文件对。
+
+先 `read_channel` 查看 `chat_candidate` 和可选的 `discussion_context`，再独立保存 `send_message.intent_assessment` 的 `discuss` 评估。用原生 `send_message` 的 `content` + `discussion` 接力，不与 `recipient_ids`（包括空列表）或 `intent_assessment` 同传；MCP 不支持 `discussion`。`invite` 需要一个现有同群成员的 `recipient_id`，可填 `expected_reply`（按 Go JSON 字符串编码，含引号与转义最多 1024 UTF-8 字节）；`reply` 的返回路径由服务端绑定；`resolve` 只公开收束，不发投递。后两种不要填 `recipient_id` 或 `expected_reply`。上下文只返回接力指针、关系、状态和可选的回答要求；正文按消息 ID 用 `read_history` 分段读取。接力不创建 Task，也不授予工作权限。
+
+接力沿用 `send_message` 的原幂等键和固定小型收据：`invite` 必须有 1 条投递，`resolve` 必须为 0，`reply` 通常为 1、上一位成员离开时可为 0。收据不代表已接收或已执行；无可信收据或事务结果未确认时保留原请求与键，先对账，不重试。
 
 ## 边界与错误
 
@@ -34,11 +42,11 @@ Pi 提供 `typebox` 和 ExtensionAPI，无需安装开发依赖即可加载。�
 - 已启用的受信 intake 可在 `send_message.intent_assessment` 使用 `continue_work` 和可选 `followup {task_id?,constraint?}`。续办 `reason`、`content` 以及交回 `reason` 分别限 4096、16384、2048 **UTF-8 字节**，不得为空或全为空白；非空 `constraint` 同样不得全为空白，限 2048 字节。文本不修剪或截断，拒绝 NUL 和孤立代理项；旧消息分支不变。`constraint:""` 等同省略；没有任务引用和非空约束的 `followup` 等同于省略整个对象。原生 HTTP 与 MCP 据此使用相同的请求语义，保留不同的任务引用和原文。是否确有原文、目标及当前角色仍由 B 核实，引用不授予权限。
 - 使用 `node:http.request`，没有 Origin/Fetch Metadata，也不继承代理；token 只进入 `Authorization: Bearer`。写操作的 `Idempotency-Key` 固定为 `sha256(toolName + toolCallId)` 小写十六进制；空调用 ID 或包含孤立代理项的写入 ID 在发送前拒绝，其余 ID 原样参与计算。
 - 请求在联网前按 **JSON 编码后的 UTF-8 字节**检查；请求及响应上限均为 **65536 字节（含边界）**。响应不解压、不截断；超限明确报错 `tool_result_too_large`。分页查询超限可在支持 `limit` 的工具上减小页大小；工作输入整批读取不能分页，见下文。
-- 完整成功 JSON 原文进入文本 content，不投影、不静默裁剪；`details: undefined`，不重复写入完整载荷。服务端负责返回小型写收据：send 201 至少为 `{message_id,created_at,delivery_count,content_omitted:true}`；create 201 创建 / 200 复用，收据为 `{member_id,reused,join_message_id}`，复用的 `join_message_id` 为 `""`。扩展不额外限制成功收据字段，仍原样转发服务端 JSON。
+- 完整成功 JSON 原文进入文本 content，不投影、不静默裁剪；`details: undefined`，不重复写入完整载荷。服务端负责返回小型写收据：send 201 至少为 `{message_id,created_at,delivery_count,content_omitted:true}`；create 201 创建 / 200 复用，收据为 `{member_id,reused,join_message_id}`，复用的 `join_message_id` 为 `""`。普通 send/create 收据仍允许安全的增量字段，原样转发服务端 JSON。
 - 只接受严格 UTF-8、安全 JSON 与预期状态；拒绝非法编码/BOM、危险属性名、非有限数值、压缩、HTML 和敏感数据回显。错误 JSON 仅保留最多 64 字符的稳定代码，并使用本地中文安全消息；从不透传服务端 message、响应头、原始网络错误或取消原因。`request_canceled` / `deadline_exceeded` 明确表示结果未知：先对账，保留原工具调用标识及幂等键，不要自动重试。`member_capacity` 提示容量已满，仅在有空余容量后重试；`tool_result_too_large` 不截断结果；工作输入读取不会提示不存在的分页参数。
 - 总超时为 25 秒（不是空闲超时）；取消、超限及时关闭请求/响应。发送后超时、断线、取消或无可信收据属于**结果未知**，不能解释为成功或未执行；先由可信协调方对账。无自动重试、重定向、模型调用或备用 provider。显式重放同一调用 ID 使用同一写入键；扩展不伪造持久化或投递确认。
 
-写工具仅在上述必要收据字段及状态一致时视为成功，允许安全的增量字段；完整 4xx 拒绝须匹配既有状态与稳定代码白名单。5xx、发送后的取消/超时、断链或不可信收据均保留未知：首次写入未知在交给模型前永久锁住当前 client 实例的后续写入。同工具、原生调用 ID 与精确序列化 payload 的重放只返回本地缓存的原未知，不再发送 HTTP；其他写入在传输前拒绝。读工具仍可用，读失败不锁写；后续读写成功或拒绝均不解锁，没有自动或模型可调用的解锁入口。此前已发送的并发写可各自结束，此保护不跨 client、进程或新轮次持久化，也不替代可信对账。
+写工具仅在当前工具的收据字段及状态一致时视为成功；完整 4xx 拒绝须匹配既有状态与稳定代码白名单。5xx、发送后的取消/超时、断链或不可信收据均保留未知：首次写入未知在交给模型前永久锁住当前 client 实例的后续写入。同工具、原生调用 ID 与精确序列化 payload 的重放只返回本地缓存的原未知，不再发送 HTTP；其他写入在传输前拒绝。读工具仍可用，读失败不锁写；后续读写成功或拒绝均不解锁，没有自动或模型可调用的解锁入口。此前已发送的并发写可各自结束，此保护不跨 client、进程或新轮次持久化，也不替代可信对账。
 
 ## 工作输入启用门槛
 

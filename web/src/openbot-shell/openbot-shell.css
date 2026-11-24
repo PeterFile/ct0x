@@ -87,6 +87,30 @@
   font-size: var(--text-small);
   cursor: pointer;
 }
+.openbot-shell .window-rail-global {
+  height: auto;
+  padding: var(--space-1);
+  line-height: var(--leading-tight);
+  text-align: center;
+}
+.openbot-shell .window-rail-marker {
+  position: absolute;
+  inset-block-start: 0;
+  inset-inline-end: 0;
+  inline-size: var(--space-2);
+  block-size: var(--space-2);
+  border: var(--border-accent);
+  border-radius: 50%;
+  background: var(--color-accent);
+}
+.openbot-shell .window-rail-status {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 @media (hover: hover) and (pointer: fine) {
   .openbot-shell .window-rail-button:hover { background: var(--color-panel); color: var(--color-text); border: 0; }
 }
@@ -138,6 +162,15 @@
   grid-column: 3;
   grid-row: 1;
 }
+.openbot-shell.app-frame[data-global="true"] { grid-template-columns: var(--page-rail-width) minmax(0, 1fr); }
+.openbot-shell[data-global="true"] > .app-frame-panes { grid-column: 2; }
+.openbot-shell .app-frame-global {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--space-4);
+  scroll-padding-block: var(--space-4);
+}
 .openbot-shell .app-frame-content {
   display: grid;
   height: 100%;
@@ -183,10 +216,10 @@
 @media (max-width: 56rem) {
   .openbot-shell.app-frame { grid-template-columns: var(--page-rail-width) minmax(0, 1fr); }
   .openbot-shell .app-frame-panes { grid-column: 2; }
-  .openbot-shell[data-mobile-pane="list"] > .app-frame-panes { display: none; }
+  .openbot-shell[data-mobile-pane="list"]:not([data-global="true"]) > .app-frame-panes { display: none; }
   .openbot-shell .app-frame-content,
   .openbot-shell[data-context="true"] .app-frame-content { grid-template-columns: minmax(0, 1fr); }
-  .openbot-shell .im-chat { padding: var(--space-3); }
+  .openbot-shell :is(.im-chat, .app-frame-global) { padding: var(--space-3); }
   .openbot-shell .im-context { border-inline-start: 0; }
 }
 .openbot-shell [hidden] { display: none !important; }

@@ -325,7 +325,7 @@ func (s *Store) routeGroupBackgroundIntent(ctx context.Context, sequence int64, 
 	if s.background.ready != ready || !ready.validAt(time.Now()) {
 		return nil // Do not route using a replaced or expired observation.
 	}
-	var m MessageRequest
+	m := MessageRequest{ActorID: "user"}
 	var messageID string
 	var payload []byte
 	var valid bool
@@ -404,6 +404,10 @@ func backgroundSourceExclusionInTx(ctx context.Context, tx *sql.Tx, messageID st
 	if err != nil {
 		return "", err
 	}
+	quotes, err := messageQuotesInstalledInTx(ctx, tx)
+	if err != nil {
+		return "", err
+	}
 	var quotedSender sql.NullString
 	if installed {
 		err := tx.QueryRowContext(ctx, `SELECT coalesce(l.reply_to_message_id,''),coalesce(l.task_id,''),q.sender_id
@@ -418,12 +422,25 @@ func backgroundSourceExclusionInTx(ctx context.Context, tx *sql.Tx, messageID st
 			return "", ErrMemberToolDenied
 		}
 	}
-	// The intent, message and log already agree on the saved scope. E can
+	if quotes && r.ReplyToMessageID == "" {
+		err := tx.QueryRowContext(ctx, `SELECT q.quoted_message_id,m.sender_id
+		 FROM main.message_quotes q LEFT JOIN main.messages m
+		 ON (m.id,m.group_id,m.topic_id)=(q.quoted_message_id,q.group_id,q.quoted_topic_id)
+		 WHERE (q.message_id,q.group_id,q.topic_id)=(?,?,?)`, messageID, r.GroupID, r.TopicID).
+			Scan(&r.ReplyToMessageID, &quotedSender)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		if r.ReplyToMessageID != "" && !quotedSender.Valid {
+			return "", ErrMemberToolDenied
+		}
+	}
+	// The intent, message and log already agree on the saved scope. E or A3 can
 	// resolve an omitted input topic to that scope; the immutable source still
 	// encodes the original topic and links, never the inferred topic. Verify
 	// the exact omitted-recipient payload without re-running thread routing.
 	if !bytes.Equal(payload, r.payload()) {
-		if !installed || r.TopicID == "" {
+		if (!installed && !quotes) || r.TopicID == "" {
 			return "", ErrMemberToolDenied
 		}
 		r.TopicID = ""

@@ -36,9 +36,10 @@ func (s *Store) BindMemberTool(ctx context.Context, claim TurnClaim) (MemberTool
 	}
 	defer tx.Rollback()
 	scope := MemberToolScope{Claim: claim}
-	err = tx.QueryRowContext(ctx, "SELECT t.member_id,t.conversation_id,c.topic_id"+memberToolBinding,
-		claim.GroupID, claim.TurnID, claim.Token).Scan(&scope.MemberID, &scope.ConversationID, &scope.TopicID)
-	if err != nil || !memberToolIDsValid(scope.MemberID, scope.ConversationID) {
+	var deliveryID string
+	err = tx.QueryRowContext(ctx, "SELECT t.member_id,t.conversation_id,c.topic_id,t.delivery_id"+memberToolBinding,
+		claim.GroupID, claim.TurnID, claim.Token).Scan(&scope.MemberID, &scope.ConversationID, &scope.TopicID, &deliveryID)
+	if err != nil || isThreadDecisionRef(deliveryID) || !memberToolIDsValid(scope.MemberID, scope.ConversationID) {
 		return MemberToolScope{}, ErrMemberToolDenied
 	}
 	if err := tx.Commit(); err != nil {
@@ -71,11 +72,11 @@ func memberToolScopeInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope)
 	if !memberToolIDsValid(claim.GroupID, claim.TurnID, claim.Token, scope.MemberID, scope.ConversationID) {
 		return ErrMemberToolDenied
 	}
-	var allowed int
+	var deliveryID string
 	err := tx.QueryRowContext(ctx, `UPDATE turns SET claim_token=claim_token
 	 WHERE id IN (SELECT t.id`+memberToolBinding+` AND t.member_id=? AND t.conversation_id=? AND c.topic_id=?)
-	 RETURNING 1`, claim.GroupID, claim.TurnID, claim.Token, scope.MemberID, scope.ConversationID, scope.TopicID).Scan(&allowed)
-	if err != nil {
+	 RETURNING delivery_id`, claim.GroupID, claim.TurnID, claim.Token, scope.MemberID, scope.ConversationID, scope.TopicID).Scan(&deliveryID)
+	if err != nil || isThreadDecisionRef(deliveryID) {
 		return ErrMemberToolDenied
 	}
 	return nil

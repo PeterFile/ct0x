@@ -54,10 +54,13 @@ type investigationCWD struct {
 }
 
 func (p *Preparer) configureInvestigation(opts *InvestigationPreparationOptions) (*investigationPreparationSettings, error) {
+	r := p.memberTools
 	if opts == nil {
+		if r != nil && r.tools.discussionWorkReturn {
+			return nil, errInvestigationAdapterUnavailable
+		}
 		return nil, nil
 	}
-	r := p.memberTools
 	if r == nil || r.roleFence == nil || r.tools.chatEngine == nil || p.enableCodexAppServer {
 		return nil, errInvestigationAdapterUnavailable
 	}
@@ -162,9 +165,10 @@ type investigationRolePreparation struct {
 	scope domain.TaskInvestigationScope
 	cwd   investigationCWD
 	// The exact fresh request before the scheduler fills the two claim fields.
-	request provider.ExecuteRequest
-	build   func(provider.NativeMemberToolConfig, []string) (provider.Executor, error)
-	owner   *initialInvestigationOwnerPreparation
+	request    provider.ExecuteRequest
+	build      func(provider.NativeMemberToolConfig, []string) (provider.Executor, error)
+	owner      *initialInvestigationOwnerPreparation
+	invitation investigationInvitation
 }
 
 type initialInvestigationOwnerPreparation struct {
@@ -258,9 +262,18 @@ func (p *Preparer) sampleInvestigationMember(member domain.Member, operations []
 }
 
 func (p *Preparer) previewInvestigationIntake(ctx context.Context, selected provider.Provider, trigger domain.Message, schema memberToolIntakeSchema) (memberToolIntakeSchema, error) {
-	if p.investigation == nil || p.investigation.providerID != selected.ID || !singleInvestigationRoot(trigger) ||
-		!provider.PiInvestigationBridgeSupported(p.piMemberToolsExtension) {
+	if p.investigation == nil || p.investigation.providerID != selected.ID || !provider.PiInvestigationBridgeSupported(p.piMemberToolsExtension) {
 		return schema, nil
+	}
+	var invitation investigationInvitation
+	if !singleInvestigationRoot(trigger) {
+		if !p.memberTools.tools.discussionWorkReturn {
+			return schema, nil
+		}
+		invitation = investigationInvitationOf(trigger)
+		if invitation.messageID == "" {
+			return schema, nil
+		}
 	}
 	policy, err := p.store.GetChatPolicy(ctx, domain.ThreadRef{GroupID: trigger.GroupID, TopicID: trigger.TopicID})
 	if err != nil {
@@ -270,12 +283,15 @@ func (p *Preparer) previewInvestigationIntake(ctx context.Context, selected prov
 	// the captured source/policy after the scheduler has claimed the delivery.
 	schema.investigation, schema.investigationBlobs = true, p.investigation.artifacts != nil
 	schema.investigation = schema.offersInvestigation(policy)
+	if schema.investigation && invitation.messageID != "" {
+		schema.invitation = &invitation
+	}
 	return schema, nil
 }
 
 // Before any legacy history, repair context, workspace grants or cwd selection.
 func (p *Preparer) planInvestigationRole(ctx context.Context, state store.CoordinationRoleState, member domain.Member,
-	scope domain.TaskInvestigationScope) (rolePreparationPlan, error) {
+	scope domain.TaskInvestigationScope, invitation investigationInvitation) (rolePreparationPlan, error) {
 	var empty rolePreparationPlan
 	cfg, role := p.investigation, state.Provenance
 	if cfg == nil {
@@ -309,7 +325,7 @@ func (p *Preparer) planInvestigationRole(ctx context.Context, state store.Coordi
 	}
 	var facts []store.DispatchWorkerCapabilityFact
 	if role.Kind == store.CoordinationRoleCoordinator {
-		facts, err = p.investigationDispatchCandidates(ctx, state, scope)
+		facts, err = p.investigationDispatchCandidates(ctx, state, scope, invitation.messageID != "")
 		if err != nil {
 			return empty, err
 		}
@@ -317,8 +333,8 @@ func (p *Preparer) planInvestigationRole(ctx context.Context, state store.Coordi
 			return empty, rolePreparationBlocked(state, "investigation_no_supported_worker", nil)
 		}
 	}
-	prepared := &investigationRolePreparation{investigationPreparationSettings: *cfg, scope: scope}
-	if role.Kind == store.CoordinationRoleWorker && p.memberTools.investigationOwnerLaunchEnabled() {
+	prepared := &investigationRolePreparation{investigationPreparationSettings: *cfg, scope: scope, invitation: invitation}
+	if role.Kind == store.CoordinationRoleWorker && invitation.messageID == "" && p.memberTools.investigationOwnerLaunchEnabled() {
 		candidates, err := p.memberTools.tools.investigationDelegateCandidates(ctx, role, scope)
 		if err != nil {
 			return empty, preparationResolutionError(ctx, err)
@@ -332,6 +348,9 @@ func (p *Preparer) planInvestigationRole(ctx context.Context, state store.Coordi
 	in, err := investigationPreparationContext(role, scope, facts, prepared.owner, p.roleMaxContextBytes)
 	if err != nil {
 		return empty, err
+	}
+	if invitation.messageID != "" && role.Kind == store.CoordinationRoleWorker {
+		in.Permissions = append(in.Permissions, "只有调查完成才提交结论。若缺少补充说明，公开说明待确认事项，等待后续输入；本首轮不能委派或整项交回。")
 	}
 	return rolePreparationPlan{state: state, selected: selected, selection: provider.AdapterSelection{ID: provider.PiMemberToolAdapterID, Protocol: provider.PiExtensionProtocol}, dispatchCapabilities: facts, input: in,
 		investigation: prepared}, nil
@@ -368,7 +387,7 @@ func (p *Preparer) prepareInvestigationRole(ctx context.Context, plan rolePrepar
 // The prompt receives only their IDs for the formal decision, not any member
 // metadata, and Store still rechecks the request and sampled facts on write.
 func (p *Preparer) investigationDispatchCandidates(ctx context.Context, state store.CoordinationRoleState,
-	scope domain.TaskInvestigationScope) ([]store.DispatchWorkerCapabilityFact, error) {
+	scope domain.TaskInvestigationScope, fromInvitation bool) ([]store.DispatchWorkerCapabilityFact, error) {
 	role := state.Provenance
 	view, err := p.store.GetDispatchRequest(ctx, role.GroupID, role.RequestID)
 	if err != nil {
@@ -409,7 +428,7 @@ func (p *Preparer) investigationDispatchCandidates(ctx context.Context, state st
 		if err != nil {
 			return nil, roleExecutorPreparationError(ctx, state, err)
 		}
-		if p.memberTools.investigationOwnerLaunchEnabled() {
+		if !fromInvitation && p.memberTools.investigationOwnerLaunchEnabled() {
 			// The first worker may have zero or more supported peers. Qualify
 			// both profile shapes without enumerating other members for it here.
 			supports := p.memberTools.investigationTaskWork.Supports

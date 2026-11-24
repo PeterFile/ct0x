@@ -25,14 +25,15 @@ type PendingDelivery struct {
 type PendingOptions struct {
 	Limit int // Zero selects 50; maximum 200.
 	After *Cursor
-	Lane  string // Empty scans all; "human" selects sender_id=user; "work" selects all other senders.
+	Lane  string // Empty scans legacy lanes; "human" and "work" split by sender. PendingThreadDecisions is separate.
 }
 
 type ClaimTurnInput struct {
-	GroupID, DeliveryID string
-	ResourceKeys        []string // Complete canonical keys from trusted configuration, never model arguments.
-	MaxActive           int
-	BackgroundProfile   BackgroundDispatchProfile // Set only by trusted tool-free preparation.
+	GroupID, DeliveryID    string
+	ResourceKeys           []string // Complete canonical keys from trusted configuration, never model arguments.
+	MaxActive              int
+	BackgroundProfile      BackgroundDispatchProfile // Set only by trusted tool-free preparation.
+	ThreadDecisionAnswerID string                    `json:"-"` // Required only for a trusted, typed Thread decision continuation.
 }
 
 // ListPendingDeliveries scans FIFO; callers must continue after resource conflicts.
@@ -41,7 +42,7 @@ func (s *Store) ListPendingDeliveries(ctx context.Context, options PendingOption
 	if err != nil {
 		return Page[PendingDelivery]{}, err
 	}
-	if options.Lane != "" && options.Lane != "human" && options.Lane != "work" {
+	if options.Lane != "" && options.Lane != "human" && options.Lane != "work" && options.Lane != PendingThreadDecisions {
 		return Page[PendingDelivery]{}, queueError("扫描待投递失败", ErrInvalid)
 	}
 	query := `SELECT d.group_id,msg.sender_id,d.id,d.message_id,d.conversation_id,d.recipient_id,d.state,d.turn_id,d.error,d.created_at
@@ -66,7 +67,11 @@ func (s *Store) ListPendingDeliveries(ctx context.Context, options PendingOption
 		}
 		query += `)`
 	}
-	args := []any{}
+	filter, args, err := s.threadDecisionPendingFilter(ctx, options.Lane)
+	if err != nil {
+		return Page[PendingDelivery]{}, queueError("扫描待投递失败", err)
+	}
+	query += filter
 	switch options.Lane {
 	case "human":
 		query += " AND msg.sender_id='user'"

@@ -32,11 +32,12 @@ const (
 )
 
 type Store struct {
-	db                     *sql.DB
-	schemaVersion          int // Known migration prefix at Open, not a later ledger observation.
-	investigationExecution atomic.Bool
-	taskWorkExecution      atomic.Bool
-	background             groupBackgroundDispatch
+	db                      *sql.DB
+	schemaVersion           int // Known migration prefix at Open, not a later ledger observation.
+	investigationExecution  atomic.Bool
+	taskWorkExecution       atomic.Bool
+	threadDecisionExecution atomic.Bool
+	background              groupBackgroundDispatch
 }
 
 type CreateGroupInput struct {
