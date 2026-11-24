@@ -72,7 +72,8 @@ test("actual Pi 1.4.0 loader registers the native tools with closed schemas", as
     assert.equal(schema.properties.before.type, "string");
   }
   const send = tools.get("send_message").parameters;
-  assert.deepEqual(Object.keys(send.properties).sort(), ["content", "intent_assessment", "recipient_ids"]);
+  assert.deepEqual(Object.keys(send.properties).sort(), ["content", "intent_assessment", "recipient_ids", "reply_to_message_id"]);
+  assert.equal(send.properties.reply_to_message_id.type, "string");
   assert.equal(send.properties.intent_assessment.additionalProperties, false);
   assert.deepEqual(send.properties.intent_assessment.properties.disposition.anyOf.map(schema => schema.const),
     ["discuss", "clarify", "request_work", "prepare_work"]);
@@ -86,6 +87,42 @@ test("actual Pi 1.4.0 loader registers the native tools with closed schemas", as
   assert.deepEqual(Object.keys(create.properties).sort(), ["name", "reason", "role"]);
   assert.deepEqual([...create.required].sort(), ["name", "reason", "role"]);
   for (const schema of Object.values(create.properties)) assert.equal(schema.type, "string");
+});
+
+test("plain reply_to_message_id and optional recipients reach HTTP unchanged", async t => {
+  const receipt = { message_id: "reply", created_at: "2026-11-20T00:00:00Z", delivery_count: 0, content_omitted: true };
+  const { tools, requests } = await toolsFor(t, (_, response) => json(response, receipt, 201));
+  const send = tools.get("send_message");
+  const plain = { content: "直接接话。" };
+  const quote = { content: "引用旧原文。", reply_to_message_id: "\ufeffe\u0301🙂" };
+  for (const [index, payload] of [plain, { ...plain, recipient_ids: [] }, quote,
+    { ...quote, recipient_ids: [] }, { ...quote, reply_to_message_id: "🙂".repeat(64), recipient_ids: ["peer"] }].entries()) {
+    const args = send.prepareArguments(payload);
+    assert.deepEqual(args, payload);
+    const id = `reply-${index}`;
+    await execute(send, args, undefined, id);
+    assert.equal(requests.length, index + 1);
+    assert.equal(requests[index].url, `${BASE}/send_message`);
+    assert.deepEqual(requests[index].body, Buffer.from(JSON.stringify(payload)));
+    assert.equal(requests[index].headers["idempotency-key"], createHash("sha256").update("send_message" + id).digest("hex"));
+  }
+});
+
+test("invalid reply_to_message_id and conflicting structured input fail before Pi coercion or HTTP", async t => {
+  const { tools, requests } = await toolsFor(t);
+  const send = tools.get("send_message");
+  const quote = { content: "引用旧原文。", reply_to_message_id: "old-message" };
+  for (const input of [
+    ...[undefined, null, 42, false, {}, [], "", ".", "..", " id", "id\u3000", "a\u0085b", "a\u0000b", "\ud800", "🙂".repeat(64) + "x"]
+      .map(reply_to_message_id => ({ ...quote, reply_to_message_id })),
+    { ...quote, recipient_ids: null }, { ...quote, recipient_ids: [1] },
+    ...[undefined, null, { disposition: "discuss", reason: "只讨论" }].map(intent_assessment => ({ ...quote, intent_assessment })),
+    { ...quote, discussion: null },
+  ]) {
+    assert.throws(() => send.prepareArguments(input), /未发送/);
+    await assert.rejects(execute(send, input), /未发送/);
+  }
+  assert.equal(requests.length, 0);
 });
 
 test("contextual chat assessment uses the existing send transport without caller or grants", async t => {
@@ -439,6 +476,7 @@ test("only issued relay intake advertises discussion; raw ambiguous fields canno
   for (const input of [
     { ...payload, discussion: null }, { ...payload, recipient_ids: [] }, { ...payload, recipient_ids: null },
     { ...payload, intent_assessment: { disposition: "discuss", reason: "讨论" } },
+    { ...payload, reply_to_message_id: "old-message" }, { ...payload, reply_to_message_id: null },
     { ...payload, discussion: { ...payload.discussion, recipient_id: null } },
     { ...payload, discussion: { ...payload.discussion, expected_reply: null } },
     { ...payload, discussion: { kind: "invite" } },

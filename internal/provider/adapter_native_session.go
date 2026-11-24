@@ -65,106 +65,143 @@ const (
 	piPreJournalBridgeImplSHA       = "85bfc85b5ebda50b7bcddb64966f1f730838c5437c4e2d9caef4251f0fe274d5"
 	piDiscussionRelayBridgeEntrySHA = "a9178ae8ad54ea8ce834c9594dbbf407222be70f60ccb35d45506cb7f9855737"
 	piDiscussionRelayBridgeImplSHA  = "17c987936c185fd11ea8c5c26855aa15c9707d393fac1152c1bbb2d1eaa035d4"
+	piOrdinaryQuoteBridgeEntrySHA   = "1a7c9c01d71c3d010c06586a6946b4c64f11e617a8f8a58722e408fd70bd9c0f"
 	piIntegratedBridgeEntrySHA      = "35e10bcfef2635f1732747de667308ca6c79b449b73876667d819f4e501ababa"
+	piIntegratedQuoteBridgeEntrySHA = "326fb8c0fef8eb75deba1348231a345f99636728e058a24fe3c620ce2c1686ce"
 	piIntegratedBridgeImplSHA       = "f138eb8b5203ab2a65c71c41f0cb7e4e8eaad0a0f509f029df5ed8a804d96cde"
 )
 
 // PiNativeSessionBridgeSupported qualifies only the actual trusted native release
 // pair. It never reads declarations from the extension, or probes the CLI.
 func PiNativeSessionBridgeSupported(extensionPath string) bool {
-	return qualifyPiNativeBridge(extensionPath) != ""
+	return qualifyPiNativeBridge(extensionPath).path != ""
 }
 
-func qualifyPiNativeBridge(extensionPath string) string {
-	if entry := qualifyPiInvestigationBridge(extensionPath); entry != "" {
-		return entry
+// PiNativeSessionBridgeQuoteSupport reports the ordinary send_message schema of
+// a qualified pair, not whether this turn has been granted send_message.
+func PiNativeSessionBridgeQuoteSupport(extensionPath string) (quote, qualified bool) {
+	bridge := qualifyPiNativeBridge(extensionPath)
+	return bridge.sendMessageQuote, bridge.path != ""
+}
+
+type qualifiedPiBridge struct {
+	path             string
+	sendMessageQuote bool
+}
+
+func (b qualifiedPiBridge) quoteFor(names []string) bool {
+	return b.sendMessageQuote && slices.Contains(names, "send_message")
+}
+
+func qualifyPiNativeBridge(extensionPath string) qualifiedPiBridge {
+	if bridge := qualifyPiInvestigationBridge(extensionPath); bridge.path != "" {
+		return bridge
 	}
 	return qualifyPiBridgePair(extensionPath, piDigestBridgeImplSHA, piDigestBridgeEntrySHA)
 }
 
 func PiInvestigationBridgeSupported(extensionPath string) bool {
-	return qualifyPiInvestigationBridge(extensionPath) != ""
+	return qualifyPiInvestigationBridge(extensionPath).path != ""
 }
 
 // PiCombinedIntakeBridgeSupported requires the pair whose tool descriptions
 // distinguish investigation from fresh Task Work continuation.
 func PiCombinedIntakeBridgeSupported(extensionPath string) bool {
 	return PiDiscussionRelayBridgeSupported(extensionPath) || PiRunExplanationBridgeSupported(extensionPath) ||
-		qualifyPiBridgePair(extensionPath, piPreJournalBridgeImplSHA, piPreJournalBridgeEntrySHA) != "" ||
-		qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA) != ""
+		qualifyPiBridgePair(extensionPath, piPreJournalBridgeImplSHA, piPreJournalBridgeEntrySHA).path != "" ||
+		qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA).path != ""
 }
 
 // PiDiscussionRelayBridgeSupported qualifies the installed relay-aware pair,
 // not the per-turn permission to use it.
 func PiDiscussionRelayBridgeSupported(extensionPath string) bool {
-	return qualifyPiDiscussionRelayBridge(extensionPath) != ""
+	return qualifyPiDiscussionRelayBridge(extensionPath).path != ""
 }
 
-func qualifyPiDiscussionRelayBridge(extensionPath string) string {
-	return qualifyPiBridgePair(extensionPath, piDiscussionRelayBridgeImplSHA, piDiscussionRelayBridgeEntrySHA)
+func qualifyPiDiscussionRelayBridge(extensionPath string) qualifiedPiBridge {
+	return qualifyPiBridgePair(extensionPath, piDiscussionRelayBridgeImplSHA, piDiscussionRelayBridgeEntrySHA, piOrdinaryQuoteBridgeEntrySHA)
 }
 
-func qualifyPiInvestigationBridge(extensionPath string) string {
-	if entry := qualifyPiRunExplanationBridge(extensionPath); entry != "" {
-		return entry
+func qualifyPiInvestigationBridge(extensionPath string) qualifiedPiBridge {
+	if bridge := qualifyPiRunExplanationBridge(extensionPath); bridge.path != "" {
+		return bridge
 	}
-	if entry := qualifyPiDiscussionRelayBridge(extensionPath); entry != "" {
-		return entry
+	if bridge := qualifyPiDiscussionRelayBridge(extensionPath); bridge.path != "" {
+		return bridge
 	}
-	if entry := qualifyPiBridgePair(extensionPath, piPreJournalBridgeImplSHA, piPreJournalBridgeEntrySHA); entry != "" {
-		return entry
+	if bridge := qualifyPiBridgePair(extensionPath, piPreJournalBridgeImplSHA, piPreJournalBridgeEntrySHA); bridge.path != "" {
+		return bridge
 	}
 	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA, piInvestigationBridgeEntry200SHA)
 }
 
-func qualifyPiBridgePair(extensionPath, implSHA string, entrySHAs ...string) string {
+func qualifyPiBridgePair(extensionPath, implSHA string, entrySHAs ...string) qualifiedPiBridge {
 	if !filepath.IsAbs(extensionPath) {
-		return ""
+		return qualifiedPiBridge{}
 	}
 	// Pass the physical entry to Pi so the loader and this check agree on the
 	// base of the relative import, even with a configured symlink alias.
 	entry, err := filepath.EvalSymlinks(extensionPath)
 	if err != nil || filepath.Base(entry) != "index.ts" {
-		return ""
+		return qualifiedPiBridge{}
 	}
 	impl := filepath.Join(filepath.Dir(entry), "bridge.mjs")
-	if piBridgeBytesMatch(entry, entrySHAs...) && piBridgeBytesMatch(impl, implSHA) {
-		return entry
+	// Classify the schema from the same entry bytes used for qualification.
+	if entrySHA := piBridgeMatchingSHA(entry, entrySHAs...); entrySHA != "" && piBridgeBytesMatch(impl, implSHA) {
+		return qualifiedPiBridge{path: entry, sendMessageQuote: entrySHA == piOrdinaryQuoteBridgeEntrySHA && implSHA == piDiscussionRelayBridgeImplSHA}
 	}
-	// The integrated release is an exact alternative to either optional
+	// The integrated releases are exact alternatives to either optional
 	// profile's original pair. Never accept a mix of entry and parser releases.
 	integratedOK := implSHA == piRunExplanationImplSHA && slices.Contains(entrySHAs, piRunExplanationEntrySHA) ||
 		implSHA == piDiscussionRelayBridgeImplSHA && slices.Contains(entrySHAs, piDiscussionRelayBridgeEntrySHA)
-	if integratedOK && piBridgeBytesMatch(entry, piIntegratedBridgeEntrySHA) && piBridgeBytesMatch(impl, piIntegratedBridgeImplSHA) {
-		return entry
+	if integratedOK {
+		if entrySHA := piBridgeMatchingSHA(entry, piIntegratedQuoteBridgeEntrySHA, piIntegratedBridgeEntrySHA); entrySHA != "" && piBridgeBytesMatch(impl, piIntegratedBridgeImplSHA) {
+			return qualifiedPiBridge{path: entry, sendMessageQuote: entrySHA == piIntegratedQuoteBridgeEntrySHA}
+		}
 	}
-	return ""
+	return qualifiedPiBridge{}
 }
 
 func piBridgeBytesMatch(path string, digests ...string) bool {
+	return piBridgeMatchingSHA(path, digests...) != ""
+}
+
+func piBridgeMatchingSHA(path string, digests ...string) string {
 	const maxSize = 64 << 10
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
-		return false
+		return ""
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0444 == 0 || info.Size() > maxSize {
-		return false
+		return ""
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxSize+1))
+	if err != nil || len(data) > maxSize {
+		return ""
+	}
 	sum := sha256.Sum256(data)
-	return err == nil && len(data) <= maxSize && slices.Contains(digests, hex.EncodeToString(sum[:]))
+	digest := hex.EncodeToString(sum[:])
+	if !slices.Contains(digests, digest) {
+		return ""
+	}
+	return digest
 }
 
 // NewPiNativeSessionMemberToolAdapter is experimental and opt-in. It supports
 // text tool profiles only, with exact model, explicit thinking and a qualified
 // digest bridge. Legacy member tool execution does not require this bridge pair.
 func NewPiNativeSessionMemberToolAdapter(extensionPath string, config NativeMemberToolConfig, toolNames []string, options PiSessionOptions) Adapter {
+	options.Resume, options.Binding = cloneNativeSessionReference(options.Resume), bytes.Clone(options.Binding)
+	if options.ExpectedSendMessageQuote != nil {
+		quote := *options.ExpectedSendMessageQuote
+		options.ExpectedSendMessageQuote = &quote
+	}
 	return nativeSessionMemberToolAdapter{
 		memberToolAdapter: NewPiMemberToolAdapter(extensionPath, config.Path, toolNames).(memberToolAdapter),
 		configSHA256:      config.SHA256,
-		pi:                &PiSessionOptions{Resume: cloneNativeSessionReference(options.Resume), Binding: bytes.Clone(options.Binding)},
+		pi:                &options,
 	}
 }
 
@@ -188,14 +225,14 @@ type nativeSessionMemberToolAdapter struct {
 }
 
 func (a nativeSessionMemberToolAdapter) Capabilities(selected Provider) (AdapterCapabilities, error) {
-	bridge := ""
+	var bridge qualifiedPiBridge
 	if a.pi != nil {
 		bridge = qualifyPiNativeBridge(a.extensionPath)
 	}
 	return a.capabilities(selected, bridge)
 }
 
-func (a nativeSessionMemberToolAdapter) capabilities(selected Provider, bridge string) (AdapterCapabilities, error) {
+func (a nativeSessionMemberToolAdapter) capabilities(selected Provider, bridge qualifiedPiBridge) (AdapterCapabilities, error) {
 	if !nativeTextSessionProviderSupported(selected) {
 		return AdapterCapabilities{}, errExecutorConfiguration
 	}
@@ -203,7 +240,7 @@ func (a nativeSessionMemberToolAdapter) capabilities(selected Provider, bridge s
 	if err != nil {
 		return AdapterCapabilities{}, err
 	}
-	if a.pi != nil && bridge == "" {
+	if a.pi != nil && (bridge.path == "" || a.pi.ExpectedSendMessageQuote != nil && *a.pi.ExpectedSendMessageQuote != bridge.quoteFor(a.toolNames)) {
 		return AdapterCapabilities{}, errPiMemberToolConfiguration
 	}
 	caps.NativeResume = SupportSupported
@@ -214,7 +251,7 @@ func (a nativeSessionMemberToolAdapter) NewExecutor(selected Provider, timeout t
 	if timeout < 0 {
 		return nil, errExecutorConfiguration
 	}
-	bridge := ""
+	var bridge qualifiedPiBridge
 	if a.pi != nil {
 		bridge = qualifyPiNativeBridge(a.extensionPath)
 	}
@@ -230,14 +267,14 @@ func (a nativeSessionMemberToolAdapter) NewExecutor(selected Provider, timeout t
 		if err != nil || config.digest != a.configSHA256 || config.discussionRelay {
 			return nil, errPiMemberToolConfiguration
 		}
-		native, err := NewPiSessionExecutor(selected, bridge, path, a.toolNames, *a.pi, timeout)
+		native, err := NewPiSessionExecutor(selected, bridge.path, path, a.toolNames, *a.pi, timeout)
 		if err != nil {
 			return nil, err
 		}
 		// The bridge reopens the path; it must verify its own bytes before use.
 		pi := native.(piExecutor)
 		pi.memberTools.configSHA256 = a.configSHA256
-		return piDigestBoundExecutor{piExecutor: pi, configuredBridge: a.extensionPath}, nil
+		return piDigestBoundExecutor{piExecutor: pi, configuredBridge: a.extensionPath, sendMessageQuote: bridge.quoteFor(pi.memberTools.toolNames)}, nil
 	}
 	native, err := NewCodexAppServerSessionExecutor(selected, a.configPath, a.toolNames, *a.codex, timeout)
 	if err != nil {
@@ -254,6 +291,7 @@ func (a nativeSessionMemberToolAdapter) NewExecutor(selected Provider, timeout t
 type piDigestBoundExecutor struct {
 	piExecutor
 	configuredBridge    string
+	sendMessageQuote    bool // Effective native schema at construction, only for issued send_message.
 	investigationBridge bool
 	discussionRelay     bool
 }
@@ -274,7 +312,8 @@ func (e piDigestBoundExecutor) Execute(ctx context.Context, request ExecuteReque
 	case e.investigationBridge:
 		qualify = qualifyPiInvestigationBridge
 	}
-	if qualify(e.configuredBridge) != e.memberTools.extensionPath {
+	bridge := qualify(e.configuredBridge)
+	if bridge.path != e.memberTools.extensionPath || e.piSession != nil && bridge.quoteFor(e.memberTools.toolNames) != e.sendMessageQuote {
 		return ExecutionReceipt{Outcome: OutcomeUnknown, ExitCode: -1, Reason: "成员工具扩展无法确认，未调用进程，需对账"}
 	}
 	return e.piExecutor.Execute(ctx, request, onEvent)

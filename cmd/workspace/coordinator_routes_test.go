@@ -174,6 +174,7 @@ func TestRunCoordinatorConfigurationRoutes(t *testing.T) {
 				}
 				allowedCounts := map[string]int{
 					"groups": 1, "members": 2, "mutation_idempotency": 3,
+					"workspaces": 1, "projects": 1, "channels": 1,
 					"group_coordinator_bindings": 1, "group_coordinator_binding_revisions": 1,
 					"group_dispatch_policies": 1, "group_dispatch_policy_revisions": 2,
 				}
@@ -187,6 +188,14 @@ func TestRunCoordinatorConfigurationRoutes(t *testing.T) {
 					if count != allowedCounts[table] {
 						t.Fatalf("unexpected durable state in %s: count=%d want=%d", table, count, allowedCounts[table])
 					}
+				}
+				var linked int
+				if err := raw.QueryRow(`SELECT 1 FROM groups g
+					JOIN channels c ON c.legacy_group_id = g.id
+					JOIN projects p ON p.id = c.project_id AND p.legacy_origin_group_id = g.id
+					JOIN workspaces w ON w.id = p.workspace_id AND w.is_default = 1
+					WHERE g.id = ?`, group.ID).Scan(&linked); err != nil {
+					t.Fatalf("missing durable channel, originating project, or default workspace link for group %q: %v", group.ID, err)
 				}
 				if err := raw.QueryRow(`SELECT b.group_id,r.member_id,b.revision FROM group_coordinator_bindings b
 					JOIN group_coordinator_binding_revisions r USING(group_id,revision)`).Scan(&binding.GroupID, &binding.MemberID, &binding.Revision); err != nil || binding != wantBinding {

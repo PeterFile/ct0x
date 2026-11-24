@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"agentworkspace/internal/domain"
 )
@@ -287,11 +288,9 @@ func TestCoordinatorOperationsExactActorGroupOperationScopeFirst(t *testing.T) {
 
 func TestCoordinatorOperationsOpaqueIDsAndExactKeyBytes(t *testing.T) {
 	s, _ := openTestStore(t)
-	g := group(t, s)
 	groupID, memberID := "group:opaque|群\tinside", "member:opaque|员\tinside"
-	if _, err := s.db.Exec("UPDATE groups SET id=? WHERE id=?", groupID, g.ID); err != nil {
-		t.Fatal(err)
-	}
+	coordinationDecideExec(t, s, "INSERT INTO groups(id, name, description, created_at) VALUES(?, ?, ?, ?)",
+		groupID, "讨论组", "说明", time.Now().UTC().Format(timestampLayout))
 	m := member(t, s, groupID)
 	if _, err := s.db.Exec("UPDATE members SET id=? WHERE id=?", memberID, m.ID); err != nil {
 		t.Fatal(err)

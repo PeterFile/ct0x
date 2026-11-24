@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"agentworkspace/internal/domain"
 )
@@ -63,11 +64,9 @@ func TestRequestDispatchValidationAndChangedPayload(t *testing.T) {
 
 func TestRequestDispatchOpaqueIDsKeysAndPositiveInt64Maximum(t *testing.T) {
 	s, _ := openTestStore(t)
-	g := group(t, s)
 	groupID := "group:opaque|群\tinside"
-	if _, err := s.db.Exec("UPDATE groups SET id=? WHERE id=?", groupID, g.ID); err != nil {
-		t.Fatal(err)
-	}
+	coordinationDecideExec(t, s, "INSERT INTO groups(id, name, description, created_at) VALUES(?, ?, ?, ?)",
+		groupID, "讨论组", "说明", time.Now().UTC().Format(timestampLayout))
 	coord, worker := member(t, s, groupID).ID, member(t, s, groupID).ID
 	key := " \topaque\x00\r\n" + strings.Repeat("k", 5000) + " "
 	if _, err := s.SetCoordinator(ctx, groupID, coord, 0, key); err != nil {
