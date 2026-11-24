@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"unicode"
@@ -111,20 +112,24 @@ func validWorkInputID(id string) bool {
 
 // Select strict scalar decoding before Go JSON replacement characters can
 // alias verbatim source text or an MCP request binding.
-func memberToolSendAssessmentFields(body []byte) (continuation, excerpt bool) {
+func memberToolSendAssessmentFields(body []byte) (continuation, excerpt, decision bool) {
 	var probe struct {
 		Assessment struct {
 			Disposition string          `json:"disposition"`
 			Excerpt     json.RawMessage `json:"discussion_only_excerpt"`
+			Decision    json.RawMessage `json:"decision_context"`
 		} `json:"intent_assessment"`
 	}
 	err := json.Unmarshal(body, &probe)
-	return err == nil && probe.Assessment.Disposition == "continue_work", probe.Assessment.Excerpt != nil
+	return err == nil && probe.Assessment.Disposition == "continue_work", probe.Assessment.Excerpt != nil, probe.Assessment.Decision != nil
 }
 
 func sendMessageNeedsScalars(body []byte) bool {
-	continuation, excerpt := memberToolSendAssessmentFields(body)
-	return continuation || excerpt
+	continuation, excerpt, decision := memberToolSendAssessmentFields(body)
+	var probe struct {
+		Discussion json.RawMessage `json:"discussion"`
+	}
+	return continuation || excerpt || decision || json.Unmarshal(body, &probe) == nil && probe.Discussion != nil
 }
 
 func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Request, token string, raw json.RawMessage, content memberToolField[string], key string) (domain.ChatAssessmentReceipt, bool) {
@@ -159,7 +164,10 @@ func (a memberToolAPI) assessMemberChatIntent(w http.ResponseWriter, r *http.Req
 		assessment.ChatAssessment.DiscussionOnlyExcerpt = &assessment.DiscussionOnlyExcerpt.value
 	}
 	receipt, err := a.tools.AssessChatIntent(r.Context(), token, assessment.ChatAssessment, content.value, key)
-	if err != nil {
+	switch {
+	case errors.Is(err, store.ErrTaskWorkMutationUnknown):
+		taskWorkWriteError(w, "send_message", err)
+	case err != nil:
 		memberToolError(w, err)
 	}
 	return receipt, err == nil
@@ -200,10 +208,13 @@ func decodeContinueWork(raw json.RawMessage, content memberToolField[string]) (p
 // original arguments. In particular, never drop unknown or null fields to
 // manufacture a valid replay out of an invalid request.
 func memberMCPContinueWorkArguments(arguments json.RawMessage) json.RawMessage {
-	var input memberToolSendInput
+	var input struct {
+		Content    memberToolField[string]          `json:"content"`
+		Assessment memberToolField[json.RawMessage] `json:"intent_assessment"`
+	}
 	decoder := json.NewDecoder(bytes.NewReader(arguments))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&input) != nil || !input.Assessment.present || input.RecipientIDs.present {
+	if decoder.Decode(&input) != nil || !input.Assessment.present {
 		return arguments
 	}
 	proposal, ok := decodeContinueWork(input.Assessment.value, input.Content)

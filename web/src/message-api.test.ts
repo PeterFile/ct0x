@@ -35,6 +35,36 @@ it.each([
   expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toStrictEqual(input);
   expect(transport).toHaveBeenCalledTimes(1);
 });
+it("sends only the quote ID and does not confirm a receipt for a different or cross-group reference", async () => {
+  const quote = { message_id: "old-message", group_id: group.id, topic_id: "old-topic", sender_id: "old-member",
+    sender_name: "乙", source_kind: "unknown", excerpt: "只看本季度" };
+  const input = { content, reply_to_message_id: quote.message_id, reply_to: { ...quote, sender_name: "伪造" } };
+  const receipt = { ...message, reply_to: quote };
+  transport.mockResolvedValueOnce(json(receipt, 201));
+  expect(await sendMessage(group.id, input, "quote")).toEqual(receipt);
+  expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toEqual({ content, reply_to_message_id: quote.message_id });
+  for (const reply_to of [undefined, { ...quote, group_id: other.id }, { ...quote, message_id: "wrong" }]) {
+    transport.mockResolvedValueOnce(json({ ...message, reply_to }, 201));
+    await expect(sendMessage(group.id, input, "quote")).rejects.toMatchObject({ status: 201, code: "invalid_response" });
+  }
+  expect(decodeMessage({ ...message, reply_to: { ...quote, group_id: other.id } })).toEqual(message);
+});
+it("confirms routed quotes with matching display and raw evidence or the legacy raw ID alone", async () => {
+  const quote = { message_id: "original", group_id: group.id, topic_id: "prior-topic", sender_id: "author",
+    sender_name: "乙", source_kind: "member" as const, excerpt: "稳定原文" };
+  const input = { content, reply_to_message_id: quote.message_id };
+  const legacy = { ...message, topic_id: "current-topic", source_kind: "local_user_chat" as const, source_id: "command",
+    reply_to_message_id: quote.message_id };
+  const combined = { ...legacy, reply_to: quote };
+  transport.mockResolvedValueOnce(json(legacy, 201)).mockResolvedValueOnce(json(combined, 201));
+  expect(await sendMessage(group.id, input, "legacy")).toEqual(legacy);
+  expect(await sendMessage(group.id, input, "combined")).toEqual(combined);
+  expect(JSON.parse(String(transport.mock.calls[1][1]?.body))).toStrictEqual(input);
+  transport.mockResolvedValueOnce(json({ ...combined, reply_to_message_id: "wrong-id" }, 201));
+  await expect(sendMessage(group.id, input, "wrong-id")).rejects.toMatchObject({ code: "invalid_response" });
+  transport.mockResolvedValueOnce(json(combined, 201));
+  await expect(sendMessage(group.id, { ...input, topic_id: "" }, "explicit-main")).rejects.toMatchObject({ code: "invalid_response" });
+});
 it.each([undefined, "", "opaque-topic /?+"])("passes topic %s through without inventing a default", async topic => {
   const input = topic === undefined ? { content } : { content, topic_id: topic };
   transport.mockResolvedValueOnce(json({ ...message, topic_id: topic ?? "" }, 201));

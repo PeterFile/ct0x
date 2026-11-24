@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import type { KeyboardEvent, PointerEvent } from "react";
-import type { Message } from "./api";
+import { matchesMessageQuote } from "./api";
+import type { Message, MessageQuoteTarget } from "./api";
 
 type Anchor = { id: string; offset: number };
 type PageIntent = { kind: "older" | "reset" | "restore"; anchor: Anchor | null; revision: number; started: boolean };
@@ -13,6 +14,8 @@ const inputLifetime = 250;
 export function useMessageScroll(active: boolean, items: Message[], page: { pending: boolean; error: string }) {
   const historyRef = useRef<HTMLElement>(null), listRef = useRef<HTMLOListElement>(null);
   const [windowReset, setWindowReset] = useState(false);
+  const [quoteFocus, setQuoteFocus] = useState<{ quote: MessageQuoteTarget; revision: number; visibilityRevision: number } | null>(null);
+  const quoteVisibilityRevision = useRef(0);
   const saved = useRef<Anchor | null>(null), pageIntent = useRef<PageIntent | null>(null);
   const attempt = useRef<{ id: number; revision: number } | null>(null);
   const confirmed = useRef<{ id: string; revision: number } | null>(null);
@@ -49,7 +52,7 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     const history = historyRef.current;
     if (!history?.clientHeight) return;
     const anchor = capture();
-    saved.current = anchor ?? saved.current;
+    saved.current = listRef.current?.children.length ? anchor ?? saved.current : null;
     lastTop.current = history.scrollTop; atTail.current = isTail(history);
     return anchor;
   }
@@ -116,6 +119,12 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     // The browser moves to the fragment. A pending reset may finish before its scroll event.
     saved.current = { id, offset: 0 };
     recordReading();
+  }
+  function beginQuoteNavigation(quote: MessageQuoteTarget) {
+    clearInput(); remember(); recordReading();
+    const started = revision.current, visibilityRevision = quoteVisibilityRevision.current;
+    const isCurrent = () => revision.current === started && quoteVisibilityRevision.current === visibilityRevision;
+    return { isCurrent, focus: () => { if (isCurrent()) setQuoteFocus({ quote, revision: started, visibilityRevision }); } };
   }
   function onPointerDown(event: PointerEvent<HTMLElement>) {
     const history = historyRef.current, target = event.target;
@@ -187,12 +196,18 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
 
   useLayoutEffect(() => {
     const history = historyRef.current, entering = active && !wasActive.current;
+    // Hiding Discussion must invalidate in-flight quote jumps even when feed reads stay active.
+    if (!active && wasActive.current) ++quoteVisibilityRevision.current;
     wasActive.current = active;
     const arrived = items.some(message => !previousIDs.current.has(message.id));
     previousIDs.current = new Set(items.map(message => message.id));
     const noteChanged = previousNote.current !== windowReset;
     previousNote.current = windowReset;
-    if (!active) { pageIntent.current = null; clearInput(); return; }
+    if (!active) {
+      pageIntent.current = null; clearInput();
+      if (quoteFocus) setQuoteFocus(null);
+      return;
+    }
     if (!history?.clientHeight) return;
     if (entering) clearInput();
     if (entering && initialized.current) {
@@ -202,20 +217,35 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
     const intent = pageIntent.current;
     if (intent && page.pending) intent.started = true;
     let positioned = false;
-    const target = confirmed.current;
+    const requested = quoteFocus?.revision === revision.current && quoteFocus.visibilityRevision === quoteVisibilityRevision.current
+      ? quoteFocus.quote : undefined;
+    const original = requested && items.find(message => message.id === requested.message_id);
+    const focusQuote = requested && original && matchesMessageQuote(requested, original);
+    if (quoteFocus && (!requested || original && !focusQuote)) setQuoteFocus(null);
+    const target = focusQuote ? { id: original.id, revision: revision.current } : confirmed.current;
     if (target && target.revision === revision.current && show(target.id)) {
       confirmed.current = null; setWindowReset(false); positioned = true;
-      // An automatic reset following reactivation must not undo the confirmed presentation.
+      // An in-flight page must not undo the confirmed presentation.
       if (intent) { intent.kind = "restore"; intent.anchor = saved.current; }
+      if (focusQuote) {
+        nodeFor(target.id)?.querySelector("article")?.focus({ preventScroll: true });
+        setQuoteFocus(null);
+      }
     }
     if (intent?.started && !page.pending) {
       intent.started = false;
       if (!page.error) {
         if (!positioned && intent.revision === revision.current) {
-          if (intent.kind === "reset") { latest(); setWindowReset(false); }
+          if (intent.kind === "reset" || (intent.kind === "restore" && !intent.anchor)) { latest(); setWindowReset(false); }
           else if (!restore(intent.anchor) && intent.kind === "restore" && intent.anchor) {
             latest(); setWindowReset(true);
-          } else setWindowReset(false);
+          } else {
+            setWindowReset(false);
+            if (intent.kind === "older" && !intent.anchor && items.length) {
+              // Refresh the empty window's stale tail state whenever older visible items arrive.
+              remember();
+            }
+          }
           positioned = true;
         }
         pageIntent.current = null;
@@ -232,9 +262,9 @@ export function useMessageScroll(active: boolean, items: Message[], page: { pend
       else restore(saved.current);
     }
     if (!arrived && !page.pending) atTail.current = isTail(history);
-  }, [active, items, page.pending, page.error, windowReset]);
+  }, [active, items, page.pending, page.error, windowReset, quoteFocus]);
 
   return { historyRef, listRef, onScroll, onReadingIntent, onNavigateReference, onPointerDown, onPointerMove, onPointerEnd, onKeyDown,
-    beforeOlder: () => beforePage("older"), beforeReset: () => beforePage("reset"),
+    beginQuoteNavigation, beforeOlder: () => beforePage("older"), beforeReset: () => beforePage("reset"),
     beginSend, confirmSend, windowReset };
 }

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile, unlink } from "node:fs/promises";
+import { readFile, readdir, unlink } from "node:fs/promises";
+import { dirname } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { loadExtensions } from "./pi-loader.mjs";
+import { loadExtensions, loadSessionSDK } from "./pi-loader.mjs";
 import { BASE, TOKEN, json, loopback, privateConfig, safeFailure } from "./helpers.mjs";
 
 const entry = fileURLToPath(new URL("../index.ts", import.meta.url));
@@ -71,7 +72,8 @@ test("actual Pi 1.4.0 loader registers the native tools with closed schemas", as
     assert.equal(schema.properties.before.type, "string");
   }
   const send = tools.get("send_message").parameters;
-  assert.deepEqual(Object.keys(send.properties).sort(), ["content", "intent_assessment", "recipient_ids"]);
+  assert.deepEqual(Object.keys(send.properties).sort(), ["content", "intent_assessment", "recipient_ids", "reply_to_message_id"]);
+  assert.equal(send.properties.reply_to_message_id.type, "string");
   assert.equal(send.properties.intent_assessment.additionalProperties, false);
   assert.deepEqual(send.properties.intent_assessment.properties.disposition.anyOf.map(schema => schema.const),
     ["discuss", "clarify", "request_work", "prepare_work"]);
@@ -85,6 +87,42 @@ test("actual Pi 1.4.0 loader registers the native tools with closed schemas", as
   assert.deepEqual(Object.keys(create.properties).sort(), ["name", "reason", "role"]);
   assert.deepEqual([...create.required].sort(), ["name", "reason", "role"]);
   for (const schema of Object.values(create.properties)) assert.equal(schema.type, "string");
+});
+
+test("plain reply_to_message_id and optional recipients reach HTTP unchanged", async t => {
+  const receipt = { message_id: "reply", created_at: "2026-11-20T00:00:00Z", delivery_count: 0, content_omitted: true };
+  const { tools, requests } = await toolsFor(t, (_, response) => json(response, receipt, 201));
+  const send = tools.get("send_message");
+  const plain = { content: "直接接话。" };
+  const quote = { content: "引用旧原文。", reply_to_message_id: "\ufeffe\u0301🙂" };
+  for (const [index, payload] of [plain, { ...plain, recipient_ids: [] }, quote,
+    { ...quote, recipient_ids: [] }, { ...quote, reply_to_message_id: "🙂".repeat(64), recipient_ids: ["peer"] }].entries()) {
+    const args = send.prepareArguments(payload);
+    assert.deepEqual(args, payload);
+    const id = `reply-${index}`;
+    await execute(send, args, undefined, id);
+    assert.equal(requests.length, index + 1);
+    assert.equal(requests[index].url, `${BASE}/send_message`);
+    assert.deepEqual(requests[index].body, Buffer.from(JSON.stringify(payload)));
+    assert.equal(requests[index].headers["idempotency-key"], createHash("sha256").update("send_message" + id).digest("hex"));
+  }
+});
+
+test("invalid reply_to_message_id and conflicting structured input fail before Pi coercion or HTTP", async t => {
+  const { tools, requests } = await toolsFor(t);
+  const send = tools.get("send_message");
+  const quote = { content: "引用旧原文。", reply_to_message_id: "old-message" };
+  for (const input of [
+    ...[undefined, null, 42, false, {}, [], "", ".", "..", " id", "id\u3000", "a\u0085b", "a\u0000b", "\ud800", "🙂".repeat(64) + "x"]
+      .map(reply_to_message_id => ({ ...quote, reply_to_message_id })),
+    { ...quote, recipient_ids: null }, { ...quote, recipient_ids: [1] },
+    ...[undefined, null, { disposition: "discuss", reason: "只讨论" }].map(intent_assessment => ({ ...quote, intent_assessment })),
+    { ...quote, discussion: null },
+  ]) {
+    assert.throws(() => send.prepareArguments(input), /未发送/);
+    await assert.rejects(execute(send, input), /未发送/);
+  }
+  assert.equal(requests.length, 0);
 });
 
 test("contextual chat assessment uses the existing send transport without caller or grants", async t => {
@@ -409,6 +447,128 @@ test("issued intake guidance separates continuation, new investigation, and lite
   ]) {
     await assert.rejects(execute(send, { content: "fixture", intent_assessment }), error => safeFailure(error, /未发送/));
   }
+});
+
+test("only issued relay intake advertises discussion; raw ambiguous fields cannot fall through", async t => {
+  const payload = { content: "请核对来源。", discussion: { kind: "invite", recipient_id: "peer", expected_reply: "原始来源。" } };
+  const off = await toolsFor(t);
+  const ordinary = off.tools.get("send_message");
+  assert.equal(ordinary.parameters.properties.discussion, undefined);
+  assert.throws(() => ordinary.prepareArguments({ ...payload, discussion: null }), /未发送/);
+  await assert.rejects(execute(ordinary, payload), /未发送/);
+  assert.equal(off.requests.length, 0);
+
+  const receipt = { message_id: "invite", created_at: "2026-11-18T00:00:00Z", delivery_count: 1, content_omitted: true };
+  const server = await loopback(t, (_, response) => json(response, receipt, 201));
+  const path = await privateConfig(t, { endpoint: server.endpoint, discussion_relay: true, discussion_only_excerpt: true,
+    continue_work: true, intake_assessment_action: "read_only_investigation" });
+  const digest = createHash("sha256").update(await readFile(path)).digest("hex");
+  const { extensions, errors } = await load(path, digest);
+  assert.deepEqual(errors, []);
+  const send = extensions[0].tools.get("send_message").definition;
+  const fields = send.parameters.properties;
+  assert.deepEqual(Object.keys(fields.discussion.properties).sort(), ["expected_reply", "kind", "recipient_id"]);
+  assert.ok(fields.intent_assessment.properties.discussion_only_excerpt);
+  assert.ok(fields.intent_assessment.properties.followup);
+  assert.ok(fields.intent_assessment.properties.action.anyOf.some(action => action.const === "read_only_investigation"));
+  assert.match(extensions[0].tools.get("read_channel").definition.description, /discussion_context/);
+  assert.deepEqual(send.prepareArguments(payload), payload);
+  for (const input of [
+    { ...payload, discussion: null }, { ...payload, recipient_ids: [] }, { ...payload, recipient_ids: null },
+    { ...payload, intent_assessment: { disposition: "discuss", reason: "讨论" } },
+    { ...payload, reply_to_message_id: "old-message" }, { ...payload, reply_to_message_id: null },
+    { ...payload, discussion: { ...payload.discussion, recipient_id: null } },
+    { ...payload, discussion: { ...payload.discussion, expected_reply: null } },
+    { ...payload, discussion: { kind: "invite" } },
+    { ...payload, discussion: { kind: "reply", recipient_id: "" } },
+    { ...payload, discussion: { kind: "resolve", expected_reply: "" } },
+    { ...payload, discussion: { kind: "reply", candidate_id: "forged" } },
+  ]) {
+    assert.throws(() => send.prepareArguments(input), /未发送/);
+    await assert.rejects(execute(send, input), /未发送/);
+  }
+  assert.equal(server.requests.length, 0);
+  assert.equal((await execute(send, payload)).content[0].text, JSON.stringify(receipt));
+  assert.deepEqual(JSON.parse(server.requests[0].body), payload);
+
+  // Each string is exactly 1024 bytes after Go's compact JSON encoding.
+  assert.equal(fields.discussion.properties.expected_reply.maxLength, 1022);
+  for (const atLimit of ["x".repeat(1022), "中".repeat(340) + "ab",
+    '"\\\n\b\f\r\t'.repeat(73), "<>&\u2028\u2029".repeat(34) + "ab"]) {
+    const withExpected = expected_reply => ({ ...payload, discussion: { ...payload.discussion, expected_reply } });
+    const exact = withExpected(atLimit), oversized = withExpected(atLimit + "x");
+    assert.deepEqual(send.prepareArguments(exact), exact);
+    const sent = server.requests.length;
+    assert.throws(() => send.prepareArguments(oversized), /未发送/);
+    await assert.rejects(execute(send, oversized), /未发送/);
+    assert.equal(server.requests.length, sent);
+    await execute(send, exact, undefined, `limit-${sent}`);
+    assert.deepEqual(JSON.parse(server.requests.at(-1).body), exact);
+  }
+});
+
+test("real Pi 1.4.0 SDK invokes native relay tools and stops writes on an unknown receipt", async t => {
+  const page = { items: [], next_cursor: "" };
+  let writes = 0;
+  const server = await loopback(t, (request, response) => {
+    if (request.url.endsWith("/read_channel")) return json(response, page);
+    const rejected = ++writes === 1;
+    json(response, { error: { code: rejected ? "invalid_input" : "internal_error", message: "offline fixture" } }, rejected ? 400 : 500);
+  });
+  const path = await privateConfig(t, { endpoint: server.endpoint, discussion_relay: true });
+  const sha = bytes => createHash("sha256").update(bytes).digest("hex");
+  const loaded = await load(path, sha(await readFile(path)));
+  assert.deepEqual(loaded.errors, []);
+  const { createAgentSession, SessionManager, SettingsManager } = await loadSessionSDK();
+  const directory = dirname(path);
+  const deny = name => () => assert.fail(`unexpected ${name}`);
+  t.mock.method(globalThis, "fetch", deny("network fetch"));
+  const modelRuntime = new Proxy({}, { get: (_target, name) => deny(String(name)) });
+  const model = { id: "relay-fixture", name: "Synthetic", provider: "synthetic", api: "synthetic-no-network",
+    baseUrl: "http://127.0.0.1:1", reasoning: false, input: ["text"], contextWindow: 8192, maxTokens: 1,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+  const profile = ["list_members", "read_channel", "send_message", "search_history", "read_history"];
+  const { session } = await createAgentSession({
+    cwd: directory, agentDir: directory, model, modelRuntime, thinkingLevel: "off", noTools: "builtin", tools: [...profile],
+    sessionManager: SessionManager.inMemory(directory),
+    settingsManager: SettingsManager.inMemory({ retry: { enabled: false }, cacheWarming: "off", enableInstallTelemetry: false }),
+    resourceLoader: {
+      getExtensions: () => loaded, getSkills: () => ({ skills: [], diagnostics: [] }), getPrompts: () => ({ prompts: [], diagnostics: [] }),
+      getThemes: () => ({ themes: [], diagnostics: [] }), getAgentsFiles: () => ({ agentsFiles: [] }),
+      getSystemPrompt: () => "Offline relay fixture.", getSystemPromptSource: () => undefined,
+      getAppendSystemPrompt: () => [], getAppendSystemPromptSources: () => [], extendResources: deny("resources"), reload: deny("reload"),
+    },
+  });
+  try {
+    session.agent.streamFn = deny("agent stream");
+    session.agent.prompt = deny("agent prompt");
+    session.prompt = deny("session prompt");
+    await session.bindExtensions({ mode: "json" });
+    assert.deepEqual(session.getActiveToolNames(), profile);
+    assert.deepEqual(session.getCallableToolNames(), profile);
+    const native = new Map(session.agent.state.tools.map(tool => [tool.name, tool]));
+    const send = (id, params) => native.get("send_message").execute(id, params);
+    const invite = { content: "请核对来源。", discussion: { kind: "invite", recipient_id: "peer" } };
+    await assert.rejects(send("definite", invite), error => safeFailure(error, /invalid_input/) && !error.message.includes("未知"));
+    let original;
+    await assert.rejects(send("uncertain", invite), error => {
+      original = error;
+      return safeFailure(error, /结果未知.*幂等键.*对账/);
+    });
+    assert.equal(writes, 2, "a definite rejection must not stop the next valid write");
+    assert.deepEqual(JSON.parse(server.requests[1].body), invite);
+    assert.equal(server.requests[1].headers["idempotency-key"], sha("send_messageuncertain"));
+    await assert.rejects(send("uncertain", invite), error => error === original);
+    await assert.rejects(send("uncertain", { ...invite, content: "不同请求。" }), /阻止后续写入/);
+    const channel = await native.get("read_channel").execute("reconcile", {});
+    assert.deepEqual(channel.content, [{ type: "text", text: JSON.stringify(page) }]);
+    await assert.rejects(send("new-key", invite), /阻止后续写入/);
+    assert.equal(writes, 2);
+    assert.equal(server.requests.length, 3, "only an additional read may reach HTTP");
+  } finally {
+    session.dispose();
+  }
+  assert.deepEqual(await readdir(directory), ["capability.json"]);
 });
 
 test("strict investigation registers only the digested tool set and blocks host calls", async t => {

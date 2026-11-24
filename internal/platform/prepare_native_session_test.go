@@ -20,6 +20,7 @@ import (
 
 func TestNativeSessionPrepareDefaultOffAndKnownSelectionOnly(t *testing.T) {
 	f, _ := nativeSessionPreparation(t, "generic")
+	useReleasePiBridge(t, f)
 	f.opts.EnableNativeSessionResume, f.opts.NativePiThinking = false, ""
 	p := f.preparer(t)
 	legacy, err := p.Prepare(context.Background(), f.pending)
@@ -144,6 +145,9 @@ func TestNativeSessionPreparePiExplicitTextProfile(t *testing.T) {
 			if receipt.Outcome != provider.OutcomeSucceeded || receipt.NativeRef.Pi != nil || receipt.NativeRef.Codex != nil {
 				t.Fatal("missing Pi capture fabricated a native payload or changed execution truth")
 			}
+			if strings.Contains(string(receipt.NativeRef.Binding), `"pi_send_message_quote"`) {
+				t.Fatal("text role without send_message gained an ordinary schema marker")
+			}
 		})
 	}
 }
@@ -186,6 +190,135 @@ func TestNativeSessionPreparePiNonRoleThinkingIsIndependent(t *testing.T) {
 			if thinking, selectedModel, native := prepare(); thinking != "" || selectedModel != "model-alias" || native {
 				t.Fatal("legacy-supported model alias was not left on the fresh legacy path")
 			}
+		})
+	}
+}
+
+func TestNativeSessionPreparePiOrdinaryQuoteSchemaCompatibility(t *testing.T) {
+	f, prepared := nativeSessionPreparation(t, "generic")
+	legacy := f.opts.PiMemberToolsExtension
+	// Dropping a registered table must fail closed rather than falling back.
+	f.exec(t, "DROP TABLE IF EXISTS message_quotes")
+	if _, err := f.preparer(t).Prepare(t.Context(), f.pending); err == nil {
+		t.Fatal("missing message_quotes while registered must fail closed")
+	}
+	// On an intact database, the quote schema describes the tool, not this message.
+	f, prepared = nativeSessionPreparation(t, "generic")
+	legacy = f.opts.PiMemberToolsExtension
+	useReleasePiBridge(t, f)
+	quote := f.opts.PiMemberToolsExtension
+	upgraded, err := f.preparer(t).Prepare(t.Context(), f.pending)
+	prepareRoleOK(t, err)
+	if upgraded.Request != prepared.Request || !slices.Equal(upgraded.ResourceKeys, prepared.ResourceKeys) {
+		t.Fatal("the ordinary no-quote prompt or workspace changed with the bridge upgrade")
+	}
+	prior, receipt, call := runNativeSessionFixture(t, f, prepared, nil, provider.OutcomeSucceeded, true)
+	if call.resume != nil || receipt.NativeRef == nil || receipt.NativeRef.Pi == nil {
+		t.Fatal("first legacy run must capture a fresh native session")
+	}
+	for _, step := range []struct {
+		name, entry string
+		resume      bool
+	}{
+		{"legacy-same", legacy, true},
+		{"old-to-new", quote, false},
+		{"quote-same", quote, true},
+		{"new-to-old", legacy, false},
+		{"legacy-same-after-rollback", legacy, true},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			f.opts.PiMemberToolsExtension = step.entry
+			prepared := nextNativeSessionPreparation(t, f)
+			if preparationQuote(t, decodePreparation(t, prepared.Request.Prompt)) != nil {
+				t.Fatal("no-quote turn unexpectedly has quoted context")
+			}
+			priorID, priorNativeID := prior.TurnID, receipt.NativeSessionID
+			prior, receipt, call = runNativeSessionFixture(t, f, prepared, nil, provider.OutcomeSucceeded, true)
+			b := decodeNativeFixtureBinding(t, receipt)
+			if b.Purpose != "generic" || !slices.Contains(b.Profile.Tools, "send_message") || receipt.NativeRef.Pi == nil {
+				t.Fatal("fixture must capture a native run with actually issued send_message")
+			}
+			if want := step.entry == quote; b.Profile.PiSendMessageQuote != want || strings.Contains(string(receipt.NativeRef.Binding), `"pi_send_message_quote"`) != want {
+				t.Fatal("ordinary binding did not record only the qualified quote schema")
+			}
+			wantSource := ""
+			if step.resume {
+				wantSource = priorID
+			}
+			if (call.resume != nil) != step.resume || (receipt.NativeSessionID == priorNativeID) != step.resume || b.ResumedFromTurnID != wantSource {
+				t.Errorf("picked resume=%t, source=%q; want resume=%t, source=%q", call.resume != nil, b.ResumedFromTurnID, step.resume, wantSource)
+			}
+		})
+	}
+}
+
+func TestNativeSessionPreparePiOrdinaryQuoteBridgeSwap(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		startQuote bool
+		afterBuild bool
+	}{
+		{"upgrade-before-construction", false, false},
+		{"rollback-before-construction", true, false},
+		{"upgrade-before-invocation", false, true},
+		{"rollback-before-invocation", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, _ := nativeSessionPreparation(t, "generic")
+			legacy := f.opts.PiMemberToolsExtension
+			useReleasePiBridge(t, f)
+			quote := f.opts.PiMemberToolsExtension
+			active := t.TempDir()
+			f.opts.PiMemberToolsExtension = filepath.Join(active, "index.ts")
+			install := func(entry string) {
+				for _, name := range []string{"index.ts", "bridge.mjs"} {
+					data, err := os.ReadFile(filepath.Join(filepath.Dir(entry), name))
+					prepareRoleOK(t, err)
+					prepareRoleOK(t, os.WriteFile(filepath.Join(active, name), data, 0600))
+				}
+				if !provider.PiNativeSessionBridgeSupported(f.opts.PiMemberToolsExtension) {
+					t.Fatal("both releases must qualify at the same physical entry path")
+				}
+			}
+			before, after := legacy, quote
+			if tc.startQuote {
+				before, after = after, before
+			}
+			install(before)
+			ctx := t.Context()
+			prepared, err := f.preparer(t).Prepare(ctx, f.pending)
+			prepareRoleOK(t, err)
+			run := prepared.Executor.(*memberToolRuntimeRun)
+			factory := run.nativeSession.factory
+			calls := 0
+			run.nativeSession.factory = func(config provider.NativeMemberToolConfig, names []string, ref *provider.NativeSessionReference, binding json.RawMessage) (provider.Executor, error) {
+				calls++
+				if !tc.afterBuild {
+					install(after) // A current binding has already been selected.
+					return factory(config, names, ref, binding)
+				}
+				e, err := factory(config, names, ref, binding)
+				prepareRoleOK(t, err)
+				install(after)
+				return e, nil
+			}
+			turn, err := f.s.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group.ID, DeliveryID: f.pending.Delivery.ID,
+				MaxActive: 1, ResourceKeys: prepared.ResourceKeys})
+			prepareRoleOK(t, err)
+			req := prepared.Request
+			req.RunID, req.RuntimeDir = turn.ID, f.runtimeOptions.RoleExecutionRoot
+			got := run.Execute(ctx, req, nil)
+			wantOutcome := provider.OutcomeNotStarted
+			if tc.afterBuild {
+				wantOutcome = provider.OutcomeUnknown // Keep the adapter's invocation-fence receipt semantics.
+			}
+			if calls != 1 || got.Started || got.Outcome != wantOutcome || got.NativeRef != nil && got.NativeRef.Pi != nil {
+				t.Fatalf("schema drift crossed the native gate or retried: calls=%d, started=%t, outcome=%s (%s)", calls, got.Started, got.Outcome, got.Reason)
+			}
+			if _, err := os.Stat(filepath.Join(filepath.Dir(f.opts.PrivateWorkspaceRoot), "invoked")); !os.IsNotExist(err) {
+				t.Fatalf("schema drift invoked the sentinel CLI: %v", err)
+			}
+			memberToolRuntimeEmpty(t, f.runtimeOptions.ConfigRoot)
 		})
 	}
 }

@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Message } from "./api";
 import { Discussion } from "./Discussion";
+import { useMessageScroll } from "./useMessageScroll";
 import { deferred, group, json, other, page } from "./test/groups";
 import { delivery, message } from "./test/messages";
 
@@ -292,6 +293,117 @@ it.each([["send", "原始问题", 2], ["reset", "对应邀请", 4]] as const)(
   },
 );
 
+it.each([true, false])("jumps and focuses the exact quoted message (already loaded=%s)", async loaded => {
+  const original = { ...row(2), id: "old/#季度", sender_id: "retired-member", topic_id: "old-topic" };
+  const reply: Message = { ...row(8), reply_to_message_id: original.id,
+    reply_to: { message_id: original.id, group_id: group.id, topic_id: original.topic_id,
+      sender_id: original.sender_id, sender_name: "历史作者", source_kind: "unknown", excerpt: "只看本季度" } };
+  const items = [...initial.slice(2, 7), reply];
+  if (loaded) items.unshift(original);
+  details.mockResolvedValueOnce(json(original));
+  await open(items);
+  const input = within(scope()).getByRole("textbox", { name: "消息内容" });
+  fireEvent.change(input, { target: { value: "未发送的草稿" } });
+  const link = within(item(reply.id)).getByRole("link", { name: /历史作者.*只看本季度/ });
+  fireEvent.click(link); await flush();
+  expect(within(item(original.id)).getByRole("article")).toHaveFocus();
+  expectVisible(original.id);
+  expect(input).toHaveValue("未发送的草稿");
+  expectRequests(loaded ? [latestURL()] : [latestURL(), `/api/v1/groups/${group.id}/messages/${encodeURIComponent(original.id)}`]);
+});
+
+it("shows an ID-only receipt without an excerpt and jumps to the exact out-of-page original", async () => {
+  const original = { ...row(1), id: "old/#季度", topic_id: "prior-topic" };
+  const reply = { ...row(9), content: raw, topic_id: original.topic_id, reply_to_message_id: original.id };
+  // The user selects an original, but the history window moves before the receipt.
+  await open([original, ...initial.slice(2)]);
+  fireEvent.click(button(`回复，消息 ${original.id}`));
+  reads.mockResolvedValueOnce(page(initial.slice(2)));
+  fireEvent.click(button("刷新并重置历史窗口")); await flush();
+  expect(screen.queryByRole("article", { name: `消息 ${original.id}` })).not.toBeInTheDocument();
+  writes.mockResolvedValueOnce(json(reply, 201));
+  send(); await flush();
+  expect(screen.getByText(/消息已持久化/)).toBeVisible();
+  const link = within(item(reply.id)).getByRole("link", { name: /引用.*查看原消息/ });
+  expect(link).toHaveTextContent(original.id);
+  expect(link).not.toHaveTextContent(original.content);
+  details.mockResolvedValueOnce(json(original));
+  fireEvent.click(link); await flush();
+  const target = within(item(original.id)).getByRole("article");
+  expect(link).toHaveAttribute("href", `#${target.id}`);
+  expect(target).toHaveFocus(); expectVisible(original.id);
+  expectRequests([latestURL(), latestURL(), `/api/v1/groups/${group.id}/messages`,
+    `/api/v1/groups/${group.id}/messages/${encodeURIComponent(original.id)}`]);
+});
+
+it.each(["different topic", "new reading position"])("does not jump on a late out-of-page quote read: %s", async reason => {
+  const original = row(1);
+  const reply: Message = { ...row(8), reply_to: { message_id: original.id, group_id: group.id, topic_id: original.topic_id,
+    sender_id: original.sender_id, sender_name: "", source_kind: "unknown", excerpt: "之前的原文" } };
+  const pending = deferred<Response>(); details.mockReturnValueOnce(pending.promise);
+  await open([...initial.slice(1, 7), reply]);
+  readAt(history(), 230);
+  fireEvent.click(within(item(reply.id)).getByRole("link", { name: /之前的原文/ }));
+  if (reason === "new reading position") readAt(history(), 350);
+  const top = history().scrollTop;
+  await act(async () => pending.resolve(json(reason === "different topic" ? { ...original, topic_id: "unrelated-topic" } : original)));
+  expect(history().scrollTop).toBe(top);
+  expect(screen.queryByRole("article", { name: `消息 ${original.id}` })).not.toBeInTheDocument();
+  if (reason === "different topic") expect(screen.getByRole("alert")).toHaveTextContent("被引原消息与引用不符");
+  expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages/${original.id}`]);
+});
+
+it("ignores a late quote read after hiding Discussion and returning to the draft", async () => {
+  const original = row(1);
+  const reply: Message = { ...row(8), reply_to: { message_id: original.id, group_id: group.id, topic_id: original.topic_id,
+    sender_id: original.sender_id, sender_name: "", source_kind: "unknown", excerpt: "之前的原文" } };
+  const pending = deferred<Response>(); details.mockReturnValueOnce(pending.promise);
+  const view = await open([...initial.slice(1, 7), reply]);
+  const panel = scope();
+  fireEvent.click(within(item(reply.id)).getByRole("link", { name: /之前的原文/ }));
+  view.rerender(<Discussion groupId={group.id} active={false} members={{}} />);
+  view.rerender(<Discussion groupId={group.id} active={true} members={{}} />); await flush();
+  expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages/${original.id}`]);
+
+  const input = within(panel).getByRole("textbox", { name: "消息内容" }), draft = "继续编辑的草稿";
+  input.focus(); fireEvent.change(input, { target: { value: draft } });
+  await act(async () => pending.resolve(json(original)));
+  expect(screen.queryByRole("article", { name: `消息 ${original.id}` })).not.toBeInTheDocument();
+  expect(input).toHaveFocus();
+  expect(input).toHaveValue(draft);
+});
+
+it("invalidates a pending quote navigation handle after hiding even when the feed stays alive", () => {
+  const original = row(1), quote = { message_id: original.id, group_id: group.id, topic_id: original.topic_id, sender_id: original.sender_id };
+  let navigation: ReturnType<ReturnType<typeof useMessageScroll>["beginQuoteNavigation"]> | undefined;
+  let currentBegin: ReturnType<typeof useMessageScroll>["beginQuoteNavigation"] | undefined;
+  function Harness({ active, items }: { active: boolean; items: Message[] }) {
+    const scroll = useMessageScroll(active, items, { pending: false, error: "" });
+    currentBegin = scroll.beginQuoteNavigation;
+    return <div className="discussion-scope" hidden={!active}>
+      <section className="message-history" ref={scroll.historyRef}>
+        <ol className="message-list" ref={scroll.listRef}>
+          {items.map(entry => <li key={entry.id} data-message-id={entry.id}>
+            <article tabIndex={-1} aria-label={`消息 ${entry.id}`}>{entry.content}</article>
+          </li>)}
+        </ol>
+      </section>
+      <textarea aria-label="草稿输入" />
+    </div>;
+  }
+  const view = render(<Harness active={true} items={initial.slice(1)} />);
+  act(() => { navigation = currentBegin!(quote); });
+  expect(navigation!.isCurrent()).toBe(true);
+  view.rerender(<Harness active={false} items={initial.slice(1)} />);
+  expect(navigation!.isCurrent()).toBe(false);
+  view.rerender(<Harness active={true} items={initial} />);
+  const input = screen.getByRole("textbox", { name: "草稿输入" });
+  input.focus();
+  act(() => { navigation!.focus(); });
+  expect(input).toHaveFocus();
+  expect(screen.getByRole("article", { name: `消息 ${original.id}` })).not.toHaveFocus();
+});
+
 it("does not suppress a confirmed send merely because the reader clicked a message without scrolling", async () => {
   await open(); readAt(history(), 230); const pending = deferred<Response>(); writes.mockReturnValueOnce(pending.promise); send();
   fireEvent.pointerDown(item(row(3).id));
@@ -319,6 +431,55 @@ it.each([503, 413])("does not jump or invent messages for an unknown/rejected HT
   expect(screen.getByRole("alert")).toHaveTextContent(String(status)); expect(history().scrollTop).toBe(230);
   expect(screen.getAllByRole("article")).toHaveLength(8); expect(writes).toHaveBeenCalledTimes(1);
   expectRequests([latestURL(), `/api/v1/groups/${group.id}/messages`]);
+});
+
+it("does not follow a poll to the tail after older paging reveals the first visible messages", async () => {
+  const begin: Message = { ...row(9), source_kind: "platform", source_id: "workspace_begin:op-1" };
+  await open([begin]);
+  const container = screen.getByRole("region", { name: "消息记录" });
+  expect(within(container).queryByRole("article")).not.toBeInTheDocument();
+  const pending = deferred<Response>(); reads.mockReturnValueOnce(pending.promise);
+  fireEvent.click(within(container).getByRole("button", { name: "加载更早消息" }));
+  await act(async () => pending.resolve(page(initial)));
+  const first = initial[0].id, top = container.scrollTop, before = offset(first);
+  expect(container.scrollHeight).toBeGreaterThan(container.clientHeight);
+  expect(top).toBe(0); expectVisible(first);
+
+  const newest = row(10);
+  reads.mockResolvedValueOnce(page([begin, newest])); await poll();
+  expect(item(newest.id)).toBeInTheDocument();
+  expect(container.scrollTop).toBe(top); expect(offset(first)).toBe(before);
+  expectRequests([latestURL(), olderURL, latestURL()]);
+});
+
+it("does not follow a poll to the tail after an initialized group resets to a trace-only window and loads older messages", async () => {
+  const begin: Message = { ...row(9), source_kind: "platform", source_id: "workspace_begin:op-1" };
+  const view = await open(initial);
+  const container = screen.getByRole("region", { name: "消息记录" });
+  reads.mockResolvedValueOnce(page([begin], "older+/"));
+  fireEvent.click(button("刷新并重置历史窗口"));
+  await flush();
+  expect(within(container).queryByRole("article")).not.toBeInTheDocument();
+
+  view.rerender(<Discussion groupId={undefined} members={{}} />);
+  reads.mockResolvedValueOnce(page([begin], "older+/"));
+  view.rerender(<Discussion groupId={group.id} members={{}} />);
+  await flush();
+  expect(screen.queryByText(resetNotice)).not.toBeInTheDocument();
+
+  const pending = deferred<Response>(); reads.mockReturnValueOnce(pending.promise);
+  fireEvent.click(within(container).getByRole("button", { name: "加载更早消息" }));
+  tops.set(container, 10); fireEvent.scroll(container);
+  await act(async () => pending.resolve(page(initial)));
+  const first = initial[0].id, top = container.scrollTop, before = offset(first);
+  expect(container.scrollHeight).toBeGreaterThan(container.clientHeight);
+  expect(top).toBe(10);
+
+  const newest = row(10);
+  reads.mockResolvedValueOnce(page([begin, newest])); await poll();
+  expect(item(newest.id)).toBeInTheDocument();
+  expect(container.scrollTop).toBe(top); expect(offset(first)).toBe(before);
+  expectRequests([latestURL(), latestURL(), latestURL(), olderURL, latestURL()]);
 });
 
 it.each([false, true])("restores a real prepend anchor, not total height delta (native anchoring=%s)", async native => {

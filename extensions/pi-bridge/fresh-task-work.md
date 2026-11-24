@@ -53,10 +53,11 @@ If a write's receipt can't be confirmed, the bridge refuses replays and all
 later writes in that client, even after a successful read. Only the first
 unconfirmed write adds `result.details.agent_workspace_write_unknown_v1` to
 Pi's native `tool_execution_end`. The record holds the bound role and RunID,
-operation, original native call ID (at most 256 visible ASCII bytes), the key
-`SHA256(operation + call ID)`, and the SHA-256 of the exact HTTP request bytes.
-It holds no request body or capability. Checked successes and definite denials
-don't set this marker.
+operation, original native call ID (at most 256 visible ASCII bytes), the
+idempotency key, and the SHA-256 of the exact HTTP request bytes. Non-proposal
+writes keep `SHA256(operation + call ID)`; proposals use the Run-scoped key
+below. The marker holds no request body or capability. Checked successes and
+definite denials don't set it.
 
 The pinned typed adapter requires a native `tool_execution_start` and matching
 `tool_execution_end` (same call ID and bound write name), even for a declined
@@ -77,8 +78,58 @@ If a valid marker was observed despite clipping, a reserved tail in the same
 no identity to recover. The log helps same-key reconciliation; it doesn't
 supply the original request, reconcile the write, or authorize replay.
 
-Remove the fresh flag on restart to disable new launches. That does not settle
-previous claims, release unknown resources or authorize retry of in-flight work.
+## Task decision proposals (separate opt-in)
+
+`--enable-pi-task-decision-proposals` adds only `propose_task_decision` to the
+exact fresh Pi 1.4.0 **text Task continuation** above. It requires the current
+pinned `fresh-task-work.ts`/`fresh-task-work.mjs` pair, the existing fresh launch
+flag and dependencies, and F's installed **decision request and answer** schemas.
+Startup and proposal grant issuance use the same bounded pending Task read as
+`GET /api/v1/me/pending-decisions`. A v30 database without F's schemas, or one
+with only the request schema, rejects this opt-in; fresh Task Work remains
+available with the flag off. Older pinned fresh pairs remain usable only for the
+four-tool profile. This option does not install or register migrations.
+
+The initial native text Worker is excluded: its Store run-profile and session
+binding require the exact existing Worker tool set, which would need separate
+Store/receipt compatibility work. Coordinator, intake, ordinary, file, Codex,
+readonly investigation, and delegate/report profiles get no proposal authority.
+This path does not select native resume or add a new scheduler wake.
+
+After the final continuation launch gate **and** a durably accepted native
+run, the bridge sends the question to F. The loopback request needs the issued
+bearer, a distinct proof from the same digest-bound private config, and the
+exact native call ID. Before sending, Pi checks the live SDK session ID against
+the Run ID in that config. The proposal's `Idempotency-Key` is lowercase hex
+`SHA256(operation + NUL + Run ID + NUL + call ID)`, using literal zero bytes as
+separators. The server checks it against the actual bound Turn before calling F;
+the native receipt parser uses the same identity for unknown markers. Reusing a
+call ID in a new Turn yields a different key, without using the bearer or proof.
+A bearer-only caller or the preflight cannot obtain this grant; this is not an
+attestation against an actor that can steal the private config or impersonate
+the trusted executable.
+
+The tool supplies only `kind` (`decision`, `authorization`, `unblock`),
+`expected_version`, `question`, `facts`, `recommendation`, optional `choices`
+and (only for `authorization`) the proposed `scope` and `impact`. No expiry,
+identity or grant fields are exposed. `0` opens or coalesces an identical slot;
+an amendment requires the current version. The fixed receipt body contains only
+`decision_request_id`, `kind` and `version`. Pi also requires `Idempotency-Key`
+in the success headers to match the request exactly; missing or mismatched
+receipt evidence is unknown. F binds the owner and generation and records a
+question, not an answer, grant, message, acknowledgment or submission.
+
+F #221 does not prove rollback on any proposal error. After the Engine is
+called, even a stale/idempotency conflict is reported as unknown rather than a
+safe rejection. The client keeps the exact call ID, original key and payload
+hash and refuses further writes or replay; a successful read does not reopen
+writes. The server also fences this capability's writes and preserves an
+unknown Turn on Engine uncertainty, even if Pi reports success. No automatic
+reconciliation or replay is provided.
+
+Remove the proposal flag to disable new grants, or the fresh flag to disable
+fresh launches. Neither settles previous claims, releases unknown resources or
+authorizes retry of in-flight work.
 
 For the offline SDK-to-Go regression, export `TEST_PI_TYPED_PRINT_FIXTURES`
 pointing to an empty private directory and run these from the repository root
@@ -86,7 +137,7 @@ with the pinned SDK dependencies installed:
 
 ```sh
 node --test --test-name-pattern='Pi JSON print' extensions/pi-bridge/tests/fresh-task-work.test.mjs
-go test -race -run '^TestPiFreshTaskWorkSDKPrintLifecycle$' ./internal/provider
+go test -p 1 -race -run '^TestPiFreshTask(Work|Decision)SDKPrintLifecycle$' ./internal/provider
 ```
 
 Node uses an in-memory SDK session, synthetic assistant turns and mocked HTTP.

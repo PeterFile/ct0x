@@ -171,7 +171,7 @@ func (p *Preparer) AdapterReports() map[string]ProviderAdapterReport {
 			report := ProviderAdapterReport{ID: selection.ID, Protocol: selection.Protocol, Enabled: true}
 			if _, caps, err := p.sampleMemberToolAdapter(selected, p.memberTools.operations); err == nil {
 				if tools := p.nativeReportTools(selected); len(tools) > 0 {
-					if registry, err := p.nativeSessionAdapterRegistry(selection, provider.NativeMemberToolConfig{}, tools, nil, nil); err == nil {
+					if registry, err := p.nativeSessionAdapterRegistry(selection, provider.NativeMemberToolConfig{}, tools, nil, nil, nil); err == nil {
 						if nativeCaps, err := registry.Capabilities(selection, selected); err == nil {
 							caps = nativeCaps
 						}

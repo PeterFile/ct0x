@@ -101,6 +101,7 @@ func (e *memberToolRuntimeRun) nativeSessionBinding(ctx context.Context, request
 		profile.MaxGroupMembers = grants.MaxGroupMembers
 	}
 	profile.Tools = slices.Clone(grants.Operations)
+	profile.PiSendMessageQuote = profile.PiSendMessageQuote && slices.Contains(profile.Tools, "send_message")
 	binding := store.NativeRunBinding{Version: store.NativeRunBindingVersion, GroupID: claim.GroupID, TurnID: claim.TurnID,
 		MemberID: scope.MemberID, ConversationID: scope.ConversationID, TopicID: scope.TopicID, Profile: profile}
 	switch {
@@ -179,6 +180,16 @@ func (e *memberToolRuntimeRun) constructExecutor(ctx context.Context, request pr
 		return native, nil, err
 	}
 	if e.nativeSession == nil {
+		if e.explanationBuilder != nil && !e.intake && e.role == nil {
+			entry, found := e.runtime.nativeRegistration(token)
+			if !found {
+				return nil, nil, errMemberToolRuntimeBinding
+			}
+			if entry.runExplanation != nil {
+				native, err := e.explanationBuilder(provider.NativeMemberToolConfig{Path: configPath, SHA256: config.digest}, claim.TurnID, names)
+				return native, nil, err
+			}
+		}
 		native, err := e.factory(configPath, claim.TurnID, names)
 		return native, nil, err
 	}

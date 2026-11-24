@@ -256,19 +256,43 @@ func TestThreadRoutingComparisonDoesNotWakeQuotedAuthor(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !installed {
-		t.Run("legacy_reply_unavailable", func(t *testing.T) {
+		var quotesInstalled bool
+		if err := messageSQL(t, a).QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='message_quotes')`).Scan(&quotesInstalled); err != nil {
+			t.Fatal(err)
+		}
+		if !quotesInstalled {
+			t.Run("legacy_reply_unavailable", func(t *testing.T) {
+				const body = `{"content":"引用仅作对照。","topic_id":"legacy-topic"`
+				w := a.request("POST", path+"/messages", body+`,"reply_to_message_id":"`+quoted.ID+`"}`, "legacy-reply")
+				assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+				// The rejected reference must not consume the key or persist a row.
+				m := decoded[domain.Message](t, a.request("POST", path+"/messages", body+`}`, "legacy-reply"), 201)
+				if m.TopicID != "legacy-topic" || m.Content != "引用仅作对照。" || m.ReplyToMessageID != "" ||
+					len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != quotedAuthor {
+					t.Fatalf("legacy explicit topic or default delivery changed: %+v", m)
+				}
+				page := decoded[listResult[domain.Message]](t, a.request("GET", path+"/messages", ""), 200)
+				if len(page.Items) != 3 || page.Items[0].ID != m.ID {
+					t.Fatalf("rejected reply changed the timeline: %+v", page)
+				}
+			})
+			return
+		}
+		t.Run("a3_only_comparison_and_task_link_unavailable", func(t *testing.T) {
 			const body = `{"content":"引用仅作对照。","topic_id":"legacy-topic"`
-			w := a.request("POST", path+"/messages", body+`,"reply_to_message_id":"`+quoted.ID+`"}`, "legacy-reply")
+			// Related task links still require thread routing; rejection must not consume the key or persist a row.
+			w := a.request("POST", path+"/messages", body+`,"related_task_id":"task-unavailable"}`, "legacy-task-link")
 			assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
-			// The rejected reference must not consume the key or persist a row.
-			m := decoded[domain.Message](t, a.request("POST", path+"/messages", body+`}`, "legacy-reply"), 201)
-			if m.TopicID != "legacy-topic" || m.Content != "引用仅作对照。" || m.ReplyToMessageID != "" ||
-				len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != quotedAuthor {
-				t.Fatalf("legacy explicit topic or default delivery changed: %+v", m)
+			// With message quotes registered (A3) and thread routing absent, a comparison-only quote
+			// persists the quote on the explicit topic without waking the quoted author.
+			m := decoded[domain.Message](t, a.request("POST", path+"/messages", body+`,"reply_to_message_id":"`+quoted.ID+`"}`, "legacy-task-link"), 201)
+			if m.TopicID != "legacy-topic" || m.Content != "引用仅作对照。" || m.ReplyToMessageID != quoted.ID ||
+				m.ReplyTo == nil || m.ReplyTo.MessageID != quoted.ID || len(m.Deliveries) != 0 {
+				t.Fatalf("A3-only comparison woke the quoted author or lost explicit scope: %+v", m)
 			}
 			page := decoded[listResult[domain.Message]](t, a.request("GET", path+"/messages", ""), 200)
 			if len(page.Items) != 3 || page.Items[0].ID != m.ID {
-				t.Fatalf("rejected reply changed the timeline: %+v", page)
+				t.Fatalf("A3-only comparison changed the timeline count: %+v", page)
 			}
 		})
 		return
@@ -380,22 +404,26 @@ func TestThreadRoutingEvidenceAndRecipients(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		key, content, topic, recipient string
-		public                         bool
+		public, explicitTopic          bool
 	}{
-		{"author", "阈值是多少？", alert.TopicID, second.ID, false},
-		{"public-reply", "只记录这个问题。", alert.TopicID, "", true},
-		{"comparison", "引用仅作对照，当前讨论明年仓库容量规划。", plan.TopicID, first.ID, false},
-		{"unknown-comparison", "当前讨论支付网关故障，引用仅作对照。", "", first.ID, false},
-		{"conflicting-reply", "明年仓库容量规划还需要讨论。", "", first.ID, false},
+		{"author", "阈值是多少？", alert.TopicID, second.ID, false, false},
+		{"public-reply", "只记录这个问题。", alert.TopicID, "", true, false},
+		{"comparison", "引用仅作对照，当前讨论明年仓库容量规划。", plan.TopicID, first.ID, false, false},
+		{"unknown-comparison", "当前讨论支付网关故障，引用仅作对照。", "", first.ID, false, false},
+		{"conflicting-reply", "明年仓库容量规划还需要讨论。", "", "", false, false},
+		{"explicit-different-topic", "阈值是多少？", plan.TopicID, "", false, true},
 	} {
 		input := map[string]any{"content": tc.content, "reply_to_message_id": author.ID}
 		if tc.public {
 			input["recipient_ids"] = []string{}
 		}
+		if tc.explicitTopic {
+			input["topic_id"] = tc.topic
+		}
 		m := decoded[domain.Message](t, post(tc.key, input), 201)
-		if m.TopicID != tc.topic || m.ReplyToMessageID != author.ID || (tc.public && len(m.Deliveries) != 0) ||
-			(!tc.public && (len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != tc.recipient)) {
-			t.Fatalf("%s: wrong scope, link, or delivery: %+v", tc.key, m)
+		if m.TopicID != tc.topic || m.ReplyToMessageID != author.ID || (tc.recipient == "" && len(m.Deliveries) != 0) ||
+			(tc.recipient != "" && (len(m.Deliveries) != 1 || m.Deliveries[0].RecipientID != tc.recipient)) {
+			t.Errorf("%s: wrong scope, link, or delivery: %+v", tc.key, m)
 		}
 	}
 	explicitComparison := decoded[domain.Message](t, post("explicit-comparison", map[string]any{
@@ -406,12 +434,12 @@ func TestThreadRoutingEvidenceAndRecipients(t *testing.T) {
 		t.Fatalf("explicit topic changed or comparison selected the quoted author: %+v", explicitComparison)
 	}
 	page := decoded[listResult[domain.Message]](t, a.request("GET", path, ""), 200)
-	if len(page.Items) != 14 || page.Items[0].ReplyToMessageID != author.ID || page.NextCursor != "" {
+	if len(page.Items) != 15 || page.Items[0].ReplyToMessageID != author.ID || page.NextCursor != "" {
 		t.Fatalf("one group timeline did not carry the stable link: %+v", page)
 	}
 
 	raw := messageSQL(t, a)
-	for table, want := range map[string]int{"thread_routing_topics": 2, "tasks": 0, "mandates": 0, "deliveries": 11} {
+	for table, want := range map[string]int{"thread_routing_topics": 2, "tasks": 0, "mandates": 0, "deliveries": 10} {
 		var got int
 		if err := raw.QueryRow("SELECT count(*) FROM " + table).Scan(&got); err != nil || got != want {
 			t.Fatalf("%s: got %d, %v; want %d", table, got, err, want)

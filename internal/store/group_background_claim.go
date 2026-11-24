@@ -21,12 +21,13 @@ const groupBackgroundEarlierSQL = `EXISTS(
    EXISTS(SELECT 1 FROM group_background_intents i WHERE i.group_id=d.group_id
      AND i.topic_id=d.topic_id AND i.sequence<cur.sequence AND i.delivery_id IS NULL)
    OR EXISTS(SELECT 1 FROM deliveries older
+     JOIN members om ON om.id=older.recipient_id AND om.group_id=older.group_id AND om.status='active'
      JOIN message_log src ON src.message_id=older.message_id
      JOIN message_command_sources older_chat ON older_chat.message_id=src.message_id AND older_chat.kind='local_user_chat'
      WHERE older.group_id=d.group_id AND older.topic_id=d.topic_id
        AND older.state='queued' AND older.turn_id='' AND src.sequence<cur.sequence
-       AND (EXISTS(SELECT 1 FROM group_background_intents i WHERE i.delivery_id=older.id)
-         OR EXISTS(SELECT 1 FROM group_background_intents i WHERE i.delivery_id=d.id)))
+       AND ((EXISTS(SELECT 1 FROM group_background_intents i WHERE i.delivery_id=older.id) AND om.workspace='')
+         OR (older.recipient_id=d.recipient_id AND EXISTS(SELECT 1 FROM group_background_intents i WHERE i.delivery_id=d.id))))
  ))`
 
 // BackgroundDispatchProfileReady is a preparation hint, not a claim. ClaimTurn
