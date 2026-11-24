@@ -241,9 +241,10 @@ func TestGroupBackgroundDispatchHTTPThreadRouting(t *testing.T) {
 	 AND idempotency_key=? AND payload=?`, first.ID, g.ID, key, inputPayload(mode+"+topic-selector/v1:auto"))
 	f.assertCount(t, 1, `SELECT count(*) FROM group_background_intents i
 	 JOIN message_log l ON (l.sequence,l.message_id,l.group_id,l.topic_id)=(i.sequence,i.message_id,i.group_id,i.topic_id)
-	 JOIN thread_routing_links r ON (r.message_id,r.group_id,r.topic_id)=(i.message_id,i.group_id,i.topic_id)
+	 JOIN message_quotes q ON (q.message_id,q.group_id,q.topic_id)=(i.message_id,i.group_id,i.topic_id)
 	 WHERE i.message_id=? AND i.source_id=? AND i.group_id=? AND i.topic_id=? AND i.delivery_id IS NULL
-	 AND r.reply_to_message_id=? AND r.reply_to_topic_id=?`, first.ID, first.SourceID, g.ID, first.TopicID, quoted.ID, quoted.TopicID)
+	 AND q.quoted_message_id=? AND q.quoted_topic_id=?`, first.ID, first.SourceID, g.ID, first.TopicID, quoted.ID, quoted.TopicID)
+	f.assertCount(t, 0, `SELECT count(*) FROM thread_routing_links WHERE message_id=?`, first.ID)
 
 	cfg := backgroundOptions()
 	f.pass(t, cfg)
