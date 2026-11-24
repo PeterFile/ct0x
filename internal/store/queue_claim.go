@@ -50,7 +50,7 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 		return domain.Turn{}, queueError(action, err)
 	}
 	if expected := input.PreparedThreadState; expected != nil {
-		if err := verifyPreparedThreadStateInTx(ctx, tx, t, expected); err != nil {
+		if err := s.verifyPreparedThreadStateInTx(ctx, tx, t, expected); err != nil {
 			return domain.Turn{}, queueError(action, err)
 		}
 	}

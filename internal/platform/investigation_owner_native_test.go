@@ -176,6 +176,33 @@ func ownerNativeStop(t *testing.T, emit func(provider.Event) error, req provider
 
 func ownerNativeKey(op, call string) string { return fmt.Sprintf("%x", sha256.Sum256([]byte(op+call))) }
 
+const investigationTaskStateMarker = "Task state is not material in this investigation profile."
+
+func seedInvestigationTaskState(t *testing.T, f *boundWorkReportFixture, scope domain.ThreadStateScope) {
+	t.Helper()
+	var installed bool
+	roleOK(t, f.raw.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='thread_state_revisions')`).Scan(&installed))
+	if !installed {
+		return
+	}
+	source, err := f.local.CreateMessage(t.Context(), scope.GroupID, platform.MessageInput{TopicID: scope.TopicID,
+		Content: investigationTaskStateMarker, RecipientIDs: []string{}}, "investigation-state-source")
+	roleOK(t, err)
+	state, err := f.local.SetThreadState(t.Context(), scope, store.ThreadStateUpdate{Kind: domain.ThreadStateConstraint,
+		Action: "set", Content: source.Content, SourceMessage: source.ID}, "investigation-state")
+	roleOK(t, err)
+	if state.Scope != scope || state.Revision != 1 || len(state.Records) != 1 {
+		t.Fatal("fixture did not confirm nonzero state on the exact investigation Task")
+	}
+}
+
+func assertNoInvestigationTaskState(t *testing.T, prepared scheduler.PreparedExecution) {
+	t.Helper()
+	if prepared.PreparedThreadState != nil || strings.Contains(prepared.Request.Prompt, `"thread_state"`) || strings.Contains(prepared.Request.Prompt, investigationTaskStateMarker) {
+		t.Fatal("investigation inherited Task state or its formal claim stamp")
+	}
+}
+
 func TestPiInvestigationOwnerNativeSQLiteRoundTrip(t *testing.T) {
 	// Do not overlap this round trip with the SQLite-heavy race fixtures;
 	// keep the production HTTP deadline on its scoped tool calls.
@@ -190,6 +217,9 @@ func TestPiInvestigationOwnerNativeSQLiteRoundTrip(t *testing.T) {
 	next := f.queueInvestigationOwner(t, []domain.ArtifactVersionRef{approved}, 2, child.ID, peer.ID, unsupported.ID)
 	original, err := f.db.ResolveCoordinationDelivery(t.Context(), f.group, next)
 	roleOK(t, err)
+	role := original.Provenance
+	seedInvestigationTaskState(t, f, domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: role.GroupID, TopicID: role.TopicID},
+		TaskID: role.TaskID, TaskRevision: role.TaskRevision})
 	const channel, artifact = platform.ReadInvestigationChannelOperation, platform.ReadInvestigationArtifactOperation
 	var tokens []string
 	var typedCommits, nativeCalls int
@@ -306,6 +336,7 @@ func TestPiInvestigationOwnerNativeSQLiteRoundTrip(t *testing.T) {
 		})
 	obs := runInvestigationOwnerWakes(t, f, prep, &next, 3)
 	for i, o := range obs {
+		assertNoInvestigationTaskState(t, o.PreparedExecution) // Initial investigation, delegation, report.
 		f.claims(t, roleRun{claim: o.claim}, domain.TurnStateSucceeded, 0)
 		if o.receipt.NativeRef != nil || o.receipt.Outcome != provider.OutcomeSucceeded {
 			t.Fatal("typed run did not settle as fresh-only")
@@ -415,6 +446,10 @@ func testPiInvestigationOwnerNativeFollowup(t *testing.T, modes ...string) {
 			f.delegate(t, nil, nil, false) // Seed only the prior work for this followup fixture.
 			f.settleWork(t, f.claimWork(t, f.delegation.DeliveryID), false)
 			input, _ := queueInvestigationWorkInput(t, f, "请进一步查对原材料。", false)
+			if mode == "admitted" {
+				parent := f.delegation.TaskWorkParent
+				seedInvestigationTaskState(t, f, domain.ThreadStateScope{ThreadRef: parent.ThreadRef, TaskID: parent.TaskID, TaskRevision: parent.TaskRevision})
+			}
 			next := input.WorkDeliveryID
 			var constructCalls, nativeCalls, gateCalls int
 			prep := newInvestigationOwnerPreparer(t, f, nil, mode != "typed-launch-disabled",
@@ -480,6 +515,7 @@ func testPiInvestigationOwnerNativeFollowup(t *testing.T, modes ...string) {
 					t.Fatal("fresh typed owner missed its exact launch fence")
 				}
 				if mode == "admitted" {
+					assertNoInvestigationTaskState(t, o.PreparedExecution) // Follow-up on the same exact Task.
 					wantWrites = 1
 					f.claims(t, roleRun{claim: o.claim}, domain.TurnStateSucceeded, 0)
 				} else {

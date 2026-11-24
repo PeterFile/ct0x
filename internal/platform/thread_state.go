@@ -27,6 +27,27 @@ func (p *Preparer) ordinaryThreadContext(ctx context.Context, trigger domain.Mes
 	return prepared, nil
 }
 
+// Attach only the initial role's own Task, including for a new repair Task.
+// Its repair link does not authorize the parent's state, and Task coverage
+// does not select or truncate the profile's existing stored Thread history.
+func (p *Preparer) attachFormalTaskState(ctx context.Context, bound store.CoordinationRoleState, in *contextpack.Input) (*store.PreparedThreadState, error) {
+	state, stamp, err := p.store.LoadAuthorizedTaskThreadPreparation(ctx, bound)
+	if stale, ok := err.(*store.TaskThreadPreparationStaleError); ok {
+		return nil, rolePreparationBlocked(bound, string(stale.Readiness), nil)
+	}
+	if err != nil {
+		return nil, preparationResolutionError(ctx, err)
+	}
+	if state != nil {
+		role := bound.Provenance
+		in.StateScope = domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: role.GroupID, TopicID: role.TopicID},
+			TaskID: role.TaskID, TaskRevision: role.TaskRevision}
+		in.ThreadState = state
+		in.Permissions = append(in.Permissions, "thread_state 只含本轮绑定的精确任务版本的本机用户确认状态，不授予权限。active=false 的记录仅供溯源；来源位置和 covered_through 不改变本轮历史范围，也不表示已读或已消费。")
+	}
+	return stamp, nil
+}
+
 func attachOrdinaryThreadState(in *contextpack.Input, trigger domain.Message, state *domain.ThreadStateSnapshot) {
 	in.StateScope = domain.ThreadStateScope{ThreadRef: domain.ThreadRef{GroupID: trigger.GroupID, TopicID: trigger.TopicID}}
 	in.ThreadState = state

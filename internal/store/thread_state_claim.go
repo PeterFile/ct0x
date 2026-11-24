@@ -7,20 +7,24 @@ import (
 	"agentworkspace/internal/domain"
 )
 
-// PreparedThreadState fences the exact history and state used by an ordinary
-// prompt. Empty state still participates, as does E1b without state installed.
-// A nil stamp preserves legacy and separate typed preparation paths.
+// PreparedThreadState fences ordinary Thread preparation (including E1b-only
+// history) or an initial formal role's exact Task state. Installed empty state
+// still participates. A nil stamp preserves legacy and separate typed paths.
 type PreparedThreadState struct {
 	domain.ThreadRef
 	MessageID      string
 	Revision       int64
 	stateInstalled bool
 	correctionTip  int64
+	role           *CoordinationRoleState
 }
 
 // Runs after the first claim write reserves the binding and before any Turn or
 // resource insert. The same write lock serializes this read and user updates.
-func verifyPreparedThreadStateInTx(ctx context.Context, tx *sql.Tx, turn domain.Turn, expected *PreparedThreadState) error {
+func (s *Store) verifyPreparedThreadStateInTx(ctx context.Context, tx *sql.Tx, turn domain.Turn, expected *PreparedThreadState) error {
+	if expected.role != nil {
+		return s.verifyPreparedTaskThreadStateInTx(ctx, tx, turn, expected)
+	}
 	thread := domain.ThreadRef{GroupID: turn.GroupID}
 	var messageID string
 	if err := tx.QueryRowContext(ctx, `SELECT d.topic_id,d.message_id FROM deliveries d
@@ -32,16 +36,8 @@ func verifyPreparedThreadStateInTx(ctx context.Context, tx *sql.Tx, turn domain.
 	if thread != expected.ThreadRef || messageID != expected.MessageID {
 		return ErrTurnBusy
 	}
-	// Keep E2's integrity checks, even for an empty or partly undisclosed state.
-	state, err := preparationThreadStateInTx(ctx, tx, domain.ThreadStateScope{ThreadRef: thread}, messageID, noCorrectionLedger)
-	if err != nil {
+	if err := verifyPreparedStateRevisionInTx(ctx, tx, domain.ThreadStateScope{ThreadRef: thread}, messageID, expected); err != nil {
 		return err
-	}
-	if state == nil && expected.stateInstalled {
-		return errThreadStateIntegrity
-	}
-	if state != nil && (!expected.stateInstalled || state.Revision != expected.Revision) {
-		return ErrTurnBusy
 	}
 	tip, err := correctionTipInTx(ctx, tx)
 	if err != nil {
@@ -61,6 +57,56 @@ func verifyPreparedThreadStateInTx(ctx context.Context, tx *sql.Tx, turn domain.
 		if changed {
 			return ErrTurnBusy
 		}
+	}
+	return nil
+}
+
+func (s *Store) verifyPreparedTaskThreadStateInTx(ctx context.Context, tx *sql.Tx, turn domain.Turn, expected *PreparedThreadState) error {
+	bound := *expected.role
+	p := bound.Provenance
+	thread := domain.ThreadRef{GroupID: p.GroupID, TopicID: p.TopicID}
+	if p.GroupID != turn.GroupID || p.DeliveryID != turn.DeliveryID || p.ConversationID != turn.ConversationID || p.MemberID != turn.MemberID ||
+		expected.ThreadRef != thread || expected.MessageID != p.MessageID {
+		return ErrMemberToolDenied
+	}
+	current, err := s.resolveQueuedCoordinationInTx(ctx, tx, turn.GroupID, turn.DeliveryID, turn.ID, nil)
+	if err != nil {
+		return err
+	}
+	blocked, err := preparedTaskRoleReadiness(bound, current)
+	if err != nil {
+		return err
+	}
+	if blocked != CoordinationReady {
+		return ErrTurnBusy
+	}
+	// Formal state uses stored evidence, not the ordinary correction ledger.
+	return coordinationRoleRelationError(verifyPreparedStateRevisionInTx(ctx, tx, domain.ThreadStateScope{ThreadRef: thread,
+		TaskID: p.TaskID, TaskRevision: p.TaskRevision}, p.MessageID, expected))
+}
+
+// Only readiness may differ from a ready bound role. A different identity,
+// profile, or persisted source is not ordinary drift.
+func preparedTaskRoleReadiness(bound, current CoordinationRoleState) (CoordinationReadinessCode, error) {
+	blocked := current.Blocked
+	current.Blocked = CoordinationReady
+	if current != bound {
+		return CoordinationReady, ErrMemberToolDenied
+	}
+	return blocked, nil
+}
+
+func verifyPreparedStateRevisionInTx(ctx context.Context, tx *sql.Tx, scope domain.ThreadStateScope, messageID string, expected *PreparedThreadState) error {
+	// Keep E2's integrity checks, even for an empty or partly undisclosed state.
+	state, err := preparationThreadStateInTx(ctx, tx, scope, messageID, noCorrectionLedger)
+	if err != nil {
+		return err
+	}
+	if state == nil && expected.stateInstalled {
+		return errThreadStateIntegrity
+	}
+	if state != nil && (!expected.stateInstalled || state.Revision != expected.Revision) {
+		return ErrTurnBusy
 	}
 	return nil
 }

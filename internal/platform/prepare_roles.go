@@ -138,6 +138,7 @@ type rolePreparationPlan struct {
 	workspace            *domain.TaskWorkspaceScope
 	investigation        *investigationRolePreparation
 	nativeText           bool
+	threadStateClaim     *store.PreparedThreadState
 	input                contextpack.Input
 }
 
@@ -238,7 +239,14 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 			in.Permissions[0] = nativeSessionTextPermission
 		}
 	}
-	return rolePreparationPlan{state: state, selected: selected, selection: selection, dispatchCapabilities: facts, workspace: workspace, nativeText: nativeText, input: in}, nil
+	// Only this initial formal role profile renders the exact bound Task.
+	// Typed investigation exits above; typed wakes use their own planner.
+	stamp, err := p.attachFormalTaskState(ctx, state, &in)
+	if err != nil {
+		return empty, err
+	}
+	return rolePreparationPlan{state: state, selected: selected, selection: selection, dispatchCapabilities: facts,
+		workspace: workspace, nativeText: nativeText, threadStateClaim: stamp, input: in}, nil
 }
 
 func (plan rolePreparationPlan) format() ([]byte, error) {
@@ -304,5 +312,6 @@ func (p *Preparer) prepareCoordinationRole(ctx context.Context, state store.Coor
 			return empty, roleWorkspacePreparationError(state, err)
 		}
 	}
-	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{workspace.key}, Request: request}, nil
+	return scheduler.PreparedExecution{Executor: executor, ResourceKeys: []string{workspace.key}, Request: request,
+		PreparedThreadState: plan.threadStateClaim}, nil
 }

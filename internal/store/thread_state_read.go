@@ -256,23 +256,85 @@ func loadThreadPreparationInTx(ctx context.Context, tx *sql.Tx, thread domain.Th
 // Requiring the persisted ready owner/coordinator binding excludes ordinary
 // chat and non-owner delegates. Claim/execution must still revalidate.
 func (s *Store) LoadAuthorizedTaskThreadState(ctx context.Context, bound CoordinationRoleState) (*domain.ThreadStateSnapshot, error) {
+	state, err := s.loadAuthorizedTaskThreadState(ctx, bound, false)
+	if state != nil && state.Revision == 0 {
+		return nil, nil
+	}
+	return state, err
+}
+
+// TaskThreadPreparationStaleError reports a verified readiness change for the
+// exact bound formal role, not failed identity or provenance validation.
+type TaskThreadPreparationStaleError struct{ Readiness CoordinationReadinessCode }
+
+func (*TaskThreadPreparationStaleError) Error() string {
+	return "准备期间正式任务角色已变更"
+}
+
+// LoadAuthorizedTaskThreadPreparation is the process-local counterpart for
+// initial formal role profiles that already permit this exact Task view. The
+// same authorized read issues the claim stamp, even when E2 is unregistered or
+// its state is empty, so formal claims still fence role, readiness, and return
+// markers before inserting a Turn.
+func (s *Store) LoadAuthorizedTaskThreadPreparation(ctx context.Context, bound CoordinationRoleState) (*domain.ThreadStateSnapshot, *PreparedThreadState, error) {
+	role := bound.Provenance
+	if role.SourceKind != "" || role.SourceID != "" || bound.AttemptID != "" {
+		return nil, nil, ErrMemberToolDenied
+	}
+	state, err := s.loadAuthorizedTaskThreadState(ctx, bound, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	boundCopy := bound
+	stamp := &PreparedThreadState{
+		ThreadRef: domain.ThreadRef{GroupID: role.GroupID, TopicID: role.TopicID},
+		MessageID: role.MessageID,
+		role:      &boundCopy,
+	}
+	if state != nil {
+		stamp.ThreadRef = state.Scope.ThreadRef
+		stamp.Revision = state.Revision
+		stamp.stateInstalled = true
+		if state.Revision == 0 {
+			state = nil // Fence an empty scope without changing the packet.
+		}
+	}
+	return state, stamp, nil
+}
+
+func (s *Store) loadAuthorizedTaskThreadState(ctx context.Context, bound CoordinationRoleState, preparing bool) (*domain.ThreadStateSnapshot, error) {
 	p := bound.Provenance
 	if bound.Blocked != CoordinationReady || (p.Kind != CoordinationRoleCoordinator && p.Kind != CoordinationRoleWorker) || p.TaskID == "" {
 		return nil, ErrMemberToolDenied
 	}
-	actual, err := s.ResolveCoordinationDelivery(ctx, p.GroupID, p.DeliveryID)
-	if err != nil {
-		return nil, err
-	}
-	if actual != bound {
-		return nil, ErrMemberToolDenied
+	if !validTriggerID(p.GroupID) || !validTriggerID(p.DeliveryID) {
+		return nil, coordinationAssignmentFinish(nil, "input", ErrInvalid)
 	}
 	const action = "读取执行话题状态失败"
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
-		return nil, storeError(action, err)
+		return nil, coordinationAssignmentFinish(nil, "begin", err)
 	}
 	defer tx.Rollback()
+	// Classification, current readiness and exact Task state must all refer
+	// to this snapshot, not to separate resolver and state transactions.
+	actual, err := s.resolveQueuedCoordinationInTx(ctx, tx, p.GroupID, p.DeliveryID, "", nil)
+	if err != nil {
+		return nil, coordinationAssignmentFinish(tx, "source", err)
+	}
+	if actual != bound {
+		if !preparing {
+			return nil, ErrMemberToolDenied
+		}
+		blocked, err := preparedTaskRoleReadiness(bound, actual)
+		if err != nil {
+			return nil, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, coordinationAssignmentFinish(tx, "commit", err)
+		}
+		return nil, &TaskThreadPreparationStaleError{Readiness: blocked}
+	}
 	state, err := preparationThreadStateInTx(ctx, tx, domain.ThreadStateScope{
 		ThreadRef: domain.ThreadRef{GroupID: p.GroupID, TopicID: p.TopicID}, TaskID: p.TaskID, TaskRevision: p.TaskRevision,
 	}, p.MessageID, noCorrectionLedger)
@@ -281,9 +343,6 @@ func (s *Store) LoadAuthorizedTaskThreadState(ctx context.Context, bound Coordin
 	}
 	if err != nil {
 		return nil, storeError(action, err)
-	}
-	if state != nil && state.Revision == 0 {
-		return nil, nil
 	}
 	return state, nil
 }
