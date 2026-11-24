@@ -24,6 +24,9 @@ var piSessionModel = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9]
 type PiSessionOptions struct {
 	Resume  *NativeSessionReference
 	Binding json.RawMessage
+	// The digest-bound adapter checks this server-side profile expectation.
+	// Nil leaves schema selection to its normal bridge qualification.
+	ExpectedSendMessageQuote *bool `json:"-"`
 }
 
 type piSessionOptions struct {

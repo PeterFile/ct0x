@@ -48,6 +48,7 @@ type NativeRunProfile struct {
 	WorkspaceIdentity     string               `json:"workspace_identity"`
 	ResourceKeys          []string             `json:"resource_keys"`
 	Tools                 []string             `json:"tools"`
+	PiSendMessageQuote    bool                 `json:"pi_send_message_quote,omitempty"` // Ordinary Pi send_message has reply_to_message_id.
 	MaxGroupMembers       int                  `json:"max_group_members"`
 	WorkspaceGrantID      string               `json:"workspace_grant_id"`
 	WorkspaceGrantVersion int                  `json:"workspace_grant_version"`
@@ -126,6 +127,9 @@ func decodeNativeRunBinding(data []byte) (NativeRunBinding, error) {
 func validNativeRunBinding(b NativeRunBinding) bool {
 	if b.Version != NativeRunBindingVersion || !nativeStrings(b.GroupID, b.MemberID, b.ConversationID, b.TurnID) ||
 		!nativeOptionalStrings(b.TopicID, b.CandidateID, b.ResumedFromTurnID) || b.ResumedFromTurnID == b.TurnID || !validNativeRunProfile(b.Profile) {
+		return false
+	}
+	if b.Profile.PiSendMessageQuote && b.Purpose != "generic" {
 		return false
 	}
 	switch b.Purpose {

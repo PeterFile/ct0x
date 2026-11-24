@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -200,17 +201,26 @@ func publishSettledTurnReply(ctx context.Context, tx *sql.Tx, turn *domain.Turn)
 
 // Start with sources for this Turn only; every other lookup uses a message key
 // or the exact mutation receipt key. Any delivery row vetoes a public-only match.
-const ordinaryTurnReplyMatch = `SELECT EXISTS(
- SELECT 1 FROM message_command_sources s INDEXED BY message_command_sources_turn
- CROSS JOIN messages m ON m.id=s.message_id
+const ordinaryTurnSendFrom = ` FROM message_command_sources s INDEXED BY message_command_sources_turn
+ CROSS JOIN messages m ON m.id=s.message_id`
+const ordinaryTurnSendFence = `
  WHERE s.turn_id=? AND s.kind='member' AND s.claim_digest=?
-   AND m.group_id=? AND m.sender_id=? AND m.topic_id=? AND m.content COLLATE BINARY=?
-   AND s.payload IN (?,?)
+   AND m.group_id=? AND m.sender_id=? AND m.topic_id=? AND m.content COLLATE BINARY=?`
+const ordinaryTurnSendProof = `
    AND NOT EXISTS(SELECT 1 FROM chat_discussion_events e WHERE e.message_id=m.id)
    AND NOT EXISTS(SELECT 1 FROM deliveries d WHERE d.message_id=m.id)
    AND EXISTS(SELECT 1 FROM mutation_idempotency r WHERE r.operation=? AND r.actor_id=m.sender_id
-     AND r.group_id=m.group_id AND r.idempotency_key=s.idempotency_key AND r.record_id=m.id AND r.payload=s.payload)
+     AND r.group_id=m.group_id AND r.idempotency_key=s.idempotency_key AND r.record_id=m.id AND r.payload=s.payload)`
+
+const ordinaryTurnReplyMatch = `SELECT EXISTS(
+ SELECT 1` + ordinaryTurnSendFrom + ordinaryTurnSendFence + `
+   AND s.payload IN (?,?)` + ordinaryTurnSendProof + `
 )`
+
+const ordinaryQuotedTurnReplyMatches = `SELECT q.quoted_message_id,q.quoted_source_kind,q.excerpt,s.payload` + ordinaryTurnSendFrom + `
+ CROSS JOIN message_quotes q ON q.message_id=m.id AND q.group_id=m.group_id AND q.topic_id=m.topic_id
+   AND q.quoted_topic_id=m.topic_id AND q.quoted_message_id<>'' AND q.quoted_message_id<>m.id` + ordinaryTurnSendFence + `
+   AND s.id<>'' AND typeof(s.payload)='blob'` + ordinaryTurnSendProof
 
 func hasMatchingOrdinaryTurnSend(ctx context.Context, tx *sql.Tx, turn *domain.Turn, topicID string) (bool, error) {
 	// Unlike structured resolves, ordinary sends must prove the current claim and
@@ -222,6 +232,9 @@ func hasMatchingOrdinaryTurnSend(ctx context.Context, tx *sql.Tx, turn *domain.T
 	var duplicate bool
 	err := tx.QueryRowContext(ctx, ordinaryTurnReplyMatch, turn.ID, digest[:], r.GroupID, r.ActorID, r.TopicID, r.Content,
 		omitted, r.payload(), r.scope().operation).Scan(&duplicate)
+	if err == nil && !duplicate {
+		duplicate, err = hasMatchingOrdinaryQuotedTurnSend(ctx, tx, turn.ID, digest[:], r)
+	}
 	if err != nil || !duplicate {
 		return false, err
 	}
@@ -238,6 +251,45 @@ func hasMatchingOrdinaryTurnSend(ctx context.Context, tx *sql.Tx, turn *domain.T
 	var untyped bool
 	err = tx.QueryRowContext(ctx, `SELECT NOT EXISTS(SELECT 1 FROM task_work_deliveries WHERE delivery_id=?)`, turn.DeliveryID).Scan(&untyped)
 	return untyped, err
+}
+
+func hasMatchingOrdinaryQuotedTurnSend(ctx context.Context, tx *sql.Tx, turnID string, digest []byte, r MessageRequest) (bool, error) {
+	var available bool
+	if err := tx.QueryRowContext(ctx, messageQuoteAvailable).Scan(&available); err != nil || !available {
+		return false, err // Legacy schemas have no canonical quote evidence.
+	}
+	rows, err := tx.QueryContext(ctx, ordinaryQuotedTurnReplyMatches, turnID, digest, r.GroupID, r.ActorID, r.TopicID, r.Content, r.scope().operation)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var kind, excerpt string
+		var saved []byte
+		if err := rows.Scan(&r.ReplyToMessageID, &kind, &excerpt, &saved); err != nil {
+			return false, err
+		}
+		// Rebuild both public fingerprints from the persisted edge, not a claimed target.
+		r.RecipientIDs = nil
+		omitted := r.payload()
+		r.RecipientIDs = []string{}
+		if !bytes.Equal(saved, omitted) && !bytes.Equal(saved, r.payload()) {
+			continue
+		}
+		// The same resolver A used on write verifies the original in the physical
+		// topic and derives its source kind and excerpt from server-owned rows.
+		original, _, err := resolveMessageQuoteInTx(ctx, tx, r, false)
+		if errors.Is(err, ErrMemberToolDenied) || errors.Is(err, ErrInvalid) {
+			continue // Missing, out-of-scope, or malformed original.
+		}
+		if err != nil {
+			return false, err
+		}
+		if original.SourceKind == kind && original.Excerpt == excerpt {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // Start from the unique candidate for this Turn and follow the assessment's

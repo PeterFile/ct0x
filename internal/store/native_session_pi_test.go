@@ -139,6 +139,24 @@ func TestNativeSessionPiRoundTripAndExactProgression(t *testing.T) {
 	}
 }
 
+func TestNativeSessionPiQuoteMarkerRequiresOrdinarySend(t *testing.T) {
+	b := nativePiBinding(domain.Turn{ID: "turn", GroupID: "group", MemberID: "member", ConversationID: "conversation"})
+	b.Profile.Tools = []string{"list_members", "read_channel", "read_history", "search_history", "send_message"}
+	b.Profile.PiSendMessageQuote = true
+	data, err := CanonicalNativeRunBinding(b)
+	if err != nil || !bytes.Contains(data, []byte(`"pi_send_message_quote":true`)) {
+		t.Fatalf("ordinary quote profile did not retain its canonical marker: %s, %v", data, err)
+	}
+	b.Purpose, b.CandidateID = "chat_intake/v1", "candidate"
+	if _, err := CanonicalNativeRunBinding(b); !errors.Is(err, ErrInvalid) {
+		t.Fatal("chat intake accepted an ordinary quote schema marker")
+	}
+	b.Profile.PiSendMessageQuote = false
+	if _, err := CanonicalNativeRunBinding(b); err != nil {
+		t.Fatalf("legacy native chat intake is no longer valid: %v", err)
+	}
+}
+
 func TestNativeSessionPiProfileAndBoundedMetadata(t *testing.T) {
 	b := nativePiBinding(domain.Turn{ID: "turn", GroupID: "group", MemberID: "member", ConversationID: "conversation"})
 	good := nativePiReference(t, b)
@@ -205,6 +223,7 @@ func TestNativeSessionPiProfileAndBoundedMetadata(t *testing.T) {
 		func(p *NativeRunProfile) { p.NativePolicy.NativeFileAccess = true },
 		func(p *NativeRunProfile) { p.NativePolicy.NativeArtifacts = true },
 		func(p *NativeRunProfile) { p.Tools = []string{"write_workspace_file"} },
+		func(p *NativeRunProfile) { p.PiSendMessageQuote = true }, // No send_message grant.
 	} {
 		p := b.Profile
 		change(&p)

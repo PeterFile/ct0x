@@ -64,6 +64,8 @@ function sendMessageParameters(continueWork: boolean, discussionOnly = false, in
   return Type.Object({
     content: Type.String({ description: "消息正文。" + (continueWork ? `续办正文不得为空白，最多 ${workInputBytes.content} UTF-8 字节。` : "") }),
     recipient_ids: Type.Optional(Type.Array(Type.String(), { description: "接收成员标识；省略或空数组表示公开消息，不创建投递、不唤醒成员；仅显式列出的成员会进入投递队列。" })),
+    reply_to_message_id: Type.Optional(Type.String({ minLength: 1, maxLength: 256,
+      description: "仅普通消息使用：当前群组和话题内原消息的 ID（最多 256 UTF-8 字节）；不得与 intent_assessment 或 discussion 同传。" })),
     intent_assessment: Type.Optional(assessment),
     ...(relay ? { discussion: Type.Optional(discussionAction) } : {}),
   }, { additionalProperties: false });
@@ -234,6 +236,12 @@ function validWorkInputID(value: string): boolean {
   return validOpaqueIDShape(value) && !/^\p{White_Space}|\p{White_Space}$/u.test(value);
 }
 
+function validPlainQuote(message: { reply_to_message_id?: unknown }): boolean {
+  const id = message.reply_to_message_id;
+  return typeof id === "string" && id !== "." && id !== ".." && validWorkInputID(id) &&
+    !Object.hasOwn(message, "intent_assessment") && !Object.hasOwn(message, "discussion");
+}
+
 function validExpectedReply(value: string): boolean {
   if (value === "") return true;
   if (!validNonBlankText(value, discussionExpectedReplyJSONBytes)) return false;
@@ -301,9 +309,14 @@ export default function piBridge(pi: ExtensionAPI) {
       parameters,
       ...(tool.name === "send_message" ? {
         prepareArguments(args: unknown) {
-          // Check relay fields before Pi can drop optional nulls or coerce
-          // types into an unrelated send or a different handoff.
-          const message = args as { content: string; discussion?: Static<typeof discussionAction>; intent_assessment?: Record<string, unknown> } | null;
+          // Check quote and relay fields before Pi can drop optional nulls or
+          // coerce types into an unrelated send or a different handoff.
+          const message = args as { content: string; reply_to_message_id?: unknown; discussion?: Static<typeof discussionAction>;
+            intent_assessment?: Record<string, unknown> } | null;
+          if (message && Object.hasOwn(message, "reply_to_message_id") &&
+              (!Value.Check(parameters, args) || !validPlainQuote(message))) {
+            throw new Error("成员工具参数无效，未发送请求。");
+          }
           if (message && Object.hasOwn(message, "discussion") &&
               (!discussionRelay || !Value.Check(parameters, args) || !validDiscussion(message))) {
             throw new Error("成员工具参数无效，未发送请求。");
@@ -328,11 +341,14 @@ export default function piBridge(pi: ExtensionAPI) {
             payload = JSON.parse(encoded);
             valid = Value.Check(parameters, payload);
             if (valid && tool.name === "send_message") {
-              const message = payload as { content: string; discussion?: Static<typeof discussionAction>; recipient_ids?: string[]; intent_assessment?: {
-                disposition: string; reason: string; action?: string; discussion_only_excerpt?: string;
-                repair?: { review_id: string }; followup?: { task_id?: string; constraint?: string };
-              } };
-              if (Object.hasOwn(message, "discussion")) {
+              const message = payload as { content: string; reply_to_message_id?: string; discussion?: Static<typeof discussionAction>;
+                recipient_ids?: string[]; intent_assessment?: {
+                  disposition: string; reason: string; action?: string; discussion_only_excerpt?: string;
+                  repair?: { review_id: string }; followup?: { task_id?: string; constraint?: string };
+                } };
+              if (Object.hasOwn(message, "reply_to_message_id")) {
+                valid = validPlainQuote(message);
+              } else if (Object.hasOwn(message, "discussion")) {
                 valid = discussionRelay && validDiscussion(message);
               } else if (Object.hasOwn(message, "intent_assessment")) {
                 valid = !Object.hasOwn(message, "recipient_ids");
