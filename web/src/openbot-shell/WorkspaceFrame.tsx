@@ -7,12 +7,13 @@ interface WorkspaceFrameProps {
   children: ReactNode;
   before: ReactNode;
   contextOpen: boolean;
+  globalOpen: boolean;
   pane: "list" | "chat";
 }
 
 /** Keep the upstream left / panes / content paint order; App supplies stable pane slots. */
 export function WorkspaceFrame(props: WorkspaceFrameProps) {
-  return <div className="openbot-shell app-frame" data-context={props.contextOpen} data-mobile-pane={props.pane}>
+  return <div className="openbot-shell app-frame" data-context={props.contextOpen} data-global={props.globalOpen} data-mobile-pane={props.pane}>
     {props.before}
     {props.left}
     <div className="app-frame-panes">

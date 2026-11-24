@@ -95,6 +95,7 @@ beforeEach(() => {
     const kind = kinds.find(kind => url.pathname.endsWith(`/coordination/${paths[kind]}`));
     if (kind && (method === "GET" || method === "PUT")) return (method === "PUT" ? puts[kind] : reads[kind])(input, init);
     if (method === "GET") {
+      if (url.search === "?limit=1" && /^\/api\/v1\/me\/pending-(decisions|reviews)$/.test(url.pathname)) return Promise.resolve(page());
       if (url.pathname === "/api/v1/groups") return Promise.resolve(page([group, other]));
       if (url.pathname.endsWith("/members")) return members(input, init);
       if (url.pathname.endsWith("/messages")) return Promise.resolve(page());

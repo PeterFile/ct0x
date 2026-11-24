@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"strings"
 
 	"agentworkspace/internal/domain"
@@ -13,6 +14,16 @@ import (
 // CreateLocalUserMessage is a trusted command seam, not a member operation.
 // Only a new command creates proof; replaying legacy data never upgrades it.
 func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, recipients []string) (domain.Message, error) {
+	return s.createLocalUserMessage(ctx, r, recipients, false)
+}
+
+// PostLocalUserMessage is the normal local chat entry. A caller supplying
+// authoritative deliveries directly continues to use CreateLocalUserMessage.
+func (s *Store) PostLocalUserMessage(ctx context.Context, r MessageRequest) (domain.Message, error) {
+	return s.createLocalUserMessage(ctx, r, r.RecipientIDs, true)
+}
+
+func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, recipients []string, normalPost bool) (domain.Message, error) {
 	if r.ActorID != "user" {
 		return domain.Message{}, ErrMemberToolDenied
 	}
@@ -24,20 +35,32 @@ func (s *Store) CreateLocalUserMessage(ctx context.Context, r MessageRequest, re
 	if err := requireMessageActor(ctx, tx, r.GroupID, "user"); err != nil {
 		return domain.Message{}, storeError("验证用户消息失败", err)
 	}
-	_, replay, err := lookupMutation(ctx, tx, r.scope(), r.payload())
+	payload := r.payload()
+	reservation := payload
+	bindSelector := normalPost && r.TopicID == "" && r.IdempotencyKey != ""
+	if bindSelector {
+		reservation = r.topicSelectionPayload()
+	}
+	id, replay, err := reserveMutation(ctx, tx, r.scope(), reservation)
+	if bindSelector && errors.Is(err, ErrConflict) {
+		// Exact legacy reservations are still replayable; this only reads
+		// and cannot create an unversioned key or rewrite its source proof.
+		id, replay, err = lookupMutation(ctx, tx, r.scope(), payload)
+	}
+	if errors.Is(err, ErrConflict) && r.hasLegacyQuotePayload() {
+		id, replay, err = lookupMutation(ctx, tx, r.scope(), r.encodePayload("", true))
+	}
 	if err != nil {
 		return domain.Message{}, storeError("读取用户消息回执失败", err)
 	}
-	message, err := createMessageInTx(ctx, tx, r, recipients)
+	var message domain.Message
+	if replay {
+		message, err = localMessageReceiptInTx(ctx, tx, r, id, normalPost)
+	} else {
+		message, err = publishLocalMessageInTx(ctx, tx, r, id, payload, recipients, normalPost)
+	}
 	if err != nil {
 		return domain.Message{}, storeError("创建用户消息失败", err)
-	}
-	if !replay {
-		sourceID, err := messageCommandSourceInTx(ctx, tx, message.ID, "local_user_chat", r.payload(), r.IdempotencyKey, nil)
-		if err != nil {
-			return domain.Message{}, storeError("记录用户命令来源失败", err)
-		}
-		message.SourceID, message.SourceKind = sourceID, "local_user_chat"
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Message{}, storeError("保存用户消息失败", err)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -17,6 +18,8 @@ type MessageRequest struct {
 	GroupID, TopicID, Content, IdempotencyKey string
 	ActorID                                   string   `json:"-"`
 	RecipientIDs                              []string // Nil permits routing; non-nil (even empty) is an explicit set.
+	TopicIDExplicit                           bool     `json:"-"`
+	domain.ThreadLinks
 }
 
 type MessageListOptions struct {
@@ -30,11 +33,39 @@ func (r MessageRequest) scope() mutationScope {
 	return mutationScope{operation: "create_message", actorID: r.ActorID, groupID: r.GroupID, key: r.IdempotencyKey}
 }
 
-func (r MessageRequest) payload() []byte {
+// Member sends retain A3's quote-only command bytes. Local posts use E's
+// thread-link format, whether they persist an A quote or a legacy E edge.
+func (r MessageRequest) payload() []byte { return r.encodePayload("", r.ActorID != "user") }
+
+// Only the idempotency record needs the new selector discriminator. Keep the
+// immutable command-source payload in its existing exact format.
+func (r MessageRequest) topicSelectionPayload() []byte {
+	if r.TopicIDExplicit {
+		return r.encodePayload("+topic-selector/v1:main", false)
+	}
+	return r.encodePayload("+topic-selector/v1:auto", false)
+}
+
+// Pre-composition A3 used the quote-only fingerprint for local user messages
+// too. This is a lookup alias only, never a new reservation or source proof.
+func (r MessageRequest) hasLegacyQuotePayload() bool {
+	return r.ActorID == "user" && r.ReplyToMessageID != "" && r.RelatedTaskID == ""
+}
+
+func (r MessageRequest) encodePayload(selector string, quoteOnly bool) []byte {
 	fields := []string{r.GroupID, r.TopicID, r.Content, "omitted"}
 	if r.RecipientIDs != nil {
 		fields[3] = "explicit"
 	}
+	// Neither marker can collide with a legacy recipient list of any length.
+	if quoteOnly && r.ReplyToMessageID != "" && r.RelatedTaskID == "" {
+		fields[3] += "/quote"
+		fields = append(fields, r.ReplyToMessageID)
+	} else if r.ThreadLinks != (domain.ThreadLinks{}) {
+		fields[3] += "+thread-links/v1"
+		fields = append(fields, r.ReplyToMessageID, r.RelatedTaskID)
+	}
+	fields[3] += selector // Cannot collide with a legacy recipient list or link payload.
 	return mutationPayload(append(fields, recipientSet(r.RecipientIDs)...)...)
 }
 
@@ -54,12 +85,22 @@ func (s *Store) LookupMessageReceipt(ctx context.Context, request MessageRequest
 		return domain.Message{}, false, storeError("读取消息回执失败", err)
 	}
 	id, found, err := lookupMutation(ctx, tx, request.scope(), request.payload())
+	if request.ActorID == "user" && request.TopicID == "" && errors.Is(err, ErrConflict) {
+		id, found, err = lookupMutation(ctx, tx, request.scope(), request.topicSelectionPayload())
+	}
+	if errors.Is(err, ErrConflict) && request.hasLegacyQuotePayload() {
+		id, found, err = lookupMutation(ctx, tx, request.scope(), request.encodePayload("", true))
+	}
 	if err != nil {
 		return domain.Message{}, false, storeError("读取消息回执失败", err)
 	}
 	var m domain.Message
 	if found {
-		m, err = messageInTx(ctx, tx, request.GroupID, id)
+		if request.ActorID == "user" {
+			m, err = localMessageReceiptInTx(ctx, tx, request, id, true)
+		} else {
+			m, err = scopedMessageReceiptInTx(ctx, tx, request, id)
+		}
 		if err != nil {
 			return domain.Message{}, false, storeError("读取消息回执失败", err)
 		}
@@ -102,13 +143,29 @@ func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolv
 	if err := requireMessageActor(ctx, tx, r.GroupID, r.ActorID); err != nil {
 		return domain.Message{}, err
 	}
+	if r.RelatedTaskID != "" {
+		return domain.Message{}, fmt.Errorf("%w：任务关联仅可在本机用户发言中使用", ErrInvalid)
+	}
 	id, replay, err := reserveMutation(ctx, tx, r.scope(), r.payload())
 	if err != nil {
 		return domain.Message{}, err
 	}
 	if replay {
-		return messageInTx(ctx, tx, r.GroupID, id)
+		return scopedMessageReceiptInTx(ctx, tx, r, id)
 	}
+	var quote *domain.MessageQuote
+	if r.ReplyToMessageID != "" {
+		quote, _, err = resolveMessageQuoteInTx(ctx, tx, r, false)
+		if err != nil {
+			return domain.Message{}, err
+		}
+	}
+	return insertRequestedMessageInTx(ctx, tx, r, id, r.TopicID, resolved, quote)
+}
+
+// The request, quote and id are already verified. Only the new row and its
+// deliveries take the resolved storage topic, not the original request proof.
+func insertRequestedMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id, topicID string, resolved []string, quote *domain.MessageQuote) (domain.Message, error) {
 	if strings.TrimSpace(r.Content) == "" {
 		return domain.Message{}, fmt.Errorf("%w：消息内容不能为空", ErrInvalid)
 	}
@@ -124,25 +181,47 @@ func createMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, resolv
 		}
 	}
 	message := domain.Message{
-		ID: id, GroupID: r.GroupID, TopicID: r.TopicID, SenderID: r.ActorID,
+		ID: id, GroupID: r.GroupID, TopicID: topicID, SenderID: r.ActorID,
 		Content: r.Content, CreatedAt: time.Now().UTC(),
 	}
 	if err := insertMessageRow(ctx, tx, message); err != nil {
 		return domain.Message{}, err
 	}
+	if quote != nil {
+		if err := insertMessageQuoteInTx(ctx, tx, message, quote); err != nil {
+			return domain.Message{}, err
+		}
+	}
 	stamp := message.CreatedAt.Format(timestampLayout)
 	for _, recipient := range resolved {
-		c, err := conversationInTx(ctx, tx, r.GroupID, recipient, r.TopicID)
+		c, err := conversationInTx(ctx, tx, r.GroupID, recipient, topicID)
 		if err != nil {
 			return domain.Message{}, err
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO deliveries(id, message_id, conversation_id, recipient_id, group_id, topic_id, created_at)
-			 VALUES(?, ?, ?, ?, ?, ?, ?)`, rand.Text(), id, c.ID, recipient, r.GroupID, r.TopicID, stamp); err != nil {
+			 VALUES(?, ?, ?, ?, ?, ?, ?)`, rand.Text(), id, c.ID, recipient, r.GroupID, topicID, stamp); err != nil {
 			return domain.Message{}, err
 		}
 	}
-	return messageInTx(ctx, tx, r.GroupID, id)
+	message, err := messageInTx(ctx, tx, r.GroupID, id)
+	message.ReplyTo = quote
+	return message, err
+}
+
+func scopedMessageReceiptInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id string) (domain.Message, error) {
+	m, err := messageInTx(ctx, tx, r.GroupID, id)
+	if err != nil || r.ReplyToMessageID == "" {
+		return m, err
+	}
+	items := []domain.Message{m}
+	if err := projectMessageQuotesInTx(ctx, tx, r.GroupID, &r.TopicID, items); err != nil {
+		return domain.Message{}, err
+	}
+	if q := items[0].ReplyTo; q == nil || q.MessageID != r.ReplyToMessageID {
+		return domain.Message{}, errors.New("已保存的消息与引用回执不符")
+	}
+	return items[0], nil
 }
 
 func requireMessageActor(ctx context.Context, tx *sql.Tx, groupID, actorID string) error {
@@ -164,6 +243,9 @@ func (s *Store) GetMessage(ctx context.Context, groupID, messageID string) (doma
 		return domain.Message{}, storeError("读取消息失败", err)
 	}
 	messages := []domain.Message{m}
+	if err := messageThreadLinksInTx(ctx, tx, groupID, messages); err != nil {
+		return domain.Message{}, storeError("读取消息引用失败", err)
+	}
 	if err := projectMessageDiscussionsInTx(ctx, tx, groupID, messages); err != nil {
 		return domain.Message{}, err
 	}

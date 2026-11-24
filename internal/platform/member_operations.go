@@ -48,6 +48,11 @@ func (s *MemberTools) SendMessage(ctx context.Context, token string, input Membe
 		if entry.candidate == nil || !slices.Contains(entry.grants.Operations, "send_message") {
 			return domain.Message{}, store.ErrMemberToolDenied
 		}
+		unlock, ok := entry.intake.threadDecision.lockMutation()
+		if !ok {
+			return domain.Message{}, store.ErrMemberToolDenied
+		}
+		defer unlock()
 		result, err := s.db.SendMessageForChatIntake(ctx, entry.scope, entry.candidate.ID, input, key)
 		if err != nil {
 			return domain.Message{}, memberRoleError(ctx, err)

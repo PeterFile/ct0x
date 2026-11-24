@@ -22,10 +22,16 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
 		return nil, nil, nil, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
 	}
+	if err := config.validateThreadDecisionHandoff(); err != nil {
+		return nil, nil, nil, err
+	}
 	if err := config.validateInvestigationOption(); err != nil {
 		return nil, nil, nil, err
 	}
 	if err := config.validateNativeSessionConfig(); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := config.validateRunExplanationConfig(); err != nil {
 		return nil, nil, nil, err
 	}
 	if err := config.validateInvestigationDataDir(); err != nil {
@@ -90,7 +96,13 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			ConfigRoot: root, Endpoint: endpoint, MaxGroupMembers: config.memberToolsMaxMembers,
 			Operations: []string{"list_members", "read_channel", "send_message", "create_member", "search_history", "read_history"},
 		}
-		if config.enableNativeSessionResume {
+		if config.enableRunExplanation {
+			if !engine.UsesStore(db) {
+				return nil, nil, nil, errors.New("公开运行说明须使用同一数据库")
+			}
+			toolOptions.RunExplanation = engine
+		}
+		if config.enableNativeSessionResume || config.enableRunExplanation {
 			toolOptions.NativeExecutionRoot = schedulerOptions.RuntimeDir
 		}
 		if config.enableCoordinationRoles {
@@ -99,6 +111,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			options.RoleThinking = config.roleThinking
 		}
 		toolOptions.FreshTaskWork = freshTaskWork
+		toolOptions.EnablePiTaskDecisionProposals = config.enablePiTaskDecisionProposals
 		switch {
 		case config.enableInvestigationOwnerManagement:
 			tools, err = platform.NewMemberToolRuntimeWithInvestigationOwnerManagement(db, toolOptions, engine,
@@ -118,6 +131,8 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		}
 		options.MemberTools, options.PiMemberToolsExtension = tools, config.piMemberToolsExtension
 		options.EnableCodexAppServer = config.enableCodexAppServer
+		// Installing the qualified new bridge opts the trusted Pi intake into relay.
+		options.EnablePiDiscussionRelay = config.enableCoordinationRoles
 		options.EnableNativeSessionResume = config.enableNativeSessionResume
 		options.NativePiThinking = config.nativePiThinking
 	}
@@ -138,6 +153,12 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 				err = errors.Join(err, tools.Close())
 			}
 			return nil, nil, nil, err
+		}
+	}
+	if config.enableThreadDecisionHandoff {
+		schedulerOptions.PrepareThreadDecision, err = preparer.EnableThreadDecisionHandoff(context.Background())
+		if err != nil {
+			return nil, nil, nil, errors.Join(err, tools.Close())
 		}
 	}
 	if freshTaskWork != nil || investigationTaskWork != nil {

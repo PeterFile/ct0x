@@ -1,0 +1,536 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"regexp"
+	"slices"
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
+
+const (
+	maxThreadTextBytes = 4096
+	maxThreadTitles    = 128
+)
+
+var (
+	threadNewSubject = regexp.MustCompile(`(?i)^(?:(?:开(?:个|一个)?|开启|新建)?[ \t]*新(?:的)?(?:议题|话题)|(?:let's |start )?(?:a )?new (?:topic|discussion))[ \t]*[:：][ \t]*`)
+	threadInvite     = regexp.MustCompile(`(?i)^(?:(?:我们|咱们)(?:来|先)?讨论|let['’]s discuss[ \t]+)`)
+	threadBusiness   = regexp.MustCompile(`(?i)(?:规划|提案|报告|策略|设计|方案|复盘|验证|调查|审查|排期|迁移|预算|改进|回顾|项目|告警|故障|事故|\b(?:plan|proposal|report|strategy|design|review|migration|budget|investigation|project|alert|incident|bug))$`)
+	threadCurrent    = regexp.MustCompile(`(?i)^(?:(?:当前|现在|这次|本次)(?:只)?(?:讨论|处理|跟进)|(?:请)?(?:跟进|继续处理)(?:那个)?|current (?:subject|topic)|follow up on)[ \t]*[:：]?\s*`)
+	threadComparison = regexp.MustCompile(`(?i)(?:仅作(?:对照|比较|参考)|(?:只)?作为(?:对照|比较|参考)|仅供参考|for comparison|comparison only)`)
+	threadCompNegZh  = regexp.MustCompile(`(?:(?:并|绝|决)?不是|并非|绝非|决非|不只是?|不仅是?|不再|不能|不可|不必|无需|无须|请?不要|请?勿|别|非)$|(?:不要|请勿|别|不能|不可|不必|无需|无须|并非|不是)(?:把|将|拿|用)`)
+	threadCompNegEn  = regexp.MustCompile(`(?i)(?:^|\b)(?:not|never|no\s+longer|isn['’]t|aren['’]t|wasn['’]t|weren['’]t|don['’]t|doesn['’]t|do\s+not|does\s+not|cannot|can['’]t)\b(?:\s+(?:just|only|merely|simply))?(?:\s+(?:use|treat|cite|quote|post|mark|consider|take|meant|intended|used|treated)(?:\s+\S+){0,4})?(?:\s+as)?$`)
+	threadIssue      = regexp.MustCompile(`(?i)[a-z][a-z0-9]{1,15}-[0-9]{1,12}`)
+	threadNonName    = regexp.MustCompile(`(?:什么|怎么样|怎么|如何|吗|一下|随便|闲聊|还好吗|可以吗|是否|^这个|^那个|^这个事|^那件事|^the (?:same|other) thing$)`)
+	threadGeneric    = regexp.MustCompile(`(?i)^(?:(?:议题|话题|任务|工作|项目|问题|进展|告警|故障|事故|复盘|规划|计划|报告|方案|topic|issue|task|work|project|status|alert|incident|bug|plan|report|review)[ \t/_-]*)+$`)
+)
+
+type threadTopicEvidence struct {
+	topic             string
+	conflict, matched bool
+}
+
+func (e *threadTopicEvidence) add(topic string) {
+	if topic != "" {
+		e.confirm(topic)
+	}
+}
+
+func (e *threadTopicEvidence) confirm(topic string) {
+	e.conflict = e.conflict || (e.matched && e.topic != topic)
+	e.topic, e.matched = topic, true
+}
+
+type threadTextRoute struct {
+	threadTopicEvidence
+	current, comparison bool
+	newTitle, newIssue  string
+	aliases             map[string][]string // Explicit shortened subject → candidate topics.
+}
+
+func (t threadTextRoute) resolveAliases(evidence threadTopicEvidence) threadTopicEvidence {
+	strong := evidence.matched
+	for _, candidates := range t.aliases {
+		if len(candidates) == 0 {
+			continue
+		}
+		if strong {
+			// A narrowed alias is corroboration, not a second binding. A
+			// strong target outside the candidates still conflicts with it.
+			evidence.conflict = evidence.conflict || !slices.Contains(candidates, evidence.topic)
+		} else if len(candidates) == 1 {
+			evidence.add(candidates[0])
+		} else {
+			evidence.conflict = true
+		}
+	}
+	return evidence
+}
+
+func threadClauseSeparator(r rune) bool { return strings.ContainsRune("\n。！；，;!,", r) }
+
+// Explicit storage scopes bypass topic matching but not comparison semantics.
+func threadComparisonReply(body string) bool {
+	active, ok := actionableThreadText(body)
+	return ok && hasThreadComparison(active)
+}
+
+func hasThreadComparison(text string) bool {
+	for _, match := range threadComparison.FindAllStringIndex(text, -1) {
+		clauseStart := 0
+		for i, r := range text[:match[0]] {
+			if threadClauseSeparator(r) || r == '(' || r == '（' || r == ':' || r == '：' {
+				clauseStart = i + utf8.RuneLen(r)
+			}
+		}
+		prefix := strings.TrimSpace(text[clauseStart:match[0]])
+		if threadCompNegZh.MatchString(prefix) || threadCompNegEn.MatchString(prefix) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// Strip only balanced, trailing parentheticals marked as comparison. Do this
+// before splitting clauses so punctuation inside cannot expose a quoted issue.
+func stripThreadComparisonSuffixes(text string) (string, bool) {
+	var kept strings.Builder
+	var closers []rune
+	var start, after int
+	for i, r := range text {
+		switch r {
+		case '(', '（':
+			if len(closers) == 0 {
+				start = i
+			}
+			if r == '(' {
+				closers = append(closers, ')')
+			} else {
+				closers = append(closers, '）')
+			}
+		case ')', '）':
+			if len(closers) == 0 || closers[len(closers)-1] != r {
+				return "", false
+			}
+			closers = closers[:len(closers)-1]
+			if len(closers) != 0 || !hasThreadComparison(text[start:i]) {
+				continue
+			}
+			end := i + utf8.RuneLen(r)
+			tail := strings.TrimLeftFunc(text[end:], func(c rune) bool { return c != '\n' && unicode.IsSpace(c) })
+			if next, _ := utf8.DecodeRuneInString(tail); tail != "" && !threadClauseSeparator(next) && !strings.ContainsRune(".？?", next) {
+				return "", false
+			}
+			kept.WriteString(text[after:start])
+			kept.WriteByte(' ')
+			after = end
+		}
+	}
+	if len(closers) != 0 {
+		return "", false
+	}
+	if after == 0 {
+		return text, true
+	}
+	kept.WriteString(text[after:])
+	return kept.String(), true
+}
+
+func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) (threadTextRoute, error) {
+	var route threadTextRoute
+	active, ok := actionableThreadText(body)
+	if !ok {
+		return route, nil
+	}
+	route.comparison = hasThreadComparison(active)
+	if route.comparison {
+		var separated bool
+		active, separated = stripThreadComparisonSuffixes(active)
+		if !separated {
+			route.conflict = true
+			return route, nil
+		}
+	}
+	clauses := strings.FieldsFunc(active, threadClauseSeparator)
+	var title, exact string
+	var openingFollowup bool
+	for i, clause := range clauses {
+		clause = strings.TrimSpace(clause)
+		opening := i == 0 && threadNewSubject.MatchString(clause)
+		invite := i == 0 && threadInvite.MatchString(clause)
+		current := threadCurrent.MatchString(clause)
+		if route.comparison && hasThreadComparison(clause) {
+			if opening || invite || current {
+				// The marked comparison and current subject are not delimited.
+				route.conflict = true
+				return route, nil
+			}
+			clauses[i] = ""
+			continue
+		}
+		switch {
+		case opening:
+			route.current = true
+			title = threadName(threadNewSubject.ReplaceAllString(clause, ""))
+		case invite:
+			route.current = true
+			title = threadName(threadInvite.ReplaceAllString(clause, ""))
+			if !threadBusiness.MatchString(title) && len(issueTokens(title)) != 1 {
+				title = ""
+			}
+		case current:
+			if route.current && title == "" {
+				route.conflict = true
+				return route, nil
+			}
+			route.current = true
+			subject := threadName(threadCurrent.ReplaceAllString(clause, ""))
+			if title == "" {
+				exact = subject
+			} else {
+				// An action prefix after a declared title is not a second
+				// subject unless the remaining text supplies evidence.
+				openingFollowup = true
+			}
+			if subject != "" && len(issueTokens(subject)) == 0 {
+				if route.aliases == nil {
+					route.aliases = make(map[string][]string)
+				}
+				route.aliases[threadTitleKey(subject)] = nil
+			}
+		}
+	}
+	if route.comparison {
+		// Do not turn neighboring clauses into a single title when whitespace
+		// is normalized for matching.
+		active = strings.Join(clauses, "。")
+	}
+	if title != "" {
+		exact = title
+	}
+	titleIssues := issueTokens(title)
+	if exact != "" {
+		var topic string
+		err := tx.QueryRowContext(ctx, `SELECT topic_id FROM main.thread_routing_topics
+		 WHERE group_id=? AND title_key=?`, group, threadTitleKey(exact)).Scan(&topic)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return route, err
+		}
+		route.add(topic)
+		if topic != "" {
+			delete(route.aliases, threadTitleKey(exact))
+		}
+	}
+	issues := issueTokens(active)
+	if len(issues) > 1 {
+		route.conflict = true
+		return route, nil
+	}
+	if len(issues) == 1 {
+		var topic string
+		err := tx.QueryRowContext(ctx, `SELECT topic_id FROM main.thread_routing_topics
+		 WHERE group_id=? AND issue_id=? AND issue_id<>''`, group, issues[0]).Scan(&topic)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return route, err
+		}
+		if openingFollowup && (len(titleIssues) == 0 || titleIssues[0] != issues[0]) && (topic == "" || topic != route.topic) {
+			route.conflict = true
+		}
+		route.add(topic)
+	}
+	if active == "" {
+		return route, nil
+	}
+	names, complete, err := threadTitleEvidenceInTx(ctx, tx, group, active, route.aliases)
+	if err != nil {
+		return route, err
+	}
+	if !complete {
+		route.aliases = nil // A partial catalog cannot prove alias uniqueness.
+	}
+	// A known name elsewhere in the message cannot replace an unmatched
+	// declared title. In an incomplete catalog it may be unsafe to decide.
+	if openingFollowup {
+		route.conflict = route.conflict || !complete
+		if !route.matched {
+			secondary := route.resolveAliases(names)
+			route.conflict = route.conflict || secondary.matched || secondary.conflict
+		}
+	}
+	route.add(names.topic)
+	route.conflict = route.conflict || names.conflict
+	if title != "" && !route.conflict && route.topic == "" && complete {
+		var issue string
+		if len(titleIssues) == 1 {
+			issue = titleIssues[0]
+		}
+		route.newTitle, route.newIssue = title, issue
+	}
+	return route, nil
+}
+
+func threadTitleEvidenceInTx(ctx context.Context, tx *sql.Tx, group, active string, aliases map[string][]string) (threadTopicEvidence, bool, error) {
+	var evidence threadTopicEvidence
+	rows, err := tx.QueryContext(ctx, `SELECT topic_id,title_key,issue_id FROM main.thread_routing_topics
+	 WHERE group_id=? ORDER BY topic_id LIMIT ?`, group, maxThreadTitles+1)
+	if err != nil {
+		return evidence, false, err
+	}
+	defer rows.Close()
+	text := threadTitleKey(active)
+	var matches threadTitleMatches
+	for n := 0; rows.Next(); n++ {
+		if n == maxThreadTitles {
+			// Never infer a unique name from an incomplete sample. The issue ID
+			// and structured references do not depend on catalog order or age.
+			return threadTopicEvidence{}, false, nil
+		}
+		var topic, key, issue string
+		if err := rows.Scan(&topic, &key, &issue); err != nil {
+			return evidence, false, err
+		}
+		if !threadGeneric.MatchString(key) {
+			matches.record(text, key, topic)
+		}
+		if len(aliases) != 0 {
+			alias := threadIssueAlias(key, issue)
+			if candidates, wanted := aliases[alias]; wanted {
+				aliases[alias] = append(candidates, topic)
+			}
+		}
+	}
+	// The longest complete match at a position suppresses a shorter one
+	// there, and a previously matched span suppresses only its contents.
+	var furthestEnd int
+	for start, match := range matches {
+		end := start + len(match.key)
+		if match.key != "" && end > furthestEnd {
+			evidence.add(match.topic)
+			delete(aliases, match.key)
+			furthestEnd = end
+		}
+	}
+	return evidence, true, rows.Err()
+}
+
+// Remove only the separately recognized issue ID, at one end of the name.
+// The remaining text must independently qualify as a name.
+func threadIssueAlias(key, issue string) string {
+	if issue == "" {
+		return ""
+	}
+	const delimiters = " :：–—()（）[]【】"
+	key = strings.Trim(key, delimiters)
+	issue = strings.ToLower(issue)
+	var name string
+	switch {
+	case strings.HasPrefix(key, issue) && threadTokenBounds(key, 0, len(issue), isIssueWord):
+		name = strings.TrimLeft(key[len(issue):], delimiters)
+	case strings.HasSuffix(key, issue) && threadTokenBounds(key, len(key)-len(issue), len(key), isIssueWord):
+		name = strings.TrimRight(key[:len(key)-len(issue)], delimiters)
+	}
+	return threadTitleKey(threadName(name))
+}
+
+func threadTitleKey(title string) string {
+	return strings.ToLower(strings.Join(strings.Fields(title), " "))
+}
+
+func threadName(s string) string {
+	// A creation title is one short named subject, not an entire prose body.
+	for i, r := range s {
+		if r == '?' || r == '？' {
+			return ""
+		}
+		if strings.ContainsRune("\n。！；，、;!,", r) || r == '.' && (i+1 == len(s) || s[i+1] == ' ') {
+			s = s[:i]
+			break
+		}
+	}
+	s = strings.TrimSpace(s)
+	if !validHistoryText(s, 192) || threadNonName.MatchString(s) || threadGeneric.MatchString(s) {
+		return ""
+	}
+	letters := 0
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			letters++
+		}
+	}
+	if letters < 4 {
+		return ""
+	}
+	return s
+}
+
+func issueTokens(text string) []string {
+	var ids []string
+	for _, match := range threadIssue.FindAllStringIndex(text, -1) {
+		if !threadTokenBounds(text, match[0], match[1], isIssueWord) {
+			continue
+		}
+		id := strings.ToUpper(text[match[0]:match[1]])
+		if len(ids) == 0 || id != ids[0] {
+			ids = append(ids, id)
+			if len(ids) == 2 {
+				break
+			}
+		}
+	}
+	return ids
+}
+
+// Keep at most one match per byte position, independent of catalog order.
+// Only allocate this bounded index when a complete title actually occurs.
+type threadTitleMatches []struct{ key, topic string }
+
+func (m *threadTitleMatches) record(text, key, topic string) {
+	for offset := 0; key != "" && offset < len(text); {
+		index := strings.Index(text[offset:], key)
+		if index == -1 {
+			return
+		}
+		start := offset + index
+		if threadTokenBounds(text, start, start+len(key), isNonHanWord) {
+			if *m == nil {
+				*m = make(threadTitleMatches, len(text))
+			}
+			if slot := &(*m)[start]; len(key) > len(slot.key) {
+				slot.key, slot.topic = key, topic
+			}
+		}
+		offset = start + 1
+	}
+}
+
+func threadTokenBounds(text string, start, end int, word func(rune) bool) bool {
+	left, _ := utf8.DecodeLastRuneInString(text[:start])
+	right, _ := utf8.DecodeRuneInString(text[end:])
+	first, _ := utf8.DecodeRuneInString(text[start:end])
+	last, _ := utf8.DecodeLastRuneInString(text[start:end])
+	return !(word(left) && word(first) || word(right) && word(last))
+}
+
+func isNonHanWord(r rune) bool {
+	return !unicode.Is(unicode.Han, r) && (unicode.IsLetter(r) || unicode.IsNumber(r) || r == '_')
+}
+
+func isIssueWord(r rune) bool { return isNonHanWord(r) || r == '-' }
+
+var threadQuotes = strings.NewReplacer("“", "\x01", "”", "\x01", "「", "\x02", "」", "\x02", "『", "\x03", "』", "\x03")
+
+func isASCIIAlphaNum(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+}
+
+func hasSameLineSingleClose(rest string, open, closeRune rune, prev rune) bool {
+	for i := 0; i < len(rest); {
+		r, w := utf8.DecodeRuneInString(rest[i:])
+		if r == closeRune {
+			next, _ := utf8.DecodeRuneInString(rest[i+w:])
+			if open != '\'' || !(isASCIIAlphaNum(prev) && isASCIIAlphaNum(next)) {
+				return true
+			}
+		}
+		prev = r
+		i += w
+	}
+	return false
+}
+
+// Extract only non-quoted prose and enforce maxThreadTextBytes on that prose
+// so >4 KiB quoted material does not erase short routing/comparison signals.
+func actionableThreadText(body string) (string, bool) {
+	if !validHistoryText(body, len(body)) {
+		return "", false
+	}
+	var active strings.Builder
+	var fence string
+	var quoted rune
+	for rawLine := range strings.SplitSeq(body, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if fence != "" {
+			if strings.HasPrefix(line, fence) {
+				fence = ""
+			}
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~"):
+			fence = line[:3]
+			continue
+		case strings.HasPrefix(line, ">") || strings.HasPrefix(line, "＞"):
+			continue
+		}
+		replaced := threadQuotes.Replace(line)
+		var prev rune
+		for i := 0; i < len(replaced); {
+			r, w := utf8.DecodeRuneInString(replaced[i:])
+			if quoted != 0 {
+				switch quoted {
+				case '\'':
+					if r == '\'' {
+						next, _ := utf8.DecodeRuneInString(replaced[i+w:])
+						if !(isASCIIAlphaNum(prev) && isASCIIAlphaNum(next)) {
+							quoted = 0
+						}
+					}
+				case '‘':
+					if r == '’' {
+						quoted = 0
+					}
+				default:
+					if r == quoted {
+						quoted = 0
+					}
+				}
+				prev = r
+				i += w
+				continue
+			}
+			switch r {
+			case '"', '`', '\x01', '\x02', '\x03':
+				quoted = r
+				active.WriteByte(' ')
+			case '\'':
+				if !isASCIIAlphaNum(prev) && hasSameLineSingleClose(replaced[i+w:], '\'', '\'', r) {
+					quoted = '\''
+					active.WriteByte(' ')
+				} else {
+					active.WriteRune(r)
+				}
+			case '‘':
+				if hasSameLineSingleClose(replaced[i+w:], '‘', '’', r) {
+					quoted = '‘'
+					active.WriteByte(' ')
+				} else {
+					active.WriteRune(r)
+				}
+			default:
+				active.WriteRune(r)
+			}
+			if active.Len() > maxThreadTextBytes*2 && len(strings.TrimSpace(active.String())) > maxThreadTextBytes {
+				return "", false
+			}
+			prev = r
+			i += w
+		}
+		if quoted == '\'' || quoted == '‘' {
+			quoted = 0
+		}
+		active.WriteByte('\n')
+		if active.Len() > maxThreadTextBytes*2 && len(strings.TrimSpace(active.String())) > maxThreadTextBytes {
+			return "", false
+		}
+	}
+	trimmed := strings.TrimSpace(active.String())
+	if trimmed == "" || len(trimmed) > maxThreadTextBytes {
+		return "", false
+	}
+	return trimmed, true
+}
