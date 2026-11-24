@@ -29,6 +29,7 @@ type config struct {
 	piFreshTaskWorkExtension, piFreshInvestigationWorkExtension    string
 	enableInvestigationOwnerManagement, enableDiscussionWorkReturn bool
 	enablePiTaskDecisionProposals                                  bool
+	groupBackgroundDispatchPreview                                 string
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -41,6 +42,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		fmt.Fprintln(output, "  --enable-run-explanation  允许合格的全新普通 Pi 成员轮次主动发布一条公开运行说明（默认禁用；须启用执行和成员工具、配置精确可信 Pi 扩展且数据库支持；不适用于续接或受信协调角色）")
 		fmt.Fprintln(output, "  普通讨论接力：启用执行、成员工具和协调角色，并显式选择支持接力的可信 Pi 扩展；旧版扩展和其他适配器保持原行为。")
 		fmt.Fprintln(output, "  --enable-investigation-execution  显式启用 Pi 1.4.0 只读调查首轮预览（默认禁用；须使用独立的私有数据目录、明确选定的 Pi 和可信扩展，启用协调角色且不得同时启用 Codex AppServer；限单收件人的本机用户原始消息）")
+		fmt.Fprintln(output, "  --group-background-dispatch-preview 路径  可信后台讨论预览授权文件（默认禁用；须启用执行、明确指定 --pi-path 并具备有效的实际运行证据；见 docs/group-background-dispatch-preview.md）")
 	}
 	flags.StringVar(&config.listen, "listen", httpapi.DefaultAddress, "监听地址")
 	flags.StringVar(&config.dataDir, "data-dir", "", "数据目录")
@@ -69,6 +71,13 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 			return nil
 		})
 	}
+	flags.Func("group-background-dispatch-preview", "可信预览授权文件的绝对路径", func(path string) error {
+		if config.groupBackgroundDispatchPreview != "" || !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
+			return errors.New("群组后台调度预览授权文件只能指定一次且必须是绝对路径")
+		}
+		config.groupBackgroundDispatchPreview = filepath.Clean(path)
+		return nil
+	})
 	devSet := false
 	flags.Func("dev-origin", "开发来源", func(value string) error {
 		if devSet || value == "" {
@@ -95,6 +104,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		return config, errors.New("监听地址必须是带端口的回环 IP 地址")
 	}
 	config.listen = address.String()
+	if config.groupBackgroundDispatchPreview != "" && (!config.enableExecution || config.piPath == "") {
+		return config, errors.New("群组后台调度预览须启用执行并明确指定 --pi-path")
+	}
 	if !config.enableExecution && set["execution-max-active"] {
 		return config, errors.New("执行禁用时不能指定最大并发")
 	}
