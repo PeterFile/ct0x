@@ -30,10 +30,10 @@ var (
 )
 
 func PiRunExplanationBridgeSupported(extensionPath string) bool {
-	return qualifyPiRunExplanationBridge(extensionPath) != ""
+	return qualifyPiRunExplanationBridge(extensionPath).path != ""
 }
 
-func qualifyPiRunExplanationBridge(extensionPath string) string {
+func qualifyPiRunExplanationBridge(extensionPath string) qualifiedPiBridge {
 	return qualifyPiBridgePair(extensionPath, piRunExplanationImplSHA, piRunExplanationEntrySHA)
 }
 
@@ -41,7 +41,7 @@ func qualifyPiRunExplanationBridge(extensionPath string) string {
 // Pi profile. The caller owns the live claim and issued config. Neither this
 // constructor nor the tool name grants authority or elects native resume.
 func NewPiRunExplanationExecutor(selected Provider, extension string, issued NativeMemberToolConfig, runID string, base []string, timeout time.Duration) (Executor, error) {
-	bridge, path := qualifyPiRunExplanationBridge(extension), filepath.Clean(issued.Path)
+	bridge, path := qualifyPiRunExplanationBridge(extension).path, filepath.Clean(issued.Path)
 	journal := piRunExplanationConfigJournal(path, issued.SHA256, runID)
 	if bridge == "" || journal == "" {
 		return nil, errPiMemberToolConfiguration

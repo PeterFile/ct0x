@@ -60,7 +60,7 @@ func (a piInvestigationAdapter) NewExecutor(selected Provider, timeout time.Dura
 	if err != nil || config.digest != a.config.SHA256 || !slices.Equal(config.investigationTools, names) {
 		return nil, errPiMemberToolConfiguration
 	}
-	entry := qualifyPiInvestigationBridge(a.extension)
+	entry := qualifyPiInvestigationBridge(a.extension).path
 	native, err := newPiMemberToolExecutor(selected, entry, path, names, timeout, true)
 	if err != nil {
 		return nil, err
@@ -82,7 +82,7 @@ func NewPiInvestigationIntakeExecutor(selected Provider, extension string, issue
 	if config.discussionRelay {
 		qualify = qualifyPiDiscussionRelayBridge
 	}
-	bridge := qualify(extension)
+	bridge := qualify(extension).path
 	if bridge == "" {
 		return nil, errPiMemberToolConfiguration
 	}
