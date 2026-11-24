@@ -27,14 +27,30 @@ type backgroundDispatchApproval struct {
 	MaxActiveMembers int                              `json:"max_active_members"`
 	ApprovalExpires  time.Time                        `json:"approval_expires_at"`
 	Paused           bool                             `json:"paused"`
-	Preset           backgroundDispatchPreset         `json:"preset"`
+	Preset           backgroundDispatchTemplate       `json:"preset"`
+	Create           backgroundDispatchTemplate       `json:"create"`
 	Qualification    *backgroundDispatchQualification `json:"qualification"`
 }
 
-type backgroundDispatchPreset struct {
+type backgroundDispatchTemplate struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
 	Role string `json:"role"`
+}
+
+// Only an omitted template can be empty. A supplied value, including null,
+// must decode as a complete template without its own profile override.
+func (t *backgroundDispatchTemplate) UnmarshalJSON(data []byte) error {
+	type fields backgroundDispatchTemplate
+	if !httpapi.DecodeStrictJSONObject(data, (*fields)(t)) ||
+		!backgroundApprovalText(t.ID, 128) || !backgroundApprovalText(t.Name, 128) || !backgroundApprovalText(t.Role, 512) {
+		return errBackgroundApproval
+	}
+	return nil
+}
+
+func (t backgroundDispatchTemplate) forProfile(profile store.BackgroundDispatchProfile) store.BackgroundDispatchTemplate {
+	return store.BackgroundDispatchTemplate{ID: t.ID, Name: t.Name, Role: t.Role, Profile: profile}
 }
 
 // A local operator attests an actual successful run for this exact account/model
@@ -92,7 +108,7 @@ func readBackgroundDispatchApproval(path, providerID string) (a backgroundDispat
 	}
 	if a.ProviderID != providerID || !provider.IsExactPiModel(a.Model) ||
 		a.MaxActiveMembers < 1 || a.MaxActiveMembers > 200 || a.ApprovalExpires.IsZero() ||
-		!backgroundApprovalText(a.Preset.ID, 128) || !backgroundApprovalText(a.Preset.Name, 128) || !backgroundApprovalText(a.Preset.Role, 512) {
+		(a.Preset.ID == "" && a.Create.ID == "") {
 		return a, errBackgroundApproval
 	}
 	// Do not use a just-withdrawn or replaced grant from an already open inode.
@@ -153,13 +169,14 @@ func (c config) withBackgroundDispatchPassClock(db *store.Store, preparer *platf
 	if err != nil || !preparer.SupportsBackgroundDiscussionAdapter(initial.profile()) {
 		return nil, pathErr
 	}
+	startupCapacity := initial.MaxActiveMembers
 	return func(ctx context.Context) {
 		if intentPass != nil {
 			intentPass(ctx)
 		}
 		// The Store requires a valid capacity even to publish an empty list.
-		// Never retain the initial approval, preset or evidence as fallback.
-		options := store.BackgroundDispatchOptions{MaxActiveMembers: initial.MaxActiveMembers}
+		// Do not use any earlier templates or evidence as fallback.
+		options := store.BackgroundDispatchOptions{MaxActiveMembers: startupCapacity}
 		approval, readErr := read()
 		profile := approval.profile()
 		adapterOK := false
@@ -183,7 +200,13 @@ func (c config) withBackgroundDispatchPassClock(db *store.Store, preparer *platf
 			if until := approval.readyUntil(selected, wall, effective); !until.IsZero() {
 				options.ReadyUntil = until
 				options.ReadyProfiles = []store.BackgroundDispatchProfile{profile}
-				options.Presets = []store.BackgroundDispatchTemplate{{ID: approval.Preset.ID, Name: approval.Preset.Name, Role: approval.Preset.Role, Profile: profile}}
+				if approval.Preset.ID != "" {
+					options.Presets = []store.BackgroundDispatchTemplate{approval.Preset.forProfile(profile)}
+				}
+				if approval.Create.ID != "" {
+					create := approval.Create.forProfile(profile)
+					options.Create = &create
+				}
 			}
 		}
 		if err := errors.Join(readErr, db.RunGroupBackgroundDispatch(ctx, options)); err != nil {

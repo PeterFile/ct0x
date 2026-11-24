@@ -59,6 +59,38 @@ func TestReadBackgroundDispatchApprovalStrictJSON(t *testing.T) {
 	}
 }
 
+func TestReadBackgroundDispatchApprovalTemplates(t *testing.T) {
+	const template = `{"id":"discussion","name":"讨论","role":"主持"}`
+	const preset, create = `"preset":` + template, `"create":` + template
+	for _, tt := range []struct {
+		name, templates string
+		wantOK          bool
+	}{
+		{"legacy preset only", preset + ",", true},
+		{"create only", create + ",", true},
+		{"preset and create", preset + "," + create + ",", true},
+		{"neither template", "", false},
+		{"null preset alongside create", `"preset":null,` + create + ",", false},
+		{"null create alongside preset", preset + `,"create":null,`, false},
+		{"empty create alongside preset", preset + `,"create":{},`, false},
+		{"non-object create", `"create":[],`, false},
+		{"missing create role", `"create":{"id":"discussion","name":"讨论"},`, false},
+		{"untrimmed create id", strings.Replace(create, `"discussion"`, `" discussion"`, 1) + ",", false},
+		{"oversized create name", strings.Replace(create, "讨论", strings.Repeat("n", 129), 1) + ",", false},
+		{"duplicate create", create + "," + create + ",", false},
+		{"duplicate create role", strings.Replace(create, `"role":`, `"ROLE":"other","role":`, 1) + ",", false},
+		{"create profile override", strings.Replace(create, `"role":`, `"model":"other/model","role":`, 1) + ",", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			body := strings.Replace(backgroundApprovalFixtureJSON, preset+",", tt.templates, 1)
+			_, err := readBackgroundDispatchApprovalFixture(t, body)
+			if tt.wantOK && err != nil || !tt.wantOK && !errors.Is(err, errBackgroundApproval) {
+				t.Fatalf("approval error = %v, want success = %t", err, tt.wantOK)
+			}
+		})
+	}
+}
+
 func TestReadBackgroundDispatchApprovalExactPiModel(t *testing.T) {
 	for _, tt := range []struct {
 		name, model string
