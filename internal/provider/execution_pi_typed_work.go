@@ -72,6 +72,8 @@ func (p *piTypedWorkOutput) boundWrite(name string) bool {
 	switch name {
 	case "ack_work_input", "hand_back_work_input", "submit_result", "report_work":
 		return true
+	case ProposeTaskDecisionTool:
+		return p.role == "followup"
 	case DelegateWorkTool:
 		return domain.TaskWorkSourceKind(p.role) == PiInitialInvestigationOwnerRole || domain.TaskWorkSourceKind(p.role).IsOwnerContinuation()
 	case HandbackWorkTool:
@@ -167,8 +169,14 @@ func (p *piTypedWorkOutput) observeMarker(details map[string]any, runID, name, i
 		!piTypedWriteRequestSHA.MatchString(e.RequestSHA256) {
 		return false
 	}
-	key := sha256.Sum256([]byte(e.Operation + e.ToolCallID))
-	if hex.EncodeToString(key[:]) != e.IdempotencyKey {
+	var key string
+	if name == ProposeTaskDecisionTool {
+		key = PiTaskDecisionWriteKey(runID, id)
+	} else {
+		digest := sha256.Sum256([]byte(name + id))
+		key = hex.EncodeToString(digest[:])
+	}
+	if key != e.IdempotencyKey {
 		return false
 	}
 	p.unknown = &e

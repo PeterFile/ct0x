@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ApiError, getMessage, listMessages } from "./api";
-import type { Message } from "./api";
+import { ApiError, getMessage, listMessages, matchesMessageQuote } from "./api";
+import type { Message, MessageQuoteTarget } from "./api";
 
 type FeedRecord = { message: Message; source: "read" | "receipt"; dataVersion: number; presenceVersion: number };
 type Feed = { entries: Map<string, FeedRecord>; floor: number };
@@ -23,7 +23,7 @@ function merge(previous: Feed, incoming: Message[], version: number, reset = fal
 const timeKey = (value: string) => value.replace(/(?:\.(\d+))?Z$/, (_match, fraction?: string) => `.${(fraction ?? "").padEnd(9, "0")}Z`);
 const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
 
-export function useMessageFeed(groupId: string, active: boolean) {
+export function useMessageFeed(groupId: string, active: boolean, paused = false) {
   const [feed, setFeed] = useState<Feed>({ entries: new Map(), floor: 0 });
   const [page, setPage] = useState({ pending: true, error: "", next: "" });
   const [pollError, setPollError] = useState("");
@@ -31,6 +31,7 @@ export function useMessageFeed(groupId: string, active: boolean) {
   const clock = useRef(0), epoch = useRef(0), running = useRef(false), pageBusy = useRef(false);
   const controllers = useRef(new Set<AbortController>()), detailBusy = useRef(new Set<string>());
   const lastRequest = useRef({ before: "", reset: true });
+  const pausedRequest = useRef<typeof lastRequest.current | null | undefined>(undefined);
   const windowVersion = useRef(0), detailQueue = useRef<string[]>([]);
   const beginRead = useCallback(() => {
     const controller = new AbortController(), generation = epoch.current, version = ++clock.current;
@@ -67,16 +68,36 @@ export function useMessageFeed(groupId: string, active: boolean) {
       if (read.valid()) setDetails(previous => ({ ...previous, [id]: { pending: false, error: errorText(error) } }));
     } finally { if (read.valid()) detailBusy.current.delete(id); read.close(); }
   }, [groupId, beginRead]);
+  const loadQuote = useCallback(async (quote: MessageQuoteTarget, isCurrent: () => boolean) => {
+    if (!running.current || quote.group_id !== groupId) return false;
+    const window = windowVersion.current, read = beginRead();
+    const valid = () => read.valid() && window === windowVersion.current && isCurrent();
+    try {
+      const original = await getMessage(groupId, quote.message_id, read.signal);
+      if (!valid()) return false;
+      if (!matchesMessageQuote(quote, original)) throw new ApiError("被引原消息与引用不符。");
+      setFeed(previous => merge(previous, [original], read.version));
+      return true;
+    } catch (error) {
+      if (valid()) throw error;
+      return false;
+    } finally { read.close(); }
+  }, [groupId, beginRead]);
   useEffect(() => {
+    // A global page pauses reads for the same group, not its loaded history window.
+    if (paused) pausedRequest.current = pageBusy.current ? lastRequest.current : null;
+    const resume = pausedRequest.current;
+    if (!paused) pausedRequest.current = undefined;
     running.current = active; ++epoch.current;
     pageBusy.current = false; detailBusy.current.clear(); setDetails({}); setPollError("");
-    if (active) void loadPage();
+    if (active && resume === undefined) void loadPage();
+    else if (active && resume) void loadPage(resume.before, resume.reset);
     return () => {
       running.current = false; ++epoch.current;
       for (const controller of controllers.current) controller.abort();
       controllers.current.clear();
     };
-  }, [active, loadPage]);
+  }, [active, paused, loadPage]);
   const beginSend = useCallback(() => ++clock.current, []);
   const confirm = useCallback((message: Message, attempt: number) => {
     const version = ++clock.current;
@@ -144,6 +165,6 @@ export function useMessageFeed(groupId: string, active: boolean) {
     timer = setTimeout(() => void cycle(), 5000);
     return () => { stopped = true; clearTimeout(timer); };
   }, [active, groupId, beginRead, refreshDetail]);
-  return { items, page, pollError, details, loadPage, refreshDetail, beginSend, confirm, preserveReference,
+  return { items, page, pollError, details, loadPage, refreshDetail, loadQuote, beginSend, confirm, preserveReference,
     retry: () => loadPage(lastRequest.current.before, lastRequest.current.reset) };
 }
