@@ -2,8 +2,29 @@ import { ApiError, decodeMessage, messageIn } from "./api";
 import type { Message, WireMessage } from "./api";
 
 export type HistoryQuery = Readonly<{ q: string; topic_id?: string; before?: string }>;
-export type HistoryPage = { items: Message[]; next_cursor: string };
+type EffectiveTopic = { effective_topic_id?: string };
+export type HistoryMessage = Message & EffectiveTopic;
+type WireHistoryMessage = WireMessage & EffectiveTopic;
+export type HistoryPage = { items: HistoryMessage[]; next_cursor: string };
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null && !Array.isArray(value);
+const topicEncoder = new TextEncoder();
+const maxTopicBytes = 256;
+
+function historyMessageIn(groupId: string, topicId?: string) {
+  const inGroup = messageIn(groupId);
+  return (value: unknown): value is WireHistoryMessage => {
+    if (!inGroup(value)) return false;
+    const effective = "effective_topic_id" in value ? value.effective_topic_id : undefined;
+    // Exact UTF-8 selectors may be empty (main) and are never trimmed or normalized.
+    if (effective !== undefined && (typeof effective !== "string" || effective.length > maxTopicBytes
+      || /[\0\ud800-\udfff]/u.test(effective) || topicEncoder.encode(effective).length > maxTopicBytes)) return false;
+    return topicId === undefined || (effective ?? value.topic_id) === topicId;
+  };
+}
+function decodeHistoryMessage({ effective_topic_id, ...wire }: WireHistoryMessage): HistoryMessage {
+  const message = decodeMessage(wire);
+  return effective_topic_id === undefined ? message : { ...message, effective_topic_id };
+}
 
 async function request<T>(path: string, signal: AbortSignal | undefined, valid: (value: unknown) => value is T): Promise<T> {
   let response: Response;
@@ -28,17 +49,21 @@ async function request<T>(path: string, signal: AbortSignal | undefined, valid: 
 }
 
 const historyPath = (groupId: string) => `/api/v1/groups/${encodeURIComponent(groupId)}/history`;
-export async function searchHistory(groupId: string, query: HistoryQuery, signal?: AbortSignal): Promise<HistoryPage> {
-  const params = new URLSearchParams({ q: query.q, limit: "50" });
-  if (query.topic_id !== undefined) params.set("topic_id", query.topic_id);
-  if (query.before) params.set("before", query.before);
-  const result = await request(`${historyPath(groupId)}?${params}`, signal, (value): value is { items: WireMessage[]; next_cursor: string } => isRecord(value)
-    && Array.isArray(value.items) && value.items.every(messageIn(groupId, query.topic_id)) && typeof value.next_cursor === "string");
-  return { ...result, items: result.items.map(decodeMessage) };
+export async function searchHistory(groupId: string, { q, topic_id: topicId, before }: HistoryQuery, signal?: AbortSignal): Promise<HistoryPage> {
+  const params = new URLSearchParams({ q, limit: "50" });
+  if (topicId !== undefined) params.set("topic_id", topicId);
+  if (before) params.set("before", before);
+  const inScope = historyMessageIn(groupId, topicId);
+  const result = await request(`${historyPath(groupId)}?${params}`, signal, (value): value is { items: WireHistoryMessage[]; next_cursor: string } => isRecord(value)
+    && Array.isArray(value.items) && value.items.every(inScope) && typeof value.next_cursor === "string");
+  return { ...result, items: result.items.map(decodeHistoryMessage) };
 }
-export function readHistory(groupId: string, messageId: string, topicId?: string, signal?: AbortSignal) {
+// A result's recorded topic is an identity check on the reply, not a read selector.
+export function readHistory(groupId: string, messageId: string, topicId?: string, signal?: AbortSignal, recordedTopicId?: string) {
   const params = new URLSearchParams();
   if (topicId !== undefined) params.set("topic_id", topicId);
+  const inScope = historyMessageIn(groupId, topicId);
   return request(`${historyPath(groupId)}/${encodeURIComponent(messageId)}${params.size ? `?${params}` : ""}`, signal,
-    (value): value is WireMessage => messageIn(groupId, topicId)(value) && value.id === messageId).then(decodeMessage);
+    (value): value is WireHistoryMessage => inScope(value) && value.id === messageId
+      && (recordedTopicId === undefined || value.topic_id === recordedTopicId)).then(decodeHistoryMessage);
 }

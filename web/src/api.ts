@@ -42,6 +42,10 @@ export type MessageQuote = Readonly<{
 // An E-only reply attests the ID within this group, not the original's topic, author or excerpt.
 export type MessageQuoteTarget = Pick<MessageQuote, "message_id" | "group_id"> &
   (Pick<MessageQuote, "topic_id" | "sender_id"> | Readonly<{ topic_id?: never; sender_id?: never }>);
+export type ThreadCorrectionReceipt = Readonly<
+  { message_id: string; original_topic_id: string; previous_topic_id: string; effective_topic_id: string; question?: never }
+  | { message_id?: never; original_topic_id: ""; previous_topic_id: ""; effective_topic_id: ""; question: string }
+>;
 export type Message = MessageSource & {
   id: string; group_id: string; topic_id: string; sender_id: string; content: string; created_at: string; deliveries: Delivery[];
   reply_to?: MessageQuote;
@@ -49,10 +53,11 @@ export type Message = MessageSource & {
   discussion?: MessageDiscussion | null;
   discussion_closure_reason?: string;
   discussion_work?: MessageDiscussionWork;
+  thread_correction?: ThreadCorrectionReceipt;
 };
-export type WireMessage = Omit<Message, "reply_to" | "reply_to_message_id" | "discussion" | "discussion_closure_reason" | "discussion_work"> & {
+export type WireMessage = Omit<Message, "reply_to" | "reply_to_message_id" | "discussion" | "discussion_closure_reason" | "discussion_work" | "thread_correction"> & {
   reply_to?: unknown; reply_to_message_id?: unknown;
-  discussion?: unknown; discussion_closure_reason?: unknown; discussion_work?: unknown;
+  discussion?: unknown; discussion_closure_reason?: unknown; discussion_work?: unknown; thread_correction?: unknown;
 };
 export type MessageInput = Readonly<{ content: string; recipient_ids?: readonly string[]; topic_id?: string; reply_to_message_id?: string }>;
 type Page<T> = { items: T[]; next_cursor: string };
@@ -163,12 +168,30 @@ function replyEvidenceFor(message: WireMessage): ReplyEvidence | undefined {
   const quote = quoteFor(reply_to, message);
   if (quote && (id === undefined || quote.message_id === id)) return { id, quote };
 }
+function threadCorrectionFor(value: unknown, message: WireMessage): ThreadCorrectionReceipt | undefined {
+  // Corrections live on main and never have a chat-command source or delivery.
+  if (!isRecord(value) || Array.isArray(value) || message.topic_id !== "" || message.sender_id !== "user" || message.deliveries.length !== 0
+    || (message.source_kind !== undefined && message.source_kind !== "unknown") || (message.source_id !== undefined && message.source_id !== "")) return;
+  const { message_id, original_topic_id, previous_topic_id, effective_topic_id, question } = value;
+  if (question !== undefined) {
+    if (message_id === undefined && original_topic_id === "" && previous_topic_id === "" && effective_topic_id === ""
+      && boundedDiscussionText(question, 512) && question.trim() === question && question !== "" && !/[\p{Cc}\p{Cf}]/u.test(question)) {
+      return { original_topic_id, previous_topic_id, effective_topic_id, question };
+    }
+    return;
+  }
+  if (discussionId(message_id) && message_id !== message.id && boundedDiscussionText(original_topic_id, 4096)
+    && boundedDiscussionText(previous_topic_id, 4096) && discussionId(effective_topic_id)) {
+    return { message_id, original_topic_id, previous_topic_id, effective_topic_id };
+  }
+}
 export function decodeMessage(wire: WireMessage): Message {
-  const { reply_to, reply_to_message_id, discussion, discussion_closure_reason, discussion_work, ...message } = wire;
+  const { reply_to, reply_to_message_id, discussion, discussion_closure_reason, discussion_work, thread_correction, ...message } = wire;
   // Invalid optional evidence must not conceal an otherwise valid public row.
   const reply = replyEvidenceFor(wire);
+  const correction = threadCorrectionFor(thread_correction, wire);
   const projected: Message = { ...message, ...(reply?.id === undefined ? {} : { reply_to_message_id: reply.id }),
-    ...(reply?.quote ? { reply_to: reply.quote } : {}) };
+    ...(reply?.quote ? { reply_to: reply.quote } : {}), ...(correction ? { thread_correction: correction } : {}) };
   if (discussion === null) return { ...projected, discussion };
   const relation = discussionFor(discussion, message);
   if (!relation) return projected;
@@ -264,7 +287,10 @@ export function sendMessage(groupId: string, input: MessageInput, key: string, s
     recipient_ids: Array.isArray(input.recipient_ids) ? Object.freeze([...input.recipient_ids]) : input.recipient_ids,
     topic_id: input.topic_id, reply_to_message_id: input.reply_to_message_id });
   return post(messagesPath(groupId), sent, key, (value): value is WireMessage => {
-    if (!messageIn(groupId, sent.topic_id)(value) || value.content !== sent.content) return false;
+    if (!messageIn(groupId)(value) || value.content !== sent.content) return false;
+    if (sent.topic_id !== undefined && value.topic_id !== sent.topic_id
+      // A scope conflict on a correction is recorded as a clarification on main.
+      && threadCorrectionFor(value.thread_correction, value)?.question === undefined) return false;
     const reply = replyEvidenceFor(value);
     return reply !== undefined && (reply.id ?? reply.quote?.message_id) === sent.reply_to_message_id;
   }, signal).then(decodeMessage);

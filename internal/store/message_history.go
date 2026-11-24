@@ -71,6 +71,9 @@ func (s *Store) ListMessages(ctx context.Context, groupID string, options Messag
 	if err := messageThreadLinksInTx(ctx, tx, groupID, page.Items); err != nil {
 		return Page[domain.Message]{}, storeError("读取消息引用失败", err)
 	}
+	if err := messageThreadCorrectionsInTx(ctx, tx, groupID, page.Items); err != nil {
+		return Page[domain.Message]{}, storeError("读取话题纠正失败", err)
+	}
 	if err := projectMessageDiscussionsInTx(ctx, tx, groupID, page.Items); err != nil {
 		return Page[domain.Message]{}, err
 	}

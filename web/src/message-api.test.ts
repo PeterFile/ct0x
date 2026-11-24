@@ -83,6 +83,44 @@ it.each(["", "topic-A"])("rejects a 201 receipt outside requested topic %s", asy
   expect(error).toMatchObject({ status: 201, code: "invalid_response" });
   expect(isDefinitiveRejection(error)).toBe(false);
 });
+const clarification = { ...message, content: "这句话指的是告警", deliveries: [], source_kind: "unknown" as const,
+  thread_correction: { original_topic_id: "", previous_topic_id: "", effective_topic_id: "",
+    question: "你指的是本群哪个已存在的话题？请用完整名称或故障编号。" } };
+
+it("accepts the matching main-timeline clarification for an explicitly scoped send", async () => {
+  transport.mockResolvedValueOnce(json(clarification, 201))
+    .mockResolvedValueOnce(json({ items: [clarification], next_cursor: "" })).mockResolvedValueOnce(json(clarification));
+  const input = { content: clarification.content, topic_id: "topic-A" };
+  expect(await sendMessage(group.id, input, "correction-key")).toEqual(clarification);
+  expect(JSON.parse(String(transport.mock.calls[0][1]?.body))).toStrictEqual(input);
+  expect((await listMessages(group.id)).items).toEqual([clarification]);
+  expect(await getMessage(group.id, clarification.id)).toEqual(clarification);
+});
+
+it.each([
+  { thread_correction: undefined },
+  { thread_correction: { question: clarification.thread_correction.question } },
+  { thread_correction: { ...clarification.thread_correction, question: [] } },
+  { thread_correction: { ...clarification.thread_correction, question: " " } },
+  { thread_correction: { ...clarification.thread_correction, question: "前往另一群\n核对" } },
+  { thread_correction: { ...clarification.thread_correction, question: "答".repeat(200) } },
+  { thread_correction: { ...clarification.thread_correction, effective_topic_id: "topic-B" } },
+  { thread_correction: { ...clarification.thread_correction, message_id: "another-message" } },
+  { thread_correction: { original_topic_id: "", previous_topic_id: "", effective_topic_id: "topic-A", message_id: "earlier-message" } },
+  { group_id: other.id }, { content: "different request" }, { topic_id: "topic-B" },
+  { sender_id: "member-5" }, { deliveries: [delivery] }, { source_kind: "local_user_chat", source_id: "normal-chat" },
+])("does not relax the explicit scope check for an inconsistent clarification: %j", async incompatible => {
+  transport.mockResolvedValueOnce(json({ ...clarification, ...incompatible }, 201));
+  await expect(sendMessage(group.id, { content: clarification.content, topic_id: "topic-A" }, "key"))
+    .rejects.toMatchObject({ status: 201, code: "invalid_response" });
+});
+
+it("keeps the message but drops invalid optional correction metadata in the feed", async () => {
+  const { thread_correction: _correction, ...row } = clarification;
+  transport.mockResolvedValueOnce(json({ items: [{ ...row, thread_correction: { ..._correction, message_id: "earlier" } }], next_cursor: "" }));
+  expect((await listMessages(group.id)).items).toEqual([row]);
+});
+
 it("preserves raw content and the same key/body on explicit caller retry, never retrying automatically", async () => {
   const input = { content, recipient_ids: [], topic_id: "" };
   transport.mockRejectedValueOnce(new TypeError("offline"));
