@@ -369,3 +369,124 @@ func TestGroupBackgroundDispatchReviewRoutingFailureIsTopicLocal(t *testing.T) {
 	backgroundDelivery(t, f, first)
 	backgroundDelivery(t, f, later)
 }
+
+func TestGroupBackgroundDispatchReviewUnreadyOrLeftOlderDoesNotDeadlockTopic(t *testing.T) {
+	ctx := context.Background()
+	f := newBackgroundFixture(t, "", true)
+	p, _ := backgroundPreparer(t, f, discussionProfile.ProviderID, provider.Pi, "1.4.0", false)
+	hasPending := func(deliveryID string) bool {
+		t.Helper()
+		page, err := f.db.ListPendingDeliveries(ctx, store.PendingOptions{Lane: "human"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range page.Items {
+			if item.Delivery.ID == deliveryID {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 1. Earlier unready explicit delivery to another member must not deadlock
+	// subsequent A1 or active-member explicit deliveries in the same topic.
+	g1 := f.group(t, "no-deadlock-unready")
+	ready1 := backgroundMember(t, f, g1.ID, discussionProfile)
+	unready1 := backgroundMember(t, f, g1.ID, store.BackgroundDispatchProfile{})
+	_ = f.post(t, g1.ID, "", platform.MessageInput{Content: "先发给未配运行器成员", TopicID: "同话题", RecipientIDs: []string{unready1.ID}})
+	a1Msg := f.post(t, g1.ID, "", platform.MessageInput{Content: "无收件人续谈", TopicID: "同话题"})
+	explicitAfter := f.post(t, g1.ID, "", platform.MessageInput{Content: "再发给就绪成员", TopicID: "同话题", RecipientIDs: []string{ready1.ID}})
+	f.pass(t, backgroundOptions())
+	a1Pending := backgroundDelivery(t, f, a1Msg)
+	if !hasPending(a1Pending.Delivery.ID) {
+		t.Fatal("earlier unready explicit delivery blocked later active A1 delivery")
+	}
+	if hasPending(explicitAfter.Deliveries[0].ID) {
+		t.Fatal("later explicit delivery overtook earlier ready A1 delivery")
+	}
+	preparedA1, err := p.Prepare(ctx, a1Pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turnA1, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{
+		GroupID: g1.ID, DeliveryID: a1Pending.Delivery.ID, MaxActive: 2,
+		ResourceKeys: preparedA1.ResourceKeys, BackgroundProfile: preparedA1.BackgroundProfile,
+	})
+	if err != nil {
+		t.Fatalf("claim later A1 past unready explicit failed: %v", err)
+	}
+	if _, err := f.db.ApplyTurnReceipt(ctx, store.TurnClaim{GroupID: g1.ID, TurnID: turnA1.ID, Token: turnA1.ClaimToken}, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if !hasPending(explicitAfter.Deliveries[0].ID) {
+		t.Fatal("subsequent explicit delivery remained blocked after A1 left queued")
+	}
+	tExplicit, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: g1.ID, DeliveryID: explicitAfter.Deliveries[0].ID, MaxActive: 2})
+	if err != nil {
+		t.Fatalf("claim subsequent explicit delivery failed: %v", err)
+	}
+	if _, err := f.db.ApplyTurnReceipt(ctx, store.TurnClaim{GroupID: g1.ID, TurnID: tExplicit.ID, Token: tExplicit.ClaimToken}, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. An earlier A1 delivery whose recipient became left or workspace-bound
+	// must not block later active-member deliveries in that topic.
+	for _, kind := range []string{"left", "workspace"} {
+		g2 := f.group(t, "no-deadlock-"+kind)
+		ready2 := backgroundMember(t, f, g2.ID, discussionProfile)
+		olderA1 := f.post(t, g2.ID, "", platform.MessageInput{Content: "早期自动路由", TopicID: "同话题"})
+		f.pass(t, backgroundOptions())
+		if kind == "left" {
+			f.exec(t, `UPDATE members SET status='left' WHERE id=? AND group_id=?`, ready2.ID, g2.ID)
+		} else {
+			f.exec(t, `UPDATE members SET workspace='bound-ws' WHERE id=? AND group_id=?`, ready2.ID, g2.ID)
+		}
+		_ = olderA1
+		otherActive := backgroundMember(t, f, g2.ID, discussionProfile)
+		followup := f.post(t, g2.ID, "", platform.MessageInput{Content: "后续显式追问", TopicID: "同话题", RecipientIDs: []string{otherActive.ID}})
+		if !hasPending(followup.Deliveries[0].ID) {
+			t.Fatalf("stale %s A1 delivery blocked active member in same topic", kind)
+		}
+		tFollow, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: g2.ID, DeliveryID: followup.Deliveries[0].ID, MaxActive: 2})
+		if err != nil {
+			t.Fatalf("claim past stale %s A1 delivery failed: %v", kind, err)
+		}
+		if _, err := f.db.ApplyTurnReceipt(ctx, store.TurnClaim{GroupID: g2.ID, TurnID: tFollow.ID, Token: tFollow.ClaimToken}, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 3. Same active recipient explicit delivery still precedes a later A1 delivery.
+	g3 := f.group(t, "same-member-fifo")
+	ready3 := backgroundMember(t, f, g3.ID, discussionProfile)
+	sameFirst := f.post(t, g3.ID, "", platform.MessageInput{Content: "先显式提问", TopicID: "同话题", RecipientIDs: []string{ready3.ID}})
+	sameLater := f.post(t, g3.ID, "", platform.MessageInput{Content: "后补无收件人", TopicID: "同话题"})
+	f.pass(t, backgroundOptions())
+	samePending := backgroundDelivery(t, f, sameLater)
+	if hasPending(samePending.Delivery.ID) {
+		t.Fatal("same-member later A1 overtook earlier active explicit delivery in pending list")
+	}
+	preparedSame, err := p.Prepare(ctx, samePending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{
+		GroupID: g3.ID, DeliveryID: samePending.Delivery.ID, MaxActive: 2,
+		ResourceKeys: preparedSame.ResourceKeys, BackgroundProfile: preparedSame.BackgroundProfile,
+	}); !errors.Is(err, store.ErrTurnBusy) {
+		t.Fatalf("same-member later A1 bypassed earlier active explicit delivery: %v", err)
+	}
+	tFirst, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: g3.ID, DeliveryID: sameFirst.Deliveries[0].ID, MaxActive: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ApplyTurnReceipt(ctx, store.TurnClaim{GroupID: g3.ID, TurnID: tFirst.ID, Token: tFirst.ClaimToken}, provider.ExecutionReceipt{Outcome: provider.OutcomeNotStarted}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.db.ClaimTurn(ctx, store.ClaimTurnInput{
+		GroupID: g3.ID, DeliveryID: samePending.Delivery.ID, MaxActive: 2,
+		ResourceKeys: preparedSame.ResourceKeys, BackgroundProfile: preparedSame.BackgroundProfile,
+	}); err != nil {
+		t.Fatalf("same-member later A1 did not unblock after earlier explicit settled: %v", err)
+	}
+}
