@@ -32,11 +32,12 @@ const (
 )
 
 type Store struct {
-	db                     *sql.DB
-	schemaVersion          int // Known migration prefix at Open, not a later ledger observation.
-	investigationExecution atomic.Bool
-	taskWorkExecution      atomic.Bool
-	background             groupBackgroundDispatch
+	db                      *sql.DB
+	schemaVersion           int // Known migration prefix at Open, not a later ledger observation.
+	investigationExecution  atomic.Bool
+	taskWorkExecution       atomic.Bool
+	threadDecisionExecution atomic.Bool
+	background              groupBackgroundDispatch
 }
 
 type CreateGroupInput struct {
@@ -83,14 +84,18 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+	// Reject damaged or orphan A1 schema objects before migrate mutates the database.
+	if _, err := checkGroupBackgroundSchema(db, false); err != nil {
+		return nil, storeError("检查群组后台调度迁移状态失败", errors.Join(err, db.Close()))
+	}
 	if err := migrate(db); err != nil {
 		return nil, storeError("初始化数据库失败", errors.Join(err, db.Close()))
 	}
-	installed, err := checkGroupBackgroundSchema(db)
+	state, err := checkGroupBackgroundSchema(db, true)
 	if err != nil {
 		return nil, storeError("检查群组后台调度迁移状态失败", errors.Join(err, db.Close()))
 	}
-	return &Store{db: db, schemaVersion: len(migrations), background: groupBackgroundDispatch{installed: installed}}, nil
+	return &Store{db: db, schemaVersion: len(migrations), background: groupBackgroundDispatch{state: state}}, nil
 }
 
 func (s *Store) Close() error { return storeError("关闭数据库失败", s.db.Close()) }
@@ -121,9 +126,7 @@ func (s *Store) createGroup(ctx context.Context, input CreateGroupInput, bindBac
 	if replay {
 		g, err = scanGroup(tx.QueryRowContext(ctx, "SELECT "+groupColumns+" FROM groups WHERE id = ?", id))
 	} else {
-		g, err = scanGroup(tx.QueryRowContext(ctx,
-			"INSERT INTO groups(id, name, description, created_at) VALUES(?, ?, ?, ?) RETURNING "+groupColumns,
-			id, input.Name, input.Description, time.Now().UTC().Format(timestampLayout)))
+		g, err = insertGroupInTx(ctx, tx, id, input.Name, input.Description, time.Now().UTC().Format(timestampLayout))
 	}
 	if err != nil {
 		return domain.Group{}, storeError("创建群组失败", err)
@@ -137,6 +140,12 @@ func (s *Store) createGroup(ctx context.Context, input CreateGroupInput, bindBac
 		return domain.Group{}, storeError("保存群组失败", err)
 	}
 	return g, nil
+}
+
+func insertGroupInTx(ctx context.Context, tx *sql.Tx, id, name, description, createdAt string) (domain.Group, error) {
+	return scanGroup(tx.QueryRowContext(ctx,
+		"INSERT INTO groups(id, name, description, created_at) VALUES(?, ?, ?, ?) RETURNING "+groupColumns,
+		id, name, description, createdAt))
 }
 
 func (s *Store) GetGroup(ctx context.Context, id string) (domain.Group, error) {

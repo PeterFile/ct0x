@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"agentworkspace/internal/domain"
 )
@@ -167,6 +168,7 @@ type taskWorkFacts struct {
 	v                                  assignmentSnapshot
 	dispatch                           domain.AssignmentDispatchState
 	turnID, assessmentID, sourceTurnID string
+	decisionAnswer                     bool
 	delegation                         *domain.TaskWorkDelegation
 	report                             *domain.TaskWorkReport
 }
@@ -244,9 +246,13 @@ func taskWorkDeliveryInTx(ctx context.Context, tx *sql.Tx, groupID, deliveryID s
 	if !valid {
 		return f, ErrMemberToolDenied
 	}
-	if d.SourceKind == domain.TaskWorkSourceFollowup {
+	switch {
+	case d.SourceKind == domain.TaskWorkSourceFollowup && (isDecisionAnswerID(d.SourceID) || strings.HasPrefix(d.SourceID, decisionAnswerReplacementPrefix)):
+		d.SourceID, err = decisionAnswerWakeSourceInTx(ctx, tx, *d)
+		f.decisionAnswer = err == nil
+	case d.SourceKind == domain.TaskWorkSourceFollowup:
 		f.assessmentID, f.sourceTurnID, err = taskWorkFollowupSourceInTx(ctx, tx, *d)
-	} else {
+	default:
 		err = taskWorkReportSourceInTx(ctx, tx, &f)
 	}
 	return f, err

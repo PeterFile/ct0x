@@ -386,3 +386,73 @@ func TestBackgroundDispatchPreviewClockRollback(t *testing.T) {
 		})
 	}
 }
+
+func TestBackgroundDispatchPreviewMonotonicClockStripped(t *testing.T) {
+	ctx := t.Context()
+	// 1. Real default production sample (sample == nil) produces bounded wall expiry.
+	c, db, p, providers := newBackgroundPreviewPassFixture(t)
+	path := c.groupBackgroundDispatchPreview
+	grant := backgroundPreviewFixtureApproval(t, c.piPath)
+	grant["qualification"] = backgroundPreviewQualification(grant, c.piPath, time.Now().UTC().Add(-(backgroundQualificationLifetime - 180*time.Millisecond)))
+	writeBackgroundPreviewFixtureApproval(t, path, grant)
+	var output bytes.Buffer
+	passDefault, err := c.withBackgroundDispatchPass(db, p, providers, nil, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := store.BackgroundDispatchProfile{ProviderID: providers[0].ID, Model: backgroundFixtureModel}
+	passDefault(ctx)
+	if output.Len() != 0 || !db.BackgroundDispatchProfileReady(profile) {
+		t.Fatalf("default real-clock sample failed readiness: ready=%t output=%q", db.BackgroundDispatchProfileReady(profile), &output)
+	}
+	time.Sleep(240 * time.Millisecond)
+	if db.BackgroundDispatchProfileReady(profile) {
+		t.Fatal("default real-clock sample did not expire on schedule")
+	}
+
+	// 2. Real OS time.Now() carrying monotonic readings still calibrates forward
+	// and rejects backward wall-clock jumps.
+	c2, db2, p2, providers2 := newBackgroundPreviewPassFixture(t)
+	path2 := c2.groupBackgroundDispatchPreview
+	grant2 := backgroundPreviewFixtureApproval(t, c2.piPath)
+	start := time.Now()
+	var wallOffset time.Duration
+	var nowLock time.Time
+	monotonicSample := func() (time.Time, time.Duration) {
+		now := nowLock
+		if now.IsZero() {
+			now = time.Now()
+		}
+		return now.UTC().Add(wallOffset), time.Since(start)
+	}
+	grant2["qualification"] = backgroundPreviewQualification(grant2, c2.piPath, time.Now().UTC())
+	writeBackgroundPreviewFixtureApproval(t, path2, grant2)
+	var output2 bytes.Buffer
+	passMono, err := c2.withBackgroundDispatchPassClock(db2, p2, providers2, nil, &output2, monotonicSample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile2 := store.BackgroundDispatchProfile{ProviderID: providers2[0].ID, Model: backgroundFixtureModel}
+	// Simulate wall jumping forward while the sample retains a monotonic reading.
+	wallOffset = 10 * time.Minute
+	nowLock = start
+	grant2["qualification"] = backgroundPreviewQualification(grant2, c2.piPath, start.UTC().Add(wallOffset))
+	writeBackgroundPreviewFixtureApproval(t, path2, grant2)
+	passMono(ctx)
+	if output2.Len() != 0 || !db2.BackgroundDispatchProfileReady(profile2) {
+		t.Fatalf("forward wall jump with monotonic sample failed: ready=%t output=%q", db2.BackgroundDispatchProfileReady(profile2), &output2)
+	}
+	// Roll wall clock backward; monotonic clock advances (nowLock cleared to live time.Now()).
+	// Effective clock must not roll back: a timestamp in the rolled-back wall's past (already stale
+	// relative to +10m calibration) must NOT re-arm readiness.
+	wallOffset = 0
+	nowLock = time.Time{}
+	time.Sleep(10 * time.Millisecond)
+	grant2["approval_expires_at"] = time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339Nano)
+	grant2["qualification"] = backgroundPreviewQualification(grant2, c2.piPath, time.Now().UTC().Add(-2*time.Second))
+	writeBackgroundPreviewFixtureApproval(t, path2, grant2)
+	passMono(ctx)
+	if output2.Len() != 0 || db2.BackgroundDispatchProfileReady(profile2) {
+		t.Fatalf("wall rollback with monotonic sample resurrected expired/stale grant: ready=%t output=%q", db2.BackgroundDispatchProfileReady(profile2), &output2)
+	}
+}

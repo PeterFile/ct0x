@@ -60,7 +60,7 @@ func (a piInvestigationAdapter) NewExecutor(selected Provider, timeout time.Dura
 	if err != nil || config.digest != a.config.SHA256 || !slices.Equal(config.investigationTools, names) {
 		return nil, errPiMemberToolConfiguration
 	}
-	entry := qualifyPiInvestigationBridge(a.extension)
+	entry := qualifyPiInvestigationBridge(a.extension).path
 	native, err := newPiMemberToolExecutor(selected, entry, path, names, timeout, true)
 	if err != nil {
 		return nil, err
@@ -71,10 +71,19 @@ func (a piInvestigationAdapter) NewExecutor(selected Provider, timeout time.Dura
 
 // NewPiInvestigationIntakeExecutor binds the fresh intake tool set to the
 // qualified Pi bridge and issued config. It never selects a native session.
-// The issued schema can offer discussion_only_excerpt without the investigation action.
+// The issued schema can offer discussion fields without the investigation action.
 func NewPiInvestigationIntakeExecutor(selected Provider, extension string, issued NativeMemberToolConfig, timeout time.Duration) (Executor, error) {
-	bridge, path := qualifyPiInvestigationBridge(extension), filepath.Clean(issued.Path)
-	if bridge == "" || !piMemberToolConfigMatches(path, issued.SHA256, false) {
+	path := filepath.Clean(issued.Path)
+	config, err := readPiMemberToolConfig(path, false)
+	if err != nil || config.digest != issued.SHA256 {
+		return nil, errPiMemberToolConfiguration
+	}
+	qualify := qualifyPiInvestigationBridge
+	if config.discussionRelay {
+		qualify = qualifyPiDiscussionRelayBridge
+	}
+	bridge := qualify(extension).path
+	if bridge == "" {
 		return nil, errPiMemberToolConfiguration
 	}
 	names := []string{"list_members", "read_channel", "send_message", "search_history", "read_history"}
@@ -83,5 +92,5 @@ func NewPiInvestigationIntakeExecutor(selected Provider, extension string, issue
 		return nil, err
 	}
 	native.memberTools.configSHA256 = issued.SHA256
-	return piDigestBoundExecutor{piExecutor: native, configuredBridge: extension, investigationBridge: true}, nil
+	return piDigestBoundExecutor{piExecutor: native, configuredBridge: extension, investigationBridge: true, discussionRelay: config.discussionRelay}, nil
 }

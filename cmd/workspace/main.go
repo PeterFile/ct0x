@@ -137,6 +137,9 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if memberTools != nil {
 		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)
 		routes = append(routes, httpapi.MemberHistoryToolRoutes(memberTools.Tools())...)
+		if config.enableRunExplanation {
+			routes = append(routes, httpapi.MemberRunExplanationRoutes(memberTools.Tools())...)
+		}
 		if config.enableInvestigationExecution {
 			routes = append(routes, httpapi.MemberInvestigationToolRoutes(memberTools.Tools())...)
 			if config.piFreshInvestigationWorkExtension != "" {

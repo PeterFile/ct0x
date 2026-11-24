@@ -145,8 +145,17 @@ func (p *Preparer) bindNativeSessionPreparation(executor provider.Executor, sele
 	if !ok || selected.Name == provider.Codex && (!run.intake || run.role != nil || run.intakeSchema != (memberToolIntakeSchema{})) {
 		return errPrepareBinding
 	}
+	if selected.Name == provider.Pi && slices.Contains(names, "send_message") {
+		quote, qualified := provider.PiNativeSessionBridgeQuoteSupport(p.piMemberToolsExtension)
+		// Quote-capable intake should already be on the issued-config fresh path.
+		if !qualified || quote && (run.intake || run.role != nil) {
+			return errPrepareBinding
+		}
+		profile.PiSendMessageQuote = quote
+	}
 	run.nativeSession = &memberToolNativeSessionPlan{profile: *profile, selectSession: p.store.SelectNativeSession, factory: func(config provider.NativeMemberToolConfig, names []string, resume *provider.NativeSessionReference, binding json.RawMessage) (provider.Executor, error) {
-		registry, err := p.nativeSessionAdapterRegistry(selection, config, names, resume, binding)
+		quote := profile.PiSendMessageQuote && slices.Contains(names, "send_message")
+		registry, err := p.nativeSessionAdapterRegistry(selection, config, names, resume, binding, &quote)
 		if err != nil {
 			return nil, err
 		}
@@ -158,11 +167,12 @@ func (p *Preparer) bindNativeSessionPreparation(executor provider.Executor, sele
 
 // Like the legacy factory, the per-turn registry samples implementation
 // capabilities and constructs an executor. All native work stays in Execute.
-func (p *Preparer) nativeSessionAdapterRegistry(selection provider.AdapterSelection, config provider.NativeMemberToolConfig, names []string, resume *provider.NativeSessionReference, binding json.RawMessage) (*provider.AdapterRegistry, error) {
+func (p *Preparer) nativeSessionAdapterRegistry(selection provider.AdapterSelection, config provider.NativeMemberToolConfig, names []string, resume *provider.NativeSessionReference, binding json.RawMessage, piSendMessageQuote *bool) (*provider.AdapterRegistry, error) {
 	var adapter provider.Adapter
 	switch selection {
 	case (provider.AdapterSelection{ID: provider.PiMemberToolAdapterID, Protocol: provider.PiExtensionProtocol}):
-		adapter = provider.NewPiNativeSessionMemberToolAdapter(p.piMemberToolsExtension, config, names, provider.PiSessionOptions{Resume: resume, Binding: binding})
+		adapter = provider.NewPiNativeSessionMemberToolAdapter(p.piMemberToolsExtension, config, names,
+			provider.PiSessionOptions{Resume: resume, Binding: binding, ExpectedSendMessageQuote: piSendMessageQuote})
 	case (provider.AdapterSelection{ID: provider.CodexAppServerAdapterID, Protocol: provider.CodexAppServerProtocol}):
 		adapter = provider.NewCodexAppServerNativeSessionMemberToolAdapter(config, names, provider.CodexAppServerSessionOptions{Resume: resume, Binding: binding})
 	default:
@@ -178,7 +188,8 @@ func (p *Preparer) piIntakeChangesNativeSchema() bool {
 // Provider-wide reporting describes the process configuration only. It cannot
 // assert any member's model, claim, resources, or resumable history.
 func (p *Preparer) nativeReportTools(selected provider.Provider) []string {
-	if p.codexNativeIntakeConfigured(selected) {
+	if p.codexNativeIntakeConfigured(selected) && !p.threadDecisionHandoff {
+		// The opt-in handoff schema on eligible turns is not the v30 profile.
 		return chatIntakeOperations()
 	}
 	if !p.piNativeSessionConfigured(selected) {

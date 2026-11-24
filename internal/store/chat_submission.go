@@ -24,6 +24,9 @@ func (s *Store) chatTextSubmissionInTx(ctx context.Context, tx *sql.Tx, input Su
 		if err := requireHandledWorkConstraintsInTx(ctx, tx, input); err != nil {
 			return evidence, err
 		}
+		if err := requireHandledDecisionAnswersInTx(ctx, tx, input); err != nil {
+			return evidence, err
+		}
 	} else if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_assessments'),
 	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_policy_scopes')`).Scan(&hasChat, &hasScope); err != nil {
 		return evidence, err

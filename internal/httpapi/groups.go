@@ -13,14 +13,20 @@ type localAPI struct{ local *platform.LocalUser }
 
 func LocalUserRoutes(local *platform.LocalUser) []Route {
 	a := localAPI{local}
-	return []Route{
+	return append([]Route{
+		{http.MethodGet, "/api/v1/me/pending-decisions", a.listPendingDecisions},
+		{http.MethodGet, "/api/v1/me/decisions/{decision}/answer", a.getDecisionAnswer},
+		{http.MethodPost, "/api/v1/me/decisions/{decision}/answer", noQuery(a.answerDecision)},
+		{http.MethodPost, "/api/v1/groups/{group}/decisions/{decision}/answer", noQuery(a.answerDecision)},
+		{http.MethodGet, "/api/v1/me/agent-runs", a.listAgentRuns},
+		{http.MethodGet, "/api/v1/me/agent-runs/{run}", a.getAgentRun},
 		{http.MethodGet, "/api/v1/groups", a.listGroups},
 		{http.MethodPost, "/api/v1/groups", noQuery(a.createGroup)},
 		{http.MethodGet, "/api/v1/groups/{group}", noQuery(a.getGroup)},
 		{http.MethodGet, "/api/v1/groups/{group}/members", a.listMembers},
 		{http.MethodPost, "/api/v1/groups/{group}/members", noQuery(a.createMember)},
 		{http.MethodGet, "/api/v1/groups/{group}/members/{member}", noQuery(a.getMember)},
-	}
+	}, a.projectRoutes()...)
 }
 
 func noQuery(next http.HandlerFunc) http.HandlerFunc {

@@ -18,6 +18,7 @@ const (
 
 	memberInitialInvestigationOwnerPurpose    = "investigation_initial_owner/v1"
 	memberContinuingInvestigationOwnerPurpose = "investigation_continuing_owner/v1"
+	memberInvestigationReturnOwnerPurpose     = "investigation_return_owner/v1"
 )
 
 // InvestigationDelegateSupport samples the trusted installed provider for the
@@ -65,7 +66,13 @@ func (r *MemberToolRuntime) IssueInitialInvestigationOwnerTools(ctx context.Cont
 // an exact, already-bound report or followup owner. The read-only report and
 // delegate issuers cannot issue this purpose. Revoke the token on exit.
 func (r *MemberToolRuntime) IssueFreshInvestigationOwnerManagementTools(ctx context.Context, role store.CoordinationToolScope, expected domain.TaskWorkDelivery, artifacts *MemberArtifactGrant) (string, InvestigationOwnerToolProfile, error) {
-	return r.issueFreshInvestigationOwnerTools(ctx, role, expected, artifacts, true)
+	return r.issueFreshInvestigationOwnerTools(ctx, role, expected, artifacts, memberContinuingInvestigationOwnerPurpose, investigationInvitation{})
+}
+
+// InvestigationHandbackEnabled mounts only the existing native HTTP handback
+// route; each registration still requires its own live B owner proof.
+func (s *MemberTools) InvestigationHandbackEnabled() bool {
+	return s != nil && (s.discussionWorkReturn || s.InvestigationOwnerManagementEnabled())
 }
 
 func (entry memberToolRegistration) investigationOwnerProfile() InvestigationOwnerToolProfile {
@@ -87,10 +94,14 @@ func investigationOwnerOperations(operations, candidates []string, continuing bo
 }
 
 func (entry memberToolRegistration) withOwnerManagementOperations(operations []string) []string {
-	if entry.purpose == memberInitialInvestigationOwnerPurpose || entry.purpose == memberContinuingInvestigationOwnerPurpose {
+	switch entry.purpose {
+	case memberInitialInvestigationOwnerPurpose, memberContinuingInvestigationOwnerPurpose:
 		return investigationOwnerOperations(operations, entry.delegateCandidateIDs, entry.purpose == memberContinuingInvestigationOwnerPurpose)
+	case memberInvestigationReturnOwnerPurpose:
+		return append(operations, HandbackWorkOperation)
+	default:
+		return operations
 	}
-	return operations
 }
 
 func investigationOwnerPermissions(candidates []string, continuing bool) []string {
@@ -176,17 +187,17 @@ func (s *MemberTools) supportsInvestigationDelegate(member domain.Member, reads 
 }
 
 func (s *MemberTools) withInvestigationOwnerManagement(token, op string, use func(memberToolRegistration) error) error {
-	if !s.InvestigationOwnerManagementEnabled() {
-		return store.ErrMemberToolDenied
-	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry := s.capabilities[sha256.Sum256([]byte(token))]
 	if !slices.Contains(entry.grants.Operations, op) {
 		return store.ErrMemberToolDenied
 	}
-	if !(op == DelegateWorkOperation && entry.initialInvestigationOwnerValid()) &&
-		!(entry.purpose == memberContinuingInvestigationOwnerPurpose && entry.investigationWorkOwnerValid()) {
+	managed := s.InvestigationOwnerManagementEnabled() && ((op == DelegateWorkOperation && entry.initialInvestigationOwnerValid()) ||
+		(entry.purpose == memberContinuingInvestigationOwnerPurpose && entry.investigationWorkOwnerValid()))
+	returnOnly := s.discussionWorkReturn && op == HandbackWorkOperation && entry.purpose == memberInvestigationReturnOwnerPurpose &&
+		entry.investigationWorkOwnerValid()
+	if !managed && !returnOnly {
 		return store.ErrMemberToolDenied
 	}
 	// No live readiness preflight here. B re-proves the claim and owner in
@@ -207,6 +218,7 @@ func (s *MemberTools) DelegateWork(ctx context.Context, token string, input doma
 }
 
 // HandbackWork records B's whole-task notice, not a return of a WorkInput.
+// Only B can also publish an A7 return; this method doesn't acknowledge a wake.
 func (s *MemberTools) HandbackWork(ctx context.Context, token string, input domain.HandbackWorkInput, key string) (out domain.TaskWorkHandback, err error) {
 	err = s.withInvestigationOwnerManagement(token, HandbackWorkOperation, func(entry memberToolRegistration) error {
 		out, err = s.workReportEngine.HandbackWork(ctx, entry.scope, input, key)

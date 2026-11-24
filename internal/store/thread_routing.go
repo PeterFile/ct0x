@@ -15,7 +15,9 @@ import (
 type localThreadRoute struct {
 	topic, recipient, replyTopic string
 	newTitle, newIssue           string
+	quote                        *domain.MessageQuote
 	comparisonAuthor             string // Reference-only author excluded from fallback.
+	suppressFallback             bool   // A direct quote with no eligible author stays public.
 }
 
 func threadRoutingInstalledInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
@@ -87,21 +89,23 @@ func (s *Store) publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r Messa
 	// an already bound group can wait for a pass, even on disabled startup.
 	var deferred bool
 	if normalPost && r.RecipientIDs == nil {
-		if route.recipient == "" && s.background.installed {
-			if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_background_bindings WHERE group_id=?)`, r.GroupID).Scan(&deferred); err != nil {
-				return domain.Message{}, storeError("读取群组后台绑定失败", err)
+		if route.recipient == "" && !route.suppressFallback {
+			if s.background.installed() {
+				if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_background_bindings WHERE group_id=?)`, r.GroupID).Scan(&deferred); err != nil {
+					return domain.Message{}, storeError("读取群组后台绑定失败", err)
+				}
 			}
-		}
-		if route.recipient == "" && !deferred {
-			if err := activeDefaultRecipientInTx(ctx, tx, r.GroupID, route.comparisonAuthor, &route.recipient); err != nil {
-				return domain.Message{}, err
+			if !deferred {
+				if err := activeDefaultRecipientInTx(ctx, tx, r.GroupID, route.comparisonAuthor, &route.recipient); err != nil {
+					return domain.Message{}, err
+				}
 			}
 		}
 		if route.recipient != "" {
 			recipients = []string{route.recipient}
 		}
 	}
-	m, err := insertRequestedMessageInTx(ctx, tx, r, id, route.topic, recipients)
+	m, err := insertRequestedMessageInTx(ctx, tx, r, id, route.topic, recipients, route.quote)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -116,17 +120,20 @@ func (s *Store) publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r Messa
 			return domain.Message{}, err
 		}
 	}
-	if r.ThreadLinks != (domain.ThreadLinks{}) {
-		var replyTopic any
-		if r.ReplyToMessageID != "" {
-			replyTopic = route.replyTopic // An empty topic denotes main, not a missing link.
-		}
+	// When installed, A's quote is the only reply edge. E still persists
+	// independent Task links and supports databases without the A schema.
+	var legacyReplyID string
+	var legacyReplyTopic any
+	if route.quote == nil && r.ReplyToMessageID != "" {
+		legacyReplyID, legacyReplyTopic = r.ReplyToMessageID, route.replyTopic // Empty topic denotes main.
+	}
+	if r.RelatedTaskID != "" || legacyReplyID != "" {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO main.thread_routing_links(message_id,group_id,topic_id,reply_to_message_id,reply_to_topic_id,task_id)
-		 VALUES(?,?,?,nullif(?,''),?,nullif(?,''))`, m.ID, m.GroupID, m.TopicID, r.ReplyToMessageID, replyTopic, r.RelatedTaskID); err != nil {
+		 VALUES(?,?,?,nullif(?,''),?,nullif(?,''))`, m.ID, m.GroupID, m.TopicID, legacyReplyID, legacyReplyTopic, r.RelatedTaskID); err != nil {
 			return domain.Message{}, err
 		}
-		m.ThreadLinks = r.ThreadLinks
 	}
+	m.ThreadLinks = r.ThreadLinks
 	if deferred {
 		if err := recordGroupBackgroundIntent(ctx, tx, m); err != nil {
 			return domain.Message{}, storeError("保存后台调度意图失败", err)
@@ -141,25 +148,40 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 	if err != nil {
 		return route, err
 	}
-	if !installed {
-		if r.ThreadLinks != (domain.ThreadLinks{}) {
-			return route, fmt.Errorf("%w：当前实例未启用消息引用", ErrInvalid)
-		}
-		return route, nil
+	if !installed && r.RelatedTaskID != "" {
+		return route, fmt.Errorf("%w：当前实例未启用消息引用", ErrInvalid)
 	}
-	var replyAuthor, taskOwner string
-	var taskTopic sql.NullString
-	if r.ReplyToMessageID != "" {
-		if !validThreadReference(r.ReplyToMessageID) {
-			return route, fmt.Errorf("%w：回复消息标识无效", ErrInvalid)
-		}
-		err = tx.QueryRowContext(ctx, `SELECT m.topic_id,coalesce(a.id,'') FROM messages m
-		 LEFT JOIN members a ON a.group_id=m.group_id AND a.id=m.sender_id AND a.id<>'user' AND a.status='active'
-		 WHERE m.id=? AND m.group_id=?`, r.ReplyToMessageID, r.GroupID).Scan(&route.replyTopic, &replyAuthor)
+	hasReply := r.ReplyToMessageID != ""
+	var replyAuthor, replySender string
+	if hasReply {
+		quotes, err := messageQuotesInstalledInTx(ctx, tx)
 		if err != nil {
 			return route, err
 		}
+		var target *domain.MessageQuote
+		var active bool
+		switch {
+		case quotes:
+			target, active, err = resolveMessageQuoteInTx(ctx, tx, r, true)
+			route.quote = target
+		case installed:
+			if !validThreadReference(r.ReplyToMessageID) {
+				return route, fmt.Errorf("%w：回复消息标识无效", ErrInvalid)
+			}
+			target, active, err = readMessageQuoteTargetInTx(ctx, tx, r, true, false)
+		default:
+			return route, fmt.Errorf("%w：当前实例未启用消息引用", ErrInvalid)
+		}
+		if err != nil {
+			return route, err
+		}
+		route.replyTopic, replySender = target.TopicID, target.SenderID
+		if active {
+			replyAuthor = replySender
+		}
 	}
+	var taskOwner string
+	var taskTopic sql.NullString
 	if r.RelatedTaskID != "" {
 		if !validThreadReference(r.RelatedTaskID) {
 			return route, fmt.Errorf("%w：关联任务标识无效", ErrInvalid)
@@ -174,14 +196,20 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 			return route, err
 		}
 	}
-	// Unclassified long text may contain a comparison cue outside the budget.
-	// Keep the verified quote, but do not use it as routing evidence.
-	referenceOnly := r.ReplyToMessageID != "" && len(r.Content) > maxThreadTextBytes
-	if !infer || r.TopicID != "" || r.TopicIDExplicit {
-		if referenceOnly || (replyAuthor != "" && threadComparisonReply(r.Content)) {
-			route.comparisonAuthor = replyAuthor
-		} else if route.replyTopic == route.topic {
-			route.recipient = replyAuthor
+	inferTopic := infer && r.TopicID == "" && !r.TopicIDExplicit
+	if !installed || !inferTopic {
+		referenceOnly := hasReply && threadComparisonReply(r.Content)
+		route.suppressFallback = hasReply && (!installed || !referenceOnly)
+		if referenceOnly {
+			route.comparisonAuthor = replySender
+		} else if hasReply {
+			// An omitted selector can reuse the verified storage topic without an E catalog.
+			if inferTopic {
+				route.topic = route.replyTopic
+			}
+			if route.replyTopic == route.topic {
+				route.recipient = replyAuthor
+			}
 		}
 		return route, nil
 	}
@@ -194,11 +222,13 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 	if taskTopic.Valid {
 		evidence.confirm(taskTopic.String)
 	}
-	referenceOnly = referenceOnly || text.comparison
-	if referenceOnly {
-		route.comparisonAuthor = replyAuthor
-	} else if r.ReplyToMessageID != "" {
+	// Over-budget text contributes no evidence, not permission to set aside
+	// a verified reply. Only a recognized comparison permits other defaults.
+	route.suppressFallback = hasReply && !text.comparison
+	if route.suppressFallback {
 		evidence.confirm(route.replyTopic)
+	} else if hasReply {
+		route.comparisonAuthor = replySender
 	}
 	evidence = text.resolveAliases(evidence)
 	if text.conflict || evidence.conflict || (text.newTitle != "" && evidence.matched) {
@@ -212,8 +242,11 @@ func resolveLocalThreadInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, i
 		return route, nil
 	}
 	switch {
-	case !referenceOnly && replyAuthor != "" && route.replyTopic == route.topic:
-		route.recipient = replyAuthor
+	case route.suppressFallback:
+		// An ineligible author means no default delivery, even with a Task link.
+		if route.replyTopic == route.topic {
+			route.recipient = replyAuthor
+		}
 	case taskTopic.Valid && taskTopic.String == route.topic && taskOwner != "":
 		route.recipient = taskOwner
 	case route.topic != "" && route.newTitle == "":

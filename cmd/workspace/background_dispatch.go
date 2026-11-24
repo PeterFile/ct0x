@@ -76,8 +76,8 @@ func (a backgroundDispatchApproval) readyUntil(selected provider.Provider, wall,
 		q.ObservedAt.IsZero() || wall.Before(q.ObservedAt) {
 		return time.Time{}
 	}
-	deadline := a.ApprovalExpires
-	if observedUntil := q.ObservedAt.Add(backgroundQualificationLifetime); observedUntil.Before(deadline) {
+	deadline := a.ApprovalExpires.UTC().Round(0)
+	if observedUntil := q.ObservedAt.Add(backgroundQualificationLifetime).UTC().Round(0); observedUntil.Before(deadline) {
 		deadline = observedUntil
 	}
 	if !effective.Before(deadline) {
@@ -88,7 +88,7 @@ func (a backgroundDispatchApproval) readyUntil(selected provider.Provider, wall,
 	if until := wall.Add(deadline.Sub(effective)); until.Before(deadline) {
 		deadline = until
 	}
-	return deadline.UTC()
+	return deadline.UTC().Round(0)
 }
 
 func readBackgroundDispatchApproval(path, providerID string) (a backgroundDispatchApproval, err error) {
@@ -99,11 +99,11 @@ func readBackgroundDispatchApproval(path, providerID string) (a backgroundDispat
 	}
 	defer file.Close()
 	info, err := file.Stat()
-	if err != nil || (info.Mode() != 0600 && info.Mode() != 0400) || info.Size() > maxBytes {
+	if err != nil || (info.Mode() != 0600 && info.Mode() != 0400) || !backgroundFileOwned(info) || info.Size() > maxBytes {
 		return a, errBackgroundApproval
 	}
 	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
-	if err != nil || len(data) > maxBytes || !httpapi.DecodeStrictJSONObject(data, &a) {
+	if err != nil || int64(len(data)) != info.Size() || !httpapi.DecodeStrictJSONObject(data, &a) {
 		return a, errBackgroundApproval
 	}
 	if a.ProviderID != providerID || !provider.IsExactPiModel(a.Model) ||
@@ -113,6 +113,9 @@ func readBackgroundDispatchApproval(path, providerID string) (a backgroundDispat
 	}
 	// Do not use a just-withdrawn or replaced grant from an already open inode.
 	live, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return a, os.ErrNotExist
+	}
 	if err != nil || !sameBackgroundFile(info, live) {
 		return a, errBackgroundApproval
 	}
@@ -141,10 +144,12 @@ func (c config) withBackgroundDispatchPassClock(db *store.Store, preparer *platf
 	if sample == nil {
 		start := time.Now()
 		sample = func() (time.Time, time.Duration) {
-			return time.Now().UTC(), time.Since(start)
+			now := time.Now()
+			return now.UTC().Round(0), now.Sub(start)
 		}
 	}
 	effective, lastElapsed := sample()
+	effective = effective.UTC().Round(0)
 	i := slices.IndexFunc(providers, func(p provider.Provider) bool {
 		return p.Name == provider.Pi && p.Path == filepath.Clean(c.piPath)
 	})
@@ -185,7 +190,8 @@ func (c config) withBackgroundDispatchPassClock(db *store.Store, preparer *platf
 		// Advance on every pass, independent of the file, and only recalibrate
 		// forward. A rollback cannot replenish an earlier sample's lifetime.
 		wall, elapsed := sample()
-		effective = effective.Add(elapsed - lastElapsed)
+		wall = wall.UTC().Round(0)
+		effective = effective.Add(elapsed - lastElapsed).Round(0)
 		if wall.After(effective) {
 			effective = wall
 		}

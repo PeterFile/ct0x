@@ -6,5 +6,6 @@ import "agentworkspace/internal/platform"
 // omitted (or null) wire selector from an explicit selection of main.
 type localMessageRequest struct {
 	platform.MessageInput
-	TopicID *string `json:"topic_id"`
+	TopicID *string        `json:"topic_id"`
+	QuoteID messageQuoteID `json:"reply_to_message_id"`
 }
