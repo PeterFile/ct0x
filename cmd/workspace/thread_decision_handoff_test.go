@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"io"
 	"os"
 	"path/filepath"
@@ -33,11 +34,25 @@ func TestThreadDecisionHandoffOptInAndOldStorage(t *testing.T) {
 	if err != nil || !enabled.enableThreadDecisionHandoff {
 		t.Fatalf("verified prerequisites did not select handoff: %v", err)
 	}
-	db, err := store.Open(filepath.Join(root, "public-v30.sqlite"))
+	oldPath := filepath.Join(root, "public-missing-thread-answer.sqlite")
+	db, err := store.Open(oldPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	raw, err := sql.Open("sqlite", oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`DROP VIEW IF EXISTS decision_thread_answerable;
+DROP TABLE IF EXISTS decision_thread_answer_consumptions;
+DROP TABLE IF EXISTS decision_thread_answers;`); err != nil {
+		_ = raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
 	catalog := platform.DiscoverProviders(context.Background(), provider.Search{Explicit: []provider.Location{{Name: provider.Codex, Path: cli}}}, provider.Runner{})
 	engine := coordination.New(db)
 	const endpoint = "http://127.0.0.1:7310/api/v1/member-tools"
@@ -47,6 +62,17 @@ func TestThreadDecisionHandoffOptInAndOldStorage(t *testing.T) {
 	}
 	if runner, runtime, preparer, err := executionRunner(base, db, engine, catalog, endpoint, io.Discard); err != nil || runner == nil || runtime == nil || preparer == nil {
 		t.Fatalf("old database no longer composes with the flag off: %v", err)
+	} else {
+		t.Cleanup(func() { _ = runtime.Close() })
+	}
+
+	currentDB, err := store.Open(filepath.Join(root, "public-current.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = currentDB.Close() })
+	if runner, runtime, preparer, err := executionRunner(enabled, currentDB, coordination.New(currentDB), catalog, endpoint, io.Discard); err != nil || runner == nil || runtime == nil || preparer == nil {
+		t.Fatalf("registered database failed to compose thread decision handoff: %v", err)
 	} else {
 		t.Cleanup(func() { _ = runtime.Close() })
 	}
