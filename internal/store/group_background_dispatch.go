@@ -36,14 +36,26 @@ type BackgroundDispatchOptions struct {
 	Create           *BackgroundDispatchTemplate  // Nil forbids auto-creation.
 }
 
+type groupBackgroundSchemaState uint8
+
+const (
+	groupBackgroundSchemaAbsent groupBackgroundSchemaState = iota
+	groupBackgroundSchemaComplete
+	groupBackgroundSchemaDamaged
+)
+
 type groupBackgroundDispatch struct {
-	installed bool
-	enabled   atomic.Bool
-	pass      sync.Mutex
-	readyMu   sync.RWMutex
-	ready     *backgroundReadySnapshot
+	state   groupBackgroundSchemaState
+	enabled atomic.Bool
+	pass    sync.Mutex
+	readyMu sync.RWMutex
+	ready   *backgroundReadySnapshot
 	// These only bound/rotate observations. They are not consumption checkpoints.
 	after, through int64
+}
+
+func (b *groupBackgroundDispatch) installed() bool {
+	return b.state == groupBackgroundSchemaComplete
 }
 
 type backgroundReadySnapshot struct {
@@ -64,8 +76,33 @@ const (
 	backgroundReadyLifetime  = 30 * time.Second
 )
 
-// Open verifies the complete schema so transaction-local readers can use this probe.
-const groupBackgroundSchemaExists = `EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='group_background_bindings')`
+// Store.Open verifies every canonical DDL definition and rejects damaged schemas
+// before migrate runs. Transaction-local readers still verify the complete object
+// set and absence of orphan references instead of probing only bindings.
+const groupBackgroundSchemaObjectTuple = `(
+	('table','group_background_bindings','group_background_bindings'),
+	('table','group_background_intents','group_background_intents'),
+	('table','group_background_joins','group_background_joins'),
+	('index','group_background_pending','group_background_intents'),
+	('index','group_background_pending_topic','group_background_intents'),
+	('index','group_background_queued_topic','deliveries'),
+	('index','group_background_active_profiles','members'),
+	('index','group_background_preset_membership','group_background_joins'),
+	('trigger','group_background_intent_insert','group_background_intents'),
+	('trigger','group_background_intent_finish','group_background_intents'),
+	('trigger','group_background_intent_delete','group_background_intents'),
+	('trigger','group_background_join_insert','group_background_joins'),
+	('trigger','group_background_join_update','group_background_joins'),
+	('trigger','group_background_join_delete','group_background_joins'),
+	('trigger','group_background_delivery_insert','deliveries')
+)`
+
+const groupBackgroundSchemaFilterSQL = `NOT (type='index' AND sql IS NULL AND name GLOB 'sqlite_autoindex_*')
+	 AND (lower(name) GLOB 'group_background_*' OR lower(tbl_name) GLOB 'group_background_*' OR lower(coalesce(sql,'')) GLOB '*group_background_*')`
+
+const groupBackgroundSchemaCompleteSQL = `((SELECT count(*)=15 FROM main.sqlite_schema WHERE (type,name,tbl_name) IN ` + groupBackgroundSchemaObjectTuple + `)
+	 AND NOT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE ` + groupBackgroundSchemaFilterSQL + `
+	 AND (type,name,tbl_name) NOT IN ` + groupBackgroundSchemaObjectTuple + `))`
 
 type backgroundSchemaObject struct {
 	kind, owner, definition string
@@ -113,25 +150,25 @@ func expectedGroupBackgroundObjects() (map[string]backgroundSchemaObject, error)
 	return expected, nil
 }
 
-func checkGroupBackgroundSchema(db *sql.DB) (bool, error) {
+func checkGroupBackgroundSchema(db *sql.DB, afterMigrate bool) (groupBackgroundSchemaState, error) {
 	expected, err := expectedGroupBackgroundObjects()
 	if err != nil {
-		return false, err
+		return groupBackgroundSchemaDamaged, err
 	}
 	required := len(expected)
-	// Reserve the whole namespace case-insensitively, but require canonical
-	// names and definitions when matching its objects.
+	// Reserve the whole namespace case-insensitively and catch outside-prefix
+	// triggers/views/indexes whose table or SQL references group_background_*.
 	rows, err := db.Query(`SELECT name,type,tbl_name,coalesce(sql,'') FROM main.sqlite_schema
-	 WHERE lower(name) GLOB 'group_background_*'`)
+	 WHERE ` + groupBackgroundSchemaFilterSQL)
 	if err != nil {
-		return false, err
+		return groupBackgroundSchemaDamaged, err
 	}
 	defer rows.Close()
 	var found, matched int
 	for rows.Next() {
 		var name, kind, owner, definition string
 		if err := rows.Scan(&name, &kind, &owner, &definition); err != nil {
-			return false, err
+			return groupBackgroundSchemaDamaged, err
 		}
 		found++
 		if want, ok := expected[name]; ok && kind == want.kind && owner == want.owner &&
@@ -141,17 +178,37 @@ func checkGroupBackgroundSchema(db *sql.DB) (bool, error) {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return false, err
+		return groupBackgroundSchemaDamaged, err
 	}
 	if found == required && matched == required {
-		return true, nil
+		return groupBackgroundSchemaComplete, nil
 	}
-	// Open calls this only after migrate commits, so every schema in the
-	// current registry is already recorded in the ledger, at any position.
-	if found == 0 && !slices.Contains(migrations, groupBackgroundDispatchSchema) {
-		return false, nil
+	// Before migrate, 0 objects/references is absent unless the migration ledger
+	// already claims A1 was applied (all_absent on an already-migrated database).
+	// After migrate, 0 objects is absent only when A1 is not registered.
+	if found == 0 {
+		version := slices.Index(migrations, groupBackgroundDispatchSchema) + 1
+		if version == 0 {
+			return groupBackgroundSchemaAbsent, nil
+		}
+		if !afterMigrate {
+			var hasLedger bool
+			if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type='table' AND name='schema_migrations')`).Scan(&hasLedger); err != nil {
+				return groupBackgroundSchemaDamaged, err
+			}
+			if !hasLedger {
+				return groupBackgroundSchemaAbsent, nil
+			}
+			var recorded bool
+			if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM main.schema_migrations WHERE version=?)`, version).Scan(&recorded); err != nil {
+				return groupBackgroundSchemaDamaged, err
+			}
+			if !recorded {
+				return groupBackgroundSchemaAbsent, nil
+			}
+		}
 	}
-	return false, fmt.Errorf("群组后台调度数据库结构不完整：应有 %d 个对象，找到 %d 个，匹配 %d 个", required, found, matched)
+	return groupBackgroundSchemaDamaged, fmt.Errorf("群组后台调度数据库结构不完整（已损坏）：应有 %d 个对象，找到 %d 个，匹配 %d 个", required, found, matched)
 }
 
 // EnableGroupBackgroundDispatch is startup wiring for the same Store used by
@@ -162,7 +219,14 @@ func (s *Store) EnableGroupBackgroundDispatch(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if !s.background.installed {
+	if !s.background.installed() {
+		return fmt.Errorf("%w：未安装群组后台调度迁移", ErrInvalid)
+	}
+	state, err := checkGroupBackgroundSchema(s.db, true)
+	if err != nil {
+		return storeError("检查群组后台调度迁移状态失败", err)
+	}
+	if state != groupBackgroundSchemaComplete {
 		return fmt.Errorf("%w：未安装群组后台调度迁移", ErrInvalid)
 	}
 	s.background.enabled.Store(true)
@@ -508,7 +572,7 @@ func joinBackgroundMember(ctx context.Context, tx *sql.Tx, groupID, topicID, ori
 // Join provenance is independent. This marker remains readable after restart
 // and does not convey approval or runtime readiness.
 func (s *Store) BackgroundDiscussionKind(ctx context.Context, groupID, deliveryID string) (string, error) {
-	if !s.background.installed {
+	if !s.background.installed() {
 		return "", nil
 	}
 	var kind string

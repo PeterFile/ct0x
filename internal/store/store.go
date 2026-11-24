@@ -84,14 +84,18 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+	// Reject damaged or orphan A1 schema objects before migrate mutates the database.
+	if _, err := checkGroupBackgroundSchema(db, false); err != nil {
+		return nil, storeError("检查群组后台调度迁移状态失败", errors.Join(err, db.Close()))
+	}
 	if err := migrate(db); err != nil {
 		return nil, storeError("初始化数据库失败", errors.Join(err, db.Close()))
 	}
-	installed, err := checkGroupBackgroundSchema(db)
+	state, err := checkGroupBackgroundSchema(db, true)
 	if err != nil {
 		return nil, storeError("检查群组后台调度迁移状态失败", errors.Join(err, db.Close()))
 	}
-	return &Store{db: db, schemaVersion: len(migrations), background: groupBackgroundDispatch{installed: installed}}, nil
+	return &Store{db: db, schemaVersion: len(migrations), background: groupBackgroundDispatch{state: state}}, nil
 }
 
 func (s *Store) Close() error { return storeError("关闭数据库失败", s.db.Close()) }

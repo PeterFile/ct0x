@@ -55,7 +55,7 @@ func (s *Store) ClaimTurn(ctx context.Context, input ClaimTurnInput) (domain.Tur
 		return domain.Turn{}, queueError(action, err)
 	}
 	var background bool
-	if s.background.installed {
+	if s.background.installed() {
 		background, err = backgroundClaimProfileInTx(ctx, tx, input)
 		if err != nil {
 			return domain.Turn{}, queueError(action, err)

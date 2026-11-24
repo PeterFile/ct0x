@@ -103,7 +103,7 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=18),
 	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=21),
 	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='task_work_deliveries'),
-	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),`+workInputSchemaExists+","+groupBackgroundSchemaExists, taskWorkReportVersion, taskWorkInputVersion).
+	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),`+workInputSchemaExists+","+groupBackgroundSchemaCompleteSQL, taskWorkReportVersion, taskWorkInputVersion).
 		Scan(&available, &hasReviewNotices, &hasWorkspaceNotices, &hasTaskWork, &hasWorkReports, &hasWorkInputs, &hasGroupBackground); err != nil {
 		return err
 	}

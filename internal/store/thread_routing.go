@@ -90,7 +90,7 @@ func (s *Store) publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r Messa
 	var deferred bool
 	if normalPost && r.RecipientIDs == nil {
 		if route.recipient == "" && !route.suppressFallback {
-			if s.background.installed {
+			if s.background.installed() {
 				if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_background_bindings WHERE group_id=?)`, r.GroupID).Scan(&deferred); err != nil {
 					return domain.Message{}, storeError("读取群组后台绑定失败", err)
 				}

@@ -263,7 +263,7 @@ func messageReceiptInTx(ctx context.Context, tx *sql.Tx, groupID, messageID stri
 		return m, err
 	}
 	var installed, deferred bool
-	if err := tx.QueryRowContext(ctx, "SELECT "+groupBackgroundSchemaExists).Scan(&installed); err != nil || !installed {
+	if err := tx.QueryRowContext(ctx, "SELECT "+groupBackgroundSchemaCompleteSQL).Scan(&installed); err != nil || !installed {
 		return m, err
 	}
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_background_intents WHERE message_id=? AND group_id=?)`, messageID, groupID).Scan(&deferred); err != nil {
