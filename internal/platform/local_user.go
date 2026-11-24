@@ -28,7 +28,7 @@ type MemberInput struct {
 func NewLocalUser(db *store.Store) *LocalUser { return &LocalUser{db} }
 
 func (s *LocalUser) CreateGroup(ctx context.Context, input GroupInput, key string) (domain.Group, error) {
-	return s.db.CreateGroup(ctx, store.CreateGroupInput{
+	return s.db.CreateLocalUserGroup(ctx, store.CreateGroupInput{
 		Name: input.Name, Description: input.Description, ActorID: "user", IdempotencyKey: key,
 	})
 }

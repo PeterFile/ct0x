@@ -37,6 +37,7 @@ type Store struct {
 	investigationExecution  atomic.Bool
 	taskWorkExecution       atomic.Bool
 	threadDecisionExecution atomic.Bool
+	background              groupBackgroundDispatch
 }
 
 type CreateGroupInput struct {
@@ -83,15 +84,35 @@ func Open(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+	// Reject damaged or orphan A1 schema objects before migrate mutates the database.
+	if _, err := checkGroupBackgroundSchema(db, false); err != nil {
+		return nil, storeError("检查群组后台调度迁移状态失败", errors.Join(err, db.Close()))
+	}
 	if err := migrate(db); err != nil {
 		return nil, storeError("初始化数据库失败", errors.Join(err, db.Close()))
 	}
-	return &Store{db: db, schemaVersion: len(migrations)}, nil
+	state, err := checkGroupBackgroundSchema(db, true)
+	if err != nil {
+		return nil, storeError("检查群组后台调度迁移状态失败", errors.Join(err, db.Close()))
+	}
+	return &Store{db: db, schemaVersion: len(migrations), background: groupBackgroundDispatch{state: state}}, nil
 }
 
 func (s *Store) Close() error { return storeError("关闭数据库失败", s.db.Close()) }
 
 func (s *Store) CreateGroup(ctx context.Context, input CreateGroupInput) (domain.Group, error) {
+	return s.createGroup(ctx, input, false)
+}
+
+// CreateLocalUserGroup is only exposed through the trusted local-human entry.
+func (s *Store) CreateLocalUserGroup(ctx context.Context, input CreateGroupInput) (domain.Group, error) {
+	if input.ActorID != "user" {
+		return domain.Group{}, ErrMemberToolDenied
+	}
+	return s.createGroup(ctx, input, s.background.enabled.Load())
+}
+
+func (s *Store) createGroup(ctx context.Context, input CreateGroupInput, bindBackground bool) (domain.Group, error) {
 	scope := mutationScope{operation: "create_group", actorID: input.ActorID, key: input.IdempotencyKey}
 	tx, id, replay, err := s.beginMutation(ctx, scope, mutationPayload(input.Name, input.Description))
 	if err != nil {
@@ -109,6 +130,11 @@ func (s *Store) CreateGroup(ctx context.Context, input CreateGroupInput) (domain
 	}
 	if err != nil {
 		return domain.Group{}, storeError("创建群组失败", err)
+	}
+	if !replay && bindBackground {
+		if err := coordinationDispatchWrite(ctx, tx, "INSERT INTO group_background_bindings(group_id) VALUES(?)", g.ID); err != nil {
+			return domain.Group{}, storeError("绑定群组后台调度失败", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Group{}, storeError("保存群组失败", err)

@@ -6,6 +6,7 @@ import { CreationDisclosure } from "./CreationDisclosure";
 import { MemberAvatar } from "./MemberAvatar";
 import { MemberAdapterDetails } from "./MemberAdapterDetails";
 import { WorkspaceGrantSettings } from "./WorkspaceGrantSettings";
+import { onBackgroundRosterRefresh } from "./background-roster-refresh";
 
 function unique<T extends { id: string }>(items: T[]) {
   const seen = new Set<string>();
@@ -79,38 +80,71 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
   const selectedProvider = !catalogue.pending && !catalogue.error
     ? catalogue.items.find(provider => provider.id === selected?.provider_id) : undefined;
   const [draft, setDraft] = useState(emptyDraft);
-  const [request, setRequest] = useState({ before: "", version: 0 });
-  const [page, setPage] = useState({ pending: true, error: "", next: "" });
+  const [request, setRequest] = useState({ before: "", version: 0, background: false });
+  const [page, setPage] = useState({ pending: true, error: "", next: "", loadedOlder: false });
+  const readBusy = useRef(false), refreshQueued = useRef(false);
+  const firstPageIds = useRef(new Set<string>());
   const [mutation, setMutation] = useState({ pending: false, error: "", uncertain: false });
   const confirmed = useRef<{ member: Member; afterRead: number }[]>([]);
   const readSequence = useRef(0);
   const operation = useRef<{ key: string; input: MemberInput } | null>(null);
   const posting = useRef<AbortController | null>(null);
   const mounted = useRef(false);
-  const load = (before = "") => setRequest(previous => ({ before, version: previous.version + 1 }));
+  const load = (before = "", background = false) => {
+    readBusy.current = true;
+    setRequest(previous => ({ before, version: previous.version + 1, background }));
+  };
+  useEffect(() => {
+    if (!active) return;
+    return onBackgroundRosterRefresh(groupId, () => {
+      refreshQueued.current = true;
+      if (!readBusy.current) load("", true);
+    });
+  }, [active, groupId]);
   useEffect(() => {
     mounted.current = true;
     return () => { mounted.current = false; posting.current?.abort(); };
   }, []);
   useEffect(() => {
-    if (!active) { if (request.before) load(); return; }
+    if (!active) {
+      if (request.before || request.background) load();
+      readBusy.current = refreshQueued.current = false;
+      return;
+    }
+    readBusy.current = true;
+    // Only a new first-page read covers queued invalidations.
+    if (!request.before) refreshQueued.current = false;
     let ignore = false;
     const controller = new AbortController();
     const read = ++readSequence.current;
     setPage(previous => ({ ...previous, pending: true, error: "" }));
     listMembers(groupId, request.before, controller.signal).then(result => {
       if (ignore) return;
+      const overlapsFirstPage = !request.before && result.items.some(member => firstPageIds.current.has(member.id));
+      if (!request.before) firstPageIds.current = new Set(result.items.map(member => member.id));
       // A receipt only outranks reads already started when it arrived.
       confirmed.current = confirmed.current.filter(receipt => receipt.afterRead >= read);
       const protectedMembers = confirmed.current.map(receipt => receipt.member);
       setItems(previous => {
         const updates = new Map(result.items.map(member => [member.id, member]));
-        const retained = request.before ? previous.map(member => updates.get(member.id) ?? member) : [];
-        return unique([...protectedMembers, ...retained, ...result.items]);
+        // A first-page refresh (including retries) does not replace loaded
+        // older pages unless the response covers the entire roster.
+        const retained = request.before || result.next_cursor ? previous.map(member => updates.get(member.id) ?? member) : [];
+        const observed = request.before ? [...retained, ...result.items] : [...result.items, ...retained];
+        return unique([...protectedMembers, ...observed]);
       });
-      setPage({ pending: false, error: "", next: result.next_cursor });
+      setPage(previous => {
+        // Retained rows alone do not prove continuity with the old cursor.
+        const keepCursor = request.background && previous.loadedOlder && overlapsFirstPage && Boolean(result.next_cursor);
+        return { pending: false, error: "", next: keepCursor ? previous.next : result.next_cursor,
+          loadedOlder: keepCursor || Boolean(request.before) };
+      });
     }, error => {
       if (!ignore) setPage(previous => ({ ...previous, pending: false, error: errorText(error) }));
+    }).finally(() => {
+      if (ignore) return;
+      readBusy.current = false;
+      if (refreshQueued.current) load("", true);
     });
     return () => { ignore = true; controller.abort(); };
   }, [active, groupId, request]);
@@ -146,7 +180,7 @@ function MemberScope({ groupId, active, grantActive, catalogue, onMembers, onRec
     <button type="button" onClick={() => load()}>刷新成员</button>
     <div aria-busy={page.pending}>
       {page.pending ? <p role="status">正在载入成员…</p> : null}
-      {page.error ? <div role="alert"><p>{page.error}</p><button type="button" onClick={() => load(request.before)}>重试载入成员</button></div> : null}
+      {page.error ? <div role="alert"><p>{page.error}</p><button type="button" onClick={() => load(request.before, request.background)}>重试载入成员</button></div> : null}
       {!page.pending && !page.error && !items.length ? <p>尚无成员，可创建群内成员。</p> : null}
       <ul className="group-list" aria-label="成员列表">{items.map(member => <li key={member.id} className={onRecipient ? "member-with-avatar" : undefined}>
         {onRecipient && member.group_id === groupId ? <MemberAvatar member={member} onRecipient={() => onRecipient(groupId, member.id)} /> : null}

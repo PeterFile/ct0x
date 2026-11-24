@@ -11,9 +11,10 @@ import (
 
 // PreparedExecution contains trusted configuration only; preparation never starts execution.
 type PreparedExecution struct {
-	Executor     provider.Executor
-	Request      provider.ExecuteRequest
-	ResourceKeys []string
+	Executor          provider.Executor
+	Request           provider.ExecuteRequest
+	ResourceKeys      []string
+	BackgroundProfile store.BackgroundDispatchProfile // Nonzero only for an actual A1 tool-free or Pi discussion-relay run.
 	// BindTurnClaim optionally receives the original committed claim before Execute.
 	// The claim stays in trusted Go code, outside the provider request.
 	BindTurnClaim func(store.TurnClaim) `json:"-"`

@@ -210,7 +210,7 @@ func insertRequestedMessageInTx(ctx context.Context, tx *sql.Tx, r MessageReques
 }
 
 func scopedMessageReceiptInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id string) (domain.Message, error) {
-	m, err := messageInTx(ctx, tx, r.GroupID, id)
+	m, err := messageReceiptInTx(ctx, tx, r.GroupID, id)
 	if err != nil || r.ReplyToMessageID == "" {
 		return m, err
 	}
@@ -253,6 +253,26 @@ func (s *Store) GetMessage(ctx context.Context, groupID, messageID string) (doma
 		return domain.Message{}, storeError("读取消息失败", err)
 	}
 	return messages[0], nil
+}
+
+// GET observes live delivery facts. An asynchronous POST receipt instead
+// freezes what that command committed: original visibility and no deliveries.
+func messageReceiptInTx(ctx context.Context, tx *sql.Tx, groupID, messageID string) (domain.Message, error) {
+	m, err := messageInTx(ctx, tx, groupID, messageID)
+	if err != nil || len(m.Deliveries) == 0 {
+		return m, err
+	}
+	var installed, deferred bool
+	if err := tx.QueryRowContext(ctx, "SELECT "+groupBackgroundSchemaCompleteSQL).Scan(&installed); err != nil || !installed {
+		return m, err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_background_intents WHERE message_id=? AND group_id=?)`, messageID, groupID).Scan(&deferred); err != nil {
+		return domain.Message{}, err
+	}
+	if deferred {
+		m.Deliveries = []domain.Delivery{}
+	}
+	return m, nil
 }
 
 func messageInTx(ctx context.Context, tx *sql.Tx, groupID, messageID string) (domain.Message, error) {
