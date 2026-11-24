@@ -26,6 +26,8 @@ func LocalUserRoutes(local *platform.LocalUser) []Route {
 		{http.MethodGet, "/api/v1/groups/{group}/members", a.listMembers},
 		{http.MethodPost, "/api/v1/groups/{group}/members", noQuery(a.createMember)},
 		{http.MethodGet, "/api/v1/groups/{group}/members/{member}", noQuery(a.getMember)},
+		{http.MethodGet, threadStatePath, a.threadState},
+		{http.MethodPut, threadStatePath, a.threadState},
 	}
 }
 
