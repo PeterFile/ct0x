@@ -12,8 +12,10 @@ import (
 type LocalUser struct{ db *store.Store }
 
 type GroupInput struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	Name                           string `json:"name"`
+	Description                    string `json:"description"`
+	ImportAuthorizationFromGroupID string `json:"import_authorization_from_group_id,omitempty"`
+	ImportAuthorizationFromTopicID string `json:"import_authorization_from_topic_id,omitempty"`
 }
 
 // Provider, model and workspace are preferences, not capabilities or access grants.
@@ -28,8 +30,13 @@ type MemberInput struct {
 func NewLocalUser(db *store.Store) *LocalUser { return &LocalUser{db} }
 
 func (s *LocalUser) CreateGroup(ctx context.Context, input GroupInput, key string) (domain.Group, error) {
-	return s.db.CreateGroup(ctx, store.CreateGroupInput{
-		Name: input.Name, Description: input.Description, ActorID: "user", IdempotencyKey: key,
+	return s.db.CreateLocalUserGroup(ctx, store.CreateGroupInput{
+		Name:                           input.Name,
+		Description:                    input.Description,
+		ActorID:                        "user",
+		IdempotencyKey:                 key,
+		ImportAuthorizationFromGroupID: input.ImportAuthorizationFromGroupID,
+		ImportAuthorizationFromTopicID: input.ImportAuthorizationFromTopicID,
 	})
 }
 

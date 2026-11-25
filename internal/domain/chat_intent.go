@@ -31,6 +31,8 @@ type ChatPolicyRequest struct {
 	PreparationScopeKind      string                   `json:"preparation_scope_kind,omitempty"`
 	AllowWorkspaceChanges     bool                     `json:"allow_workspace_changes,omitempty"`
 	Investigation             *ChatInvestigationPolicy `json:"investigation,omitempty"`
+	// Automatic selection only for current, explicit, same-topic text requests.
+	AutomaticTextDispatch bool `json:"automatic_text_dispatch,omitempty"`
 }
 
 // ChatInvestigationPolicy is a local-user allowlist, not a tool or delegation grant.

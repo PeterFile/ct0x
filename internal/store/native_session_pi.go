@@ -2,6 +2,7 @@ package store
 
 import (
 	"regexp"
+	"slices"
 
 	"agentworkspace/internal/provider"
 )
@@ -16,11 +17,12 @@ var nativePiEntryID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 func validNativeAdapterProfile(p NativeRunProfile) bool {
 	switch p.Adapter {
 	case "codex-app-server-text-member/v1":
-		return p.Protocol == "codex-app-server/v2@0.166.0" && p.CLIVersion == "0.166.0" && p.Thinking == "" &&
+		return p.Protocol == "codex-app-server/v2@0.166.0" && p.CLIVersion == "0.166.0" && p.Thinking == "" && !p.PiSendMessageQuote &&
 			p.NativePolicy == (NativeTextPolicy{Sandbox: "read-only", ApprovalPolicy: "never"})
 	case "pi-json-text-member-session/v1":
 		return p.Protocol == "pi-json-session/v3@1.4.0" && p.CLIVersion == "1.4.0" && nativePiModel.MatchString(p.Model) &&
-			validNativePiThinking(p.Thinking) && p.NativePolicy == (NativeTextPolicy{Sandbox: "tools-only", ApprovalPolicy: "never"})
+			validNativePiThinking(p.Thinking) && p.NativePolicy == (NativeTextPolicy{Sandbox: "tools-only", ApprovalPolicy: "never"}) &&
+			(!p.PiSendMessageQuote || slices.Contains(p.Tools, "send_message"))
 	}
 	return false
 }

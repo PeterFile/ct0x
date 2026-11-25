@@ -155,10 +155,20 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			return nil, nil, nil, err
 		}
 	}
+	schedulerOptions.IntentPass, err = config.withBackgroundDispatchPass(db, preparer, providers, schedulerOptions.IntentPass, output)
+	if err != nil {
+		if tools != nil {
+			err = errors.Join(err, tools.Close())
+		}
+		return nil, nil, nil, err
+	}
 	if config.enableThreadDecisionHandoff {
 		schedulerOptions.PrepareThreadDecision, err = preparer.EnableThreadDecisionHandoff(context.Background())
 		if err != nil {
-			return nil, nil, nil, errors.Join(err, tools.Close())
+			if tools != nil {
+				err = errors.Join(err, tools.Close())
+			}
+			return nil, nil, nil, err
 		}
 	}
 	if freshTaskWork != nil || investigationTaskWork != nil {

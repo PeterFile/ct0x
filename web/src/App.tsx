@@ -169,7 +169,9 @@ export function App({ shell: Shell }: { shell?: ComponentType<AppShellProps> } =
         </div>
         {selected ? <ChatDecisionDisclosure key={selected.id} groupId={selected.id} active={chatVisible} onSaved={onSaved} /> : null}
         <div className="discussion-content">
-          <Discussion groupId={inChatPane ? selected?.id : undefined} active={chatVisible} members={members} recipientSelection={recipientSelection} />
+          <Discussion groupId={inChatPane ? selected?.id : undefined} active={chatVisible}
+            rosterGroupId={contextVisible && context === "members" ? selected?.id : undefined}
+            members={members} recipientSelection={recipientSelection} />
         </div>
       </main>,
 

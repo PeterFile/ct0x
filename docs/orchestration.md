@@ -51,6 +51,8 @@ Runtime binds `source_kind/source_id` and `purpose=chat_intake/v1`; `authority_e
 
 Chat `text_submission` carries no Artifact references; file tools, Artifact publication, and external actions are outside this path. `topic_summary` submissions require nonempty UTF-8 text of at most 8192 bytes; structural checks do not prove semantic quality.
 
+The opt-in automatic text route keeps one canonical work outcome per source. A separately verified discussion-only excerpt still restricts new work from descendant messages, without changing that outcome or creating another decision. Explicit current no-start wording is a veto, never a way to infer permission. A new automatic decline rechecks the exact active, same-group coordinator against the frozen provider and model and requires an empty workspace, but does not require an eligible worker. Saved decisions retain their original replay checks.
+
 **Ordinary discussion candidate.** When the local user omits recipients, the server targets the earliest active member if one exists. An explicit empty list publishes without delivery. The `@` and avatar controls select stable member IDs. The released runtime exposes legacy member-tool entry points. The structured Store interfaces (`ApplyChatDiscussion*` and `ReadChatDiscussionContext`) await their first production callers.
 
 In the structured Store path, each handoff starts from a recorded local-user chat command. Only the current owner can advance it after a persisted assessment for its server-bound `chat_intake/v1` claim, delivery, and candidate. The server binds the source, actor, group, topic, and return route. An identical authorized retry with the same key returns the original publication receipt.

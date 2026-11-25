@@ -55,6 +55,15 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 		if current.Revision != expected {
 			return domain.ChatPolicy{}, ErrConflict
 		}
+		if input.AutomaticTextDispatch {
+			supported, err := chatAutomaticTextSchemaInTx(ctx, tx)
+			if err != nil {
+				return domain.ChatPolicy{}, admissionError("读取自动文本分派策略版本失败", err)
+			}
+			if !supported {
+				return domain.ChatPolicy{}, fmt.Errorf("%w：当前数据库版本不支持自动文本分派", ErrInvalid)
+			}
+		}
 		if input.AllowWorkspaceChanges {
 			supported, err := chatWorkspaceSupportedInTx(ctx, tx)
 			if err != nil {
@@ -78,6 +87,9 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 		if investigation != "" {
 			rule += "\n预授权范围 read_only_investigation：只读调查并交付纯文本；只允许以下明确配置的资料，不授予文件、进程或网络权限。\n" + investigation
 		}
+		if input.AutomaticTextDispatch {
+			rule += "\n允许在本策略启用时为本话题的本机用户明确纯文本请求选择接收成员为协调员，并从由本机用户创建的活跃同群成员中选择一位不同的执行成员。两人均须支持受限文本执行；此选项不授权自主准备、目录、修复或调查工作。"
+		}
 		command, err := createMessageInTx(ctx, tx, MessageRequest{GroupID: thread.GroupID, TopicID: thread.TopicID, ActorID: "user", Content: rule, RecipientIDs: []string{}}, nil)
 		if err != nil {
 			return domain.ChatPolicy{}, admissionError("保存策略规范规则失败", err)
@@ -97,6 +109,11 @@ func (s *Store) SetChatPolicy(ctx context.Context, thread domain.ThreadRef, inpu
 		}
 		if err := coordinatorWrite(ctx, tx, `INSERT INTO chat_policy_scopes(group_id,topic_id,revision,scope_kind,command_source_id) VALUES(?,?,?,?,?)`, thread.GroupID, thread.TopicID, revision, input.PreparationScopeKind, sourceID); err != nil {
 			return domain.ChatPolicy{}, admissionError("保存策略可执行范围失败", err)
+		}
+		if input.AutomaticTextDispatch {
+			if err := coordinatorWrite(ctx, tx, `INSERT INTO chat_automatic_text_policy_revisions(group_id,topic_id,revision) VALUES(?,?,?)`, thread.GroupID, thread.TopicID, revision); err != nil {
+				return domain.ChatPolicy{}, admissionError("保存自动文本分派授权失败", err)
+			}
 		}
 		if input.AllowWorkspaceChanges {
 			if err := coordinatorWrite(ctx, tx, `INSERT INTO chat_workspace_policy_revisions(group_id,topic_id,revision,allow_workspace_changes) VALUES(?,?,?,1)`, thread.GroupID, thread.TopicID, revision); err != nil {
@@ -206,6 +223,9 @@ func chatPolicyInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, re
 		}
 		if policy.InvestigationSupported {
 			policy.Investigation, err = chatInvestigationPolicyInTx(ctx, tx, thread, policy.Revision)
+		}
+		if err == nil && policy.ConfigurationSourceID != "" {
+			err = chatAutomaticTextPolicyInTx(ctx, tx, &policy)
 		}
 	}
 	return policy, err

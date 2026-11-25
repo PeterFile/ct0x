@@ -545,11 +545,13 @@ describe("IM shell", () => {
     expect(within(main()).getByRole("heading", { name: group.name })).toHaveFocus();
     expect(refresh.closest("[hidden]")).not.toBeNull(); expect(transport.mock.calls[0][1]?.signal?.aborted).toBe(true);
     showContext("成员"); const heading = within(context("成员")).getByRole("heading", { name: "成员" });
-    expect(heading).toHaveFocus(); expect(messageReads.mock.calls[0][1]?.signal?.aborted).toBe(true);
+    // The selected roster still observes joins through the same group feed.
+    expect(heading).toHaveFocus(); expect(messageReads.mock.calls[0][1]?.signal?.aborted).toBe(false);
     resize(false); expect(heading).toHaveFocus(); expect(main()).toBeVisible(); expect(refresh).toBeVisible();
-    expect(transport).toHaveBeenCalledTimes(2); expect(messageReads).toHaveBeenCalledTimes(2);
+    expect(transport).toHaveBeenCalledTimes(2); expect(messageReads).toHaveBeenCalledTimes(1);
     closeContext(); expect(trigger("成员")).toHaveFocus(); resize(true);
     fireEvent.click(screen.getByRole("button", { name: "返回群组" }));
+    expect(messageReads.mock.calls[0][1]?.signal?.aborted).toBe(true);
     resize(false); content().focus(); resize(true);
     expect(screen.getByRole("button", { name: group.name })).toHaveFocus();
     expect(screen.queryByRole("main")).not.toBeInTheDocument();

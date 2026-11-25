@@ -36,16 +36,24 @@ func DecodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 		WriteError(w, http.StatusRequestEntityTooLarge, "body_too_large", "请求体不能超过 1 MiB")
 		return false
 	}
-	trimmed := bytes.TrimSpace(body)
-	if err == nil && utf8.Valid(body) && len(trimmed) > 0 && trimmed[0] == '{' {
-		decoder := json.NewDecoder(bytes.NewReader(body))
-		decoder.DisallowUnknownFields()
-		if decoder.Decode(dst) == nil && decoder.Decode(new(any)) == io.EOF && uniqueJSONKeys(json.NewDecoder(bytes.NewReader(body))) {
-			return true
-		}
+	if err == nil && DecodeStrictJSONObject(body, dst) {
+		return true
 	}
 	WriteError(w, http.StatusBadRequest, "invalid_json", "请求体必须是有效的单个 JSON 对象，且不得含有未知或重复字段")
 	return false
+}
+
+// DecodeStrictJSONObject decodes a single UTF-8 JSON object into a narrow DTO,
+// rejecting unknown fields and case-folded duplicate keys at any depth. Callers
+// must bound the input size, pass a pointer and discard the result on failure.
+func DecodeStrictJSONObject(body []byte, dst any) bool {
+	trimmed := bytes.TrimSpace(body)
+	if !utf8.Valid(body) || len(trimmed) == 0 || trimmed[0] != '{' {
+		return false
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(dst) == nil && decoder.Decode(new(any)) == io.EOF && uniqueJSONKeys(json.NewDecoder(bytes.NewReader(body)))
 }
 
 // Token traversal catches duplicate keys in nested objects, including arrays.

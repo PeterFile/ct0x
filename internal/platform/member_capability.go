@@ -35,6 +35,7 @@ type memberToolRegistration struct {
 	candidate          *domain.ChatCandidate
 	purpose            string
 	intake             memberToolIntakeSchema
+	automaticText      *automaticTextSampler
 	runExplanation     *memberRunExplanation
 	taskWork           *taskWorkToolBinding
 	workReport         *taskWorkReportBinding
@@ -72,24 +73,29 @@ func NewMemberTools(db *store.Store) *MemberTools {
 // Issue is called by the trusted runtime only AFTER ClaimTurn, never during preparation.
 // It refuses duplicate registrations rather than silently rotating a live capability.
 func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants) (string, error) {
-	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{}, nil)
+	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{}, nil, nil)
 }
 
 // IssueChatIntake is a separate trusted runtime seam, never a tool/API input.
 // It freezes a restricted profile and persists the exact claim-bound purpose.
 func (s *MemberTools) IssueChatIntake(ctx context.Context, claim store.TurnClaim) (string, error) {
-	return s.issueChatIntake(ctx, claim, memberToolIntakeSchema{})
+	return s.issueChatIntake(ctx, claim, memberToolIntakeSchema{}, nil)
 }
 
-func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema) (string, error) {
-	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema, nil)
+// Use an immutable sampler identity; native launch compares registrations.
+type automaticTextSampler struct {
+	sample func(context.Context) store.ChatAutomaticTextFacts
+}
+
+func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema, sampler *automaticTextSampler) (string, error) {
+	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema, nil, sampler)
 }
 
 func chatIntakeOperations() []string {
 	return []string{"list_members", "read_channel", "send_message", "search_history", "read_history"}
 }
 
-func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema, explanation *memberRunExplanation) (string, error) {
+func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema, explanation *memberRunExplanation, sampler *automaticTextSampler) (string, error) {
 	grants.Operations = slices.Clone(grants.Operations)
 	if grants.Skills != nil {
 		// Freeze the source even if the caller overwrites its exported wrapper.
@@ -160,7 +166,7 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 		candidate = &captured
 	}
 	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate,
-		purpose: purpose, intake: schema, runExplanation: explanation}
+		purpose: purpose, intake: schema, automaticText: sampler, runExplanation: explanation}
 	return token, nil
 }
 

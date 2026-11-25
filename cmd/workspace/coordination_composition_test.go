@@ -200,6 +200,8 @@ func TestCoordinationCompositionRoutesOptIn(t *testing.T) {
 	}
 }
 
+const coordinationCompositionFixtureModel = "fixture-model"
+
 type coordinationCompositionExpectation struct {
 	DataDir, GroupID, CoordinatorID, WorkerID, Extension, Thinking, Mode string
 }
@@ -235,7 +237,7 @@ func newCoordinationCompositionFixture(t *testing.T, mode, thinking string) *coo
 	executionJSON(t, "POST", base+"/api/v1/groups", platform.GroupInput{Name: "受信角色装配"}, &f.group)
 	for _, target := range []*domain.Member{&f.lead, &f.worker} {
 		executionJSON(t, "POST", base+"/api/v1/groups/"+f.group.ID+"/members", platform.MemberInput{
-			Name: "仅文字角色", Role: "--thinking off; Coordinator/Worker文字不能改选授权", ProviderID: selected.ID, Model: "fixture-model",
+			Name: "仅文字角色", Role: "--thinking off; Coordinator/Worker文字不能改选授权", ProviderID: selected.ID, Model: coordinationCompositionFixtureModel,
 		}, target)
 	}
 	if err := stop(); err != nil {
@@ -787,7 +789,7 @@ func TestCoordinationCompositionNativeHelper(t *testing.T) {
 		tools = "read_channel,search_history,read_history,submit_result"
 	}
 	want := []string{"--offline", "--mode", "json", "-p", "--no-extensions", "--no-mcp", "--no-builtin-tools", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
-		"--session-dir", filepath.Join(expected.DataDir, "runtime", runID), "--session-id", runID, "--tools", tools, "--extension", expected.Extension, "--model", "fixture-model"}
+		"--session-dir", filepath.Join(expected.DataDir, "runtime", runID), "--session-id", runID, "--tools", tools, "--extension", expected.Extension, "--model", coordinationCompositionFixtureModel}
 	if kind != "ordinary" && expected.Thinking != "" {
 		want = append(want, "--thinking", expected.Thinking)
 	}
@@ -812,7 +814,7 @@ func TestCoordinationCompositionNativeHelper(t *testing.T) {
 		case 404:
 			code = "not_found"
 		}
-		if expected.Mode == "chat-intake" {
+		if expected.Mode == "chat-intake" || expected.Mode == "automatic-text" {
 			return memberToolsHTTP(t, config.Endpoint, config.Token, operation, input, key, status, code, coordinationCompositionToolBudget())
 		}
 		return memberToolsHTTP(t, config.Endpoint, config.Token, operation, input, key, status, code)
@@ -845,7 +847,7 @@ func TestCoordinationCompositionNativeHelper(t *testing.T) {
 		}
 		call("decide_dispatch", map[string]any{"kind": "assign", "worker_member_id": expected.WorkerID, "reason": "forged role"}, "ordinary-decide", status)
 		call("submit_result", map[string]any{"summary": "forged role"}, "ordinary-submit", status)
-		if expected.Mode == "chat-intake" {
+		if expected.Mode == "chat-intake" || expected.Mode == "automatic-text" {
 			if page.ChatCandidate == nil || page.ChatCandidate.SourceSenderID != "user" || page.ChatCandidate.SourceKind != "local_user_chat" || page.ChatCandidate.SourceID == "" || page.ChatCandidate.Purpose != domain.ChatIntakePurpose || page.ChatCandidate.Policy.Revision != 1 || !bytes.Contains(prompt, []byte("intent_assessment")) {
 				t.Fatal("ordinary semantic assessment lacks a captured source/policy and prompt contract")
 			}
@@ -863,7 +865,23 @@ func TestCoordinationCompositionNativeHelper(t *testing.T) {
 			if sourceContent == "先讨论摘要应当包含哪三条结论。" {
 				assessment = domain.ChatAssessment{Disposition: "discuss", Reason: "模拟语义评估：仅讨论，没有工作请求"}
 			}
-			operation, input = "send_message", map[string]any{"content": "三条结论与边界已说明。", "intent_assessment": assessment}
+			if expected.Mode == "automatic-text" {
+				if page.ChatCandidate.BindingRevision != 0 || page.ChatCandidate.DispatchPolicyRevision != 0 ||
+					!bytes.Contains(channel, []byte(`"automatic_text_dispatch":true`)) {
+					t.Fatal("intake did not capture an opted-in policy with absent formal routing")
+				}
+				switch sourceContent {
+				case automaticTextDiscussion:
+					assessment = domain.ChatAssessment{Disposition: "discuss", Reason: "本次只讨论", DiscussionOnlyExcerpt: new("这次只讨论，不开工。")}
+				case automaticTextWork:
+					assessment.Title = "本季合计和同比对照口径"
+					assessment.Description = "在原话题交付纯文本，不改文件。"
+					assessment.Acceptance = "两行分别说明本季合计与同比对照；去年同期不计入本季合计。"
+				default:
+					t.Fatalf("unexpected bound source: %q", sourceContent)
+				}
+			}
+			operation, input = "send_message", map[string]any{"content": "结论与边界已说明。", "intent_assessment": assessment}
 		}
 	case "coordinator":
 		call("send_message", map[string]any{"content": "not granted"}, "role-send", 403)
@@ -872,7 +890,11 @@ func TestCoordinationCompositionNativeHelper(t *testing.T) {
 	case "worker":
 		call("send_message", map[string]any{"content": "not granted"}, "role-send", 403)
 		call("decide_dispatch", map[string]any{"kind": "decline", "reason": "wrong role"}, "role-decide", 403)
-		operation, input = "submit_result", map[string]any{"summary": "本地角色工具提交", "artifact_versions": []any{}}
+		summary := "本地角色工具提交"
+		if expected.Mode == "automatic-text" {
+			summary = automaticTextSubmission
+		}
+		operation, input = "submit_result", map[string]any{"summary": summary, "artifact_versions": []any{}}
 	}
 	var messages []any
 	if operation != "" {

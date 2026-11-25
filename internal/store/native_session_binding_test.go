@@ -78,7 +78,7 @@ func TestNativeSessionCodexProfileBytesRemainFrozen(t *testing.T) {
 		t.Fatalf("Codex canonical profile changed: %s, %v", got, err)
 	}
 	data, err := CanonicalNativeRunBinding(binding)
-	if err != nil || bytes.Contains(data, []byte(`"thinking"`)) {
+	if err != nil || bytes.Contains(data, []byte(`"thinking"`)) || bytes.Contains(data, []byte(`"pi_send_message_quote"`)) {
 		t.Fatalf("optional Pi field changed legacy Codex binding bytes: %s, %v", data, err)
 	}
 	if _, err := decodeNativeRunBinding(data); err != nil {
@@ -87,6 +87,32 @@ func TestNativeSessionCodexProfileBytesRemainFrozen(t *testing.T) {
 	binding.Profile.Thinking = "max"
 	if _, err := NativeRunProfileSHA256(binding.Profile); !errors.Is(err, ErrInvalid) {
 		t.Fatal("Pi thinking field broadened the Codex profile")
+	}
+	binding.Profile.Thinking = ""
+	binding.Profile.Tools = append(binding.Profile.Tools, "send_message")
+	binding.Profile.PiSendMessageQuote = true
+	if _, err := NativeRunProfileSHA256(binding.Profile); !errors.Is(err, ErrInvalid) {
+		t.Fatal("Codex accepted an ordinary Pi schema marker")
+	}
+}
+
+func TestNativeSessionLegacyPiProfileBytesRemainFrozen(t *testing.T) {
+	binding := nativePiBinding(domain.Turn{ID: "turn", GroupID: "group", MemberID: "member", ConversationID: "conversation"})
+	binding.Profile.Tools = append(binding.Profile.Tools, "send_message")
+	// Canonical v1 profile before the ordinary quote schema discriminator.
+	const frozenProfile = `{"adapter":"pi-json-text-member-session/v1","authority":{"assignment_id":"","authority_generation":0,"binding_revision":0,"chat_policy_revision":0,"mandate_id":"","policy_revision":0,"request_id":"","task_id":"","task_revision":0},"cli_path":"/test/bin/pi","cli_version":"1.4.0","configured_workspace":"/shared/workspace","cwd":"/test/workspace","max_group_members":8,"model":"synthetic/model","native_policy":{"approval_policy":"never","native_artifacts":false,"native_file_access":false,"network_access":false,"sandbox":"tools-only"},"protocol":"pi-json-session/v3@1.4.0","provider_id":"pi","resource_keys":["shared"],"thinking":"max","tools":["list_members","read_channel","send_message"],"workspace_grant_id":"","workspace_grant_version":0,"workspace_identity":"private:fixture-node:inode-123","workspace_resolved_root":"","workspace_root":""}`
+	const frozenBinding = `{"candidate_id":"","conversation_id":"conversation","group_id":"group","member_id":"member","profile":` + frozenProfile + `,"purpose":"generic","resumed_from_turn_id":"","topic_id":"","turn_id":"turn","version":1}`
+	const frozenSHA = "32b71a23f519ca3955c5b8469731eab9689f87d94907ef1b9341b296830ce02c"
+	got, err := CanonicalNativeRunBinding(binding)
+	if err != nil || string(got) != frozenBinding {
+		t.Fatalf("legacy Pi canonical binding changed: %s, %v", got, err)
+	}
+	old, err := decodeNativeRunBinding([]byte(frozenBinding))
+	if err != nil {
+		t.Fatalf("legacy Pi binding no longer decodes: %v", err)
+	}
+	if got, err := NativeRunProfileSHA256(old.Profile); err != nil || got != frozenSHA {
+		t.Fatalf("legacy Pi canonical profile hash changed: %s, %v", got, err)
 	}
 }
 
