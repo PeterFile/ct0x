@@ -32,6 +32,12 @@ func (s *Store) handleWorkInputInTx(ctx context.Context, tx *sql.Tx, scope Membe
 	if !validTriggerID(inputID) || handBack && !memberToolTextValid(reason, 2048) {
 		return out, ErrInvalid
 	}
+	if isDecisionAnswerID(inputID) {
+		if handBack {
+			return out, ErrMemberToolDenied
+		}
+		return s.consumeDecisionAnswerInTx(ctx, tx, role, original, inputID, key)
+	}
 	installed, err := workInputSchemaInTx(ctx, tx)
 	if err != nil {
 		return out, err

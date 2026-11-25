@@ -122,6 +122,9 @@ exit 0`)
 			if _, err := adapter.Capabilities(selected); err == nil {
 				t.Fatal("unaudited release advertised native resume")
 			}
+			if quote, qualified := PiNativeSessionBridgeQuoteSupport(entry); quote || qualified {
+				t.Fatal("unaudited pair advertised the ordinary quote schema")
+			}
 			if e, err := adapter.NewExecutor(selected, 0); e != nil || err == nil {
 				t.Fatal("unaudited release constructed a native executor")
 			}

@@ -10,6 +10,16 @@ import (
 	"agentworkspace/internal/provider"
 )
 
+func withTaskImpactSchema(t *testing.T) {
+	t.Helper()
+	if slices.Contains(migrations, taskImpactSchema) {
+		return
+	}
+	original := migrations
+	t.Cleanup(func() { migrations = original })
+	migrations = append(slices.Clone(original), taskImpactSchema)
+}
+
 func impactInput(t *testing.T, f chatFixture, quote, constraint string) (domain.ChatAssessmentReceipt, domain.ChatCandidate) {
 	t.Helper()
 	a, c := newWorkInputCandidate(t, f, quote)
@@ -53,6 +63,7 @@ func requireImpact(t *testing.T, items []domain.TaskImpact, kind domain.TaskImpa
 }
 
 func TestConstraintImpactReplansWithExistingOwnerAndExactReports(t *testing.T) {
+	withTaskImpactSchema(t)
 	f, owner, child, _ := workReportOwner(t, 3)
 	s, p := f.s, owner.Provenance
 	delegate := func(scope MemberToolScope, question, key string) domain.TaskWorkDelegation {
@@ -192,6 +203,7 @@ func TestConstraintImpactReplansWithExistingOwnerAndExactReports(t *testing.T) {
 }
 
 func TestConstraintImpactIndependentACKs(t *testing.T) {
+	withTaskImpactSchema(t)
 	for _, tc := range []struct {
 		name        string
 		assessOrder [2]int
@@ -312,6 +324,7 @@ func TestConstraintImpactIndependentACKs(t *testing.T) {
 }
 
 func TestConstraintImpactContextOnlyAndSharedQuote(t *testing.T) {
+	withTaskImpactSchema(t)
 	f := chatSetup(t, "user", false)
 	owner := chatAuthorityWorker(t, f)
 	const quote = "注明结论来源"
@@ -339,7 +352,10 @@ func TestConstraintImpactContextOnlyAndSharedQuote(t *testing.T) {
 func TestConstraintImpactUpgradeDoesNotBackfillHandling(t *testing.T) {
 	original := migrations
 	t.Cleanup(func() { migrations = original })
-	migrations = original[:taskImpactSchemaVersion-1]
+	idx := slices.Index(original, taskImpactSchema)
+	if idx >= 0 {
+		migrations = original[:idx]
+	}
 	f := chatSetup(t, "user", false)
 	owner := chatAuthorityWorker(t, f)
 	initial, _ := impactInput(t, f, "注明来源", "注明来源")
@@ -347,7 +363,11 @@ func TestConstraintImpactUpgradeDoesNotBackfillHandling(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	migrations = original
+	if idx >= 0 {
+		migrations = original
+	} else {
+		migrations = append(slices.Clone(original), taskImpactSchema)
+	}
 	s := queueHandle(t, f.path, false)
 	if same, err := s.AcknowledgeWorkInputWithKey(ctx, owner.Member, initial.WorkInputID, "pre-impact"); err != nil || !reflect.DeepEqual(same, ack) {
 		t.Fatalf("upgrade lost the exact migrated ACK: %+v %v", same, err)
@@ -368,6 +388,7 @@ func TestConstraintImpactUpgradeDoesNotBackfillHandling(t *testing.T) {
 }
 
 func TestConstraintImpactRetainsExactRepairSubmission(t *testing.T) {
+	withTaskImpactSchema(t)
 	f, original, oldSub := chatRepairFixSubmitted(t, "请交付文本。", "旧版文本交付。")
 	review := chatRepairFixBindReview(t, &f, original, oldSub, "拒收，请按原范围修复后提交。")
 	var err error

@@ -9,8 +9,9 @@ import (
 )
 
 type MemberToolMessageInput struct {
-	Content      string   `json:"content"`
-	RecipientIDs []string `json:"recipient_ids"`
+	Content          string   `json:"content"`
+	RecipientIDs     []string `json:"recipient_ids"`
+	ReplyToMessageID string   `json:"reply_to_message_id,omitempty"`
 }
 
 func (s *Store) ListMembersForTool(ctx context.Context, scope MemberToolScope, options ListOptions) (Page[domain.Member], error) {
@@ -66,7 +67,11 @@ func (s *Store) ReadChannelForTool(ctx context.Context, scope MemberToolScope, o
 		return Page[domain.Message]{}, memberToolOperationError(action, err)
 	}
 	defer tx.Rollback()
-	page, err := readCurrentChannelInTx(ctx, tx, scope, options)
+	mode, err := memberHistoryModeInTx(ctx, tx, scope)
+	if err != nil {
+		return Page[domain.Message]{}, memberToolOperationError(action, err)
+	}
+	page, err := readCurrentChannelInTx(ctx, tx, scope, options, mode)
 	if err != nil {
 		return Page[domain.Message]{}, memberToolOperationError(action, err)
 	}
@@ -77,17 +82,12 @@ func (s *Store) ReadChannelForTool(ctx context.Context, scope MemberToolScope, o
 }
 
 // The caller must fence the live scope in the same transaction before reading.
-func readCurrentChannelInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, options ListOptions) (Page[domain.Message], error) {
+func readCurrentChannelInTx(ctx context.Context, tx *sql.Tx, scope MemberToolScope, options ListOptions, mode historyScopeMode) (Page[domain.Message], error) {
 	limit, err := listLimit(options)
 	if err != nil {
 		return Page[domain.Message]{}, err
 	}
-	query, args := "SELECT "+messageColumns+" FROM messages WHERE group_id=? AND topic_id=?", []any{scope.Claim.GroupID, scope.TopicID}
-	if c := options.Before; c != nil {
-		query += " AND (created_at,id)<(?,?)"
-		args = append(args, c.CreatedAt.UTC().Format(timestampLayout), c.ID)
-	}
-	rows, err := tx.QueryContext(ctx, query+" ORDER BY created_at DESC,id DESC LIMIT ?", append(args, limit+1)...)
+	rows, err := scopedThreadMessagesInTx(ctx, tx, scope.Claim.GroupID, scope.TopicID, mode, options.Before, "", limit+1)
 	if err != nil {
 		return Page[domain.Message]{}, err
 	}
@@ -97,6 +97,9 @@ func readCurrentChannelInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSco
 		message, err := scanMessage(rows)
 		if err != nil {
 			return Page[domain.Message]{}, err
+		}
+		if mode == effectiveHistory {
+			projectEffectiveTopic(&message, scope.TopicID)
 		}
 		page.Items = append(page.Items, message)
 	}
@@ -117,6 +120,9 @@ func readCurrentChannelInTx(ctx context.Context, tx *sql.Tx, scope MemberToolSco
 		}
 	}
 	if err := messageSourcesInTx(ctx, tx, page.Items); err != nil {
+		return Page[domain.Message]{}, err
+	}
+	if err := projectMessageQuotesInTx(ctx, tx, scope.Claim.GroupID, &scope.TopicID, page.Items); err != nil {
 		return Page[domain.Message]{}, err
 	}
 	return page, nil
@@ -145,7 +151,9 @@ func (s *Store) sendMemberMessage(ctx context.Context, scope MemberToolScope, in
 	if !memberToolKeyValid(key) {
 		return domain.Message{}, ErrInvalid
 	}
-	r := MessageRequest{GroupID: scope.Claim.GroupID, TopicID: scope.TopicID, ActorID: scope.MemberID, Content: input.Content, RecipientIDs: input.RecipientIDs, IdempotencyKey: key}
+	r := MessageRequest{GroupID: scope.Claim.GroupID, TopicID: scope.TopicID, ActorID: scope.MemberID,
+		Content: input.Content, RecipientIDs: input.RecipientIDs, IdempotencyKey: key,
+		ThreadLinks: domain.ThreadLinks{ReplyToMessageID: input.ReplyToMessageID}}
 	_, replay, err := lookupMutation(ctx, tx, r.scope(), r.payload())
 	if err != nil {
 		return domain.Message{}, memberToolOperationError(action, err)

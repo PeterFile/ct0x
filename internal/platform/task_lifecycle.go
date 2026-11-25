@@ -70,6 +70,10 @@ func (s *LocalUser) ListTaskWorkReports(ctx context.Context, groupID, taskID str
 	return s.db.ListTaskWorkReports(ctx, groupID, taskID, options)
 }
 
+func (s *LocalUser) ListPendingReviews(ctx context.Context, options store.ListOptions) (store.Page[store.PendingReview], error) {
+	return s.db.ListPendingReviews(ctx, "user", options)
+}
+
 func (s *LocalUser) ReviewTask(ctx context.Context, groupID, taskID string, input TaskReviewInput, key string) (domain.ReviewDecision, error) {
 	return s.db.ReviewTask(ctx, store.ReviewTaskInput{
 		GroupID: groupID, TaskID: taskID, ActorID: "user", ExpectedRevision: input.ExpectedRevision,

@@ -35,6 +35,13 @@ func taskWorkCurrentInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts) (bloc
 		sql.Named("mandate", d.MandateID), sql.Named("authority", d.AuthorityGeneration), sql.Named("owner", d.OwnerMemberID),
 		sql.Named("binding", r.BindingRevision), sql.Named("kind", string(d.SourceKind)), sql.Named("member", d.MemberID),
 		sql.Named("coordinator", r.CoordinatorMemberID), sql.Named("policy", r.PolicyRevision)).Scan(&active, &blocked)
+	if err == nil && blocked == "" && f.decisionAnswer {
+		var live bool
+		live, err = decisionAnswerLiveInTx(ctx, tx, d.SourceID)
+		if err == nil && !live {
+			blocked = "decision_answer_stale"
+		}
+	}
 	if err == nil && blocked == "" {
 		var pinned bool
 		pinned, err = taskArtifactDependenciesBlockedInTx(ctx, tx, d.GroupID, d.TaskID)

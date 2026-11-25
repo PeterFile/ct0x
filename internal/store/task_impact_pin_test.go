@@ -91,6 +91,7 @@ func impactPinnedOwner(t *testing.T, f chatFixture, child domain.Task, memberID,
 }
 
 func TestConstraintImpactExactPinsAndCancellationRetainClaims(t *testing.T) {
+	withTaskImpactSchema(t)
 	f := chatSetup(t, "user", false)
 	s := f.s
 	second, third := member(t, s, f.groupID), member(t, s, f.groupID)

@@ -387,7 +387,7 @@ func (s *Store) ReadTaskWorkChannel(ctx context.Context, scope MemberToolScope, 
 		if !p.AllowTopicMessages {
 			return Page[domain.Message]{}, ErrMemberToolDenied
 		}
-		return readCurrentChannelInTx(ctx, tx, scope, opts)
+		return readCurrentChannelInTx(ctx, tx, scope, opts, storageHistory)
 	})
 }
 

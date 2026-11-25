@@ -207,7 +207,17 @@ func (s *Store) coordinationDecideNewInTx(ctx context.Context, tx *sql.Tx, r dom
 	}
 	decline := workerID == "" // Only a validated decline has no worker ID.
 	investigation, err := s.investigationDispatchInTx(ctx, tx, r, decline)
-	if err != nil || decline { // Decline still requires current authority, not a worker fact.
+	if err != nil {
+		return err
+	}
+	if decline {
+		_, live, err := chatAutomaticTextRoleInTx(ctx, tx, r.GroupID, r.ID, false)
+		if err == nil && !live {
+			return ErrConflict
+		}
+		return err
+	}
+	if err := requireChatAutomaticTextAssignmentInTx(ctx, tx, r, workerID); err != nil {
 		return err
 	}
 	return coordinationDecideCapabilityInTx(ctx, tx, r, workerID, facts, required, investigation)

@@ -20,6 +20,7 @@ const (
 	CoordinationMemberInactive        CoordinationReadinessCode = "member_inactive"
 	CoordinationAlreadyDecided        CoordinationReadinessCode = "already_decided"
 	CoordinationAttemptConflict       CoordinationReadinessCode = "attempt_conflict"
+	CoordinationAutomaticTextChanged  CoordinationReadinessCode = "automatic_text_roles_changed"
 
 	CoordinationDiscussionWorkReturnHandlerRequired CoordinationReadinessCode = "discussion_work_return_handler_required"
 )
@@ -28,10 +29,11 @@ const (
 // Blocked describes a new start, never permission to replay a historical command.
 // Ready is a bounded hint; Bind still owns full-history and activation gates.
 type CoordinationRoleState struct {
-	Provenance        CoordinationRoleProvenance `json:"-"`
-	AttemptID         string                     `json:"-"`
-	ProviderID, Model string                     `json:"-"`
-	Blocked           CoordinationReadinessCode  `json:"-"`
+	Provenance            CoordinationRoleProvenance `json:"-"`
+	AttemptID             string                     `json:"-"`
+	ProviderID, Model     string                     `json:"-"`
+	Blocked               CoordinationReadinessCode  `json:"-"`
+	AutomaticTextWorkerID string                     `json:"-"`
 }
 
 // ResolveCoordinationDelivery observes queued identity in one read snapshot.
@@ -155,6 +157,9 @@ func (s *Store) resolveCoordinationDelivery(ctx context.Context, groupID, delive
 // Raw candidates precede parent joins. A broken second relation still counts;
 // only successful absence from BOTH unique delivery indexes permits ordinary.
 func coordinationQueuedProvenanceInTx(ctx context.Context, tx *sql.Tx, base CoordinationRoleProvenance, sender string) (CoordinationRoleProvenance, error) {
+	if isThreadDecisionRef(base.DeliveryID) || isThreadDecisionRef(base.MessageID) {
+		return CoordinationRoleProvenance{}, ErrMemberToolDenied
+	}
 	rows, err := tx.QueryContext(ctx, `WITH source AS (
  SELECT 'coordinator' kind,s.request_id,s.task_id,s.group_id,s.delivery_id,s.message_id,s.conversation_id,
  s.delivered_member_id,'' assignment_id,s.status IN ('enqueued','assigned','declined') linked
@@ -353,6 +358,16 @@ func coordinationRoleStateInTx(ctx context.Context, tx *sql.Tx, scope MemberTool
 			}
 		} else if receipt.Decision.CoordinatorTurnID != scope.Claim.TurnID {
 			return CoordinationRoleState{}, ErrMemberToolDenied
+		}
+	}
+	if state.Blocked == CoordinationReady {
+		worker, live, err := chatAutomaticTextRoleInTx(ctx, tx, p.GroupID, p.RequestID, true)
+		if err != nil {
+			return CoordinationRoleState{}, err
+		}
+		state.AutomaticTextWorkerID = worker
+		if !live {
+			state.Blocked = CoordinationAutomaticTextChanged
 		}
 	}
 	if checkArtifactDeps && state.Blocked == CoordinationReady {

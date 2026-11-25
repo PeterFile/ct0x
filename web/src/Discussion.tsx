@@ -1,14 +1,21 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { ApiError, isDefinitiveRejection, sendMessage } from "./api";
-import type { Delivery, Member, Message, MessageDiscussionWork, MessageInput } from "./api";
+import { ApiError, getMember, isDefinitiveRejection, matchesMessageQuote, sendMessage } from "./api";
+import type { Delivery, Member, Message, MessageDiscussionWork, MessageInput, MessageQuoteTarget } from "./api";
 import { messageAuthor, messageSourceLabel } from "./message-source";
+import { refreshBackgroundRoster } from "./background-roster-refresh";
 import { RequestWork } from "./RequestWork";
 import type { RequestWorkHandle } from "./RequestWork";
 import { useMessageFeed } from "./useMessageFeed";
 import { useMessageScroll } from "./useMessageScroll";
 import "./discussion-presentation.css";
 const emptyMembers: Member[] = [];
+const workspaceBeginPrefix = "workspace_begin:";
+function isWorkspaceIntentTrace({ source_kind, source_id }: Message) {
+  // workspace_finish: also covers receipts that require reconciliation; the ID does not distinguish those outcomes.
+  return source_kind === "platform" && source_id !== undefined
+    && source_id.startsWith(workspaceBeginPrefix) && source_id.length > workspaceBeginPrefix.length;
+}
 const deliveryLabel = (state: string) => state === "queued" ? "已入队" : state === "accepted" ? "CLI已接收" : state === "failed" ? "投递失败" : "状态未知";
 function deliverySummary(deliveries: Delivery[]) {
   if (!deliveries.length) return "暂无投递记录";
@@ -32,27 +39,51 @@ function shortTime(value: string) {
 
 export type RecipientSelection = { groupId: string; memberId: string; version: number };
 
-export function Discussion({ groupId, members, recipientSelection }: {
-  groupId?: string; members: Record<string, Member[]>; recipientSelection?: RecipientSelection;
+export function Discussion({ groupId, active = true, rosterGroupId, members, recipientSelection }: {
+  groupId?: string; active?: boolean; rosterGroupId?: string; members: Record<string, Member[]>; recipientSelection?: RecipientSelection;
 }) {
   const [visited, setVisited] = useState<string[]>([]);
+  const feedGroupId = groupId ?? rosterGroupId;
   useEffect(() => {
-    if (groupId) setVisited(previous => previous.includes(groupId) ? previous : [...previous, groupId]);
-  }, [groupId]);
+    if (feedGroupId) setVisited(previous => previous.includes(feedGroupId) ? previous : [...previous, feedGroupId]);
+  }, [feedGroupId]);
   return <>
     {!groupId ? <p className="empty-panel">请先选择群组，再查看讨论和发送消息。</p> : null}
     {visited.map(id => <div key={id} className="discussion-scope" hidden={id !== groupId}>
-      <DiscussionScope groupId={id} active={id === groupId} members={members[id] ?? emptyMembers} recipientSelection={recipientSelection} />
+      <DiscussionScope groupId={id} active={id === groupId && active}
+        paused={id === groupId && !active && id !== rosterGroupId}
+        observeRoster={id === rosterGroupId}
+        members={members[id] ?? emptyMembers} recipientSelection={recipientSelection} />
     </div>)}
   </>;
 }
-function DiscussionScope({ groupId, active, members, recipientSelection }: {
-  groupId: string; active: boolean; members: Member[]; recipientSelection?: RecipientSelection;
+function DiscussionScope({ groupId, active, paused, observeRoster, members, recipientSelection }: {
+  groupId: string; active: boolean; paused: boolean; observeRoster: boolean; members: Member[]; recipientSelection?: RecipientSelection;
 }) {
-  const formId = useId(), feed = useMessageFeed(groupId, active);
-  const scroll = useMessageScroll(active, feed.items, feed.page);
+  const observeFeed = active || observeRoster;
+  const formId = useId(), feed = useMessageFeed(groupId, observeFeed, paused, active);
+  const visibleItems = useMemo(() => feed.items.filter(message => !isWorkspaceIntentTrace(message)), [feed.items]);
+  const scroll = useMessageScroll(active, visibleItems, feed.page);
+  // Validate discussion relations against the full loaded window, not just rendered rows.
   const loaded = useMemo(() => new Map(feed.items.map(message => [message.id, message])), [feed.items]);
+  const seenJoins = useRef(new Set<string>()), refreshedGap = useRef(0);
+  useEffect(() => {
+    if (!observeFeed) return;
+    let joined = false;
+    for (const message of feed.items) {
+      if (message.group_id !== groupId || !backgroundJoin(message) || seenJoins.current.has(message.id)) continue;
+      seenJoins.current.add(message.id);
+      joined = true;
+    }
+    if (joined || (observeRoster && feed.latestGap !== refreshedGap.current)) {
+      refreshedGap.current = feed.latestGap;
+      refreshBackgroundRoster(groupId);
+    }
+  }, [observeFeed, observeRoster, feed.items, feed.latestGap, groupId]);
   const [content, setContent] = useState("");
+  const [quote, setQuote] = useState<(Pick<Message, "id" | "sender_id" | "source_kind"> & { excerpt: string }) | null>(null);
+  const [quoteAuthor, setQuoteAuthor] = useState<Pick<Member, "id" | "name"> | null>(null);
+  const [quoteError, setQuoteError] = useState("");
   const [route, setRoute] = useState("default"), [recipients, setRecipients] = useState<string[]>([]);
   const [mention, setMention] = useState<{ start: number; end: number; query: string } | null>(null);
   const [highlight, setHighlight] = useState(0);
@@ -66,6 +97,17 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
   const eligible = scopedMembers.filter(member => member.status === "active");
   const membersById = new Map(scopedMembers.map(member => [member.id, member]));
   const authorName = (id: string) => id === "user" ? "我" : membersById.get(id)?.name ?? "未载入成员";
+  const quoteMemberID = quote && quote.sender_id !== "user" && quote.source_kind !== "platform" ? quote.sender_id : "";
+  const quoteMemberName = membersById.get(quoteMemberID)?.name ?? (quoteAuthor?.id === quoteMemberID ? quoteAuthor.name : undefined);
+  useEffect(() => {
+    // Resolve an unpaged author's name only on demand, not for each timeline row.
+    if (!active || !quoteMemberID || quoteMemberName) return;
+    const controller = new AbortController();
+    void getMember(groupId, quoteMemberID, controller.signal).then(member => {
+      if (!controller.signal.aborted) setQuoteAuthor({ id: member.id, name: member.name });
+    }).catch(() => { /* Keep the stable author ID if the historical name is unavailable. */ });
+    return () => controller.abort();
+  }, [active, groupId, quoteMemberID, quoteMemberName]);
   const blocked = mutation.pending || mutation.uncertain;
   const suggestions = mention && active && !blocked ? eligible.filter(member => (route !== "selected" || !recipients.includes(member.id))
     && `${member.name} ${member.role} ${member.id}`.toLocaleLowerCase().includes(mention.query.toLocaleLowerCase())) : [];
@@ -99,6 +141,27 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
     caret.current = mention.start + insertion.length;
     setContent(previous => previous.slice(0, mention.start) + insertion + previous.slice(mention.end)); setMention(null);
   }
+  function selectQuote(message: Message) {
+    if (!active || blocked || operation.current || message.group_id !== groupId) return;
+    setQuote({ id: message.id, sender_id: message.sender_id, source_kind: message.source_kind,
+      excerpt: discussionPreview(message.content.replace(/[\p{White_Space}\p{Cc}]+/gu, " ").trim()) });
+    textarea.current?.focus({ preventScroll: true });
+  }
+  async function navigateQuote(reference: MessageQuoteTarget) {
+    if (!active) return;
+    const navigation = scroll.beginQuoteNavigation(reference);
+    setQuoteError("");
+    try {
+      const original = loaded.get(reference.message_id);
+      if (original) {
+        if (!matchesMessageQuote(reference, original)) throw new ApiError("被引原消息与引用不符。");
+        feed.preserveReference(original.id);
+      } else if (!await feed.loadQuote(reference, navigation.isCurrent)) return;
+      navigation.focus();
+    } catch (error) {
+      if (navigation.isCurrent()) setQuoteError(error instanceof ApiError ? error.message : "未能载入被引原消息，请重试。");
+    }
+  }
   function removeRecipient(id: string) {
     if (blocked) return;
     setRecipients(previous => previous.filter(value => value !== id));
@@ -115,8 +178,10 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
     if (!operation.current && (!content.trim() || invalidRecipients)) {
       setMutation({ pending: false, uncertain: false, notice: "", error: !content.trim() ? "请输入消息内容。" : "请选择本群已载入的在群成员，或清除选择后重选。" }); return;
     }
+    // Selecting a quote supplies a reference, not a topic selector.
     operation.current ??= { key: crypto.randomUUID(), input: Object.freeze({ content,
-      ...(route === "default" ? {} : { recipient_ids: Object.freeze(route === "public" ? [] : [...recipients]) }) }) };
+      ...(route === "default" ? {} : { recipient_ids: Object.freeze(route === "public" ? [] : [...recipients]) }),
+      ...(quote ? { reply_to_message_id: quote.id } : {}) }) };
     setMention(null);
     const current = operation.current, controller = new AbortController(); posting.current = controller;
     setMutation({ pending: true, uncertain: false, error: "", notice: "" });
@@ -125,9 +190,11 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
     try {
       const receipt = await sendMessage(groupId, current.input, current.key, controller.signal);
       if (!mounted.current) return;
-      feed.confirm(receipt, attempt); operation.current = null; setContent("");
+      feed.confirm(receipt, attempt); operation.current = null; setContent(""); setQuote(null);
       scroll.confirmSend(receipt.id, attempt);
-      setMutation({ pending: false, uncertain: false, error: "", notice: "消息已持久化；投递状态见记录。" });
+      const notice = receipt.thread_correction?.question ? "需澄清话题；归属未变更。"
+        : receipt.thread_correction ? "话题纠正已记录；未向成员投递。" : "消息已持久化；投递状态见记录。";
+      setMutation({ pending: false, uncertain: false, error: "", notice });
     } catch (error) {
       if (!mounted.current) return;
       const uncertain = mutation.uncertain || !isDefinitiveRejection(error), reason = error instanceof ApiError ? error.message : "请求未完成，请重试。";
@@ -149,15 +216,21 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
       <a href={`#${formId}-content`}>跳至消息输入</a>
       <span className="feed-note">最新页自动更新</span>
     </div>
-    <p className="feed-note">已载入 {feed.items.length} 条（含话题，片段可能有间隔）。</p>
+    <p className="feed-note">已载入 {visibleItems.length} 条（含话题，片段可能有间隔）。</p>
     {feed.pollError ? <p role="status">自动刷新暂不可用：{feed.pollError} 将稍后重试。</p> : null}
+    {quoteError ? <p role="alert">无法跳转到被引消息：{quoteError}</p> : null}
     {feed.page.pending ? <p role="status">正在载入消息…</p> : null}
     {feed.page.error ? <div role="alert"><p>{feed.page.error}</p><button type="button" onClick={feed.retry}>重试载入消息</button></div> : null}
-    {!feed.page.pending && !feed.page.error && !feed.items.length ? <p>尚无消息，可发送第一条讨论。</p> : null}
+    {!feed.page.pending && !feed.page.error && !visibleItems.length
+      ? <p>{feed.items.length ? "当前窗口没有讨论消息。" : "尚无消息，可发送第一条讨论。"}</p> : null}
     {feed.page.next ? <button type="button" disabled={feed.page.pending} onClick={() => { scroll.beforeOlder(); void feed.loadPage(feed.page.next, false); }}>加载更早消息</button> : null}
     <RequestWork groupId={groupId} active={active} members={members} ref={requestWork} />
-    <ol className="message-list" aria-label="群组消息" ref={scroll.listRef}>{feed.items.map(message => {
+    <ol className="message-list" aria-label="群组消息" ref={scroll.listRef}>{visibleItems.map(message => {
       const discussion = discussionContextFor(message, loaded);
+      const projection = message.reply_to;
+      const reference = projection ?? (message.reply_to_message_id
+        ? { message_id: message.reply_to_message_id, group_id: message.group_id } : undefined);
+      const original = reference ? loaded.get(reference.message_id) : undefined;
       const refreshDiscussion = discussion !== undefined && message.deliveries.length === 1;
       const refreshLabel = refreshDiscussion ? "讨论状态" : "投递";
       const refresh = <button className={refreshDiscussion ? "message-discussion-refresh" : undefined} type="button"
@@ -169,13 +242,25 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
           <header className="message-meta"><strong>{messageAuthor(message, membersById.get(message.sender_id)?.name)}</strong><time dateTime={message.created_at}>{shortTime(message.created_at)}</time>
             <span className="feed-note">{messageSourceLabel(message.source_kind)}</span></header>
           {message.topic_id ? <p className="eyebrow accent">话题消息</p> : null}
+          {reference ? original && !matchesMessageQuote(reference, original) ? <p className="message-quote">引用 · 无法确认原消息</p>
+            : <a className="message-quote" href={`#${messageAnchor(formId, reference.message_id)}`} onClick={event => {
+              if (event.defaultPrevented || event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+              event.preventDefault(); void navigateQuote(reference);
+            }}>{projection ? <><strong>引用 · {messageAuthor(projection, projection.sender_name || `成员 ${projection.sender_id}`)}</strong>
+              <span>{projection.excerpt || "（无文字短摘）"}</span></>
+              : <><strong>引用 · 查看原消息</strong><span>消息 ID：{reference.message_id}</span></>}</a> : null}
           <p className="message-content">{message.content}</p>
+          {message.thread_correction?.question ? <p className="message-content" role="status">
+            <strong>话题归属待澄清：</strong><span>{message.thread_correction.question}</span>
+          </p> : null}
           {discussion ? <DiscussionContext relation={discussion} closureReason={message.discussion_closure_reason}
             work={message.discussion_work} members={membersById} scopeId={formId}
             onNavigateReference={id => { scroll.onNavigateReference(id); feed.preserveReference(id); }} /> : null}
           <div className="message-actions">
-            <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
-              onClick={event => requestWork.current?.open(message, event.currentTarget)}>转为任务</button>
+            <button className="message-reply-action" type="button" aria-label={`回复，消息 ${message.id}`} disabled={blocked}
+              onClick={() => selectQuote(message)}>回复</button>
+            {!backgroundJoin(message) && !message.thread_correction ? <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
+              onClick={event => requestWork.current?.open(message, event.currentTarget)}>转为任务</button> : null}
             {refreshDiscussion ? refresh : null}
             <details className="message-details">
               <summary className={message.deliveries.some(delivery => !["queued", "accepted"].includes(delivery.state) || Boolean(delivery.error)) ? "delivery-warning" : undefined}>
@@ -206,6 +291,11 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
     <section className="message-composer" aria-label="撰写消息" tabIndex={0}>
     <form aria-label="发送消息" onSubmit={submit}>
       {scroll.windowReset ? <p className="feed-note">历史窗口已更新，可加载更早消息</p> : null}
+      {quote ? <div className="message-quote composer-quote">
+        <span><span>引用 · </span><strong>{messageAuthor(quote, quoteMemberName ?? `成员 ${quote.sender_id}`)}</strong></span>
+        <button type="button" disabled={blocked} onClick={() => { if (!operation.current) setQuote(null); }}>取消引用</button>
+        <span>{quote.excerpt || "（无文字短摘）"}</span>
+      </div> : null}
       <fieldset disabled={blocked}>
         <label htmlFor={`${formId}-content`}>消息内容</label>
         <textarea ref={textarea} id={`${formId}-content`} required rows={2} value={content} placeholder="直接发消息，输入 @ 选择成员"
@@ -266,6 +356,10 @@ function DiscussionScope({ groupId, active, members, recipientSelection }: {
     </form>
     </section>
   </div>;
+}
+
+function backgroundJoin(message: Message) {
+  return message.source_kind === "platform" && message.source_id?.startsWith("group_background_join:");
 }
 
 const discussionLabels = { invite: "邀请协作", reply: "回送答复", resolve: "讨论总结" };

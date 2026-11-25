@@ -161,6 +161,28 @@ func (p *Preparer) sampleDispatchCandidates(ctx context.Context, groupID, coordi
 	}
 }
 
+// Automatic text currently composes only the verified Pi text role profiles.
+// No directory grants, capacity reservations, or model/credential probes.
+func (p *Preparer) sampleAutomaticTextRoles(ctx context.Context, intake domain.Member) store.ChatAutomaticTextFacts {
+	var facts store.ChatAutomaticTextFacts
+	r := p.memberTools
+	if intake.Workspace != "" || r == nil || r.roleFence == nil || !r.rootValid() || !r.roleFence.rootValid(r.roleFence.executionRoot) {
+		return facts
+	}
+	selected, _, err := p.sampleMemberToolMember(intake, memberToolRoleOperations(store.CoordinationRoleCoordinator))
+	if err != nil || selected.Name != provider.Pi {
+		return facts
+	}
+	facts.Coordinator = store.DispatchWorkerCapabilityFact{GroupID: intake.GroupID, MemberID: intake.ID, ProviderID: intake.ProviderID, Model: intake.Model}
+	workers, err := p.sampleDispatchCandidates(ctx, intake.GroupID, intake.ID)
+	if err == nil {
+		facts.Workers = slices.DeleteFunc(workers, func(w store.DispatchWorkerCapabilityFact) bool {
+			return p.providers[w.ProviderID].Name != provider.Pi
+		})
+	}
+	return facts
+}
+
 // AdapterReports describes the actually selected process adapter, not account,
 // network, authorization or model readiness. Unknown support is represented nil.
 // Every returned map, report and capability pointer is detached from the preparer.
@@ -171,7 +193,7 @@ func (p *Preparer) AdapterReports() map[string]ProviderAdapterReport {
 			report := ProviderAdapterReport{ID: selection.ID, Protocol: selection.Protocol, Enabled: true}
 			if _, caps, err := p.sampleMemberToolAdapter(selected, p.memberTools.operations); err == nil {
 				if tools := p.nativeReportTools(selected); len(tools) > 0 {
-					if registry, err := p.nativeSessionAdapterRegistry(selection, provider.NativeMemberToolConfig{}, tools, nil, nil); err == nil {
+					if registry, err := p.nativeSessionAdapterRegistry(selection, provider.NativeMemberToolConfig{}, tools, nil, nil, nil); err == nil {
 						if nativeCaps, err := registry.Capabilities(selection, selected); err == nil {
 							caps = nativeCaps
 						}

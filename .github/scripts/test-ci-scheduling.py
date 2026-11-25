@@ -538,8 +538,7 @@ class ShardBatchTests(unittest.TestCase):
                     self.assertEqual([len(subset) for subset in expected_subsets], sizes)
                     for args in runs:
                         self.assertEqual(args, ["go", "test", "-count=1", "-race", "-json", "-run",
-                                                args[args.index("-run") + 1],
-                                                *(["-timeout=13m"] if slot == 1 else []), "./internal/platform"])
+                                                args[args.index("-run") + 1], "./internal/platform"])
                     self.assertEqual([call.args[2] for call in verify.call_args_list], expected_subsets)
                     self.assertTrue(all(call.args[1] == "agentworkspace/internal/platform" for call in verify.call_args_list))
                     self.assertFalse(expected_subsets[0].keys() & expected_subsets[1].keys())
@@ -552,24 +551,6 @@ class ShardBatchTests(unittest.TestCase):
                                               "checkout_sha": SHA, "checkout_tree": TREE,
                                               "package": "agentworkspace/internal/platform", "compiled": compiled,
                                               "selected": selected, "runs": selected, "passes": selected, "skips": {}})
-
-    def test_platform_slot_1_budget_is_scoped_to_every_bounded_race_subcall(self):
-        for profile, worker, slot, run_count in [("platform", 2, 1, 3), ("platform", 5, 2, 3),
-                                                 ("store", 0, 1, 4), ("httpapi", 0, 1, 4)]:
-            names = self.slot_names(profile, slot, 49)
-            with self.subTest(profile=profile, slot=slot), tempfile.TemporaryDirectory(prefix="ci-slot-budget-") as directory, \
-                 redirect_stdout(io.StringIO()), mock.patch.object(self.shards, "check_identity"), \
-                 mock.patch.object(self.shards, "worker_parallelism", return_value=1), \
-                 mock.patch.object(self.shards, "command", side_effect=self.worker_go(names)) as command:
-                self.shards.run_worker(profile, worker, directory, RUN, SHA, TREE)
-                tests = [call.args[0] for call in command.call_args_list if call.args[0][:2] == ["go", "test"]]
-                self.assertEqual(sum("-list" in args for args in tests), 1)
-                self.assertEqual(sum("-run" in args for args in tests), run_count)
-                for args in tests:
-                    timeouts = [arg for arg in args if arg.partition("=")[0] in
-                                ("-timeout", "--timeout", "-test.timeout", "--test.timeout")]
-                    expected = ["-timeout=13m"] if (profile, slot) == ("platform", 1) and "-run" in args else []
-                    self.assertEqual(timeouts, expected, args)
 
     def test_platform_subset_boundaries_and_exact_union(self):
         for count in (0, 1, 24, 25, 45, 48, 49, 73):
@@ -621,9 +602,8 @@ class ShardBatchTests(unittest.TestCase):
                 self.shards.run_worker(profile, worker, directory, RUN, SHA, TREE)
                 runs = [call.args[0] for call in command.call_args_list if "-run" in call.args[0]]
                 expected = [self.verifier.selection(compiled, logical, profile) for logical in self.shards.BATCHES[profile][worker]]
-                self.assertEqual(runs, [["go", "test", "-count=1", "-race", "-json", "-run", pattern,
-                                         *(["-timeout=13m"] if (profile, logical) == ("platform", 1) else []), "./internal/" + profile]
-                                        for logical, (_, pattern) in zip(self.shards.BATCHES[profile][worker], expected)])
+                self.assertEqual(runs, [["go", "test", "-count=1", "-race", "-json", "-run", pattern, "./internal/" + profile]
+                                        for _, pattern in expected])
                 self.assertEqual([call.args[2] for call in verify.call_args_list], [selected for selected, _ in expected])
                 total, package, summary_name, prefix = self.verifier.PROFILES[profile]
                 for logical, (selected, _) in zip(self.shards.BATCHES[profile][worker], expected):
@@ -846,20 +826,13 @@ class ShardBatchTests(unittest.TestCase):
                     destination = root / f"{profile}-worker-v1-{worker}"
                     self.shards.run_worker(profile, worker, destination, RUN, SHA, TREE)
                     tests = [command for command in calls if command[:2] == ["go", "test"]]
-                    expected_slots = [slot for slot in slots
-                                      for _ in range(max(1, (len(self.verifier.selection(Counter(names), slot, profile)[0]) + 23) // 24)
-                                                     if profile == "platform" else 1)]
-                    self.assertEqual(len(tests), len(expected_slots) + 1)
+                    expected_runs = sum(max(1, (len(self.verifier.selection(Counter(names), slot, profile)[0]) + 23) // 24)
+                                        if profile == "platform" else 1 for slot in slots)
+                    self.assertEqual(len(tests), expected_runs + 1)
                     self.assertEqual(sum("-list" in command for command in tests), 1)
-                    run_slots = iter(expected_slots)
                     for command in tests:
                         for flag in ("-count=1", "-race", "-json"):
                             self.assertIn(flag, command)
-                        slot = None if "-list" in command else next(run_slots)
-                        timeouts = [arg for arg in command if arg.partition("=")[0] in
-                                    ("-timeout", "--timeout", "-test.timeout", "--test.timeout")]
-                        expected = ["-timeout=13m"] if (profile, slot) == ("platform", 1) else []
-                        self.assertEqual(timeouts, expected, f"{profile} slot {slot}")
                     self.assertEqual({path.name for path in destination.iterdir()}, {f"{profile}-shard-v1-{slot}" for slot in slots})
             result = self.shards.aggregate_workers(root, RUN, SHA, TREE)
             self.assertEqual(sum(summary["total"] for summary in result.values()), 81)

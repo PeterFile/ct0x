@@ -153,6 +153,9 @@ func (s *Store) BindAssignmentAttempt(ctx context.Context, scope CoordinationToo
 			return out, ErrMemberToolDenied
 		}
 		phase = "activate"
+		if err := requireChatAutomaticTextAssignmentInTx(ctx, tx, v.r, v.a.WorkerMemberID); err != nil {
+			return out, err
+		}
 		if _, err := s.investigationDispatchInTx(ctx, tx, v.r, false); err != nil {
 			return out, err
 		}
@@ -201,9 +204,12 @@ func (s *Store) BindAssignmentAttempt(ctx context.Context, scope CoordinationToo
 	if err := coordinationAssignmentStartInTx(ctx, tx, v, scope, binding.AttemptID); err != nil {
 		return out, err
 	}
-	// An existing binding retains its original replay fences. This extra
-	// readiness check governs new writes, not reads of that historical receipt.
+	// Check fresh writes again before commit, including any trigger effects.
+	// An existing binding retains its original replay fences.
 	if fresh {
+		if err := requireChatAutomaticTextAssignmentInTx(ctx, tx, v.r, v.a.WorkerMemberID); err != nil {
+			return out, err
+		}
 		if _, err := s.investigationDispatchInTx(ctx, tx, v.r, false); err != nil {
 			return out, err
 		}

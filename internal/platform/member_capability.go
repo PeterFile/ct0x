@@ -35,6 +35,8 @@ type memberToolRegistration struct {
 	candidate          *domain.ChatCandidate
 	purpose            string
 	intake             memberToolIntakeSchema
+	automaticText      *automaticTextSampler
+	runExplanation     *memberRunExplanation
 	taskWork           *taskWorkToolBinding
 	workReport         *taskWorkReportBinding
 	investigationOwner *investigationWorkOwnerBinding
@@ -51,12 +53,17 @@ type MemberTools struct {
 	capabilities     map[[sha256.Size]byte]memberToolRegistration
 	mcpRequests      map[[sha256.Size]byte]*memberMCPRequests
 	chatEngine       *coordination.Engine
+	runExplanation   *coordination.Engine   // Independent native opt-in; immutable after construction.
 	workInputs       MemberWorkInputService // Immutable after runtime construction.
 	freshTaskWork    FreshTaskWorkLaunch    // Independent of the legacy work-input preview.
+	taskDecisions    bool                   // Exact fresh text continuation only.
 	workReportEngine *coordination.Engine   // Transport only; independent of either launch opt-in.
 	workspace        *memberWorkspaceRegistry
 
+	threadDecisionAcks map[[sha256.Size]byte]*threadDecisionAckRegistration
+
 	investigationDelegateSupport InvestigationDelegateSupport // Immutable trusted opt-in.
+	discussionWorkReturn         bool                         // Separate opt-in; no delegation grant.
 }
 
 func NewMemberTools(db *store.Store) *MemberTools {
@@ -66,24 +73,29 @@ func NewMemberTools(db *store.Store) *MemberTools {
 // Issue is called by the trusted runtime only AFTER ClaimTurn, never during preparation.
 // It refuses duplicate registrations rather than silently rotating a live capability.
 func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants) (string, error) {
-	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{})
+	return s.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{}, nil, nil)
 }
 
 // IssueChatIntake is a separate trusted runtime seam, never a tool/API input.
 // It freezes a restricted profile and persists the exact claim-bound purpose.
 func (s *MemberTools) IssueChatIntake(ctx context.Context, claim store.TurnClaim) (string, error) {
-	return s.issueChatIntake(ctx, claim, memberToolIntakeSchema{})
+	return s.issueChatIntake(ctx, claim, memberToolIntakeSchema{}, nil)
 }
 
-func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema) (string, error) {
-	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema)
+// Use an immutable sampler identity; native launch compares registrations.
+type automaticTextSampler struct {
+	sample func(context.Context) store.ChatAutomaticTextFacts
+}
+
+func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema, sampler *automaticTextSampler) (string, error) {
+	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema, nil, sampler)
 }
 
 func chatIntakeOperations() []string {
 	return []string{"list_members", "read_channel", "send_message", "search_history", "read_history"}
 }
 
-func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema) (string, error) {
+func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants, purpose string, schema memberToolIntakeSchema, explanation *memberRunExplanation, sampler *automaticTextSampler) (string, error) {
 	grants.Operations = slices.Clone(grants.Operations)
 	if grants.Skills != nil {
 		// Freeze the source even if the caller overwrites its exported wrapper.
@@ -135,17 +147,26 @@ func (s *MemberTools) issue(ctx context.Context, claim store.TurnClaim, grants M
 		if captured.Purpose != domain.ChatIntakePurpose {
 			return "", store.ErrMemberToolDenied
 		}
-		if schema.offersInvestigation(captured.Policy) && captured.SourceKind == "local_user_chat" && captured.SourceSenderID == "user" {
-			delivery, err := investigationRootDelivery(ctx, s.db, captured.ThreadRef, captured.MessageID, captured.SourceID, scope.MemberID, claim.TurnID)
-			if err != nil || delivery.ConversationID != scope.ConversationID {
-				schema.investigation = false // Do not add authority on ambiguous or unavailable evidence.
+		switch {
+		case !schema.offersInvestigation(captured.Policy):
+			schema.investigation = false
+		case schema.invitation != nil:
+			if !s.discussionWorkReturn {
+				return "", store.ErrMemberToolDenied
 			}
-		} else {
+			if err := schema.invitation.checkCapture(ctx, s.db, captured, scope); err != nil {
+				return "", err // A planned structured entry must not fall back on lost binding evidence.
+			}
+		case captured.SourceKind == "local_user_chat" && captured.SourceSenderID == "user":
+			delivery, err := investigationRootDelivery(ctx, s.db, captured.ThreadRef, captured.MessageID, captured.SourceID, scope.MemberID, claim.TurnID)
+			schema.investigation = err == nil && delivery.ConversationID == scope.ConversationID
+		default:
 			schema.investigation = false
 		}
 		candidate = &captured
 	}
-	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate, purpose: purpose, intake: schema}
+	s.capabilities[key] = memberToolRegistration{scope: scope, grants: grants, skills: skillState, candidate: candidate,
+		purpose: purpose, intake: schema, automaticText: sampler, runExplanation: explanation}
 	return token, nil
 }
 
@@ -154,6 +175,9 @@ func (s *MemberTools) Revoke(token string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	key := sha256.Sum256([]byte(token))
+	if s.revokeThreadDecisionAckLocked(key) {
+		return
+	}
 	s.capabilities[key].skills.clear()
 	if s.workspace != nil {
 		_ = s.workspace.revokeLocked(key)
@@ -165,6 +189,11 @@ func (s *MemberTools) Revoke(token string) {
 func (s *MemberTools) RevokeTurn(turnID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for key, ack := range s.threadDecisionAcks {
+		if ack.claim.TurnID == turnID {
+			s.revokeThreadDecisionAckLocked(key)
+		}
+	}
 	for key, entry := range s.capabilities {
 		if entry.scope.Claim.TurnID == turnID {
 			entry.skills.clear()
@@ -186,6 +215,15 @@ func (s *MemberTools) withAuthorized(ctx context.Context, token, operation strin
 	entry, found := s.capabilities[sha256.Sum256([]byte(token))]
 	if !found || !slices.Contains(entry.grants.Operations, operation) {
 		return store.ErrMemberToolDenied
+	}
+	if b := entry.runExplanation; b != nil && (operation == "send_message" || operation == "create_member") {
+		// Only the fresh opt-in has this gate. A known uncertain Store write
+		// stops subsequent mutations even if transport is bypassed.
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if b.unknown {
+			return store.ErrAgentRunExplanationUnknown
+		}
 	}
 	err := s.db.ValidateMemberTool(ctx, entry.scope)
 	if err == nil {

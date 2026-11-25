@@ -102,7 +102,29 @@ func TestTaskWorkInputsHTTPScopedHistory(t *testing.T) {
 	taskLifecycleError(t, get("/api/v1/groups/other/tasks/"+admission.TaskID+"/work-inputs"), 404, "not_found")
 
 	impactURL := base + admission.TaskID + "/impacts"
+	var impactInstalled bool
+	if err := f.raw.QueryRow(`SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='task_constraint_impacts')`).Scan(&impactInstalled); err != nil {
+		t.Fatal(err)
+	}
 	impacts := decoded[listResult[domain.TaskImpact]](t, get(impactURL), 200)
+	if !impactInstalled {
+		if len(impacts.Items) != 0 || impacts.NextCursor != "" {
+			t.Fatalf("uninstalled impact schema must return an empty page: %+v", impacts)
+		}
+		returned, err := engine.HandBackWorkInputWithKey(ctx, worker, inbox[1].ID, "该额外要求要单独授权。", "scoped-return")
+		readinessHTTPOK(t, err)
+		replayed, err := engine.HandBackWorkInputWithKey(ctx, worker, inbox[1].ID, "该额外要求要单独授权。", "scoped-return")
+		readinessHTTPOK(t, err)
+		if replayed.Return == nil || *replayed.Return != *returned.Return {
+			t.Fatalf("return replay changed the original question: %+v", replayed)
+		}
+		again := decoded[listResult[domain.TaskImpact]](t, get(impactURL), 200)
+		if len(again.Items) != 0 || again.NextCursor != "" {
+			t.Fatalf("uninstalled impact schema must keep empty page after return: %+v", again)
+		}
+		taskLifecycleError(t, get("/api/v1/groups/other/tasks/"+admission.TaskID+"/impacts"), 404, "not_found")
+		return
+	}
 	if len(impacts.Items) != 1 || impacts.Items[0].Kind != domain.TaskImpactConstraintConfirmed ||
 		impacts.Items[0].Source.InputID != inbox[0].ID || impacts.Items[0].Source.MessageID != inbox[0].ReplyMessageID ||
 		impacts.Items[0].Source.SourceSequence != inbox[0].SourceSequence || impacts.Items[0].Source.SourceSequence <= 0 ||

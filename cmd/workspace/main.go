@@ -126,6 +126,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	routes = append(routes, httpapi.TaskRoutes(local)...)
 	routes = append(routes, httpapi.TaskLifecycleRoutes(local)...)
 	routes = append(routes, httpapi.HistoryRoutes(local)...)
+	routes = append(routes, httpapi.ProjectExperienceRoutes(local)...)
 	if preparer != nil {
 		routes = append(routes, httpapi.WorkspaceGrantRoutes(preparer)...)
 	}
@@ -136,6 +137,9 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if memberTools != nil {
 		routes = append(routes, httpapi.MemberToolRoutes(memberTools.Tools())...)
 		routes = append(routes, httpapi.MemberHistoryToolRoutes(memberTools.Tools())...)
+		if config.enableRunExplanation {
+			routes = append(routes, httpapi.MemberRunExplanationRoutes(memberTools.Tools())...)
+		}
 		if config.enableInvestigationExecution {
 			routes = append(routes, httpapi.MemberInvestigationToolRoutes(memberTools.Tools())...)
 			if config.piFreshInvestigationWorkExtension != "" {
@@ -181,6 +185,13 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		if config.enableCodexAppServer {
 			sessionStatus += "；Codex 0.166.0 AppServer 仅普通 chat_intake/v1 可续接，角色和 Task 执行仍为全新单轮"
 		}
+	}
+	if config.groupBackgroundDispatchPreview != "" {
+		// Same recovered Store already bound to LocalUser, Preparer and scheduler.
+		if err := db.EnableGroupBackgroundDispatch(ctx); err != nil {
+			return err
+		}
+		toolStatus += "；新群后台讨论预览已配置，仅凭有效授权和近期可信运行证据调度，目录探测不代表就绪"
 	}
 	if _, err := fmt.Fprintf(output, "本地 HTTP 进程已启动： http://%s （已提供健康检查、群组与成员创建查询、消息持久化、历史与详情、排队投递记录、任务创建、列表与详情、成果版本只读查询与下载及 CLI 目录；目录仅启动时探测、证据仅存内存；%s；%s；%s；工作目录不是主机读取沙箱，数据目录及祖先必须可信且目录身份稳定；其他功能尚未启用）\n", listener.Addr(), executionStatus, sessionStatus, toolStatus); err != nil {
 		return fmt.Errorf("输出启动信息失败：%w", err)

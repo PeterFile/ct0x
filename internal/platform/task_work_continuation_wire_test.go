@@ -614,7 +614,9 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 			if scheduled {
 				// Only the seeded wake is needed. The executor cancels on completion,
 				// leaving the deadline as a watchdog rather than polling while it runs.
-				runCtx, stop := context.WithTimeout(ctx, 60*time.Second)
+				// The v33 decision-answer triggers make every guarded write compile more
+				// SQL under -race, so CI needs about 90s here; keep a wide margin.
+				runCtx, stop := context.WithTimeout(ctx, 180*time.Second)
 				defer stop()
 				err = scheduler.Run(runCtx, f.db, scheduler.Options{Recovered: true, RuntimeDir: f.root, MaxActive: f.options.RoleMaxActive, PollInterval: time.Hour},
 					func(ctx context.Context, pending store.PendingDelivery) (scheduler.PreparedExecution, error) {

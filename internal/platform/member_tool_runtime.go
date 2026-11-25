@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -34,16 +35,22 @@ type MemberToolRuntimeOptions struct {
 	RoleMaxActive     int
 	RoleExecutionRoot string
 	// NativeExecutionRoot is the trusted scheduler RuntimeDir for native text
-	// sessions. When roles are configured, the same pinned root is reused.
+	// sessions and the fresh Pi explanation journal. Roles reuse the same root.
 	NativeExecutionRoot string
 	// ChatIntake reuses the same Engine and requires the role execution path.
 	ChatIntake *coordination.Engine
+	// RunExplanation opts into publication only for qualified fresh ordinary Pi turns.
+	// It must borrow the same Store and never enables chat intake or roles.
+	RunExplanation *coordination.Engine
 	// WorkInputs opts into the legacy preview. A typed nil is a configuration
 	// error. Its ContinueWork implementation takes precedence and requires ChatIntake.
 	WorkInputs MemberWorkInputService
 	// FreshTaskWork composes typed continuation via the ChatIntake Engine and
 	// the role execution fence. It does not install the legacy preview.
 	FreshTaskWork *FreshTaskWorkLaunch
+	// EnablePiTaskDecisionProposals is a separate native-only opt-in. It needs
+	// the exact proposal-capable fresh text adapter and F's pending/answer path.
+	EnablePiTaskDecisionProposals bool
 }
 
 type MemberToolRunBinding struct {
@@ -132,7 +139,11 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 	if options.WorkInputs != nil && (roleFence == nil || nilWorkInputService(options.WorkInputs)) {
 		return nil, errMemberToolRuntimeConfig
 	}
+	if options.RunExplanation != nil && (executionRoot == nil || !options.RunExplanation.UsesStore(db)) {
+		return nil, errMemberToolRuntimeConfig
+	}
 	tools := NewMemberTools(db)
+	tools.runExplanation = options.RunExplanation
 	tools.workInputs = options.WorkInputs
 	if launch := options.FreshTaskWork; launch != nil {
 		if roleFence == nil || !options.ChatIntake.UsesStore(db) || launch.Supports == nil || launch.Construct == nil {
@@ -147,6 +158,18 @@ func NewMemberToolRuntime(db *store.Store, options MemberToolRuntimeOptions) (*M
 		if err := tools.EnableChatIntake(options.ChatIntake); err != nil {
 			return nil, errMemberToolRuntimeConfig
 		}
+	}
+	if options.EnablePiTaskDecisionProposals {
+		if tools.freshTaskWork.taskDecisionAdapter == nil {
+			return nil, errMemberToolRuntimeConfig
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), memberToolRuntimeVerificationTimeout)
+		err := tools.checkTaskDecisionSchema(ctx)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
+		tools.taskDecisions = true
 	}
 	return &MemberToolRuntime{tools: tools, configRoot: root, resolvedRoot: resolved,
 		rootInfo: info, endpoint: options.Endpoint, operations: operations, maxGroupMembers: capacity, roleFence: roleFence,
@@ -203,20 +226,22 @@ func memberToolRuntimeText(value string) bool {
 // These qualified Pi schema hints require the issued-config builder even if
 // issuance rechecks the policy and removes the investigation action.
 func (schema memberToolIntakeSchema) requiresIssuedPiConfig() bool {
-	return schema.piDiscussionExcerpt || schema.investigation
+	return schema.piDiscussionExcerpt || schema.piDiscussionRelaySource != "" || schema.investigation
 }
 
 type memberToolRuntimeRun struct {
-	runtime       *MemberToolRuntime
-	binding       MemberToolRunBinding
-	factory       MemberToolExecutorFactory
-	used          atomic.Bool
-	role          *store.CoordinationRoleProvenance
-	intake        bool
-	intakeSchema  memberToolIntakeSchema
-	intakeBuilder func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
-	investigation *investigationRolePreparation
-	nativeSession *memberToolNativeSessionPlan
+	runtime            *MemberToolRuntime
+	binding            MemberToolRunBinding
+	factory            MemberToolExecutorFactory
+	used               atomic.Bool
+	role               *store.CoordinationRoleProvenance
+	intake             bool
+	intakeSchema       memberToolIntakeSchema
+	automaticText      *automaticTextSampler
+	intakeBuilder      func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
+	explanationBuilder func(provider.NativeMemberToolConfig, string, []string) (provider.Executor, error)
+	investigation      *investigationRolePreparation
+	nativeSession      *memberToolNativeSessionPlan
 	// Cloned at trusted wrapping and again when the claimed token is registered.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
@@ -251,10 +276,17 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	}
 	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
 	var token string
+	var explanation *memberRunExplanation
 	if e.intake {
-		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema)
+		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema, e.automaticText)
 	} else {
-		token, err = r.tools.Issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers, ProviderID: e.binding.ProviderID, Model: e.binding.Model})
+		if e.explanationBuilder != nil && e.nativeSession == nil && r.tools.runExplanationSupported(ctx) {
+			dir := filepath.Join(request.RuntimeDir, request.RunID)
+			explanation = &memberRunExplanation{path: filepath.Join(dir, runExplanationAttemptFile),
+				bridgePath: filepath.Join(dir, provider.PiRunExplanationJournalName)}
+		}
+		token, err = r.tools.issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers,
+			ProviderID: e.binding.ProviderID, Model: e.binding.Model}, "generic", memberToolIntakeSchema{}, explanation, nil)
 	}
 	if err != nil {
 		// Duplicate authority, stale generation and uncertain reads are not proof
@@ -293,13 +325,25 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	if !e.commitNativeLaunch(ctx, token, session, nil) {
 		return e.startupFailure(ctx, request, claim, token, "原生会话启动绑定无法确认，执行未启动")
 	}
-	// Once invoked, only the adapter owns execution classification and evidence.
+	// Only the adapter reports native lifecycle. Drain the selected authority
+	// before checking its binding or folding in an unconfirmed tool write.
 	raw := native.Execute(ctx, nativeRequest, onEvent)
-	if session == nil {
+	if explanation != nil {
+		r.tools.Revoke(token)
+		receipt := explanation.receipt(raw, token, claim.Token, r.executionRoot.rootValid(request.RuntimeDir), ctx.Err() == nil)
+		token = ""
+		return receipt
+	}
+	decision := e.intakeSchema.threadDecision
+	if session == nil && decision == nil {
 		return raw
 	}
-	r.tools.Revoke(token)
+	r.tools.Revoke(token) // Drain authorized writes before reading their outcome.
 	token = ""
+	if decision != nil && decision.uncertain.Load() {
+		raw.Outcome = provider.OutcomeUnknown
+		raw.Reason = ErrThreadDecisionRequestUnknown.Error()
+	}
 	return session.receipt(ctx, e, claim, raw)
 }
 
@@ -347,7 +391,7 @@ func (e *memberToolRuntimeRun) preflight(ctx context.Context, request provider.E
 
 func (e *memberToolRuntimeRun) clearRunDirectory(request provider.ExecuteRequest) bool {
 	r := e.runtime
-	return (e.nativeSession == nil || r.executionRoot.rootValid(request.RuntimeDir)) && r.clearRunDirectory(request)
+	return (e.nativeSession == nil && e.explanationBuilder == nil || r.executionRoot.rootValid(request.RuntimeDir)) && r.clearRunDirectory(request)
 }
 
 // Only inspect: the adapter still reserves RuntimeDir/RunID exclusively itself.
@@ -399,14 +443,27 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 	if entry.purpose == memberInvestigationRolePurpose {
 		strictTools = entry.grants.Operations
 	}
+	var explanationRun, explanationJournal, explanationClaim string
+	if entry.runExplanation != nil {
+		claim := entry.scope.Claim
+		explanationRun, explanationJournal = claim.TurnID, entry.runExplanation.bridgePath
+		// This fingerprint detects accidental credential material in exact bytes;
+		// it neither conveys the claim token nor grants authority to the bridge.
+		explanationClaim = fmt.Sprintf("%d:%x", len(claim.Token), sha256.Sum256([]byte(claim.Token)))
+	}
 	data, err := json.Marshal(struct {
 		Endpoint               string   `json:"endpoint"`
 		Token                  string   `json:"token"`
 		ContinueWork           bool     `json:"continue_work,omitempty"`
 		DiscussionOnlyExcerpt  bool     `json:"discussion_only_excerpt,omitempty"`
+		DiscussionRelay        bool     `json:"discussion_relay,omitempty"`
 		IntakeAssessmentAction string   `json:"intake_assessment_action,omitempty"`
 		InvestigationTools     []string `json:"investigation_tools,omitempty"`
-	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, action, strictTools})
+		RunExplanation         string   `json:"run_explanation,omitempty"`
+		ExplanationJournal     string   `json:"run_explanation_journal,omitempty"`
+		ExplanationClaim       string   `json:"run_explanation_claim_fingerprint,omitempty"`
+	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, entry.discussionRelay(), action, strictTools,
+		explanationRun, explanationJournal, explanationClaim})
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}

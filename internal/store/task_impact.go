@@ -5,14 +5,23 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"agentworkspace/internal/domain"
 )
 
+func taskImpactSchemaVersionNow() int {
+	return slices.Index(migrations, taskImpactSchema) + 1
+}
+
 func taskImpactSchemaInTx(ctx context.Context, tx *sql.Tx) (bool, error) {
+	version := taskImpactSchemaVersionNow()
+	if version <= 0 {
+		return false, nil
+	}
 	var installed bool
-	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?)`, taskImpactSchemaVersion).Scan(&installed)
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?)`, version).Scan(&installed)
 	return installed, err
 }
 

@@ -19,6 +19,15 @@ const (
 	cleanupTimeout  = 5 * time.Second
 )
 
+const (
+	humanLane = iota
+	workLane
+	threadDecisionLane
+	laneCount
+)
+
+var laneNames = [laneCount]string{"human", "work", store.PendingThreadDecisions}
+
 var (
 	errOptions     = errors.New("调度参数无效，需先持有独占锁并完成启动恢复，且使用私有运行目录")
 	errPreparation = errors.New("准备执行失败，已停止调度，请检查可信执行配置")
@@ -44,9 +53,10 @@ type loop struct {
 	prepare  PrepareFunc
 	active   map[string]liveExecution
 	finished chan completion
-	cursors  [2]*store.Cursor
+	cursors  [laneCount]*store.Cursor
 	// Saturate at three: fallback claims must not erase the preferred lane's debt.
 	humanClaims int
+	threadFirst bool // Alternate opportunities without changing the legacy lanes' 3:1 debt.
 }
 
 // Run requires the caller to retain its singleton lock and Store until all
@@ -65,7 +75,7 @@ func Run(parent context.Context, s *store.Store, options Options, prepare Prepar
 	ctx, stop := context.WithCancel(parent)
 	defer stop()
 	r := loop{ctx: ctx, stop: stop, store: s, options: options, prepare: prepare,
-		active: make(map[string]liveExecution), finished: make(chan completion)}
+		active: make(map[string]liveExecution), finished: make(chan completion), threadFirst: true}
 	ticker := time.NewTicker(options.PollInterval)
 	defer ticker.Stop()
 	var failure error
@@ -138,12 +148,20 @@ func (r *loop) schedule() error {
 			continue
 		default:
 		}
-		preferred := 0
+		preferred, fallback := humanLane, workLane
 		if r.humanClaims == 3 {
-			preferred = 1
+			preferred, fallback = workLane, humanLane
+		}
+		lanes := []int{preferred, fallback}
+		if r.options.PrepareThreadDecision != nil {
+			if r.threadFirst {
+				lanes = []int{threadDecisionLane, preferred, fallback}
+			} else {
+				lanes = []int{preferred, fallback, threadDecisionLane}
+			}
 		}
 		claimed := false
-		for _, lane := range []int{preferred, 1 - preferred} {
+		for _, lane := range lanes {
 			if budget == 0 || r.ctx.Err() != nil {
 				break
 			}
@@ -154,11 +172,12 @@ func (r *loop) schedule() error {
 			if !ok {
 				continue
 			}
-			if lane == 0 && r.humanClaims < 3 {
+			if lane == humanLane && r.humanClaims < 3 {
 				r.humanClaims++
-			} else if lane == 1 && preferred == 1 {
+			} else if lane == workLane && preferred == workLane {
 				r.humanClaims = 0
 			}
+			r.threadFirst = lane != threadDecisionLane
 			r.launch(turn, prepared)
 			claimed = true
 			break
@@ -171,12 +190,8 @@ func (r *loop) schedule() error {
 }
 
 func (r *loop) scan(lane int, budget *int) (domain.Turn, PreparedExecution, bool, error) {
-	name := "human"
-	if lane == 1 {
-		name = "work"
-	}
 	page, err := r.store.ListPendingDeliveries(r.ctx, store.PendingOptions{
-		Limit: min(pendingPageSize, *budget), After: r.cursors[lane], Lane: name,
+		Limit: min(pendingPageSize, *budget), After: r.cursors[lane], Lane: laneNames[lane],
 	})
 	if err != nil {
 		return domain.Turn{}, PreparedExecution{}, false, schedulingStoreError(err)
@@ -194,18 +209,39 @@ func (r *loop) scan(lane int, budget *int) (domain.Turn, PreparedExecution, bool
 		if i == len(page.Items)-1 && page.NextCursor == nil {
 			r.cursors[lane] = nil
 		}
-		prepared, err := r.prepare(r.ctx, pending)
+		var prepared PreparedExecution
+		var typed PreparedThreadDecision
+		var answerID string
+		if lane == threadDecisionLane {
+			wake, resolveErr := r.store.ResolveThreadDecisionWake(r.ctx, pending.GroupID, d.ID)
+			if errors.Is(resolveErr, store.ErrNotFound) {
+				continue // Never try ordinary preparation for this delivery.
+			}
+			if resolveErr != nil {
+				return domain.Turn{}, PreparedExecution{}, false, schedulingStoreError(resolveErr)
+			}
+			answerID = wake.Receipt.ID
+			typed, err = r.options.PrepareThreadDecision(r.ctx, pending, wake)
+			if err == nil && (typed.Execute == nil || answerID == "" || len(typed.ResourceKeys) == 0) {
+				err = errPreparation
+			}
+			prepared.Request, prepared.ResourceKeys = typed.Request, typed.ResourceKeys
+		} else {
+			prepared, err = r.prepare(r.ctx, pending)
+		}
 		if errors.Is(err, ErrNotReady) {
 			continue
 		}
 		if r.ctx.Err() != nil {
 			break
 		}
-		if err != nil || missingExecutor(prepared.Executor) {
+		if err != nil || (lane != threadDecisionLane && missingExecutor(prepared.Executor)) {
 			return domain.Turn{}, PreparedExecution{}, false, errPreparation
 		}
 		turn, err := r.store.ClaimTurn(r.ctx, store.ClaimTurnInput{
 			GroupID: pending.GroupID, DeliveryID: d.ID, ResourceKeys: prepared.ResourceKeys, MaxActive: r.options.MaxActive,
+			BackgroundProfile:      prepared.BackgroundProfile,
+			ThreadDecisionAnswerID: answerID,
 		})
 		if errors.Is(err, store.ErrTurnBusy) || errors.Is(err, store.ErrNotFound) {
 			continue
@@ -216,9 +252,25 @@ func (r *loop) scan(lane int, budget *int) (domain.Turn, PreparedExecution, bool
 		if err != nil {
 			return domain.Turn{}, PreparedExecution{}, false, schedulingStoreError(err)
 		}
+		if lane == threadDecisionLane {
+			prepared.Executor = claimedThreadDecision{execute: typed.Execute, claim: turnClaim(turn)}
+		}
 		return turn, prepared, true, nil
 	}
 	return domain.Turn{}, PreparedExecution{}, false, nil
+}
+
+type claimedThreadDecision struct {
+	execute func(context.Context, store.TurnClaim, provider.ExecuteRequest, func(provider.Event) error) provider.ExecutionReceipt
+	claim   store.TurnClaim
+}
+
+func (e claimedThreadDecision) Execute(ctx context.Context, request provider.ExecuteRequest, onEvent func(provider.Event) error) provider.ExecutionReceipt {
+	return e.execute(ctx, e.claim, request, onEvent)
+}
+
+func turnClaim(turn domain.Turn) store.TurnClaim {
+	return store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
 }
 
 func missingExecutor(executor provider.Executor) bool {
@@ -241,11 +293,14 @@ func schedulingStoreError(err error) error {
 
 func (r *loop) launch(turn domain.Turn, prepared PreparedExecution) {
 	ctx, cancel := context.WithCancel(r.ctx)
-	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	claim := turnClaim(turn)
 	r.active[turn.ID] = liveExecution{claim: claim, cancel: cancel}
 	prepared.Request.RunID, prepared.Request.RuntimeDir = turn.ID, r.options.RuntimeDir
 	go func() {
 		defer cancel()
+		if prepared.BindTurnClaim != nil {
+			prepared.BindTurnClaim(claim)
+		}
 		var failure error
 		receipt := prepared.Executor.Execute(ctx, prepared.Request, func(event provider.Event) error {
 			writeCtx, done := context.WithTimeout(context.WithoutCancel(r.ctx), cleanupTimeout)
