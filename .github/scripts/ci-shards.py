@@ -25,6 +25,7 @@ BATCHES = {
     "httpapi": ((0, 1, 2, 3), (4, 5, 6, 7)),
 }
 PLATFORM_RUN_LIMIT = 24
+STORE_SLOW_RUN_LIMIT = 5
 # Pairing A/B: run 44712299768. Preserve isolation for #225 slots and #240 package times >=330s.
 SLOW_STORE_SLOTS = {6, 8, 38, 50, 51, 57, 62}
 LOG_LOCK = Lock()
@@ -39,11 +40,17 @@ def worker_parallelism(profile, slots):
         return 1
 
 
-def execution_subsets(selected, profile):
-    if profile != "platform" or len(selected) <= PLATFORM_RUN_LIMIT:
+def execution_subsets(selected, profile, slot=None):
+    if profile == "platform":
+        limit = PLATFORM_RUN_LIMIT
+    elif profile == "store" and slot in SLOW_STORE_SLOTS:
+        limit = STORE_SLOW_RUN_LIMIT
+    else:
+        return [selected]
+    if len(selected) <= limit:
         return [selected]
     names = sorted(selected)
-    groups = (len(names) + PLATFORM_RUN_LIMIT - 1) // PLATFORM_RUN_LIMIT
+    groups = (len(names) + limit - 1) // limit
     return [Counter({name: selected[name] for name in names[index::groups]}) for index in range(groups)]
 
 
@@ -82,7 +89,7 @@ def run_slot(profile, slot, compiled, package, expected, temporary):
     with LOG_LOCK:
         print(f"CI: {profile} 槽 {slot}/{total}，{len(selected)} 个顶层项", flush=True)
     runs, passes = Counter(), Counter()
-    for index, subset in enumerate(execution_subsets(selected, profile)):
+    for index, subset in enumerate(execution_subsets(selected, profile, slot)):
         pattern = verifier.run_pattern(subset)
         events = private / f"run-{index}.json"
         try:

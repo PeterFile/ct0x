@@ -476,7 +476,7 @@ class ShardBatchTests(unittest.TestCase):
         self.assertIn(8, batches["platform"][1])
         workflow = (WORKFLOWS / "ci-full.yml").read_text()
         shards = job(workflow, "go-shards")
-        for text in ["matrix: ${{ fromJSON(inputs.matrix) }}", "max-parallel: 7", "fail-fast: false", "timeout-minutes: 25"]:
+        for text in ["matrix: ${{ fromJSON(inputs.matrix) }}", "max-parallel: 7", "fail-fast: false", "timeout-minutes: 40"]:
             self.assertIn(text, shards)
         self.assertIn("merge-multiple: false", job(workflow, "gate"))
 
@@ -647,6 +647,63 @@ class ShardBatchTests(unittest.TestCase):
                  mock.patch.object(self.shards, "command", side_effect=self.worker_go(names, mutate)):
                 with self.assertRaises(ValueError):
                     self.shards.run_worker("platform", 2, directory, RUN, SHA, TREE)
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_slow_store_slot_subsets_preserve_exact_disjoint_union(self):
+        for count in (0, 1, 5, 6, 18):
+            selected = Counter({f"TestStoreVector{index}": 1 for index in reversed(range(count))})
+            limit = self.shards.STORE_SLOW_RUN_LIMIT
+            groups = max(1, (count + limit - 1) // limit)
+            ordered = sorted(selected)
+            expected = [Counter({name: selected[name] for name in ordered[index::groups]}) for index in range(groups)]
+            with self.subTest(count=count):
+                subsets = self.shards.execution_subsets(selected, "store", 62)
+                self.assertEqual(subsets, expected)
+                self.assertTrue(all(len(subset) <= limit for subset in subsets))
+                self.assertLessEqual(max(map(len, subsets)) - min(map(len, subsets)), 1)
+                self.assertEqual(sum(subsets, Counter()), selected)
+                for first, second in itertools.combinations(subsets, 2):
+                    self.assertFalse(first.keys() & second.keys())
+                self.assertEqual(self.shards.execution_subsets(selected, "store", 0), [selected])
+
+        slot60 = self.slot_names("store", 60, 1)
+        slot61 = self.slot_names("store", 61, 1)
+        slot62 = self.slot_names("store", 62, 18)
+        slot63 = self.slot_names("store", 63, 1)
+        names = slot60 + slot61 + slot62 + slot63
+        compiled = Counter(names)
+        with tempfile.TemporaryDirectory(prefix="ci-slow-store-") as directory, \
+             redirect_stdout(io.StringIO()), mock.patch.object(self.shards, "check_identity"), \
+             mock.patch.object(self.shards, "command", side_effect=self.worker_go(names)) as command, \
+             mock.patch.object(self.shards, "worker_parallelism", return_value=1):
+            self.shards.run_worker("store", 15, directory, RUN, SHA, TREE)
+            runs = [call.args[0] for call in command.call_args_list if "-run" in call.args[0]]
+            expected_patterns = []
+            for logical in self.shards.BATCHES["store"][15]:
+                selected, _ = self.verifier.selection(compiled, logical, "store")
+                for subset in self.shards.execution_subsets(selected, "store", logical):
+                    expected_patterns.append(self.verifier.run_pattern(subset))
+            self.assertEqual(len(runs), 7)
+            self.assertEqual(runs, [["go", "test", "-count=1", "-race", "-json", "-run", pattern, "./internal/store"]
+                                    for pattern in expected_patterns])
+            for logical in self.shards.BATCHES["store"][15]:
+                selected, _ = self.verifier.selection(compiled, logical, "store")
+                summary = json.loads((Path(directory) / f"store-shard-v1-{logical}" / "store-summary.json").read_text())
+                self.assertEqual(summary, {"schema": 1, "slot": logical, "total": 64, "run_id": RUN,
+                                          "checkout_sha": SHA, "checkout_tree": TREE, "package": "agentworkspace/internal/store",
+                                          "compiled": compiled, "selected": selected,
+                                          "runs": selected, "passes": selected, "skips": {}})
+
+        ordered62 = sorted(slot62)
+        first, second = [Counter({name: 1 for name in ordered62[index::2]}) for index in range(2)]
+        for subsets in ([first], [first, first, second]):
+            with self.subTest(bad_sizes=list(map(len, subsets))), tempfile.TemporaryDirectory(prefix="ci-slow-store-bad-") as directory, \
+                 redirect_stdout(io.StringIO()), mock.patch.object(self.shards, "check_identity"), \
+                 mock.patch.object(self.shards, "command", side_effect=self.worker_go(slot62)), \
+                 mock.patch.object(self.shards, "worker_parallelism", return_value=1), \
+                 mock.patch.object(self.shards, "execution_subsets", return_value=subsets):
+                with self.assertRaises(ValueError):
+                    self.shards.run_worker("store", 15, directory, RUN, SHA, TREE)
                 self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_store_pairing_requires_available_cpus_and_excludes_entire_slow_groups(self):

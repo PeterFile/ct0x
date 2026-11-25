@@ -43,7 +43,7 @@ jobs:
   go-shards:
     name: Go ${{ matrix.profile }} worker ${{ matrix.worker }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       # Bound two suites to fourteen shard runners; clients already passed preflight.
