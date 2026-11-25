@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Route native CI events and run bounded, single-runner draft feedback."""
+"""Route native CI events: full on master pushes, path-scoped PR feedback unless ci:full."""
 import argparse
 import importlib.util
 import json
@@ -33,8 +33,6 @@ def check(condition, message):
 def mode(event_name, event):
     if event_name == "push":
         return "full" if event.get("ref") == "refs/heads/master" else "ignore"
-    if event_name == "merge_group":
-        return "full" if event.get("action") == "checks_requested" else "ignore"
     if event_name != "pull_request":
         return "ignore"
     pr = event["pull_request"]
@@ -44,19 +42,12 @@ def mode(event_name, event):
     # Native edited payloads include base.ref.from only for an actual base-branch edit.
     relevant = (action in PR_ACTIONS or
                 action == "edited" and old_base is not None or
-                action == "labeled" and (label == "ci:refresh" or label == "ci:full" and pr["draft"]))
+                action == "labeled" and label in ("ci:refresh", "ci:full"))
     if not relevant:
         return "ignore"
+    # Master is validated after merge; PRs run full only when explicitly requested.
     override = label == "ci:full" or any(row.get("name", "").casefold() == "ci:full" for row in pr.get("labels", []))
-    return "full" if not pr["draft"] or override else "feedback"
-
-
-def bucket(event_name, event):
-    if event_name == "pull_request":
-        number = event["number"]
-        check(type(number) is int and number > 0, "PR 编号非法")
-        return number % 2
-    return 1 if event_name == "merge_group" else 0
+    return "full" if override else "feedback"
 
 
 def git(root, *args):
@@ -113,10 +104,8 @@ def plan(event_name, event, sha, root):
               "checkout 不是此 PR 的双亲合并提交")
         # The payload's base.sha may be stale. HEAD's first parent is authoritative.
         paths = changed_paths(base, sha, root)
-    elif event_name == "merge_group":
-        check(event["merge_group"]["head_sha"] == sha, "合并队列 SHA 不符")
     head = parents[1] if event_name == "pull_request" else sha
-    return {"mode": selected_mode, "bucket": bucket(event_name, event), "sha": sha, "tree": tree, "base": base,
+    return {"mode": selected_mode, "sha": sha, "tree": tree, "base": base,
             "head": head, "matrix": shard_matrix(), **classify(paths)}
 
 
@@ -197,7 +186,7 @@ def main():
         run_id = os.environ["GITHUB_RUN_ID"]
         check(re.fullmatch(r"[1-9][0-9]{0,63}", run_id), "run 身份非法")
         output.write(f"run_id={run_id}\n")
-        for key in ("mode", "bucket", "sha", "tree", "head", "base", "matrix", "go", "web", "bridge", "ci", "conservative"):
+        for key in ("mode", "sha", "tree", "head", "base", "matrix", "go", "web", "bridge", "ci", "conservative"):
             value = selected[key]
             output.write(f"{key}={json.dumps(value) if isinstance(value, (bool, dict)) else value}\n")
 
