@@ -24,6 +24,8 @@ func (p *Preparer) memberToolAdapter(selected provider.Provider) (provider.Adapt
 			return provider.AdapterSelection{ID: provider.PiMemberToolAdapterID, Protocol: provider.PiExtensionProtocol}, true
 		case selected.Name == provider.Codex && p.enableCodexAppServer:
 			return provider.AdapterSelection{ID: provider.CodexAppServerAdapterID, Protocol: provider.CodexAppServerProtocol}, true
+		case selected.Name == provider.Agy && p.enableAgyACP:
+			return provider.AdapterSelection{ID: provider.AgyACPAdapterID, Protocol: provider.ACPV1Protocol}, true
 		}
 	}
 	return provider.AdapterSelection{}, false
@@ -44,6 +46,8 @@ func (p *Preparer) memberToolAdapterRegistry(selection provider.AdapterSelection
 		}
 	case provider.CodexAppServerAdapterID:
 		adapter = provider.NewCodexAppServerMemberToolAdapter(configPath, names)
+	case provider.AgyACPAdapterID:
+		adapter = provider.NewAgyACPMemberToolAdapter(configPath, names)
 	default:
 		return nil, errMemberToolAdapterUnsupported
 	}
@@ -223,3 +227,5 @@ func (p *Preparer) AdapterReports() map[string]ProviderAdapterReport {
 }
 
 const codexNativeTextPermission = "实验性 Codex AppServer 仅启用受限只读原生文本配置：无可写目录、审批设为 never；原生 apply_patch 仍可能注册，但写入须被原生安全边界拒绝，不能据此开展文件任务或发布 Artifact。view_image 已关闭，原生文件读取不承诺隔离；继承 MCP 已禁用，唯一平台 MCP 不提供 resources。"
+
+const agyNativeTextPermission = "实验性 Agy ACP 仅启用受限只读原生文本配置：运行于隔离沙箱、独立设置与严格 PreToolUse 工具白名单下；不提供文件系统写作任务或 Artifact 授权，不支持原生恢复或运行中追加输入。"

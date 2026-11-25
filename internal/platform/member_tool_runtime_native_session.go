@@ -10,6 +10,7 @@ import (
 	"slices"
 
 	"agentworkspace/internal/domain"
+	"agentworkspace/internal/preflight"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/scheduler"
 	"agentworkspace/internal/store"
@@ -189,6 +190,18 @@ func (e *memberToolRuntimeRun) constructExecutor(ctx context.Context, request pr
 				native, err := e.explanationBuilder(provider.NativeMemberToolConfig{Path: configPath, SHA256: config.digest}, claim.TurnID, names)
 				return native, nil, err
 			}
+		}
+		if e.contextFactory != nil {
+			var native provider.Executor
+			err := preflight.Run(ctx, "member_runtime_factory", func() error {
+				var factoryErr error
+				native, factoryErr = e.contextFactory(ctx, configPath, claim.TurnID, names)
+				if factoryErr == nil && native == nil {
+					return errMemberToolRuntimeConfig
+				}
+				return factoryErr
+			})
+			return native, nil, err
 		}
 		native, err := e.factory(configPath, claim.TurnID, names)
 		return native, nil, err

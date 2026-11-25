@@ -87,5 +87,5 @@ func copyAdapterReport(report ProviderAdapterReport) ProviderAdapterReport {
 }
 
 func validAdapterProtocol(protocol provider.Protocol) bool {
-	return protocol == provider.OneShotProtocol || protocol == provider.PiExtensionProtocol || protocol == provider.CodexAppServerProtocol
+	return protocol == provider.OneShotProtocol || protocol == provider.PiExtensionProtocol || protocol == provider.CodexAppServerProtocol || protocol == provider.ACPV1Protocol
 }

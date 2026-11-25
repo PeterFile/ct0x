@@ -94,6 +94,10 @@ func TestMemberMCPProtocolOptInLifecycleAndProfile(t *testing.T) {
 	if w.Code != 202 || w.Body.Len() != 0 {
 		t.Fatal("initialized notification must have an empty 202 response")
 	}
+	w = memberMCPHTTP(t, f, `{"jsonrpc":"2.0","method":"notifications/roots/list_changed","params":{}}`)
+	if w.Code != 202 || w.Body.Len() != 0 {
+		t.Fatal("roots list_changed notification must have an empty 202 response")
+	}
 	w = memberMCPHTTP(t, f, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
 	var list struct {
 		Result struct {
@@ -277,6 +281,8 @@ func TestMemberMCPAuthAndFramingFailClosed(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"content":"forged"},"purpose":"chat_intake/v1"}}`,
 		`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"send_message","arguments":{"content":"notification write"}}}`,
 		`{"jsonrpc":"2.0","id":1,"method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":1,"method":"notifications/roots/list_changed"}`,
+		`{"jsonrpc":"2.0","method":"notifications/roots/list_changed","params":{"extra":true}}`,
 		memberMCPInitialize + `{}`,
 	} {
 		w := memberMCPHTTP(t, f, body)

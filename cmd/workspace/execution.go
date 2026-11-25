@@ -22,6 +22,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
 		return nil, nil, nil, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
 	}
+	if config.enableAgyACP && (!config.enableExecution || !config.enableMemberTools) {
+		return nil, nil, nil, errors.New("启用 Agy ACP 必须同时启用执行和成员工具")
+	}
 	if err := config.validateThreadDecisionHandoff(); err != nil {
 		return nil, nil, nil, err
 	}
@@ -131,6 +134,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		}
 		options.MemberTools, options.PiMemberToolsExtension = tools, config.piMemberToolsExtension
 		options.EnableCodexAppServer = config.enableCodexAppServer
+		options.EnableAgyACP = config.enableAgyACP
 		// Installing the qualified new bridge opts the trusted Pi intake into relay.
 		options.EnablePiDiscussionRelay = config.enableCoordinationRoles
 		options.EnableNativeSessionResume = config.enableNativeSessionResume

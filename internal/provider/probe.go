@@ -21,7 +21,9 @@ func (r Runner) Probe(ctx context.Context, p Provider, kind ProbeType) Provider 
 	default:
 		kind = "unsupported"
 	}
-	if (p.Name == Pi || p.Name == Codex) && (kind == VersionProbe || kind == AccountProbe) {
+	if kind == AccountProbe && p.Name == Agy {
+		reason = "此提供方暂不支持只读账户探针，账户状态保持未知"
+	} else if (p.Name == Pi || p.Name == Codex || p.Name == Agy) && (kind == VersionProbe || kind == AccountProbe) {
 		args, env := []string{"--version"}, []string{}
 		if p.Name == Pi {
 			env = []string{"PI_OFFLINE=1"}

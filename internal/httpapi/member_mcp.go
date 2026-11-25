@@ -65,7 +65,7 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 	id, validID := memberMCPID(frame["id"])
 	method := memberMCPString(frame["method"])
 	if !memberMCPFields(frame, "jsonrpc", "id", "method", "params") || memberMCPString(frame["jsonrpc"]) != "2.0" || !validID || method == "" || len(method) > 128 ||
-		(id == nil) != (method == "notifications/initialized") {
+		(id == nil) != memberMCPNotification(method) {
 		memberMCPError(w, 400, nil, -32600, "JSON-RPC 请求格式或 id 无效")
 		return
 	}
@@ -103,10 +103,10 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			"serverInfo":   map[string]string{"name": "agent-workspace-member-tools", "version": "1"},
 			"instructions": "调用身份与权限由当前运行能力绑定。写入幂等键由能力与 JSON-RPC id 派生。" + memberMCPReconcile,
 		})
-	case "notifications/initialized", "ping":
+	case "notifications/initialized", "notifications/roots/list_changed", "ping":
 		if _, ok := memberMCPParams(frame["params"]); !ok {
 			memberMCPError(w, 400, id, -32602, "请求参数无效")
-		} else if method == "notifications/initialized" {
+		} else if memberMCPNotification(method) {
 			w.WriteHeader(http.StatusAccepted)
 		} else {
 			memberMCPReply(w, id, map[string]any{})
@@ -444,6 +444,10 @@ func memberMCPEnvelopeFits(envelope map[string]any) bool {
 }
 
 // Return whether the response writer accepted the complete, original envelope.
+func memberMCPNotification(method string) bool {
+	return method == "notifications/initialized" || method == "notifications/roots/list_changed"
+}
+
 func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *memberMCPBuffer) bool {
 	failed, text := buffer.status >= 400, string(buffer.body)
 	if failed {

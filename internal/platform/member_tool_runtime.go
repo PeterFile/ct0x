@@ -21,6 +21,7 @@ import (
 
 	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/domain"
+	"agentworkspace/internal/preflight"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/scheduler"
 	"agentworkspace/internal/store"
@@ -65,6 +66,10 @@ type MemberToolRunBinding struct {
 // It must never start native execution, including when construction returns an error.
 type MemberToolExecutorFactory func(configPath, runID string, toolNames []string) (provider.Executor, error)
 
+// MemberToolContextExecutorFactory has the same no-start contract and must
+// honor the supplied execution context without leaving detached inspection.
+type MemberToolContextExecutorFactory func(ctx context.Context, configPath, runID string, toolNames []string) (provider.Executor, error)
+
 // MemberToolRuntime owns one store-bound registry and an immutable policy snapshot.
 // ConfigRoot and its ancestors must remain trusted and stable for its lifetime.
 type MemberToolRuntime struct {
@@ -79,7 +84,10 @@ type MemberToolRuntime struct {
 	investigationTaskWork    *InvestigationTaskWorkLaunch
 }
 
-const memberToolRuntimeVerificationTimeout = 5 * time.Second
+const (
+	memberToolRuntimeVerificationTimeout = 5 * time.Second
+	memberToolRuntimeUnknownReason       = "成员工具执行归属或历史结果未知，需对账后再处理"
+)
 
 var (
 	errMemberToolRuntimeConfig       = errors.New("成员工具运行配置无效")
@@ -189,6 +197,22 @@ func (r *MemberToolRuntime) Tools() *MemberTools { return r.tools }
 
 // Wrap has no claim, credential, filesystem or factory side effects.
 func (r *MemberToolRuntime) Wrap(binding MemberToolRunBinding, factory MemberToolExecutorFactory) (provider.Executor, error) {
+	if factory == nil {
+		return nil, errMemberToolRuntimeBinding
+	}
+	return r.wrap(binding, &memberToolRuntimeRun{factory: factory})
+}
+
+// WrapWithContext is the opt-in ordinary runtime path for cancellable adapter
+// construction. It does not change the current claim or native event contract.
+func (r *MemberToolRuntime) WrapWithContext(binding MemberToolRunBinding, factory MemberToolContextExecutorFactory) (provider.Executor, error) {
+	if factory == nil {
+		return nil, errMemberToolRuntimeBinding
+	}
+	return r.wrap(binding, &memberToolRuntimeRun{contextFactory: factory})
+}
+
+func (r *MemberToolRuntime) wrap(binding MemberToolRunBinding, run *memberToolRuntimeRun) (provider.Executor, error) {
 	for _, id := range []string{binding.GroupID, binding.MemberID, binding.ConversationID, binding.DeliveryID} {
 		if !memberToolRuntimeText(id) {
 			return nil, errMemberToolRuntimeBinding
@@ -200,10 +224,11 @@ func (r *MemberToolRuntime) Wrap(binding MemberToolRunBinding, factory MemberToo
 			return nil, errMemberToolRuntimeBinding
 		}
 	}
-	if factory == nil || len(binding.Model) > 256 {
+	if len(binding.Model) > 256 {
 		return nil, errMemberToolRuntimeBinding
 	}
-	return &memberToolRuntimeRun{runtime: r, binding: binding, factory: factory}, nil
+	run.runtime, run.binding = r, binding
+	return run, nil
 }
 
 // WrapChatIntake is selected by trusted preparation, not by model arguments.
@@ -233,6 +258,7 @@ type memberToolRuntimeRun struct {
 	runtime            *MemberToolRuntime
 	binding            MemberToolRunBinding
 	factory            MemberToolExecutorFactory
+	contextFactory     MemberToolContextExecutorFactory
 	used               atomic.Bool
 	role               *store.CoordinationRoleProvenance
 	intake             bool
@@ -265,7 +291,7 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	if e.role != nil {
 		return e.executeCoordinationRole(ctx, request, onEvent)
 	}
-	unknown := e.startupUnknown("成员工具执行归属或历史结果未知，需对账后再处理")
+	unknown := e.startupUnknown(memberToolRuntimeUnknownReason)
 	if e.used.Swap(true) || !memberToolRuntimeRunID.MatchString(request.RunID) || request.Model != e.binding.Model {
 		return unknown
 	}
@@ -302,21 +328,36 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 			config.cleanup()
 		}
 	}()
-	config, err = r.createConfig(token)
-	if receipt := e.preflight(ctx, request, claim, token, config); receipt != nil {
-		return *receipt
+	if e.contextFactory == nil {
+		config, err = r.createConfig(token)
+	} else {
+		err = preflight.Run(ctx, "member_runtime_create_config", func() error {
+			var createErr error
+			config, createErr = r.createConfig(token)
+			return createErr
+		})
 	}
-	if err != nil {
-		return e.startupFailure(ctx, request, claim, token, "无法安全准备成员工具凭证，执行未启动")
-	}
-	native, session, err := e.constructExecutor(ctx, request, claim, token, config, e.toolOperations())
+	var native provider.Executor
+	var session *memberToolNativeTurn
 	if e.nativeSession == nil {
+		if checkErr := e.tracePreflight(ctx, "member_runtime_pre_factory", request, claim, token, config); checkErr != nil || err != nil {
+			return r.preHandoffFailure(request, checkErr, "无法安全准备成员工具凭证，执行未启动")
+		}
+		native, session, err = e.constructExecutor(ctx, request, claim, token, config, e.toolOperations())
+		if checkErr := e.tracePreflight(ctx, "member_runtime_post_factory", request, claim, token, config); checkErr != nil || err != nil || native == nil {
+			return r.preHandoffFailure(request, checkErr, "无法构造成员工具执行器，执行未启动")
+		}
+	} else {
 		if receipt := e.preflight(ctx, request, claim, token, config); receipt != nil {
 			return *receipt
 		}
-	}
-	if err != nil || native == nil {
-		return e.startupFailure(ctx, request, claim, token, "无法构造成员工具执行器，执行未启动")
+		if err != nil {
+			return e.startupFailure(ctx, request, claim, token, "无法安全准备成员工具凭证，执行未启动")
+		}
+		native, session, err = e.constructExecutor(ctx, request, claim, token, config, e.toolOperations())
+		if err != nil || native == nil {
+			return e.startupFailure(ctx, request, claim, token, "无法构造成员工具执行器，执行未启动")
+		}
 	}
 	nativeRequest, err := e.executionRequest(request, config)
 	if err != nil {
@@ -354,6 +395,65 @@ func (e *memberToolRuntimeRun) toolOperations() []string {
 	return slices.Clone(e.runtime.operations)
 }
 
+func (e *memberToolRuntimeRun) tracePreflight(ctx context.Context, stage string, request provider.ExecuteRequest, claim store.TurnClaim, token string, config *memberToolRuntimeConfigFile) error {
+	runCheck := func() error {
+		r := e.runtime
+		checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), memberToolRuntimeVerificationTimeout)
+		defer cancel()
+		turn, err := r.tools.db.GetTurn(checkCtx, claim.GroupID, claim.TurnID)
+		if err != nil || !e.fresh(turn) || turn.ClaimToken != claim.Token || !e.clearRunDirectory(request) ||
+			r.tools.withAuthorized(checkCtx, token, e.toolOperations()[0], func(scope store.MemberToolScope, _ MemberToolGrants) error {
+				if scope.Claim != claim || scope.MemberID != e.binding.MemberID || scope.ConversationID != e.binding.ConversationID {
+					return store.ErrMemberToolDenied
+				}
+				return nil
+			}) != nil || checkCtx.Err() != nil {
+			return errMemberToolRuntimeBinding
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !r.rootValid() || !e.configValid(config) {
+			return errMemberToolRuntimeConfig
+		}
+		return nil
+	}
+	if e.contextFactory == nil {
+		return runCheck()
+	}
+	end := preflight.Begin(ctx, stage)
+	err := runCheck()
+	if err == nil {
+		err = ctx.Err()
+	}
+	end(err)
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+func (r *MemberToolRuntime) preHandoffFailure(request provider.ExecuteRequest, checkErr error, reason string) provider.ExecutionReceipt {
+	unknown := memberToolRuntimeReceipt(provider.OutcomeUnknown, memberToolRuntimeUnknownReason)
+	switch checkErr {
+	case nil:
+	case context.Canceled, context.DeadlineExceeded:
+		reason = "执行在启动前已取消或超时"
+	case errMemberToolRuntimeConfig:
+		reason = "成员工具凭证目录或文件已变更，执行未启动"
+	default:
+		return unknown
+	}
+	// Absence observed in preflight is not ownership. In either factory mode,
+	// fence this abandoned run in the same namespace the adapter must acquire.
+	// Leave the empty directory in place; removing it would reopen the race
+	// before the receipt is applied. This never hands off to the adapter.
+	if dir := r.validatedRunDirectory(request); dir != "" && os.Mkdir(dir, 0700) == nil {
+		return memberToolRuntimeReceipt(provider.OutcomeNotStarted, reason)
+	}
+	return unknown
+}
+
 func (e *memberToolRuntimeRun) preflight(ctx context.Context, request provider.ExecuteRequest, claim store.TurnClaim, token string, config *memberToolRuntimeConfigFile) *provider.ExecutionReceipt {
 	r := e.runtime
 	if e.nativeSession != nil {
@@ -365,28 +465,11 @@ func (e *memberToolRuntimeRun) preflight(ctx context.Context, request provider.E
 		receipt := e.startupFailure(ctx, request, claim, token, "成员工具凭证目录或文件已变更，执行未启动")
 		return &receipt
 	}
-	outcome, reason := provider.OutcomeUnknown, "成员工具执行归属或历史结果未知，需对账后再处理"
-	// Bound reconciliation independently of caller cancellation, including SQL pool
-	// waits. This never settles a turn; failure or expiry must remain unknown.
-	checkCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), memberToolRuntimeVerificationTimeout)
-	defer cancel()
-	turn, err := r.tools.db.GetTurn(checkCtx, claim.GroupID, claim.TurnID)
-	if err == nil && e.fresh(turn) && turn.ClaimToken == claim.Token && e.clearRunDirectory(request) &&
-		r.tools.withAuthorized(checkCtx, token, e.toolOperations()[0], func(scope store.MemberToolScope, _ MemberToolGrants) error {
-			if scope.Claim != claim || scope.MemberID != e.binding.MemberID || scope.ConversationID != e.binding.ConversationID {
-				return store.ErrMemberToolDenied
-			}
-			return nil
-		}) == nil && checkCtx.Err() == nil {
-		outcome, reason = provider.OutcomeNotStarted, "成员工具凭证目录或文件已变更，执行未启动"
-		if ctx.Err() != nil {
-			reason = "执行在启动前已取消或超时"
-		} else if r.rootValid() && e.configValid(config) {
-			return nil
-		}
+	if err := e.tracePreflight(ctx, "", request, claim, token, config); err != nil {
+		receipt := r.preHandoffFailure(request, err, "成员工具凭证目录或文件已变更，执行未启动")
+		return &receipt
 	}
-	receipt := memberToolRuntimeReceipt(outcome, reason)
-	return &receipt
+	return nil
 }
 
 func (e *memberToolRuntimeRun) clearRunDirectory(request provider.ExecuteRequest) bool {
@@ -394,23 +477,31 @@ func (e *memberToolRuntimeRun) clearRunDirectory(request provider.ExecuteRequest
 	return (e.nativeSession == nil && e.explanationBuilder == nil || r.executionRoot.rootValid(request.RuntimeDir)) && r.clearRunDirectory(request)
 }
 
-// Only inspect: the adapter still reserves RuntimeDir/RunID exclusively itself.
+// Only inspect: on handoff, the adapter reserves RuntimeDir/RunID exclusively.
 func (r *MemberToolRuntime) clearRunDirectory(request provider.ExecuteRequest) bool {
-	if !filepath.IsAbs(request.RuntimeDir) {
+	dir := r.validatedRunDirectory(request)
+	if dir == "" {
 		return false
+	}
+	_, err := os.Lstat(dir)
+	return os.IsNotExist(err)
+}
+
+func (r *MemberToolRuntime) validatedRunDirectory(request provider.ExecuteRequest) string {
+	if !filepath.IsAbs(request.RuntimeDir) {
+		return ""
 	}
 	info, err := os.Lstat(filepath.Clean(request.RuntimeDir))
 	if err != nil || info.Mode() != os.ModeDir|0700 {
-		return false
+		return ""
 	}
 	// Existing identity-based overlap checks also handle symlinked ancestors and
 	// case aliases; equal identities are aliases, which this boundary also rejects.
 	keys, err := scheduler.WorkspaceResourceKeys([]string{r.configRoot, request.RuntimeDir})
 	if err != nil || keys[0] == keys[1] {
-		return false
+		return ""
 	}
-	_, err = os.Lstat(filepath.Join(request.RuntimeDir, request.RunID))
-	return os.IsNotExist(err)
+	return filepath.Join(request.RuntimeDir, request.RunID)
 }
 
 func (r *MemberToolRuntime) rootValid() bool {

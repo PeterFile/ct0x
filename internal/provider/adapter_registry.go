@@ -191,7 +191,7 @@ func (r *AdapterRegistry) NewExecutor(s AdapterSelection, p Provider, timeout ti
 }
 
 func knownProtocol(p Protocol) bool {
-	return p == OneShotProtocol || p == PiExtensionProtocol || p == CodexAppServerProtocol
+	return p == OneShotProtocol || p == PiExtensionProtocol || p == CodexAppServerProtocol || p == ACPV1Protocol
 }
 
 // Reject typed nil implementations as well as nil interfaces before calling them.

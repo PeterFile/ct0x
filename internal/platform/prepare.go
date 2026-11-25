@@ -39,6 +39,7 @@ type PrepareOptions struct {
 	MemberTools             *MemberToolRuntime
 	PiMemberToolsExtension  string
 	EnableCodexAppServer    bool          // Default false; requires the role-enabled runtime.
+	EnableAgyACP            bool          // Default false; opts into experimental Agy ACP stdio + HTTP MCP.
 	EnablePiDiscussionRelay bool          // Requires the trusted chat intake and the qualified Pi bridge pair.
 	HistoryLimit            int           // Zero defaults to 50; explicit range is 1..200.
 	MaxContextBytes         int           // Zero: 16 KiB ordinary, RoleMaxContextBytes for trusted chat intake; maximum 1 MiB.
@@ -78,6 +79,7 @@ type Preparer struct {
 	piDiscussionSchema     bool
 	piDiscussionRelay      bool
 	enableCodexAppServer   bool
+	enableAgyACP           bool
 
 	investigation             *investigationPreparationSettings
 	enableNativeSessionResume bool
@@ -150,10 +152,10 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 	if opts.NativePiThinking != "" && (!opts.EnableNativeSessionResume || path == "" || !validNativePiThinking(opts.NativePiThinking)) {
 		return errPrepareConfig
 	}
-	if r == nil && path == "" && !opts.EnableCodexAppServer && !opts.EnableNativeSessionResume {
+	if r == nil && path == "" && !opts.EnableCodexAppServer && !opts.EnableAgyACP && !opts.EnableNativeSessionResume {
 		return nil
 	}
-	if r == nil || path == "" && !opts.EnableCodexAppServer || r.tools == nil || r.tools.db != p.store || r.tools.capabilities == nil ||
+	if r == nil || path == "" && !opts.EnableCodexAppServer && !opts.EnableAgyACP || r.tools == nil || r.tools.db != p.store || r.tools.capabilities == nil ||
 		opts.EnableCodexAppServer && r.roleFence == nil ||
 		r.rootInfo == nil || !filepath.IsAbs(r.configRoot) || !filepath.IsAbs(r.resolvedRoot) ||
 		!memberToolRuntimeEndpoint(r.endpoint) || r.maxGroupMembers < 1 || r.maxGroupMembers > 200 || !r.rootValid() {
@@ -191,7 +193,7 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 			return errPrepareConfig
 		}
 	}
-	p.memberTools, p.piMemberToolsExtension, p.enableCodexAppServer = r, path, opts.EnableCodexAppServer
+	p.memberTools, p.piMemberToolsExtension, p.enableCodexAppServer, p.enableAgyACP = r, path, opts.EnableCodexAppServer, opts.EnableAgyACP
 	p.piDiscussionRelay = opts.EnablePiDiscussionRelay && r.tools.chatEngine != nil && provider.PiDiscussionRelayBridgeSupported(path)
 	p.piDiscussionSchema = p.piDiscussionRelay || provider.PiInvestigationBridgeSupported(path)
 	p.enableNativeSessionResume, p.nativePiThinking = opts.EnableNativeSessionResume, opts.NativePiThinking
@@ -634,6 +636,11 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 					in.Permissions[0] = "仅支持所选 Codex AppServer 版本的全新单轮执行；不支持恢复或运行中追加输入。"
 				}
 				in.Permissions = append(in.Permissions, codexNativeTextPermission)
+			} else if enabled && selection.Protocol == provider.ACPV1Protocol {
+				if p.memberTools.tools.chatEngine == nil {
+					in.Permissions[0] = "仅支持所选 ACP 版本的全新单轮执行；不支持恢复或运行中追加输入。"
+				}
+				in.Permissions = append(in.Permissions, agyNativeTextPermission)
 			}
 		}
 		if nativeText {

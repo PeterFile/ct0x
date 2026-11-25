@@ -233,6 +233,10 @@ func (p *Preparer) planCoordinationRole(ctx context.Context, state store.Coordin
 		in.Permissions[0] = "仅支持所选 Codex AppServer 版本的全新单轮角色执行；不支持恢复或运行中追加输入。"
 		in.Permissions[1] = "本轮角色平台工具仅有 " + strings.Join(memberToolRoleOperations(state.Provenance.Kind), "、") + "；调用者、群组、会话、话题和任务关系由服务端绑定，模型不能改选身份或授权。"
 		in.Permissions = append(in.Permissions, codexNativeTextPermission)
+	} else if selection.Protocol == provider.ACPV1Protocol {
+		in.Permissions[0] = "仅支持所选 ACP 版本的全新单轮角色执行；不支持恢复或运行中追加输入。"
+		in.Permissions[1] = "本轮角色平台工具仅有 " + strings.Join(memberToolRoleOperations(state.Provenance.Kind), "、") + "；调用者、群组、会话、话题和任务关系由服务端绑定，模型不能改选身份或授权。"
+		in.Permissions = append(in.Permissions, agyNativeTextPermission)
 	}
 	workInputs := state.Provenance.Kind == store.CoordinationRoleWorker && r.tools.WorkInputsEnabled()
 	if workInputs {
