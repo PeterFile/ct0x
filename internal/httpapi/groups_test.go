@@ -348,15 +348,31 @@ func TestQueryCursorValidationAndErrors(t *testing.T) {
 	}
 }
 
-func TestGroupCreateImportAuthorizationHTTPUnregisteredFailsClosed(t *testing.T) {
+func TestGroupCreateImportAuthorizationHTTP(t *testing.T) {
 	a := openGroupAPI(t, "")
 	source := decoded[domain.Group](t, a.request(http.MethodPost, "/api/v1/groups", `{"name":"源群组","description":"正常创建"}`, "http-src-group"), 201)
 	replayed := decoded[domain.Group](t, a.request(http.MethodPost, "/api/v1/groups", `{"name":"源群组","description":"正常创建"}`, "http-src-group"), 201)
 	if replayed.ID != source.ID {
 		t.Fatalf("normal group idempotent replay mismatch: %+v vs %+v", replayed, source)
 	}
-	w := a.request(http.MethodPost, "/api/v1/groups", `{"name":"导入群","import_authorization_from_group_id":"`+source.ID+`"}`, "http-import-unreg")
+	w := a.request(http.MethodPost, "/api/v1/groups", `{"name":"无源策略导入","import_authorization_from_group_id":"`+source.ID+`"}`, "http-import-no-policy")
 	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+	w = a.request(http.MethodPost, "/api/v1/groups", `{"name":"不存在源群","import_authorization_from_group_id":"missing-source-group"}`, "http-import-missing")
+	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 404, "not_found")
 	w = a.request(http.MethodPost, "/api/v1/groups", `{"name":"无源群只有话题","import_authorization_from_topic_id":"t1"}`, "http-import-topic-only")
 	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+
+	if _, err := a.db.SetChatPolicy(context.Background(), domain.ThreadRef{GroupID: source.ID}, domain.ChatPolicyRequest{
+		Enabled: true, Action: domain.ChatActionTextSubmission, MaxAdmissions: 3, AutomaticTextDispatch: true,
+	}, 0, "http-enable-source-auto"); err != nil {
+		t.Fatal(err)
+	}
+	importBody := `{"name":"授权导入新群","description":"一句直达","import_authorization_from_group_id":"` + source.ID + `"}`
+	imported := decoded[domain.Group](t, a.request(http.MethodPost, "/api/v1/groups", importBody, "http-import-ok"), 201)
+	importedReplay := decoded[domain.Group](t, a.request(http.MethodPost, "/api/v1/groups", importBody, "http-import-ok"), 201)
+	if importedReplay.ID != imported.ID {
+		t.Fatalf("imported group idempotent replay mismatch: %+v vs %+v", importedReplay, imported)
+	}
+	w = a.request(http.MethodPost, "/api/v1/groups", `{"name":"授权导入新群","description":"一句直达","import_authorization_from_group_id":"`+source.ID+`","import_authorization_from_topic_id":"other"}`, "http-import-ok")
+	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 409, "conflict")
 }

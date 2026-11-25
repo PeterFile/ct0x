@@ -243,6 +243,7 @@ BEGIN SELECT RAISE(ABORT, '接纳任务必须有明确接纳的评审'); END;
 	projectDirectorySchema,
 	decisionThreadAnswerSchema, agentRunExplanationSchema, messageQuoteSchema, projectExperienceSchema,
 	groupBackgroundDispatchSchema,
+	chatAutomaticTextSchema,
 }
 
 // Migration history is explicit and contiguous; never infer it from table shape.
