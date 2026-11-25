@@ -353,6 +353,11 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 		if intake {
 			run := executor.(*memberToolRuntimeRun)
 			run.intakeSchema = intakeSchema
+			if selected.Name == provider.Pi && trigger.SourceKind == "local_user_chat" {
+				run.automaticText = &automaticTextSampler{sample: func(ctx context.Context) store.ChatAutomaticTextFacts {
+					return p.sampleAutomaticTextRoles(ctx, member)
+				}}
+			}
 			if intakeSchema.requiresIssuedPiConfig() {
 				run.intakeBuilder = func(config provider.NativeMemberToolConfig) (provider.Executor, error) {
 					return provider.NewPiInvestigationIntakeExecutor(selected, p.piMemberToolsExtension, config, p.executionTimeout)

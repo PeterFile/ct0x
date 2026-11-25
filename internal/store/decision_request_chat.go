@@ -24,7 +24,7 @@ func (s *Store) ApplyChatDecisionClarification(ctx context.Context, scope Member
 		return domain.DecisionRequest{}, decisionRequestError("记录话题待决事项失败", err)
 	}
 	capture := decisionClarificationCapture{body: body}
-	if _, err := s.applyChatAssessment(ctx, scope, candidateID, input, content, key, false, &capture); err != nil {
+	if _, err := s.applyChatAssessment(ctx, scope, candidateID, input, content, key, false, &capture, ChatAutomaticTextFacts{}); err != nil {
 		return domain.DecisionRequest{}, err
 	}
 	return capture.request, nil

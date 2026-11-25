@@ -102,6 +102,32 @@ func TestChatInvestigationClueAdmissionAndReplay(t *testing.T) {
 	}
 }
 
+func TestChatInvestigationClueRejectsAutomaticTextRouting(t *testing.T) {
+	f := newAutoTextFixture(t)
+	const topic = "investigation"
+	input := automaticTextPolicy(2)
+	clue := clueInvestigationConfig(t, investigationClueTermsJSON)
+	input.Investigation = &clue
+	f.policy(t, topic, 0, input)
+	f.s.EnableInvestigationExecution()
+
+	scope, id := f.claim(t, f.post(t, topic, automaticTextRequest, f.co.ID), f.co.ID)
+	if r, err := f.assess(scope, id, automaticTextProposal, "admit-text"); err != nil || r.TaskID == "" {
+		t.Fatalf("fixture did not establish automatic routing: %+v, %v", r, err)
+	}
+	discussionEnd(t, f.s, scope)
+
+	before := automaticWorkSnapshot(t, f.s)
+	scope, id = f.claim(t, f.post(t, topic, investigationClue, f.co.ID), f.co.ID)
+	candidate, err := f.s.CaptureChatCandidate(ctx, scope)
+	if err != nil || candidate.InvestigationClueMatched {
+		t.Fatalf("generated routing must not advertise a clue: matched=%t, err=%v", candidate.InvestigationClueMatched, err)
+	}
+	r, err := f.assess(scope, id, investigationProposal(), "clue")
+	assertAutomaticTextQuestion(t, f.s, r, err, "automatic_text_routing_scope")
+	messageSequencePreserved(t, f.s, before)
+}
+
 func TestChatInvestigationClueDiscussionOnly(t *testing.T) {
 	for _, mode := range []string{"direct", "member", "relayed", "structured", "alternate-action", "repair-proposal"} {
 		t.Run(mode, func(t *testing.T) {

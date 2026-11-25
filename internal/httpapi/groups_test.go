@@ -347,3 +347,16 @@ func TestQueryCursorValidationAndErrors(t *testing.T) {
 		t.Fatalf("internal storage error leaked: %s", w.Body)
 	}
 }
+
+func TestGroupCreateImportAuthorizationHTTPUnregisteredFailsClosed(t *testing.T) {
+	a := openGroupAPI(t, "")
+	source := decoded[domain.Group](t, a.request(http.MethodPost, "/api/v1/groups", `{"name":"源群组","description":"正常创建"}`, "http-src-group"), 201)
+	replayed := decoded[domain.Group](t, a.request(http.MethodPost, "/api/v1/groups", `{"name":"源群组","description":"正常创建"}`, "http-src-group"), 201)
+	if replayed.ID != source.ID {
+		t.Fatalf("normal group idempotent replay mismatch: %+v vs %+v", replayed, source)
+	}
+	w := a.request(http.MethodPost, "/api/v1/groups", `{"name":"导入群","import_authorization_from_group_id":"`+source.ID+`"}`, "http-import-unreg")
+	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+	w = a.request(http.MethodPost, "/api/v1/groups", `{"name":"无源群只有话题","import_authorization_from_topic_id":"t1"}`, "http-import-topic-only")
+	assertError(t, w.Code, w.Header(), w.Body.Bytes(), 400, "invalid_input")
+}

@@ -237,6 +237,7 @@ type memberToolRuntimeRun struct {
 	role               *store.CoordinationRoleProvenance
 	intake             bool
 	intakeSchema       memberToolIntakeSchema
+	automaticText      *automaticTextSampler
 	intakeBuilder      func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
 	explanationBuilder func(provider.NativeMemberToolConfig, string, []string) (provider.Executor, error)
 	investigation      *investigationRolePreparation
@@ -277,7 +278,7 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 	var token string
 	var explanation *memberRunExplanation
 	if e.intake {
-		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema)
+		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema, e.automaticText)
 	} else {
 		if e.explanationBuilder != nil && e.nativeSession == nil && r.tools.runExplanationSupported(ctx) {
 			dir := filepath.Join(request.RuntimeDir, request.RunID)
@@ -285,7 +286,7 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 				bridgePath: filepath.Join(dir, provider.PiRunExplanationJournalName)}
 		}
 		token, err = r.tools.issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers,
-			ProviderID: e.binding.ProviderID, Model: e.binding.Model}, "generic", memberToolIntakeSchema{}, explanation)
+			ProviderID: e.binding.ProviderID, Model: e.binding.Model}, "generic", memberToolIntakeSchema{}, explanation, nil)
 	}
 	if err != nil {
 		// Duplicate authority, stale generation and uncertain reads are not proof

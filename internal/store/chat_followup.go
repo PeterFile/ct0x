@@ -16,14 +16,11 @@ import (
 
 // A trusted source has one follow-up decision, even when delivered to multiple
 // assessors. Its first immutable receipt, not a new assessment, is replayed.
-func chatFollowupReceiptInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate) (domain.ChatAssessmentReceipt, error) {
-	var id, candidateID string
-	err := tx.QueryRowContext(ctx, `SELECT a.id,a.candidate_id FROM chat_followup_routes r JOIN chat_assessments a ON a.id=r.assessment_id
-	 WHERE r.source_id=? AND r.group_id=? AND r.topic_id=? AND r.reply_message_id=?`, c.SourceID, c.GroupID, c.TopicID, c.MessageID).Scan(&id, &candidateID)
-	if err != nil {
-		return domain.ChatAssessmentReceipt{}, err
-	}
-	return chatAssessmentReceiptInTx(ctx, tx, id, candidateID)
+func chatFollowupReceiptIDsInTx(ctx context.Context, tx *sql.Tx, c domain.ChatCandidate, expectedID string) (id, candidateID string, err error) {
+	err = tx.QueryRowContext(ctx, `SELECT a.id,a.candidate_id FROM chat_followup_routes r JOIN chat_assessments a ON a.id=r.assessment_id
+	 WHERE r.source_id=? AND r.group_id=? AND r.topic_id=? AND r.reply_message_id=? AND (?='' OR r.assessment_id=?)`,
+		c.SourceID, c.GroupID, c.TopicID, c.MessageID, expectedID, expectedID).Scan(&id, &candidateID)
+	return
 }
 
 type chatFollowupRoute struct {
@@ -108,7 +105,7 @@ func (s *Store) prepareChatFollowupInTx(ctx context.Context, tx *sql.Tx, scope M
 	if (input.Action != "" && input.Action != domain.ChatActionTextSubmission && input.Action != domain.ChatActionReadOnlyInvestigation) || input.Title != "" || input.Description != "" || input.Acceptance != "" {
 		return route, chatWorkInputTextOnly()
 	}
-	if err := chatAdmissionGateInTx(ctx, tx, c, domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork, Action: domain.ChatActionTextSubmission}); err != nil {
+	if err := chatAdmissionGateInTx(ctx, tx, c, domain.ChatAssessment{Disposition: domain.ChatDispositionContinueWork, Action: domain.ChatActionTextSubmission}, nil); err != nil {
 		return route, err
 	}
 	if constraint != "" && !strings.Contains(body, constraint) {

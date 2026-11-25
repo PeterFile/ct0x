@@ -44,6 +44,8 @@ type CreateGroupInput struct {
 	Name, Description string
 	ActorID           string `json:"-"` // Bound by trusted platform/session code.
 	IdempotencyKey    string
+	ImportAuthorizationFromGroupID string
+	ImportAuthorizationFromTopicID string
 }
 
 type CreateMemberInput struct {
@@ -113,14 +115,25 @@ func (s *Store) CreateLocalUserGroup(ctx context.Context, input CreateGroupInput
 }
 
 func (s *Store) createGroup(ctx context.Context, input CreateGroupInput, bindBackground bool) (domain.Group, error) {
+	importing := input.ImportAuthorizationFromGroupID != "" || input.ImportAuthorizationFromTopicID != ""
+	if importing && input.ActorID != "user" {
+		return domain.Group{}, ErrMemberToolDenied
+	}
+	payload := mutationPayload(input.Name, input.Description)
+	if importing {
+		payload = mutationPayload(input.Name, input.Description, input.ImportAuthorizationFromGroupID, input.ImportAuthorizationFromTopicID)
+	}
 	scope := mutationScope{operation: "create_group", actorID: input.ActorID, key: input.IdempotencyKey}
-	tx, id, replay, err := s.beginMutation(ctx, scope, mutationPayload(input.Name, input.Description))
+	tx, id, replay, err := s.beginMutation(ctx, scope, payload)
 	if err != nil {
 		return domain.Group{}, storeError("创建群组失败", err)
 	}
 	defer tx.Rollback()
 	if strings.TrimSpace(input.Name) == "" {
 		return domain.Group{}, fmt.Errorf("%w：群组名称不能为空", ErrInvalid)
+	}
+	if input.ImportAuthorizationFromTopicID != "" && input.ImportAuthorizationFromGroupID == "" {
+		return domain.Group{}, fmt.Errorf("%w：导入授权必须指定来源群组 ID", ErrInvalid)
 	}
 	var g domain.Group
 	if replay {
@@ -134,6 +147,11 @@ func (s *Store) createGroup(ctx context.Context, input CreateGroupInput, bindBac
 	if !replay && bindBackground {
 		if err := coordinationDispatchWrite(ctx, tx, "INSERT INTO group_background_bindings(group_id) VALUES(?)", g.ID); err != nil {
 			return domain.Group{}, storeError("绑定群组后台调度失败", err)
+		}
+	}
+	if !replay && input.ImportAuthorizationFromGroupID != "" {
+		if err := insertGroupAuthorizationImportInTx(ctx, tx, g.ID, input.ImportAuthorizationFromGroupID, input.ImportAuthorizationFromTopicID); err != nil {
+			return domain.Group{}, storeError("导入群组自动文本授权失败", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
