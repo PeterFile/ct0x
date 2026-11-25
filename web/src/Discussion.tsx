@@ -192,7 +192,9 @@ function DiscussionScope({ groupId, active, paused, observeRoster, members, reci
       if (!mounted.current) return;
       feed.confirm(receipt, attempt); operation.current = null; setContent(""); setQuote(null);
       scroll.confirmSend(receipt.id, attempt);
-      setMutation({ pending: false, uncertain: false, error: "", notice: "消息已持久化；投递状态见记录。" });
+      const notice = receipt.thread_correction?.question ? "需澄清话题；归属未变更。"
+        : receipt.thread_correction ? "话题纠正已记录；未向成员投递。" : "消息已持久化；投递状态见记录。";
+      setMutation({ pending: false, uncertain: false, error: "", notice });
     } catch (error) {
       if (!mounted.current) return;
       const uncertain = mutation.uncertain || !isDefinitiveRejection(error), reason = error instanceof ApiError ? error.message : "请求未完成，请重试。";
@@ -248,13 +250,16 @@ function DiscussionScope({ groupId, active, paused, observeRoster, members, reci
               <span>{projection.excerpt || "（无文字短摘）"}</span></>
               : <><strong>引用 · 查看原消息</strong><span>消息 ID：{reference.message_id}</span></>}</a> : null}
           <p className="message-content">{message.content}</p>
+          {message.thread_correction?.question ? <p className="message-content" role="status">
+            <strong>话题归属待澄清：</strong><span>{message.thread_correction.question}</span>
+          </p> : null}
           {discussion ? <DiscussionContext relation={discussion} closureReason={message.discussion_closure_reason}
             work={message.discussion_work} members={membersById} scopeId={formId}
             onNavigateReference={id => { scroll.onNavigateReference(id); feed.preserveReference(id); }} /> : null}
           <div className="message-actions">
             <button className="message-reply-action" type="button" aria-label={`回复，消息 ${message.id}`} disabled={blocked}
               onClick={() => selectQuote(message)}>回复</button>
-            {!backgroundJoin(message) ? <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
+            {!backgroundJoin(message) && !message.thread_correction ? <button className="message-task-action" type="button" aria-label={`转为任务，消息 ${message.id}`}
               onClick={event => requestWork.current?.open(message, event.currentTarget)}>转为任务</button> : null}
             {refreshDiscussion ? refresh : null}
             <details className="message-details">

@@ -77,9 +77,13 @@ func (s *Store) SearchHistoryForTool(ctx context.Context, scope MemberToolScope,
 	if input.Limit == 0 {
 		input.Limit = 20
 	}
+	mode, err := memberHistoryModeInTx(ctx, tx, scope)
+	if err != nil {
+		return MemberHistorySearchResult{}, memberToolOperationError(action, err)
+	}
 	page, err := searchHistoryInScopeTx(ctx, tx, scope.Claim.GroupID, HistoryQuery{
 		Query: input.Query, TopicID: &scope.TopicID, Limit: input.Limit, Before: input.Before,
-	})
+	}, mode)
 	if err != nil {
 		return MemberHistorySearchResult{}, memberToolOperationError(action, err)
 	}
@@ -121,7 +125,11 @@ func (s *Store) ReadHistoryForTool(ctx context.Context, scope MemberToolScope, i
 	if input.Length == 0 {
 		input.Length = 1024
 	}
-	message, err := readHistoryInScopeTx(ctx, tx, scope.Claim.GroupID, &scope.TopicID, input.MessageID)
+	mode, err := memberHistoryModeInTx(ctx, tx, scope)
+	if err != nil {
+		return MemberHistoryReadResult{}, memberToolOperationError(action, err)
+	}
+	message, err := readHistoryInScopeTx(ctx, tx, scope.Claim.GroupID, &scope.TopicID, input.MessageID, mode)
 	if err != nil {
 		return MemberHistoryReadResult{}, memberToolOperationError(action, err)
 	}

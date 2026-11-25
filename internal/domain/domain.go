@@ -61,7 +61,10 @@ type Message struct {
 	Deliveries []Delivery    `json:"deliveries"`
 	ReplyTo    *MessageQuote `json:"reply_to,omitempty"`
 	ThreadLinks
-	Discussion *MessageDiscussion `json:"discussion,omitempty"`
+	// TopicID remains the storage scope. Only ordinary scoped reads project an override.
+	EffectiveTopicID *string            `json:"effective_topic_id,omitempty"`
+	ThreadCorrection *ThreadCorrection  `json:"thread_correction,omitempty"`
+	Discussion       *MessageDiscussion `json:"discussion,omitempty"`
 	// Read projections on the discussion head, not publication receipts.
 	DiscussionClosureReason string              `json:"discussion_closure_reason,omitempty"`
 	DiscussionWork          *ChatDiscussionWork `json:"discussion_work,omitempty"`

@@ -215,10 +215,8 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 	}
 	titleIssues := issueTokens(title)
 	if exact != "" {
-		var topic string
-		err := tx.QueryRowContext(ctx, `SELECT topic_id FROM main.thread_routing_topics
-		 WHERE group_id=? AND title_key=?`, group, threadTitleKey(exact)).Scan(&topic)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		topic, err := threadTopicByKeyInTx(ctx, tx, group, threadTitleKey(exact), false)
+		if err != nil {
 			return route, err
 		}
 		route.add(topic)
@@ -232,10 +230,8 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 		return route, nil
 	}
 	if len(issues) == 1 {
-		var topic string
-		err := tx.QueryRowContext(ctx, `SELECT topic_id FROM main.thread_routing_topics
-		 WHERE group_id=? AND issue_id=? AND issue_id<>''`, group, issues[0]).Scan(&topic)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		topic, err := threadTopicByKeyInTx(ctx, tx, group, issues[0], true)
+		if err != nil {
 			return route, err
 		}
 		if openingFollowup && (len(titleIssues) == 0 || titleIssues[0] != issues[0]) && (topic == "" || topic != route.topic) {
@@ -246,7 +242,7 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 	if active == "" {
 		return route, nil
 	}
-	names, complete, err := threadTitleEvidenceInTx(ctx, tx, group, active, route.aliases)
+	names, complete, err := threadTitleEvidenceInTx(ctx, tx, group, active, route.aliases, "")
 	if err != nil {
 		return route, err
 	}
@@ -274,7 +270,20 @@ func resolveThreadTextInTx(ctx context.Context, tx *sql.Tx, group, body string) 
 	return route, nil
 }
 
-func threadTitleEvidenceInTx(ctx context.Context, tx *sql.Tx, group, active string, aliases map[string][]string) (threadTopicEvidence, bool, error) {
+func threadTopicByKeyInTx(ctx context.Context, tx *sql.Tx, group, key string, issue bool) (string, error) {
+	filter := "title_key=?"
+	if issue {
+		filter = "issue_id=? AND issue_id<>''"
+	}
+	var topic string
+	err := tx.QueryRowContext(ctx, `SELECT topic_id FROM main.thread_routing_topics WHERE group_id=? AND `+filter, group, key).Scan(&topic)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	}
+	return topic, err
+}
+
+func threadTitleEvidenceInTx(ctx context.Context, tx *sql.Tx, group, active string, aliases map[string][]string, correctionSubject string) (threadTopicEvidence, bool, error) {
 	var evidence threadTopicEvidence
 	rows, err := tx.QueryContext(ctx, `SELECT topic_id,title_key,issue_id FROM main.thread_routing_topics
 	 WHERE group_id=? ORDER BY topic_id LIMIT ?`, group, maxThreadTitles+1)
@@ -294,7 +303,11 @@ func threadTitleEvidenceInTx(ctx context.Context, tx *sql.Tx, group, active stri
 		if err := rows.Scan(&topic, &key, &issue); err != nil {
 			return evidence, false, err
 		}
-		if !threadGeneric.MatchString(key) {
+		if correctionSubject != "" {
+			if hasThreadToken(key, correctionSubject, isNonHanWord) {
+				evidence.add(topic)
+			}
+		} else if !threadGeneric.MatchString(key) {
 			matches.record(text, key, topic)
 		}
 		if len(aliases) != 0 {
@@ -406,6 +419,21 @@ func (m *threadTitleMatches) record(text, key, topic string) {
 		}
 		offset = start + 1
 	}
+}
+
+func hasThreadToken(text, token string, word func(rune) bool) bool {
+	for offset := 0; token != "" && offset < len(text); {
+		index := strings.Index(text[offset:], token)
+		if index == -1 {
+			return false
+		}
+		start := offset + index
+		if threadTokenBounds(text, start, start+len(token), word) {
+			return true
+		}
+		offset = start + 1
+	}
+	return false
 }
 
 func threadTokenBounds(text string, start, end int, word func(rune) bool) bool {

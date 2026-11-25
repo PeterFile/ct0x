@@ -108,19 +108,24 @@ func rolePreparationContext(p store.CoordinationRoleProvenance, group domain.Gro
 // has already been selected by Store; Build alone chooses its bounded suffix.
 func appendPreparationMessages(in *contextpack.Input, topic string, trigger domain.Message, history []domain.Message) error {
 	for i, message := range append(slices.Clone(history), trigger) {
-		if message.GroupID != in.Scope.GroupID || message.TopicID != topic || !utf8.ValidString(message.Content) {
+		scopeTopic := message.TopicID
+		if i < len(history) && message.EffectiveTopicID != nil {
+			scopeTopic = *message.EffectiveTopicID
+		}
+		if message.GroupID != in.Scope.GroupID || scopeTopic != topic || !utf8.ValidString(message.Content) {
 			return errPrepareBinding
 		}
 		body, err := json.Marshal(struct {
-			ID         string    `json:"id"`
-			GroupID    string    `json:"group_id"`
-			TopicID    string    `json:"topic_id"`
-			SenderID   string    `json:"sender_id"`
-			CreatedAt  time.Time `json:"created_at"`
-			Content    string    `json:"content"`
-			SourceID   string    `json:"source_id,omitempty"`
-			SourceKind string    `json:"source_kind,omitempty"`
-		}{message.ID, message.GroupID, message.TopicID, message.SenderID, message.CreatedAt, message.Content, message.SourceID, message.SourceKind})
+			ID               string    `json:"id"`
+			GroupID          string    `json:"group_id"`
+			TopicID          string    `json:"topic_id"`
+			EffectiveTopicID *string   `json:"effective_topic_id,omitempty"`
+			SenderID         string    `json:"sender_id"`
+			CreatedAt        time.Time `json:"created_at"`
+			Content          string    `json:"content"`
+			SourceID         string    `json:"source_id,omitempty"`
+			SourceKind       string    `json:"source_kind,omitempty"`
+		}{message.ID, message.GroupID, message.TopicID, message.EffectiveTopicID, message.SenderID, message.CreatedAt, message.Content, message.SourceID, message.SourceKind})
 		if err != nil {
 			return &preparationFailure{category: errPrepareRead, cause: err}
 		}
