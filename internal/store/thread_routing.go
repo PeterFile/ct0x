@@ -54,7 +54,7 @@ func localMessageReceiptInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 			return domain.Message{}, err
 		}
 	}
-	m, err := messageInTx(ctx, tx, r.GroupID, id)
+	m, err := messageReceiptInTx(ctx, tx, r.GroupID, id)
 	if err != nil {
 		return domain.Message{}, err
 	}
@@ -79,7 +79,7 @@ func localMessageReceiptInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 	return items[0], nil
 }
 
-func publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id string, payload []byte, recipients []string, normalPost bool) (domain.Message, error) {
+func (s *Store) publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, id string, payload []byte, recipients []string, normalPost bool) (domain.Message, error) {
 	route := localThreadRoute{topic: r.TopicID}
 	if normalPost || r.ThreadLinks != (domain.ThreadLinks{}) {
 		var err error
@@ -93,12 +93,21 @@ func publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 	if route.correction != nil {
 		r.RecipientIDs, recipients = nil, nil
 	}
-	// Compose A's single dispatch decision here: an E recipient is a suggestion
-	// for omitted recipients only. Fallback cannot wake a reference-only author.
+	// Explicit recipients (including public-only) and a verified thread
+	// recipient bypass background dispatch. Only the unresolved default in
+	// an already bound group can wait for a pass, even on disabled startup.
+	var deferred bool
 	if route.correction == nil && normalPost && r.RecipientIDs == nil {
 		if route.recipient == "" && !route.suppressFallback {
-			if err := activeDefaultRecipientInTx(ctx, tx, r.GroupID, route.comparisonAuthor, &route.recipient); err != nil {
-				return domain.Message{}, err
+			if s.background.installed() {
+				if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM group_background_bindings WHERE group_id=?)`, r.GroupID).Scan(&deferred); err != nil {
+					return domain.Message{}, storeError("读取群组后台绑定失败", err)
+				}
+			}
+			if !deferred {
+				if err := activeDefaultRecipientInTx(ctx, tx, r.GroupID, route.comparisonAuthor, &route.recipient); err != nil {
+					return domain.Message{}, err
+				}
 			}
 		}
 		if route.recipient != "" {
@@ -140,6 +149,11 @@ func publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r MessageRequest, 
 		}
 	}
 	m.ThreadLinks = r.ThreadLinks
+	if deferred {
+		if err := recordGroupBackgroundIntent(ctx, tx, m); err != nil {
+			return domain.Message{}, storeError("保存后台调度意图失败", err)
+		}
+	}
 	return m, nil
 }
 

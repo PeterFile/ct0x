@@ -40,10 +40,23 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 	err = tx.QueryRowContext(ctx, "SELECT id FROM chat_candidates WHERE turn_id=?", scope.Claim.TurnID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		thread := domain.ThreadRef{GroupID: scope.Claim.GroupID, TopicID: scope.TopicID}
+		kind, sourceID, sourceErr := messageSourceInTx(ctx, tx, messageID)
+		if sourceErr != nil {
+			return domain.ChatCandidate{}, memberToolOperationError("读取真实来源失败", sourceErr)
+		}
 		var policy domain.ChatPolicy
 		policy, err = chatPolicyInTx(ctx, tx, thread, 0)
 		if err != nil {
 			return domain.ChatCandidate{}, memberToolOperationError("读取聊天策略失败", err)
+		}
+		if policy.Revision == 0 && kind == "local_user_chat" {
+			imported, importErr := s.materializeImportedChatAutomaticTextPolicyInTx(ctx, tx, thread)
+			if importErr != nil {
+				return domain.ChatCandidate{}, memberToolOperationError("导入群组聊天授权失败", importErr)
+			}
+			if imported.Revision > 0 {
+				policy = imported
+			}
 		}
 		var binding, dispatchPolicy int64
 		binding, dispatchPolicy, err = chatDispatchRevisionsInTx(ctx, tx, scope.Claim.GroupID)
@@ -54,10 +67,6 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 		err = coordinationDispatchWrite(ctx, tx, `INSERT INTO chat_candidates(id,group_id,topic_id,message_id,member_id,turn_id,generation,policy_revision,binding_revision,dispatch_policy_revision)
 		 VALUES(?,?,?,?,?,?,?,nullif(?,0),?,?)`, id, thread.GroupID, thread.TopicID, messageID, scope.MemberID, scope.Claim.TurnID, generation, policy.Revision, binding, dispatchPolicy)
 		if err == nil {
-			kind, sourceID, sourceErr := messageSourceInTx(ctx, tx, messageID)
-			if sourceErr != nil {
-				return domain.ChatCandidate{}, memberToolOperationError("读取真实来源失败", sourceErr)
-			}
 			digest := sha256.Sum256([]byte(scope.Claim.Token))
 			err = coordinationDispatchWrite(ctx, tx, `INSERT INTO chat_intake_executions(candidate_id,turn_id,purpose,claim_digest,source_id,source_kind) VALUES(?,?,?,?,?,?)`, id, scope.Claim.TurnID, domain.ChatIntakePurpose, digest[:], sourceID, kind)
 			if err == nil {
@@ -86,7 +95,10 @@ func (s *Store) CaptureChatCandidate(ctx context.Context, scope MemberToolScope)
 	}
 	if p := candidate.Policy.Investigation; p != nil && len(p.ClueTerms) > 0 && s.investigationExecution.Load() {
 		proposal := domain.ChatAssessment{Disposition: "prepare_work", Action: domain.ChatActionReadOnlyInvestigation}
-		err := chatAdmissionGateInTx(ctx, tx, candidate, proposal)
+		automatic, err := chatAutomaticTextPlanInTx(ctx, tx, candidate)
+		if err == nil {
+			err = chatAdmissionGateInTx(ctx, tx, candidate, proposal, automatic)
+		}
 		if err == nil {
 			_, err = s.chatInvestigationAdmissionInTx(ctx, tx, scope, candidate, proposal)
 		}

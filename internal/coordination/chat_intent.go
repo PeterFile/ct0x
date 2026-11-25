@@ -43,6 +43,12 @@ func (e *Engine) AssessChatIntent(ctx context.Context, scope store.MemberToolSco
 	return e.store.ApplyChatAssessment(ctx, scope, candidateID, input, content, key)
 }
 
+// AssessChatIntentWithAutomaticText is the trusted runtime's existing intake
+// evaluation with optional role facts; it does not expose another model tool.
+func (e *Engine) AssessChatIntentWithAutomaticText(ctx context.Context, scope store.MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string, facts store.ChatAutomaticTextFacts) (domain.ChatAssessmentReceipt, error) {
+	return e.store.ApplyChatAssessmentWithAutomaticText(ctx, scope, candidateID, input, content, key, facts)
+}
+
 // AssessChatIntentDormant records official input without native delivery. It is
 // for trusted callers explicitly choosing the attempt-only path.
 func (e *Engine) AssessChatIntentDormant(ctx context.Context, scope store.MemberToolScope, candidateID string, input domain.ChatAssessment, content, key string) (domain.ChatAssessmentReceipt, error) {

@@ -82,6 +82,41 @@ func TestPrepareAdapterDispatchCandidates(t *testing.T) {
 	}
 }
 
+func TestPrepareAutomaticTextUsesVerifiedPiRoleFacts(t *testing.T) {
+	for _, mode := range []string{"verified-pi", "unverified-pi", "codex"} {
+		t.Run(mode, func(t *testing.T) {
+			f := newRolePrepareFixture(t)
+			f.enableRuntime(t)
+			selected := f.opts.Providers[1]
+			selected.ID = "automatic-worker-provider"
+			switch mode {
+			case "unverified-pi":
+				selected.Version = "unknown"
+			case "codex":
+				selected.Name, selected.Version = provider.Codex, "0.166.0"
+				f.opts.EnableCodexAppServer = true
+			}
+			f.opts.Providers = append(f.opts.Providers, selected)
+			f.exec(t, "UPDATE members SET provider_id=? WHERE id=?", selected.ID, f.worker.ID)
+			p := f.preparer(t)
+			ctx := t.Context()
+			intake, err := f.s.GetMember(ctx, f.group.ID, f.coordinator.ID)
+			prepareRoleOK(t, err)
+			facts := p.sampleAutomaticTextRoles(ctx, intake)
+			if facts.Coordinator.MemberID != intake.ID || facts.Coordinator.ProviderID != intake.ProviderID || facts.Coordinator.Model != intake.Model {
+				t.Fatalf("lost the selected intake actor: %+v", facts.Coordinator)
+			}
+			if want := mode == "verified-pi"; (len(facts.Workers) == 1) != want || want && facts.Workers[0].ProviderID != selected.ID {
+				t.Fatalf("wrong automatic worker facts: %+v", facts.Workers)
+			}
+			intake.ProviderID = selected.ID
+			if mode != "verified-pi" && p.sampleAutomaticTextRoles(ctx, intake).Coordinator.MemberID != "" {
+				t.Fatal("unqualified coordinator provider received a role fact")
+			}
+		})
+	}
+}
+
 func TestPrepareAdapterUnavailableCandidateCannotDispatch(t *testing.T) {
 	for _, mode := range []string{"default-off", "unknown-version"} {
 		t.Run(mode, func(t *testing.T) {

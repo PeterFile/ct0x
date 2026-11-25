@@ -240,6 +240,7 @@ func (r *loop) scan(lane int, budget *int) (domain.Turn, PreparedExecution, bool
 		}
 		turn, err := r.store.ClaimTurn(r.ctx, store.ClaimTurnInput{
 			GroupID: pending.GroupID, DeliveryID: d.ID, ResourceKeys: prepared.ResourceKeys, MaxActive: r.options.MaxActive,
+			BackgroundProfile:      prepared.BackgroundProfile,
 			ThreadDecisionAnswerID: answerID,
 			PreparedThreadState:    prepared.PreparedThreadState,
 		})

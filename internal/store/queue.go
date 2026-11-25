@@ -33,7 +33,8 @@ type ClaimTurnInput struct {
 	ResourceKeys           []string // Complete canonical keys from trusted configuration, never model arguments.
 	MaxActive              int
 	PreparedThreadState    *PreparedThreadState
-	ThreadDecisionAnswerID string `json:"-"` // Required only for a trusted, typed Thread decision continuation.
+	BackgroundProfile      BackgroundDispatchProfile // Set only by trusted tool-free preparation.
+	ThreadDecisionAnswerID string                    `json:"-"` // Required only for a trusted, typed Thread decision continuation.
 }
 
 // ListPendingDeliveries scans FIFO; callers must continue after resource conflicts.
@@ -50,6 +51,10 @@ func (s *Store) ListPendingDeliveries(ctx context.Context, options PendingOption
 	 JOIN messages msg ON msg.id=d.message_id AND msg.group_id=d.group_id
 	 WHERE d.state='queued' AND d.turn_id='' AND m.status='active'
 	 AND NOT EXISTS(SELECT 1 FROM turns WHERE (conversation_id=d.conversation_id OR member_id=d.recipient_id) AND ` + activeTurnPredicate + `)`
+	// A disabled dispatcher cannot advance its backlog; don't let it block ordinary deliveries.
+	if s.background.enabled.Load() {
+		query += " AND NOT " + groupBackgroundEarlierSQL
+	}
 	// A handled redundant wake stays in history but cannot consume a scheduler
 	// slot. ClaimTurn rechecks the same fact transactionally against races.
 	supported, err := taskWorkSchemaSupportedInTx(ctx, s.db)

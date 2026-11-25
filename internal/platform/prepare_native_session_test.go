@@ -197,8 +197,14 @@ func TestNativeSessionPreparePiNonRoleThinkingIsIndependent(t *testing.T) {
 func TestNativeSessionPreparePiOrdinaryQuoteSchemaCompatibility(t *testing.T) {
 	f, prepared := nativeSessionPreparation(t, "generic")
 	legacy := f.opts.PiMemberToolsExtension
-	// The schema describes the tool, not this message or the DB's quote support.
+	// Dropping a registered table must fail closed rather than falling back.
 	f.exec(t, "DROP TABLE IF EXISTS message_quotes")
+	if _, err := f.preparer(t).Prepare(t.Context(), f.pending); err == nil {
+		t.Fatal("missing message_quotes while registered must fail closed")
+	}
+	// On an intact database, the quote schema describes the tool, not this message.
+	f, prepared = nativeSessionPreparation(t, "generic")
+	legacy = f.opts.PiMemberToolsExtension
 	useReleasePiBridge(t, f)
 	quote := f.opts.PiMemberToolsExtension
 	upgraded, err := f.preparer(t).Prepare(t.Context(), f.pending)
