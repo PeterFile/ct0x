@@ -767,7 +767,7 @@ func TestIntentPassCancellationAndQueryFailure(t *testing.T) {
 		if !reflect.DeepEqual(before, engineCoordinatorSnapshot(t, f.db)) {
 			t.Fatal("pre-cancelled pass wrote rows")
 		}
-		ctx, cancel = context.WithCancel(context.Background())
+		ctx, cancel = context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 		calls := 0
 		p.now = func() time.Time {
@@ -777,7 +777,7 @@ func TestIntentPassCancellationAndQueryFailure(t *testing.T) {
 			}
 			return base
 		}
-		if err := p.run(ctx); !errors.Is(err, context.Canceled) {
+		if err := p.observe(ctx); !errors.Is(err, context.Canceled) {
 			t.Fatalf("mid-pass cancellation not exposed: %v", err)
 		}
 		rows := engineLocalRows(t, f.db, "SELECT request_id FROM coordination_dispatch_state WHERE status='enqueued'")
@@ -785,7 +785,9 @@ func TestIntentPassCancellationAndQueryFailure(t *testing.T) {
 			t.Fatalf("cancellation did extra work or lost completed cursor: %v %+v", rows, p)
 		}
 		p.now = func() time.Time { return base.Add(time.Hour) }
-		if err := p.run(context.Background()); err != nil {
+		resumeCtx, resumeCancel := context.WithTimeout(context.Background(), 120*time.Second)
+		defer resumeCancel()
+		if err := p.observe(resumeCtx); err != nil {
 			t.Fatal(err)
 		}
 		if rows := engineLocalRows(t, f.db, "SELECT request_id FROM coordination_dispatch_state WHERE status='enqueued'"); len(rows) != 3 || p.cutoff != base {
