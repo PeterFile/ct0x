@@ -26,7 +26,7 @@ def prefix(context):
 def validate_plan(plan, expected):
     check(isinstance(plan, dict) and set(plan) == {"schema", "identity", "base", "master_oid", "inventories", "monolith", "schedule"},
           "试验计划字段不完整或多余")
-    check(type(plan["schema"]) is int and plan["schema"] == 1 and plan["identity"] == expected and
+    check(type(plan["schema"]) is int and plan["schema"] == 1 and plan_module.key(plan["identity"]) == plan_module.key(expected) and
           set(expected) == IDENTITY_FIELDS, "计划与实际 run/attempt/控制器/产品/方案身份不符")
     plan_module.parameters(expected["scheme"], expected["repeat"], expected["shard_parallel"])
     for field in ("run_id", "attempt"):
@@ -51,7 +51,7 @@ def read_receipt(directory, context, job, number, payload):
     check(path.is_file() and not path.is_symlink(), "回执不是普通文件")
     receipt = verifier.decode(path.read_text())
     check(isinstance(receipt, dict) and set(receipt) == {"schema", "identity", "job", "job_number", payload}, "作业回执字段非法")
-    check(type(receipt["schema"]) is int and receipt["schema"] == 1 and receipt["identity"] == context and
+    check(type(receipt["schema"]) is int and receipt["schema"] == 1 and plan_module.key(receipt["identity"]) == plan_module.key(context) and
           receipt["job"] == job and type(receipt["job_number"]) is int and receipt["job_number"] == number,
           "作业回执混入其他 run/attempt/方案/runner 身份")
     return receipt[payload]

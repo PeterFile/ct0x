@@ -273,6 +273,7 @@ class ReceiptTests(unittest.TestCase):
             original = path.read_text()
             valid = json.loads(original)
             for field, value in [("attempt", "2"), ("run_id", "43"), ("scheme", "b"), ("shard_parallel", 8),
+                                 ("repeat", True), ("shard_parallel", 12.0),
                                  ("controller_sha", "9" * 40), ("controller_tree", "8" * 40),
                                  ("checkout_sha", "7" * 40), ("checkout_tree", "6" * 40)]:
                 receipt = copy.deepcopy(valid)
@@ -433,8 +434,55 @@ class PublicJobTests(unittest.TestCase):
         self.enterContext(mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "PeterFile/ct0x", "GH_TOKEN": ""}))
         self.response(self.data)
 
-    def response(self, data):
-        self.request.return_value.__enter__.return_value.read.return_value = json.dumps(data).encode()
+    def response(self, data, *following):
+        self.request.reset_mock()
+        self.sleep.reset_mock()
+        self.request.side_effect = None
+        read = self.request.return_value.__enter__.return_value.read
+        read.return_value = json.dumps(data).encode()
+        read.side_effect = [json.dumps(snapshot).encode() for snapshot in (data, *following)] if following else None
+
+    def pending_snapshots(self):
+        mutations = [lambda d: d["jobs"].clear()]
+        for index in (0, 4, 5, 8):
+            mutations.append(lambda d, i=index: d["jobs"].pop(i))
+            states = ("queued", "waiting", "requested", "pending") if index == 4 else ("queued", "in_progress")
+            mutations += [lambda d, i=index, s=status: d["jobs"][i].update(
+                status=s, conclusion=None, completed_at=None,
+                started_at=d["jobs"][i]["started_at"] if s == "in_progress" else None) for status in states]
+        for mutate in mutations:
+            data = copy.deepcopy(self.data)
+            mutate(data)
+            data["total_count"] = len(data["jobs"])
+            yield data
+
+    def test_missing_or_nonterminal_jobs_refetch_once_before_success(self):
+        for index, pending in enumerate(self.pending_snapshots()):
+            with self.subTest(snapshot=index):
+                self.response(pending, {**self.data, "jobs": list(reversed(self.data["jobs"]))})
+                result = self.driver.public_job_numbers(self.context, self.plan)
+                self.assertEqual([row["id"] for row in result], list(range(1, 10)))
+                self.assertEqual(self.request.call_count, 2)
+                self.sleep.assert_called_once_with(10)
+
+    def test_two_pending_snapshots_are_explicitly_unverified(self):
+        for index, pending in enumerate(self.pending_snapshots()):
+            with self.subTest(snapshot=index):
+                self.response(pending)
+                with self.assertRaisesRegex(ValueError, "未核实") as failure:
+                    self.driver.public_job_numbers(self.context, self.plan)
+                self.assertNotIn("回归", str(failure.exception))
+                self.assertEqual(self.request.call_count, 2)
+                self.sleep.assert_called_once_with(10)
+        first, second = copy.deepcopy(self.data), copy.deepcopy(self.data)
+        for snapshot, index in ((first, 0), (second, 4)):
+            snapshot["jobs"].pop(index)
+            snapshot["total_count"] -= 1
+        self.response(first, second)
+        with self.assertRaisesRegex(ValueError, "未核实"):
+            self.driver.public_job_numbers(self.context, self.plan)
+        self.assertEqual(self.request.call_count, 2)
+        self.sleep.assert_called_once_with(10)
 
     def test_optional_token_is_only_in_get_header(self):
         for token in (None, "", "  ", "test-private-token"):
@@ -452,33 +500,84 @@ class PublicJobTests(unittest.TestCase):
                 self.assertEqual(len(result), 9)
                 self.assertNotIn("test-private-token", json.dumps(result) + output.getvalue())
 
-    def test_incomplete_extra_mixed_or_inconsistent_jobs_fail_closed(self):
-        mutations = [lambda d: d["jobs"].pop(),
-                     lambda d: d["jobs"].append(copy.deepcopy(d["jobs"][0])),
+    def test_invalid_jobs_fail_without_retry_even_with_a_pending_peer(self):
+        mutations = [lambda d: d["jobs"].append(copy.deepcopy(d["jobs"][0])),
                      lambda d: d["jobs"].append({**d["jobs"][0], "id": 100, "name": "unexpected wrapper"}),
                      lambda d: d["jobs"][0].update(id=d["jobs"][1]["id"]),
                      lambda d: d["jobs"][0].update(id=True),
                      lambda d: d["jobs"][0].update(run_id=43),
                      lambda d: d["jobs"][0].update(run_attempt=2),
                      lambda d: d["jobs"][0].update(head_sha="a" * 40),
-                     lambda d: d["jobs"][0].update(name=None)]
+                     lambda d: d["jobs"][0].update(name=None),
+                     lambda d: d["jobs"][0].update(name="unexpected wrapper"),
+                     lambda d: d["jobs"][0].update(name=d["jobs"][1]["name"]),
+                     lambda d: d["jobs"][0].update(started_at=[]),
+                     lambda d: d["jobs"][0].update(completed_at={}),
+                     lambda d: d["jobs"].__setitem__(0, None)]
+        mutations += [lambda d, f=field: d["jobs"][0].pop(f) for field in self.data["jobs"][0]]
         for index in range(len(self.data["jobs"])):
-            states = [("completed", "success"), ("in_progress", "success"), ("queued", None)] if index == 4 else [
-                ("in_progress", "success"), ("completed", "failure"), ("completed", "skipped"),
-                ("completed", "cancelled"), ("completed", None)]
+            states = [("in_progress", "success"), ("queued", "failure"), ("unknown", None), (None, None),
+                      ([], None), ("completed", None), ("completed", []), ("completed", {})]
+            states += [("completed", conclusion) for conclusion in (
+                "failure", "skipped", "cancelled", "timed_out", "action_required", "neutral")]
+            if index == 4:
+                states.append(("completed", "success"))
             mutations += [lambda d, i=index, s=status, c=conclusion: d["jobs"][i].update(status=s, conclusion=c)
                           for status, conclusion in states]
         for index, mutate in enumerate(mutations):
-            data = copy.deepcopy(self.data)
-            mutate(data)
-            data["total_count"] = len(data["jobs"])
-            self.response(data)
-            with self.subTest(mutation=index), self.assertRaises(ValueError):
-                self.driver.public_job_numbers(self.context, self.plan)
+            for pending_peer in (None, "queued", "missing"):
+                data = copy.deepcopy(self.data)
+                mutate(data)
+                if pending_peer:
+                    # Keep the malformed row and any duplicate pair intact.
+                    peer = next(row for row in data["jobs"] if row in self.data["jobs"][-2:])
+                    data["jobs"].remove(peer)
+                    if pending_peer == "queued":
+                        peer.update(status="queued", conclusion=None, completed_at=None)
+                        data["jobs"].insert(0, peer)
+                data["total_count"] = len(data["jobs"])
+                self.response(data, self.data)
+                with self.subTest(mutation=index, pending_peer=pending_peer):
+                    with self.assertRaises(ValueError):
+                        self.driver.public_job_numbers(self.context, self.plan)
+                    self.assertEqual(self.request.call_count, 1)
+                    self.sleep.assert_not_called()
         for total in (0, 100, True):
-            self.response({**self.data, "total_count": total})
-            with self.subTest(total=total), self.assertRaises(ValueError):
-                self.driver.public_job_numbers(self.context, self.plan)
+            self.response({**self.data, "total_count": total}, self.data)
+            with self.subTest(total=total):
+                with self.assertRaises(ValueError):
+                    self.driver.public_job_numbers(self.context, self.plan)
+                self.assertEqual(self.request.call_count, 1)
+                self.sleep.assert_not_called()
+
+    def test_pending_and_http_errors_share_the_two_get_budget(self):
+        pending = next(self.pending_snapshots())
+        for error in (HTTPError("https://api.github.com", 503, "temporary", {}, None), URLError("temporary")):
+            with self.subTest(error=type(error).__name__, first="http"):
+                self.response(pending)
+                self.request.side_effect = [error, self.request.return_value]
+                with self.assertRaisesRegex(ValueError, "未核实"):
+                    self.driver.public_job_numbers(self.context, self.plan)
+                self.assertEqual(self.request.call_count, 2)
+                self.assertEqual(self.sleep.call_count, 1)
+            with self.subTest(error=type(error).__name__, first="pending"):
+                self.response(pending)
+                self.request.side_effect = [self.request.return_value, error]
+                with self.assertRaisesRegex(ValueError, "读取公开作业编号失败"):
+                    self.driver.public_job_numbers(self.context, self.plan)
+                self.assertEqual(self.request.call_count, 2)
+                self.sleep.assert_called_once_with(10)
+
+    def test_malformed_response_is_not_retried(self):
+        for raw in (b"{", b'{"total_count":9,"total_count":9,"jobs":[]}', b"[]", b"null",
+                    b'{"total_count":0,"jobs":{}}'):
+            with self.subTest(raw=raw):
+                self.response(self.data)
+                self.request.return_value.__enter__.return_value.read.side_effect = [raw, json.dumps(self.data).encode()]
+                with self.assertRaises(ValueError):
+                    self.driver.public_job_numbers(self.context, self.plan)
+                self.assertEqual(self.request.call_count, 1)
+                self.sleep.assert_not_called()
 
     def test_http_failure_hides_credentials_and_retries_only_transients_once(self):
         for error, calls in ((HTTPError("https://api.github.com", 403, "test-private-token", {}, None), 1),
@@ -589,6 +688,8 @@ class WorkflowTests(unittest.TestCase):
         text = (SCRIPTS.parent / "workflows/full-trial.yml").read_text()
         for key in ("workflow_call:", "sha:", "scheme:", "repeat:", "shard_parallel:"):
             self.assertIn(key, text)
+        self.assertEqual(set(re.findall(r"^  ([\w-]+):$", text.split("jobs:\n", 1)[1], re.M)),
+                         {"preflight", "go-shards", "go-workspace", "go-other", "go-vet", "go-benchmarks", "aggregate"})
         self.assertIn("fail-fast: false", text)
         self.assertIn("!cancelled()", text)
         self.assertNotIn("secrets:", text)

@@ -231,11 +231,14 @@ def public_job_numbers(context, plan):
     token = os.environ.get("GH_TOKEN", "").strip()
     if token:
         headers["Authorization"] = "Bearer " + token
+    expected = ["Trial preflight", "Go ordinary and remaining race", "Go vet and CI gates", "Go benchmarks", "Trial final receipt"]
+    expected += [f"Trial shard {i}" for i in range(len(plan["schedule"]["shards"]))]
+    expected += [f"Trial workspace {i}" for i in plan["schedule"]["workspace"]]
+    fields = {"id", "name", "run_id", "head_sha", "run_attempt", "status", "conclusion", "started_at", "completed_at"}
     for attempt in range(2):
         try:
             with urlopen(Request(url, headers=headers), timeout=20) as response:
                 data = verifier.decode(response.read().decode())
-            break
         except (HTTPError, URLError) as error:
             if isinstance(error, HTTPError):
                 error.close()
@@ -243,30 +246,34 @@ def public_job_numbers(context, plan):
                 detail = f"HTTP {error.code}" if isinstance(error, HTTPError) else "网络错误"
                 raise ValueError("读取公开作业编号失败：" + detail) from None
             time.sleep(1)
-    check(isinstance(data, dict) and type(data.get("total_count")) is int and isinstance(data.get("jobs"), list),
-          "公开作业编号列表非法")
-    jobs = data["jobs"]
-    check(data["total_count"] == len(jobs) and len(jobs) <= 100, "公开作业编号列表不完整")
-    expected = ["Trial preflight", "Go ordinary and remaining race", "Go vet and CI gates", "Go benchmarks", "Trial final receipt"]
-    expected += [f"Trial shard {i}" for i in range(len(plan["schedule"]["shards"]))]
-    expected += [f"Trial workspace {i}" for i in plan["schedule"]["workspace"]]
-    check(len(jobs) == len(expected), "公开作业集合缺失或多余")
-    fields = {"id", "name", "run_id", "head_sha", "run_attempt", "status", "conclusion", "started_at", "completed_at"}
-    check(all(isinstance(row, dict) and fields <= row.keys() and isinstance(row["name"], str) and
-              type(row["id"]) is int and row["id"] > 0 for row in jobs), "公开作业编号字段非法")
-    check(len({row["id"] for row in jobs}) == len(jobs), "公开作业编号重复")
-    result = []
-    for name in expected:
-        matches = [row for row in jobs if row["name"] == name or row["name"].endswith(" / " + name)]
-        check(len(matches) == 1, "公开作业编号缺失或重复：" + name)
-        row = matches[0]
-        check(type(row["id"]) is int and row["id"] > 0 and str(row["run_id"]) == context["run_id"] and
-              row["head_sha"] == context["controller_sha"] and str(row["run_attempt"]) == context["attempt"],
-              "公开作业编号与本次 run/attempt/控制器不符")
-        status = ("in_progress", None) if name == "Trial final receipt" else ("completed", "success")
-        check((row["status"], row["conclusion"]) == status, "公开作业状态不是当前完整成功执行：" + name)
-        result.append({key: row[key] for key in ("id", "name", "status", "conclusion", "started_at", "completed_at")})
-    return result
+            continue
+        check(isinstance(data, dict) and type(data.get("total_count")) is int and isinstance(data.get("jobs"), list),
+              "公开作业编号列表非法")
+        jobs = data["jobs"]
+        check(data["total_count"] == len(jobs) and len(jobs) <= 100, "公开作业编号列表不完整")
+        check(all(isinstance(row, dict) and fields <= row.keys() and isinstance(row["name"], str) and
+                  type(row["id"]) is int and row["id"] > 0 and
+                  all(row[key] is None or isinstance(row[key], str) for key in ("started_at", "completed_at"))
+                  for row in jobs), "公开作业编号字段非法")
+        check(len({row["id"] for row in jobs}) == len(jobs), "公开作业编号重复")
+        result, pending = {}, False
+        for row in jobs:
+            matches = [name for name in expected if row["name"] == name or row["name"].endswith(" / " + name)]
+            check(len(matches) == 1, "公开作业集合包含非预期作业")
+            name = matches[0]
+            check(name not in result, "公开作业编号重复：" + name)
+            check(str(row["run_id"]) == context["run_id"] and row["head_sha"] == context["controller_sha"] and
+                  str(row["run_attempt"]) == context["attempt"], "公开作业编号与本次 run/attempt/控制器不符")
+            status = ("in_progress", None) if name == "Trial final receipt" else ("completed", "success")
+            if (row["status"], row["conclusion"]) != status:
+                check(row["status"] in ("queued", "in_progress", "waiting", "requested", "pending") and
+                      row["conclusion"] is None, "公开作业状态不是当前完整成功执行：" + name)
+                pending = True
+            result[name] = {key: row[key] for key in ("id", "name", "status", "conclusion", "started_at", "completed_at")}
+        if len(result) == len(expected) and not pending:
+            return [result[name] for name in expected]
+        check(not attempt, "公开作业状态未核实：预期作业尚未可见或仍为非终态，请等待 REST 同步后重试")
+        time.sleep(10)
 
 
 def aggregate(plan, context):
