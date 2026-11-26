@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"agentworkspace/internal/preflight"
 )
 
 const codexAppServerMemberConfigLimit = 4096
@@ -38,6 +40,13 @@ type memberToolConfig struct {
 // Trusted, stable ancestors are required. Descriptor and path checks detect
 // replacement/metadata drift, not hostile ancestor mutation or ABA writes.
 func readMemberToolConfigFile(path string) ([]byte, os.FileInfo, error) {
+	return readMemberToolConfigFileContext(context.Background(), path)
+}
+
+func readMemberToolConfigFileContext(ctx context.Context, path string) ([]byte, os.FileInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
 	if !filepath.IsAbs(path) || strings.ContainsRune(path, 0) {
 		return nil, nil, errPiMemberToolConfiguration
 	}
@@ -45,6 +54,9 @@ func readMemberToolConfigFile(path string) ([]byte, os.FileInfo, error) {
 	before, err := os.Lstat(path)
 	if err != nil || before.Mode() != 0600 || before.Size() <= 0 || before.Size() > codexAppServerMemberConfigLimit {
 		return nil, nil, errPiMemberToolConfiguration
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
 	}
 	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -62,7 +74,11 @@ func readMemberToolConfigFile(path string) ([]byte, os.FileInfo, error) {
 		_ = file.Close()
 		return nil, nil, errPiMemberToolConfiguration
 	}
-	raw, readErr := io.ReadAll(io.LimitReader(file, codexAppServerMemberConfigLimit+1))
+	raw, readErr := io.ReadAll(io.LimitReader(preflight.Reader(ctx, file), codexAppServerMemberConfigLimit+1))
+	if err := ctx.Err(); err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
 	finished, finishErr := file.Stat()
 	closeErr := file.Close()
 	after, pathErr := os.Lstat(path)
@@ -76,6 +92,10 @@ func readMemberToolConfig(path string) (memberToolConfig, error) {
 	return readMemberToolConfigMode(path, false, false, false)
 }
 
+func readMemberToolConfigContext(ctx context.Context, path string) (memberToolConfig, error) {
+	return readMemberToolConfigModeContext(ctx, path, false, false, false)
+}
+
 func readPiMemberToolConfig(path string, strict bool) (memberToolConfig, error) {
 	return readMemberToolConfigMode(path, true, strict, false)
 }
@@ -85,8 +105,15 @@ func readPiProjectExperienceConfig(path string) (memberToolConfig, error) {
 }
 
 func readMemberToolConfigMode(path string, pi, strict, projectExperience bool) (memberToolConfig, error) {
-	raw, file, err := readMemberToolConfigFile(path)
+	return readMemberToolConfigModeContext(context.Background(), path, pi, strict, projectExperience)
+}
+
+func readMemberToolConfigModeContext(ctx context.Context, path string, pi, strict, projectExperience bool) (memberToolConfig, error) {
+	raw, file, err := readMemberToolConfigFileContext(ctx, path)
 	if err != nil {
+		return memberToolConfig{}, err
+	}
+	if err := ctx.Err(); err != nil {
 		return memberToolConfig{}, err
 	}
 	var config memberToolConfig

@@ -306,6 +306,7 @@ func TestMemberToolRuntimeConfigPermissionsChangeStillCleansOwnedFile(t *testing
 			got := executor.Execute(context.Background(), f.request, nil)
 			if phase == "factory" {
 				f.requirePreparationReceipt(t, got, provider.OutcomeNotStarted)
+				f.requireEmptyRunReservation(t)
 				if nativeCalled {
 					t.Error("unsafe config permissions reached native execution")
 				}
@@ -394,7 +395,11 @@ func TestMemberToolRuntimeCleanupOnlyOwnedConfig(t *testing.T) {
 			if err != nil || string(data) != "outside-marker" {
 				t.Fatal("cleanup modified outside marker")
 			}
-			memberToolRuntimeEmpty(t, f.request.RuntimeDir)
+			if strings.HasPrefix(replacement, "factory-") {
+				f.requireEmptyRunReservation(t)
+			} else {
+				memberToolRuntimeEmpty(t, f.request.RuntimeDir)
+			}
 			f.requireUnsettled(t, domain.TurnStateStarting)
 		})
 	}

@@ -30,7 +30,7 @@ func (r *MemberToolRuntime) WrapCoordinationRoleWithCapabilities(binding MemberT
 
 func (r *MemberToolRuntime) wrapCoordinationRole(binding MemberToolRunBinding, expected store.CoordinationRoleProvenance, facts []store.DispatchWorkerCapabilityFact,
 	factory MemberToolExecutorFactory, investigation *investigationRolePreparation) (provider.Executor, error) {
-	if r.roleFence == nil || (binding.ProviderName != provider.Pi && binding.ProviderName != provider.Codex) || !memberToolRuntimeText(binding.ProviderID) || len(binding.Model) > 256 || !memberToolRuntimeText(binding.Model) ||
+	if r.roleFence == nil || (binding.ProviderName != provider.Pi && binding.ProviderName != provider.Codex && binding.ProviderName != provider.Agy) || !memberToolRuntimeText(binding.ProviderID) || len(binding.Model) > 256 || !memberToolRuntimeText(binding.Model) ||
 		expected.GroupID != binding.GroupID || expected.MemberID != binding.MemberID || expected.ConversationID != binding.ConversationID || expected.DeliveryID != binding.DeliveryID ||
 		expected.SourceKind != "" || expected.SourceID != "" || expected.TaskRevision < 1 || (expected.Kind != store.CoordinationRoleCoordinator && expected.Kind != store.CoordinationRoleWorker) ||
 		(expected.Kind == store.CoordinationRoleCoordinator && expected.AssignmentID != "") || (expected.Kind == store.CoordinationRoleWorker && !memberToolRuntimeText(expected.AssignmentID)) {
@@ -205,7 +205,7 @@ func (e *memberToolRuntimeRun) executeCoordinationRole(ctx context.Context, requ
 	operations := slices.Clone(entry.grants.Operations)
 	r.tools.mu.RUnlock()
 	workspace := slices.Contains(operations, "workspace_write")
-	if !found || workspace && e.binding.ProviderName == provider.Codex {
+	if !found || workspace && (e.binding.ProviderName == provider.Codex || e.binding.ProviderName == provider.Agy) {
 		return unknown
 	}
 	startupFailure := func() provider.ExecutionReceipt {

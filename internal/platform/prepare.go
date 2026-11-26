@@ -39,6 +39,7 @@ type PrepareOptions struct {
 	MemberTools             *MemberToolRuntime
 	PiMemberToolsExtension  string
 	EnableCodexAppServer    bool          // Default false; requires the role-enabled runtime.
+	EnableAgyACP            bool          // Default false; opts into experimental Agy ACP stdio + HTTP MCP.
 	EnablePiDiscussionRelay bool          // Requires the trusted chat intake and the qualified Pi bridge pair.
 	HistoryLimit            int           // Zero defaults to 50; explicit range is 1..200.
 	MaxContextBytes         int           // Zero: 16 KiB ordinary, RoleMaxContextBytes for trusted chat intake; maximum 1 MiB.
@@ -49,8 +50,8 @@ type PrepareOptions struct {
 	// EnablePiProjectExperience selects only the exact fresh Pi transport.
 	// The optional reader borrows the existing same-Store blob owner; it does
 	// not grant anything without a durable LocalUser approval.
-	EnablePiProjectExperience    bool
-	PiProjectExperienceArtifacts *MemberArtifactGrant
+	EnablePiProjectExperience  bool
+	ProjectExperienceArtifacts *MemberArtifactGrant
 
 	Investigation             *InvestigationPreparationOptions
 	EnableNativeSessionResume bool   // Experimental, default false; requires member tools and an opted-in adapter.
@@ -64,27 +65,28 @@ type preparationRecipient struct{ group, member string }
 // root ancestors trusted and directory identities stable while runs are claimed.
 // This is local coordination, not protection against hostile host filesystem edits.
 type Preparer struct {
-	store                        *store.Store
-	providers                    map[string]provider.Provider
-	grants                       map[preparationRecipient]int
-	privateRoot                  string
-	privateDataRoot              string
-	privateDataKey               string
-	roots, rootKeys              []string
-	historyLimit                 int
-	maxContextBytes              int
-	defaultContextBudget         bool
-	roleHistoryLimit             int
-	roleMaxContextBytes          int
-	roleThinking                 string
-	executionTimeout             time.Duration
-	memberTools                  *MemberToolRuntime
-	piMemberToolsExtension       string
-	piDiscussionSchema           bool
-	piDiscussionRelay            bool
-	enableCodexAppServer         bool
-	piProjectExperience          bool
-	piProjectExperienceArtifacts *MemberArtifactGrant
+	store                      *store.Store
+	providers                  map[string]provider.Provider
+	grants                     map[preparationRecipient]int
+	privateRoot                string
+	privateDataRoot            string
+	privateDataKey             string
+	roots, rootKeys            []string
+	historyLimit               int
+	maxContextBytes            int
+	defaultContextBudget       bool
+	roleHistoryLimit           int
+	roleMaxContextBytes        int
+	roleThinking               string
+	executionTimeout           time.Duration
+	memberTools                *MemberToolRuntime
+	piMemberToolsExtension     string
+	piDiscussionSchema         bool
+	piDiscussionRelay          bool
+	enableCodexAppServer       bool
+	piProjectExperience        bool
+	projectExperienceArtifacts *MemberArtifactGrant
+	enableAgyACP               bool
 
 	investigation             *investigationPreparationSettings
 	enableNativeSessionResume bool
@@ -157,10 +159,10 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 	if opts.NativePiThinking != "" && (!opts.EnableNativeSessionResume || path == "" || !validNativePiThinking(opts.NativePiThinking)) {
 		return errPrepareConfig
 	}
-	if r == nil && path == "" && !opts.EnableCodexAppServer && !opts.EnableNativeSessionResume && !opts.EnablePiProjectExperience && opts.PiProjectExperienceArtifacts == nil {
+	if r == nil && path == "" && !opts.EnableCodexAppServer && !opts.EnableAgyACP && !opts.EnableNativeSessionResume && !opts.EnablePiProjectExperience && opts.ProjectExperienceArtifacts == nil {
 		return nil
 	}
-	if r == nil || path == "" && !opts.EnableCodexAppServer || r.tools == nil || r.tools.db != p.store || r.tools.capabilities == nil ||
+	if r == nil || path == "" && !opts.EnableCodexAppServer && !opts.EnableAgyACP || r.tools == nil || r.tools.db != p.store || r.tools.capabilities == nil ||
 		opts.EnableCodexAppServer && r.roleFence == nil ||
 		r.rootInfo == nil || !filepath.IsAbs(r.configRoot) || !filepath.IsAbs(r.resolvedRoot) ||
 		!memberToolRuntimeEndpoint(r.endpoint) || r.maxGroupMembers < 1 || r.maxGroupMembers > 200 || !r.rootValid() {
@@ -198,19 +200,19 @@ func (p *Preparer) configureMemberTools(opts PrepareOptions) error {
 			return errPrepareConfig
 		}
 	}
-	p.memberTools, p.piMemberToolsExtension, p.enableCodexAppServer = r, path, opts.EnableCodexAppServer
+	p.memberTools, p.piMemberToolsExtension, p.enableCodexAppServer, p.enableAgyACP = r, path, opts.EnableCodexAppServer, opts.EnableAgyACP
 	p.piDiscussionRelay = opts.EnablePiDiscussionRelay && r.tools.chatEngine != nil && provider.PiDiscussionRelayBridgeSupported(path)
 	p.piDiscussionSchema = p.piDiscussionRelay || provider.PiInvestigationBridgeSupported(path)
 	if opts.EnablePiProjectExperience && (!slices.Contains(r.operations, "read_history") || !provider.PiProjectExperienceBridgeSupported(path)) {
 		return errPrepareConfig
 	}
 	p.piProjectExperience = opts.EnablePiProjectExperience
-	if reader := opts.PiProjectExperienceArtifacts; reader != nil {
-		if !p.piProjectExperience || reader.db != p.store || reader.open == nil || reader.pin != (domain.ArtifactVersionRef{}) {
+	if reader := opts.ProjectExperienceArtifacts; reader != nil {
+		if (!p.piProjectExperience && !p.enableAgyACP) || reader.db != p.store || reader.open == nil || reader.pin != (domain.ArtifactVersionRef{}) {
 			return errPrepareConfig
 		}
 		borrowed := *reader
-		p.piProjectExperienceArtifacts = &borrowed
+		p.projectExperienceArtifacts = &borrowed
 	}
 	p.enableNativeSessionResume, p.nativePiThinking = opts.EnableNativeSessionResume, opts.NativePiThinking
 	return nil
@@ -333,7 +335,10 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			return empty, err
 		}
 	}
-	projectExperience := useMemberTools && p.piProjectExperience && !nativeText && selected.Name == provider.Pi &&
+	agyExperience := useMemberTools && p.enableAgyACP && selected.Name == provider.Agy && selection.Protocol == provider.ACPV1Protocol &&
+		slices.Contains(p.memberTools.operations, "read_history")
+	piExperience := useMemberTools && p.piProjectExperience && selected.Name == provider.Pi
+	projectExperience := (piExperience || agyExperience) && !nativeText &&
 		!intakeSchema.investigation && !(intake && p.memberTools.tools.continueWorkEnabled())
 	var artifactRead *preparedDeliveryArtifactRead
 	// Sender and source metadata are part of the proof, not preconditions for
@@ -344,10 +349,10 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			return empty, preparationReadError(ctx, err)
 		}
 		if pin != (domain.ArtifactVersionRef{}) {
-			if p.piProjectExperienceArtifacts == nil {
+			if p.projectExperienceArtifacts == nil {
 				return empty, scheduler.ErrNotReady
 			}
-			artifactRead = &preparedDeliveryArtifactRead{pin: pin, owner: p.piProjectExperienceArtifacts}
+			artifactRead = &preparedDeliveryArtifactRead{pin: pin, owner: p.projectExperienceArtifacts}
 		}
 	}
 	var quote *store.DeliveryQuote
@@ -396,8 +401,12 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 		}
 		if projectExperience {
 			run.projectExperienceArtifactRead = artifactRead
-			run.projectExperienceBuilder = func(config provider.NativeMemberToolConfig) (provider.Executor, error) {
-				return provider.NewPiProjectExperienceExecutor(selected, p.piMemberToolsExtension, config, p.executionTimeout)
+			if agyExperience {
+				run.projectExperienceMCP = true
+			} else {
+				run.projectExperienceBuilder = func(config provider.NativeMemberToolConfig) (provider.Executor, error) {
+					return provider.NewPiProjectExperienceExecutor(selected, p.piMemberToolsExtension, config, p.executionTimeout)
+				}
 			}
 		} else if intakeSchema.requiresIssuedPiConfig() {
 			run.intakeBuilder = func(config provider.NativeMemberToolConfig) (provider.Executor, error) {
@@ -687,6 +696,11 @@ func (p *Preparer) buildExecutionContext(group domain.Group, member domain.Membe
 					in.Permissions[0] = "仅支持所选 Codex AppServer 版本的全新单轮执行；不支持恢复或运行中追加输入。"
 				}
 				in.Permissions = append(in.Permissions, codexNativeTextPermission)
+			} else if enabled && selection.Protocol == provider.ACPV1Protocol {
+				if p.memberTools.tools.chatEngine == nil {
+					in.Permissions[0] = "仅支持所选 ACP 版本的全新单轮执行；不支持恢复或运行中追加输入。"
+				}
+				in.Permissions = append(in.Permissions, agyNativeTextPermission)
 			}
 		}
 		if nativeText {

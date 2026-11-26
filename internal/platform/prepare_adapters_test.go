@@ -277,7 +277,7 @@ func executePreparedAdapterFixture(t *testing.T, f *rolePrepareFixture, prepared
 }
 
 func TestPrepareAdaptersShareOrdinaryRoleSubmissionReviewChain(t *testing.T) {
-	for _, name := range []string{provider.Pi, provider.Codex} {
+	for _, name := range []string{provider.Pi, provider.Codex, provider.Agy} {
 		t.Run(name, func(t *testing.T) {
 			f := newRolePrepareFixture(t)
 			f.enableRuntime(t)
@@ -285,6 +285,9 @@ func TestPrepareAdaptersShareOrdinaryRoleSubmissionReviewChain(t *testing.T) {
 			if name == provider.Codex {
 				f.opts.Providers[1].Name, f.opts.Providers[1].Version = name, "0.166.0"
 				f.opts.EnableCodexAppServer, f.opts.PiMemberToolsExtension = true, ""
+			} else if name == provider.Agy {
+				f.opts.Providers[1].Name, f.opts.Providers[1].Version = name, "1.5.16"
+				f.opts.EnableAgyACP, f.opts.PiMemberToolsExtension = true, ""
 			}
 			p := f.preparer(t)
 			ctx := context.Background()
@@ -319,7 +322,7 @@ func TestPrepareAdaptersShareOrdinaryRoleSubmissionReviewChain(t *testing.T) {
 			f.selectDelivery(t, materialized.Delivery.MessageID)
 			worker, err := p.Prepare(ctx, f.pending)
 			prepareRoleOK(t, err)
-			if name == provider.Codex && (worker.Request.Thinking != "" || coordinator.Request.Thinking != "") || name == provider.Pi && worker.Request.Thinking != "max" {
+			if (name == provider.Codex || name == provider.Agy) && (worker.Request.Thinking != "" || coordinator.Request.Thinking != "") || name == provider.Pi && worker.Request.Thinking != "max" {
 				t.Fatal("adapter-specific role thinking selection changed")
 			}
 			var submission domain.Submission
@@ -344,13 +347,16 @@ func TestPrepareAdaptersShareOrdinaryRoleSubmissionReviewChain(t *testing.T) {
 }
 
 func TestPrepareAdaptersCancelUnknownKeepsResources(t *testing.T) {
-	for _, name := range []string{provider.Pi, provider.Codex} {
+	for _, name := range []string{provider.Pi, provider.Codex, provider.Agy} {
 		t.Run(name, func(t *testing.T) {
 			f := newRolePrepareFixture(t)
 			f.enableRuntime(t)
 			if name == provider.Codex {
 				f.opts.Providers[1].Name, f.opts.Providers[1].Version = name, "0.166.0"
 				f.opts.EnableCodexAppServer = true
+			} else if name == provider.Agy {
+				f.opts.Providers[1].Name, f.opts.Providers[1].Version = name, "1.5.16"
+				f.opts.EnableAgyACP = true
 			}
 			prepared, err := f.preparer(t).Prepare(context.Background(), f.pending)
 			prepareRoleOK(t, err)

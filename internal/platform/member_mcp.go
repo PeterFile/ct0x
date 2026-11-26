@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"slices"
 
+	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
 )
 
@@ -15,6 +16,8 @@ type MemberToolTransportProfile struct {
 	InvestigationIntake   bool
 	InvestigationRole     bool
 	ThreadDecision        bool
+	ProjectExperienceMCP  bool
+	FreshTaskWorkMCP      bool
 }
 
 func (s *MemberTools) TransportOperations(ctx context.Context, token string) ([]string, error) {
@@ -78,7 +81,16 @@ func (s *MemberTools) TransportProfile(ctx context.Context, token string) (Membe
 		}
 		// Blocked is startup readiness, not historical replay authorization.
 	}
-	return s.textTransportProfile(entry), nil
+	profile := s.textTransportProfile(entry)
+	profile.FreshTaskWorkMCP = entry.taskWork != nil && entry.taskWork.mcp && entry.taskWorkProfileValid()
+	if entry.projectExperience.mcp {
+		names, err := provider.PiProjectExperienceToolNames(entry.grants.Operations)
+		if err != nil {
+			return MemberToolTransportProfile{}, store.ErrMemberToolDenied
+		}
+		profile.Operations, profile.ProjectExperienceMCP = names, true
+	}
+	return profile, nil
 }
 
 // Derive the MCP schema from the issued entry. This is not an authorization
@@ -86,4 +98,12 @@ func (s *MemberTools) TransportProfile(ctx context.Context, token string) (Membe
 func (s *MemberTools) textTransportProfile(entry memberToolRegistration) MemberToolTransportProfile {
 	return MemberToolTransportProfile{Operations: slices.Clone(entry.grants.Operations), ContinueWork: s.advertisesContinueWork(entry),
 		DiscussionOnlyExcerpt: s.isChatIntake(entry), InvestigationIntake: entry.investigationIntake(), ThreadDecision: s.offersThreadDecision(entry)}
+}
+
+// MemberMCPObservedRun returns only the registered Turn identifier for a
+// redacted transport event after the HTTP handler has checked authorization.
+func (s *MemberTools) MemberMCPObservedRun(token string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.capabilities[sha256.Sum256([]byte(token))].scope.Claim.TurnID
 }

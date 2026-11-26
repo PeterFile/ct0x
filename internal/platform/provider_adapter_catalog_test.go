@@ -97,7 +97,7 @@ func TestProviderAdapterReportsRejectMismatchedEvidence(t *testing.T) {
 
 func TestProviderAdapterUnknownAndLegacyPagination(t *testing.T) {
 	catalog, report := adapterCatalogFixture()
-	for _, protocol := range []provider.Protocol{provider.OneShotProtocol, provider.PiExtensionProtocol, provider.CodexAppServerProtocol} {
+	for _, protocol := range []provider.Protocol{provider.OneShotProtocol, provider.PiExtensionProtocol, provider.CodexAppServerProtocol, provider.ACPV1Protocol} {
 		report.Protocol, report.Capabilities = protocol, nil
 		snapshot, err := catalog.WithAdapterReports(map[string]ProviderAdapterReport{"pi_a": report})
 		if err != nil {

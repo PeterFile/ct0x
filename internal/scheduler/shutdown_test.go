@@ -43,12 +43,12 @@ func resourcePrepare(f *loopFixture, e provider.Executor) scheduler.PrepareFunc 
 func TestRunObservesDurableCancelWithoutReleasingBeforeReceipt(t *testing.T) {
 	f := newLoopFixture(t)
 	m := f.queue(t, "user", f.sender, "")
-	started, cancelled := make(chan provider.ExecuteRequest, 1), make(chan struct{}, 1)
+	started, cancelled := make(chan provider.ExecuteRequest, 1), make(chan error, 1)
 	gate, release := releaseGate(t)
 	e := executorFunc(func(ctx context.Context, request provider.ExecuteRequest, _ func(provider.Event) error) provider.ExecutionReceipt {
 		started <- request
 		<-ctx.Done()
-		cancelled <- struct{}{}
+		cancelled <- context.Cause(ctx)
 		<-gate
 		return provider.ExecutionReceipt{Started: true, Outcome: provider.OutcomeUnknown, DirectChildReaped: true}
 	})
@@ -58,7 +58,9 @@ func TestRunObservesDurableCancelWithoutReleasingBeforeReceipt(t *testing.T) {
 	if _, err := f.s.RequestTurnCancel(context.Background(), f.group, request.RunID); err != nil {
 		t.Fatal(err)
 	}
-	receive(t, cancelled)
+	if cause := receive(t, cancelled); cause != provider.ErrTurnCancelRequested {
+		t.Fatalf("durable cancellation must reach the provider with a distinct cause, got %v", cause)
+	}
 	if f.turnFor(t, m).State != domain.TurnStateCancelRequested || f.count(t, "resource_claims") != 1 {
 		t.Fatal("durable cancellation released claims without a receipt")
 	}
@@ -67,6 +69,45 @@ func TestRunObservesDurableCancelWithoutReleasingBeforeReceipt(t *testing.T) {
 	eventually(t, func() bool { return f.turnFor(t, m).State == domain.TurnStateUnknown })
 	if f.count(t, "resource_claims") != 1 {
 		t.Fatal("unknown cancellation receipt released resources")
+	}
+}
+
+func TestRunReleasesCancelledAcceptedTurnOnlyAfterCompleteReceipt(t *testing.T) {
+	f := newLoopFixture(t)
+	m := f.queue(t, "user", f.sender, "")
+	const session = "native-session"
+	accepted, cancelled := make(chan error, 1), make(chan error, 1)
+	gate, release := releaseGate(t)
+	e := executorFunc(func(ctx context.Context, _ provider.ExecuteRequest, callback func(provider.Event) error) provider.ExecutionReceipt {
+		accepted <- callback(provider.Event{Kind: provider.AcceptedEvent, NativeSessionID: session})
+		<-ctx.Done()
+		cancelled <- context.Cause(ctx)
+		<-gate
+		return provider.ExecutionReceipt{Started: true, Accepted: true, NativeSessionID: session,
+			Outcome: provider.OutcomeAborted, Terminal: provider.OutcomeAborted, DirectChildReaped: true, OutputComplete: true}
+	})
+	startLoop(t, f, f.options(1), resourcePrepare(f, e))
+	t.Cleanup(release)
+	if err := receive(t, accepted); err != nil {
+		t.Fatal(err)
+	}
+	turn := f.turnFor(t, m)
+	if turn.State != domain.TurnStateRunning || turn.AcceptedAt == nil || turn.NativeSessionID != session {
+		t.Fatalf("acceptance did not persist before cancellation: %+v", turn)
+	}
+	if _, err := f.s.RequestTurnCancel(context.Background(), f.group, turn.ID); err != nil {
+		t.Fatal(err)
+	}
+	if cause := receive(t, cancelled); cause != provider.ErrTurnCancelRequested {
+		t.Fatalf("durable cancellation reached the provider as %v", cause)
+	}
+	if f.turnFor(t, m).State != domain.TurnStateCancelRequested || f.count(t, "resource_claims") != 1 {
+		t.Fatal("cancellation released the resource before the receipt")
+	}
+	release()
+	eventually(t, func() bool { return f.turnFor(t, m).State == domain.TurnStateAborted })
+	if f.count(t, "resource_claims") != 0 {
+		t.Fatal("complete aborted receipt retained the resource")
 	}
 }
 

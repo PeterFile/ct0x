@@ -147,7 +147,7 @@ func (p *Preparer) planFreshTaskWork(ctx context.Context, input preparationInput
 		return empty, rolePreparationBlocked(state, "transport_root_unavailable", nil)
 	}
 	selected, ok := p.providers[input.member.ProviderID]
-	if !ok || selected.Name != provider.Pi || input.member.Status != domain.MemberStatusActive || len(input.member.Model) > 256 ||
+	if !ok || input.member.Status != domain.MemberStatusActive || len(input.member.Model) > 256 ||
 		!memberToolRuntimeText(input.member.Model) || !r.tools.freshTaskWork.Supports(selected) {
 		return empty, rolePreparationBlocked(state, "unsupported_provider", nil)
 	}
@@ -202,7 +202,7 @@ func (p *Preparer) planFreshTaskWork(ctx context.Context, input preparationInput
 		return empty, rolePreparationBlocked(state, "unsupported_work_scope", nil)
 	}
 	plan := taskWorkPreparation{delivery: work, mandate: mandate, provenance: prov, selected: selected,
-		taskDecision: r.tools.TaskDecisionProposalsEnabled()}
+		taskDecision: selected.Name == provider.Pi && r.tools.TaskDecisionProposalsEnabled()}
 	if plan.taskDecision && !r.tools.freshTaskWork.SupportsTaskDecision(selected) {
 		return empty, rolePreparationBlocked(state, "unsupported_provider", nil)
 	}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"agentworkspace/internal/platform"
+	"agentworkspace/internal/provider"
 	"agentworkspace/internal/store"
 )
 
@@ -24,27 +25,58 @@ const memberMCPMaxStringIDBytes = 128
 // NUL expands to six JSON bytes per input byte, the largest possible encoding.
 var memberMCPMaxEncodedID = strings.Repeat("\x00", memberMCPMaxStringIDBytes)
 
-var memberMCPComposedTools = slices.Concat(memberMCPTools, memberInvestigationMCPTools())
+var memberMCPComposedTools = slices.Concat(memberMCPTools, memberInvestigationMCPTools(), memberProjectExperienceMCPTools)
 var memberMCPWithReports = slices.Concat(memberMCPComposedTools, memberWorkReportMCPTools)
+
+// MemberMCPAuditEvent records a successful protocol step without request or response bodies.
+type MemberMCPAuditEvent struct {
+	RunID               string `json:"run_id"`
+	Route               string `json:"route"`
+	Method              string `json:"method"`
+	ProtocolVersion     string `json:"protocol_version"`
+	BearerAuthenticated bool   `json:"bearer_authenticated"`
+	Status              int    `json:"status"`
+	ResponseBytes       *int   `json:"response_bytes,omitempty"`
+	ToolName            string `json:"tool_name,omitempty"`
+	ToolSucceeded       bool   `json:"tool_succeeded,omitempty"`
+}
+
+func (a memberToolAPI) observeMemberMCP(token string, observer func(MemberMCPAuditEvent), event MemberMCPAuditEvent) {
+	if observer == nil {
+		return
+	}
+	event.RunID = a.tools.MemberMCPObservedRun(token)
+	if event.RunID == "" {
+		return
+	}
+	event.Route = "/api/v1/member-tools/mcp"
+	event.ProtocolVersion = memberMCPVersion
+	event.BearerAuthenticated = true
+	observer(event)
+}
 
 // MemberMCPRoutes is opt-in; mount on the same NewServer and registry as native
 // routes. NewServer rejects GET with 405/Allow: POST: this endpoint has no SSE.
 // No session ID, initialization state, execution queue or additional authority.
-func MemberMCPRoutes(tools *platform.MemberTools) []Route {
+func MemberMCPRoutes(tools *platform.MemberTools, observers ...func(MemberMCPAuditEvent)) []Route {
 	a := memberToolAPI{tools}
+	var observer func(MemberMCPAuditEvent)
+	if len(observers) != 0 {
+		observer = observers[0]
+	}
 	return []Route{{http.MethodPost, "/api/v1/member-tools/mcp", func(w http.ResponseWriter, r *http.Request) {
 		// Take the ACK cutoff at ingress, not after reading a possibly delayed body.
 		entered := time.Now()
 		memberToolNative(func(w http.ResponseWriter, r *http.Request, token string) {
-			a.memberMCP(w, r, token, entered)
+			a.memberMCP(w, r, token, entered, observer)
 		})(w, r)
 	}}}
 }
 
-func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token string, entered time.Time) {
-	// Fresh Pi uses its own native wire. Keep #181's unpaged MCP schema and
-	// legacy receipts; never execute a fresh command through that schema.
-	if a.tools.IsFreshTaskWorkCapability(token) {
+func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token string, entered time.Time, observer func(MemberMCPAuditEvent)) {
+	// The AGY text continuation has the exact fresh MCP schema. Pi and
+	// typed investigation capabilities still use their native codecs.
+	if a.tools.IsFreshTaskWorkCapability(token) && !a.tools.IsAgyFreshTaskWorkCapability(token) {
 		memberToolError(w, store.ErrMemberToolDenied)
 		return
 	}
@@ -64,8 +96,12 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 	}
 	id, validID := memberMCPID(frame["id"])
 	method := memberMCPString(frame["method"])
+	// AGY sends a literal null id for this specific notification.
+	if method == "notifications/roots/list_changed" && bytes.Equal(bytes.TrimSpace(frame["id"]), []byte("null")) {
+		id, validID = nil, true
+	}
 	if !memberMCPFields(frame, "jsonrpc", "id", "method", "params") || memberMCPString(frame["jsonrpc"]) != "2.0" || !validID || method == "" || len(method) > 128 ||
-		(id == nil) != (method == "notifications/initialized") {
+		(id == nil) != memberMCPNotification(method) {
 		memberMCPError(w, 400, nil, -32600, "JSON-RPC 请求格式或 id 无效")
 		return
 	}
@@ -103,11 +139,14 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			"serverInfo":   map[string]string{"name": "agent-workspace-member-tools", "version": "1"},
 			"instructions": "调用身份与权限由当前运行能力绑定。写入幂等键由能力与 JSON-RPC id 派生。" + memberMCPReconcile,
 		})
-	case "notifications/initialized", "ping":
+	case "notifications/initialized", "notifications/roots/list_changed", "ping":
 		if _, ok := memberMCPParams(frame["params"]); !ok {
 			memberMCPError(w, 400, id, -32602, "请求参数无效")
-		} else if method == "notifications/initialized" {
+		} else if memberMCPNotification(method) {
 			w.WriteHeader(http.StatusAccepted)
+			if method == "notifications/roots/list_changed" {
+				a.observeMemberMCP(token, observer, MemberMCPAuditEvent{Method: method, Status: http.StatusAccepted, ResponseBytes: new(int)})
+			}
 		} else {
 			memberMCPReply(w, id, map[string]any{})
 		}
@@ -123,13 +162,20 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		}
 		tools := make([]memberMCPTool, 0, len(profile.Operations))
 		for _, tool := range catalog {
+			if memberProjectExperienceMCPTool(tool.Name) && !profile.ProjectExperienceMCP {
+				continue
+			}
 			if slices.Contains(profile.Operations, tool.Name) {
 				if tool.Name == "send_message" && (profile.ContinueWork || profile.DiscussionOnlyExcerpt || profile.InvestigationIntake || profile.ThreadDecision) {
 					tool.InputSchema = memberMCPSendMessageSchema(profile.ContinueWork, profile.DiscussionOnlyExcerpt, profile.InvestigationIntake, profile.ThreadDecision)
 				}
-				if tool.Name == "submit_result" && profile.InvestigationRole {
-					tool.Description = "提交当前调查的纯文本结论，不附成果版本；提交不代表接纳。未知结果先对账。"
-					tool.InputSchema = json.RawMessage(`{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":8192}},"required":["summary"],"additionalProperties":false}`)
+				if tool.Name == "submit_result" && (profile.InvestigationRole || profile.FreshTaskWorkMCP) {
+					tool.Description = "提交当前尝试的纯文本结论。提交不代表接纳；未知结果先对账。"
+					tool.InputSchema = memberMCPTextSubmission
+				}
+				if tool.Name == "read_work_inputs" && profile.FreshTaskWorkMCP {
+					tool.Description = "列出绑定输入或按 input_id 读取正文片段；读取不确认处理。"
+					tool.InputSchema = memberMCPFreshTaskWorkRead
 				}
 				tools = append(tools, tool)
 			}
@@ -143,7 +189,8 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			arguments = json.RawMessage(`{}`)
 		}
 		switch name {
-		case "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", platform.ReadInvestigationArtifactOperation:
+		case "workspace_list", "workspace_read", "workspace_write", "publish_workspace_artifact", platform.ReadInvestigationArtifactOperation,
+			provider.LookupProjectExperiencesTool, provider.ReadArtifactTool:
 			// Reject before fingerprint decoding or binding; metadata stays opaque.
 			if !validMemberToolJSONStrings(arguments) {
 				memberMCPError(w, 400, id, -32602, "文件工具参数包含无效的 Unicode 字符串转义")
@@ -197,6 +244,13 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 		}
 		if !reportWrite {
 			profile, err = a.tools.TransportProfile(r.Context(), token)
+		}
+		if profile.FreshTaskWorkMCP && !slices.Contains(profile.Operations, name) ||
+			memberProjectExperienceMCPTool(name) && (err != nil || !profile.ProjectExperienceMCP || !slices.Contains(profile.Operations, name)) {
+			buffer = newMemberMCPBuffer()
+			memberToolError(buffer, store.ErrMemberToolDenied)
+			memberMCPToolReply(w, id, false, buffer)
+			return
 		}
 		if reportTools && name == platform.ReadWorkReportOperation && (err != nil || !slices.Contains(profile.Operations, name)) {
 			// Withheld report reads don't reserve IDs. The handler will still
@@ -259,6 +313,9 @@ func (a memberToolAPI) memberMCP(w http.ResponseWriter, r *http.Request, token s
 			tool.invoke(a, buffer, native, token)
 			intact := memberMCPToolReply(w, id, tool.write, buffer)
 			rejected = finish != nil && intact && memberMCPReportRejected(buffer)
+			if name == "read_channel" && intact && buffer.status == http.StatusOK {
+				a.observeMemberMCP(token, observer, MemberMCPAuditEvent{Method: method, Status: http.StatusOK, ToolName: name, ToolSucceeded: true})
+			}
 			return
 		}
 		if err != nil {
@@ -444,6 +501,10 @@ func memberMCPEnvelopeFits(envelope map[string]any) bool {
 }
 
 // Return whether the response writer accepted the complete, original envelope.
+func memberMCPNotification(method string) bool {
+	return method == "notifications/initialized" || method == "notifications/roots/list_changed"
+}
+
 func memberMCPToolReply(w http.ResponseWriter, id any, write bool, buffer *memberMCPBuffer) bool {
 	failed, text := buffer.status >= 400, string(buffer.body)
 	if failed {
