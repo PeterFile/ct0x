@@ -127,7 +127,7 @@ jobs:
             fi
           done <<< "$all"
           [[ "$store_count" -eq 1 && "$platform_count" -eq 1 && "$httpapi_count" -eq 1 && "$coordination_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
-          go test -race -timeout=14m "${rest[@]}"
+          GOFLAGS="${GOFLAGS:+$GOFLAGS }-timeout=14m" go test -race "${rest[@]}"
 
   go-vet:
     name: Go vet and CI gates
