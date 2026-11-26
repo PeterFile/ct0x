@@ -37,7 +37,7 @@ var (
 
 type liveExecution struct {
 	claim  store.TurnClaim
-	cancel context.CancelFunc
+	cancel context.CancelCauseFunc
 }
 
 type completion struct {
@@ -104,7 +104,7 @@ func Run(parent context.Context, s *store.Store, options Options, prepare Prepar
 	}
 	stop()
 	for _, execution := range r.active {
-		execution.cancel()
+		execution.cancel(nil)
 	}
 	// Execute guarantees eventual cancellation return after child Wait. There is
 	// deliberately no timeout that could return while an executor still uses DB.
@@ -115,7 +115,7 @@ func Run(parent context.Context, s *store.Store, options Options, prepare Prepar
 }
 
 func (r *loop) finish(result completion) error {
-	r.active[result.turnID].cancel()
+	r.active[result.turnID].cancel(nil)
 	delete(r.active, result.turnID)
 	return result.err
 }
@@ -130,7 +130,7 @@ func (r *loop) pollCancellation() error {
 			return errStore
 		}
 		if turn.CancelRequestedAt != nil {
-			execution.cancel()
+			execution.cancel(provider.ErrTurnCancelRequested)
 		}
 	}
 	return nil
@@ -294,12 +294,12 @@ func schedulingStoreError(err error) error {
 }
 
 func (r *loop) launch(turn domain.Turn, prepared PreparedExecution) {
-	ctx, cancel := context.WithCancel(r.ctx)
+	ctx, cancel := context.WithCancelCause(r.ctx)
 	claim := turnClaim(turn)
 	r.active[turn.ID] = liveExecution{claim: claim, cancel: cancel}
 	prepared.Request.RunID, prepared.Request.RuntimeDir = turn.ID, r.options.RuntimeDir
 	go func() {
-		defer cancel()
+		defer cancel(nil)
 		if prepared.BindTurnClaim != nil {
 			prepared.BindTurnClaim(claim)
 		}

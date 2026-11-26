@@ -68,6 +68,44 @@ func newMemberMCPHTTP(t *testing.T, operations ...string) *memberToolHTTPFixture
 	return f
 }
 
+func TestMemberMCPAuditBindsSuccessfulProtocolSteps(t *testing.T) {
+	f := newMemberToolHTTP(t, "read_channel")
+	var audit []MemberMCPAuditEvent
+	f.routes = append(f.routes, MemberMCPRoutes(f.tools, func(event MemberMCPAuditEvent) { audit = append(audit, event) })...)
+	f.handler = mustServer(t, DefaultAddress, f.routes...).Handler
+	const roots = `{"jsonrpc":"2.0","id":null,"method":"notifications/roots/list_changed","params":{}}`
+
+	invalid := memberMCPRequest(f, roots)
+	invalid.Header.Set("Authorization", "Bearer rejected-fixture")
+	denied := httptest.NewRecorder()
+	f.handler.ServeHTTP(denied, invalid)
+	if len(audit) != 0 || denied.Code == http.StatusAccepted {
+		t.Fatal("an unauthenticated request created protocol evidence")
+	}
+
+	w := memberMCPHTTP(t, f, roots)
+	if w.Code != http.StatusAccepted || w.Body.Len() != 0 {
+		t.Fatalf("unexpected roots acknowledgement: %d, %s", w.Code, w.Body)
+	}
+	memberMCPText(t, memberMCPHTTP(t, f, memberMCPCall("22", "read_channel", "{}")), false)
+	if len(audit) != 2 {
+		t.Fatalf("expected two protocol observations, got %d", len(audit))
+	}
+	for _, event := range audit {
+		if event.RunID != f.claim.TurnID || event.Route != "/api/v1/member-tools/mcp" ||
+			event.ProtocolVersion != memberMCPVersion || !event.BearerAuthenticated {
+			t.Fatalf("unbound protocol observation: %+v", event)
+		}
+	}
+	if event := audit[0]; event.Method != "notifications/roots/list_changed" || event.Status != http.StatusAccepted ||
+		event.ResponseBytes == nil || *event.ResponseBytes != 0 {
+		t.Fatalf("wrong roots evidence: %+v", event)
+	}
+	if event := audit[1]; event.Method != "tools/call" || event.Status != http.StatusOK || event.ToolName != "read_channel" || !event.ToolSucceeded {
+		t.Fatalf("wrong member read evidence: %+v", event)
+	}
+}
+
 func TestMemberMCPProtocolOptInLifecycleAndProfile(t *testing.T) {
 	f := newMemberToolHTTP(t)
 	w := httptest.NewRecorder()
@@ -93,6 +131,10 @@ func TestMemberMCPProtocolOptInLifecycleAndProfile(t *testing.T) {
 	w = memberMCPHTTP(t, f, `{"jsonrpc":"2.0","method":"notifications/initialized"}`)
 	if w.Code != 202 || w.Body.Len() != 0 {
 		t.Fatal("initialized notification must have an empty 202 response")
+	}
+	w = memberMCPHTTP(t, f, `{"jsonrpc":"2.0","method":"notifications/roots/list_changed","params":{}}`)
+	if w.Code != 202 || w.Body.Len() != 0 {
+		t.Fatal("roots list_changed notification must have an empty 202 response")
 	}
 	w = memberMCPHTTP(t, f, `{"jsonrpc":"2.0","id":2,"method":"tools/list"}`)
 	var list struct {
@@ -277,6 +319,8 @@ func TestMemberMCPAuthAndFramingFailClosed(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_message","arguments":{"content":"forged"},"purpose":"chat_intake/v1"}}`,
 		`{"jsonrpc":"2.0","method":"tools/call","params":{"name":"send_message","arguments":{"content":"notification write"}}}`,
 		`{"jsonrpc":"2.0","id":1,"method":"notifications/initialized"}`,
+		`{"jsonrpc":"2.0","id":1,"method":"notifications/roots/list_changed"}`,
+		`{"jsonrpc":"2.0","method":"notifications/roots/list_changed","params":{"extra":true}}`,
 		memberMCPInitialize + `{}`,
 	} {
 		w := memberMCPHTTP(t, f, body)

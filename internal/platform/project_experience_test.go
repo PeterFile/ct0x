@@ -49,7 +49,7 @@ func TestMemberProjectExperienceNativeLookupRevalidatesDeliveryGrant(t *testing.
 	run := memberToolRuntimeRun{runtime: &MemberToolRuntime{tools: tools}, binding: MemberToolRunBinding{DeliveryID: delivery.ID},
 		projectExperienceArtifactRead: &preparedDeliveryArtifactRead{pin: pin, owner: owner}}
 	history := MemberToolGrants{Operations: []string{"search_history", "read_history"}}
-	token, err := run.issueFreshPiDeliveryArtifactRead(ctx, claim, history)
+	token, err := run.issueFreshDeliveryArtifactRead(ctx, claim, history)
 	artifactsMust(t, err)
 	defer tools.Revoke(token)
 	q := ProjectExperienceQuery{Query: "no matching experience"}

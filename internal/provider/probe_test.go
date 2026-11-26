@@ -235,4 +235,14 @@ func TestAccountProbesRequireVerifiedVersionsAndRejectArbitraryProbes(t *testing
 			})
 		}
 	}
+	agyPath := executable(t, filepath.Join(t.TempDir(), Agy), "printf '1.5.16\\n'")
+	agyProvider := Discover(Search{Explicit: []Location{{Agy, agyPath}}})[0]
+	agyProvider = (Runner{}).Probe(context.Background(), agyProvider, VersionProbe)
+	if agyProvider.Version != "1.5.16" || agyProvider.Account != AccountUnknown {
+		t.Fatalf("unexpected agy version probe: %+v", agyProvider)
+	}
+	agyProvider = (Runner{}).Probe(context.Background(), agyProvider, AccountProbe)
+	if agyProvider.Account != AccountUnknown || agyProvider.Version != "1.5.16" {
+		t.Fatalf("agy account probe must remain unknown: %+v", agyProvider)
+	}
 }

@@ -19,6 +19,7 @@ type taskWorkToolBinding struct {
 	delivery domain.TaskWorkDelivery
 	attempt  domain.TaskAttempt
 	decision *taskDecisionGrant // Nil for the original four-tool profile.
+	mcp      bool               // Only the exact AGY continuation can use MCP.
 }
 
 func (s *MemberTools) FreshTaskWorkEnabled() bool {
@@ -41,6 +42,13 @@ func (s *MemberTools) IsFreshTaskWorkCapability(token string) bool {
 	defer s.mu.RUnlock()
 	entry := s.capabilities[sha256.Sum256([]byte(token))]
 	return entry.taskWork != nil || entry.investigationOwner != nil
+}
+
+func (s *MemberTools) IsAgyFreshTaskWorkCapability(token string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry := s.capabilities[sha256.Sum256([]byte(token))]
+	return entry.taskWork != nil && entry.taskWork.mcp && entry.taskWorkProfileValid()
 }
 
 func taskWorkMatchesScope(scope store.MemberToolScope, work domain.TaskWorkDelivery) bool {
@@ -67,8 +75,8 @@ func (entry memberToolRegistration) taskWorkProfileValid() bool {
 		b.attempt.TaskRevision == b.delivery.TaskRevision && b.attempt.TurnID == entry.scope.Claim.TurnID
 }
 
-func (s *MemberTools) issueFreshTaskWork(ctx context.Context, scope store.MemberToolScope, work domain.TaskWorkDelivery, decision bool) (string, *taskWorkToolBinding, error) {
-	if !s.FreshTaskWorkEnabled() || !taskWorkMatchesScope(scope, work) || decision && !s.TaskDecisionProposalsEnabled() {
+func (s *MemberTools) issueFreshTaskWork(ctx context.Context, scope store.MemberToolScope, work domain.TaskWorkDelivery, decision, mcp bool) (string, *taskWorkToolBinding, error) {
+	if !s.FreshTaskWorkEnabled() || !taskWorkMatchesScope(scope, work) || decision && (mcp || !s.TaskDecisionProposalsEnabled()) {
 		return "", nil, store.ErrMemberToolDenied
 	}
 	if decision {
@@ -97,7 +105,7 @@ func (s *MemberTools) issueFreshTaskWork(ctx context.Context, scope store.Member
 	if err != nil {
 		return "", nil, err
 	}
-	b := &taskWorkToolBinding{delivery: work, attempt: attempt}
+	b := &taskWorkToolBinding{delivery: work, attempt: attempt, mcp: mcp}
 	if decision {
 		b.decision = newTaskDecisionGrant()
 	}

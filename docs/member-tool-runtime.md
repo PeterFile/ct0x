@@ -32,7 +32,7 @@ func (*MemberToolRuntime) Wrap(MemberToolRunBinding, MemberToolExecutorFactory) 
 调度器先 ClaimTurn，再设置 `request.RunID/RuntimeDir`。每个 wrapper 只能调用一次 Execute，包括首次准备失败的情形。
 
 1. 用捕获的 GroupID 与请求 RunID 读取 Turn；精确核对 member/conversation/delivery、非空 claim token 和可信 Model。只允许无原生 session、acceptance、候选输出/终态、取消记录的 fresh `starting`；已有 `running` 也不能作为新启动。
-2. 只检查日志路径，不创建、删除或打开 `RuntimeDir/RunID`。复用现有目录身份重叠检查，拒绝配置根与 RuntimeDir 相同、祖孙重叠或别名；已有 RunID 文件、目录或符号链接都视为历史未知。
+2. 入口只检查日志路径，不预留 `RuntimeDir/RunID`。复用现有目录身份重叠检查，拒绝配置根与 RuntimeDir 相同、祖孙重叠或别名；已有 RunID 文件、目录或符号链接都视为历史未知。
 3. 用读取到的精确 `store.TurnClaim` 调用 Issue，由 registry 复查成员、状态、取消和 generation。成功后，在固定目录句柄下以独立随机文件名、`O_EXCL/0600` 写入且只写入 `{"endpoint":...,"token":...}`；写入句柄完全关闭后才允许调用 factory。
 4. factory 只收到绝对配置路径、可信 RunID 和复制的工具名子集；必须只构造 executor，即使返回错误也不得启动执行。factory 前后复查当前 claim、registry 权限、日志缺席和文件/根身份。每次 preflight 用 `context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)` 创建独立的 5 秒复核 context，并在返回时 cancel；GetTurn 与 withAuthorized 共用这份期限，包括 database/sql 连接池等待。原 context 取消不妨碍复核 generation，但未能在期限内确认 fresh authority 一律为 `unknown`，不能降为 `not_started`。这是每次复核的期限，不是 native 执行或整个 Execute 的返回期限。
 5. 调用 `native.Execute(ctx, request, onEvent)`，三个参数原样传入；调用后原样返回全部 native receipt 字段，包括 Outcome、Terminal、OutputComplete、Reason 等，不编造成功、回滚或替换已知终态。
@@ -40,11 +40,11 @@ func (*MemberToolRuntime) Wrap(MemberToolRunBinding, MemberToolExecutorFactory) 
 
 | 证据 | wrapper 的结果 |
 | --- | --- |
-| 重复 Execute、已有日志、Issue 失败、复核超时或读取/身份不符、generation 改变、Turn 取消/恢复/unknown/终态或已有原生执行证据 | `unknown`，固定中文原因要求对账，不调用 native |
-| 本次独占 Issue 成功后，仍可复核 fresh claim、权限和日志缺席，但配置/factory 准备失败或启动前 context 取消 | `not_started`，固定脱敏中文原因 |
+| 重复 Execute、已有日志、Issue 失败、复核超时或读取/身份不符、generation 改变、Turn 取消/恢复/unknown/终态、已有原生执行证据或未能独占预留 RunID | `unknown`，固定中文原因要求对账，不调用 native |
+| 配置/factory 准备失败或交接前 context 取消；已复核 fresh claim、权限与日志缺席，且本次能独占创建 `RuntimeDir/RunID` | `not_started`，保留空的私有 RunID 目录，不调用 native |
 | 已调用 native Execute | 原生 receipt 完整保留，native 自己判定未启动、未知或终态 |
 
-尤其是 factory 报错也必须先复核 unknown/日志证据，不能一概降为 `not_started`。未知 receipt 交给调度器应用后，Store 保留资源与容量占用。wrapper 的一次性 guard 不是跨 wrapper/跨进程的执行历史缓存：仍依赖唯一调度认领、Store 恢复 fencing，以及 adapter 原有的独占创建 RunID 日志目录；不能以新 wrapper 盲目重试。
+`Wrap` 与实验性 `WrapWithContext` 的失败路径都不能用日志缺席的快照代替独占预留。只有在明确不交接时，wrapper 才尝试独占创建同一目录；交接成功路径仍由 adapter 预留。未知 receipt 交给调度器应用后，Store 保留资源与容量占用。wrapper 的一次性 guard 不是跨 wrapper/跨进程的执行历史缓存：仍依赖唯一调度认领、Store 恢复 fencing、稳定的运行根以及不移除或复用待对账的 RunID 目录；不能以新 wrapper 盲目重试。
 
 ## 清理与信任边界
 

@@ -116,6 +116,15 @@ func memberToolRuntimeEmpty(t *testing.T, path string) {
 	}
 }
 
+func (f memberToolRuntimeFixture) requireEmptyRunReservation(t *testing.T) {
+	t.Helper()
+	dir := filepath.Join(f.request.RuntimeDir, f.request.RunID)
+	if info, err := os.Lstat(dir); err != nil || info.Mode() != os.ModeDir|0700 {
+		t.Fatal("non-start did not leave a private RunID reservation")
+	}
+	memberToolRuntimeEmpty(t, dir)
+}
+
 func (f memberToolRuntimeFixture) requireUnsettled(t *testing.T, state domain.TurnState) {
 	t.Helper()
 	turn, err := f.db.GetTurn(context.Background(), f.claim.GroupID, f.claim.TurnID)
@@ -554,11 +563,11 @@ func TestMemberToolRuntimeFactoryFailuresAndGenerationFence(t *testing.T) {
 			}
 			requireCapabilityDenied(t, capabilityUse(context.Background(), f.runtime.Tools(), token, "list_members"))
 			memberToolRuntimeEmpty(t, f.options.ConfigRoot)
-			if failure != "logs-error" {
-				memberToolRuntimeEmpty(t, f.request.RuntimeDir)
-			}
-			if failure == "error" || failure == "nil" || failure == "cancel" {
+			if want == provider.OutcomeNotStarted {
+				f.requireEmptyRunReservation(t)
 				f.requireUnsettled(t, domain.TurnStateStarting)
+			} else if failure != "logs-error" {
+				memberToolRuntimeEmpty(t, f.request.RuntimeDir)
 			}
 			f.requirePreparationReceipt(t, executor.Execute(context.Background(), f.request, nil), provider.OutcomeUnknown)
 		})

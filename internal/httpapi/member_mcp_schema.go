@@ -3,6 +3,8 @@ package httpapi
 import (
 	"encoding/json"
 	"net/http"
+
+	"agentworkspace/internal/provider"
 )
 
 type memberMCPTool struct {
@@ -105,3 +107,40 @@ var memberMCPTools = []memberMCPTool{
 		"type":"object","properties":{"input_id":{"type":"string","minLength":1,"maxLength":256},"reason":{"type":"string","minLength":1,"maxLength":2048,"description":"交回理由不得为空白，最多 2048 UTF-8 字节。"}},"required":["input_id","reason"],"additionalProperties":false
 	}`), memberToolAPI.handBackWorkInput, true},
 }
+
+var memberProjectExperienceMCPTools = []memberMCPTool{
+	{provider.LookupProjectExperiencesTool, "先检索本话题仍有效的约束、停用方案和决定。用 read_history 回读每条原消息再引用。", json.RawMessage(`{
+		"type":"object","properties":{
+			"query":{"type":"string","maxLength":512},"component":{"type":"string","maxLength":128},
+			"version":{"type":"string","maxLength":128},"limit":{"type":"integer","minimum":1,"maximum":20},
+			"before":{"type":"string","maxLength":2048}
+		},"anyOf":[{"required":["query"]},{"required":["component"]},{"required":["version"]}],"additionalProperties":false
+	}`), memberToolAPI.lookupProjectExperiences, false},
+	{provider.ReadArtifactTool, "按本轮确切获准版本读正文。用经验返回的 artifact_id、version_id 核验，分段时按 next_offset 和 content_complete。", json.RawMessage(`{
+		"type":"object","properties":{
+			"artifact_id":{"type":"string","minLength":1,"maxLength":128},
+			"version_id":{"type":"string","minLength":1,"maxLength":128},
+			"offset":{"type":"integer","minimum":0,"maximum":67108864},"max_bytes":{"type":"integer","minimum":1,"maximum":16384}
+		},"required":["artifact_id","version_id"],"additionalProperties":false
+	}`), memberToolAPI.readNativeMemberArtifact, false},
+}
+
+func memberProjectExperienceMCPTool(name string) bool {
+	return name == provider.LookupProjectExperiencesTool || name == provider.ReadArtifactTool
+}
+
+var memberMCPFreshTaskWorkRead = json.RawMessage(`{
+	"type":"object","properties":{
+		"limit":{"type":"integer","minimum":1,"maximum":20},"before":{"type":"string","maxLength":512},
+		"input_id":{"type":"string","minLength":1,"maxLength":256},"offset":{"type":"integer","minimum":0,"maximum":9007199254740991},
+		"max_bytes":{"type":"integer","minimum":4,"maximum":8192}
+	},"additionalProperties":false,
+	"if":{"required":["input_id"]},
+	"then":{"properties":{"limit":false,"before":false}},
+	"else":{"properties":{"offset":false,"max_bytes":false}}
+}`)
+
+var memberMCPTextSubmission = json.RawMessage(`{
+	"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":8192}},
+	"required":["summary"],"additionalProperties":false
+}`)

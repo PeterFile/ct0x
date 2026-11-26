@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -65,7 +67,7 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 	if _, err := db.RecoverInFlight(ctx); err != nil {
 		return fmt.Errorf("恢复在途轮次失败：%w", err)
 	}
-	search.Explicit = append([]provider.Location{{Name: provider.Pi, Path: config.piPath}, {Name: provider.Codex, Path: config.codexPath}}, search.Explicit...)
+	search.Explicit = append([]provider.Location{{Name: provider.Pi, Path: config.piPath}, {Name: provider.Codex, Path: config.codexPath}, {Name: provider.Agy, Path: config.agyPath}}, search.Explicit...)
 	catalog := platform.DiscoverProviders(ctx, search, provider.Runner{Timeout: 2 * time.Second, OutputLimit: 4096})
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("启动已取消：%w", err)
@@ -110,6 +112,9 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 		if config.enableCodexAppServer {
 			adapterStatus = "Pi 仍须受支持版本、可信扩展与显式模型；Codex 已显式选择实验性 AppServer 与同一成员工具的会话级 MCP，须版本能力受支持且指定模型；仅受限只读原生文本配置（无可写目录、审批 never），不保证禁用所有原生工具或隔离文件读取，不启用文件任务或 Artifact；能力报告不是账号或网络实测，也不授予工作许可"
 		}
+		if config.enableAgyACP {
+			adapterStatus += "；Agy 已显式选择实验性 ACP v1 与同一成员工具的会话级 MCP，运行于隔离沙箱、独立设置与严格 PreToolUse 工具白名单下，不支持原生恢复或运行中追加输入"
+		}
 		toolStatus = "平台工具已配置：" + adapterStatus + "；不授予 Coordinator、Assignment 或 RequestWork 权限"
 		if config.enableCoordinationRoles {
 			toolStatus = "平台工具与协调角色已配置：普通投递使用 chat_intake/v1（list_members、read_channel、send_message、search_history、read_history），不授予协调角色工具；启用话题聊天策略后可通过绑定来源的结构化语义评估自动准入与登记文本分派，不开放成员冒充本机用户的 RequestWork/RequestDispatch；受信协调员与工作成员按服务端执行身份分别绑定专用工具；" + adapterStatus + "；分派登记不直接执行，具体成果提交不等于接纳；角色就绪查询仅为采样诊断，不保证后续认领或执行"
@@ -151,8 +156,18 @@ func runWithSearch(ctx context.Context, args []string, output io.Writer, search 
 				toolStatus += "；只读调查仅支持选定 Pi 1.4.0、单收件人的真实本机用户原始消息与首次正式分派的角色；仅按策略读取指定资料，不授予续接或文件工具"
 			}
 		}
-		if config.enableCodexAppServer {
-			routes = append(routes, httpapi.MemberMCPRoutes(memberTools.Tools())...)
+		if config.enableCodexAppServer || config.enableAgyACP {
+			var observeMCP func(httpapi.MemberMCPAuditEvent)
+			if config.enableAgyACP {
+				audit := log.New(output, "member_mcp_audit ", 0)
+				observeMCP = func(event httpapi.MemberMCPAuditEvent) {
+					wire, err := json.Marshal(event)
+					if err == nil {
+						audit.Print(string(wire))
+					}
+				}
+			}
+			routes = append(routes, httpapi.MemberMCPRoutes(memberTools.Tools(), observeMCP)...)
 		}
 	}
 	if config.enableCoordinationRoles {

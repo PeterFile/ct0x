@@ -13,8 +13,8 @@ import (
 )
 
 // FreshTaskWorkLaunch is a trusted construction seam, never a model input.
-// Neither callback may start a process. Production installs only the exact Pi
-// adapter; the executor must consume the issued config, Turn and tool profile.
+// Neither callback may start a process. The executor must consume the
+// issued config, Turn and exact text continuation profile.
 type FreshTaskWorkLaunch struct {
 	Supports  func(provider.Provider) bool
 	Construct func(context.Context, provider.Provider, provider.FreshTaskWorkBinding) (provider.Executor, error)
@@ -25,6 +25,31 @@ type FreshTaskWorkLaunch struct {
 func NewPiFreshTaskWorkLaunch(extensionPath string, timeout time.Duration) *FreshTaskWorkLaunch {
 	a := provider.NewPiFreshTaskWorkAdapter(extensionPath, timeout)
 	return &FreshTaskWorkLaunch{Supports: a.Supports, Construct: a.NewExecutor, taskDecisionAdapter: &a}
+}
+
+// WithAgyFreshTaskWork adds the AGY-only continuation adapter to a trusted launch.
+func WithAgyFreshTaskWork(pi *FreshTaskWorkLaunch, timeout time.Duration) *FreshTaskWorkLaunch {
+	launch := &FreshTaskWorkLaunch{
+		Supports: func(selected provider.Provider) bool {
+			if selected.Name == provider.Agy {
+				return provider.SupportsAgyFreshTaskWork(selected)
+			}
+			return pi != nil && pi.Supports(selected)
+		},
+		Construct: func(ctx context.Context, selected provider.Provider, binding provider.FreshTaskWorkBinding) (provider.Executor, error) {
+			if selected.Name == provider.Agy {
+				return provider.NewAgyFreshTaskWorkExecutor(ctx, selected, binding, timeout)
+			}
+			if pi == nil {
+				return nil, errMemberToolRuntimeBinding
+			}
+			return pi.Construct(ctx, selected, binding)
+		},
+	}
+	if pi != nil {
+		launch.taskDecisionAdapter = pi.taskDecisionAdapter
+	}
+	return launch
 }
 
 func (l *FreshTaskWorkLaunch) SupportsTaskDecision(selected provider.Provider) bool {
@@ -107,7 +132,7 @@ func (e *taskWorkRun) Execute(ctx context.Context, request provider.ExecuteReque
 	var token string
 	var bound *taskWorkToolBinding
 	if investigation == nil {
-		token, bound, err = s.issueFreshTaskWork(ctx, scope, e.plan.delivery, e.plan.taskDecision)
+		token, bound, err = s.issueFreshTaskWork(ctx, scope, e.plan.delivery, e.plan.taskDecision, e.plan.selected.Name == provider.Agy)
 		if err == nil {
 			launch.AttemptID = bound.attempt.ID
 		}

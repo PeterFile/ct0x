@@ -81,7 +81,7 @@ func (s *MemberTools) Issue(ctx context.Context, claim store.TurnClaim, grants M
 // IssueChatIntake is a separate trusted runtime seam, never a tool/API input.
 // It freezes a restricted profile and persists the exact claim-bound purpose.
 func (s *MemberTools) IssueChatIntake(ctx context.Context, claim store.TurnClaim) (string, error) {
-	return s.issueChatIntake(ctx, claim, memberToolIntakeSchema{}, nil, false)
+	return s.issueChatIntake(ctx, claim, memberToolIntakeSchema{}, nil, memberProjectExperienceTransport{})
 }
 
 // Use an immutable sampler identity; native launch compares registrations.
@@ -89,9 +89,9 @@ type automaticTextSampler struct {
 	sample func(context.Context) store.ChatAutomaticTextFacts
 }
 
-func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema, sampler *automaticTextSampler, freshPiExperience bool) (string, error) {
+func (s *MemberTools) issueChatIntake(ctx context.Context, claim store.TurnClaim, schema memberToolIntakeSchema, sampler *automaticTextSampler, experience memberProjectExperienceTransport) (string, error) {
 	return s.issue(ctx, claim, MemberToolGrants{Operations: chatIntakeOperations()}, domain.ChatIntakePurpose, schema, nil, sampler,
-		memberProjectExperienceTransport{enabled: freshPiExperience})
+		experience)
 }
 
 func chatIntakeOperations() []string {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 
 	"agentworkspace/internal/artifactfs"
 	"agentworkspace/internal/coordination"
@@ -29,7 +30,7 @@ func executionArtifactOptions(config config, owner io.Closer) ([]platform.Member
 		}
 		return []platform.MemberWorkspaceOptions{options}, nil
 	}
-	if config.enablePiProjectExperience {
+	if config.enablePiProjectExperience || config.enableAgyACP {
 		blobs, ok := owner.(*artifactfs.Store)
 		if !ok || blobs == nil {
 			return nil, errors.New("成果文件库所有者无效")
@@ -45,6 +46,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	}
 	if config.enableCodexAppServer && (!config.enableExecution || !config.enableMemberTools || !config.enableCoordinationRoles) {
 		return nil, nil, nil, errors.New("启用 Codex AppServer 必须同时启用执行、成员工具和协调角色")
+	}
+	if config.enableAgyACP && (!config.enableExecution || !config.enableMemberTools) {
+		return nil, nil, nil, errors.New("启用 Agy ACP 必须同时启用执行和成员工具")
 	}
 	if err := config.validateThreadDecisionHandoff(); err != nil {
 		return nil, nil, nil, err
@@ -80,6 +84,12 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	if config.enableAgyACP && config.enableCoordinationRoles && slices.ContainsFunc(providers, provider.SupportsAgyFreshTaskWork) {
+		if !engine.UsesStore(db) {
+			return nil, nil, nil, errors.New("Agy 任务续办需要当前 Store 的协调引擎")
+		}
+		freshTaskWork = platform.WithAgyFreshTaskWork(freshTaskWork, 0)
+	}
 	investigationTaskWork, err := config.piFreshInvestigationWorkLaunch(db, engine, providers)
 	if err != nil {
 		return nil, nil, nil, err
@@ -92,7 +102,8 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	// Only explicit local-user receipts authorize external directories. Protect
 	// the entire private data root, not just per-conversation workspaces.
 	options := platform.PrepareOptions{Providers: providers, PrivateWorkspaceRoot: workspaces, PrivateDataRoot: config.dataDir}
-	if config.enableInvestigationExecution || config.enablePiProjectExperience {
+	agyArtifactReader := config.enableAgyACP && len(workspace) > 0 && workspace[0].Blobs != nil
+	if config.enableInvestigationExecution || config.enablePiProjectExperience || agyArtifactReader {
 		// Same immutable blob owner, independent authority for each profile.
 		if len(workspace) == 0 || workspace[0].Blobs == nil {
 			return nil, nil, nil, errors.New("缺少成果读取服务")
@@ -105,8 +116,8 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		if config.enablePiProjectExperience {
-			options.PiProjectExperienceArtifacts = grant // A borrower, not a per-turn grant.
+		if config.enablePiProjectExperience || agyArtifactReader {
+			options.ProjectExperienceArtifacts = grant // A borrower, not a per-turn grant.
 		}
 		if config.enableInvestigationExecution {
 			if _, err := privateExecutionRoot(workspaces, platform.InvestigationCWDName); err != nil {
@@ -164,6 +175,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		options.MemberTools, options.PiMemberToolsExtension = tools, config.piMemberToolsExtension
 		options.EnablePiProjectExperience = config.enablePiProjectExperience
 		options.EnableCodexAppServer = config.enableCodexAppServer
+		options.EnableAgyACP = config.enableAgyACP
 		// Installing the qualified new bridge opts the trusted Pi intake into relay.
 		options.EnablePiDiscussionRelay = config.enableCoordinationRoles
 		options.EnableNativeSessionResume = config.enableNativeSessionResume

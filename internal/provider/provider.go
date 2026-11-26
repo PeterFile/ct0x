@@ -17,6 +17,7 @@ type ProbeType string
 const (
 	Pi                           = "pi"
 	Codex                        = "codex"
+	Agy                          = "agy"
 	Installed       Installation = "installed"
 	AccountUnknown  Account      = "unknown"
 	Authenticated   Account      = "authenticated"
@@ -64,7 +65,7 @@ func Discover(search Search) []Provider {
 	for _, dirs := range [][]string{search.PathDirs, search.CommonDirs} {
 		for _, dir := range dirs {
 			if dir != "" {
-				locations = append(locations, Location{Pi, filepath.Join(dir, Pi)}, Location{Codex, filepath.Join(dir, Codex)})
+				locations = append(locations, Location{Pi, filepath.Join(dir, Pi)}, Location{Codex, filepath.Join(dir, Codex)}, Location{Agy, filepath.Join(dir, Agy)})
 			}
 		}
 	}
@@ -72,7 +73,7 @@ func Discover(search Search) []Provider {
 	seen := map[string][]os.FileInfo{}
 next:
 	for _, location := range locations {
-		if (location.Name != Pi && location.Name != Codex) || location.Path == "" {
+		if (location.Name != Pi && location.Name != Codex && location.Name != Agy) || location.Path == "" {
 			continue
 		}
 		path, err := filepath.Abs(location.Path)

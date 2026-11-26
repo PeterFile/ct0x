@@ -14,6 +14,7 @@ import (
 // at issuance. A zero pin on an enabled projection denotes lookup only.
 type memberProjectExperienceTransport struct {
 	enabled    bool
+	mcp        bool // Bound only to an AGY session transport.
 	pin        domain.ArtifactVersionRef
 	deliveryID string // Nonempty only on the production durable-approval path.
 }
@@ -23,10 +24,10 @@ type preparedDeliveryArtifactRead struct {
 	owner *MemberArtifactGrant
 }
 
-// issueFreshPiDeliveryArtifactRead uses the same issuance gate as the
+// issueFreshDeliveryArtifactRead uses the same issuance gate as the
 // reviewed projection, but requires the current claim to re-prove the pin
 // prepared from the triggering Delivery. Neither preparation nor config is authority.
-func (e *memberToolRuntimeRun) issueFreshPiDeliveryArtifactRead(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants) (string, error) {
+func (e *memberToolRuntimeRun) issueFreshDeliveryArtifactRead(ctx context.Context, claim store.TurnClaim, grants MemberToolGrants) (string, error) {
 	purpose := "generic"
 	if e.intake {
 		purpose = domain.ChatIntakePurpose
@@ -36,7 +37,7 @@ func (e *memberToolRuntimeRun) issueFreshPiDeliveryArtifactRead(ctx context.Cont
 	grants.Operations = append(slices.Clone(grants.Operations), provider.ReadArtifactTool)
 	grants.Artifacts = approval.owner
 	return e.runtime.tools.issue(ctx, claim, grants, purpose, e.intakeSchema, nil, e.automaticText,
-		memberProjectExperienceTransport{enabled: true, pin: approval.pin, deliveryID: e.binding.DeliveryID})
+		memberProjectExperienceTransport{enabled: true, mcp: e.projectExperienceMCP, pin: approval.pin, deliveryID: e.binding.DeliveryID})
 }
 
 // IssueFreshPiProjectExperience is for trusted fresh Pi composition before
