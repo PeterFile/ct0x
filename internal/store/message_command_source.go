@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"unicode/utf8"
 
 	"agentworkspace/internal/domain"
 )
@@ -35,6 +36,17 @@ func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, re
 	if err := requireMessageActor(ctx, tx, r.GroupID, "user"); err != nil {
 		return domain.Message{}, storeError("验证用户消息失败", err)
 	}
+	pin := r.ArtifactReadGrant
+	if pin != nil {
+		if len(r.RecipientIDs) != 1 || r.RecipientIDs[0] == "" || !ValidArtifactReadPin(*pin) {
+			return domain.Message{}, ErrInvalid
+		}
+		for _, text := range [...]string{r.GroupID, r.TopicID, r.Content, r.RecipientIDs[0]} {
+			if !utf8.ValidString(text) {
+				return domain.Message{}, ErrInvalid
+			}
+		}
+	}
 	payload := r.payload()
 	reservation := payload
 	bindSelector := normalPost && r.TopicID == "" && r.IdempotencyKey != ""
@@ -42,7 +54,7 @@ func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, re
 		reservation = r.topicSelectionPayload()
 	}
 	id, replay, err := reserveMutation(ctx, tx, r.scope(), reservation)
-	if bindSelector && errors.Is(err, ErrConflict) {
+	if bindSelector && pin == nil && errors.Is(err, ErrConflict) {
 		// Exact legacy reservations are still replayable; this only reads
 		// and cannot create an unversioned key or rewrite its source proof.
 		id, replay, err = lookupMutation(ctx, tx, r.scope(), payload)
@@ -53,6 +65,18 @@ func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, re
 	if err != nil {
 		return domain.Message{}, storeError("读取用户消息回执失败", err)
 	}
+	if pin != nil {
+		installed, _, err := artifactReadGrantStorage(ctx, tx)
+		if err != nil {
+			return domain.Message{}, storeError("验证成果读取许可失败", err)
+		}
+		if !installed {
+			if replay {
+				return domain.Message{}, ErrArtifactReadGrantIncomplete
+			}
+			return domain.Message{}, ErrArtifactReadGrantUnavailable
+		}
+	}
 	var message domain.Message
 	if replay { // Never add provenance, deliveries or a new intent on replay.
 		message, err = localMessageReceiptInTx(ctx, tx, r, id, normalPost)
@@ -61,6 +85,11 @@ func (s *Store) createLocalUserMessage(ctx context.Context, r MessageRequest, re
 	}
 	if err != nil {
 		return domain.Message{}, storeError("创建用户消息失败", err)
+	}
+	if replay && pin != nil {
+		if err := verifyArtifactReadGrantReplay(ctx, tx, message, r); err != nil {
+			return domain.Message{}, storeError("验证成果读取许可回执失败", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return domain.Message{}, storeError("保存用户消息失败", err)

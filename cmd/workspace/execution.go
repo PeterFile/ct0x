@@ -8,12 +8,36 @@ import (
 	"os"
 	"path/filepath"
 
+	"agentworkspace/internal/artifactfs"
 	"agentworkspace/internal/coordination"
 	"agentworkspace/internal/platform"
 	"agentworkspace/internal/provider"
 	"agentworkspace/internal/scheduler"
 	"agentworkspace/internal/store"
 )
+
+// Share the existing read API's blob owner without enabling workspace tools
+// or provisioning a workspace staging directory for ordinary Pi.
+func executionArtifactOptions(config config, owner io.Closer) ([]platform.MemberWorkspaceOptions, error) {
+	if !config.enableExecution || !config.enableMemberTools {
+		return nil, nil
+	}
+	if config.enableCoordinationRoles {
+		options, err := workspaceRuntimeOptions(config.dataDir, owner)
+		if err != nil {
+			return nil, err
+		}
+		return []platform.MemberWorkspaceOptions{options}, nil
+	}
+	if config.enablePiProjectExperience {
+		blobs, ok := owner.(*artifactfs.Store)
+		if !ok || blobs == nil {
+			return nil, errors.New("成果文件库所有者无效")
+		}
+		return []platform.MemberWorkspaceOptions{{Blobs: blobs}}, nil
+	}
+	return nil, nil
+}
 
 func executionRunner(config config, db *store.Store, engine *coordination.Engine, catalog *platform.ProviderCatalog, endpoint string, output io.Writer, workspace ...platform.MemberWorkspaceOptions) (func(context.Context) error, *platform.MemberToolRuntime, *platform.Preparer, error) {
 	if err := config.validatePiFreshTaskWork(); err != nil {
@@ -32,6 +56,9 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		return nil, nil, nil, err
 	}
 	if err := config.validateRunExplanationConfig(); err != nil {
+		return nil, nil, nil, err
+	}
+	if err := config.validatePiProjectExperience(); err != nil {
 		return nil, nil, nil, err
 	}
 	if err := config.validateInvestigationDataDir(); err != nil {
@@ -65,10 +92,10 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 	// Only explicit local-user receipts authorize external directories. Protect
 	// the entire private data root, not just per-conversation workspaces.
 	options := platform.PrepareOptions{Providers: providers, PrivateWorkspaceRoot: workspaces, PrivateDataRoot: config.dataDir}
-	if config.enableInvestigationExecution {
-		// Borrow the existing immutable blob owner independently of file grants.
+	if config.enableInvestigationExecution || config.enablePiProjectExperience {
+		// Same immutable blob owner, independent authority for each profile.
 		if len(workspace) == 0 || workspace[0].Blobs == nil {
-			return nil, nil, nil, errors.New("只读调查需要成果读取服务")
+			return nil, nil, nil, errors.New("缺少成果读取服务")
 		}
 		artifacts, err := platform.NewArtifacts(db, workspace[0].Blobs)
 		if err != nil {
@@ -78,12 +105,17 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		if _, err := privateExecutionRoot(workspaces, platform.InvestigationCWDName); err != nil {
-			return nil, nil, nil, err
+		if config.enablePiProjectExperience {
+			options.PiProjectExperienceArtifacts = grant // A borrower, not a per-turn grant.
 		}
-		options.Investigation = &platform.InvestigationPreparationOptions{PiPath: config.piPath, Artifacts: grant}
-		if investigationTaskWork != nil {
-			investigationTaskWork.Artifacts = grant
+		if config.enableInvestigationExecution {
+			if _, err := privateExecutionRoot(workspaces, platform.InvestigationCWDName); err != nil {
+				return nil, nil, nil, err
+			}
+			options.Investigation = &platform.InvestigationPreparationOptions{PiPath: config.piPath, Artifacts: grant}
+			if investigationTaskWork != nil {
+				investigationTaskWork.Artifacts = grant
+			}
 		}
 	}
 	var tools *platform.MemberToolRuntime
@@ -130,6 +162,7 @@ func executionRunner(config config, db *store.Store, engine *coordination.Engine
 			}
 		}
 		options.MemberTools, options.PiMemberToolsExtension = tools, config.piMemberToolsExtension
+		options.EnablePiProjectExperience = config.enablePiProjectExperience
 		options.EnableCodexAppServer = config.enableCodexAppServer
 		// Installing the qualified new bridge opts the trusted Pi intake into relay.
 		options.EnablePiDiscussionRelay = config.enableCoordinationRoles

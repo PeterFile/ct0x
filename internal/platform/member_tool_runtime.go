@@ -230,18 +230,20 @@ func (schema memberToolIntakeSchema) requiresIssuedPiConfig() bool {
 }
 
 type memberToolRuntimeRun struct {
-	runtime            *MemberToolRuntime
-	binding            MemberToolRunBinding
-	factory            MemberToolExecutorFactory
-	used               atomic.Bool
-	role               *store.CoordinationRoleProvenance
-	intake             bool
-	intakeSchema       memberToolIntakeSchema
-	automaticText      *automaticTextSampler
-	intakeBuilder      func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
-	explanationBuilder func(provider.NativeMemberToolConfig, string, []string) (provider.Executor, error)
-	investigation      *investigationRolePreparation
-	nativeSession      *memberToolNativeSessionPlan
+	runtime                       *MemberToolRuntime
+	binding                       MemberToolRunBinding
+	factory                       MemberToolExecutorFactory
+	used                          atomic.Bool
+	role                          *store.CoordinationRoleProvenance
+	intake                        bool
+	intakeSchema                  memberToolIntakeSchema
+	automaticText                 *automaticTextSampler
+	intakeBuilder                 func(provider.NativeMemberToolConfig) (provider.Executor, error) // Fresh digest-bound Pi intake only.
+	explanationBuilder            func(provider.NativeMemberToolConfig, string, []string) (provider.Executor, error)
+	investigation                 *investigationRolePreparation
+	nativeSession                 *memberToolNativeSessionPlan
+	projectExperienceBuilder      func(provider.NativeMemberToolConfig) (provider.Executor, error)
+	projectExperienceArtifactRead *preparedDeliveryArtifactRead
 	// Cloned at trusted wrapping and again when the claimed token is registered.
 	dispatchCapabilities []store.DispatchWorkerCapabilityFact
 }
@@ -256,7 +258,11 @@ func (e *memberToolRuntimeRun) matchesTurn(turn domain.Turn) bool {
 }
 
 func (e *memberToolRuntimeRun) fresh(turn domain.Turn) bool {
-	return e.matchesTurn(turn) && turn.ClaimToken != "" && turn.State == domain.TurnStateStarting &&
+	return e.matchesTurn(turn) && memberToolTurnPrelaunch(turn)
+}
+
+func memberToolTurnPrelaunch(turn domain.Turn) bool {
+	return turn.ClaimToken != "" && turn.State == domain.TurnStateStarting &&
 		turn.NativeSessionID == "" && turn.AcceptedAt == nil && turn.CancelRequestedAt == nil &&
 		turn.CandidateText == "" && turn.CandidateTerminal == ""
 }
@@ -275,18 +281,27 @@ func (e *memberToolRuntimeRun) Execute(ctx context.Context, request provider.Exe
 		return unknown
 	}
 	claim := store.TurnClaim{GroupID: turn.GroupID, TurnID: turn.ID, Token: turn.ClaimToken}
+	freshPiExperience := e.projectExperienceBuilder != nil
+	if freshPiExperience && (e.nativeSession != nil || e.intakeBuilder != nil) {
+		return unknown
+	}
+	grants := MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers, ProviderID: e.binding.ProviderID, Model: e.binding.Model}
 	var token string
 	var explanation *memberRunExplanation
-	if e.intake {
-		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema, e.automaticText)
-	} else {
+	switch {
+	case freshPiExperience && e.projectExperienceArtifactRead != nil:
+		token, err = e.issueFreshPiDeliveryArtifactRead(ctx, claim, grants)
+	case e.intake:
+		token, err = r.tools.issueChatIntake(ctx, claim, e.intakeSchema, e.automaticText, freshPiExperience)
+	case freshPiExperience:
+		token, err = r.tools.IssueFreshPiProjectExperience(ctx, claim, grants, domain.ArtifactVersionRef{})
+	default:
 		if e.explanationBuilder != nil && e.nativeSession == nil && r.tools.runExplanationSupported(ctx) {
 			dir := filepath.Join(request.RuntimeDir, request.RunID)
 			explanation = &memberRunExplanation{path: filepath.Join(dir, runExplanationAttemptFile),
 				bridgePath: filepath.Join(dir, provider.PiRunExplanationJournalName)}
 		}
-		token, err = r.tools.issue(ctx, claim, MemberToolGrants{Operations: r.operations, MaxGroupMembers: r.maxGroupMembers,
-			ProviderID: e.binding.ProviderID, Model: e.binding.Model}, "generic", memberToolIntakeSchema{}, explanation, nil)
+		token, err = r.tools.issue(ctx, claim, grants, "generic", memberToolIntakeSchema{}, explanation, nil, memberProjectExperienceTransport{})
 	}
 	if err != nil {
 		// Duplicate authority, stale generation and uncertain reads are not proof
@@ -451,6 +466,14 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 		// it neither conveys the claim token nor grants authority to the bridge.
 		explanationClaim = fmt.Sprintf("%d:%x", len(claim.Token), sha256.Sum256([]byte(claim.Token)))
 	}
+	var experienceTools []string
+	if entry.projectExperience.enabled {
+		var err error
+		experienceTools, err = provider.PiProjectExperienceToolNames(entry.grants.Operations)
+		if err != nil {
+			return nil, errMemberToolRuntimeBinding
+		}
+	}
 	data, err := json.Marshal(struct {
 		Endpoint               string   `json:"endpoint"`
 		Token                  string   `json:"token"`
@@ -462,8 +485,9 @@ func (r *MemberToolRuntime) createConfig(token string) (*memberToolRuntimeConfig
 		RunExplanation         string   `json:"run_explanation,omitempty"`
 		ExplanationJournal     string   `json:"run_explanation_journal,omitempty"`
 		ExplanationClaim       string   `json:"run_explanation_claim_fingerprint,omitempty"`
+		ProjectExperienceTools []string `json:"project_experience_tools,omitempty"`
 	}{r.endpoint, token, r.tools.advertisesContinueWork(entry), entry.intake.piDiscussionExcerpt, entry.discussionRelay(), action, strictTools,
-		explanationRun, explanationJournal, explanationClaim})
+		explanationRun, explanationJournal, explanationClaim, experienceTools})
 	if err != nil {
 		return nil, errMemberToolRuntimeConfig
 	}
@@ -514,7 +538,7 @@ func (e *memberToolRuntimeRun) configValid(c *memberToolRuntimeConfigFile) bool 
 	if c == nil || !c.valid() {
 		return false
 	}
-	return e.nativeSession == nil || c.digestMatches()
+	return (e.nativeSession == nil && e.projectExperienceBuilder == nil) || c.digestMatches()
 }
 
 func (c *memberToolRuntimeConfigFile) digestMatches() bool {

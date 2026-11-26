@@ -49,9 +49,8 @@ type NativeMemberToolConfig struct {
 	SHA256 [sha256.Size]byte `json:"-"`
 }
 
-// Keep #193's exact pair eligible for its existing native text profile.
-// Only the investigation releases understand the strict config. Each entry
-// point is pinned to its matching parser.
+// Preserve older exact pairs for their existing profiles. Each release pins
+// both the entry and the parser; only the E3 pair supports the new profile.
 const (
 	piDigestBridgeEntrySHA        = "321fd2bc30c71322a140f5e022d96b2c005e90c0b5b4468697b59978decc8356"
 	piDigestBridgeImplSHA         = "f983651f525fb411d9e8f50843b15447558f6d6b1f9f1a13563d96f3528a3061"
@@ -61,14 +60,16 @@ const (
 	piInvestigationBridgeEntry200SHA = "39d5528abee0b6b39d0088d265dbe4d51c9c00eb9f43fe1d4d6be9d2383a7a82"
 	// The earlier explanation pair remains eligible only for legacy profiles.
 	// It cannot accept a fresh explanation grant without pre-send evidence.
-	piPreJournalBridgeEntrySHA      = "dc5c17fe9f5d783d1be2becb1c47e38b01443d2f85e23e8243ddb3100853902b"
-	piPreJournalBridgeImplSHA       = "85bfc85b5ebda50b7bcddb64966f1f730838c5437c4e2d9caef4251f0fe274d5"
-	piDiscussionRelayBridgeEntrySHA = "a9178ae8ad54ea8ce834c9594dbbf407222be70f60ccb35d45506cb7f9855737"
-	piDiscussionRelayBridgeImplSHA  = "17c987936c185fd11ea8c5c26855aa15c9707d393fac1152c1bbb2d1eaa035d4"
-	piOrdinaryQuoteBridgeEntrySHA   = "1a7c9c01d71c3d010c06586a6946b4c64f11e617a8f8a58722e408fd70bd9c0f"
-	piIntegratedBridgeEntrySHA      = "35e10bcfef2635f1732747de667308ca6c79b449b73876667d819f4e501ababa"
-	piIntegratedQuoteBridgeEntrySHA = "326fb8c0fef8eb75deba1348231a345f99636728e058a24fe3c620ce2c1686ce"
-	piIntegratedBridgeImplSHA       = "f138eb8b5203ab2a65c71c41f0cb7e4e8eaad0a0f509f029df5ed8a804d96cde"
+	piPreJournalBridgeEntrySHA        = "dc5c17fe9f5d783d1be2becb1c47e38b01443d2f85e23e8243ddb3100853902b"
+	piPreJournalBridgeImplSHA         = "85bfc85b5ebda50b7bcddb64966f1f730838c5437c4e2d9caef4251f0fe274d5"
+	piDiscussionRelayBridgeEntrySHA   = "a9178ae8ad54ea8ce834c9594dbbf407222be70f60ccb35d45506cb7f9855737"
+	piDiscussionRelayBridgeImplSHA    = "17c987936c185fd11ea8c5c26855aa15c9707d393fac1152c1bbb2d1eaa035d4"
+	piOrdinaryQuoteBridgeEntrySHA     = "1a7c9c01d71c3d010c06586a6946b4c64f11e617a8f8a58722e408fd70bd9c0f"
+	piIntegratedBridgeEntrySHA        = "35e10bcfef2635f1732747de667308ca6c79b449b73876667d819f4e501ababa"
+	piIntegratedQuoteBridgeEntrySHA   = "326fb8c0fef8eb75deba1348231a345f99636728e058a24fe3c620ce2c1686ce"
+	piIntegratedBridgeImplSHA         = "f138eb8b5203ab2a65c71c41f0cb7e4e8eaad0a0f509f029df5ed8a804d96cde"
+	piProjectExperienceBridgeEntrySHA = "79ca668cfc6e1fd17422f87451ac1bee287262839dd7647870cfee8e577fab06"
+	piProjectExperienceBridgeImplSHA  = "86dd5107ed03708bea1927bac5135695ed71888da0b6e4f8cb524c3b536c8b9a"
 )
 
 // PiNativeSessionBridgeSupported qualifies only the actual trusted native release
@@ -135,6 +136,15 @@ func qualifyPiInvestigationBridge(extensionPath string) qualifiedPiBridge {
 	return qualifyPiBridgePair(extensionPath, piInvestigationBridgeImplSHA, piInvestigationBridgeEntrySHA, piInvestigationBridgeEntry200SHA)
 }
 
+// PiProjectExperienceBridgeSupported qualifies the exact fresh history parser and entry.
+func PiProjectExperienceBridgeSupported(extensionPath string) bool {
+	return qualifyPiProjectExperienceBridge(extensionPath).path != ""
+}
+
+func qualifyPiProjectExperienceBridge(extensionPath string) qualifiedPiBridge {
+	return qualifyPiBridgePair(extensionPath, piProjectExperienceBridgeImplSHA, piProjectExperienceBridgeEntrySHA)
+}
+
 func qualifyPiBridgePair(extensionPath, implSHA string, entrySHAs ...string) qualifiedPiBridge {
 	if !filepath.IsAbs(extensionPath) {
 		return qualifiedPiBridge{}
@@ -148,13 +158,17 @@ func qualifyPiBridgePair(extensionPath, implSHA string, entrySHAs ...string) qua
 	impl := filepath.Join(filepath.Dir(entry), "bridge.mjs")
 	// Classify the schema from the same entry bytes used for qualification.
 	if entrySHA := piBridgeMatchingSHA(entry, entrySHAs...); entrySHA != "" && piBridgeBytesMatch(impl, implSHA) {
-		return qualifiedPiBridge{path: entry, sendMessageQuote: entrySHA == piOrdinaryQuoteBridgeEntrySHA && implSHA == piDiscussionRelayBridgeImplSHA}
+		return qualifiedPiBridge{path: entry, sendMessageQuote: entrySHA == piOrdinaryQuoteBridgeEntrySHA && implSHA == piDiscussionRelayBridgeImplSHA ||
+			entrySHA == piProjectExperienceBridgeEntrySHA && implSHA == piProjectExperienceBridgeImplSHA}
 	}
 	// The integrated releases are exact alternatives to either optional
 	// profile's original pair. Never accept a mix of entry and parser releases.
 	integratedOK := implSHA == piRunExplanationImplSHA && slices.Contains(entrySHAs, piRunExplanationEntrySHA) ||
 		implSHA == piDiscussionRelayBridgeImplSHA && slices.Contains(entrySHAs, piDiscussionRelayBridgeEntrySHA)
 	if integratedOK {
+		if piBridgeBytesMatch(entry, piProjectExperienceBridgeEntrySHA) && piBridgeBytesMatch(impl, piProjectExperienceBridgeImplSHA) {
+			return qualifiedPiBridge{path: entry, sendMessageQuote: true}
+		}
 		if entrySHA := piBridgeMatchingSHA(entry, piIntegratedQuoteBridgeEntrySHA, piIntegratedBridgeEntrySHA); entrySHA != "" && piBridgeBytesMatch(impl, piIntegratedBridgeImplSHA) {
 			return qualifiedPiBridge{path: entry, sendMessageQuote: entrySHA == piIntegratedQuoteBridgeEntrySHA}
 		}
@@ -307,6 +321,8 @@ func (e piDigestBoundExecutor) Execute(ctx context.Context, request ExecuteReque
 			return ExecutionReceipt{Outcome: OutcomeNotStarted, ExitCode: -1, Reason: "公开运行说明的运行绑定不匹配，执行未启动"}
 		}
 		qualify = qualifyPiRunExplanationBridge
+	case e.memberTools.projectExperience:
+		qualify = qualifyPiProjectExperienceBridge
 	case e.discussionRelay:
 		qualify = qualifyPiDiscussionRelayBridge
 	case e.investigationBridge:

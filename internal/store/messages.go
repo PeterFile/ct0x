@@ -20,6 +20,7 @@ type MessageRequest struct {
 	RecipientIDs                              []string // Nil permits routing; non-nil (even empty) is an explicit set.
 	TopicIDExplicit                           bool     `json:"-"`
 	domain.ThreadLinks
+	ArtifactReadGrant *domain.ArtifactVersionRef `json:"-"` // Only local-user chat may grant an exact version.
 }
 
 type MessageListOptions struct {
@@ -49,13 +50,16 @@ func (r MessageRequest) topicSelectionPayload() []byte {
 // Pre-composition A3 used the quote-only fingerprint for local user messages
 // too. This is a lookup alias only, never a new reservation or source proof.
 func (r MessageRequest) hasLegacyQuotePayload() bool {
-	return r.ActorID == "user" && r.ReplyToMessageID != "" && r.RelatedTaskID == ""
+	return r.ActorID == "user" && r.ArtifactReadGrant == nil && r.ReplyToMessageID != "" && r.RelatedTaskID == ""
 }
 
 func (r MessageRequest) encodePayload(selector string, quoteOnly bool) []byte {
 	fields := []string{r.GroupID, r.TopicID, r.Content, "omitted"}
 	if r.RecipientIDs != nil {
 		fields[3] = "explicit"
+	}
+	if r.ArtifactReadGrant != nil {
+		fields[3] = artifactReadGrantMode
 	}
 	// Neither marker can collide with a legacy recipient list of any length.
 	if quoteOnly && r.ReplyToMessageID != "" && r.RelatedTaskID == "" {
@@ -66,7 +70,11 @@ func (r MessageRequest) encodePayload(selector string, quoteOnly bool) []byte {
 		fields = append(fields, r.ReplyToMessageID, r.RelatedTaskID)
 	}
 	fields[3] += selector // Cannot collide with a legacy recipient list or link payload.
-	return mutationPayload(append(fields, recipientSet(r.RecipientIDs)...)...)
+	fields = append(fields, recipientSet(r.RecipientIDs)...)
+	if pin := r.ArtifactReadGrant; pin != nil {
+		fields = append(fields, pin.ArtifactID, pin.VersionID)
+	}
+	return mutationPayload(fields...)
 }
 
 func recipientSet(ids []string) []string {
@@ -76,6 +84,9 @@ func recipientSet(ids []string) []string {
 }
 
 func (s *Store) LookupMessageReceipt(ctx context.Context, request MessageRequest) (domain.Message, bool, error) {
+	if request.ArtifactReadGrant != nil {
+		return domain.Message{}, false, ErrInvalid
+	}
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return domain.Message{}, false, storeError("读取消息回执失败", err)
@@ -112,6 +123,9 @@ func (s *Store) LookupMessageReceipt(ctx context.Context, request MessageRequest
 }
 
 func (s *Store) CreateMessage(ctx context.Context, request MessageRequest, resolvedRecipientIDs []string) (domain.Message, error) {
+	if request.ArtifactReadGrant != nil {
+		return domain.Message{}, ErrInvalid
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.Message{}, storeError("创建消息失败", err)

@@ -37,6 +37,7 @@ type piMemberToolOptions struct {
 	investigation         bool              // Strict first-investigation config and argv.
 	runExplanation        string            // Bound RunID for the fresh public-explanation profile only.
 	runExplanationJournal string            // Bound absolute path under that run's directory.
+	projectExperience     bool              // Qualified fresh history profile; never typed or resumable.
 
 	// Only typed investigation uses its own wire schema and in-memory session.
 	investigationConfigFile os.FileInfo
@@ -164,6 +165,10 @@ func (o *piMemberToolOptions) boundConfig() bool {
 func (o *piMemberToolOptions) launchConfigMatches() bool {
 	if !o.boundConfig() {
 		return true
+	}
+	if o.projectExperience {
+		config, err := readPiProjectExperienceConfig(o.configPath)
+		return err == nil && config.digest == o.configSHA256
 	}
 	if o.runExplanation != "" {
 		return piRunExplanationConfigJournal(o.configPath, o.configSHA256, o.runExplanation) == o.runExplanationJournal
