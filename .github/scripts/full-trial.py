@@ -223,24 +223,38 @@ def worker(plan, context, kind):
 
 
 def public_job_numbers(context, plan):
-    """Read public metadata only; no token, secrets or write permissions required."""
+    """Read public metadata with optional aggregate-scoped actions:read auth."""
     repository = os.environ["GITHUB_REPOSITORY"]
     check(repository == "PeterFile/ct0x", "公开回执仓库身份不符")
     url = f"https://api.github.com/repos/{repository}/actions/runs/{context['run_id']}/attempts/{context['attempt']}/jobs?per_page=100"
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "full-scheduling-trial"}
+    token = os.environ.get("GH_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = "Bearer " + token
     for attempt in range(2):
         try:
-            with urlopen(Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": "full-scheduling-trial"}), timeout=20) as response:
+            with urlopen(Request(url, headers=headers), timeout=20) as response:
                 data = verifier.decode(response.read().decode())
             break
         except (HTTPError, URLError) as error:
+            if isinstance(error, HTTPError):
+                error.close()
             if attempt or isinstance(error, HTTPError) and error.code < 500:
-                raise
+                detail = f"HTTP {error.code}" if isinstance(error, HTTPError) else "网络错误"
+                raise ValueError("读取公开作业编号失败：" + detail) from None
             time.sleep(1)
+    check(isinstance(data, dict) and type(data.get("total_count")) is int and isinstance(data.get("jobs"), list),
+          "公开作业编号列表非法")
     jobs = data["jobs"]
     check(data["total_count"] == len(jobs) and len(jobs) <= 100, "公开作业编号列表不完整")
     expected = ["Trial preflight", "Go ordinary and remaining race", "Go vet and CI gates", "Go benchmarks", "Trial final receipt"]
     expected += [f"Trial shard {i}" for i in range(len(plan["schedule"]["shards"]))]
     expected += [f"Trial workspace {i}" for i in plan["schedule"]["workspace"]]
+    check(len(jobs) == len(expected), "公开作业集合缺失或多余")
+    fields = {"id", "name", "run_id", "head_sha", "run_attempt", "status", "conclusion", "started_at", "completed_at"}
+    check(all(isinstance(row, dict) and fields <= row.keys() and isinstance(row["name"], str) and
+              type(row["id"]) is int and row["id"] > 0 for row in jobs), "公开作业编号字段非法")
+    check(len({row["id"] for row in jobs}) == len(jobs), "公开作业编号重复")
     result = []
     for name in expected:
         matches = [row for row in jobs if row["name"] == name or row["name"].endswith(" / " + name)]
@@ -249,8 +263,8 @@ def public_job_numbers(context, plan):
         check(type(row["id"]) is int and row["id"] > 0 and str(row["run_id"]) == context["run_id"] and
               row["head_sha"] == context["controller_sha"] and str(row["run_attempt"]) == context["attempt"],
               "公开作业编号与本次 run/attempt/控制器不符")
-        check(row["conclusion"] == "success" if name != "Trial final receipt" else row["status"] == "in_progress",
-              "公开作业状态不是当前完整成功执行：" + name)
+        status = ("in_progress", None) if name == "Trial final receipt" else ("completed", "success")
+        check((row["status"], row["conclusion"]) == status, "公开作业状态不是当前完整成功执行：" + name)
         result.append({key: row[key] for key in ("id", "name", "status", "conclusion", "started_at", "completed_at")})
     return result
 

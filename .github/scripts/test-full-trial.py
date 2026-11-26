@@ -3,6 +3,7 @@
 from collections import Counter
 from contextlib import redirect_stdout
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -15,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+from urllib.error import HTTPError, URLError
 
 SCRIPTS = Path(__file__).resolve().parent
 
@@ -24,6 +26,18 @@ def load(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def cli_fixture(plan, canonical):
+    # Rebind only verified synthetic evidence to the real CLI's current checkout.
+    plan, canonical = copy.deepcopy((plan, canonical))
+    sha, tree = [subprocess.run(["git", "rev-parse", revision], check=True, capture_output=True, text=True).stdout.strip()
+                 for revision in ("HEAD", "HEAD^{tree}")]
+    identity = {"checkout_sha": sha, "checkout_tree": tree}
+    plan["identity"].update(identity)
+    for summary in canonical.values():
+        summary.update(identity)
+    return plan, canonical
 
 
 class SchedulingTests(unittest.TestCase):
@@ -212,9 +226,44 @@ class ReceiptTests(unittest.TestCase):
                 root = Path(directory)
                 plan = self.fixture(root, scheme, parallel)
                 canonical, workspace = self.driver.collect(plan, root / "shards", root / "workspace", plan["identity"])
-                result = self.driver.aggregate_canonical(plan, canonical)
+                result = self.driver.aggregate_canonical(*cli_fixture(plan, canonical))
                 self.assertEqual(sum(row["total"] for row in result.values()), 81)
                 self.assertEqual(workspace, plan["monolith"])
+                self.assertEqual(plan["identity"]["checkout_sha"], self.plan.PRODUCT_SHA)
+
+    def test_real_aggregate_runs_from_another_shallow_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory) / "checkout"
+            subprocess.run(["git", "clone", "--quiet", "--depth=1", "--no-local", Path.cwd().as_uri(), str(checkout)],
+                           check=True, capture_output=True)
+            result = subprocess.run([sys.executable, str(SCRIPTS / "test-full-trial.py"),
+                                     "ReceiptTests.test_real_original_aggregate_accepts_reconstructed_a_b_c_only", "-v"],
+                                    cwd=checkout, capture_output=True, text=True,
+                                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_non_frozen_plan_and_wrong_real_cli_identities_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.fixture(root)
+            canonical, _ = self.driver.collect(plan, root / "shards", root / "workspace", plan["identity"])
+            for field in ("checkout_sha", "checkout_tree"):
+                invalid = copy.deepcopy(plan)
+                invalid["identity"][field] = "0" * 40
+                with self.subTest(plan_field=field), self.assertRaisesRegex(ValueError, "冻结"):
+                    self.driver.receipts.validate_plan(invalid, invalid["identity"])
+            plan, canonical = cli_fixture(plan, canonical)
+            for field in ("checkout_sha", "checkout_tree"):
+                invalid = copy.deepcopy(plan)
+                invalid["identity"][field] = "0" * 40
+                with self.subTest(cli_field=field), self.assertRaises(subprocess.CalledProcessError) as error:
+                    self.driver.aggregate_canonical(invalid, canonical)
+                self.assertIn("实际 checkout", error.exception.stderr)
+            for field, value in (("run_id", "43"), ("checkout_sha", "0" * 40), ("checkout_tree", "0" * 40)):
+                invalid = copy.deepcopy(canonical)
+                next(iter(invalid.values()))[field] = value
+                with self.subTest(receipt_field=field), self.assertRaises(subprocess.CalledProcessError):
+                    self.driver.aggregate_canonical(plan, invalid)
 
     def test_omitted_duplicate_mixed_corrupt_and_wrong_arm_receipts_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -317,7 +366,7 @@ class ExecutionTests(unittest.TestCase):
                         self.assertTrue(timing)
                         self.assertTrue(all(row["job_number"] == number and row["attempt"] == "1" for row in timing))
                 canonical, workspace = self.driver.collect(plan, outputs / "shards", outputs / "workspace", context)
-                result = self.driver.aggregate_canonical(plan, canonical)
+                result = self.driver.aggregate_canonical(*cli_fixture(plan, canonical))
                 self.assertEqual(sum(row["total"] for row in result.values()), 81)
                 self.assertEqual(workspace, plan["monolith"])
 
@@ -365,13 +414,179 @@ class ExecutionTests(unittest.TestCase):
                 os.chdir(previous)
 
 
+class PublicJobTests(unittest.TestCase):
+    def setUp(self):
+        self.driver = load("full-trial")
+        self.context = {"run_id": "42", "attempt": "1", "controller_sha": "c" * 40}
+        self.plan = {"schedule": {"shards": [[], []], "workspace": [0, 1]}}
+        names = ["Trial preflight", "Go ordinary and remaining race", "Go vet and CI gates", "Go benchmarks",
+                 "Trial final receipt", "Trial shard 0", "Trial shard 1", "Trial workspace 0", "Trial workspace 1"]
+        self.data = {"total_count": len(names), "jobs": [
+            {"id": i + 1, "run_id": 42, "run_attempt": 1, "head_sha": "c" * 40, "name": "trial / " + name,
+             "status": "in_progress" if name == "Trial final receipt" else "completed",
+             "conclusion": None if name == "Trial final receipt" else "success",
+             "started_at": "2026-11-26T16:13:15Z",
+             "completed_at": None if name == "Trial final receipt" else "2026-11-26T16:13:20Z"}
+            for i, name in enumerate(names)]}
+        self.request = self.enterContext(mock.patch.object(self.driver, "urlopen"))
+        self.sleep = self.enterContext(mock.patch.object(self.driver.time, "sleep"))
+        self.enterContext(mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "PeterFile/ct0x", "GH_TOKEN": ""}))
+        self.response(self.data)
+
+    def response(self, data):
+        self.request.return_value.__enter__.return_value.read.return_value = json.dumps(data).encode()
+
+    def test_optional_token_is_only_in_get_header(self):
+        for token in (None, "", "  ", "test-private-token"):
+            environment = {"GITHUB_REPOSITORY": "PeterFile/ct0x"}
+            if token is not None:
+                environment["GH_TOKEN"] = token
+            with self.subTest(token_present=bool(token)), mock.patch.dict(os.environ, environment, clear=True), \
+                 redirect_stdout(io.StringIO()) as output:
+                result = self.driver.public_job_numbers(self.context, self.plan)
+                request = self.request.call_args.args[0]
+                self.assertEqual(request.get_method(), "GET")
+                self.assertEqual(request.full_url,
+                                 "https://api.github.com/repos/PeterFile/ct0x/actions/runs/42/attempts/1/jobs?per_page=100")
+                self.assertEqual(request.get_header("Authorization"), "Bearer " + token if token and token.strip() else None)
+                self.assertEqual(len(result), 9)
+                self.assertNotIn("test-private-token", json.dumps(result) + output.getvalue())
+
+    def test_incomplete_extra_mixed_or_inconsistent_jobs_fail_closed(self):
+        mutations = [lambda d: d["jobs"].pop(),
+                     lambda d: d["jobs"].append(copy.deepcopy(d["jobs"][0])),
+                     lambda d: d["jobs"].append({**d["jobs"][0], "id": 100, "name": "unexpected wrapper"}),
+                     lambda d: d["jobs"][0].update(id=d["jobs"][1]["id"]),
+                     lambda d: d["jobs"][0].update(id=True),
+                     lambda d: d["jobs"][0].update(run_id=43),
+                     lambda d: d["jobs"][0].update(run_attempt=2),
+                     lambda d: d["jobs"][0].update(head_sha="a" * 40),
+                     lambda d: d["jobs"][0].update(name=None)]
+        for index in range(len(self.data["jobs"])):
+            states = [("completed", "success"), ("in_progress", "success"), ("queued", None)] if index == 4 else [
+                ("in_progress", "success"), ("completed", "failure"), ("completed", "skipped"),
+                ("completed", "cancelled"), ("completed", None)]
+            mutations += [lambda d, i=index, s=status, c=conclusion: d["jobs"][i].update(status=s, conclusion=c)
+                          for status, conclusion in states]
+        for index, mutate in enumerate(mutations):
+            data = copy.deepcopy(self.data)
+            mutate(data)
+            data["total_count"] = len(data["jobs"])
+            self.response(data)
+            with self.subTest(mutation=index), self.assertRaises(ValueError):
+                self.driver.public_job_numbers(self.context, self.plan)
+        for total in (0, 100, True):
+            self.response({**self.data, "total_count": total})
+            with self.subTest(total=total), self.assertRaises(ValueError):
+                self.driver.public_job_numbers(self.context, self.plan)
+
+    def test_http_failure_hides_credentials_and_retries_only_transients_once(self):
+        for error, calls in ((HTTPError("https://api.github.com", 403, "test-private-token", {}, None), 1),
+                             (HTTPError("https://api.github.com", 503, "test-private-token", {}, None), 2),
+                             (URLError("test-private-token"), 2)):
+            self.request.reset_mock()
+            self.sleep.reset_mock()
+            self.request.side_effect = error
+            with mock.patch.dict(os.environ, {"GH_TOKEN": "test-private-token"}), self.assertRaises(ValueError) as failure:
+                self.driver.public_job_numbers(self.context, self.plan)
+            self.assertNotIn("test-private-token", str(failure.exception))
+            self.assertEqual(self.request.call_count, calls)
+            self.assertEqual(self.sleep.call_count, calls - 1)
+        self.request.reset_mock()
+        self.request.side_effect = [URLError("temporary"), self.request.return_value]
+        self.assertEqual(len(self.driver.public_job_numbers(self.context, self.plan)), 9)
+        self.assertEqual(self.request.call_count, 2)
+
+    def test_other_repository_is_rejected_before_get(self):
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "other/repository"}), self.assertRaises(ValueError):
+            self.driver.public_job_numbers(self.context, self.plan)
+        self.request.assert_not_called()
+
+
 class WorkflowTests(unittest.TestCase):
-    def test_generated_projection_is_reproducible_and_legacy_stays_immutable(self):
+    def test_matrix_job_number_env_is_consumable_by_the_real_driver(self):
         render = load("full-trial-workflow")
-        target = SCRIPTS.parent / "workflows/full-trial.yml"
-        self.assertEqual(target.read_text(), render.render())
-        render.check_legacy(Path.cwd())
-        text = target.read_text()
+        text = (SCRIPTS.parent / "workflows/full-trial.yml").read_text()
+        for name in ("go-shards", "go-workspace"):
+            block = render.job(text, name)
+            env_name = re.search(r"^      (TRIAL_[^:]+): \$\{\{ matrix.job_number \}\}$", block, re.M)[1]
+            with mock.patch.dict(os.environ, {env_name: "3"}, clear=True):
+                self.assertEqual(load("full-trial").integer(os.environ["TRIAL_JOB_NUMBER"]), 3)
+
+    def test_generated_projection_is_reproducible(self):
+        render = load("full-trial-workflow")
+        try:
+            expected = render.render()
+        except render.SnapshotUnavailable as error:
+            self.skipTest(str(error))
+        self.assertEqual((SCRIPTS.parent / "workflows/full-trial.yml").read_text(), expected)
+
+    def test_snapshot_without_old_object_uses_only_verified_local_source(self):
+        render = load("full-trial-workflow")
+        path = ".github/workflows/ci-full.yml"
+        source = b"frozen test source\n"
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(render, "ROOT", Path(directory)), \
+             mock.patch.object(render, "LEGACY", {path: hashlib.sha256(source).hexdigest()}), \
+             mock.patch.object(render.subprocess, "run", side_effect=subprocess.CalledProcessError(128, ["git", "show"])):
+            target = Path(directory) / path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(source)
+            self.assertEqual(render.snapshot(path), source.decode())
+            target.write_text("legitimate later CI update\n")
+            with self.assertRaises(render.SnapshotUnavailable):
+                render.snapshot(path)
+            target.unlink()
+            with self.assertRaises(render.SnapshotUnavailable):
+                render.snapshot(path)
+
+    def test_snapshot_rejects_corrupt_git_source_even_if_local_source_matches(self):
+        render = load("full-trial-workflow")
+        path = ".github/workflows/ci-full.yml"
+        source = b"frozen test source\n"
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(render, "ROOT", Path(directory)), \
+             mock.patch.object(render, "LEGACY", {path: hashlib.sha256(source).hexdigest()}), \
+             mock.patch.object(render.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stdout=b"corrupt")):
+            target = Path(directory) / path
+            target.parent.mkdir(parents=True)
+            target.write_bytes(source)
+            with self.assertRaisesRegex(ValueError, "源码校验失败"):
+                render.snapshot(path)
+
+    def test_runtime_checks_product_cwd_not_disposable_controller_wrapper(self):
+        driver = load("full-trial")
+        sources = {".github/workflows/ci.yml": b"immutable product workflow\n",
+                   ".github/scripts/ci-plan.py": b"immutable scheduling source\n"}
+        pins = {path: hashlib.sha256(data).hexdigest() for path, data in sources.items()}
+        environment = {"TRIAL_SCHEME": "a", "TRIAL_REPEAT": "1", "TRIAL_PARALLEL": "7",
+                       "TRIAL_SHA": driver.planner.PRODUCT_SHA, "GITHUB_SHA": "c" * 40,
+                       "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "1"}
+        with tempfile.TemporaryDirectory() as directory:
+            product, controller = Path(directory) / "product", Path(directory) / "controller"
+            for root in (product, controller):
+                for path, data in sources.items():
+                    target = root / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(data)
+            (controller / ".github/workflows/ci.yml").write_text("disposable dispatch wrapper\n")
+            previous = Path.cwd()
+            try:
+                os.chdir(product)
+                with mock.patch.dict(os.environ, environment), mock.patch.object(driver, "ROOT", controller), \
+                     mock.patch.object(driver.workflow, "ROOT", controller), mock.patch.object(driver.workflow, "LEGACY", pins), \
+                     mock.patch.object(driver.shards, "check_identity") as check_identity, \
+                     mock.patch.object(driver, "git", side_effect=lambda root, *args: "d" * 40 if args[-1] == "HEAD^{tree}" else "c" * 40):
+                    self.assertEqual(driver.identity()["controller_sha"], "c" * 40)
+                    check_identity.assert_called_once_with(driver.planner.PRODUCT_SHA, driver.planner.PRODUCT_TREE)
+                    (product / ".github/workflows/ci.yml").write_text("wrong product workflow\n")
+                    with self.assertRaisesRegex(ValueError, "生产调度文件"):
+                        driver.identity()
+            finally:
+                os.chdir(previous)
+
+    def test_generated_workflow_is_bounded_and_read_only(self):
+        text = (SCRIPTS.parent / "workflows/full-trial.yml").read_text()
         for key in ("workflow_call:", "sha:", "scheme:", "repeat:", "shard_parallel:"):
             self.assertIn(key, text)
         self.assertIn("fail-fast: false", text)
@@ -379,6 +594,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("secrets:", text)
         self.assertNotIn(": write", text)
         self.assertNotIn("continue-on-error", text)
+        aggregate = load("full-trial-workflow").job(text, "aggregate")
+        self.assertIn("    permissions:\n      contents: read\n      actions: read\n", aggregate)
+        self.assertIn("          GH_TOKEN: ${{ github.token }}", aggregate)
+        self.assertEqual(text.count("actions: read"), 1)
+        self.assertEqual(text.count("GH_TOKEN:"), 1)
 
 
 if __name__ == "__main__":

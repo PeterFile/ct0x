@@ -47,8 +47,22 @@ def check_legacy(root=None):
             raise ValueError("生产调度文件偏离固定基线：" + path)
 
 
+class SnapshotUnavailable(ValueError):
+    """The frozen Git object and a hash-verified local copy are both absent."""
+
+
 def snapshot(path):
-    data = subprocess.run(["git", "show", f"{PRODUCT_SHA}:{path}"], check=True, capture_output=True).stdout
+    try:
+        data = subprocess.run(["git", "-C", str(ROOT), "show", f"{PRODUCT_SHA}:{path}"],
+                              check=True, capture_output=True).stdout
+    except subprocess.CalledProcessError:
+        # A shallow checkout may still contain the exact declared source bytes.
+        try:
+            data = (ROOT / path).read_bytes()
+        except FileNotFoundError:
+            raise SnapshotUnavailable("缺少可验证的冻结源码：" + path) from None
+        if hashlib.sha256(data).hexdigest() != LEGACY[path]:
+            raise SnapshotUnavailable("缺少可验证的冻结源码：" + path) from None
     if hashlib.sha256(data).hexdigest() != LEGACY[path]:
         raise ValueError("不可变基线源码校验失败：" + path)
     return data.decode()
@@ -74,6 +88,7 @@ def sidecar(source, name):
     if name == "go-vet":
         block += '''      - name: Test trial evidence and workflow projection
         run: |
+          set -euo pipefail
           python3 .trial-controller/.github/scripts/test-full-trial.py -v
           python3 .trial-controller/.github/scripts/full-trial-workflow.py --check
 '''
@@ -214,12 +229,15 @@ jobs:
     env:
       TRIAL_JOB_NUMBER: ${{ matrix.job_number }}
     steps:
-'''.replace("JOB", name).replace("KIND", kind).replace("TIMEOUT", str(timeout)).replace("PARALLEL", parallel).replace("MATRIX", matrix)
+'''.replace("  JOB:", "  " + name + ":").replace("KIND", kind).replace("TIMEOUT", str(timeout)).replace("PARALLEL", parallel).replace("MATRIX", matrix)
         workers += CHECKOUT + CONTROLLER + GO + download_plan()
         workers += '      - name: Execute and verify ' + kind + '\n        run: ' + DRIVER + ' ' + kind + '\n'
         workers += uploads(kind) + "\n"
     aggregate = '''  aggregate:
     name: Trial final receipt
+    permissions:
+      contents: read
+      actions: read
     needs: [preflight, go-shards, go-workspace, go-other, go-vet, go-benchmarks]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
@@ -244,6 +262,8 @@ jobs:
           merge-multiple: false
       - name: Rebuild canonical receipts and run original aggregate
         id: receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: python3 .trial-controller/.github/scripts/full-trial.py aggregate
       - uses: actions/upload-artifact@v7
         with:
