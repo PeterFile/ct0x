@@ -6,22 +6,22 @@ on:
   push:
     branches:
       - master
-  merge_group:
-    types: [checks_requested]
 
 permissions:
   contents: read
 
-# Irrelevant labels/title/body edits get a private group, so they cannot supersede real CI.
+# Relevant PR runs supersede older runs. Master keeps the running and latest pending run.
+# Irrelevant events get a private group, so they cannot supersede real CI.
 concurrency:
   group: >-
     ${{ format('{0}-{1}', github.workflow,
-        (github.event_name != 'pull_request' ||
-         contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-         (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-         (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft)))) &&
+        ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+         (github.event_name == 'pull_request' &&
+          (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
+           (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
+           (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
         (github.event.pull_request.number || github.ref) || format('ignored-{0}', github.run_id)) }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -31,15 +31,15 @@ jobs:
   feedback:
     name: CI preflight and feedback
     if: >-
-      ${{ github.event_name != 'pull_request' ||
-          contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-          (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-          (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft))) }}
+      ${{ (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+          (github.event_name == 'pull_request' &&
+           (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
+            (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
+            (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full')))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
-      bucket: ${{ steps.plan.outputs.bucket }}
       sha: ${{ steps.plan.outputs.sha }}
       tree: ${{ steps.plan.outputs.tree }}
       head: ${{ steps.plan.outputs.head }}
@@ -90,16 +90,11 @@ jobs:
       - name: Pi bridge test and typecheck
         run: python3 .github/scripts/ci-plan.py bridge "$RUNNER_TEMP/ci-plan.json"
 
-  # Concurrency wraps the reusable call, and is held until its final gate finishes.
-  # FIFO is by admission arrival, not PR creation. Native queues retain up to 100 pending per bucket.
+  # Master is serialized by workflow concurrency; PR full runs are opt-in.
   full:
     name: Full suite
     needs: feedback
     if: ${{ needs.feedback.outputs.mode == 'full' }}
-    concurrency:
-      group: ci-full-${{ needs.feedback.outputs.bucket }}
-      queue: max
-      cancel-in-progress: false
     uses: ./.github/workflows/ci-full.yml
     with:
       sha: ${{ needs.feedback.outputs.sha }}
@@ -113,20 +108,22 @@ jobs:
   # Cancelled dependencies and an unexpectedly skipped full also need a non-required name.
   merge-check:
     name: >-
-      ${{ (github.event_name != 'pull_request' ||
-           contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-           (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-           (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft)))) &&
-          (github.event_name != 'pull_request' || !github.event.pull_request.draft || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full')) &&
+      ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+           (github.event_name == 'pull_request' &&
+            (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
+             (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
+             (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
+          (github.event_name == 'push' || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full')) &&
           needs.feedback.result != 'cancelled' && needs.full.result != 'cancelled' &&
           (needs.feedback.result != 'success' || needs.full.result != 'skipped') && 'Full CI' || 'Feedback status' }}
     needs: ["feedback", "full"]
     if: >-
-      ${{ !cancelled() && ((github.event_name != 'pull_request' ||
-           contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-           (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-           (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || (github.event.label.name == 'ci:full' && github.event.pull_request.draft)))) &&
-          (github.event_name != 'pull_request' || !github.event.pull_request.draft || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full'))) }}
+      ${{ !cancelled() && (((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+           (github.event_name == 'pull_request' &&
+            (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
+             (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
+             (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
+          (github.event_name == 'push' || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

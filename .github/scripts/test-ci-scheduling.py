@@ -61,11 +61,29 @@ def step(text, name):
 
 
 def scalar_expression(text, values):
-    # Evaluate only scalar routing/status clauses, not the full Actions language.
+    # Evaluate only the routing/status subset used by these workflows.
     for key, value in sorted(values.items(), key=lambda item: len(item[0]), reverse=True):
         text = text.replace(key, repr(value))
     text = re.sub(r"!(?!=)", " not ", text.replace("&&", " and ").replace("||", " or "))
-    return eval(text, {"__builtins__": {}}, {})
+    functions = {"contains": lambda items, value: value.casefold() in [item.casefold() for item in items],
+                 "fromJSON": json.loads, "format": lambda pattern, *args: pattern.format(*args)}
+    return eval(text, {"__builtins__": {}, "null": None, **functions}, {})
+
+
+def native_expression(text, event_name, event, run_id=RUN):
+    pull_request = event.get("pull_request", {})
+    # Actions string comparisons and contains are case-insensitive.
+    return scalar_expression(text, {
+        "github.event_name": event_name,
+        "github.event.action": event.get("action"),
+        "github.event.label.name": event.get("label", {}).get("name", "").casefold(),
+        "github.event.pull_request.labels.*.name": [label["name"] for label in pull_request.get("labels", [])],
+        "github.event.pull_request.number": pull_request.get("number"),
+        "github.event.pull_request.draft": pull_request.get("draft"),
+        "github.event.changes.base.ref.from": event.get("changes", {}).get("base", {}).get("ref", {}).get("from"),
+        "github.ref": event.get("ref", "refs/pull/17/merge"),
+        "github.workflow": "CI", "github.run_id": run_id,
+    })
 
 
 class RoutingTests(unittest.TestCase):
@@ -73,28 +91,27 @@ class RoutingTests(unittest.TestCase):
     def setUpClass(cls):
         cls.plan = load("ci-plan")
 
-    def test_events_and_draft_full_override(self):
-        for action in ["opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft"]:
-            for draft in [True, False]:
-                with self.subTest(action=action, draft=draft):
-                    self.assertEqual(self.plan.mode("pull_request", pr(action, draft)), "feedback" if draft else "full")
-        for draft in [True, False]:
-            self.assertEqual(self.plan.mode("pull_request", pr("labeled", draft, label={"name": "ci:refresh"})),
-                             "feedback" if draft else "full")
-        self.assertEqual(self.plan.mode("pull_request", pr("labeled", label={"name": "ci:full"})), "full")
-        event = pr()
-        event["pull_request"]["labels"] = [{"name": "ci:full"}]
-        self.assertEqual(self.plan.mode("pull_request", event), "full")
-        self.assertEqual(self.plan.mode("pull_request", pr("labeled", label={"name": "CI:refresh"})), "feedback")
-        self.assertEqual(self.plan.mode("pull_request", pr("labeled", label={"name": "CI:FULL"})), "full")
+    def test_relevant_draft_and_ready_prs_default_to_feedback_with_explicit_full(self):
+        relevant = [(action, {}) for action in ["opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft"]]
+        relevant.extend([("edited", {"changes": {"base": {"ref": {"from": "release"}}}}),
+                         ("labeled", {"label": {"name": "ci:refresh"}}), ("labeled", {"label": {"name": "CI:REFRESH"}})])
+        for draft in (True, False):
+            for action, fields in relevant:
+                for labels, expected in (([], "feedback"), ([{"name": "CI:FULL"}], "full")):
+                    event = pr(action, draft, **fields)
+                    event["pull_request"]["labels"] = labels
+                    with self.subTest(action=action, draft=draft, fields=fields, labels=labels):
+                        self.assertEqual(self.plan.mode("pull_request", event), expected)
+            for label in ("ci:full", "CI:FULL"):
+                self.assertEqual(self.plan.mode("pull_request", pr("labeled", draft, label={"name": label})), "full")
         self.assertEqual(self.plan.mode("push", {"ref": "refs/heads/master"}), "full")
-        self.assertEqual(self.plan.mode("merge_group", {"action": "checks_requested"}), "full")
+        self.assertEqual(self.plan.mode("merge_group", {"action": "checks_requested"}), "ignore")
 
     def test_irrelevant_events_and_real_base_edits(self):
         events = [pr("edited", changes={"title": {"from": "old"}}),
                   pr("edited", changes={"body": {"from": "old"}}),
                   pr("edited", changes={"base": {"sha": {"from": "d" * 40}}}),
-                  pr("labeled", label={"name": "bug"}), pr("labeled", False, label={"name": "ci:full"}),
+                  pr("labeled", label={"name": "bug"}), pr("labeled", False, label={"name": "bug"}),
                   pr("unlabeled", label={"name": "ci:full"}), pr("closed")]
         for event in events:
             # An already present override must not make an unrelated event relevant.
@@ -253,12 +270,24 @@ class GitDiffTests(unittest.TestCase):
         return base, head, merge, tree, event
 
     def test_actual_synthetic_base_not_stale_payload_base(self):
-        base, head, merge, tree, event = self.fixture({"docs/a.md": "old"}, {"docs/a.md": "new"})
+        ancestor, _ = self.commit_object({"docs/a.md": "old\n"})
+        head, _ = self.commit_object({"docs/a.md": "new\n"}, [ancestor])
+        base, _ = self.commit_object({"docs/a.md": "old\n", "web/src/base.ts": "base only\n"}, [ancestor])
+        merge_tree = self.git("merge-tree", "--write-tree", base, head).decode().strip()
+        merge, tree = self.commit_object({"docs/a.md": "new\n", "web/src/base.ts": "base only\n"}, [base, head])
+        self.assertEqual(tree, merge_tree)
+        self.git("checkout", "--quiet", "--detach", merge)
+        self.assertEqual((self.root / "web/src/base.ts").read_text(), "base only\n")
+        event = pr()
+        event["pull_request"]["head"]["sha"] = head
+        event["pull_request"]["base"]["sha"] = ancestor
         result = self.plan.plan("pull_request", event, merge, self.root)
         self.assertEqual((result["sha"], result["tree"], result["base"]), (merge, tree, base))
         self.assertNotEqual(base, event["pull_request"]["base"]["sha"])
         self.assertTrue(result["docs"])
-        self.assertEqual(result["bucket"], 1)
+        self.assertFalse(result["web"], "base-only changes must not expand PR feedback")
+        self.assertEqual(result["head"], head)
+        self.assertNotIn("bucket", result)
         event_file, output, selected_file = (self.root / name for name in ("event.json", "outputs", "plan.json"))
         event_file.write_text(json.dumps(event))
         process = subprocess.run([sys.executable, str(SCRIPTS / "ci-plan.py"), "plan", str(selected_file)], cwd=self.root,
@@ -267,7 +296,7 @@ class GitDiffTests(unittest.TestCase):
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(json.loads(selected_file.read_text()), result)
         self.assertEqual(set(line.split("=", 1)[0] for line in output.read_text().splitlines()),
-                         {"mode", "bucket", "sha", "tree", "base", "head", "matrix", "run_id", "go", "web", "bridge", "ci", "conservative"})
+                         {"mode", "sha", "tree", "base", "head", "matrix", "run_id", "go", "web", "bridge", "ci", "conservative"})
         for bad_sha in [head, "f" * 40, merge + "\nowned=true"]:
             with self.assertRaises(ValueError):
                 self.plan.plan("pull_request", event, bad_sha, self.root)
@@ -278,8 +307,9 @@ class GitDiffTests(unittest.TestCase):
     def test_stacked_ci_backport_and_go_diff_do_not_expand_product_selection(self):
         _, _, merge, _, event = self.fixture({".github/workflows/ci.yml": "old"},
                                              {".github/workflows/ci.yml": "new", "internal/scheduler/task.go": "new"})
-        for draft, expected_mode in ((True, "feedback"), (False, "full")):
-            event["pull_request"]["draft"] = draft
+        for draft, labels, expected_mode in ((True, [], "feedback"), (False, [], "feedback"),
+                                              (True, [{"name": "ci:full"}], "full"), (False, [{"name": "ci:full"}], "full")):
+            event["pull_request"].update(draft=draft, labels=labels)
             selected = self.plan.plan("pull_request", event, merge, self.root)
             self.assertEqual(selected["mode"], expected_mode)
             self.assertTrue(selected["ci"] and selected["go"])
@@ -299,7 +329,7 @@ class GitDiffTests(unittest.TestCase):
 
     def test_full_product_plan_does_not_add_a_whitespace_style_gate(self):
         _, _, merge, _, event = self.fixture({"web/src/a.ts": "old\n"}, {"web/src/a.ts": "new  \n"})
-        event["pull_request"]["draft"] = False
+        event["pull_request"].update(draft=False, labels=[{"name": "ci:full"}])
         event_file = self.root / "event.json"
         event_file.write_text(json.dumps(event))
         result = subprocess.run([sys.executable, str(SCRIPTS / "ci-plan.py"), "plan", str(self.root / "plan.json")], cwd=self.root,
@@ -311,6 +341,17 @@ class GitDiffTests(unittest.TestCase):
         self.assertEqual(selected["head"], event["pull_request"]["head"]["sha"])
         for field in ("head", "base", "sha", "tree"):
             self.assertIn(field, result.stdout.decode())
+
+    def test_master_push_plan_preserves_pushed_commit_identity_and_rejects_other_events(self):
+        base, _, pushed, tree, _ = self.fixture({"PRD.md": "old"}, {"PRD.md": "new"})
+        selected = self.plan.plan("push", {"ref": "refs/heads/master"}, pushed, self.root)
+        self.assertEqual({key: selected[key] for key in ("mode", "sha", "tree", "head", "base")},
+                         {"mode": "full", "sha": pushed, "tree": tree, "head": pushed, "base": base})
+        self.assertNotIn("bucket", selected)
+        for name, event in [("push", {"ref": "refs/heads/feature"}),
+                            ("merge_group", {"action": "checks_requested", "merge_group": {"head_sha": pushed}})]:
+            with self.subTest(event_name=name), self.assertRaises(ValueError):
+                self.plan.plan(name, event, pushed, self.root)
 
     def test_reject_nonmerge_identity_and_missing_parent(self):
         head, _ = self.commit_object({"PRD.md": "text"})
@@ -324,21 +365,69 @@ class AdmissionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = (WORKFLOWS / "ci.yml").read_text()
 
-    def test_relevance_is_shared_with_supersession_and_admission_uses_native_queue(self):
+    def test_relevance_is_shared_with_supersession_without_full_admission_queue(self):
         relevant = expression(job(self.workflow, "feedback"), "if")
-        group = expression(self.workflow.split("jobs:", 1)[0], "group")
+        concurrency = self.workflow.split("jobs:", 1)[0]
+        group = expression(concurrency, "group")
+        cancel = expression(concurrency, "cancel-in-progress")
         self.assertIn(relevant, group)
-        self.assertIn("format('ignored-{0}', github.run_id)", group)
-        self.assertIn("github.event.pull_request.number || github.ref", group)
-        self.assertIn("cancel-in-progress: true", self.workflow.split("jobs:", 1)[0])
         full = job(self.workflow, "full")
-        for text in ["uses: ./.github/workflows/ci-full.yml", "needs: feedback", "needs.feedback.outputs.mode == 'full'",
-                     "queue: max", "needs.feedback.outputs.bucket", "cancel-in-progress: false"]:
+        for text in ["uses: ./.github/workflows/ci-full.yml", "needs: feedback", "needs.feedback.outputs.mode == 'full'"]:
             self.assertIn(text, full)
         self.assertNotIn("runs-on:", full)
+        self.assertNotIn("concurrency:", full)
         self.assertNotIn("concurrency:", (WORKFLOWS / "ci-full.yml").read_text())
-        plan = load("ci-plan")
-        self.assertEqual([plan.bucket("pull_request", pr(number=n)) for n in range(1, 151)], [n % 2 for n in range(1, 151)])
+        self.assertNotIn("queue:", self.workflow)
+        self.assertNotIn("bucket", self.workflow)
+        self.assertFalse(hasattr(load("ci-plan"), "bucket"))
+        events = [("push", {"ref": "refs/heads/master"}, "full"),
+                  ("push", {"ref": "refs/heads/feature"}, "ignore"),
+                  ("merge_group", {"action": "checks_requested"}, "ignore"),
+                  ("workflow_dispatch", {}, "ignore"), ("issues", {"action": "opened"}, "ignore")]
+        for draft in (True, False):
+            for action in ("opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft"):
+                events.append(("pull_request", pr(action, draft), "feedback"))
+                event = pr(action, draft)
+                event["pull_request"]["labels"] = [{"name": "CI:FULL"}]
+                events.append(("pull_request", event, "full"))
+            for label, expected in (("ci:refresh", "feedback"), ("CI:REFRESH", "feedback"),
+                                    ("ci:full", "full"), ("CI:FULL", "full"), ("bug", "ignore")):
+                events.append(("pull_request", pr("labeled", draft, label={"name": label}), expected))
+            events.append(("pull_request", pr("edited", draft, changes={"base": {"ref": {"from": "release"}}}), "feedback"))
+            for fields in ({"title": {"from": "old"}}, {"body": {"from": "old"}}, {"base": {"sha": {"from": SHA}}}):
+                event = pr("edited", draft, changes=fields)
+                event["pull_request"]["labels"] = [{"name": "ci:full"}]
+                events.append(("pull_request", event, "ignore"))
+            event = pr("labeled", draft, label={"name": "bug"})
+            event["pull_request"]["labels"] = [{"name": "ci:full"}]
+            events.append(("pull_request", event, "ignore"))
+        outer = job(self.workflow, "merge-check")
+        condition = expression(outer, "if")
+        candidate = condition[len("!cancelled() && ("):-1]
+        name = expression(outer, "name")
+        for event_name, event, tier in events:
+            with self.subTest(event_name=event_name, event=event):
+                self.assertEqual(native_expression(relevant, event_name, event), tier != "ignore")
+                self.assertEqual(native_expression(candidate, event_name, event), tier == "full")
+                group1 = native_expression(group, event_name, event)
+                group2 = native_expression(group, event_name, event, run_id="999")
+                if tier == "ignore":
+                    self.assertNotEqual(group1, group2)
+                    self.assertNotEqual(group1, native_expression(group, "pull_request", pr()))
+                    self.assertNotEqual(group1, native_expression(group, "push", {"ref": "refs/heads/master"}))
+                else:
+                    self.assertEqual(group1, group2)
+                    self.assertEqual(native_expression(cancel, event_name, event), event_name == "pull_request")
+                values = {candidate: tier == "full", "needs.feedback.result": "success", "needs.full.result": "success"}
+                self.assertEqual(scalar_expression(name, values), "Full CI" if tier == "full" else "Feedback status")
+        pr_group = native_expression(group, "pull_request", pr())
+        for event_name, event, tier in events:
+            if event_name == "pull_request" and tier != "ignore":
+                self.assertEqual(native_expression(group, event_name, event), pr_group)
+        other = pr()
+        other["pull_request"]["number"] = 18
+        self.assertNotEqual(native_expression(group, "pull_request", other), pr_group)
+        self.assertNotEqual(native_expression(group, "push", {"ref": "refs/heads/master"}), pr_group)
 
     def test_clients_and_cmd_are_preflight_not_repeated_after_admission(self):
         feedback = job(self.workflow, "feedback")
@@ -402,7 +491,7 @@ class AdmissionTests(unittest.TestCase):
         candidate = condition[len("!cancelled() && ("):-1]
         self.assertTrue(expression(gate, "name").startswith(candidate + " && "))
         self.assertIn(expression(job(self.workflow, "feedback"), "if"), candidate)
-        self.assertIn("github.event.pull_request.draft", candidate)
+        self.assertNotIn("github.event.pull_request.draft", candidate)
         self.assertIn("contains(github.event.pull_request.labels.*.name, 'ci:full')", candidate)
         self.assertIn("ci-gate.py outer", gate)
         self.assertNotIn("setup-go", gate)
@@ -433,8 +522,12 @@ class AdmissionTests(unittest.TestCase):
     def test_trigger_and_security_contract(self):
         for action in ["opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft", "edited", "labeled"]:
             self.assertIn(action, self.workflow.split("permissions:", 1)[0])
-        self.assertIn("merge_group:", self.workflow)
-        self.assertIn("checks_requested", self.workflow)
+        triggers = self.workflow.split("permissions:", 1)[0]
+        pr_trigger, push_trigger = triggers.split("  pull_request:", 1)[1].split("  push:", 1)
+        self.assertEqual(push_trigger.strip(), "branches:\n      - master")
+        self.assertNotIn("merge_group:", triggers)
+        self.assertNotIn("branches:", pr_trigger)
+        self.assertNotRegex(triggers, r"(?m)^ +paths(?:-ignore)?:")
         for text in [self.workflow, (WORKFLOWS / "ci-full.yml").read_text()]:
             self.assertNotIn("pull_request_target", text)
             self.assertIn("contents: read", text)
@@ -476,7 +569,7 @@ class ShardBatchTests(unittest.TestCase):
         self.assertIn(8, batches["platform"][1])
         workflow = (WORKFLOWS / "ci-full.yml").read_text()
         shards = job(workflow, "go-shards")
-        for text in ["matrix: ${{ fromJSON(inputs.matrix) }}", "max-parallel: 7", "fail-fast: false", "timeout-minutes: 25"]:
+        for text in ["matrix: ${{ fromJSON(inputs.matrix) }}", "max-parallel: 7", "fail-fast: false", "timeout-minutes: 40"]:
             self.assertIn(text, shards)
         self.assertIn("merge-multiple: false", job(workflow, "gate"))
 
@@ -647,6 +740,63 @@ class ShardBatchTests(unittest.TestCase):
                  mock.patch.object(self.shards, "command", side_effect=self.worker_go(names, mutate)):
                 with self.assertRaises(ValueError):
                     self.shards.run_worker("platform", 2, directory, RUN, SHA, TREE)
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_slow_store_slot_subsets_preserve_exact_disjoint_union(self):
+        for count in (0, 1, 5, 6, 18):
+            selected = Counter({f"TestStoreVector{index}": 1 for index in reversed(range(count))})
+            limit = self.shards.STORE_SLOW_RUN_LIMIT
+            groups = max(1, (count + limit - 1) // limit)
+            ordered = sorted(selected)
+            expected = [Counter({name: selected[name] for name in ordered[index::groups]}) for index in range(groups)]
+            with self.subTest(count=count):
+                subsets = self.shards.execution_subsets(selected, "store", 62)
+                self.assertEqual(subsets, expected)
+                self.assertTrue(all(len(subset) <= limit for subset in subsets))
+                self.assertLessEqual(max(map(len, subsets)) - min(map(len, subsets)), 1)
+                self.assertEqual(sum(subsets, Counter()), selected)
+                for first, second in itertools.combinations(subsets, 2):
+                    self.assertFalse(first.keys() & second.keys())
+                self.assertEqual(self.shards.execution_subsets(selected, "store", 0), [selected])
+
+        slot60 = self.slot_names("store", 60, 1)
+        slot61 = self.slot_names("store", 61, 1)
+        slot62 = self.slot_names("store", 62, 18)
+        slot63 = self.slot_names("store", 63, 1)
+        names = slot60 + slot61 + slot62 + slot63
+        compiled = Counter(names)
+        with tempfile.TemporaryDirectory(prefix="ci-slow-store-") as directory, \
+             redirect_stdout(io.StringIO()), mock.patch.object(self.shards, "check_identity"), \
+             mock.patch.object(self.shards, "command", side_effect=self.worker_go(names)) as command, \
+             mock.patch.object(self.shards, "worker_parallelism", return_value=1):
+            self.shards.run_worker("store", 15, directory, RUN, SHA, TREE)
+            runs = [call.args[0] for call in command.call_args_list if "-run" in call.args[0]]
+            expected_patterns = []
+            for logical in self.shards.BATCHES["store"][15]:
+                selected, _ = self.verifier.selection(compiled, logical, "store")
+                for subset in self.shards.execution_subsets(selected, "store", logical):
+                    expected_patterns.append(self.verifier.run_pattern(subset))
+            self.assertEqual(len(runs), 7)
+            self.assertEqual(runs, [["go", "test", "-count=1", "-race", "-json", "-run", pattern, "./internal/store"]
+                                    for pattern in expected_patterns])
+            for logical in self.shards.BATCHES["store"][15]:
+                selected, _ = self.verifier.selection(compiled, logical, "store")
+                summary = json.loads((Path(directory) / f"store-shard-v1-{logical}" / "store-summary.json").read_text())
+                self.assertEqual(summary, {"schema": 1, "slot": logical, "total": 64, "run_id": RUN,
+                                          "checkout_sha": SHA, "checkout_tree": TREE, "package": "agentworkspace/internal/store",
+                                          "compiled": compiled, "selected": selected,
+                                          "runs": selected, "passes": selected, "skips": {}})
+
+        ordered62 = sorted(slot62)
+        first, second = [Counter({name: 1 for name in ordered62[index::2]}) for index in range(2)]
+        for subsets in ([first], [first, first, second]):
+            with self.subTest(bad_sizes=list(map(len, subsets))), tempfile.TemporaryDirectory(prefix="ci-slow-store-bad-") as directory, \
+                 redirect_stdout(io.StringIO()), mock.patch.object(self.shards, "check_identity"), \
+                 mock.patch.object(self.shards, "command", side_effect=self.worker_go(slot62)), \
+                 mock.patch.object(self.shards, "worker_parallelism", return_value=1), \
+                 mock.patch.object(self.shards, "execution_subsets", return_value=subsets):
+                with self.assertRaises(ValueError):
+                    self.shards.run_worker("store", 15, directory, RUN, SHA, TREE)
                 self.assertEqual(list(Path(directory).iterdir()), [])
 
     def test_store_pairing_requires_available_cpus_and_excludes_entire_slow_groups(self):
@@ -992,30 +1142,48 @@ class GateTests(unittest.TestCase):
         identity = {"run_id": RUN, "sha": SHA, "tree": TREE, "head": "c" * 40, "base": "d" * 40}
         success = {"feedback": {"result": "success", "outputs": {"mode": "full", **identity}},
                    "full": {"result": "success", "outputs": {"verified": "true", **identity}}}
-        cases = [(success, pr(draft=False), True)]
+        full_pr = pr(draft=False)
+        full_pr["pull_request"]["labels"] = [{"name": "CI:FULL"}]
+        cases = [(success, "pull_request", full_pr, True),
+                 (success, "push", {"ref": "refs/heads/master"}, True),
+                 (success, "push", {"ref": "refs/heads/feature"}, False),
+                 (success, "merge_group", {"action": "checks_requested"}, False)]
+        for draft in (True, False):
+            cases.append((success, "pull_request", pr(draft=draft), False))
+            for label, accepted in (("ci:full", True), ("CI:FULL", True), ("ci:refresh", False), ("CI:REFRESH", False), ("bug", False)):
+                cases.append((success, "pull_request", pr("labeled", draft, label={"name": label}), accepted))
+            refresh = pr("labeled", draft, label={"name": "CI:REFRESH"})
+            refresh["pull_request"]["labels"] = [{"name": "CI:FULL"}]
+            cases.append((success, "pull_request", refresh, True))
+            for event in (pr("edited", draft, changes={"title": {"from": "old"}}), pr("labeled", draft, label={"name": "bug"})):
+                event["pull_request"]["labels"] = [{"name": "ci:full"}]
+                cases.append((success, "pull_request", event, False))
         for dependency in ("feedback", "full"):
             for state in ("failure", "cancelled", "skipped", "", "unknown"):
-                cases.append(({**success, dependency: {"result": state}}, pr(draft=False), False))
-            cases.append(({key: value for key, value in success.items() if key != dependency}, pr(draft=False), False))
+                for event_name, event in (("pull_request", full_pr), ("push", {"ref": "refs/heads/master"})):
+                    cases.append(({**success, dependency: {"result": state}}, event_name, event, False))
+            cases.append(({key: value for key, value in success.items() if key != dependency}, "pull_request", full_pr, False))
             for field in identity:
                 broken = json.loads(json.dumps(success))
                 broken[dependency]["outputs"][field] = "wrong"
-                cases.append((broken, pr(draft=False), False))
-        for field in ("verified", "sha", "tree", "run_id"):
+                cases.append((broken, "pull_request", full_pr, False))
+        for field in ("verified", *identity):
             broken = json.loads(json.dumps(success))
             broken["full"]["outputs"].pop(field)
-            cases.append((broken, pr(draft=False), False))
-        cases.extend([(success, pr(), False), (success, pr("labeled", False, label={"name": "bug"}), False),
-                      (success, pr("labeled", label={"name": "CI:FULL"}), True), ({}, pr(draft=False), False)])
+            cases.append((broken, "pull_request", full_pr, False))
+        feedback_only = json.loads(json.dumps(success))
+        feedback_only["feedback"]["outputs"]["mode"] = "feedback"
+        cases.extend([(feedback_only, "pull_request", full_pr, False), ({}, "pull_request", full_pr, False)])
         with tempfile.TemporaryDirectory(prefix="ci-outer-gate-") as directory:
             event_file = Path(directory) / "event.json"
-            for payload, event, accepted in cases:
-                event_file.write_text(json.dumps(event))
-                result = subprocess.run(["bash", "-c", command], cwd=SCRIPTS.parent.parent,
-                                        env={**os.environ, "NEEDS_JSON": json.dumps(payload), "GITHUB_RUN_ID": RUN,
-                                             "GITHUB_SHA": SHA, "GITHUB_EVENT_PATH": str(event_file), "GITHUB_EVENT_NAME": "pull_request"},
-                                        capture_output=True, timeout=5)
-                self.assertEqual(result.returncode == 0, accepted, result.stderr)
+            for payload, event_name, event, accepted in cases:
+                with self.subTest(payload=payload, event_name=event_name, event=event):
+                    event_file.write_text(json.dumps(event))
+                    result = subprocess.run(["bash", "-c", command], cwd=SCRIPTS.parent.parent,
+                                            env={**os.environ, "NEEDS_JSON": json.dumps(payload), "GITHUB_RUN_ID": RUN,
+                                                 "GITHUB_SHA": SHA, "GITHUB_EVENT_PATH": str(event_file), "GITHUB_EVENT_NAME": event_name},
+                                            capture_output=True, timeout=5)
+                    self.assertEqual(result.returncode == 0, accepted, result.stderr)
 
     def test_go_remainder_vet_and_bench_start_without_shard_dependencies(self):
         workflow = (WORKFLOWS / "ci-full.yml").read_text()
