@@ -397,6 +397,115 @@ class ConsumerAuthorityTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises((ValueError, OSError)):
                 self.read()
 
+    def complete_owner(self, attempt=1):
+        if attempt > 1:
+            self.prepare_retry()
+            self.api.native.update(status="completed", conclusion="failure")
+        else:
+            self.api.job_rows[1].update(status="completed", conclusion="success", completed_at="2026-11-26T15:56:54Z")
+        run = self.api.second_run if attempt > 1 else self.api.native
+        run.update(status="completed", conclusion="success")
+
+    def test_guard_explicitly_selects_active_or_successfully_completed_read_only_state(self):
+        states = [("in_progress", None), ("completed", "success"), ("completed", None),
+                  ("completed", "failure"), ("completed", "cancelled"), ("completed", "timed_out"),
+                  ("queued", None), (None, None), ("in_progress", "cancelled")]
+        for status, conclusion in states:
+            for completed in (False, True):
+                self.api = NativeAPI()
+                self.complete_owner()
+                self.api.native.update(status=status, conclusion=conclusion)
+                expected = (status, conclusion) == (("completed", "success") if completed else ("in_progress", None))
+                with self.subTest(status=status, conclusion=conclusion, completed=completed):
+                    if expected:
+                        self.assertEqual(self.control.guard(self.api, 10, 1, completed=completed), self.api.intent)
+                    else:
+                        with self.assertRaises(ValueError):
+                            self.control.guard(self.api, 10, 1, completed=completed)
+                self.assertTrue(all(method == "GET" for method, _ in self.api.calls))
+                self.assertEqual(self.api.posts, 0)
+        for invalid in (None, 1, "false"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 1, completed=invalid)
+
+    def test_completed_guard_retains_canonical_source_and_ancestry_checks(self):
+        for change in ("source", "tree", "ancestry", "missing-owner", "failed-normalize", "inherited-admission"):
+            self.api = NativeAPI()
+            self.complete_owner()
+            if change == "source":
+                self.api.intent["sources"] = {}
+            elif change == "tree":
+                self.api.intent["tree"] = "f" * 40
+            elif change == "ancestry":
+                self.api.reachable[MASTER].remove(SHA)
+            elif change == "missing-owner":
+                self.api.status_rows = []
+            elif change == "failed-normalize":
+                self.api.job_rows[0]["conclusion"] = "failure"
+            else:
+                self.api.job_rows[1].update(started_at="2026-11-26T15:56:46Z", completed_at="2026-11-26T15:56:46Z")
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 1, completed=True)
+            self.assertEqual(self.api.posts, 0)
+
+    def test_completed_retry_guard_keeps_actor_attempt_and_fresh_job_proofs(self):
+        for event in ("workflow_dispatch", "push"):
+            self.api = NativeAPI()
+            self.complete_owner(2)
+            if event == "push":
+                self.api = NativeAPI()
+                self.prepare_retry(event)
+                self.api.native.update(status="completed", conclusion="failure")
+                self.api.second_run.update(status="completed", conclusion="success")
+            self.assertEqual(self.control.guard(self.api, 10, 2, completed=True), self.api.intent)
+            with self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 2)
+            with self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 1, completed=True)
+            self.assertEqual(self.api.posts, 0)
+        for change in ("old-attempt", "inherited-normalize", "inherited-admission", "other-attempt-admission", "unauthorized-actor"):
+            self.api = NativeAPI()
+            self.complete_owner(2)
+            if change == "old-attempt":
+                self.api.second_run["run_attempt"] = 3
+            elif change == "unauthorized-actor":
+                self.api.second_run["triggering_actor"] = self.api.permission["user"].copy()
+                self.api.permission["permission"] = "read"
+            else:
+                job = self.api.second_jobs[0 if change == "inherited-normalize" else 1]
+                if change == "other-attempt-admission":
+                    job["run_attempt"] = 1
+                else:
+                    job.update(started_at="2026-11-26T15:56:48Z", completed_at="2026-11-26T15:56:52Z")
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 2, completed=True)
+            self.assertEqual(self.api.posts, 0)
+
+    def test_guard_rechecks_latest_state_after_validation_and_keeps_api_unknown(self):
+        for completed in (False, True):
+            self.api = NativeAPI()
+            self.complete_owner()
+            if not completed:
+                self.api.native.update(status="in_progress", conclusion=None)
+            original, reads = self.api.request, []
+            def changed(method, path, data=None, binary=False):
+                if path == self.api.prefix + "/actions/runs/10":
+                    reads.append(path)
+                    if len(reads) > 1:
+                        return self.api.native | {"run_attempt": 2}
+                return original(method, path, data, binary)
+            self.api.request = changed
+            with self.subTest(completed=completed), self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 1, completed=completed)
+            self.assertEqual(self.api.posts, 0)
+            def unknown(method, path, data=None, binary=False):
+                if path == self.api.prefix + "/actions/runs/10":
+                    raise OSError("native outcome unknown")
+                return original(method, path, data, binary)
+            self.api.request = unknown
+            with self.assertRaises(OSError):
+                self.control.guard(self.api, 10, 1, completed=completed)
+
     def test_guard_independently_verifies_sources_and_same_attempt_admission(self):
         self.api.job_rows[1].update(status="completed", conclusion="success", completed_at="2026-11-26T15:56:54Z")
         self.assertEqual(self.control.guard(self.api, 10, 1), self.api.intent)
