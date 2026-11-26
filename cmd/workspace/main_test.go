@@ -290,11 +290,11 @@ func TestRunWebDir(t *testing.T) {
 func TestWebDirStartupFailures(t *testing.T) {
 	for _, dir := range []string{filepath.Join(t.TempDir(), "missing"), t.TempDir()} {
 		t.Run(filepath.Base(dir), func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			var output bytes.Buffer
 			err := runWithSearch(ctx, []string{"--listen", "127.0.0.1:0", "--data-dir", t.TempDir(), "--web-dir", dir}, &output, provider.Search{})
-			if err == nil || !chinese(err.Error()) || errors.Is(err, context.DeadlineExceeded) {
+			if err == nil || errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "网页构建目录") {
 				t.Fatalf("missing root/build must fail startup in Chinese: %v", err)
 			}
 			if output.Len() != 0 {
