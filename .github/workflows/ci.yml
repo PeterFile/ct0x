@@ -1,20 +1,27 @@
-name: Historical Web attribution replay
+name: Historical CI diagnostic replay
 on:
   workflow_dispatch:
     inputs:
+      kind:
+        type: choice
+        options: [vet, python]
+        required: true
+        description: Original failing command
       sha:
         type: string
         required: true
-        description: Exact archived GitHub merge checkout for PR 154
+        description: Authenticated archived checkout
 permissions:
   contents: read
   actions: read
 jobs:
   replay:
-    name: Reconstruct both historical Web assertions
+    if: ${{ (inputs.kind == 'vet' && inputs.sha == '66e71aa66a1a58f52c8fa0b545d0aa135eab381a') || (inputs.kind == 'python' && inputs.sha == '85b488fa772dc1197241e730131aee5f2c8d365a') }}
+    name: Reconstruct archived ${{ inputs.kind }} failure twice
     runs-on: ubuntu-latest
-    timeout-minutes: 29
+    timeout-minutes: 30
     env:
+      FIXED_CASE: ${{ inputs.kind }}
       FIXED_SHA: ${{ inputs.sha }}
     steps:
       - uses: actions/checkout@v7
@@ -24,23 +31,27 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: 3b7ff2f557df978e6c956487f9ba1875c56ae34f
+          ref: ${{ inputs.sha }}
           path: subject
           persist-credentials: false
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-go@v7
         with:
-          node-version: 22.23.5
-          package-manager-cache: false
-      - name: Authenticate original run attempt, log and checkout
+          go-version: '1.26.0'
+          cache: false
+      - uses: actions/setup-python@v6
+        if: ${{ inputs.kind == 'python' }}
+        with:
+          python-version: 3.14.4
+      - name: Authenticate original failing job, command and tested Git tree
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -B control/.github/scripts/periodic-historical-web.py source "$RUNNER_TEMP/proof"
-      - name: Run four named Vitest probes with the original pinned Node and npm
-        run: python3 -B control/.github/scripts/periodic-historical-web.py probe "$RUNNER_TEMP/proof"
+        run: python3 -B control/.github/scripts/periodic-historical-diagnostic.py source "$RUNNER_TEMP/proof"
+      - name: Run the exact original command twice and retain raw output
+        run: python3 -B control/.github/scripts/periodic-historical-diagnostic.py repeat "$RUNNER_TEMP/proof"
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
-          name: experimental-historical-web-${{ github.run_id }}-${{ github.run_attempt }}
+          name: experimental-historical-${{ inputs.kind }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/proof
           if-no-files-found: error
           retention-days: 14
