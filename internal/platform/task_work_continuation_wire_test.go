@@ -452,6 +452,16 @@ func testFreshTaskWorkB29NativeWire(t *testing.T, modes ...string) {
 			}
 			routes := append(httpapi.MemberToolRoutes(tools), httpapi.MemberRoleToolRoutes(tools)...)
 			routes = append(routes, httpapi.MemberMCPRoutes(tools)...)
+			if mode == "confirmed" {
+				// Synthetic in-process requests use the fixture's lifetime instead of
+				// the real request deadline so the wire and Store paths can be tested.
+				for i := range routes {
+					original := routes[i].Handler
+					routes[i].Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						original.ServeHTTP(w, r.WithContext(t.Context()))
+					})
+				}
+			}
 			server, err := httpapi.NewServer(httpapi.DefaultAddress, routes...)
 			roleOK(t, err)
 			f.handler = server.Handler

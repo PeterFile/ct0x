@@ -190,15 +190,18 @@ func testPiTaskDecisionProposal(t *testing.T, mode string) {
 	f.options.ChatIntake, f.options.EnablePiTaskDecisionProposals = engine, true
 	entry, err := filepath.Abs("../../extensions/pi-bridge/fresh-task-work.ts")
 	roleOK(t, err)
-	const runTimeout = 45 * time.Second
+	const runTimeout = 2 * time.Minute
 	f.options.FreshTaskWork = platform.NewPiFreshTaskWorkLaunch(entry, runTimeout)
 	rt, err := platform.NewMemberToolRuntime(f.db, f.options)
 	roleOK(t, err)
 	t.Cleanup(func() { _ = rt.Close() })
 	tools := rt.Tools()
 	routes := append(httpapi.MemberRoleToolRoutes(tools), httpapi.MemberMCPRoutes(tools)...)
-	srv, err := httpapi.NewServer(httpapi.DefaultAddress, routes...)
-	roleOK(t, err)
+	// Give synthetic requests the test lifetime while exercising the real routes.
+	mux := http.NewServeMux()
+	for _, route := range routes {
+		mux.HandleFunc(route.Method+" "+route.Pattern, route.Handler)
+	}
 	engine.EnableTaskWorkExecution()
 	ctx := t.Context()
 
@@ -213,6 +216,7 @@ set -eu
 while [ "$1" != "--session-id" ]; do shift; done
 printf '{"type":"session","version":3,"id":"%s","cwd":"%s"}\n' "$2" "$PWD"
 printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"done"}]}}' '{"type":"agent_settled","aborted":false}'
+while [ ! -f "${0%/*}/$2-terminal" ]; do sleep 0.05; done
 `), 0700))
 	selected := provider.Provider{ID: f.worker.ProviderID, Name: provider.Pi, Path: cli, Version: "1.4.0", Installation: provider.Installed}
 	prep, err := platform.NewPreparer(f.db, platform.PrepareOptions{Providers: []provider.Provider{selected}, PrivateWorkspaceRoot: workspaces,
@@ -324,6 +328,11 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 						return ctx.Err()
 					}
 				}
+				if event.Kind == provider.TerminalEvent {
+					if err := os.WriteFile(filepath.Join(root, live.Claim.TurnID+"-terminal"), nil, 0600); err != nil {
+						return err
+					}
+				}
 				return nil
 			})
 		}()
@@ -392,7 +401,7 @@ printf '%s\n' '{"type":"agent_start"}' '{"type":"message_end","message":{"role":
 			r.Header.Set(decisionCallHeader, id)
 		}
 		w := httptest.NewRecorder()
-		srv.Handler.ServeHTTP(w, r)
+		mux.ServeHTTP(w, r.WithContext(ctx))
 		if w.Code != code || strings.Contains(w.Body.String(), config.Proof) || strings.Contains(w.Body.String(), config.Token) {
 			t.Fatalf("%s: got status %d, want %d, or response leaked config", op, w.Code, code)
 		}

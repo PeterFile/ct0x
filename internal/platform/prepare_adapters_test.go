@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -201,11 +202,16 @@ func executePreparedAdapterFixture(t *testing.T, f *rolePrepareFixture, prepared
 	ctx := context.Background()
 	run := prepared.Executor.(*memberToolRuntimeRun)
 	var issued string
-	replaceExecute := func(path string, actual provider.Executor, err error) (provider.Executor, error) {
+	replaceExecute := func(path string, names []string, actual provider.Executor, err error) (provider.Executor, error) {
 		if err != nil || actual == nil {
 			t.Fatalf("actual claimed adapter factory failed: %v", err)
 		}
-		endpoint, token := memberToolRuntimeConfigWithDiscussion(t, path, run.intakeSchema.piDiscussionExcerpt)
+		var endpoint, token string
+		if run.projectExperienceMCP {
+			endpoint, token = memberToolRuntimeProjectExperienceConfig(t, path, names)
+		} else {
+			endpoint, token = memberToolRuntimeConfigWithDiscussion(t, path, run.intakeSchema.piDiscussionExcerpt)
+		}
 		if endpoint != f.runtimeOptions.Endpoint {
 			t.Fatal("factory changed the original endpoint/config contract")
 		}
@@ -226,16 +232,24 @@ func executePreparedAdapterFixture(t *testing.T, f *rolePrepareFixture, prepared
 			return provider.ExecutionReceipt{Started: true, Accepted: true, NativeSessionID: session, Outcome: provider.OutcomeSucceeded, Terminal: provider.OutcomeSucceeded, OutputComplete: true, DirectChildReaped: true, ExitCode: 0}
 		}), nil
 	}
-	if build := run.intakeBuilder; build != nil {
+	switch {
+	case run.contextFactory != nil:
+		factory := run.contextFactory
+		run.contextFactory = func(ctx context.Context, path, runID string, names []string) (provider.Executor, error) {
+			actual, err := factory(ctx, path, runID, names)
+			return replaceExecute(path, names, actual, err)
+		}
+	case run.intakeBuilder != nil:
+		build := run.intakeBuilder
 		run.intakeBuilder = func(config provider.NativeMemberToolConfig) (provider.Executor, error) {
 			actual, err := build(config)
-			return replaceExecute(config.Path, actual, err)
+			return replaceExecute(config.Path, nil, actual, err)
 		}
-	} else {
+	default:
 		factory := run.factory
 		run.factory = func(path, id string, names []string) (provider.Executor, error) {
 			actual, err := factory(path, id, names)
-			return replaceExecute(path, actual, err)
+			return replaceExecute(path, names, actual, err)
 		}
 	}
 	turn, err := f.s.ClaimTurn(ctx, store.ClaimTurnInput{GroupID: f.group.ID, DeliveryID: run.binding.DeliveryID, MaxActive: 1, ResourceKeys: prepared.ResourceKeys})
@@ -276,6 +290,33 @@ func executePreparedAdapterFixture(t *testing.T, f *rolePrepareFixture, prepared
 	return claim, receipt
 }
 
+func memberToolRuntimeProjectExperienceConfig(t *testing.T, path string, names []string) (string, string) {
+	t.Helper()
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode() != 0600 || !filepath.IsAbs(path) {
+		t.Fatalf("config must be an absolute regular 0600 file: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config map[string]json.RawMessage
+	if json.Unmarshal(data, &config) != nil || len(config) != 3 {
+		t.Fatal("project-experience config contains unapproved fields")
+	}
+	var endpoint, token string
+	var tools []string
+	if json.Unmarshal(config["endpoint"], &endpoint) != nil || endpoint == "" ||
+		json.Unmarshal(config["token"], &token) != nil || token == "" ||
+		json.Unmarshal(config["project_experience_tools"], &tools) != nil {
+		t.Fatal("invalid project-experience config")
+	}
+	if !slices.Equal(tools, names) {
+		t.Fatalf("issued project-experience tools changed: got %v, want %v", tools, names)
+	}
+	return endpoint, token
+}
+
 func TestPrepareAdaptersShareOrdinaryRoleSubmissionReviewChain(t *testing.T) {
 	for _, name := range []string{provider.Pi, provider.Codex, provider.Agy} {
 		t.Run(name, func(t *testing.T) {
@@ -293,6 +334,12 @@ func TestPrepareAdaptersShareOrdinaryRoleSubmissionReviewChain(t *testing.T) {
 			ctx := context.Background()
 			ordinary, err := p.Prepare(ctx, f.ordinary)
 			prepareRoleOK(t, err)
+			if name == provider.Agy {
+				run := ordinary.Executor.(*memberToolRuntimeRun)
+				if !run.projectExperienceMCP || run.contextFactory == nil {
+					t.Fatal("ordinary AGY project experience lost its context-aware MCP factory")
+				}
+			}
 			executePreparedAdapterFixture(t, f, ordinary, false, func(token string) {
 				members, err := f.opts.MemberTools.tools.ListMembers(ctx, token, store.ListOptions{})
 				prepareRoleOK(t, err)

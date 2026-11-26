@@ -403,6 +403,9 @@ func (p *Preparer) Prepare(ctx context.Context, pending store.PendingDelivery) (
 			run.projectExperienceArtifactRead = artifactRead
 			if agyExperience {
 				run.projectExperienceMCP = true
+				run.contextFactory = func(ctx context.Context, configPath, _ string, names []string) (provider.Executor, error) {
+					return provider.NewAgyACPMemberToolExecutorContext(ctx, configPath, names, selected, p.executionTimeout)
+				}
 			} else {
 				run.projectExperienceBuilder = func(config provider.NativeMemberToolConfig) (provider.Executor, error) {
 					return provider.NewPiProjectExperienceExecutor(selected, p.piMemberToolsExtension, config, p.executionTimeout)

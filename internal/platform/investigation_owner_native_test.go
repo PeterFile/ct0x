@@ -489,6 +489,9 @@ func testPiInvestigationOwnerNativeFollowup(t *testing.T, modes ...string) {
 						return f.db.CommitInvestigationTaskWorkLaunch(check, store.InvestigationTaskWorkLaunch(plan), admit)
 					}
 				})
+			if mode == "admitted" {
+				f.mountMemberToolHandlers(t.Context())
+			}
 			wantWrites := 0
 			if mode == "typed-launch-disabled" {
 				ctx, stop := context.WithTimeout(t.Context(), 15*time.Second)

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"agentworkspace/internal/domain"
@@ -95,6 +96,13 @@ const decisionRequestCurrentTaskWithReturnEnd = ` b WHERE ` + workInputDecisionR
      ELSE 0 END)`
 const decisionRequestCurrentTaskWithReturn = decisionRequestCurrentTaskWithReturnStart + workInputDecisionSources + decisionRequestCurrentTaskWithReturnEnd
 
+// The exact return lookup is keyed by the existing origin trigger while the
+// subquery boundary prevents SQLite from flattening the proof view into both
+// scope branches.
+var decisionRequestCurrentTaskWithSuccessorReadOnly = strings.ReplaceAll(decisionRequestCurrentTaskWithSuccessor,
+	"FROM "+workInputDecisionSources+" b",
+	"FROM (SELECT * FROM "+workInputDecisionSources+" read_source WHERE read_source.trigger_id=q.origin_trigger_id LIMIT -1 OFFSET 0) b")
+
 const decisionRequestChatJoins = ` JOIN chat_intake_executions i ON (i.candidate_id,i.turn_id,i.purpose,i.source_kind,i.source_id)=
     (c.id,c.turn_id,'chat_intake/v1','local_user_chat',q.chat_source_id)
  JOIN turns rt ON rt.id=c.turn_id JOIN deliveries rd ON rd.id=rt.delivery_id
@@ -146,7 +154,12 @@ func decisionTaskCurrentScopeInTx(ctx context.Context, tx *sql.Tx) (string, bool
 	if err != nil || !successor {
 		return decisionRequestCurrentTaskWithReturn, bridge, err
 	}
-	return decisionRequestCurrentTaskWithSuccessor, bridge, nil
+	// Skip compiling the successor proof branch when the table is empty.
+	var hasSuccessor bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM main.task_successors)`).Scan(&hasSuccessor); err != nil || !hasSuccessor {
+		return decisionRequestCurrentTaskWithReturn, bridge, err
+	}
+	return decisionRequestCurrentTaskWithSuccessorReadOnly, bridge, nil
 }
 
 func decisionRequestPendingSQL(ctx context.Context, tx *sql.Tx, where string) (string, error) {
