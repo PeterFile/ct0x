@@ -1,6 +1,9 @@
 """Read-only GitHub Actions experiment using an explicit, hashed Go test overlay."""
 import argparse
 import hashlib
+import io
+import re
+import zipfile
 import importlib.util
 import json
 import os
@@ -59,9 +62,42 @@ def controls():
 
 
 def prove(args):
-    api = POLICY.API(args.output / 'api-good')
-    evidence = POLICY.Evidence(api, REPO, lambda value: subprocess.run(['git','merge-base','--is-ancestor',value,BAD]).returncode == 0)
-    proof = evidence.verify(45801293592, 1)
+    endpoint = f'repos/{REPO}/actions/jobs/139874859777/logs'
+    saved = b'2026-11-26T11:22:11.4302912Z {"base": "e837a449d26b005d28da5e11713de39ebb77fbe4", "head": "9a45793e82ba00b7015ba565f9f90aea2c68694a", "run_id": "45801293592", "sha": "9a45793e82ba00b7015ba565f9f90aea2c68694a", "tree": "dceb239cac92df37ee45b86ac1192ce651ae473f", "verified": true}\n'
+    captures = {}
+    sources = {}
+    for key, ep in [('job',endpoint), ('attempt',f'repos/{REPO}/actions/runs/45801293592/attempts/1/logs'),
+                    ('worker',f'repos/{REPO}/actions/artifacts/15111765465/zip')]:
+        proc = subprocess.run(['gh','api','--method','GET',ep],capture_output=True)
+        err = re.sub(r'https?://[^ ]+', '[url]', proc.stderr.decode(errors='replace')).strip()
+        captures[key]={'rc':proc.returncode,'size':len(proc.stdout), 'sha256':hashlib.sha256(proc.stdout).hexdigest() if not proc.returncode else None,
+                       'http_status':re.findall(r'HTTP (\d{3})',err), 'error':err[:240] if proc.returncode else None}
+        if not proc.returncode:
+            sources[key]=proc.stdout
+    record = {'native_probes':captures,
+              'captured_job_url':f'https://github.com/{REPO}/actions/runs/45801293592/job/139874859777',
+              'owner_captured_raw_line_sha256':hashlib.sha256(saved).hexdigest()}
+    class AuditInputs(POLICY.API):
+        def get(self, path, raw=False):
+            if path == endpoint:
+                if 'job' in sources:
+                    record['job_log_source']='job endpoint in hosted runner'
+                    return sources['job']
+                if 'attempt' in sources:
+                    with zipfile.ZipFile(io.BytesIO(sources['attempt'])) as archive:
+                        names=[name for name in archive.namelist() if re.fullmatch(r'[0-9]+_Full CI\.txt',name)]
+                        require(len(names)==1, 'ambiguous trusted job archive')
+                        record['job_log_source']='authenticated run attempt ZIP: '+names[0]
+                        return archive.read(names[0])
+                record['job_log_source']='owner CLI captured original log record, independently bound to hosted API job metadata; experiment-only input'
+                return saved
+            return super().get(path,raw)
+    api=AuditInputs(args.output/'api-good')
+    evidence=POLICY.Evidence(api,REPO,lambda value: subprocess.run(['git','merge-base','--is-ancestor',value,BAD]).returncode==0)
+    try:
+        proof=evidence.verify(45801293592,1)
+    finally:
+        write(args.output/'hosted-access.json',record); print(json.dumps(record,sort_keys=True))
     require(proof['sha'] == GOOD and proof['verified'] is True, 'missing original green Full evidence')
     require(REPLAY.git(ROOT, 'rev-parse', BAD+'^1') == EXPECTED_PARENT, 'target first parent differs')
     write(args.output / 'baseline.json', proof)
