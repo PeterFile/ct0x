@@ -523,8 +523,18 @@ class AdmissionTests(unittest.TestCase):
         for action in ["opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft", "edited", "labeled"]:
             self.assertIn(action, self.workflow.split("permissions:", 1)[0])
         triggers = self.workflow.split("permissions:", 1)[0]
-        pr_trigger, push_trigger = triggers.split("  pull_request:", 1)[1].split("  push:", 1)
-        self.assertEqual(push_trigger.strip(), "branches:\n      - master")
+        def trigger_keys(text):
+            active = "\n".join(line.split("#", 1)[0].rstrip() for line in text.splitlines())
+            block = re.search(r"^on:\n(.*?)(?=^\S|\Z)", active, re.M | re.S)[1]
+            return set(re.findall(r"^  ([a-z_]+):", block, re.M))
+
+        self.assertEqual(trigger_keys(triggers), {"pull_request"})
+        rollback = "  # push: {branches: [master]}"
+        self.assertEqual(triggers.splitlines().count(rollback), 1)
+        restored = triggers.replace(rollback, rollback.replace("# ", "", 1))
+        self.assertEqual(trigger_keys(restored), {"pull_request", "push"})
+        self.assertIn("  push: {branches: [master]}", restored)
+        pr_trigger = triggers.split("  pull_request:", 1)[1].split(rollback, 1)[0]
         self.assertNotIn("merge_group:", triggers)
         self.assertNotIn("branches:", pr_trigger)
         self.assertNotRegex(triggers, r"(?m)^ +paths(?:-ignore)?:")
@@ -1285,6 +1295,12 @@ class GateTests(unittest.TestCase):
                 self.assertEqual((Path(directory) / "go-benchmarks.txt").read_text().splitlines(),
                                  ["BenchmarkAlloc-8 100 1.25 ns/op 16 B/op 2 allocs/op",
                                   "BenchmarkStream-8 5 2.5e+02 ns/op 1.00 MB/s 0 B/op 0 allocs/op"])
+
+
+def load_tests(loader, tests, pattern):
+    # Keep the periodic policy suite in both existing explicit CI test entry points.
+    tests.addTests(loader.loadTestsFromModule(load("test-periodic-full")))
+    return tests
 
 
 if __name__ == "__main__":
