@@ -36,7 +36,7 @@ def message(line):
 
 def failures(text):
     """Only Go failure lifecycle/package records establish a named failure, never mentions."""
-    if re.search(r"panic:|test timed out|fatal error:|signal: killed|\[build failed\]", text):
+    if re.search(r"panic:|timed out|deadline exceeded|i/o timeout|fatal error:|signal: killed|\[build failed\]", text, re.I):
         return []
     groups, json_rows, pending, messages = {}, [], [], []
     for raw in text.splitlines():
@@ -89,6 +89,71 @@ def failures(text):
             for (package, root), signature in sorted(groups.items())]
 
 
+def rows(text, package):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            check(key not in result, "Go JSON 重复字段")
+            result[key] = value
+        return result
+    values = [json.loads(line, object_pairs_hook=pairs) for line in text.splitlines() if line]
+    actions = {"start", "run", "pause", "cont", "pass", "fail", "skip", "output", "bench", "attr", "artifacts"}
+    check(bool(values) and all(isinstance(row, dict) and row.get("Package") == package and row.get("Action") in actions
+                              for row in values), "Go JSON 包身份或动作不符")
+    check(sum(row.get("Action") == "start" for row in values) == 1 and values[0]["Action"] == "start", "包 start 缺失或重复")
+    terminal = [index for index, row in enumerate(values) if not row.get("Test") and row["Action"] in ("pass", "fail", "skip")]
+    check(terminal == [len(values) - 1], "包终止事件缺失、重复或不在末尾")
+    for row in values:
+        check("Test" not in row or isinstance(row["Test"], str) and bool(row["Test"]), "Go JSON Test 类型非法")
+        check("Output" not in row or isinstance(row["Output"], str), "Go JSON Output 类型非法")
+    return values
+
+
+def inventory(listing, list_code, candidate):
+    listed = rows(listing, candidate["package"])
+    check(type(list_code) is int and list_code == 0 and listed[-1]["Action"] == "pass" and
+          not any(row.get("Test") for row in listed), "编译清单不完整")
+    names = [line for row in listed if row["Action"] == "output" for line in row.get("Output", "").splitlines()
+             if re.fullmatch(TEST_RE, line)]
+    check(names in ([], [candidate["test"]]), "编译清单未精确匹配同名测试")
+    return bool(names)
+
+
+def assess(listing, list_code, text, code, candidate):
+    """Pure proof checker, shared by credential-free replay and authenticated finalization."""
+    try:
+        package, test = candidate["package"], candidate["test"]
+        if not inventory(listing, list_code, candidate):
+            return {"state": "absent"}
+        events = rows(text, package)
+        check(type(code) is int and code in (0, 1), "测试执行异常")
+        check(all(not row.get("Test") or row["Test"] == test or row["Test"].startswith(test + "/") for row in events), "执行了其他测试")
+        check(not any(row["Action"] == "skip" for row in events), "测试或子测试跳过")
+        runs = Counter(row.get("Test") for row in events if row["Action"] == "run")
+        terminal = Counter(row.get("Test") for row in events if row["Action"] in ("pass", "fail") and row.get("Test"))
+        check(runs.get(test) == 1 and runs == terminal and all(count == 1 for count in runs.values()), "精确测试生命周期不完整")
+        active = set()
+        for row in events:
+            name, action = row.get("Test"), row["Action"]
+            if not name:
+                continue
+            if action == "run":
+                check(name not in active and (name == test or test in active), "子测试缺少活动根")
+                active.add(name)
+            elif action in ("pass", "fail"):
+                check(name in active, "测试终止早于执行")
+                active.remove(name)
+        check(not active, "测试未终止")
+        if code == 0:
+            check(events[-1]["Action"] == "pass" and not any(row["Action"] == "fail" for row in events), "通过证据不完整")
+            return {"state": "pass"}
+        found = failures(text)
+        check(len(found) == 1 and found[0]["test"] == test and events[-1]["Action"] == "fail", "命名失败签名缺失、超时或有歧义")
+        return {"state": "fail", "signature": found[0]["signature"]}
+    except (ValueError, TypeError, KeyError) as error:
+        return {"state": "unknown", "reason": str(error)}
+
+
 def unknown(reason, **evidence):
     return {"status": "unknown", "reason": reason, **evidence}
 
@@ -115,6 +180,11 @@ def localize(chain, candidate, probe):
     if states[index - 1] == "absent":
         if any(state != "absent" for state in states[:index]):
             return unknown("测试消失后重现，不能证明首次引入", **evidence)
+        absent = evidence["probes"][index - 1]["results"]
+        present = evidence["probes"][index]["results"]
+        if any(row.get("definition", {}).get("state") != "absent" for row in absent) or any(
+                row.get("definition", {}).get("state") != "present" for row in present):
+            return unknown("仅编译清单变化，未证明测试源码首次引入", **evidence)
         transition = "new-test"
     else:
         if "absent" in states[:index]:
@@ -140,11 +210,30 @@ def git(root, *args):
                                        timeout=30).decode().strip()
 
 
+def definition(root, sha, candidate):
+    directory = candidate["package"].removeprefix("agentworkspace/")
+    paths = git(root, "ls-tree", "-r", "--name-only", "-z", sha, "--", directory).split("\0")
+    files, mentions, declarations = {}, [], []
+    for path in paths:
+        if not path.endswith("_test.go") or str(Path(path).parent) != directory:
+            continue
+        source = git(root, "show", sha + ":" + path)
+        check(len(source.encode()) <= MAX_LOG, "测试源码超过上限")
+        files[path] = hashlib.sha256(source.encode()).hexdigest()
+        if re.search(r"\b" + re.escape(candidate["test"]) + r"\b", source):
+            mentions.append(path)
+        if re.search(r"(?m)^func\s+" + re.escape(candidate["test"]) + r"\s*\(\s*\w+\s+\*testing\.T\s*\)", source):
+            declarations.append(path)
+    state = "present" if len(declarations) == 1 else "unknown" if mentions else "absent"
+    return {"state": state, "files": files, "declarations": declarations}
+
+
 class Probe:
     def __init__(self, root, output, timeout=90, budget=1200):
         self.root, self.output, self.timeout = Path(root), Path(output), timeout
         self.output.mkdir(parents=True, exist_ok=True)
         self.deadline, self.index = time.monotonic() + budget, 0
+        self.definitions = {}
         self.home = tempfile.TemporaryDirectory(prefix="periodic-replay-home-")
         self.env = child_env(Path(self.home.name))
 
@@ -160,13 +249,19 @@ class Probe:
         with path.open("wb") as output:
             process = subprocess.Popen(argv, cwd=cwd, env=self.env, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
-            try:
-                process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-                result["timed_out"] = True
-        result.update(returncode=process.returncode, sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            deadline = time.monotonic() + remaining
+            while process.poll() is None:
+                if time.monotonic() >= deadline or path.stat().st_size > MAX_LOG:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait()
+                    result["timed_out"] = True
+                    break
+                time.sleep(0.1)
+        with path.open("rb") as stream:
+            result.update(returncode=process.returncode, sha256=hashlib.file_digest(stream, "sha256").hexdigest())
         if path.stat().st_size > MAX_LOG or result.get("timed_out"):
             return {**result, "state": "unknown", "reason": "回放超时或日志超过上限"}, ""
         return result, path.read_text(encoding="utf-8", errors="replace")
@@ -178,8 +273,13 @@ class Probe:
         check(isinstance(test, str) and re.fullmatch(TEST_RE, test), "回放测试名非法")
         check(type(candidate.get("race")) is bool, "回放 race 类型非法")
         self.index += 1
+        if time.monotonic() >= self.deadline:
+            return {"state": "unknown", "reason": "回放总时间达到上限"}
         details = {"sha": sha, "tree": git(self.root, "rev-parse", sha + "^{tree}")}
         try:
+            if sha not in self.definitions:
+                self.definitions[sha] = definition(self.root, sha, candidate)
+            details["definition"] = self.definitions[sha]
             with tempfile.TemporaryDirectory(prefix="periodic-probe-") as temporary:
                 checkout = Path(temporary) / "source"
                 git(self.root, "worktree", "add", "--quiet", "--detach", str(checkout), sha)
@@ -191,45 +291,18 @@ class Probe:
                     listed, listing = self.execute(["go", "test", "-json", *flags, "-list", pattern,
                                                     "./" + package.removeprefix("agentworkspace/")], checkout, "list")
                     details["list"] = listed
-                    rows = self.rows(listing, package)
-                    check(listed.get("returncode") == 0 and not listed.get("state"), "列举测试失败")
-                    check(sum(row.get("Action") == "start" for row in rows) == 1 and
-                          rows[-1].get("Action") == "pass" and not any(row.get("Test") for row in rows), "编译清单不完整")
-                    names = [line for row in rows if row.get("Action") == "output" for line in row.get("Output", "").splitlines()
-                             if re.fullmatch(TEST_RE, line)]
-                    if not names:
+                    check(not listed.get("state"), "列举测试失败")
+                    if not inventory(listing, listed.get("returncode"), candidate):
                         return {**details, "state": "absent"}
-                    check(names == [test], "编译清单未精确匹配同名测试")
                     execution, text = self.execute(["go", "test", "-count=1", *flags, "-json", "-timeout=60s", "-run", pattern,
                                                    "./" + package.removeprefix("agentworkspace/")], checkout, "run")
                     details["run"] = execution
-                    rows = self.rows(text, package)
-                    check(not execution.get("state") and execution.get("returncode") in (0, 1), "测试执行异常")
-                    roots = [row for row in rows if row.get("Test") == test]
-                    check(sum(row.get("Action") == "run" for row in roots) == 1, "没有精确执行同名测试")
-                    check(all(not row.get("Test") or row["Test"] == test or row["Test"].startswith(test + "/") for row in rows),
-                          "执行了其他测试")
-                    check(not any(row.get("Action") == "skip" for row in rows), "测试或子测试跳过")
-                    counts = Counter(row.get("Test") for row in rows if row.get("Action") == "run")
-                    terminal = Counter(row.get("Test") for row in rows if row.get("Action") in ("pass", "fail") and row.get("Test"))
-                    check(counts == terminal and all(count == 1 for count in counts.values()), "测试生命周期不完整")
-                    if execution["returncode"] == 0:
-                        check(rows[-1].get("Action") == "pass" and not any(row.get("Action") == "fail" for row in rows), "通过证据不完整")
-                        return {**details, "state": "pass"}
-                    found = failures(text)
-                    check(len(found) == 1 and found[0]["test"] == test and rows[-1].get("Action") == "fail", "失败签名缺失或有歧义")
-                    return {**details, "state": "fail", "signature": found[0]["signature"]}
+                    check(not execution.get("state"), "测试执行异常")
+                    return {**details, **assess(listing, listed.get("returncode"), text, execution.get("returncode"), candidate)}
                 finally:
                     git(self.root, "worktree", "remove", "--force", str(checkout))
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             return {**details, "state": "unknown", "reason": str(error)}
-
-    @staticmethod
-    def rows(text, package):
-        rows = [json.loads(line) for line in text.splitlines() if line]
-        check(bool(rows) and all(isinstance(row, dict) and row.get("Package") == package for row in rows), "Go JSON 包身份不符")
-        return rows
-
 
 def replay(bundle, root, output):
     initial = json.loads((bundle / "receipt.json").read_text())

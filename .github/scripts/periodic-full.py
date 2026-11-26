@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -34,6 +33,21 @@ def positive(value):
 
 def sha(value):
     return isinstance(value, str) and re.fullmatch(SHA_RE, value) is not None
+
+
+def same(left, right):
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(same(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(same(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def obj(value):
+    check(isinstance(value, dict), "API 证据不是对象")
+    return value
 
 
 def strict_json(text):
@@ -108,7 +122,7 @@ def pages(api, path, key, complete=True):
     for page in range(1, 3):
         data = api.get(path + f"?per_page=100&page={page}")
         check(isinstance(data, dict) and type(data.get("total_count")) is int and data["total_count"] >= 0 and
-              isinstance(data.get(key), list), "分页证据结构不完整")
+              isinstance(data.get(key), list) and all(isinstance(row, dict) for row in data[key]), "分页证据结构不完整")
         result.extend(data[key])
         if len(result) >= data["total_count"]:
             check(len(result) == data["total_count"], "分页总数不符")
@@ -125,28 +139,28 @@ class Evidence:
 
     def commit(self, value):
         check(sha(value), "提交 SHA 非法")
-        commit = self.api.get(self.prefix + "/commits/" + value)
-        check(commit.get("sha") == value and sha(commit.get("commit", {}).get("tree", {}).get("sha")), "API 提交/tree 身份不符")
+        commit = obj(self.api.get(self.prefix + "/commits/" + value))
+        check(commit.get("sha") == value and sha(obj(obj(commit.get("commit")).get("tree")).get("sha")), "API 提交/tree 身份不符")
         parents = commit.get("parents")
-        check(isinstance(parents, list) and all(sha(row.get("sha")) for row in parents), "API 父提交缺失")
+        check(isinstance(parents, list) and all(isinstance(row, dict) and sha(row.get("sha")) for row in parents), "API 父提交缺失")
         return {"sha": value, "tree": commit["commit"]["tree"]["sha"], "head": value,
                 "base": parents[0]["sha"] if parents else value}
 
     def run(self, run_id, attempt, trusted_head=True):
         check(positive(run_id) and positive(attempt), "run/attempt 类型非法")
-        repo = self.api.get(self.prefix)
+        repo = obj(self.api.get(self.prefix))
         check(repo.get("full_name") == self.repo and repo.get("fork") is False and positive(repo.get("id")) and
               repo.get("default_branch") == "master", "不是可信的非 fork master 仓库")
-        run = self.api.get(f"{self.prefix}/actions/runs/{run_id}/attempts/{attempt}")
+        run = obj(self.api.get(f"{self.prefix}/actions/runs/{run_id}/attempts/{attempt}"))
         check(type(run.get("id")) is int and run["id"] == run_id and type(run.get("run_attempt")) is int and
               run["run_attempt"] == attempt and sha(run.get("head_sha")), "API run/attempt 身份不符")
         for key in ("repository", "head_repository"):
-            source = run.get(key, {})
+            source = obj(run.get(key))
             check(source.get("full_name") == self.repo and type(source.get("id")) is int and source["id"] == repo["id"] and
                   source.get("fork") is False, "运行来自其他仓库或 fork")
-        check(run.get("path") in WORKFLOWS and positive(run.get("workflow_id")), "未知工作流路径")
-        workflow = self.api.get(f"{self.prefix}/actions/workflows/{run['workflow_id']}")
-        check(workflow.get("path") == run["path"] and workflow.get("id") == run["workflow_id"], "工作流 API 身份不符")
+        check(isinstance(run.get("path"), str) and run["path"] in WORKFLOWS and positive(run.get("workflow_id")), "未知工作流路径")
+        workflow = obj(self.api.get(f"{self.prefix}/actions/workflows/{run['workflow_id']}"))
+        check(workflow.get("path") == run["path"] and type(workflow.get("id")) is int and workflow["id"] == run["workflow_id"], "工作流 API 身份不符")
         if trusted_head:
             check(self.ancestor(run["head_sha"]), "触发源不在可信 master 历史中")
         return run
@@ -183,7 +197,7 @@ class Evidence:
         rows = pages(self.api, f"{self.prefix}/actions/runs/{run['id']}/attempts/{run['run_attempt']}/jobs", "jobs")
         ids = set()
         for job in rows:
-            check(positive(job.get("id")) and job["id"] not in ids and type(job.get("run_id")) is int and
+            check(isinstance(job.get("name"), str) and positive(job.get("id")) and job["id"] not in ids and type(job.get("run_id")) is int and
                   job["run_id"] == run["id"] and type(job.get("run_attempt")) is int and
                   job["run_attempt"] == run["run_attempt"] and job.get("head_sha") == run["head_sha"], "作业不是同一次 run/attempt")
             check(job.get("html_url") == f"https://github.com/{self.repo}/actions/runs/{run['id']}/job/{job['id']}", "作业链接身份不符")
@@ -256,14 +270,13 @@ class Evidence:
                   type(receipt.get("run_attempt")) is int and receipt["run_attempt"] == attempt and receipt.get("status") == "success",
                   "receipt schema/repo/run/attempt/status 不符")
             if kind == "periodic":
-                check(self.artifact(run, expected_kind) == receipt, "artifact 与成功 producer 规范日志不符")
+                check(same(self.artifact(run, expected_kind), receipt), "artifact 与成功 producer 规范日志不符")
             if kind == "periodic":
                 self.successful_job(jobs, "Periodic Full preflight")
                 check(receipt.get("components") == {key: "success" for key in ("resolve", "preflight", "full")} and
                       receipt.get("checkout") == {key: target[key] for key in ("sha", "tree")}, "缺少完整预检/checkout 证明")
                 expected = {**target, "run_id": run_id, "run_attempt": attempt, "repo": self.repo, "verified": True}
-                check(receipt.get("full") == expected and type(receipt["full"].get("run_attempt")) is int and
-                      type(receipt["full"].get("run_id")) is int and receipt["full"].get("verified") is True, "Full 聚合身份不符")
+                check(same(receipt.get("full"), expected), "Full 聚合身份不符")
             else:
                 check(isinstance(receipt.get("artifact_sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", receipt["artifact_sha256"]),
                       "候选产物摘要缺失")
@@ -333,7 +346,8 @@ def attribute(localization, pulls, repo):
     result["status"] = "unknown"
     if localization.get("localization") != "reproduced" or not sha(localization.get("commit")):
         return result
-    rows = [row for row in pulls if positive(row.get("number")) and isinstance(row.get("merged_at"), str) and
+    rows = [row for row in pulls if isinstance(row, dict) and positive(row.get("number")) and
+            isinstance(row.get("merged_at"), str) and re.fullmatch(r"\d{4}-\d\d-\d\dT[0-9:]+Z", row["merged_at"]) and
             row.get("merge_commit_sha") == localization["commit"] and row.get("base", {}).get("ref") == "master" and
             row.get("base", {}).get("repo", {}).get("full_name") == repo]
     if len(rows) == 1:
@@ -368,6 +382,11 @@ def admit(args, api, evidence):
         left = api.get(f"{evidence.prefix}/contents/{path}?ref={event_sha}")
         right = api.get(f"{evidence.prefix}/contents/{path}?ref={target_sha}")
         check(sha(left.get("sha")) and left.get("sha") == right.get("sha"), "静态 Full 工作流与可信 master 源不同")
+    run_id, attempt = int(os.environ["GITHUB_RUN_ID"]), int(os.environ["GITHUB_RUN_ATTEMPT"])
+    current = evidence.run(run_id, attempt, trusted_head=False)
+    check(current["path"] == ".github/workflows/periodic-full.yml" and current["head_sha"] == event_sha and
+          (current["event"] == "workflow_dispatch" or current["event"] in ("schedule", "push") and current["head_branch"] == "master"),
+          "当前运行不是 master 周期或同仓库手动工作流")
     chain = replay.git(args.root, "rev-list", "--first-parent", "--max-count=33", target_sha).splitlines()
     proofs, reasons = evidence.search(chain)
     prior = next((proofs[value] for value in chain[1:] if value in proofs), None)
@@ -376,9 +395,6 @@ def admit(args, api, evidence):
     identity = {**target, "repo": evidence.repo, "run_id": int(os.environ["GITHUB_RUN_ID"]),
                 "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"])}
     check(positive(identity["run_id"]) and positive(identity["run_attempt"]), "当前 run/attempt 非法")
-    current = evidence.run(identity["run_id"], identity["run_attempt"], trusted_head=False)
-    check(current["path"] == ".github/workflows/periodic-full.yml" and current["event"] in ("schedule", "workflow_dispatch", "push"),
-          "当前运行不是周期工作流")
     plan = {"identity": identity, "decision": decision, "ancestor": prior, "skip_proof": skip,
             "lookup_status": "proven" if skip else "unknown", "lookup_reasons": reasons}
     write_json(args.output / "plan.json", plan)
@@ -452,7 +468,7 @@ def record(args, api, evidence):
         raise
     if result["status"] == "failure":
         try:
-            run = evidence.run(identity["run_id"], identity["run_attempt"])
+            run = evidence.run(identity["run_id"], identity["run_attempt"], trusted_head=False)
             collect_failures(evidence, run, result)
         except (ValueError, KeyError, OSError) as error:
             result.update(diagnostic_status="unknown", diagnostic_reason=str(error))
@@ -470,7 +486,6 @@ def record(args, api, evidence):
 
 def verify_localization(initial, local, directory, root):
     replay = load("periodic-replay")
-    check(local.get("initial_sha256") == digest((directory.parent / "initial" / "receipt.json").read_bytes()), "回放未绑定初始 receipt")
     if local.get("localization") != "reproduced":
         return local
     baseline = initial.get("ancestor")
@@ -479,35 +494,35 @@ def verify_localization(initial, local, directory, root):
     check(baseline["sha"] in chain, "绿点不在首亲范围")
     chain = list(reversed(chain[:chain.index(baseline["sha"]) + 1]))
     check(local.get("chain") == chain and len(local.get("probes", [])) == len(chain), "回放范围不完整")
-    by_sha = {}
+    by_sha, seen_logs = {}, set()
     candidate = initial["failure_candidates"][0]
     for sha_value, group in zip(chain, local["probes"]):
         check(group.get("sha") == sha_value and len(group.get("results", [])) == replay.REPEATS, "缺少重复回放")
         for result in group["results"]:
             check(result.get("sha") == sha_value and result.get("tree") == replay.git(root, "rev-parse", sha_value + "^{tree}"), "probe checkout 身份不符")
+            logs, codes = {"run": ""}, {"run": None}
             for key in ("list", "run"):
                 if key not in result:
                     check(key == "run" and result.get("state") == "absent", "probe 日志缺失")
                     continue
                 evidence = result[key]
                 name = evidence.get("log", "")
-                check(isinstance(name, str) and re.fullmatch(r"[0-9]{4}-(list|run)\.jsonl", name), "probe 日志路径非法")
+                check(isinstance(name, str) and re.fullmatch(r"[0-9]{4}-" + key + r"\.jsonl", name) and name not in seen_logs,
+                      "probe 日志路径非法或重复使用执行证据")
+                seen_logs.add(name)
                 data = (directory / name).read_bytes()
-                check(evidence.get("sha256") == digest(data) and not evidence.get("timed_out"), "probe 日志摘要不符")
-                rows = replay.Probe.rows(data.decode(), candidate["package"])
-                if key == "list":
-                    check(evidence.get("returncode") == 0 and rows[-1].get("Action") == "pass", "编译清单失败")
-                    listed = [line for row in rows if row.get("Action") == "output" for line in row.get("Output", "").splitlines()
-                              if re.fullmatch(replay.TEST_RE, line)]
-                    check(listed == ([] if result.get("state") == "absent" else [candidate["test"]]), "精确测试清单不符")
-                else:
-                    found = replay.failures(data.decode())
-                    check(sum(row.get("Action") == "run" and row.get("Test") == candidate["test"] for row in rows) == 1, "缺少精确测试执行")
-                    if result.get("state") == "pass":
-                        check(evidence.get("returncode") == 0 and rows[-1].get("Action") == "pass" and not found, "通过日志不符")
-                    else:
-                        check(evidence.get("returncode") == 1 and len(found) == 1 and found[0]["signature"] == candidate["signature"] and
-                              result.get("signature") == candidate["signature"], "失败日志签名不符")
+                check(len(data) <= replay.MAX_LOG and evidence.get("sha256") == digest(data) and not evidence.get("timed_out") and
+                      not evidence.get("state"), "probe 日志摘要、大小或状态不符")
+                pattern = "^" + candidate["test"] + "$"
+                flags = ["-race"] if candidate["race"] else []
+                expected = (["go", "test", "-json", *flags, "-list", pattern] if key == "list" else
+                            ["go", "test", "-count=1", *flags, "-json", "-timeout=60s", "-run", pattern])
+                expected.append("./" + candidate["package"].removeprefix("agentworkspace/"))
+                check(evidence.get("argv") == expected, "probe argv 不是精确的已知测试")
+                logs[key], codes[key] = data.decode(), evidence.get("returncode")
+            assessed = replay.assess(logs["list"], codes["list"], logs["run"], codes["run"], candidate)
+            check(assessed.get("state") == result.get("state") and assessed.get("state") != "unknown" and
+                  assessed.get("signature") == result.get("signature"), "probe 生命周期或签名不能从原始日志重建")
         by_sha[sha_value] = iter(group["results"])
     recomputed = replay.localize(chain, candidate, lambda value, _: next(by_sha[value]))
     check(recomputed.get("localization") == "reproduced" and all(recomputed.get(key) == local.get(key) for key in
@@ -526,9 +541,10 @@ def finish(args, api, evidence):
             check(local.get("initial_sha256") == digest(initial_path.read_bytes()), "回放与原始 receipt 摘要不符")
             # Validate source jobs again through authenticated attempt metadata, separately from replay.
             run = evidence.run(result["run_id"], result["run_attempt"])
+            evidence.source(run, result)
             expected = dict(result)
             collect_failures(evidence, run, expected)
-            check(expected.get("failure_candidates") == result.get("failure_candidates"), "原始失败源与 API 不符")
+            check(same(expected.get("failure_candidates"), result.get("failure_candidates")), "原始失败源与 API 不符")
             local = verify_localization(result, local, args.localization, args.root)
             if local.get("localization") == "reproduced":
                 pulls = []

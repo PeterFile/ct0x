@@ -13,10 +13,10 @@ GOOD = '9a45793e82ba00b7015ba565f9f90aea2c68694a'
 BAD = '18d11a3c0176fe98856aeeef6396e9ddfde0cca0'
 EXPECTED_PARENT = '7d70dc49ff1f3c3ae3876b2a519059c60d88ec3d'
 REPO = 'PeterFile/ct0x'
-PACKAGE = 'agentworkspace/internal/preflight'
+PACKAGE = 'agentworkspace/internal/artifactfs'
 TEST = 'TestPeriodicFaultInjection'
 SIGNATURE = 'periodic controlled assertion: separate workspace race job is present'
-FIXTURE = '''package preflight
+FIXTURE = '''package artifactfs
 
 import (
     "bytes"
@@ -76,7 +76,7 @@ def replay(args):
     wrapper.write_text('#!/usr/bin/env python3\n' + 'import json, os, sys, tempfile\nfrom pathlib import Path\n' +
                        f'real = {executable!r}\nfixture = {str(source)!r}\n' +
                        'assert sys.argv[1] == "test"\nwith tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fd:\n' +
-                       '    json.dump({"Replace": {str(Path.cwd()/"internal/preflight/zz_periodic_fault_test.go"): fixture}}, fd)\n' +
+                       '    json.dump({"Replace": {str(Path.cwd()/"internal/artifactfs/benchmark_test.go"): fixture}}, fd)\n' +
                        'os.execv(real, [real, "test", "-overlay=" + fd.name, *sys.argv[2:]])\n')
     wrapper.chmod(0o755)
     chain = [GOOD, *REPLAY.git(ROOT, 'rev-list', '--first-parent', '--reverse', GOOD + '..' + BAD).splitlines()]
