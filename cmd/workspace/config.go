@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"agentworkspace/internal/httpapi"
+	"agentworkspace/internal/provider"
 )
 
 const defaultExecutionMaxActive = 1
@@ -30,6 +31,7 @@ type config struct {
 	enableInvestigationOwnerManagement, enableDiscussionWorkReturn bool
 	enablePiTaskDecisionProposals                                  bool
 	groupBackgroundDispatchPreview                                 string
+	enablePiProjectExperience                                      bool
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -43,6 +45,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 		fmt.Fprintln(output, "  普通讨论接力：启用执行、成员工具和协调角色，并显式选择支持接力的可信 Pi 扩展；旧版扩展和其他适配器保持原行为。")
 		fmt.Fprintln(output, "  --enable-investigation-execution  显式启用 Pi 1.4.0 只读调查首轮预览（默认禁用；须使用独立的私有数据目录、明确选定的 Pi 和可信扩展，启用协调角色且不得同时启用 Codex AppServer；限单收件人的本机用户原始消息）")
 		fmt.Fprintln(output, "  --group-background-dispatch-preview 路径  可信后台讨论预览授权文件（默认禁用；须启用执行、明确指定 --pi-path 并具备有效的实际运行证据；见 docs/group-background-dispatch-preview.md）")
+		fmt.Fprintln(output, "  --enable-pi-project-experience  启用全新 Pi 历史轮的项目经验检索（默认禁用；须启用执行和成员工具并配置确切受信扩展；成果读取另须本机用户对单个投递批准确切版本及数据库支持）")
 	}
 	flags.StringVar(&config.listen, "listen", httpapi.DefaultAddress, "监听地址")
 	flags.StringVar(&config.dataDir, "data-dir", "", "数据目录")
@@ -52,6 +55,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags.BoolVar(&config.enableMemberTools, "enable-member-tools", false, "启用 Pi 基础成员工具（默认禁用）")
 	flags.StringVar(&config.piMemberToolsExtension, "pi-member-tools-extension", "", "可信 Pi 扩展的绝对文件路径")
 	flags.BoolVar(&config.enableRunExplanation, "enable-run-explanation", false, "启用普通 Pi 公开运行说明（默认禁用）")
+	flags.BoolVar(&config.enablePiProjectExperience, "enable-pi-project-experience", false, "全新 Pi 历史轮项目经验检索")
 	config.registerPiFreshTaskWorkFlag(flags, output)
 	config.registerPiFreshInvestigationWorkFlag(flags, output)
 	flags.IntVar(&config.memberToolsMaxMembers, "member-tools-max-members", 4, "成员工具增员容量（1..200）")
@@ -170,6 +174,9 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 			return config, errors.New("关闭 Pi 成员工具扩展失败")
 		}
 	}
+	if err := config.validatePiProjectExperience(); err != nil {
+		return config, err
+	}
 	if set["native-pi-thinking"] && config.nativePiThinking == "" {
 		return config, errors.New("指定的原生 Pi thinking 级别不能为空")
 	}
@@ -199,6 +206,13 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 func (c config) validateThreadDecisionHandoff() error {
 	if c.enableThreadDecisionHandoff && (!c.enableExecution || !c.enableMemberTools || !c.enableCoordinationRoles || !c.enableCodexAppServer) {
 		return errors.New("话题待决接线须同时启用执行、成员工具、协调角色和 Codex AppServer")
+	}
+	return nil
+}
+
+func (c config) validatePiProjectExperience() error {
+	if c.enablePiProjectExperience && (!c.enableExecution || !c.enableMemberTools || !provider.PiProjectExperienceBridgeSupported(c.piMemberToolsExtension)) {
+		return errors.New("项目经验工具须同时启用执行、成员工具并指定支持该工具的确切受信 Pi 扩展")
 	}
 	return nil
 }

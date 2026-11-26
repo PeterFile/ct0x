@@ -14,13 +14,14 @@ type MessageInput struct {
 	ReplyToMessageID string   `json:"reply_to_message_id,omitempty"`
 	RelatedTaskID    string   `json:"related_task_id,omitempty"`
 	// The HTTP DTO sets this for an explicitly selected main topic.
-	TopicIDExplicit bool `json:"-"`
+	TopicIDExplicit   bool                       `json:"-"`
+	ArtifactReadGrant *domain.ArtifactVersionRef `json:"artifact_read_grant,omitempty"`
 }
 
 func (s *LocalUser) CreateMessage(ctx context.Context, groupID string, input MessageInput, key string) (domain.Message, error) {
 	return s.db.PostLocalUserMessage(ctx, store.MessageRequest{
 		GroupID: groupID, ActorID: "user", Content: input.Content, TopicID: input.TopicID,
-		RecipientIDs: input.RecipientIDs, IdempotencyKey: key,
+		RecipientIDs: input.RecipientIDs, IdempotencyKey: key, ArtifactReadGrant: input.ArtifactReadGrant,
 		TopicIDExplicit: input.TopicIDExplicit,
 		ThreadLinks:     domain.ThreadLinks{ReplyToMessageID: input.ReplyToMessageID, RelatedTaskID: input.RelatedTaskID},
 	})

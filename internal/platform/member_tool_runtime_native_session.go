@@ -71,7 +71,7 @@ func (r *MemberToolRuntime) nativeRegistration(token string) (memberToolRegistra
 	r.tools.mu.RLock()
 	defer r.tools.mu.RUnlock()
 	entry, found := r.tools.capabilities[key]
-	return entry, found // Issued entries are immutable until deletion.
+	return entry, found // Native session entries never attach a fresh project experience projection.
 }
 
 // Use actually issued facts, without the registry lock. The prepared profile
@@ -172,6 +172,13 @@ func (e *memberToolRuntimeRun) nativeRoleAuthority(ctx context.Context, role sto
 
 func (e *memberToolRuntimeRun) constructExecutor(ctx context.Context, request provider.ExecuteRequest, claim store.TurnClaim, token string, config *memberToolRuntimeConfigFile, names []string) (provider.Executor, *memberToolNativeTurn, error) {
 	configPath := filepath.Join(e.runtime.configRoot, config.name)
+	if e.projectExperienceBuilder != nil {
+		if e.nativeSession != nil || e.role != nil || e.intakeBuilder != nil {
+			return nil, nil, errMemberToolRuntimeBinding
+		}
+		native, err := e.projectExperienceBuilder(provider.NativeMemberToolConfig{Path: configPath, SHA256: config.digest})
+		return native, nil, err
+	}
 	if bound := e.intakeSchema.requiresIssuedPiConfig(); bound || e.intakeBuilder != nil {
 		if !bound || e.intakeBuilder == nil || e.nativeSession != nil || e.role != nil || !e.intake {
 			return nil, nil, errMemberToolRuntimeBinding

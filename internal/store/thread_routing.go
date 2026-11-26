@@ -91,6 +91,9 @@ func (s *Store) publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r Messa
 	// A topical command has no chat proof or deliveries, even with explicit
 	// recipients. Keep the original request bytes in the mutation receipt.
 	if route.correction != nil {
+		if r.ArtifactReadGrant != nil {
+			return domain.Message{}, ErrInvalid
+		}
 		r.RecipientIDs, recipients = nil, nil
 	}
 	// Explicit recipients (including public-only) and a verified thread
@@ -123,11 +126,19 @@ func (s *Store) publishLocalMessageInTx(ctx context.Context, tx *sql.Tx, r Messa
 			return domain.Message{}, err
 		}
 	} else {
+		if r.ArtifactReadGrant != nil {
+			payload = r.artifactReadGrantSourcePayload(m.TopicID)
+		}
 		m.SourceID, err = messageCommandSourceInTx(ctx, tx, m.ID, "local_user_chat", payload, r.IdempotencyKey, nil)
 		if err != nil {
 			return domain.Message{}, err
 		}
 		m.SourceKind = "local_user_chat"
+		if pin := r.ArtifactReadGrant; pin != nil {
+			if err := insertDeliveryArtifactReadGrant(ctx, tx, m, *pin); err != nil {
+				return domain.Message{}, err
+			}
+		}
 	}
 	if route.newTitle != "" {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO main.thread_routing_topics(group_id,topic_id,title,title_key,issue_id,origin_message_id)
