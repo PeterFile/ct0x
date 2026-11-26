@@ -326,7 +326,7 @@ func (s *Store) loadAuthorizedTaskThreadState(ctx context.Context, bound Coordin
 		if !preparing {
 			return nil, ErrMemberToolDenied
 		}
-		blocked, err := preparedTaskRoleReadiness(bound, actual)
+		blocked, err := preparedTaskRoleReadiness(ctx, tx, bound, actual)
 		if err != nil {
 			return nil, err
 		}

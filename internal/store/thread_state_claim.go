@@ -73,7 +73,7 @@ func (s *Store) verifyPreparedTaskThreadStateInTx(ctx context.Context, tx *sql.T
 	if err != nil {
 		return err
 	}
-	blocked, err := preparedTaskRoleReadiness(bound, current)
+	blocked, err := preparedTaskRoleReadiness(ctx, tx, bound, current)
 	if err != nil {
 		return err
 	}
@@ -87,8 +87,18 @@ func (s *Store) verifyPreparedTaskThreadStateInTx(ctx context.Context, tx *sql.T
 
 // Only readiness may differ from a ready bound role. A different identity,
 // profile, or persisted source is not ordinary drift.
-func preparedTaskRoleReadiness(bound, current CoordinationRoleState) (CoordinationReadinessCode, error) {
+func preparedTaskRoleReadiness(ctx context.Context, tx *sql.Tx, bound, current CoordinationRoleState) (CoordinationReadinessCode, error) {
 	blocked := current.Blocked
+	if blocked != CoordinationReady && current.AutomaticTextWorkerID == "" && bound.AutomaticTextWorkerID != "" {
+		// A preexisting blocker can skip loading the automatic role. Recover
+		// its frozen worker from the same snapshot before comparing profiles.
+		p := current.Provenance
+		worker, _, err := chatAutomaticTextRoleInTx(ctx, tx, p.GroupID, p.RequestID, false)
+		if err != nil {
+			return CoordinationReady, err
+		}
+		current.AutomaticTextWorkerID = worker
+	}
 	current.Blocked = CoordinationReady
 	if current != bound {
 		return CoordinationReady, ErrMemberToolDenied
