@@ -190,16 +190,22 @@ func (p *Preparer) planFreshTaskWork(ctx context.Context, input preparationInput
 		return empty, rolePreparationBlocked(state, "task_changed", nil)
 	}
 	admission, err := p.store.GetChatAdmission(ctx, work.GroupID, work.TaskID)
-	if err != nil {
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		if err := p.store.VerifyQueuedTextTaskSuccessor(ctx, work, prov.RequestID); err != nil {
+			return empty, preparationResolutionError(ctx, err)
+		}
+	case err != nil:
 		return empty, preparationResolutionError(ctx, err)
-	}
-	if admission.GroupID != work.GroupID || admission.TopicID != work.TopicID || admission.TaskID != work.TaskID ||
-		admission.MandateID != work.MandateID || admission.DispatchRequestID != prov.RequestID {
-		return empty, errPrepareBinding
-	}
-	if admission.Action != domain.ChatActionTextSubmission || admission.WorkspaceScope != nil ||
-		admission.Outcome != "admitted" || !admission.AuthorityEvidenceVerified {
-		return empty, rolePreparationBlocked(state, "unsupported_work_scope", nil)
+	default:
+		if admission.GroupID != work.GroupID || admission.TopicID != work.TopicID || admission.TaskID != work.TaskID ||
+			admission.MandateID != work.MandateID || admission.DispatchRequestID != prov.RequestID {
+			return empty, errPrepareBinding
+		}
+		if admission.Action != domain.ChatActionTextSubmission || admission.WorkspaceScope != nil ||
+			admission.Outcome != "admitted" || !admission.AuthorityEvidenceVerified {
+			return empty, rolePreparationBlocked(state, "unsupported_work_scope", nil)
+		}
 	}
 	plan := taskWorkPreparation{delivery: work, mandate: mandate, provenance: prov, selected: selected,
 		taskDecision: selected.Name == provider.Pi && r.tools.TaskDecisionProposalsEnabled()}

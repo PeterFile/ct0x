@@ -9,6 +9,15 @@ type RequestWorkRequest struct {
 	Reason       string               `json:"reason"`
 	NewTask      *NewTaskRequest      `json:"new_task,omitempty"`
 	ExistingTask *ExistingTaskRequest `json:"existing_task,omitempty"`
+	Predecessor  *TaskSuccessorInput  `json:"predecessor,omitempty"`
+}
+
+// TaskSuccessorInput selects the accepted result retained by an explicit new task.
+type TaskSuccessorInput struct {
+	TaskID           string `json:"task_id"`
+	ExpectedRevision int64  `json:"expected_revision"`
+	SubmissionID     string `json:"submission_id"`
+	ReviewID         string `json:"review_id"`
 }
 
 type NewTaskRequest struct {
@@ -32,7 +41,9 @@ type TaskRef struct {
 }
 
 type AdmissionReceipt struct {
-	Decision RoutingDecision `json:"decision"`
-	Mandate  Mandate         `json:"mandate"`
-	Task     TaskRef         `json:"task"`
+	Decision          RoutingDecision     `json:"decision"`
+	Mandate           Mandate             `json:"mandate"`
+	Task              TaskRef             `json:"task"`
+	Predecessor       *TaskSuccessorInput `json:"predecessor,omitempty"`
+	DispatchRequestID string              `json:"dispatch_request_id,omitempty"`
 }

@@ -206,7 +206,7 @@ func taskWorkOwnerChatBasisInTx(ctx context.Context, tx *sql.Tx, f taskWorkFacts
 	 AND NOT EXISTS(SELECT 1 FROM chat_workspace_scopes WHERE task_id=:task)`, sql.Named("request", f.v.r.ID),
 		sql.Named("mandate", d.MandateID), sql.Named("grp", d.GroupID), sql.Named("topic", d.TopicID), sql.Named("task", d.TaskID)).Scan(&basis.action, &messageID, &sourceKind, &sourceID)
 	if errors.Is(err, sql.ErrNoRows) {
-		return taskWorkChatBasis{}, errTaskWorkChatScope
+		return taskSuccessorChatBasisInTx(ctx, tx, f.v.r)
 	}
 	if err != nil {
 		return taskWorkChatBasis{}, err

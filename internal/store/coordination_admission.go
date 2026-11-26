@@ -63,6 +63,9 @@ func (s *Store) RequestWork(ctx context.Context, groupID string, request domain.
 	if err != nil {
 		return domain.AdmissionReceipt{}, admissionError("读取工作请求回执失败", err)
 	}
+	if prior := request.Predecessor; prior != nil && (receipt.Predecessor == nil || *receipt.Predecessor != *prior || receipt.DispatchRequestID == "") {
+		return domain.AdmissionReceipt{}, fmt.Errorf("%w：缺少确切续办回执", ErrConflict)
+	}
 	if err := tx.Commit(); err != nil {
 		return domain.AdmissionReceipt{}, admissionError("保存工作请求失败", err)
 	}
@@ -97,7 +100,15 @@ func requestWorkPayload(groupID string, request domain.RequestWorkRequest, key s
 		return nil, fmt.Errorf("%w：工作请求模式无效", ErrInvalid)
 	}
 	// Length-prefixed fields retain opaque topic bytes and canonical dependency-set semantics.
-	return mutationPayload(fields...), nil
+	payload := mutationPayload(fields...)
+	if prior := request.Predecessor; prior != nil {
+		if request.Mode != domain.RoutingDecisionCreateNew || !validTriggerID(prior.TaskID) || prior.ExpectedRevision < 1 ||
+			!validTriggerID(prior.SubmissionID) || !validTriggerID(prior.ReviewID) {
+			return nil, fmt.Errorf("%w：续办必须新建任务并指定原任务、版本、提交和接纳评审", ErrInvalid)
+		}
+		payload = mutationPayload("task_successor/v1", string(payload), prior.TaskID, strconv.FormatInt(prior.ExpectedRevision, 10), prior.SubmissionID, prior.ReviewID)
+	}
+	return payload, nil
 }
 
 func admitWorkInTx(ctx context.Context, tx *sql.Tx, trigger domain.Trigger, request domain.RequestWorkRequest, decisionID string) error {
@@ -115,6 +126,13 @@ func admitWorkInTx(ctx context.Context, tx *sql.Tx, trigger domain.Trigger, requ
 	}
 	if coordinated {
 		return fmt.Errorf("%w：来源已获授权", ErrConflict)
+	}
+	var successor taskSuccessorProof
+	if request.Predecessor != nil {
+		successor, err = prepareTaskSuccessorInTx(ctx, tx, trigger, *request.Predecessor)
+		if err != nil {
+			return err
+		}
 	}
 	var task domain.Task
 	if request.Mode == domain.RoutingDecisionCreateNew {
@@ -181,6 +199,9 @@ func admitWorkInTx(ctx context.Context, tx *sql.Tx, trigger domain.Trigger, requ
 		if changed != 1 {
 			return fmt.Errorf("%w：授权记录未写入", ErrConflict)
 		}
+	}
+	if request.Predecessor != nil {
+		return insertTaskSuccessorInTx(ctx, tx, trigger, task, mandateID, request.Reason, *request.Predecessor, successor)
 	}
 	return nil
 }

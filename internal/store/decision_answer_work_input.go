@@ -33,15 +33,10 @@ const decisionAnswerCurrentVersion = `q.withdrawn_at IS NULL
  AND v.version=(SELECT max(version) FROM decision_request_versions WHERE request_id=q.id) AND (`
 
 const decisionAnswerCurrentScope = decisionAnswerCurrentVersion + decisionRequestCurrentTask + `)`
-const decisionAnswerCurrentScopeWithReturn = decisionAnswerCurrentVersion + decisionRequestCurrentTaskWithReturn + `)`
 
 func decisionAnswerCurrentInTx(ctx context.Context, tx *sql.Tx) (string, error) {
-	bridge, err := workInputDecisionInstalledInTx(ctx, tx)
-	scope := decisionAnswerCurrentScope
-	if bridge {
-		scope = decisionAnswerCurrentScopeWithReturn
-	}
-	return scope + ` AND (v.expires_at IS NULL OR v.expires_at>?)`, err
+	scope, _, err := decisionTaskCurrentScopeInTx(ctx, tx)
+	return decisionAnswerCurrentVersion + scope + `) AND (v.expires_at IS NULL OR v.expires_at>?)`, err
 }
 
 func decisionAnswerLiveInTx(ctx context.Context, tx *sql.Tx, id string) (bool, error) {
