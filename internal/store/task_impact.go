@@ -56,17 +56,22 @@ func recordTaskImpactInTx(ctx context.Context, tx *sql.Tx, i domain.TaskWorkInpu
 		domain.TaskImpactConstraintConfirmed, i.ID, message.ID); err != nil {
 		return err
 	}
+	predecessorSubmission, err := taskSuccessorSubmissionInTx(ctx, tx, request)
+	if err != nil {
+		return err
+	}
 	args := []any{sql.Named("grp", i.GroupID), sql.Named("task", i.TaskID), sql.Named("rev", i.TaskRevision),
 		sql.Named("assignment", i.AssignmentID), sql.Named("mandate", i.MandateID), sql.Named("topic", i.TopicID),
-		sql.Named("generation", request.AuthorityGeneration), sql.Named("request", request.ID), sql.Named("input", i.ID), sql.Named("stamp", stamp)}
+		sql.Named("generation", request.AuthorityGeneration), sql.Named("request", request.ID), sql.Named("predecessor_submission", predecessorSubmission)}
 	var expected int64
-	if err := tx.QueryRowContext(ctx, taskImpactFacts+` SELECT count(*) FROM facts`, args[:8]...).Scan(&expected); err != nil {
+	if err := tx.QueryRowContext(ctx, taskImpactFacts+` SELECT count(*) FROM facts`, args...).Scan(&expected); err != nil {
 		return err
 	}
 	result, err := tx.ExecContext(ctx, taskImpactFacts+`
 	 INSERT INTO task_constraint_impacts
 	 (id,input_id,group_id,source_task_id,task_id,task_revision,created_at,kind,ref_id,pin_review_id,affected_submission_id)
-	 SELECT lower(hex(randomblob(16))),:input,:grp,:task,task_id,revision,:stamp,kind,ref_id,review_id,affected_submission FROM facts`, args...)
+	 SELECT lower(hex(randomblob(16))),:input,:grp,:task,task_id,revision,:stamp,kind,ref_id,review_id,affected_submission FROM facts`,
+		append(args, sql.Named("input", i.ID), sql.Named("stamp", stamp))...)
 	if err != nil {
 		return err
 	}
@@ -80,7 +85,7 @@ func recordTaskImpactInTx(ctx context.Context, tx *sql.Tx, i domain.TaskWorkInpu
 	return cancelAffectedImpactOwnersInTx(ctx, tx, i, stamp)
 }
 
-// Submissions qualify by exact Task revision or by the existing direct repair
+// Submissions qualify by exact Task revision or direct repair or successor
 // lineage. Newer versions of the same artifact, plain edges and topic peers
 // are never used to discover dependents. No text is proof of verification.
 const taskImpactFacts = `WITH old_submissions(id,task_id,revision) AS (
@@ -88,6 +93,8 @@ const taskImpactFacts = `WITH old_submissions(id,task_id,revision) AS (
  UNION
  SELECT parent_submission_id,parent_task_id,reviewed_task_revision FROM chat_repair_links
  WHERE (group_id,topic_id,repair_task_id,mandate_id,dispatch_request_id)=(:grp,:topic,:task,:mandate,:request)
+	 UNION
+	 SELECT id,task_id,task_revision FROM task_submissions WHERE group_id=:grp AND id=:predecessor_submission
 ), old_delegations(id) AS (
  SELECT id FROM task_work_delegations WHERE (group_id,task_id,task_revision,assignment_id,mandate_id,authority_generation,topic_id)=
  (:grp,:task,:rev,:assignment,:mandate,:generation,:topic)

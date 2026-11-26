@@ -59,16 +59,15 @@ const decisionRequestTaskScope = `q.task_id IS NOT NULL AND t.status='open' AND 
  JOIN coordination_assignment_dispatch d ON d.assignment_id=ca.id AND d.status='enqueued'
  JOIN coordination_assignment_attempts original ON original.assignment_id=ca.id`
 
-const decisionRequestTaskCurrentRelations = `
+const decisionRequestTaskCurrentJoins = `
  JOIN coordination_triggers o ON (o.id,o.group_id,o.topic_id,o.message_id,o.message_sequence)=
     (q.origin_trigger_id,q.group_id,q.topic_id,q.source_message_id,q.source_sequence)
  JOIN group_coordinator_bindings b ON (b.group_id,b.revision)=(q.group_id,r.binding_revision)
  JOIN group_dispatch_policies dp ON (dp.group_id,dp.revision)=(q.group_id,r.policy_revision)
  JOIN members w ON (w.id,w.group_id,w.status)=(q.owner_member_id,q.group_id,'active')
- JOIN members co ON (co.id,co.group_id,co.status)=(r.coordinator_member_id,q.group_id,'active')
- JOIN chat_assessments admission ON (admission.decision_id,admission.dispatch_request_id)=(m.decision_id,r.id)
- JOIN chat_candidates c ON c.id=admission.candidate_id
- JOIN chat_policies p ON (p.group_id,p.topic_id,p.revision)=(q.group_id,q.topic_id,c.policy_revision)
+ JOIN members co ON (co.id,co.group_id,co.status)=(r.coordinator_member_id,q.group_id,'active')`
+
+const decisionRequestTaskCurrentAuthority = `
  WHERE (tc.task_id,tc.group_id,tc.topic_id,tc.current_mandate_id,tc.authority_generation)=
     (q.task_id,q.group_id,q.topic_id,q.mandate_id,q.authority_generation)
  AND (t.active_attempt_id=original.attempt_id OR EXISTS(SELECT 1 FROM task_work_continuations k
@@ -78,6 +77,12 @@ const decisionRequestTaskCurrentRelations = `
          work.authority_generation,work.owner_member_id,work.member_id)=
         (q.assignment_id,q.task_id,q.group_id,q.topic_id,q.task_revision,q.mandate_id,
          q.authority_generation,q.owner_member_id,q.owner_member_id)))`
+
+// This concatenation is also part of the frozen v33 and v46 SQL.
+const decisionRequestTaskCurrentRelations = decisionRequestTaskCurrentJoins + `
+ JOIN chat_assessments admission ON (admission.decision_id,admission.dispatch_request_id)=(m.decision_id,r.id)
+ JOIN chat_candidates c ON c.id=admission.candidate_id
+ JOIN chat_policies p ON (p.group_id,p.topic_id,p.revision)=(q.group_id,q.topic_id,c.policy_revision)` + decisionRequestTaskCurrentAuthority
 
 const decisionRequestCurrentTask = decisionRequestTaskScope + `
  JOIN mandates m ON (m.id,m.origin_trigger_id,m.authorized_by)=(q.mandate_id,q.origin_trigger_id,q.recipient_id)` + decisionRequestTaskCurrentRelations + `)`
@@ -119,18 +124,29 @@ const decisionRequestCurrent = ` WHERE q.recipient_id='user' AND q.withdrawn_at 
 const decisionRequestUnanswered = ` AND NOT EXISTS(SELECT 1 FROM decision_answers ans WHERE ans.request_id=q.id)`
 
 func currentDecisionSQLInTx(ctx context.Context, tx *sql.Tx) (columns, where string, bridge bool, err error) {
-	bridge, err = workInputDecisionInstalledInTx(ctx, tx)
+	taskScope, bridge, err := decisionTaskCurrentScopeInTx(ctx, tx)
 	if err != nil {
 		return "", "", false, err
 	}
-	inputID, taskScope := `''`, decisionRequestCurrentTask
+	inputID := `''`
 	if bridge {
 		inputID = `CASE WHEN ` + workInputDecisionIDMatch + ` THEN coalesce((SELECT b.input_id FROM ` + workInputDecisionSources + ` b
 		 WHERE ` + workInputDecisionReadMatch + `),'') ELSE '' END`
-		taskScope = decisionRequestCurrentTaskWithReturn
 	}
 	return decisionRequestColumns + inputID + decisionRequestRelations, ` WHERE q.recipient_id='user' AND q.withdrawn_at IS NULL
 	 AND (v.expires_at IS NULL OR v.expires_at>?) AND ((` + taskScope + `) OR (` + decisionRequestCurrentChat + `))`, bridge, nil
+}
+
+func decisionTaskCurrentScopeInTx(ctx context.Context, tx *sql.Tx) (string, bool, error) {
+	bridge, err := workInputDecisionInstalledInTx(ctx, tx)
+	if err != nil || !bridge {
+		return decisionRequestCurrentTask, bridge, err
+	}
+	successor, err := taskSuccessorSchemaInTx(ctx, tx)
+	if err != nil || !successor {
+		return decisionRequestCurrentTaskWithReturn, bridge, err
+	}
+	return decisionRequestCurrentTaskWithSuccessor, bridge, nil
 }
 
 func decisionRequestPendingSQL(ctx context.Context, tx *sql.Tx, where string) (string, error) {

@@ -38,5 +38,6 @@ func admissionReceiptInTx(ctx context.Context, tx *sql.Tx, groupID, decisionID s
 		return domain.AdmissionReceipt{}, err
 	}
 	receipt.Task = domain.TaskRef{ID: d.TaskID, GroupID: d.GroupID, RevisionAtAdmission: d.TaskRevisionAtAdmission}
-	return receipt, nil
+	err = readTaskSuccessorReceiptInTx(ctx, tx, &receipt)
+	return receipt, err
 }

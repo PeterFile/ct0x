@@ -45,7 +45,12 @@ func (s *Store) chatTextSubmissionInTx(ctx context.Context, tx *sql.Tx, input Su
 	 LEFT JOIN chat_candidates c ON c.id=a.candidate_id`+scopeJoin+`
 	 WHERE m.group_id=? AND m.task_id=?`, input.GroupID, input.TaskID).Scan(&action, &authority, &scope)
 	if errors.Is(err, sql.ErrNoRows) {
-		return evidence, nil
+		var successor bool
+		successor, err = isTextTaskSuccessorInTx(ctx, tx, input.GroupID, input.TaskID)
+		if err != nil || !successor {
+			return evidence, err
+		}
+		action = domain.ChatActionTextSubmission
 	}
 	if err != nil {
 		return evidence, err
