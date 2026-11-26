@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "rules": [
+    {
+      "paths": [
+        "internal/store/",
+        "internal/platform/",
+        "internal/httpapi/",
+        "internal/coordination/",
+        "internal/provider/",
+        "cmd/workspace/",
+        "extensions/pi-bridge/"
+      ],
+      "ordinary": {
+        "agentworkspace/cmd/workspace": [
+          "TestCoordinationCompositionSchedulerRoleReceipts"
+        ]
+      },
+      "tests": {
+        "agentworkspace/internal/store": [
+          "TestMissingAndCrossGroupReferences",
+          "TestQueueClaimRacesAcrossHandles",
+          "TestWorkspaceOperationRevocationClaimAndAttemptFences",
+          "TestWorkspaceOperationUnresolvedOutcomesAndRecovery",
+          "TestTaskWorkInputEffectKeys",
+          "TestTaskWorkInputMutationUncertainty",
+          "TestWorkerArtifactCrossGroupVersionAndCallerIsolation"
+        ],
+        "agentworkspace/internal/platform": [
+          "TestFreshTaskWorkB29NativeWireUncertaintyAndCancellation",
+          "TestWorkspaceGrantAliasesKeepUnknownAndCancelFences",
+          "TestMemberToolRuntimeDuplicateExecutionRetainsUnknownClaims",
+          "TestMemberToolRuntimeRevokeDrainsAfterCancellation",
+          "TestRoleRuntimeRevokeDrainKeepsFenceUntilCleanup",
+          "TestWorkspaceGrantRejectsUnsafeRootsAndForeignMembers",
+          "TestInvestigationOwnerManagementAllowsOriginalUserFollowup",
+          "TestInvestigationOwnerManagementMemberFollowupStaysUnmanaged"
+        ],
+        "agentworkspace/internal/httpapi": [
+          "TestDispatchExecutionHTTPDurableSafeReceiptsAndCancellation",
+          "TestDispatchRequestHTTPPreservesRealUnknownCancelAndResourceEvidence",
+          "TestTaskLifecycleHTTPReadIsolationAndForeignBodyPointers"
+        ],
+        "agentworkspace/internal/coordination": [
+          "TestIntentPassBindingBudgetAndRotation",
+          "TestIntentPassHeldAndGenerationConflict",
+          "TestIntentPassCommitUnknownAndOriginalGenerationReplay",
+          "TestIntentPassPreservesUnknownAndCancelResources",
+          "TestIntentPumpSchedulerPersistentFailurePrefixReaches51"
+        ],
+        "agentworkspace/cmd/workspace": [
+          "TestCoordinationCompositionUnknownCancelAndShutdownHoldClaims",
+          "TestCoordinationCompositionReporterAndOrdinaryProgress"
+        ]
+      }
+    },
+    {
+      "paths": [
+        "internal/store/*migration*",
+        "internal/store/*schema*",
+        "internal/store/*.sql",
+        "internal/store/store.go"
+      ],
+      "tests": {
+        "agentworkspace/internal/store": [
+          "TestMergeGateAllMigrationPrefixesUpgradeReopenReplay",
+          "TestMissingAndCrossGroupReferences",
+          "TestMergeGatePublishedMigrationAuthority",
+          "TestMergeGatePublishedMigrationAuthorityRejectsMutation"
+        ]
+      }
+    }
+  ],
+  "ci_tests": [
+    "test-ci-scheduling.py",
+    "test-store-shard.py",
+    "test-merge-gate.py",
+    "test-merge-gate-publish.py",
+    "test-merge-gate-workflow.py"
+  ],
+  "ci_modules": {
+    "ci-observer.py": [
+      "test-ci-observer.py"
+    ],
+    "periodic-full.py": [
+      "test-periodic-full.py"
+    ],
+    "*release*.py": [
+      "test-release-*.py"
+    ],
+    "*experiment*.py": [
+      "test-experiment-*.py",
+      "test-full-trial.py"
+    ],
+    "full-trial.py": [
+      "test-full-trial.py"
+    ]
+  }
+}

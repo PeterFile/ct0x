@@ -1,0 +1,187 @@
+name: PR Merge validation
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && format('Merge validation PR {0} head {1} base {2}', inputs.pr, inputs.head, inputs.base) || format('Merge validation PR {0}', github.event.pull_request.number) }}
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, edited, labeled]
+  # Only the base-owned publisher dispatches policy-changing candidates. No write token enters these jobs.
+  workflow_dispatch:
+    inputs:
+      pr:
+        type: string
+        required: true
+      head:
+        type: string
+        required: true
+      base:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      tree:
+        type: string
+        required: true
+      policy_sha:
+        type: string
+        required: true
+      source_repo_id:
+        type: string
+        required: true
+      source_repo:
+        type: string
+        required: true
+      source_ref:
+        type: string
+        required: true
+      base_ref:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    merge-validation-${{ github.event_name }}-${{ inputs.pr || github.event.pull_request.number }}-${{ (github.event.action == 'edited' && github.event.changes.base.ref.from == null || github.event.action == 'labeled' && github.event.label.name != 'ci:refresh') && github.run_id || 'current' }}
+  cancel-in-progress: true
+
+env:
+  MERGE_POLICY_ROOT: ${{ github.workspace }}/${{ github.event_name == 'workflow_dispatch' && 'policy' || 'candidate' }}
+  MERGE_WORKFLOW_SHA: ${{ github.workflow_sha }}
+
+defaults:
+  run:
+    shell: bash
+    working-directory: candidate
+
+jobs:
+  plan:
+    name: Merge plan
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (github.event.action != 'edited' || github.event.changes.base.ref.from != null) &&
+          (github.event.action != 'labeled' || github.event.label.name == 'ci:refresh') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          path: candidate
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: policy
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: candidate/go.mod
+          cache: false
+      - id: plan
+        name: Verify true merge parents and select complete impacted suites
+        run: python3 -B "$MERGE_POLICY_ROOT/.github/scripts/merge-gate.py" plan "$RUNNER_TEMP/merge-plan.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: merge-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/merge-plan.json
+          if-no-files-found: error
+          retention-days: 7
+
+  tests:
+    name: Merge tests / ${{ matrix.unit }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 7
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          path: candidate
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: policy
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: merge-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/merge-plan
+      - uses: actions/setup-go@v7
+        if: ${{ matrix.kind == 'go' || matrix.kind == 'ci' || matrix.kind == 'vet' }}
+        with:
+          go-version-file: candidate/go.mod
+          cache: false
+      - uses: actions/setup-node@v7
+        if: ${{ matrix.kind == 'web' }}
+        with:
+          node-version: '22.x'
+          check-latest: true
+      - uses: actions/setup-node@v7
+        if: ${{ matrix.kind == 'bridge' || matrix.kind == 'ci' }}
+        with:
+          node-version: '24.13.0'
+      - name: Run selected unit with observed terminal evidence
+        env:
+          UNIT_INDEX: ${{ matrix.index }}
+        run: python3 -B "$MERGE_POLICY_ROOT/.github/scripts/merge-gate.py" run "$RUNNER_TEMP/merge-plan/merge-plan.json" "$UNIT_INDEX" "$RUNNER_TEMP/merge-unit/unit.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: merge-unit-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.index }}
+          path: ${{ runner.temp }}/merge-unit/unit.json
+          if-no-files-found: error
+          retention-days: 7
+
+  evidence:
+    name: Merge evidence
+    needs: [plan, tests]
+    if: >-
+      ${{ always() && (github.event_name == 'workflow_dispatch' ||
+          (github.event.action != 'edited' || github.event.changes.base.ref.from != null) &&
+          (github.event.action != 'labeled' || github.event.label.name == 'ci:refresh')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          path: candidate
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: policy
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: merge-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/merge-plan
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: merge-unit-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: ${{ runner.temp }}/merge-units
+      - name: Require every expected terminal success on this exact attempt
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 -B "$MERGE_POLICY_ROOT/.github/scripts/merge-gate.py" final "$RUNNER_TEMP/merge-plan/merge-plan.json" "$RUNNER_TEMP/merge-units" "$RUNNER_TEMP/merge-receipt/merge-gate.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: merge-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/merge-receipt/merge-gate.json
+          if-no-files-found: error
+          retention-days: 7
