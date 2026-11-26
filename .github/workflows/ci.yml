@@ -1,137 +1,206 @@
-name: CI
+name: Release validation probe
+run-name: Release probe / ${{ inputs.mode }} / ${{ inputs.sha }} / ${{ github.run_id }}-${{ github.run_attempt }} / Pi
 
 on:
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, edited, labeled]
-  push:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 实验目标的小写完整提交 SHA
+        required: true
+        type: string
+        default: 18d11a3c0176fe98856aeeef6396e9ddfde0cca0
+      mode:
+        description: 仅构建二进制或运行离线门禁
+        required: true
+        type: choice
+        default: gate
+        options: [build, gate]
 
 permissions:
   contents: read
-
-# Relevant PR runs supersede older runs. Master keeps the running and latest pending run.
-# Irrelevant events get a private group, so they cannot supersede real CI.
-concurrency:
-  group: >-
-    ${{ format('{0}-{1}', github.workflow,
-        ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-         (github.event_name == 'pull_request' &&
-          (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-           (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-           (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
-        (github.event.pull_request.number || github.ref) || format('ignored-{0}', github.run_id)) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
     shell: bash
 
+env:
+  MODE: ${{ inputs.mode }}
+  TARGET_SHA: ${{ inputs.sha }}
+  CONTROLLER: ${{ github.workflow_ref }}
+  CONTROLLER_SHA: ${{ github.workflow_sha }}
+  PYTHONDONTWRITEBYTECODE: '1'
+
 jobs:
-  feedback:
-    name: CI preflight and feedback
-    if: >-
-      ${{ (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-          (github.event_name == 'pull_request' &&
-           (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-            (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-            (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full')))) }}
+  build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    outputs:
-      mode: ${{ steps.plan.outputs.mode }}
-      sha: ${{ steps.plan.outputs.sha }}
-      tree: ${{ steps.plan.outputs.tree }}
-      head: ${{ steps.plan.outputs.head }}
-      base: ${{ steps.plan.outputs.base }}
-      run_id: ${{ steps.plan.outputs.run_id }}
-      matrix: ${{ steps.plan.outputs.matrix }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 2
-          persist-credentials: false
-      - name: Route immutable merge and check full diff
-        id: plan
-        run: python3 .github/scripts/ci-plan.py plan "$RUNNER_TEMP/ci-plan.json"
-      - uses: actions/setup-go@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      # Ordinary cmd catches composition/liveness regressions before full fanout (#218).
-      - name: Ordinary test cmd package
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
-        run: go test -count=1 ./cmd/workspace
-      - name: Test CI scheduling and shard gates
-        if: ${{ steps.plan.outputs.mode == 'feedback' && steps.plan.outputs.ci == 'true' }}
+      - name: 验证实验输入与控制器
         run: |
           set -euo pipefail
-          python3 .github/scripts/test-ci-scheduling.py -v
-          python3 .github/scripts/test-store-shard.py -v
-      - name: Targeted Go feedback
-        run: python3 .github/scripts/ci-plan.py feedback "$RUNNER_TEMP/ci-plan.json"
-      - uses: actions/setup-node@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.web == 'true' }}
+          printf 'mode=%s target_sha=%s run_id=%s run_attempt=%s controller=Pi:%s controller_sha=%s ref=%s\n' \
+            "$MODE" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CONTROLLER" "$CONTROLLER_SHA" "$GITHUB_REF"
+          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch &&
+             "$GITHUB_REF" == refs/heads/codex/ci-release-probe-20261126 &&
+             "$CONTROLLER" == "$GITHUB_REPOSITORY/.github/workflows/ci.yml@$GITHUB_REF" &&
+             "$GITHUB_SHA" == "$CONTROLLER_SHA" ]] || { echo '::error::拒绝非实验分支或错误控制器'; exit 1; }
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ &&
+             "$TARGET_SHA" == 18d11a3c0176fe98856aeeef6396e9ddfde0cca0 ]] || { echo '::error::目标必须是本实验固定的小写完整 SHA'; exit 1; }
+          [[ "$MODE" == build || "$MODE" == gate ]] || { echo '::error::模式必须为 build 或 gate'; exit 1; }
+      - uses: actions/checkout@v7
         with:
-          node-version: '22.x'
-          check-latest: true
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - name: Web test, typecheck and build
-        run: python3 .github/scripts/ci-plan.py web "$RUNNER_TEMP/ci-plan.json"
-      - uses: actions/setup-node@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.bridge == 'true' }}
+          ref: ${{ inputs.sha }}
+          path: target
+          fetch-depth: 0
+          clean: true
+          persist-credentials: false
+      - name: 验证干净目标、Git 树与当前 master 历史
+        working-directory: target
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$TARGET_SHA" ]]
+          tree="$(git rev-parse HEAD^{tree})"
+          [[ "$tree" == 6df8bf3ccb986f8f4088dc310e0257b3f6285d9a ]]
+          worktree="$(git status --porcelain --untracked-files=all)"
+          [[ -z "$worktree" ]]
+          master="$(git rev-parse refs/remotes/origin/master^{commit})"
+          git merge-base --is-ancestor "$TARGET_SHA" "$master"
+          printf 'target_sha=%s target_tree=%s origin_master=%s\n' "$TARGET_SHA" "$tree" "$master"
+      - uses: actions/setup-go@v7
+        if: ${{ inputs.mode == 'build' }}
         with:
-          node-version: '24.13.0'
-          cache: npm
-          cache-dependency-path: extensions/pi-bridge/package-lock.json
-      - name: Pi bridge test and typecheck
-        run: python3 .github/scripts/ci-plan.py bridge "$RUNNER_TEMP/ci-plan.json"
+          go-version-file: target/go.mod
+          cache: false
+      - name: 交叉编译并验证二进制来源
+        if: ${{ inputs.mode == 'build' }}
+        working-directory: target
+        env:
+          GOOS: darwin
+          GOARCH: amd64
+          GOAMD64: v1
+          CGO_ENABLED: '0'
+          GOFLAGS: -mod=readonly
+          GOENV: 'off'
+          GOWORK: 'off'
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/release-probe-binary"
+          mkdir -p "$out"
+          go build -trimpath -buildvcs=true -o "$out/workspace-darwin-amd64" ./cmd/workspace
+          worktree="$(git status --porcelain --untracked-files=all)"
+          [[ -z "$worktree" ]]
+          python3 - "$out/workspace-darwin-amd64" <<'PY'
+          import hashlib, json, os, pathlib, subprocess, sys
+          binary = pathlib.Path(sys.argv[1])
+          info = subprocess.check_output(["go", "version", "-m", str(binary)], text=True)
+          print(info, end="")
+          settings = [parts[1] for line in info.splitlines()
+                      if len(parts := line.split()) == 2 and parts[0] == "build"]
+          expected = {"vcs": "git", "vcs.revision": os.environ["TARGET_SHA"],
+                      "vcs.modified": "false", "GOOS": "darwin", "GOARCH": "amd64",
+                      "CGO_ENABLED": "0", "-trimpath": "true"}
+          for key, value in expected.items():
+              if [item.split("=", 1)[1] for item in settings if item.startswith(key + "=")] != [value]:
+                  raise SystemExit("二进制构建信息不匹配：" + key)
+          def git(ref):
+              return subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
+          record = {"schema": 1, "mode": os.environ["MODE"], "controller": "Pi",
+                    "workflow_ref": os.environ["CONTROLLER"], "workflow_sha": os.environ["CONTROLLER_SHA"],
+                    "target_sha": git("HEAD"), "target_tree": git("HEAD^{tree}"),
+                    "origin_master": git("refs/remotes/origin/master^{commit}"),
+                    "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+                    "go_version": info.splitlines()[0].split()[-1], "build_settings": expected,
+                    "binary": binary.name, "sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
+          provenance = json.dumps(record, sort_keys=True, indent=2) + "\n"
+          binary.with_name("provenance.json").write_text(provenance, encoding="utf-8")
+          print(provenance, end="")
+          PY
+      - uses: actions/upload-artifact@v7
+        if: ${{ inputs.mode == 'build' }}
+        with:
+          name: release-probe-binary-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-probe-binary/
+          if-no-files-found: error
+          retention-days: 7
 
-  # Master is serialized by workflow concurrency; PR full runs are opt-in.
-  full:
-    name: Full suite
-    needs: feedback
-    if: ${{ needs.feedback.outputs.mode == 'full' }}
-    uses: ./.github/workflows/ci-full.yml
-    with:
-      sha: ${{ needs.feedback.outputs.sha }}
-      tree: ${{ needs.feedback.outputs.tree }}
-      head: ${{ needs.feedback.outputs.head }}
-      base: ${{ needs.feedback.outputs.base }}
-      matrix: ${{ needs.feedback.outputs.matrix }}
-
-  # Derive candidacy from the native event, not outputs that a failed preflight may never emit.
-  # Feedback/ignored events must never publish even a skipped check under the required name.
-  # Cancelled dependencies and an unexpectedly skipped full also need a non-required name.
-  merge-check:
-    name: >-
-      ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-           (github.event_name == 'pull_request' &&
-            (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-             (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-             (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
-          (github.event_name == 'push' || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full')) &&
-          needs.feedback.result != 'cancelled' && needs.full.result != 'cancelled' &&
-          (needs.feedback.result != 'success' || needs.full.result != 'skipped') && 'Full CI' || 'Feedback status' }}
-    needs: ["feedback", "full"]
-    if: >-
-      ${{ !cancelled() && (((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-           (github.event_name == 'pull_request' &&
-            (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-             (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-             (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
-          (github.event_name == 'push' || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full'))) }}
+  gate:
+    needs: build
+    if: ${{ inputs.mode == 'gate' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
+          path: policy
+          fetch-depth: 0
+          clean: true
           persist-credentials: false
-      - name: Check same-run preflight and full evidence
+      - name: 验证不可变实验工作流并确定候选父提交
+        id: policy
+        working-directory: policy
+        run: |
+          set -euo pipefail
+          {
+            set -x
+            printf 'mode=%s target_sha=%s run_id=%s run_attempt=%s controller=Pi:%s controller_sha=%s\n' \
+              "$MODE" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CONTROLLER" "$CONTROLLER_SHA"
+            printf 'external_log=%s/%s/actions/runs/%s/attempts/%s\n' \
+              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            [[ "$GITHUB_REF" == refs/heads/codex/ci-release-probe-20261126 ]]
+            [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" && "$GITHUB_SHA" == "$CONTROLLER_SHA" ]]
+            worktree="$(git status --porcelain --untracked-files=all)"
+            [[ -z "$worktree" ]]
+            git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/codex/ci-release-probe-20261126
+            candidate="$(git rev-parse HEAD^1)"
+            printf 'candidate_sha=%s controller_tree=%s\n' "$candidate" "$(git rev-parse HEAD^{tree})"
+            printf 'candidate=%s\n' "$candidate" >> "$GITHUB_OUTPUT"
+          } 2>&1 | tee "$RUNNER_TEMP/release-probe-gate.log"
+      # The driver replaces ci.yml; test its immutable first parent, not the driver.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.policy.outputs.candidate }}
+          path: policy
+          fetch-depth: 0
+          clean: true
+          persist-credentials: false
+      - name: 运行全部离线门禁并保存完整输出
+        working-directory: policy
         env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 .github/scripts/ci-gate.py outer
+          CANDIDATE_SHA: ${{ steps.policy.outputs.candidate }}
+        run: |
+          set -euo pipefail
+          {
+            set -x
+            [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]]
+            worktree="$(git status --porcelain --untracked-files=all)"
+            [[ -z "$worktree" ]]
+            printf 'candidate_sha=%s candidate_tree=%s\n' "$CANDIDATE_SHA" "$(git rev-parse HEAD^{tree})"
+            shopt -s nullglob
+            tests=(.github/scripts/test-release*.py)
+            status=0
+            if (( ${#tests[@]} == 0 )); then
+              echo '::error::候选父提交中没有 release 门禁测试'
+              status=1
+            fi
+            for test in "${tests[@]}" .github/scripts/test-ci-scheduling.py .github/scripts/test-store-shard.py; do
+              python3 "$test" -v || status=1
+            done
+            if command -v actionlint >/dev/null 2>&1; then
+              actionlint || status=1
+            else
+              echo 'actionlint 不可用；未安装或下载额外工具'
+            fi
+            worktree="$(git status --porcelain --untracked-files=all)" || status=1
+            [[ -z "$worktree" ]] || status=1
+            printf 'gate_exit_status=%s\n' "$status"
+            exit "$status"
+          } 2>&1 | tee -a "$RUNNER_TEMP/release-probe-gate.log"
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: release-probe-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-probe-gate.log
+          if-no-files-found: error
+          retention-days: 7
