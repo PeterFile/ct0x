@@ -95,24 +95,28 @@ def observe_shards(context):
         shards.log_events = original
 
 
-def inventory(profile, temporary):
+def go_test_args(race):
+    return ["go", "test", "-count=1"] + (["-race"] if race else [])
+
+
+def inventory(profile, temporary, race=True):
     target = "./cmd/workspace" if profile == "workspace" else "./internal/" + profile
     package = planner.WORKSPACE_PACKAGE if profile == "workspace" else verifier.PROFILES[profile][1]
     actual = shards.command(["go", "list", target], capture_output=True, text=True).stdout.strip()
     check(actual == package, "实际 Go 包与固定配置不符")
-    path = Path(temporary) / f"{profile}-list.json"
+    path = Path(temporary) / f"{profile}-{'race' if race else 'ordinary'}-list.json"
     with path.open("wb") as output:
-        shards.command(["go", "test", "-count=1", "-race", "-json", "-list", "^(Test|Example|Fuzz)", target],
+        shards.command(go_test_args(race) + ["-json", "-list", "^(Test|Example|Fuzz)", target],
                        stdout=output, env={**os.environ, "TMPDIR": str(temporary)})
     return verifier.inventory(path, package)
 
 
 def workspace_run(selected, context, temporary, race, part=0, monolith=False):
     check(shutil.which("node"), "workspace 需要 Node；拒绝新增环境条件 skip")
-    path = Path(temporary) / "workspace-events.json"
-    args = ["go", "test", "-count=1"]
+    path = Path(temporary) / f"workspace-{'race' if race else 'ordinary'}-events.json"
+    args = go_test_args(race)
     if race:
-        args += ["-race", "-timeout=20m"]
+        args += ["-timeout=20m"]
     args += ["-json"]
     if not monolith:
         args += ["-run", verifier.run_pattern(selected)]
@@ -131,11 +135,15 @@ def preflight(context):
     temp = Path(os.environ["RUNNER_TEMP"])
     with tempfile.TemporaryDirectory(prefix="trial-preflight-") as temporary:
         inventories = {profile: inventory(profile, temporary) for profile in (*verifier.PROFILES, "workspace")}
-        monolith = workspace_run(inventories["workspace"], {**context, "job": "preflight", "job_number": 0},
+        # Build tags may add or remove tests in either mode; never derive one
+        # inventory from the other or compare ordinary outcomes with race runs.
+        ordinary = inventory("workspace", temporary, race=False)
+        monolith = workspace_run(ordinary, {**context, "job": "preflight", "job_number": 0},
                                  temporary, False, monolith=True)
-    plan = {"schema": 1, "identity": context, "base": git(Path.cwd(), "show", "-s", "--format=%P", "HEAD").split()[0],
+    plan = {"schema": 2, "identity": context, "base": git(Path.cwd(), "show", "-s", "--format=%P", "HEAD").split()[0],
             "master_oid": git(Path.cwd(), "rev-parse", "refs/remotes/origin/master"), "inventories": inventories,
-            "monolith": monolith, "schedule": planner.schedule(context["scheme"], context["shard_parallel"], inventories)}
+            "workspace_ordinary": {"compiled": ordinary, "proof": monolith},
+            "schedule": planner.schedule(context["scheme"], context["shard_parallel"], inventories)}
     receipts.validate_plan(plan, context)
     directory = temp / "trial-plan"
     directory.mkdir()
@@ -213,7 +221,7 @@ def worker(plan, context, kind):
                             for unit in plan["schedule"]["shards"][number]]
     else:
         with tempfile.TemporaryDirectory(prefix="trial-workspace-") as temporary:
-            compiled = inventory("workspace", temporary)
+            compiled = inventory("workspace", temporary, race=True)
             check(compiled == plan["inventories"]["workspace"], "workspace 实际 compiled 与预检不符")
             selected = planner.workspace_selection(compiled, number, len(plan["schedule"]["workspace"]))
             proof = workspace_run(selected, context_with_job, temporary, True, number, context["scheme"] != "c")
@@ -286,7 +294,7 @@ def aggregate(plan, context):
              "coverage": {profile: {"slots": row["total"], "top_level": len(row["compiled"]),
                                     "inventory_sha256": hashlib.sha256(planner.key(row["compiled"]).encode()).hexdigest(),
                                     "runs": sum(row["runs"].values()), "passes": sum(row["passes"].values())} for profile, row in result.items()},
-             "workspace": workspace, "schedule": plan["schedule"],
+             "workspace": workspace, "workspace_ordinary": plan["workspace_ordinary"]["proof"], "schedule": plan["schedule"],
              "weights_sha256": hashlib.sha256((SCRIPTS / "full-trial-weights.json").read_bytes()).hexdigest()}
     (temp / "trial-final.json").write_text(json.dumps(final, sort_keys=True, ensure_ascii=False) + "\n")
     artifact = prefix(context) + "-final"
@@ -294,7 +302,9 @@ def aggregate(plan, context):
         output.write(f"verified=true\nreceipt={artifact}\n")
     with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
         summary.write(f"## Full 调度试验 {context['scheme'].upper()} / 重复 {context['repeat']}\n\n"
-                      f"已验证 81 个逻辑槽、workspace 单体等价性及全部预检/侧车。\n\n"
+                      "已验证 81 个逻辑槽及全部预检/侧车；workspace 普通单体与 race 实际执行分别精确覆盖各自 compiled inventory。\n\n"
+                      "`workspace_ordinary` 保留普通单体证明；`workspace` 保留 race 证明（A/B 单体，C 不重叠子集并集）。\n\n"
+                      "C 与跨运行实际 A race 单体的同模式结果等价性由外部试验校验器核实，不以普通单体或清单推断。\n\n"
                       f"产品 `{context['checkout_sha']}` / 树 `{context['checkout_tree']}`\n\n"
                       f"控制器 `{context['controller_sha']}` / 树 `{context['controller_tree']}`\n\n"
                       f"run/attempt `{context['run_id']}/{context['attempt']}`；唯一公开 artifact：`{artifact}`。\n\n"

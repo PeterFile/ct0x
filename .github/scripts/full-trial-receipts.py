@@ -24,9 +24,9 @@ def prefix(context):
 
 
 def validate_plan(plan, expected):
-    check(isinstance(plan, dict) and set(plan) == {"schema", "identity", "base", "master_oid", "inventories", "monolith", "schedule"},
+    check(isinstance(plan, dict) and set(plan) == {"schema", "identity", "base", "master_oid", "inventories", "workspace_ordinary", "schedule"},
           "试验计划字段不完整或多余")
-    check(type(plan["schema"]) is int and plan["schema"] == 1 and plan_module.key(plan["identity"]) == plan_module.key(expected) and
+    check(type(plan["schema"]) is int and plan["schema"] == 2 and plan_module.key(plan["identity"]) == plan_module.key(expected) and
           set(expected) == IDENTITY_FIELDS, "计划与实际 run/attempt/控制器/产品/方案身份不符")
     plan_module.parameters(expected["scheme"], expected["repeat"], expected["shard_parallel"])
     for field in ("run_id", "attempt"):
@@ -39,10 +39,9 @@ def validate_plan(plan, expected):
         check(isinstance(plan[field], str) and re.fullmatch(r"[0-9a-f]{40}", plan[field]), "master 历史身份非法")
     calculated = plan_module.schedule(expected["scheme"], expected["shard_parallel"], plan["inventories"])
     check(plan_module.key(plan["schedule"]) == plan_module.key(calculated), "计划调度偏离固定基线/LPT 算法")
-    monolith = plan["monolith"]
-    events.compare_workspace([monolith], monolith)
-    check(monolith["selected"] == plan["inventories"]["workspace"] and
-          monolith["skips"] == {name: 1 for name in events.BASELINE_SKIPS}, "单体证明与 compiled/固定 skip 不符")
+    ordinary = plan["workspace_ordinary"]
+    check(isinstance(ordinary, dict) and set(ordinary) == {"compiled", "proof"}, "workspace 普通模式证明字段非法")
+    events.workspace_coverage([ordinary["proof"]], ordinary["compiled"])
 
 
 def read_receipt(directory, context, job, number, payload):
@@ -109,9 +108,13 @@ def collect(plan, shard_directory, workspace_directory, expected):
         check(isinstance(payload, dict) and set(payload) == {"compiled", "proof"} and
               verifier.counter(payload["compiled"]) == plan["inventories"]["workspace"], "workspace compiled 不符")
         selected = plan_module.workspace_selection(plan["inventories"]["workspace"], number, len(workspace_jobs))
-        check(payload["proof"]["selected"] == selected, "workspace 分片哈希/顶层名称不符")
-        proofs.append(payload["proof"])
-    return combined, events.compare_workspace(proofs, plan["monolith"])
+        proof = payload["proof"]
+        check(isinstance(proof, dict) and set(proof) == events.WORKSPACE_FIELDS, "workspace 回执字段不完整或多余")
+        check(verifier.counter(proof["selected"]) == selected, "workspace 分片哈希/顶层名称不符")
+        proofs.append(proof)
+    # A/B provide actual race monoliths; C provides only actual disjoint race
+    # subsets. Cross-run equivalence to A's race monolith is an external gate.
+    return combined, events.workspace_coverage(proofs, plan["inventories"]["workspace"])
 
 
 def aggregate_canonical(plan, canonical):

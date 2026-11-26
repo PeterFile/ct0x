@@ -40,6 +40,13 @@ def cli_fixture(plan, canonical):
     return plan, canonical
 
 
+def workspace_proof_fixture(compiled):
+    helper = "TestArtifactReadMarkerWriteFailureHelper"
+    return {"selected": dict(compiled), "runs": dict(compiled),
+            "passes": {name: count for name, count in compiled.items() if name != helper},
+            "skips": {helper: 1} if helper in compiled else {}}
+
+
 class SchedulingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -160,6 +167,38 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     self.events.compare_workspace(parts, result)
 
+    def test_workspace_coverage_rejects_inferred_or_malformed_mode_evidence(self):
+        helper = "TestArtifactReadMarkerWriteFailureHelper"
+        for mode_only in ("TestCoordinationCompositionSchedulerRoleReceipts", "TestRaceOnly"):
+            compiled = Counter({helper: 1, "TestCommon": 1, mode_only: 1})
+            with self.subTest(mode_only=mode_only), tempfile.TemporaryDirectory() as directory:
+                actual = self.events.workspace(self.event_file(directory, compiled, [helper]), compiled)
+                self.assertEqual(self.events.workspace_coverage([actual], compiled), actual)
+                mutations = [lambda p: p.update(extra={}), lambda p: p.pop("skips"),
+                             lambda p: p.update(runs=[]), lambda p: p.update(selected=None)]
+                for field in ("selected", "runs", "passes"):
+                    mutations.append(lambda p, f=field: p[f].pop(mode_only))
+                mutations += [lambda p: p["skips"].clear(), lambda p: [p[f].pop(mode_only, None) for f in p],
+                              lambda p: [p[f].update({mode_only: 2}) for f in ("selected", "runs", "passes")],
+                              lambda p: [p[f].update({"TestNotBuilt": p[f].pop(mode_only)})
+                                         for f in ("selected", "runs", "passes")],
+                              lambda p: (p["passes"].pop("TestCommon"), p["skips"].update(TestCommon=1)),
+                              lambda p: (p["skips"].clear(), p["passes"].update({helper: 1}))]
+                for index, mutate in enumerate(mutations):
+                    invalid = copy.deepcopy(actual)
+                    mutate(invalid)
+                    with self.subTest(mutation=index), self.assertRaises(ValueError):
+                        self.events.workspace_coverage([invalid], compiled)
+                for parts in ([], [actual, actual], [None], [{}]):
+                    with self.assertRaises(ValueError):
+                        self.events.workspace_coverage(parts, compiled)
+                for inventory in ({}, {mode_only: 2}, {mode_only: True}):
+                    with self.assertRaises(ValueError):
+                        self.events.workspace_coverage([actual], inventory)
+                for reference in (None, {}, {**actual, "extra": {}}):
+                    with self.assertRaises(ValueError):
+                        self.events.compare_workspace([actual], reference)
+
     def test_timing_export_never_copies_output_or_credentials_and_keeps_failures(self):
         with tempfile.TemporaryDirectory() as directory:
             path = self.event_file(directory, ["TestNormal"], mutate=lambda rows: rows.insert(2, {
@@ -184,11 +223,13 @@ class ReceiptTests(unittest.TestCase):
                    "scheme": scheme, "repeat": 1, "shard_parallel": parallel}
         inventories = SchedulingTests.inventories(self)
         inventories["workspace"]["TestArtifactReadMarkerWriteFailureHelper"] = 1
-        monolith = {"selected": dict(inventories["workspace"]), "runs": dict(inventories["workspace"]),
-                    "passes": {n: 1 for n in inventories["workspace"] if n != "TestArtifactReadMarkerWriteFailureHelper"},
-                    "skips": {"TestArtifactReadMarkerWriteFailureHelper": 1}}
-        plan = {"schema": 1, "identity": context, "base": "e" * 40, "master_oid": "f" * 40,
-                "inventories": inventories, "monolith": monolith,
+        ordinary = Counter(inventories["workspace"])
+        ordinary["TestCoordinationCompositionSchedulerRoleReceipts"] = 1
+        inventories["workspace"].update({"TestRaceOnlyOne": 1, "TestRaceOnlyTwo": 1})
+        race_proof = workspace_proof_fixture(inventories["workspace"])
+        plan = {"schema": 2, "identity": context, "base": "e" * 40, "master_oid": "f" * 40,
+                "inventories": inventories,
+                "workspace_ordinary": {"compiled": dict(ordinary), "proof": workspace_proof_fixture(ordinary)},
                 "schedule": self.plan.schedule(scheme, parallel, inventories)}
         for job_number, units in enumerate(plan["schedule"]["shards"]):
             results = []
@@ -212,7 +253,7 @@ class ReceiptTests(unittest.TestCase):
             path.write_text(json.dumps(receipt))
         for job_number in plan["schedule"]["workspace"]:
             selected = self.plan.workspace_selection(inventories["workspace"], job_number, len(plan["schedule"]["workspace"]))
-            proof = {field: {n: v for n, v in values.items() if n in selected} for field, values in monolith.items()}
+            proof = {field: {n: v for n, v in values.items() if n in selected} for field, values in race_proof.items()}
             receipt = {"schema": 1, "identity": context, "job": "go-workspace", "job_number": job_number,
                        "workspace": {"compiled": dict(inventories["workspace"]), "proof": proof}}
             path = root / "workspace" / (self.driver.prefix(context) + f"-workspace-{job_number}") / "receipt.json"
@@ -228,7 +269,8 @@ class ReceiptTests(unittest.TestCase):
                 canonical, workspace = self.driver.collect(plan, root / "shards", root / "workspace", plan["identity"])
                 result = self.driver.aggregate_canonical(*cli_fixture(plan, canonical))
                 self.assertEqual(sum(row["total"] for row in result.values()), 81)
-                self.assertEqual(workspace, plan["monolith"])
+                self.assertEqual(workspace, workspace_proof_fixture(plan["inventories"]["workspace"]))
+                self.assertNotEqual(workspace, plan["workspace_ordinary"]["proof"])
                 self.assertEqual(plan["identity"]["checkout_sha"], self.plan.PRODUCT_SHA)
 
     def test_real_aggregate_runs_from_another_shallow_checkout(self):
@@ -300,6 +342,50 @@ class ReceiptTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.driver.collect(plan, root / "shards", root / "workspace", plan["identity"])
 
+    def test_workspace_mode_receipts_reject_omissions_substitutions_and_bad_shapes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.fixture(root)
+            ordinary = plan["workspace_ordinary"]
+            mutations = [lambda p: p.update(schema=1), lambda p: p.pop("workspace_ordinary"),
+                         lambda p: p.update(monolith=ordinary["proof"]),
+                         lambda p: p.update(workspace_ordinary=None),
+                         lambda p: p["workspace_ordinary"].update(extra={}),
+                         lambda p: p["workspace_ordinary"].pop("compiled"),
+                         lambda p: p["workspace_ordinary"].update(proof=None)]
+            name = "TestCoordinationCompositionSchedulerRoleReceipts"
+            for fields in (("runs",), ("selected", "runs", "passes")):
+                mutations.append(lambda p, fs=fields: [p["workspace_ordinary"]["proof"][f].pop(name) for f in fs])
+            mutations += [lambda p: p["workspace_ordinary"].update(compiled=p["inventories"]["workspace"]),
+                          lambda p: p["workspace_ordinary"]["proof"].update(extra={})]
+            for index, mutate in enumerate(mutations):
+                invalid = copy.deepcopy(plan)
+                mutate(invalid)
+                with self.subTest(ordinary=index), self.assertRaises(ValueError):
+                    self.driver.collect(invalid, root / "shards", root / "workspace", plan["identity"])
+            name = "TestRaceOnlyOne"
+            job_number = next(i for i in plan["schedule"]["workspace"] if
+                              name in self.plan.workspace_selection(plan["inventories"]["workspace"], i, 4))
+            path = root / "workspace" / (self.driver.prefix(plan["identity"]) + f"-workspace-{job_number}") / "receipt.json"
+            original = path.read_text()
+            mutations = [lambda p: p.update(extra={}), lambda p: p.update(proof=None),
+                         lambda p: p.update(compiled=ordinary["compiled"]),
+                         lambda p: p["proof"].update(extra={}), lambda p: p["proof"].pop("runs"),
+                         lambda p: p["proof"].update(selected=[]),
+                         lambda p: p["proof"]["runs"].pop(name),
+                         lambda p: [p["proof"][f].pop(name) for f in ("selected", "runs", "passes")],
+                         lambda p: [p["proof"][f].update({"TestNotBuilt": p["proof"][f].pop(name)})
+                                    for f in ("selected", "runs", "passes")],
+                         lambda p: [p["proof"][f].update({name: 2}) for f in ("selected", "runs", "passes")],
+                         lambda p: (p["proof"]["passes"].pop(name), p["proof"]["skips"].update({name: 1}))]
+            for index, mutate in enumerate(mutations):
+                invalid = json.loads(original)
+                mutate(invalid["workspace"])
+                path.write_text(json.dumps(invalid))
+                with self.subTest(race=index), self.assertRaises(ValueError):
+                    self.driver.collect(plan, root / "shards", root / "workspace", plan["identity"])
+                path.write_text(original)
+
     def test_skipped_or_partial_job_set_is_not_success(self):
         required = {"preflight", "go-shards", "go-workspace", "go-other", "go-vet", "go-benchmarks"}
         good = {name: {"result": "success"} for name in required}
@@ -318,7 +404,7 @@ class ExecutionTests(unittest.TestCase):
         cls.driver = load("full-trial")
         cls.plan = cls.driver.planner
 
-    def go(self, inventories, fail=False):
+    def go(self, inventories, fail=False, ordinary=None, omit=None):
         def command(args, **kwargs):
             profile = "workspace" if args[-1] == "./cmd/workspace" else args[-1].removeprefix("./internal/")
             package = "agentworkspace/" + args[-1].removeprefix("./")
@@ -326,14 +412,15 @@ class ExecutionTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, stdout=package + "\n")
             self.assertEqual(args[:2], ["go", "test"])
             self.assertIn("-count=1", args)
+            compiled = ordinary if profile == "workspace" and "-race" not in args and ordinary is not None else inventories[profile]
             rows = [{"Action": "start", "Package": package}]
             if "-list" in args:
                 rows += [{"Action": "output", "Package": package,
-                          "Output": "\n".join(inventories[profile]) + f"\nok  \t{package}\t0.001s\n"}]
+                          "Output": "\n".join(compiled) + f"\nok  \t{package}\t0.001s\n"}]
             else:
                 pattern = args[args.index("-run") + 1] if "-run" in args else ".*"
-                for name in inventories[profile]:
-                    if re.fullmatch(pattern, name):
+                for name in compiled:
+                    if name != omit and re.fullmatch(pattern, name):
                         action = "skip" if name == "TestArtifactReadMarkerWriteFailureHelper" else "pass"
                         rows += [{"Action": "run", "Package": package, "Test": name},
                                  {"Action": action, "Package": package, "Test": name, "Elapsed": 0.01}]
@@ -369,7 +456,61 @@ class ExecutionTests(unittest.TestCase):
                 canonical, workspace = self.driver.collect(plan, outputs / "shards", outputs / "workspace", context)
                 result = self.driver.aggregate_canonical(*cli_fixture(plan, canonical))
                 self.assertEqual(sum(row["total"] for row in result.values()), 81)
-                self.assertEqual(workspace, plan["monolith"])
+                self.assertEqual(workspace, workspace_proof_fixture(plan["inventories"]["workspace"]))
+                with mock.patch.dict(os.environ, {"RUNNER_TEMP": str(root), "GITHUB_OUTPUT": str(root / "output"),
+                                                   "GITHUB_STEP_SUMMARY": str(root / "summary")}), \
+                     mock.patch.object(self.driver, "collect", return_value=(canonical, workspace)), \
+                     mock.patch.object(self.driver, "aggregate_canonical", return_value=result), \
+                     mock.patch.object(self.driver, "public_job_numbers", return_value=[]):
+                    self.driver.aggregate(plan, context)
+                final = json.loads((root / "trial-final.json").read_text())
+                self.assertEqual(final["workspace"], workspace)
+                self.assertEqual(final["workspace_ordinary"], plan["workspace_ordinary"]["proof"])
+                self.assertNotEqual(final["workspace"], final["workspace_ordinary"])
+
+    def test_preflight_compiles_each_mode_and_never_runs_a_race_monolith(self):
+        for scheme, parallel in (("a", 7), ("b", 12), ("c", 12)):
+            with self.subTest(scheme=scheme), tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+                root = Path(directory)
+                expected = ReceiptTests.fixture(self, root / "expected", scheme, parallel)
+                ordinary = expected["workspace_ordinary"]["compiled"]
+                with mock.patch.dict(os.environ, {"RUNNER_TEMP": directory, "GITHUB_OUTPUT": str(root / "output")}), \
+                     mock.patch.object(self.driver.shards, "command", side_effect=self.go(expected["inventories"], ordinary=ordinary)) as go, \
+                     mock.patch.object(self.driver, "git", side_effect=[expected["base"], expected["master_oid"]]):
+                    self.driver.preflight(expected["identity"])
+                    plan = self.driver.read_plan(expected["identity"])
+                self.assertEqual(plan, expected)
+                commands = [call.args[0] for call in go.call_args_list if call.args[0][:2] == ["go", "test"]]
+                workspace = [args for args in commands if args[-1] == "./cmd/workspace"]
+                self.assertEqual(len(workspace), 3)
+                self.assertEqual(sum("-list" in args and "-race" in args for args in workspace), 1)
+                self.assertEqual(sum("-list" in args and "-race" not in args for args in workspace), 1)
+                self.assertEqual(sum("-list" not in args and "-race" not in args and "-run" not in args for args in workspace), 1)
+                self.assertIn("TestCoordinationCompositionSchedulerRoleReceipts", plan["workspace_ordinary"]["proof"]["passes"])
+                self.assertNotIn("TestCoordinationCompositionSchedulerRoleReceipts", plan["inventories"]["workspace"])
+                self.assertIn("TestRaceOnlyOne", plan["inventories"]["workspace"])
+
+    def test_missing_mode_only_execution_never_publishes_success(self):
+        for scheme, parallel in (("a", 7), ("b", 12), ("c", 12)):
+            for race in (False, True):
+                with self.subTest(scheme=scheme, race=race), tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
+                    root = Path(directory)
+                    plan = ReceiptTests.fixture(self, root / "expected", scheme, parallel)
+                    name = "TestRaceOnlyOne" if race else "TestCoordinationCompositionSchedulerRoleReceipts"
+                    jobs = plan["schedule"]["workspace"]
+                    number = next(i for i in jobs if name in self.plan.workspace_selection(plan["inventories"]["workspace"], i, len(jobs))) if race else 0
+                    with mock.patch.dict(os.environ, {"RUNNER_TEMP": directory, "TRIAL_JOB_NUMBER": str(number),
+                                                      "GITHUB_JOB": "go-workspace", "GITHUB_OUTPUT": str(root / "output")}), \
+                         mock.patch.object(self.driver.shards, "command", side_effect=self.go(
+                             plan["inventories"], ordinary=plan["workspace_ordinary"]["compiled"], omit=name)):
+                        with self.assertRaisesRegex(ValueError, "覆盖计数"):
+                            if race:
+                                self.driver.worker(plan, plan["identity"], "workspace")
+                            else:
+                                self.driver.preflight(plan["identity"])
+                    self.assertFalse((root / "trial-plan").exists())
+                    self.assertFalse((root / "trial-receipt").exists())
+                    self.assertTrue((root / "trial-timing.jsonl").is_file())
 
     def test_missing_real_execution_never_publishes_success_receipt(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
@@ -382,6 +523,145 @@ class ExecutionTests(unittest.TestCase):
                     self.driver.worker(plan, plan["identity"], "shard")
             self.assertFalse((root / "trial-receipt").exists())
             self.assertTrue((root / "trial-timing.jsonl").is_file())
+
+    def test_real_go_build_tags_have_independent_exact_mode_coverage(self):
+        helper = "TestArtifactReadMarkerWriteFailureHelper"
+        ordinary_only = "TestCoordinationCompositionSchedulerRoleReceipts"
+        for ordinary_extra, race_extra in (([ordinary_only], ["TestRaceOnlyOne", "TestRaceOnlyTwo"]),
+                                           ([ordinary_only, "TestOrdinaryTwo"], ["TestRaceOnlyOne"])):
+            with self.subTest(ordinary=ordinary_extra, race=race_extra), tempfile.TemporaryDirectory() as directory, \
+                 redirect_stdout(io.StringIO()):
+                root = Path(directory)
+                workspace = root / "cmd/workspace"
+                workspace.mkdir(parents=True)
+                scratch = root / "tmp"
+                scratch.mkdir()
+                (root / "go.mod").write_text("module agentworkspace\n\ngo 1.24\n")
+                (workspace / "common_test.go").write_text('package main\nimport "testing"\n' +
+                    'func TestCommon(t *testing.T) {}\n' + f'func {helper}(t *testing.T) {{ t.Skip("fixture") }}\n')
+                for tag, names, filename in (("!race", ordinary_extra, "ordinary_test.go"),
+                                              ("race", race_extra, "race_test.go")):
+                    (workspace / filename).write_text(f'//go:build {tag}\n\npackage main\nimport "testing"\n' +
+                        "\n".join(f"func {name}(t *testing.T) {{}}" for name in names))
+                context = {"run_id": "42", "attempt": "1", "scheme": "c", "job": "go-workspace", "job_number": 0}
+                previous = Path.cwd()
+                try:
+                    os.chdir(root)
+                    with mock.patch.dict(os.environ, {"RUNNER_TEMP": directory, "GOPROXY": "off", "GOSUMDB": "off",
+                                                      "GOWORK": "off", "GOTOOLCHAIN": "local"}):
+                        ordinary = self.driver.inventory("workspace", scratch, race=False)
+                        race = self.driver.inventory("workspace", scratch, race=True)
+                        self.assertEqual(ordinary, Counter([helper, "TestCommon", *ordinary_extra]))
+                        self.assertEqual(race, Counter([helper, "TestCommon", *race_extra]))
+                        ordinary_proof = self.driver.workspace_run(ordinary, context, scratch, False, monolith=True)
+                        race_monolith = self.driver.workspace_run(race, context, scratch, True, monolith=True)
+                        parts = [self.driver.workspace_run(self.plan.workspace_selection(race, i, 4), context, scratch, True, i)
+                                 for i in range(4)]
+                        self.assertEqual(self.driver.events.workspace_coverage([ordinary_proof], ordinary), ordinary_proof)
+                        self.assertEqual(self.driver.events.workspace_coverage(parts, race), race_monolith)
+                        self.driver.events.compare_workspace(parts, race_monolith)
+                        with self.assertRaises(ValueError):
+                            self.driver.events.compare_workspace(parts, ordinary_proof)
+                        for compiled, mode in ((race, False), (ordinary, True)):
+                            with self.subTest(wrong_mode=mode), self.assertRaises(ValueError):
+                                self.driver.workspace_run(compiled, context, scratch, mode, monolith=True)
+                finally:
+                    os.chdir(previous)
+
+    def test_real_preflight_and_workspace_entrypoints_keep_modes_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected = ReceiptTests.fixture(self, root / "expected")
+            product, binaries = root / "product", root / "bin"
+            binaries.mkdir()
+            for path, digest in self.driver.workflow.LEGACY.items():
+                target = product / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = Path(path).read_bytes()
+                # Hosted tests run from the product checkout; the shallow
+                # controller may contain only a disposable ci.yml wrapper.
+                if hashlib.sha256(source).hexdigest() != digest:
+                    source = self.driver.workflow.snapshot(path).encode()
+                target.write_bytes(source)
+            data = {"race": expected["inventories"], "ordinary": expected["workspace_ordinary"]["compiled"]}
+            (root / "inventories.json").write_text(json.dumps(data))
+            # Only process boundaries are fixtures: the unmodified entrypoint still
+            # checks identity, parses Go JSON, validates plans and publishes receipts.
+            (binaries / "git").write_text(f'''#!{sys.executable}
+import sys
+args = sys.argv[1:]
+controller = args[:1] == ["-C"]
+if controller:
+    args = args[2:]
+if args == ["rev-parse", "HEAD"]:
+    print({"c" * 40!r} if controller else {self.plan.PRODUCT_SHA!r})
+elif args == ["rev-parse", "HEAD^{{tree}}"]:
+    print({"d" * 40!r} if controller else {self.plan.PRODUCT_TREE!r})
+elif args == ["rev-parse", "refs/remotes/origin/master"]:
+    print({expected["master_oid"]!r})
+elif args[:1] == ["show"]:
+    print({expected["base"]!r})
+elif args[:1] != ["merge-base"]:
+    sys.exit(2)
+''')
+            (binaries / "go").write_text(f'''#!{sys.executable}
+import json, os, re, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open(os.environ["TRIAL_FIXTURE_COMMANDS"], "a") as output:
+    output.write(json.dumps(args) + "\\n")
+profile = args[-1].split("/")[-1]
+package = "agentworkspace/" + args[-1].removeprefix("./")
+if args[0] == "list":
+    print(package)
+    sys.exit(0)
+data = json.loads(Path(os.environ["TRIAL_FIXTURE_INVENTORIES"]).read_text())
+names = data["ordinary"] if profile == "workspace" and "-race" not in args else data["race"][profile]
+rows = [{{"Action": "start", "Package": package}}]
+if "-list" in args:
+    rows.append({{"Action": "output", "Package": package, "Output": "\\n".join(names) + f"\\nok  \\t{{package}}\\t0.001s\\n"}})
+else:
+    pattern = args[args.index("-run") + 1] if "-run" in args else ".*"
+    for name in names:
+        if re.fullmatch(pattern, name):
+            rows += [{{"Action": "run", "Package": package, "Test": name}},
+                     {{"Action": "skip" if name == "TestArtifactReadMarkerWriteFailureHelper" else "pass",
+                       "Package": package, "Test": name}}]
+rows.append({{"Action": "pass", "Package": package}})
+for row in rows:
+    print(json.dumps(row))
+''')
+            for path in binaries.iterdir():
+                path.chmod(0o755)
+            environment = {**os.environ, "PATH": str(binaries) + os.pathsep + os.environ["PATH"],
+                           "PYTHONDONTWRITEBYTECODE": "1", "RUNNER_TEMP": directory,
+                           "TRIAL_FIXTURE_INVENTORIES": str(root / "inventories.json"),
+                           "TRIAL_FIXTURE_COMMANDS": str(root / "commands.jsonl"),
+                           "TRIAL_SCHEME": "c", "TRIAL_REPEAT": "1", "TRIAL_PARALLEL": "12",
+                           "TRIAL_SHA": self.plan.PRODUCT_SHA, "GITHUB_SHA": "c" * 40,
+                           "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_OUTPUT": str(root / "output")}
+            def run(command, **extra):
+                return subprocess.run([sys.executable, str(SCRIPTS / "full-trial.py"), command], cwd=product,
+                                      env={**environment, **extra}, capture_output=True, text=True, timeout=30)
+            result = run("preflight")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            plan = json.loads((root / "trial-plan/plan.json").read_text())
+            self.assertEqual(plan, expected)
+            for number in plan["schedule"]["workspace"]:
+                result = run("workspace", TRIAL_JOB_NUMBER=str(number), GITHUB_JOB="go-workspace")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                target = root / "expected/workspace" / (self.driver.prefix(plan["identity"]) + f"-workspace-{number}")
+                shutil.rmtree(target)
+                (root / "trial-receipt").rename(target)
+            _, race = self.driver.collect(plan, root / "expected/shards", root / "expected/workspace", plan["identity"])
+            self.assertEqual(race, workspace_proof_fixture(plan["inventories"]["workspace"]))
+            commands = [json.loads(line) for line in (root / "commands.jsonl").read_text().splitlines()]
+            runs = [args for args in commands if args[0] == "test" and "-list" not in args]
+            self.assertEqual(len(runs), 5, "C must run one ordinary monolith and only four race subsets")
+            self.assertTrue(all("-race" in args and "-run" in args for args in runs[1:]))
+            result = run("workspace", TRIAL_JOB_NUMBER="0", GITHUB_JOB="go-workspace", GITHUB_RUN_ATTEMPT="2")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / "trial-receipt").exists())
 
     def test_real_go_compiled_inventory_and_race_subset_without_dependencies(self):
         with tempfile.TemporaryDirectory() as directory, redirect_stdout(io.StringIO()):
