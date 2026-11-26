@@ -29,20 +29,34 @@ func decisionAnswerWakeSourceInTx(ctx context.Context, tx *sql.Tx, d domain.Task
 
 // Readiness and ACK both recheck the current version rather than treating a
 // saved human statement or physically queued delivery as authority to start.
-const decisionAnswerCurrentScope = `q.withdrawn_at IS NULL
- AND v.version=(SELECT max(version) FROM decision_request_versions WHERE request_id=q.id) AND (` + decisionRequestCurrentTask + `)`
+const decisionAnswerCurrentVersion = `q.withdrawn_at IS NULL
+ AND v.version=(SELECT max(version) FROM decision_request_versions WHERE request_id=q.id) AND (`
 
-const decisionAnswerCurrent = decisionAnswerCurrentScope + ` AND (v.expires_at IS NULL OR v.expires_at>?)`
+const decisionAnswerCurrentScope = decisionAnswerCurrentVersion + decisionRequestCurrentTask + `)`
+const decisionAnswerCurrentScopeWithReturn = decisionAnswerCurrentVersion + decisionRequestCurrentTaskWithReturn + `)`
+
+func decisionAnswerCurrentInTx(ctx context.Context, tx *sql.Tx) (string, error) {
+	bridge, err := workInputDecisionInstalledInTx(ctx, tx)
+	scope := decisionAnswerCurrentScope
+	if bridge {
+		scope = decisionAnswerCurrentScopeWithReturn
+	}
+	return scope + ` AND (v.expires_at IS NULL OR v.expires_at>?)`, err
+}
 
 func decisionAnswerLiveInTx(ctx context.Context, tx *sql.Tx, id string) (bool, error) {
 	return decisionAnswerLiveAtInTx(ctx, tx, id, time.Now().UTC())
 }
 
 func decisionAnswerLiveAtInTx(ctx context.Context, tx *sql.Tx, id string, at time.Time) (bool, error) {
+	current, err := decisionAnswerCurrentInTx(ctx, tx)
+	if err != nil {
+		return false, err
+	}
 	var live bool
-	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1`+decisionAnswerEvidence+`
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1`+decisionAnswerEvidence+`
 	 JOIN tasks t ON (t.id,t.group_id)=(q.task_id,q.group_id)
-	 WHERE ans.id=? AND `+decisionAnswerCurrent+`)`, id, at.UTC().Format(timestampLayout)).Scan(&live)
+	 WHERE ans.id=? AND `+current+`)`, id, at.UTC().Format(timestampLayout)).Scan(&live)
 	return live, err
 }
 
@@ -53,17 +67,21 @@ const decisionAnswerHandlingMatch = `EXISTS(SELECT 1` + taskWorkContinuationRela
  WHERE b.delivery_id IN (work.delivery_id,replacement.delivery_id) AND (b.turn_id,b.attempt_id)=(c.turn_id,c.attempt_id))`
 
 // The common fresh Submission guard has already checked the Task's active
-// Attempt. decisionAnswerCurrent proves that very Attempt is bound to the
+// Attempt. The current scope proves that very Attempt is bound to the
 // answer's original Assignment, Mandate and authority generation.
 func requireHandledDecisionAnswersInTx(ctx context.Context, tx *sql.Tx, input SubmitTaskInput) error {
 	installed, err := decisionAnswerInstalledInTx(ctx, tx)
 	if err != nil || !installed {
 		return err
 	}
+	current, err := decisionAnswerCurrentInTx(ctx, tx)
+	if err != nil {
+		return err
+	}
 	var pending bool
 	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1`+decisionAnswerEvidence+decisionAnswerReplacementJoin+`
  JOIN tasks t ON (t.id,t.group_id)=(q.task_id,q.group_id)
- WHERE (q.group_id,q.task_id,q.task_revision,t.active_attempt_id)=(?,?,?,?) AND `+decisionAnswerCurrent+` AND `+decisionAnswerProof+`
+ WHERE (q.group_id,q.task_id,q.task_revision,t.active_attempt_id)=(?,?,?,?) AND `+current+` AND `+decisionAnswerProof+`
  AND NOT EXISTS(SELECT 1 FROM decision_answer_consumptions c WHERE c.answer_id=ans.id AND `+decisionAnswerHandlingMatch+`))`,
 		input.GroupID, input.TaskID, input.ExpectedRevision, input.AttemptID, time.Now().UTC().Format(timestampLayout)).Scan(&pending)
 	if err == nil && pending {
@@ -88,7 +106,7 @@ const decisionAnswerWorkInputSelect = `SELECT ans.id,q.group_id,q.topic_id,q.tas
 // A pending answer is visible to its exact physical wake only; later turns of
 // the same work may see it as history only after explicit handling.
 const decisionAnswerWorkerWhere = ` WHERE (q.assignment_id,q.task_revision,q.group_id,q.topic_id,q.task_id,q.owner_member_id,q.mandate_id)=
- (?,?,?,?,?,?,?) AND (? IN (work.delivery_id,replacement.delivery_id) OR c.answer_id IS NOT NULL) AND ` + decisionAnswerProof + ` AND ` + decisionAnswerCurrent
+ (?,?,?,?,?,?,?) AND (? IN (work.delivery_id,replacement.delivery_id) OR c.answer_id IS NOT NULL) AND ` + decisionAnswerProof + ` AND `
 
 func decisionAnswerWorkInputArgs(p CoordinationRoleProvenance, mandateID string) []any {
 	return append(workerWorkInputArgs(p), mandateID, p.DeliveryID, time.Now().UTC().Format(timestampLayout))
@@ -98,8 +116,12 @@ func decisionAnswerWorkInputInTx(ctx context.Context, tx *sql.Tx, p Coordination
 	if err := requireDecisionAnswersInTx(ctx, tx); err != nil {
 		return domain.TaskWorkInput{}, err
 	}
+	current, err := decisionAnswerCurrentInTx(ctx, tx)
+	if err != nil {
+		return domain.TaskWorkInput{}, err
+	}
 	args := append(decisionAnswerWorkInputArgs(p, mandateID), id)
-	i, err := scanWorkInput(tx.QueryRowContext(ctx, decisionAnswerWorkInputSelect+decisionAnswerWorkerWhere+` AND ans.id=?`, args...))
+	i, err := scanWorkInput(tx.QueryRowContext(ctx, decisionAnswerWorkInputSelect+decisionAnswerWorkerWhere+current+` AND ans.id=?`, args...))
 	return i, coordinationRoleRelationError(err)
 }
 
@@ -113,7 +135,11 @@ func decisionAnswerWorkInputHistoryInTx(ctx context.Context, tx *sql.Tx, role Co
 	if err != nil {
 		return page, err
 	}
-	return mergeDecisionAnswerWorkInputHistoryInTx(ctx, tx, decisionAnswerWorkerWhere, decisionAnswerWorkInputArgs(p, r.MandateID), opts.Before, limit, page)
+	current, err := decisionAnswerCurrentInTx(ctx, tx)
+	if err != nil {
+		return page, err
+	}
+	return mergeDecisionAnswerWorkInputHistoryInTx(ctx, tx, decisionAnswerWorkerWhere+current, decisionAnswerWorkInputArgs(p, r.MandateID), opts.Before, limit, page)
 }
 
 // Read at most limit+1 answers with the same exclusive cursor and sort order

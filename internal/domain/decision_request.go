@@ -58,6 +58,7 @@ type DecisionTaskRef struct {
 	AuthorityGeneration int64  `json:"authority_generation"`
 	OwnerMemberID       string `json:"owner_member_id"`
 	OriginTriggerID     string `json:"origin_trigger_id"`
+	WorkInputID         string `json:"work_input_id,omitempty"` // Only for an exact returned follow-up.
 }
 
 type DecisionChatProof struct {

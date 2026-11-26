@@ -92,7 +92,8 @@ func (s *Store) ProposeTaskDecisionRequest(ctx context.Context, scope MemberTool
 }
 
 const taskDecisionSlotWhere = `q.task_id IS NOT NULL AND
- (q.group_id,q.topic_id,q.task_id,q.task_revision,q.assignment_id,q.mandate_id,q.authority_generation,q.owner_member_id,q.kind)=(?,?,?,?,?,?,?,?,?)`
+ (q.group_id,q.topic_id,q.task_id,q.task_revision,q.assignment_id,q.mandate_id,q.authority_generation,q.owner_member_id,q.kind)=(?,?,?,?,?,?,?,?,?)
+ AND q.origin_trigger_id=(SELECT origin_trigger_id FROM mandates WHERE id=?)`
 
 func taskDecisionRequestInTx(ctx context.Context, tx *sql.Tx, role CoordinationToolScope, owner assignmentSnapshot, input domain.TaskDecisionRequestInput, body, key string) (domain.DecisionRequest, error) {
 	var zero domain.DecisionRequest
@@ -122,7 +123,7 @@ func taskDecisionRequestInTx(ctx context.Context, tx *sql.Tx, role CoordinationT
 	 FROM decision_requests q JOIN decision_request_versions v ON v.request_id=q.id
 	 AND v.version=(SELECT max(version) FROM decision_request_versions WHERE request_id=q.id)
 	 WHERE `+taskDecisionSlotWhere, r.GroupID, r.TopicID, r.TaskID, r.TaskRevision, a.ID, r.MandateID, r.AuthorityGeneration,
-		a.WorkerMemberID, input.Kind).Scan(&id, &version, &savedBody, &savedExpiry, &withdrawn)
+		a.WorkerMemberID, input.Kind, r.MandateID).Scan(&id, &version, &savedBody, &savedExpiry, &withdrawn)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return zero, err
 	}

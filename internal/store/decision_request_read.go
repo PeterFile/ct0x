@@ -36,28 +36,30 @@ func decisionRequestError(action string, err error) error {
 // On v30 the trusted local-user group's visibility predicate is group existence
 // (the same scope as ListGroups), not membership of a model or a synthetic Project.
 // Keep it in this transaction and replace it with D's predicate when available.
-const decisionRequestSelect = `SELECT q.id,v.version,q.kind,q.group_id,q.topic_id,g.name,q.recipient_id,q.relay,
+const decisionRequestColumns = `SELECT q.id,v.version,q.kind,q.group_id,q.topic_id,g.name,q.recipient_id,q.relay,
  coalesce(q.task_id,''),coalesce(t.title,''),coalesce(q.task_revision,0),coalesce(q.assignment_id,''),coalesce(q.mandate_id,''),
  coalesce(q.authority_generation,0),coalesce(q.owner_member_id,''),coalesce(q.origin_trigger_id,''),
  coalesce(q.chat_source_id,''),coalesce(a.candidate_id,''),coalesce(a.id,''),coalesce(a.notice_message_id,''),
  q.source_message_id,q.source_sequence,v.author_member_id,v.author_turn_id,coalesce(v.author_attempt_id,''),
- v.question_json,q.created_at,v.created_at,v.expires_at
- FROM decision_requests q JOIN groups g ON g.id=q.group_id
+ v.question_json,q.created_at,v.created_at,v.expires_at, `
+
+const decisionRequestRelations = ` FROM decision_requests q JOIN groups g ON g.id=q.group_id
  JOIN decision_request_versions v ON v.request_id=q.id AND v.version=(SELECT max(version) FROM decision_request_versions WHERE request_id=q.id)
  LEFT JOIN tasks t ON (t.id,t.group_id)=(q.task_id,q.group_id)
  LEFT JOIN chat_assessments a ON a.id=q.chat_assessment_id`
 
 // Settlement of the asking Turn is not an answer. The Task still needs the
 // exact open work generation and its canonical owner, not the original claim.
-const decisionRequestCurrentTask = `q.task_id IS NOT NULL AND t.status='open' AND t.revision=q.task_revision
+const decisionRequestTaskScope = `q.task_id IS NOT NULL AND t.status='open' AND t.revision=q.task_revision
  AND t.current_submission_id IS NULL AND coalesce(t.assignee_id,'') IN ('',q.owner_member_id)
  AND EXISTS(SELECT 1 FROM task_coordination tc
  JOIN coordination_assignments ca ON (ca.id,ca.task_id,ca.group_id,ca.worker_member_id)=(q.assignment_id,q.task_id,q.group_id,q.owner_member_id)
  JOIN coordination_dispatch_requests r ON (r.id,r.task_id,r.group_id,r.topic_id,r.task_revision,r.mandate_id,r.authority_generation)=
     (ca.request_id,q.task_id,q.group_id,q.topic_id,q.task_revision,q.mandate_id,q.authority_generation)
  JOIN coordination_assignment_dispatch d ON d.assignment_id=ca.id AND d.status='enqueued'
- JOIN coordination_assignment_attempts original ON original.assignment_id=ca.id
- JOIN mandates m ON (m.id,m.origin_trigger_id,m.authorized_by)=(q.mandate_id,q.origin_trigger_id,q.recipient_id)
+ JOIN coordination_assignment_attempts original ON original.assignment_id=ca.id`
+
+const decisionRequestTaskCurrentRelations = `
  JOIN coordination_triggers o ON (o.id,o.group_id,o.topic_id,o.message_id,o.message_sequence)=
     (q.origin_trigger_id,q.group_id,q.topic_id,q.source_message_id,q.source_sequence)
  JOIN group_coordinator_bindings b ON (b.group_id,b.revision)=(q.group_id,r.binding_revision)
@@ -75,7 +77,18 @@ const decisionRequestCurrentTask = `q.task_id IS NOT NULL AND t.status='open' AN
     AND (work.assignment_id,work.task_id,work.group_id,work.topic_id,work.task_revision,work.mandate_id,
          work.authority_generation,work.owner_member_id,work.member_id)=
         (q.assignment_id,q.task_id,q.group_id,q.topic_id,q.task_revision,q.mandate_id,
-         q.authority_generation,q.owner_member_id,q.owner_member_id))))`
+         q.authority_generation,q.owner_member_id,q.owner_member_id)))`
+
+const decisionRequestCurrentTask = decisionRequestTaskScope + `
+ JOIN mandates m ON (m.id,m.origin_trigger_id,m.authorized_by)=(q.mandate_id,q.origin_trigger_id,q.recipient_id)` + decisionRequestTaskCurrentRelations + `)`
+
+const decisionRequestCurrentTaskWithReturnStart = decisionRequestTaskScope + `
+ JOIN mandates m ON (m.id,m.authorized_by)=(q.mandate_id,q.recipient_id)` + decisionRequestTaskCurrentRelations + `
+ AND CASE WHEN m.origin_trigger_id=q.origin_trigger_id THEN 1 WHEN ` + workInputDecisionIDMatch + `
+     THEN EXISTS(SELECT 1 FROM `
+const decisionRequestCurrentTaskWithReturnEnd = ` b WHERE ` + workInputDecisionReadMatch + ` AND b.policy_revision=p.revision)
+     ELSE 0 END)`
+const decisionRequestCurrentTaskWithReturn = decisionRequestCurrentTaskWithReturnStart + workInputDecisionSources + decisionRequestCurrentTaskWithReturnEnd
 
 const decisionRequestChatJoins = ` JOIN chat_intake_executions i ON (i.candidate_id,i.turn_id,i.purpose,i.source_kind,i.source_id)=
     (c.id,c.turn_id,'chat_intake/v1','local_user_chat',q.chat_source_id)
@@ -105,8 +118,22 @@ const decisionRequestCurrent = ` WHERE q.recipient_id='user' AND q.withdrawn_at 
 
 const decisionRequestUnanswered = ` AND NOT EXISTS(SELECT 1 FROM decision_answers ans WHERE ans.request_id=q.id)`
 
-func decisionRequestPendingSQL(ctx context.Context, tx *sql.Tx) (string, error) {
-	where := decisionRequestCurrent
+func currentDecisionSQLInTx(ctx context.Context, tx *sql.Tx) (columns, where string, bridge bool, err error) {
+	bridge, err = workInputDecisionInstalledInTx(ctx, tx)
+	if err != nil {
+		return "", "", false, err
+	}
+	inputID, taskScope := `''`, decisionRequestCurrentTask
+	if bridge {
+		inputID = `CASE WHEN ` + workInputDecisionIDMatch + ` THEN coalesce((SELECT b.input_id FROM ` + workInputDecisionSources + ` b
+		 WHERE ` + workInputDecisionReadMatch + `),'') ELSE '' END`
+		taskScope = decisionRequestCurrentTaskWithReturn
+	}
+	return decisionRequestColumns + inputID + decisionRequestRelations, ` WHERE q.recipient_id='user' AND q.withdrawn_at IS NULL
+	 AND (v.expires_at IS NULL OR v.expires_at>?) AND ((` + taskScope + `) OR (` + decisionRequestCurrentChat + `))`, bridge, nil
+}
+
+func decisionRequestPendingSQL(ctx context.Context, tx *sql.Tx, where string) (string, error) {
 	installed, err := decisionAnswerInstalledInTx(ctx, tx)
 	if err != nil {
 		return "", err
@@ -130,7 +157,7 @@ func scanDecisionRequest(row scanner) (out domain.DecisionRequest, err error) {
 		&task.TaskID, &task.TaskTitle, &task.TaskRevision, &task.AssignmentID, &task.MandateID, &task.AuthorityGeneration, &task.OwnerMemberID, &task.OriginTriggerID,
 		&chat.SourceID, &chat.CandidateID, &chat.AssessmentID, &chat.NoticeMessageID,
 		&out.SourceMessageID, &out.SourceSequence, &out.AuthorMemberID, &out.AuthorTurnID, &out.AuthorAttemptID,
-		&question, &created, &updated, &expires)
+		&question, &created, &updated, &expires, &task.WorkInputID)
 	if err != nil {
 		return out, err
 	}
@@ -159,15 +186,19 @@ func scanDecisionRequest(row scanner) (out domain.DecisionRequest, err error) {
 }
 
 func pendingDecisionRequestInTx(ctx context.Context, tx *sql.Tx, thread domain.ThreadRef, id string, version int64, now time.Time) (domain.DecisionRequest, error) {
-	where, err := decisionRequestPendingSQL(ctx, tx)
+	columns, where, _, err := currentDecisionSQLInTx(ctx, tx)
 	if err != nil {
 		return domain.DecisionRequest{}, err
 	}
-	return decisionRequestVersionInTx(ctx, tx, where, thread, id, version, now)
+	where, err = decisionRequestPendingSQL(ctx, tx, where)
+	if err != nil {
+		return domain.DecisionRequest{}, err
+	}
+	return decisionRequestVersionInTx(ctx, tx, columns+where, thread, id, version, now)
 }
 
-func decisionRequestVersionInTx(ctx context.Context, tx *sql.Tx, where string, thread domain.ThreadRef, id string, version int64, now time.Time) (domain.DecisionRequest, error) {
-	return scanDecisionRequest(tx.QueryRowContext(ctx, decisionRequestSelect+where+`
+func decisionRequestVersionInTx(ctx context.Context, tx *sql.Tx, query string, thread domain.ThreadRef, id string, version int64, now time.Time) (domain.DecisionRequest, error) {
+	return scanDecisionRequest(tx.QueryRowContext(ctx, query+`
  AND (q.group_id,q.topic_id,q.id,v.version)=(?,?,?,?)`, now.UTC().Format(timestampLayout), thread.GroupID, thread.TopicID, id, version))
 }
 
@@ -209,37 +240,57 @@ func (s *Store) listPendingDecisionRequests(ctx context.Context, options ListOpt
 	if err := requireDecisionRequestsInTx(ctx, tx); err != nil {
 		return page, decisionRequestError(action, err)
 	}
+	columns, current, bridge, err := currentDecisionSQLInTx(ctx, tx)
+	if err != nil {
+		return page, decisionRequestError(action, err)
+	}
 	var where string
 	if list == decisionListRequests {
-		where, err = decisionRequestPendingSQL(ctx, tx)
+		where, err = decisionRequestPendingSQL(ctx, tx, current)
 	} else {
 		if err := requireDecisionAnswersInTx(ctx, tx); err != nil {
 			return page, decisionRequestError(action, err)
 		}
-		where = decisionRequestCurrent + decisionRequestUnanswered + ` AND q.task_id IS NOT NULL`
+		where = current + decisionRequestUnanswered + ` AND q.task_id IS NOT NULL`
 		if list == decisionListAnswerable {
-			where, err = s.answerableDecisionSQL(ctx, tx, where)
+			where, err = s.answerableDecisionSQL(ctx, tx, current, where)
 		}
 	}
 	if err != nil {
 		return page, decisionRequestError(action, err)
 	}
-	query := decisionRequestSelect + where
+	query := columns + where
 	args := []any{time.Now().UTC().Format(timestampLayout)}
 	if c := options.Before; c != nil {
 		query += ` AND (q.created_at,q.id)<(?,?)`
 		args = append(args, c.CreatedAt.UTC().Format(timestampLayout), c.ID)
 	}
-	rows, err := tx.QueryContext(ctx, query+` ORDER BY q.created_at DESC,q.id DESC LIMIT ?`, append(args, limit+1)...)
+	query += ` ORDER BY q.created_at DESC,q.id DESC`
+	if !bridge {
+		query += ` LIMIT ?`
+		args = append(args, limit+1)
+	}
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return page, decisionRequestError(action, err)
 	}
 	defer rows.Close()
 	items := make([]domain.DecisionRequest, 0, limit+1)
-	for rows.Next() {
+	for len(items) <= limit && rows.Next() {
 		item, err := scanDecisionRequest(rows)
 		if err != nil {
 			return page, decisionRequestError(action, err)
+		}
+		if item.Task != nil && item.Task.WorkInputID != "" {
+			facts, err := decisionTaskFactsInTx(ctx, tx, item.Task.AssignmentID)
+			if err != nil {
+				return page, decisionRequestError(action, err)
+			}
+			if err := decisionTaskChatAuthorityInTx(ctx, tx, facts); errors.Is(err, ErrConflict) {
+				continue
+			} else if err != nil {
+				return page, decisionRequestError(action, err)
+			}
 		}
 		items = append(items, item)
 	}

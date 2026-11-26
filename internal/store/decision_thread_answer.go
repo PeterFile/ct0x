@@ -38,12 +38,12 @@ func (s *Store) threadDecisionExecutionReady(ctx context.Context, q threadDecisi
 	return installed, err
 }
 
-func (s *Store) answerableDecisionSQL(ctx context.Context, tx *sql.Tx, taskOnly string) (string, error) {
+func (s *Store) answerableDecisionSQL(ctx context.Context, tx *sql.Tx, current, taskOnly string) (string, error) {
 	ready, err := s.threadDecisionExecutionReady(ctx, tx)
 	if err != nil || !ready {
 		return taskOnly, err
 	}
-	return decisionRequestCurrent + decisionRequestUnanswered + decisionThreadUnanswered + ` AND (q.task_id IS NOT NULL
+	return current + decisionRequestUnanswered + decisionThreadUnanswered + ` AND (q.task_id IS NOT NULL
 	 OR EXISTS(SELECT 1 FROM decision_thread_answerable r WHERE (r.request_id,r.version)=(q.id,v.version)))`, nil
 }
 
