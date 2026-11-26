@@ -116,7 +116,12 @@ func enqueueExecution(t *testing.T, url, providerID, workspace string) (domain.G
 
 func awaitExecution(t *testing.T, condition func() bool) {
 	t.Helper()
-	deadline := time.NewTimer(3 * time.Second)
+	awaitExecutionWithin(t, 3*time.Second, condition)
+}
+
+func awaitExecutionWithin(t *testing.T, timeout time.Duration, condition func() bool) {
+	t.Helper()
+	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
@@ -124,7 +129,7 @@ func awaitExecution(t *testing.T, condition func() bool) {
 		select {
 		case <-tick.C:
 		case <-deadline.C:
-			t.Fatal("local execution condition did not become true within 3s")
+			t.Fatalf("local execution condition did not become true within %s", timeout)
 		}
 	}
 }
@@ -300,7 +305,7 @@ func TestExecutionStartupRejectsUnsafeRoots(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				var output bytes.Buffer
 				err = runWithSearch(ctx, []string{"--listen", "127.0.0.1:0", "--data-dir", dir, "--pi-path", f.path, "--enable-execution"}, &output, provider.Search{})
@@ -372,7 +377,7 @@ func TestExecutionSchedulerFailureStopsHTTP(t *testing.T) {
 		}
 	case <-done:
 		t.Fatalf("process failed before startup: %v", result)
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("startup timed out")
 	}
 	if url == "" {

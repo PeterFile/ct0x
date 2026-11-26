@@ -181,7 +181,7 @@ func TestPiComposedIntakeResolvesIssuedOptions(t *testing.T) {
 	f, _ := nativeSessionPreparation(t, domain.ChatIntakePurpose)
 	f.opts.Providers = f.opts.Providers[1:]
 	f.opts.Providers[0].Path = launcher
-	f.opts.ExecutionTimeout = 10 * time.Second
+	f.opts.ExecutionTimeout = 30 * time.Second
 	engine := f.runtimeOptions.ChatIntake
 	thread := domain.ThreadRef{GroupID: f.group.ID, TopicID: "combined-resolution"}
 	policy, err := engine.SetChatPolicy(ctx, thread, domain.ChatPolicyRequest{

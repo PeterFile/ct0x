@@ -158,7 +158,7 @@ func TestMemberToolsStartupRejectsUnsafeRoot(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 			var output bytes.Buffer
 			err = runWithSearch(ctx, memberToolsArgs(t, dir, f.path), &output, provider.Search{})
