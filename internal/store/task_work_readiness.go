@@ -75,6 +75,10 @@ func (s *Store) taskWorkReadinessForOwnerInTx(ctx context.Context, tx *sql.Tx, f
 	if !s.taskWorkExecution.Load() {
 		return "task_work_execution_disabled", "", nil
 	}
+	stale, err := taskImpactWakeBlockedInTx(ctx, tx, d, turnID)
+	if err != nil || stale {
+		return "constraint_impact_stale", "", err
+	}
 	blocked, active, err = taskWorkCurrentInTx(ctx, tx, f)
 	if err != nil || blocked != "" {
 		return blocked, active, err

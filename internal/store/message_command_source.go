@@ -98,13 +98,14 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 	if len(messages) == 0 {
 		return nil
 	}
-	var available, hasReviewNotices, hasWorkspaceNotices, hasTaskWork, hasWorkInputs, hasWorkReports, hasGroupBackground bool
+	var available, hasReviewNotices, hasWorkspaceNotices, hasTaskWork, hasWorkInputs, hasWorkReports, hasImpacts, hasGroupBackground bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=17),
 	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=18),
 	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=21),
 	 EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='task_work_deliveries'),
-	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),`+workInputSchemaExists+","+groupBackgroundSchemaCompleteSQL, taskWorkReportVersion, taskWorkInputVersion).
-		Scan(&available, &hasReviewNotices, &hasWorkspaceNotices, &hasTaskWork, &hasWorkReports, &hasWorkInputs, &hasGroupBackground); err != nil {
+	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),
+	 EXISTS(SELECT 1 FROM schema_migrations WHERE version=?),`+workInputSchemaExists+","+groupBackgroundSchemaCompleteSQL, taskImpactSchemaVersionNow(), taskWorkReportVersion, taskWorkInputVersion).
+		Scan(&available, &hasReviewNotices, &hasWorkspaceNotices, &hasTaskWork, &hasImpacts, &hasWorkReports, &hasWorkInputs, &hasGroupBackground); err != nil {
 		return err
 	}
 	if !available && !hasWorkspaceNotices {
@@ -148,6 +149,11 @@ func messageSourcesInTx(ctx context.Context, tx *sql.Tx, messages []domain.Messa
 		returnKind = "CASE WHEN handback.input_id IS NOT NULL THEN 'platform' END,"
 		returnSource = "CASE WHEN handback.input_id IS NOT NULL THEN 'work_input_return:'||handback.input_id END,"
 		returnJoin = " LEFT JOIN task_work_input_returns handback ON handback.notice_message_id=m.id AND handback.member_id=m.sender_id"
+	}
+	if hasImpacts {
+		workKind += "CASE WHEN impact.id IS NOT NULL THEN 'platform' END,"
+		workSource += "CASE WHEN impact.id IS NOT NULL THEN 'task_impact:'||impact.id END,"
+		workJoin += ` LEFT JOIN task_constraint_impacts impact ON impact.notice_message_id=m.id AND impact.group_id=m.group_id`
 	}
 	joinKind, joinSource, joinNotice := "", "", ""
 	if hasGroupBackground {

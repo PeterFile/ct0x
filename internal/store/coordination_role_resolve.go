@@ -332,7 +332,7 @@ func coordinationRoleStateInTx(ctx context.Context, tx *sql.Tx, scope MemberTool
  WHEN :kind='worker' AND EXISTS(SELECT 1 FROM task_dependencies dep JOIN tasks parent ON parent.id=dep.dependency_id AND parent.group_id=dep.group_id
  WHERE dep.task_id=r.task_id AND dep.group_id=r.group_id AND parent.status<>'accepted') THEN 'dependency_not_accepted'
  ELSE '' END,
- CASE WHEN :kind='worker' AND :attempt='' THEN EXISTS(SELECT 1 FROM task_dependencies dep
+ CASE WHEN :kind='worker' THEN EXISTS(SELECT 1 FROM task_dependencies dep
  WHERE dep.group_id=r.group_id AND dep.task_id=r.task_id) ELSE 0 END
  FROM coordination_dispatch_requests r LEFT JOIN coordination_dispatch_state s ON s.request_id=r.id
  LEFT JOIN tasks t ON t.id=r.task_id LEFT JOIN mandates m ON m.id=r.mandate_id LEFT JOIN routing_decisions rd ON rd.id=m.decision_id
@@ -383,11 +383,18 @@ func coordinationRoleStateInTx(ctx context.Context, tx *sql.Tx, scope MemberTool
 		}
 	}
 	if checkArtifactDeps && state.Blocked == CoordinationReady {
-		blocked, err := taskArtifactDependenciesBlockedInTx(ctx, tx, p.GroupID, p.TaskID)
-		if err != nil {
-			return CoordinationRoleState{}, err
-		}
-		if blocked {
+		if state.AttemptID == "" {
+			blocked, err := taskArtifactDependenciesBlockedInTx(ctx, tx, p.GroupID, p.TaskID)
+			if err != nil {
+				return CoordinationRoleState{}, err
+			}
+			if blocked {
+				state.Blocked = CoordinationDependencyNotAccepted
+			}
+		} else if err := requireFreshTaskPinsInTx(ctx, tx, p.GroupID, p.TaskID); err != nil {
+			if !errors.Is(err, errTaskImpactPinStale) {
+				return CoordinationRoleState{}, err
+			}
 			state.Blocked = CoordinationDependencyNotAccepted
 		}
 	}

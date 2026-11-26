@@ -77,12 +77,16 @@ func coordinationAssignmentStartInTx(ctx context.Context, tx *sql.Tx, v assignme
 
 func coordinationAssignmentCurrentInTx(ctx context.Context, tx *sql.Tx, v assignmentSnapshot, own, turnID string) error {
 	args := append(v.args(), sql.Named("own", own), sql.Named("turn", turnID))
-	var allowed bool
-	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1"+coordinationAssignmentRelations+coordinationAssignmentStart+")", args...).Scan(&allowed); err != nil {
+	var allowed, hasDependencies bool
+	if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1"+coordinationAssignmentRelations+coordinationAssignmentStart+`),
+	 EXISTS(SELECT 1 FROM task_dependencies WHERE group_id=:grp AND task_id=:task)`, args...).Scan(&allowed, &hasDependencies); err != nil {
 		return err
 	}
 	if !allowed {
 		return ErrConflict
+	}
+	if hasDependencies {
+		return requireFreshTaskPinsInTx(ctx, tx, v.r.GroupID, v.r.TaskID)
 	}
 	return nil
 }

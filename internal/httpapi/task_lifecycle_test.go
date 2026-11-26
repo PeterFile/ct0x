@@ -25,8 +25,8 @@ func openTaskLifecycleAPI(t *testing.T, path string) *groupAPI {
 	local := platform.NewLocalUser(a.db)
 	routes := append(LocalUserRoutes(local), TaskRoutes(local)...)
 	lifecycle := TaskLifecycleRoutes(local)
-	if len(lifecycle) != 12 {
-		t.Fatalf("lifecycle route count = %d, want 12", len(lifecycle))
+	if len(lifecycle) != 13 {
+		t.Fatalf("lifecycle route count = %d, want 13", len(lifecycle))
 	}
 	a.handler = mustServer(t, DefaultAddress, append(routes, lifecycle...)...).Handler
 	return a

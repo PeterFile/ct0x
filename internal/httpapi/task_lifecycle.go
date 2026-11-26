@@ -23,6 +23,7 @@ func TaskLifecycleRoutes(local *platform.LocalUser) []Route {
 		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/reviews/{review}", noQuery(a.getTaskReview)},
 		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/work-inputs", a.listTaskWorkInputs},
 		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/work-reports", a.listTaskWorkReports},
+		{http.MethodGet, "/api/v1/groups/{group}/tasks/{task}/impacts", a.listTaskImpacts},
 	}
 }
 
@@ -139,6 +140,18 @@ func (a localAPI) listTaskWorkReports(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page, err := a.local.ListTaskWorkReports(r.Context(), groupID, taskID, options)
+	writePage(w, page, scope, groupID, err)
+}
+
+func (a localAPI) listTaskImpacts(w http.ResponseWriter, r *http.Request) {
+	groupID, taskID := r.PathValue("group"), r.PathValue("task")
+	scope := "task_impacts:" + taskID
+	options, err := listOptions(r, scope, groupID)
+	if err != nil {
+		operationError(w, err)
+		return
+	}
+	page, err := a.local.ListTaskImpacts(r.Context(), groupID, taskID, options)
 	writePage(w, page, scope, groupID, err)
 }
 

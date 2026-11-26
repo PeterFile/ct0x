@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -128,10 +129,17 @@ func TestTaskWorkInputMutationUncertainty(t *testing.T) {
 			if !reflect.DeepEqual(projection, original) {
 				t.Fatalf("effect changed the projected input: %+v", projection)
 			}
+			impactInstalled := slices.Contains(migrations, taskImpactSchema)
 			added := []string{"mutation_idempotency", "task_work_input_consumptions"}
+			if impactInstalled {
+				added = append(added, "task_constraint_impacts", "messages", "message_log")
+			}
 			payload := mutationPayload(id, p.AssignmentID)
 			if handBack {
 				added = []string{"mutation_idempotency", "task_work_input_returns", "messages", "message_log"}
+				if impactInstalled {
+					added = append(added, "task_constraint_impacts")
+				}
 				payload = mutationPayload(id, p.AssignmentID, reason)
 				h := want.Return
 				if h == nil || h.Reason != reason || h.AttemptID != owner.AttemptID || h.TurnID != scope.Claim.TurnID || want.Consumption != nil ||
@@ -167,6 +175,14 @@ func TestTaskWorkInputMutationUncertainty(t *testing.T) {
 				t.Fatalf("confirmed changed-payload conflict lost its classification: %v", err)
 			}
 			messageSequencePreserved(t, observer, after)
+			impact := impacts(t, observer, p.GroupID, p.TaskID)
+			if impactInstalled {
+				if len(impact) != 1 || impact[0].Source.InputID != id || handBack != (impact[0].Decision != nil) {
+					t.Fatalf("reconciliation did not preserve precisely one scoped effect: %+v", impact)
+				}
+			} else if len(impact) != 0 {
+				t.Fatalf("uninstalled impact schema persisted an effect: %+v", impact)
+			}
 			t.Logf("phase=%s unknown before reconciliation; effect already durable=%t; exact key and original occupancy preserved", phase, persisted)
 		})
 	}

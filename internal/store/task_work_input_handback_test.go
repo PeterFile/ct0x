@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -184,7 +185,11 @@ func TestTaskWorkInvestigationHandbackWithoutRuntime(t *testing.T) {
 		t.Fatalf("return changed the projected original input: %+v", projected)
 	}
 	after := messageSequenceSnapshot(t, cold)
-	for _, table := range []string{"task_work_input_returns", "mutation_idempotency", "messages", "message_log"} {
+	tables := []string{"task_work_input_returns", "mutation_idempotency", "messages", "message_log"}
+	if slices.Contains(migrations, taskImpactSchema) {
+		tables = append(tables, "task_constraint_impacts")
+	}
+	for _, table := range tables {
 		if len(after[table]) != len(before[table])+1 {
 			t.Fatalf("return must add exactly one %s row", table)
 		}

@@ -104,6 +104,11 @@ func (s *Store) handleWorkInputInTx(ctx context.Context, tx *sql.Tx, scope Membe
 			return out, err
 		}
 	}
+	if fresh {
+		if err := recordTaskImpactInTx(ctx, tx, i, r); err != nil {
+			return out, err
+		}
+	}
 	if fresh || newKey {
 		// Verify the actual effect and current authority after the last write,
 		// including any changes made by triggers in this transaction.
