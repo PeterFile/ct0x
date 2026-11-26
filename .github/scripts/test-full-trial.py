@@ -574,18 +574,25 @@ class ExecutionTests(unittest.TestCase):
             expected = ReceiptTests.fixture(self, root / "expected")
             product, binaries = root / "product", root / "bin"
             binaries.mkdir()
-            for path, digest in self.driver.workflow.LEGACY.items():
+            legacy = {}
+            for path in self.driver.workflow.LEGACY:
                 target = product / path
                 target.parent.mkdir(parents=True, exist_ok=True)
-                source = Path(path).read_bytes()
-                # Hosted tests run from the product checkout; the shallow
-                # controller may contain only a disposable ci.yml wrapper.
-                if hashlib.sha256(source).hexdigest() != digest:
-                    source = self.driver.workflow.snapshot(path).encode()
+                source = (self.driver.ROOT / path).read_bytes()
+                legacy[path] = hashlib.sha256(source).hexdigest()
                 target.write_bytes(source)
+            # Only fixture policy data changes; all CLI and integrity checks stay real.
+            launcher = root / "trial-cli-fixture.py"
+            launcher.write_text(f'''import importlib.util
+spec = importlib.util.spec_from_file_location("trial_cli_fixture", {str(SCRIPTS / "full-trial.py")!r})
+driver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(driver)
+driver.workflow.LEGACY = {legacy!r}
+driver.main()
+''')
             data = {"race": expected["inventories"], "ordinary": expected["workspace_ordinary"]["compiled"]}
             (root / "inventories.json").write_text(json.dumps(data))
-            # Only process boundaries are fixtures: the unmodified entrypoint still
+            # Git/Go boundaries are fixtures: the unmodified entrypoint still
             # checks identity, parses Go JSON, validates plans and publishes receipts.
             (binaries / "git").write_text(f'''#!{sys.executable}
 import sys
@@ -641,7 +648,7 @@ for row in rows:
                            "TRIAL_SHA": self.plan.PRODUCT_SHA, "GITHUB_SHA": "c" * 40,
                            "GITHUB_RUN_ID": "42", "GITHUB_RUN_ATTEMPT": "1", "GITHUB_OUTPUT": str(root / "output")}
             def run(command, **extra):
-                return subprocess.run([sys.executable, str(SCRIPTS / "full-trial.py"), command], cwd=product,
+                return subprocess.run([sys.executable, str(launcher), command], cwd=product,
                                       env={**environment, **extra}, capture_output=True, text=True, timeout=30)
             result = run("preflight")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
