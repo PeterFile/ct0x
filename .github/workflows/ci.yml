@@ -1,137 +1,80 @@
-name: CI
+# Temporary experimental controller only; never merge this replacement into master.
+name: Historical CI evidence
 
 on:
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, edited, labeled]
-  push:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      policy_sha:
+        description: '人工审核过的 merge-gate 分支提交（小写四十位 SHA）'
+        required: true
+        type: string
+      phase:
+        description: '审计阶段；diagnostics 始终核验八个固定历史原件'
+        required: true
+        type: choice
+        options: [selector, diagnostics, both]
+        default: both
+      offset:
+        description: 'selector 在冻结清单中的起始位置（0..112）'
+        required: false
+        type: string
+        default: '0'
+      count:
+        description: 'selector 最大条数（1..150）'
+        required: false
+        type: string
+        default: '150'
 
 permissions:
   contents: read
 
-# Relevant PR runs supersede older runs. Master keeps the running and latest pending run.
-# Irrelevant events get a private group, so they cannot supersede real CI.
 concurrency:
-  group: >-
-    ${{ format('{0}-{1}', github.workflow,
-        ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-         (github.event_name == 'pull_request' &&
-          (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-           (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-           (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
-        (github.event.pull_request.number || github.ref) || format('ignored-{0}', github.run_id)) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: historical-ci-evidence-experiment
+  cancel-in-progress: false
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  feedback:
-    name: CI preflight and feedback
+  audit:
+    name: 历史证据采集（非产品门禁）
     if: >-
-      ${{ (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-          (github.event_name == 'pull_request' &&
-           (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-            (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-            (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full')))) }}
+      ${{ github.event_name == 'workflow_dispatch' &&
+          github.repository == 'PeterFile/ct0x' &&
+          github.ref == 'refs/heads/codex/ci-historical-audit-20261126' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    outputs:
-      mode: ${{ steps.plan.outputs.mode }}
-      sha: ${{ steps.plan.outputs.sha }}
-      tree: ${{ steps.plan.outputs.tree }}
-      head: ${{ steps.plan.outputs.head }}
-      base: ${{ steps.plan.outputs.base }}
-      run_id: ${{ steps.plan.outputs.run_id }}
-      matrix: ${{ steps.plan.outputs.matrix }}
+    timeout-minutes: 210
     steps:
-      - uses: actions/checkout@v7
+      - name: 检出固定 controller
+        uses: actions/checkout@v7
         with:
+          repository: PeterFile/ct0x
           ref: ${{ github.sha }}
+          path: controller
           fetch-depth: 2
           persist-credentials: false
-      - name: Route immutable merge and check full diff
-        id: plan
-        run: python3 .github/scripts/ci-plan.py plan "$RUNNER_TEMP/ci-plan.json"
-      - uses: actions/setup-go@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
-        with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      # Ordinary cmd catches composition/liveness regressions before full fanout (#218).
-      - name: Ordinary test cmd package
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
-        run: go test -count=1 ./cmd/workspace
-      - name: Test CI scheduling and shard gates
-        if: ${{ steps.plan.outputs.mode == 'feedback' && steps.plan.outputs.ci == 'true' }}
+      - name: 初始化终态证据存档
         run: |
-          set -euo pipefail
-          python3 .github/scripts/test-ci-scheduling.py -v
-          python3 .github/scripts/test-store-shard.py -v
-      - name: Targeted Go feedback
-        run: python3 .github/scripts/ci-plan.py feedback "$RUNNER_TEMP/ci-plan.json"
-      - uses: actions/setup-node@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.web == 'true' }}
+          mkdir -p evidence
+          printf '%s\n' '{"schema":1,"status":"infrastructure-error","errors":["审计未启动或被中断"],"rows":[]}' > evidence/index.json
+      - name: 安装固定 Go（不上传缓存）
+        uses: actions/setup-go@v7
         with:
-          node-version: '22.x'
-          check-latest: true
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - name: Web test, typecheck and build
-        run: python3 .github/scripts/ci-plan.py web "$RUNNER_TEMP/ci-plan.json"
-      - uses: actions/setup-node@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.bridge == 'true' }}
-        with:
-          node-version: '24.13.0'
-          cache: npm
-          cache-dependency-path: extensions/pi-bridge/package-lock.json
-      - name: Pi bridge test and typecheck
-        run: python3 .github/scripts/ci-plan.py bridge "$RUNNER_TEMP/ci-plan.json"
-
-  # Master is serialized by workflow concurrency; PR full runs are opt-in.
-  full:
-    name: Full suite
-    needs: feedback
-    if: ${{ needs.feedback.outputs.mode == 'full' }}
-    uses: ./.github/workflows/ci-full.yml
-    with:
-      sha: ${{ needs.feedback.outputs.sha }}
-      tree: ${{ needs.feedback.outputs.tree }}
-      head: ${{ needs.feedback.outputs.head }}
-      base: ${{ needs.feedback.outputs.base }}
-      matrix: ${{ needs.feedback.outputs.matrix }}
-
-  # Derive candidacy from the native event, not outputs that a failed preflight may never emit.
-  # Feedback/ignored events must never publish even a skipped check under the required name.
-  # Cancelled dependencies and an unexpectedly skipped full also need a non-required name.
-  merge-check:
-    name: >-
-      ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-           (github.event_name == 'pull_request' &&
-            (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-             (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-             (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
-          (github.event_name == 'push' || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full')) &&
-          needs.feedback.result != 'cancelled' && needs.full.result != 'cancelled' &&
-          (needs.feedback.result != 'success' || needs.full.result != 'skipped') && 'Full CI' || 'Feedback status' }}
-    needs: ["feedback", "full"]
-    if: >-
-      ${{ !cancelled() && (((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-           (github.event_name == 'pull_request' &&
-            (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-             (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-             (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
-          (github.event_name == 'push' || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full'))) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Check same-run preflight and full evidence
+          go-version: '1.26.0'
+          cache: false
+      - name: 只读历史回放
         env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 .github/scripts/ci-gate.py outer
+          AUDIT_READ_TOKEN: ${{ github.token }}
+        run: python3 -B controller/.github/scripts/ci-historical-audit.py run
+      - name: 归档未完成项为 unknown
+        if: ${{ always() && hashFiles('controller/.github/scripts/ci-historical-audit.py') != '' }}
+        run: python3 -B controller/.github/scripts/ci-historical-audit.py finalize
+      - name: 上传原始证据与索引
+        if: ${{ always() && hashFiles('evidence/index.json') != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: historical-ci-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7
