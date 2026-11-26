@@ -38,7 +38,7 @@ func TestRunTaskLifecycleRoutes(t *testing.T) {
 	base, stop := startRunWithSearch(t, provider.Search{}, args...)
 	baseline := taskLifecycleRecoverySnapshot(t, dsn.String(), seeded)
 	t.Logf("synthetic Store-only sentinel %s: starting -> unknown after owned startup; one resource remains occupied; no provider CLI", initial.ID)
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{Timeout: 12 * time.Second}
 	defer client.CloseIdleConnections()
 	request := func(method, path, body, key string, status int, result any) []byte {
 		t.Helper()

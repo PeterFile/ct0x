@@ -159,6 +159,31 @@ func TestTaskWorkInputMutationUncertainty(t *testing.T) {
 				t.Fatalf("wrong durable key or payload: record=%q %v", recordID, err)
 			}
 			after := messageSequenceSnapshot(t, observer)
+			if handBack && impactInstalled && slices.Contains(migrations, workInputDecisionSchema) {
+				page, err := observer.ListPendingTaskDecisions(ctx, ListOptions{})
+				if err != nil || len(page.Items) != 1 {
+					t.Fatalf("expected exactly one returned-input decision: %+v %v", page, err)
+				}
+				q := page.Items[0]
+				dispatch, err := observer.GetDispatchRequest(ctx, p.GroupID, p.RequestID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !strings.HasPrefix(q.ID, workInputDecisionPrefix) || q.ID == id || q.RecipientID != "user" ||
+					q.Relay != domain.DecisionRelayTaskOwner || q.AuthorMemberID != want.Return.MemberID ||
+					q.AuthorTurnID != want.Return.TurnID || q.AuthorAttemptID != want.Return.AttemptID || q.Facts != want.Return.Reason {
+					t.Fatalf("wrong returned-input decision projection: %+v", q)
+				}
+				assertReturnedDecisionScope(t, q, want, c, dispatch.Request.AuthorityGeneration)
+				for _, table := range []string{"decision_requests", "decision_request_versions"} {
+					rows := slices.DeleteFunc(slices.Clone(after[table]), func(row []any) bool { return len(row) > 0 && row[0] == q.ID })
+					if len(after[table]) != len(before[table])+1 ||
+						!slices.EqualFunc(rows, before[table], func(a, b []any) bool { return reflect.DeepEqual(a, b) }) {
+						t.Fatalf("%s did not preserve its existing rows with exactly one projected addition", table)
+					}
+					delete(before, table)
+				}
+			}
 			for _, table := range added {
 				if len(after[table]) != len(before[table])+1 {
 					t.Fatalf("expected exactly one new %s row", table)

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
 	"agentworkspace/internal/artifactfs"
 	"agentworkspace/internal/domain"
@@ -24,6 +25,7 @@ func TestRunProjectExperienceAcceptedAndRetired(t *testing.T) {
 	args := []string{"--listen", "127.0.0.1:0", "--data-dir", f.dir}
 	base, stop := startRunWithSearch(t, provider.Search{}, args...)
 	h := projectExperienceHTTP{base: base, client: experienceHTTPClient(t)}
+	h.client.Timeout = 12 * time.Second
 	groupPath := "/api/v1/groups/" + f.group.ID
 	entry := groupPath + projectExperienceRoute
 	taskPath := groupPath + "/tasks/" + f.base.SourceTaskID

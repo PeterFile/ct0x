@@ -134,6 +134,10 @@ func (a agyACPAdapter) Capabilities(p Provider) (AdapterCapabilities, error) {
 }
 
 func (a agyACPAdapter) NewExecutor(p Provider, timeout time.Duration) (Executor, error) {
+	return a.newExecutor(context.Background(), p, timeout)
+}
+
+func (a agyACPAdapter) newExecutor(ctx context.Context, p Provider, timeout time.Duration) (Executor, error) {
 	if _, err := a.Capabilities(p); err != nil {
 		return nil, err
 	}
@@ -144,7 +148,14 @@ func (a agyACPAdapter) NewExecutor(p Provider, timeout time.Duration) (Executor,
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, ErrAdapterConfiguration
 	}
-	return NewACPExecutor(a.acpConfig(p), timeout)
+	return NewACPExecutorContext(ctx, a.acpConfig(p), timeout)
+}
+
+// NewAgyACPMemberToolExecutorContext is the cancellable ordinary AGY member
+// tool constructor. It shares the adapter's capability, config-file and
+// construction checks; only the supplied inspection context is new.
+func NewAgyACPMemberToolExecutorContext(ctx context.Context, configPath string, toolNames []string, selected Provider, timeout time.Duration) (Executor, error) {
+	return agyACPAdapter{configPath: configPath, toolNames: append([]string(nil), toolNames...)}.newExecutor(ctx, selected, timeout)
 }
 
 // SupportsAgyFreshTaskWork checks the exact AGY CLI contract without starting it.

@@ -73,6 +73,17 @@ func requireHandledDecisionAnswersInTx(ctx context.Context, tx *sql.Tx, input Su
 	if err != nil {
 		return err
 	}
+	// An empty result rules out pending answers in this transaction.
+	var anyAnswers bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM decision_answers ans
+ JOIN decision_requests q ON q.id=ans.request_id
+ WHERE (q.group_id,q.task_id,q.task_revision)=(?,?,?))`,
+		input.GroupID, input.TaskID, input.ExpectedRevision).Scan(&anyAnswers); err != nil {
+		return err
+	}
+	if !anyAnswers {
+		return nil
+	}
 	var pending bool
 	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1`+decisionAnswerEvidence+decisionAnswerReplacementJoin+`
  JOIN tasks t ON (t.id,t.group_id)=(q.task_id,q.group_id)

@@ -185,6 +185,37 @@ func TestTaskWorkInvestigationHandbackWithoutRuntime(t *testing.T) {
 		t.Fatalf("return changed the projected original input: %+v", projected)
 	}
 	after := messageSequenceSnapshot(t, cold)
+	if slices.Contains(migrations, taskImpactSchema) && slices.Contains(migrations, workInputDecisionSchema) {
+		page, err := cold.ListPendingTaskDecisions(ctx, ListOptions{})
+		if err != nil || len(page.Items) != 1 || page.NextCursor != nil {
+			t.Fatalf("fresh return must expose one pending task decision: %+v %v", page, err)
+		}
+		q := page.Items[0]
+		if !strings.HasPrefix(q.ID, workInputDecisionPrefix) || q.Version != 1 ||
+			q.Kind != domain.DecisionRequestAuthorization || q.Relay != domain.DecisionRelayTaskOwner || q.RecipientID != "user" ||
+			q.ThreadRef != got.ThreadRef || q.Task == nil || q.Task.WorkInputID != got.ID || q.Task.TaskID != got.TaskID ||
+			q.Task.TaskRevision != got.TaskRevision || q.Task.MandateID != got.MandateID || q.Task.AssignmentID != got.AssignmentID ||
+			q.Task.OwnerMemberID != got.WorkerMemberID || q.Task.OriginTriggerID != got.TriggerID ||
+			q.SourceMessageID != got.ReplyMessageID || q.SourceSequence != got.SourceSequence ||
+			q.AuthorMemberID != h.MemberID || q.AuthorTurnID != h.TurnID || q.AuthorAttemptID != h.AttemptID ||
+			q.Facts != h.Reason || q.Question != h.Question {
+			t.Fatalf("pending decision lost the returned authority or source: %+v (task %+v), return %+v", q, q.Task, h)
+		}
+		for _, table := range []string{"decision_requests", "decision_request_versions"} {
+			if len(after[table]) != len(before[table])+1 {
+				t.Fatalf("return must add exactly one %s row", table)
+			}
+			remaining := slices.DeleteFunc(slices.Clone(after[table]), func(row []any) bool {
+				return len(row) != 0 && row[0] == q.ID
+			})
+			if len(remaining) != len(before[table]) || !slices.EqualFunc(remaining, before[table], func(a, b []any) bool {
+				return reflect.DeepEqual(a, b)
+			}) {
+				t.Fatalf("return changed original %s rows", table)
+			}
+			delete(before, table)
+		}
+	}
 	tables := []string{"task_work_input_returns", "mutation_idempotency", "messages", "message_log"}
 	if slices.Contains(migrations, taskImpactSchema) {
 		tables = append(tables, "task_constraint_impacts")
