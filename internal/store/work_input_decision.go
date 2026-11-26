@@ -60,6 +60,10 @@ func captureWorkInputDecisionInTx(ctx context.Context, tx *sql.Tx, i domain.Task
 	if err != nil || !installed {
 		return "", err
 	}
+	// The v46 enrollment trigger requires the notice's published row first.
+	if err := verifyWorkInputReturnNoticeInTx(ctx, tx, i); err != nil {
+		return "", err
+	}
 	id, stamp := workInputDecisionPrefix+rand.Text(), h.ReturnedAt.Format(timestampLayout)
 	body, err := decisionQuestionJSON(workInputReturnQuestion(i), domain.DecisionRequestAuthorization)
 	if err != nil {

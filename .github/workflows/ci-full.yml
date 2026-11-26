@@ -100,18 +100,23 @@ jobs:
           platform=$(go list ./internal/platform)
           httpapi=$(go list ./internal/httpapi)
           coordination=$(go list ./internal/coordination)
+          workspace=$(go list ./cmd/workspace)
           [[ -n "$store" && "$store" != *$'\n'* &&
              -n "$platform" && "$platform" != *$'\n'* &&
              -n "$httpapi" && "$httpapi" != *$'\n'* &&
              -n "$coordination" && "$coordination" != *$'\n'* &&
+             -n "$workspace" && "$workspace" != *$'\n'* &&
              "$store" != "$platform" && "$store" != "$coordination" && "$platform" != "$coordination" &&
-             "$httpapi" != "$store" && "$httpapi" != "$platform" && "$httpapi" != "$coordination" ]] || exit 1
+             "$httpapi" != "$store" && "$httpapi" != "$platform" && "$httpapi" != "$coordination" &&
+             "$workspace" != "$store" && "$workspace" != "$platform" &&
+             "$workspace" != "$httpapi" && "$workspace" != "$coordination" ]] || exit 1
           all=$(go list ./...)
           rest=()
           store_count=0
           platform_count=0
           httpapi_count=0
           coordination_count=0
+          workspace_count=0
           while IFS= read -r package; do
             [[ -n "$package" ]] || exit 1
             if [[ "$package" == "$store" ]]; then
@@ -122,12 +127,37 @@ jobs:
               httpapi_count=$((httpapi_count + 1))
             elif [[ "$package" == "$coordination" ]]; then
               coordination_count=$((coordination_count + 1))
+            elif [[ "$package" == "$workspace" ]]; then
+              workspace_count=$((workspace_count + 1))
             else
               rest+=("$package")
             fi
           done <<< "$all"
-          [[ "$store_count" -eq 1 && "$platform_count" -eq 1 && "$httpapi_count" -eq 1 && "$coordination_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
+          [[ "$store_count" -eq 1 && "$platform_count" -eq 1 && "$httpapi_count" -eq 1 && "$coordination_count" -eq 1 && "$workspace_count" -eq 1 && "${#rest[@]}" -gt 0 ]] || exit 1
           GOFLAGS="${GOFLAGS:+$GOFLAGS }-timeout=14m" go test -race "${rest[@]}"
+
+  go-workspace:
+    name: Go workspace race
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Race test workspace package
+        env:
+          CHECKOUT_SHA: ${{ inputs.sha }}
+          CHECKOUT_TREE: ${{ inputs.tree }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$CHECKOUT_SHA" ]] || exit 1
+          [[ "$(git rev-parse 'HEAD^{tree}')" == "$CHECKOUT_TREE" ]] || exit 1
+          go test -count=1 -race -timeout=20m ./cmd/workspace
 
   go-vet:
     name: Go vet and CI gates
@@ -200,7 +230,7 @@ jobs:
   # Only the outer gate publishes the required check, including when admission never starts.
   gate:
     name: Full suite evidence
-    needs: ["go-shards", "go-other", "go-vet", "go-benchmarks"]
+    needs: ["go-shards", "go-other", "go-workspace", "go-vet", "go-benchmarks"]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -8,7 +8,7 @@ import re
 import sys
 
 
-REQUIRED = {"go-shards", "go-other", "go-vet", "go-benchmarks"}
+REQUIRED = {"go-shards", "go-other", "go-workspace", "go-vet", "go-benchmarks"}
 
 
 def check_results(results, required=REQUIRED):
