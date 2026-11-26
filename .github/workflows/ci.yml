@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, edited, labeled]
   push:
@@ -135,3 +136,146 @@ jobs:
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: python3 .github/scripts/ci-gate.py outer
+
+  # Disposable, nonrequired API probe; never executes candidate repository code.
+  merge-context-probe:
+    name: Inspect synthetic check target
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          github.repository == 'PeterFile/ct0x' &&
+          github.ref == 'refs/heads/codex/ci-merge-context-probe-20261127' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+      checks: write
+    concurrency:
+      group: ci-merge-context-probe-20261127
+      cancel-in-progress: false
+    steps:
+      - name: Probe verified synthetic merge target
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from urllib.parse import urlencode
+
+          REPO = "PeterFile/ct0x"
+          BRANCH = "codex/ci-merge-context-probe-20261127"
+          NAME = "CI merge-context probe"
+
+          def require(condition, message):
+              if not condition:
+                  raise SystemExit(f"探针拒绝执行：{message}")
+
+          def sha(value):
+              require(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}", value)
+                      and value != "0" * 40, "无效的提交或树 SHA")
+              return value
+
+          require(os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+                  and os.environ["GITHUB_REPOSITORY"] == REPO
+                  and os.environ["GITHUB_REF"] == f"refs/heads/{BRANCH}", "事件、仓库或分支不符")
+          head = sha(os.environ["GITHUB_SHA"])
+          run_id = int(os.environ["GITHUB_RUN_ID"])
+          attempt = int(os.environ["GITHUB_RUN_ATTEMPT"])
+          require(run_id > 0 and attempt > 0, "无效的运行标识")
+
+          def api(path, payload=None):
+              command = ["gh", "api", "--hostname", "github.com", "--method",
+                         "GET" if payload is None else "POST",
+                         "-H", "Accept: application/vnd.github+json",
+                         "-H", "X-GitHub-Api-Version: 2022-11-28", f"repos/{REPO}/{path}"]
+              if payload is not None:
+                  command += ["--input", "-"]
+              result = subprocess.run(command, input=None if payload is None else json.dumps(payload),
+                                      text=True, capture_output=True, check=True, timeout=30)
+              return json.loads(result.stdout)
+
+          def eligible(pr):
+              return (pr["state"] == "open" and pr["draft"] is True
+                      and (pr["head"]["repo"] or {}).get("full_name") == REPO
+                      and pr["head"]["ref"] == BRANCH and pr["head"]["sha"] == head
+                      and (pr["base"]["repo"] or {}).get("full_name") == REPO
+                      and pr["base"]["ref"] == "master")
+
+          query = urlencode({"state": "open", "head": f"PeterFile:{BRANCH}",
+                             "base": "master", "per_page": 100})
+          pulls = api(f"pulls?{query}")
+          require(isinstance(pulls, list) and len(pulls) < 100, "PR 列表不完整")
+          candidates = [pr for pr in pulls if eligible(pr)]
+          require(len(candidates) == 1, "必须恰有一个匹配当前 SHA 的官方草稿 PR")
+          number = candidates[0]["number"]
+          require(type(number) is int and number > 0, "无效的 PR 编号")
+
+          def snapshot():
+              for retry in range(5):
+                  pr = api(f"pulls/{number}")
+                  require(pr["number"] == number and eligible(pr) and pr["merged"] is False
+                          and pr["merged_at"] is None, "PR 身份或开放草稿状态已变化")
+                  if pr["mergeable"] is not None:
+                      break
+                  require(retry < 4, "合并能力计算超时")
+                  time.sleep(2)
+              # Drafts and unmet checks may block merging; only conflict-free structure is probed.
+              require(pr["mergeable"] is True and pr["mergeable_state"] in
+                      ("clean", "draft", "blocked", "unstable", "has_hooks"), "合并能力不健康或未知")
+              ref = api("git/ref/heads/master")
+              require(ref["ref"] == "refs/heads/master" and ref["object"]["type"] == "commit",
+                      "master 引用类型不符")
+              base = sha(ref["object"]["sha"])
+              require(sha(pr["base"]["sha"]) == base, "PR 基线不是当前 master")
+              merge = sha(pr["merge_commit_sha"])
+              require(merge not in (head, base), "目标必须是独立的合成合并提交")
+              commit = api(f"git/commits/{merge}")
+              require(commit["sha"] == merge
+                      and [parent["sha"] for parent in commit["parents"]] == [base, head],
+                      "合成提交对象或有序父提交不符")
+              return base, merge, sha(commit["tree"]["sha"])
+
+          base, merge, tree = snapshot()
+          external_id = f"ci-merge-context-probe-20261127:{REPO}:pr:{number}:merge:{merge}"
+          query = urlencode({"check_name": NAME, "filter": "all", "per_page": 100})
+          checks = api(f"commits/{merge}/check-runs?{query}")
+          require(len(checks["check_runs"]) == checks["total_count"] <= 100, "检查列表不完整")
+
+          def owned(check):
+              return (check["name"] == NAME and check["external_id"] == external_id
+                      and check["app"]["slug"] == "github-actions")
+
+          own = [check for check in checks["check_runs"] if owned(check)]
+          require(len(own) <= 1, "存在重复的自身探针检查")
+          check = None
+          if own:
+              check_id = own[0]["id"]
+              require(type(check_id) is int and check_id > 0, "无效的检查编号")
+              check = api(f"check-runs/{check_id}")
+          # Serialize dispatches, then re-read live PR/base/merge immediately before the sole write.
+          require(snapshot() == (base, merge, tree), "写入前 PR、基线或合成提交已变化")
+          if check is None:
+              # Never retry an ambiguous POST or PATCH any existing writer's check.
+              check = api("check-runs", {
+                  "name": NAME, "head_sha": merge, "external_id": external_id,
+                  "status": "completed", "conclusion": "success",
+                  "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                  "output": {
+                      "title": "synthetic-target probe：仅验证合成提交目标",
+                      "summary": f"仅探测草稿 PR #{number} 的合成合并提交 {merge}（树 {tree}）"
+                                 "保存非必需 CheckRun 的行为；不执行测试，不代表 CI 或合并门禁通过。",
+                  },
+              })
+          require(owned(check) and type(check["id"]) is int and check["id"] > 0
+                  and check["head_sha"] == merge and check["status"] == "completed"
+                  and check["conclusion"] == "success", "返回的检查身份、目标或结果不符")
+          print(json.dumps({"pr": number, "head": head, "base": base, "merge": merge, "tree": tree,
+                            "check_id": check["id"], "check_head_sha": check["head_sha"],
+                            "check_name": check["name"], "status": check["status"],
+                            "conclusion": check["conclusion"], "run_id": run_id, "attempt": attempt},
+                           sort_keys=True))
+          PY
