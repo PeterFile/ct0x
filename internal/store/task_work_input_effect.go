@@ -104,7 +104,12 @@ func (s *Store) handleWorkInputInTx(ctx context.Context, tx *sql.Tx, scope Membe
 			return out, err
 		}
 	}
+	var decisionID string
 	if fresh {
+		decisionID, err = captureWorkInputDecisionInTx(ctx, tx, i, r)
+		if err != nil {
+			return out, err
+		}
 		if err := recordTaskImpactInTx(ctx, tx, i, r); err != nil {
 			return out, err
 		}
@@ -156,6 +161,11 @@ func (s *Store) handleWorkInputInTx(ctx context.Context, tx *sql.Tx, scope Membe
 		}
 		if !present || id != inputID {
 			return out, ErrConflict
+		}
+	}
+	if decisionID != "" {
+		if err := verifyWorkInputDecisionInTx(ctx, tx, i, r, decisionID); err != nil {
+			return out, err
 		}
 	}
 	return i, nil

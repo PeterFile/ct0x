@@ -103,7 +103,12 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 		}
 		return a, nil
 	}
-	q, err := decisionRequestVersionInTx(ctx, tx, decisionRequestCurrent, thread, id, input.Version, time.Now())
+	columns, where, _, err := currentDecisionSQLInTx(ctx, tx)
+	if err != nil {
+		return zero, err
+	}
+	query := columns + where
+	q, err := decisionRequestVersionInTx(ctx, tx, query, thread, id, input.Version, time.Now())
 	if errors.Is(err, sql.ErrNoRows) {
 		return zero, ErrConflict
 	}
@@ -137,16 +142,15 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 		if q.Task == nil {
 			return zero, ErrDecisionRelayUnsupported
 		}
-		v, dispatch, err := coordinationAssignmentLoad(ctx, tx, q.Task.AssignmentID)
+		facts, err := decisionTaskFactsInTx(ctx, tx, q.Task.AssignmentID)
 		if err != nil {
-			return zero, coordinationRoleRelationError(err)
+			return zero, err
 		}
-		facts := taskWorkFacts{v: v, dispatch: dispatch, d: taskWorkRecord(v, v.r.CoordinatorMemberID, "")}
 		if err := decisionTaskAuthorityInTx(ctx, tx, q, facts); err != nil {
 			return zero, err
 		}
 		save = func() (domain.DecisionAnswerReceipt, error) {
-			return saveDecisionTaskAnswerInTx(ctx, tx, q, v, actor, text, input.OptionIndex)
+			return saveDecisionTaskAnswerInTx(ctx, tx, q, facts.v, actor, text, input.OptionIndex)
 		}
 	default:
 		return zero, ErrDecisionRelayUnsupported
@@ -177,7 +181,7 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 	}
 	// Last-write readback: require the same still-current version and the actual
 	// source, typed marker and scope, including any effect of database triggers.
-	if _, err := decisionRequestVersionInTx(ctx, tx, decisionRequestCurrent, thread, id, q.Version, time.Now()); err != nil {
+	if _, err := decisionRequestVersionInTx(ctx, tx, query, thread, id, q.Version, time.Now()); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = ErrConflict
 		}
@@ -209,6 +213,14 @@ func (s *Store) answerDecisionInTx(ctx context.Context, tx *sql.Tx, actor string
 		}
 	}
 	return a, nil
+}
+
+func decisionTaskFactsInTx(ctx context.Context, tx *sql.Tx, assignmentID string) (taskWorkFacts, error) {
+	v, dispatch, err := coordinationAssignmentLoad(ctx, tx, assignmentID)
+	if err != nil {
+		return taskWorkFacts{}, coordinationRoleRelationError(err)
+	}
+	return taskWorkFacts{v: v, dispatch: dispatch, d: taskWorkRecord(v, v.r.CoordinatorMemberID, "")}, nil
 }
 
 func decisionTaskAuthorityInTx(ctx context.Context, tx *sql.Tx, q domain.DecisionRequest, f taskWorkFacts) error {
