@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,7 +37,8 @@ func TestAutomaticChatTextCompositionFromEmptyGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { f.db.Close() })
-	f.raw, err = sql.Open("sqlite", filepath.Join(f.dir, "workspace.db"))
+	dsn := &url.URL{Scheme: "file", Path: filepath.Join(f.dir, "workspace.db"), RawQuery: "_pragma=busy_timeout(5000)"}
+	f.raw, err = sql.Open("sqlite", dsn.String())
 	if err != nil {
 		t.Fatal(err)
 	}
