@@ -510,6 +510,11 @@ func TestChatAutomaticTextOnlyOriginalTopicAndPerRevisionBudget(t *testing.T) {
 
 func (f autoTextFixture) startCoordinator(t *testing.T) CoordinationToolScope {
 	t.Helper()
+	return f.claimRole(t, f.enqueueCoordinator(t))
+}
+
+func (f autoTextFixture) enqueueCoordinator(t *testing.T) string {
+	t.Helper()
 	f.policy(t, "", 0, automaticTextPolicy(2))
 	intake, id := f.claim(t, f.post(t, "", automaticTextRequest, f.co.ID), f.co.ID)
 	r, err := f.assess(intake, id, automaticTextProposal, "admit")
@@ -521,7 +526,7 @@ func (f autoTextFixture) startCoordinator(t *testing.T) CoordinationToolScope {
 	if err != nil || d.Delivery == nil {
 		t.Fatalf("coordinator delivery: %+v, %v", d, err)
 	}
-	return f.claimRole(t, d.Delivery.DeliveryID)
+	return d.Delivery.DeliveryID
 }
 
 func (f autoTextFixture) claimRole(t *testing.T, deliveryID string) CoordinationToolScope {
@@ -872,6 +877,49 @@ func TestChatAutomaticTextBindingsCannotBeBorrowed(t *testing.T) {
 	}
 	if got, err := request(); err != nil || got.ID == "" || got.TopicID != m.TopicID || got.BindingRevision != 2 || got.PolicyRevision != 2 {
 		t.Fatalf("explicitly replaced pair did not restore manual dispatch: %+v %v", got, err)
+	}
+}
+
+func TestThreadStateFormalAutomaticTextPolicyDrift(t *testing.T) {
+	for _, kind := range []CoordinationRoleKind{CoordinationRoleCoordinator, CoordinationRoleWorker} {
+		t.Run(string(kind), func(t *testing.T) {
+			f := newAutoTextFixture(t)
+			deliveryID := f.enqueueCoordinator(t)
+			if kind == CoordinationRoleWorker {
+				co := f.claimRole(t, deliveryID)
+				_, deliveryID = f.enqueueWorker(t, co)
+				discussionEnd(t, f.s, co.Member)
+			}
+			groupID := f.thread.GroupID
+			role, err := f.s.ResolveCoordinationDelivery(ctx, groupID, deliveryID)
+			if err != nil || role.Provenance.Kind != kind || role.Blocked != CoordinationReady || role.AutomaticTextWorkerID != f.worker.ID {
+				t.Fatalf("fixture did not prepare the frozen automatic role: %+v, %v", role, err)
+			}
+			_, stamp, err := f.s.LoadAuthorizedTaskThreadPreparation(ctx, role)
+			if err != nil || stamp == nil {
+				t.Fatalf("initial preparation did not issue a claim stamp: %v", err)
+			}
+			if _, err := f.s.SetDispatchPolicy(ctx, groupID, nil, 1, "expire-automatic-role"); err != nil {
+				t.Fatal(err)
+			}
+			before := messageSequenceSnapshot(t, f.s)
+
+			state, staleStamp, err := f.s.LoadAuthorizedTaskThreadPreparation(ctx, role)
+			var stale *TaskThreadPreparationStaleError
+			if state != nil || staleStamp != nil || !errors.As(err, &stale) || stale.Readiness != CoordinationPolicyStale {
+				t.Errorf("preparation must classify policy drift as stale: %+v, %+v, %v", state, staleStamp, err)
+			}
+			turn, err := f.s.ClaimTurn(ctx, ClaimTurnInput{GroupID: groupID, DeliveryID: deliveryID, MaxActive: 1,
+				ResourceKeys: []string{"fixture/automatic-policy-drift"}, PreparedThreadState: stamp})
+			if turn.ID != "" || !errors.Is(err, ErrTurnBusy) {
+				t.Errorf("claim must wait on policy drift: %+v, %v", turn, err)
+			}
+			role.AutomaticTextWorkerID = f.co.ID
+			if _, _, err := f.s.LoadAuthorizedTaskThreadPreparation(ctx, role); !errors.Is(err, ErrMemberToolDenied) {
+				t.Errorf("changed automatic worker must remain unauthorized: %v", err)
+			}
+			messageSequencePreserved(t, f.s, before)
+		})
 	}
 }
 

@@ -65,6 +65,22 @@ func (s *Store) resolveCoordinationDelivery(ctx context.Context, groupID, delive
 		return out, err
 	}
 	phase = "source"
+	state, err := s.resolveQueuedCoordinationInTx(ctx, tx, groupID, deliveryID, "", expected)
+	if err != nil {
+		return out, err
+	}
+	phase = "commit"
+	if err := tx.Commit(); err != nil {
+		return out, err
+	}
+	return state, nil
+}
+
+// A formal claim may read back its own reservation, but no Turn may yet exist.
+// Keep the same raw marker/schema probes as the unreserved reader: typed work
+// and returns with contradictory evidence must never fall through to a role.
+func (s *Store) resolveQueuedCoordinationInTx(ctx context.Context, tx *sql.Tx, groupID, deliveryID, reservedTurnID string,
+	expected *domain.ChatDiscussionWorkReturnReceipt) (out CoordinationRoleState, err error) {
 	installed, err := s.chatDiscussionWorkReturnInstalledInTx(ctx, tx)
 	if err != nil {
 		return out, err
@@ -74,7 +90,7 @@ func (s *Store) resolveCoordinationDelivery(ctx context.Context, groupID, delive
 	p.Kind, p.GroupID, p.DeliveryID = CoordinationRoleOrdinary, groupID, deliveryID
 	const fields = `SELECT d.message_id,d.conversation_id,d.recipient_id,d.topic_id,
  coalesce(m.sender_id,''),coalesce(w.provider_id,''),coalesce(w.model,''),
- coalesce(d.state='queued' AND d.turn_id='' AND m.group_id=d.group_id AND m.topic_id=d.topic_id
+ coalesce(d.state='queued' AND d.turn_id=? AND m.group_id=d.group_id AND m.topic_id=d.topic_id
  AND c.group_id=d.group_id AND c.member_id=d.recipient_id AND c.topic_id=d.topic_id AND w.group_id=d.group_id
  AND EXISTS(SELECT 1 FROM groups WHERE id=d.group_id)
  AND NOT EXISTS(SELECT 1 FROM turns WHERE delivery_id=d.id),0),
@@ -91,10 +107,10 @@ func (s *Store) resolveCoordinationDelivery(ctx context.Context, groupID, delive
 	}
 	var valid, marked bool
 	var sender string
-	err = tx.QueryRowContext(ctx, query, deliveryID, groupID).Scan(&p.MessageID, &p.ConversationID, &p.MemberID, &p.TopicID,
+	err = tx.QueryRowContext(ctx, query, reservedTurnID, deliveryID, groupID).Scan(&p.MessageID, &p.ConversationID, &p.MemberID, &p.TopicID,
 		&sender, &state.ProviderID, &state.Model, &valid, &state.Blocked, &marked)
 	if errors.Is(err, sql.ErrNoRows) {
-		if expected != nil {
+		if expected != nil || reservedTurnID != "" {
 			return out, ErrMemberToolDenied
 		}
 		// A missing or foreign queue row does not hide a raw return marker.
@@ -146,10 +162,6 @@ func (s *Store) resolveCoordinationDelivery(ctx context.Context, groupID, delive
 		if err != nil {
 			return out, err
 		}
-	}
-	phase = "commit"
-	if err := tx.Commit(); err != nil {
-		return out, err
 	}
 	return state, nil
 }

@@ -704,7 +704,7 @@ func TestArtifactReadPartialMarkerRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	command := exec.CommandContext(ctx, executable, "-test.run=^TestArtifactReadMarkerWriteFailureHelper$", "-test.v", "-test.timeout=5s")
-	command.Env = append(os.Environ(), "WORKSPACE_ARTIFACT_MARKER_FAILURE_DIR="+dir)
+	command.Env = append(os.Environ(), raceChildEnv(), "WORKSPACE_ARTIFACT_MARKER_FAILURE_DIR="+dir)
 	output, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("isolated file-size-limit fixture failed: %v\n%s", err, output)

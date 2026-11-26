@@ -885,7 +885,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_batched_workers_keep_real_uncached_runs_and_isolated_evidence(self):
         block = re.search(r"\n  go-shards:\n(.*?)(?=\n  go-other:)", self.workflow, re.S)[1]
-        for text in ["fail-fast: false", "timeout-minutes: 25", "max-parallel: 7", "actions/setup-go@v7",
+        for text in ["fail-fast: false", "timeout-minutes: 40", "max-parallel: 7", "actions/setup-go@v7",
                      "ci-shards.py run", "actions/upload-artifact@v7", "overwrite: true", "if-no-files-found: error",
                      "name: ${{ matrix.profile }}-worker-v1-${{ matrix.worker }}", "retention-days: 7"]:
             self.assertIn(text, block)

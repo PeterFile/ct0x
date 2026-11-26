@@ -242,7 +242,16 @@ func TestMigrationsBatch1UpgradeReplayAndEntrypoints(t *testing.T) {
 		ThreadLinks:    domain.ThreadLinks{ReplyToMessageID: memberMsg.ID},
 	}
 	compared := postThreadMessage(t, s, compareReq)
-	if compared.ReplyTo == nil || compared.ReplyTo.MessageID != memberMsg.ID || len(compared.Deliveries) != 0 {
+	if compared.ReplyTo == nil || compared.ReplyTo.MessageID != memberMsg.ID {
+		t.Fatalf("comparison quote lost reply_to projection: %+v", compared)
+	}
+	if slices.Index(prior, threadRoutingSchema) >= 0 {
+		// With E1 thread routing installed, a comparison excludes the quoted author (f.b)
+		// and falls back to another active member (f.a) unless recipients are explicitly empty.
+		if len(compared.Deliveries) != 1 || compared.Deliveries[0].RecipientID != f.a || compared.Deliveries[0].RecipientID == f.b {
+			t.Fatalf("comparison quote with thread routing woke wrong recipient: %+v (want %s, not %s)", compared, f.a, f.b)
+		}
+	} else if len(compared.Deliveries) != 0 {
 		t.Fatalf("comparison quote unexpectedly woke author: %+v", compared)
 	}
 

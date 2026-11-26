@@ -78,7 +78,7 @@ func launchInstance(t *testing.T, dir, address string, args ...string) *instance
 	p := &instanceProcess{ready: make(chan string, 1), done: make(chan struct{})}
 	args = append([]string{"-test.run=^TestInstanceProcessHelper$", "--", "--data-dir", dir, "--listen", address}, args...)
 	p.cmd = exec.CommandContext(ctx, executable, args...)
-	p.cmd.Env = append(os.Environ(), "AGENT_WORKSPACE_F1_HELPER=1")
+	p.cmd.Env = append(os.Environ(), raceChildEnv(), "AGENT_WORKSPACE_F1_HELPER=1")
 	p.cmd.Stderr = &p.stderr
 	p.cmd.WaitDelay = time.Second
 	p.input, err = p.cmd.StdinPipe()

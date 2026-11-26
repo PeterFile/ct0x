@@ -119,7 +119,7 @@ func TestWorkspaceGrantStaleRootServerSurvivesRestart(t *testing.T) {
 				var health map[string]any
 				executionJSON(t, "GET", base+"/healthz", nil, &health)
 				privateGroup, _, privateMessage := enqueueExecution(t, base, "local-fixture", "")
-				awaitExecution(t, func() bool {
+				awaitExecutionWithin(t, 10*time.Second, func() bool {
 					stored, err := db.GetMessage(ctx, privateGroup.ID, privateMessage.ID)
 					if err != nil || stored.Deliveries[0].TurnID == "" {
 						return false

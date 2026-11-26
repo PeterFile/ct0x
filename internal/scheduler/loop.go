@@ -242,7 +242,9 @@ func (r *loop) scan(lane int, budget *int) (domain.Turn, PreparedExecution, bool
 			GroupID: pending.GroupID, DeliveryID: d.ID, ResourceKeys: prepared.ResourceKeys, MaxActive: r.options.MaxActive,
 			BackgroundProfile:      prepared.BackgroundProfile,
 			ThreadDecisionAnswerID: answerID,
+			PreparedThreadState:    prepared.PreparedThreadState,
 		})
+		// A stale prepared snapshot is busy too: leave it queued and reprepare on a later scan.
 		if errors.Is(err, store.ErrTurnBusy) || errors.Is(err, store.ErrNotFound) {
 			continue
 		}
