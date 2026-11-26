@@ -56,7 +56,7 @@ for arg do
 done
 printf '%s\n' "$run" >> "$root/calls"
 printf '%s\n' "$@" > "$root/args-$run"
-` + "MEMBER_TOOLS_FIXTURE_ROOT=\"$root\" MEMBER_TOOLS_FIXTURE_RUN=\"$run\" exec '" + binary + "' -test.run='^TestMemberToolsNativeHelper$'\n"
+` + "MEMBER_TOOLS_FIXTURE_ROOT=\"$root\" MEMBER_TOOLS_FIXTURE_RUN=\"$run\" " + raceChildShellEnv + "exec '" + binary + "' -test.run='^TestMemberToolsNativeHelper$'\n"
 	if err := os.WriteFile(f.path, []byte(body), 0700); err != nil {
 		t.Fatal(err)
 	}

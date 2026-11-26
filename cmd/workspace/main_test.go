@@ -24,6 +24,16 @@ import (
 	"agentworkspace/internal/store"
 )
 
+// Apply this only when a fixture re-executes the test binary. The race
+// detector still reports races, but the child can exit without its extra wait.
+const raceChildExitOption = "atexit_sleep_ms=0"
+
+const raceChildShellEnv = `GORACE="${GORACE-} ` + raceChildExitOption + `" `
+
+func raceChildEnv() string {
+	return "GORACE=" + os.Getenv("GORACE") + " " + raceChildExitOption
+}
+
 func chinese(text string) bool {
 	return strings.ContainsFunc(text, func(r rune) bool { return unicode.Is(unicode.Han, r) })
 }
