@@ -83,12 +83,17 @@ def replay(args):
     require(chain[-2:] == [EXPECTED_PARENT, BAD], 'unexpected master history')
     os.environ['PATH'] = str(wrapper.parent) + os.pathsep + os.environ['PATH']
     candidate = {'package': PACKAGE, 'test': TEST, 'race': False, 'signature': {'tests': [TEST], 'messages':[SIGNATURE]}}
-    raw = args.output/'probes'
-    runner = REPLAY.Probe(ROOT, raw, timeout=150, budget=1200)
-    try:
-        result = REPLAY.localize(chain, candidate, runner)
-    finally:
-        runner.close()
+    initial = args.output/'initial'
+    initial.mkdir(exist_ok=True)
+    raw = args.output/'localization'
+    raw.mkdir(exist_ok=True)
+    baseline = json.loads((args.output/'baseline.json').read_text())
+    write(initial/'receipt.json', {'kind':'controlled-fault-input', 'sha': BAD,
+          'tree': REPLAY.git(ROOT, 'rev-parse', BAD+'^{tree}'), 'ancestor':baseline,
+          'failure_candidates':[candidate]})
+    REPLAY.replay(initial, ROOT, raw)
+    result = json.loads((raw/'localization.json').read_text())
+    result = POLICY.verify_localization(json.loads((initial/'receipt.json').read_text()), result, raw, ROOT)
     write(args.output/'localization.json', result)
     require(result.get('localization')=='reproduced' and result.get('commit')==BAD, 'did not reproduce unique transition')
     require(result.get('good_sha')==EXPECTED_PARENT and result.get('bad_sha')==BAD, 'localized pair differs')
