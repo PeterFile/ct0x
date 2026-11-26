@@ -140,7 +140,7 @@ while [ ! -f "$root/release-$run" ]; do sleep 0.05; done`
 		t.Helper()
 		memberToolsHTTP(t, config.Endpoint, config.Token, "send_message", map[string]any{
 			"content": "先核对依据。", "intent_assessment": domain.ChatAssessment{Disposition: "discuss", Reason: "只核对已有依据。"},
-		}, key, 201, "")
+		}, key, 201, "", 15*time.Second)
 	}
 	send := func(config memberToolsNativeConfig, kind, target, key, content string, count int) (string, []byte) {
 		t.Helper()

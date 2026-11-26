@@ -37,6 +37,7 @@ PLATFORM_PACKAGE = "agentworkspace/internal/platform"
 PLATFORM_TOTAL = 9
 HTTPAPI_PACKAGE = "agentworkspace/internal/httpapi"
 COORDINATION_PACKAGE = "agentworkspace/internal/coordination"
+WORKSPACE_PACKAGE = "agentworkspace/cmd/workspace"
 # Fixed SHA-256 first-eight-byte big-endian vectors: mod 8 except for legacy slot 4,
 # where mod 16 = 4 stays and mod 16 = 12 moves to slot 8.
 PLATFORM_SLOTS = {"TestCoordination": 7, "TestAlpha": 3, "TestBeta": 3, "TestGamma": 8,
@@ -874,10 +875,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(job.index("ci-gate.py"), job.index("download-artifact"))
         self.assertLess(job.index("download-artifact"), job.index("ci-shards.py aggregate"))
         self.assertNotRegex(job, r"\b(?:go test|go vet|npm|setup-go)\b")
-        # Ordinary cmd now precedes admission; coordination/rest/vet/bench no longer wait for shards.
+        # Ordinary cmd precedes admission; coordination/rest/workspace/vet/bench do not wait for shards.
         self.assertIn("go test -count=1 ./cmd/workspace", self.parent_workflow)
         self.assertNotIn("go test -count=1 ./cmd/workspace", self.workflow)
-        for name in ["go-other", "go-vet", "go-benchmarks"]:
+        for name in ["go-other", "go-workspace", "go-vet", "go-benchmarks"]:
             block = re.search(rf"\n  {name}:\n(.*?)(?=\n  [\w-]+:)", self.workflow, re.S)[1]
             self.assertNotIn("needs:", block)
         for command in ["go test -count=1 ./internal/coordination", "go test -count=1 -race ./internal/coordination"]:
@@ -926,10 +927,12 @@ class WorkflowTests(unittest.TestCase):
               ./internal/platform) printf '%s\\n' "$STUB_PLATFORM" ;;
               ./internal/httpapi) printf '%s\\n' "$STUB_HTTPAPI" ;;
               ./internal/coordination) printf '%s\\n' "$STUB_COORDINATION" ;;
+              ./cmd/workspace) printf '%s\\n' "$STUB_WORKSPACE" ;;
               ./...) printf '%s\\n' "$STUB_ALL" ;;
               *) return 90 ;;
             esac
           elif [[ "$#" -gt 2 && "$1" == test && "$2" == -race ]]; then
+            [[ "$GOFLAGS" == '-mod=readonly -timeout=14m' ]] || return 91
             printf 'race:%s\\n' "${@:3}"
           else
             return 90
@@ -937,14 +940,17 @@ class WorkflowTests(unittest.TestCase):
         }
         readonly -f go
         '''
-        packages = {"STORE": PACKAGE, "PLATFORM": PLATFORM_PACKAGE, "HTTPAPI": HTTPAPI_PACKAGE, "COORDINATION": COORDINATION_PACKAGE}
+        packages = {"STORE": PACKAGE, "PLATFORM": PLATFORM_PACKAGE, "HTTPAPI": HTTPAPI_PACKAGE,
+                    "COORDINATION": COORDINATION_PACKAGE, "WORKSPACE": WORKSPACE_PACKAGE}
         remainder = ["agentworkspace/other", PACKAGE + "extra", PLATFORM_PACKAGE + "/child", HTTPAPI_PACKAGE + "extra",
-                     HTTPAPI_PACKAGE + "/child", COORDINATION_PACKAGE + "/child", COORDINATION_PACKAGE + "extra"]
-        valid = [PACKAGE, *remainder, PLATFORM_PACKAGE, HTTPAPI_PACKAGE, COORDINATION_PACKAGE]
+                     HTTPAPI_PACKAGE + "/child", COORDINATION_PACKAGE + "/child", COORDINATION_PACKAGE + "extra",
+                     WORKSPACE_PACKAGE + "extra", WORKSPACE_PACKAGE + "/child"]
+        valid = [PACKAGE, *remainder, PLATFORM_PACKAGE, HTTPAPI_PACKAGE, COORDINATION_PACKAGE, WORKSPACE_PACKAGE]
         cases = [("valid", packages, valid, True), ("empty-remainder", packages, list(packages.values()), False),
                  ("blank-remainder", packages, [*valid, "", "other"], False), ("empty-all", packages, [], False)]
         for suite, package in packages.items():
             cases.extend([(f"empty-{suite}", {**packages, suite: ""}, valid, False),
+                          (f"blank-{suite}", {**packages, suite: "\n"}, valid, False),
                           (f"multiline-{suite}", {**packages, suite: package + "\nother"}, valid, False),
                           (f"missing-{suite}", packages, [name for name in valid if name != package], False),
                           (f"duplicate-{suite}", packages, [*valid, package], False)])
@@ -954,7 +960,8 @@ class WorkflowTests(unittest.TestCase):
         for label, identities, all_packages, accepted in cases:
             with self.subTest(case=label):
                 result = subprocess.run(["/bin/bash", "-c", stub + script],
-                                        env={**os.environ, "PATH": "", **{"STUB_" + suite: package for suite, package in identities.items()},
+                                        env={**os.environ, "PATH": "", "GOFLAGS": "-mod=readonly",
+                                             **{"STUB_" + suite: package for suite, package in identities.items()},
                                              "STUB_ALL": "\n".join(all_packages)}, text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode == 0, accepted, result.stderr)
                 self.assertEqual(result.stdout.splitlines(), ["race:" + package for package in remainder] if accepted else [])

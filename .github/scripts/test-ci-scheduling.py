@@ -1104,7 +1104,9 @@ class GateTests(unittest.TestCase):
         gate = job(full, "gate")
         self.assertIn("if: ${{ !cancelled() }}", gate)
         needs = json.loads(re.search(r"^    needs: (\[[^\n]+\])$", gate, re.M)[1])
+        self.assertEqual(self.gate.REQUIRED, {"go-shards", "go-other", "go-workspace", "go-vet", "go-benchmarks"})
         self.assertEqual(set(needs), set(self.gate.REQUIRED))
+        self.assertEqual(len(needs), len(self.gate.REQUIRED))
         step = re.search(r"- name: Check required results\n(.*?)(?=\n      -)", gate, re.S)
         self.assertIsNotNone(step)
         self.assertIn("toJSON(needs)", step[1])
@@ -1185,14 +1187,73 @@ class GateTests(unittest.TestCase):
                                             capture_output=True, timeout=5)
                     self.assertEqual(result.returncode == 0, accepted, result.stderr)
 
+    def test_workspace_race_job_is_independent_and_runs_one_exact_uncached_package(self):
+        workflow = (WORKFLOWS / "ci-full.yml").read_text()
+        workspace = job(workflow, "go-workspace")
+        self.assertLess(workflow.index("\n  go-other:"), workflow.index("\n  go-workspace:"))
+        self.assertLess(workflow.index("\n  go-workspace:"), workflow.index("\n  go-vet:"))
+        for text in ["    name: Go workspace race\n", "    runs-on: ubuntu-latest\n", "    timeout-minutes: 25\n"]:
+            self.assertIn(text, workspace)
+        self.assertNotRegex(workspace, r"(?m)^ +(?:needs|if|continue-on-error|strategy):")
+        self.assertEqual(re.findall(r"^      - uses: ([^\n]+)", workspace, re.M),
+                         ["actions/checkout@v7", "actions/setup-go@v7"])
+        self.assertIn("      - uses: actions/checkout@v7\n        with:\n"
+                      "          ref: ${{ inputs.sha }}\n          persist-credentials: false\n", workspace)
+        self.assertIn("      - uses: actions/setup-go@v7\n        with:\n"
+                      "          go-version-file: go.mod\n          cache-dependency-path: go.sum\n", workspace)
+        self.assertEqual(len(re.findall(r"^      - ", workspace, re.M)), 3)
+        self.assertEqual(len(re.findall(r"^        run:", workspace, re.M)), 1)
+        race = step(workspace, "Race test workspace package")
+        self.assertIn("        env:\n          CHECKOUT_SHA: ${{ inputs.sha }}\n"
+                      "          CHECKOUT_TREE: ${{ inputs.tree }}\n", race)
+        script = textwrap.dedent(re.search(r"        run: \|\n(.*)", race, re.S)[1])
+        self.assertEqual(script.splitlines()[0], "set -euo pipefail")
+        command = "go test -count=1 -race -timeout=20m ./cmd/workspace"
+        self.assertEqual([line.strip() for line in workspace.splitlines() if line.strip().startswith("go test")], [command])
+        self.assertEqual(workflow.count(command), 1)
+        self.assertEqual(script.rstrip().splitlines()[-1], command)
+        self.assertNotIn("GOFLAGS", workspace)
+        self.assertIn("    timeout-minutes: 25\n", job(workflow, "go-other"))
+
+    def test_workspace_race_actual_step_checks_sha_and_tree_before_go_and_propagates_failure(self):
+        workspace = job((WORKFLOWS / "ci-full.yml").read_text(), "go-workspace")
+        race = step(workspace, "Race test workspace package")
+        script = textwrap.dedent(re.search(r"        run: \|\n(.*)", race, re.S)[1])
+        stub = '''git() {
+          case "$*" in
+            'rev-parse HEAD') printf '%s\\n' "$STUB_SHA" ;;
+            'rev-parse HEAD^{tree}') printf '%s\\n' "$STUB_TREE" ;;
+            *) return 90 ;;
+          esac
+        }
+        go() {
+          printf 'go:%s\\n' "$*"
+          [[ "$*" == 'test -count=1 -race -timeout=20m ./cmd/workspace' ]] || return 90
+          return "$STUB_GO_EXIT"
+        }
+        readonly -f git go
+        '''
+        for actual_sha, actual_tree, code in [(SHA, TREE, 0), ("c" * 40, TREE, 0), (SHA, "c" * 40, 0),
+                                               ("", TREE, 0), (SHA, "", 0), (SHA, TREE, 1)]:
+            with self.subTest(sha=actual_sha, tree=actual_tree, go_exit=code):
+                identity_matches = actual_sha == SHA and actual_tree == TREE
+                result = subprocess.run(["/bin/bash", "-c", stub + script],
+                                        env={**os.environ, "PATH": "", "CHECKOUT_SHA": SHA, "CHECKOUT_TREE": TREE,
+                                             "STUB_SHA": actual_sha, "STUB_TREE": actual_tree, "STUB_GO_EXIT": str(code)},
+                                        text=True, capture_output=True, timeout=5)
+                self.assertEqual(result.returncode == 0, identity_matches and code == 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(),
+                                 ["go:test -count=1 -race -timeout=20m ./cmd/workspace"] if identity_matches else [])
+
     def test_go_remainder_vet_and_bench_start_without_shard_dependencies(self):
         workflow = (WORKFLOWS / "ci-full.yml").read_text()
-        for name in ["go-other", "go-vet", "go-benchmarks"]:
+        for name in ["go-other", "go-workspace", "go-vet", "go-benchmarks"]:
             self.assertNotIn("needs:", job(workflow, name))
         other = job(workflow, "go-other")
-        self.assertIn("go test -count=1 ./internal/coordination", other)
-        self.assertIn("go test -count=1 -race ./internal/coordination", other)
-        self.assertIn('GOFLAGS="${GOFLAGS:+$GOFLAGS }-timeout=14m" go test -race "${rest[@]}"', other)
+        commands = ["go test -count=1 ./internal/coordination", "go test -count=1 -race ./internal/coordination",
+                    'GOFLAGS="${GOFLAGS:+$GOFLAGS }-timeout=14m" go test -race "${rest[@]}"']
+        positions = [other.index(command) for command in commands]
+        self.assertEqual(positions, sorted(positions))
         self.assertIn("go vet ./...", job(workflow, "go-vet"))
         self.assertIn("go test -run '^$' -bench . -benchmem ./...", job(workflow, "go-benchmarks"))
         self.assertNotIn("npm ", workflow)
