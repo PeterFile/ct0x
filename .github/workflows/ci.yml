@@ -1,49 +1,46 @@
-name: Periodic Full attribution experiment
+name: Historical Web attribution replay
 on:
   workflow_dispatch:
     inputs:
       sha:
-        required: true
         type: string
-        description: Fixed master target for the controlled test overlay
+        required: true
+        description: Exact archived GitHub merge checkout for PR 154
 permissions:
   contents: read
   actions: read
-  pull-requests: read
-concurrency:
-  group: periodic-full-attribution-experiment
-  cancel-in-progress: false
 jobs:
-  experiment:
-    name: Confirm first failing merge under controlled test overlay
+  replay:
+    name: Reconstruct both historical Web assertions
     runs-on: ubuntu-latest
-    timeout-minutes: 28
+    timeout-minutes: 29
     env:
       FIXED_SHA: ${{ inputs.sha }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
+          path: control
           persist-credentials: false
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@v7
         with:
-          go-version-file: go.mod
-          cache: false
-      - name: Authenticate the historical green Full at its exact attempt
+          ref: 3b7ff2f557df978e6c956487f9ba1875c56ae34f
+          path: subject
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.23.5
+          package-manager-cache: false
+      - name: Authenticate original run attempt, log and checkout
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -B .github/scripts/periodic-experiment.py prove "$RUNNER_TEMP/proof"
-      - name: Localize the controlled fault on master first parents without API credentials
-        run: python3 -B .github/scripts/periodic-experiment.py replay "$RUNNER_TEMP/proof"
-      - name: Authenticate the actual merged pull request
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: python3 -B .github/scripts/periodic-experiment.py associate "$RUNNER_TEMP/proof"
+        run: python3 -B control/.github/scripts/periodic-historical-web.py source "$RUNNER_TEMP/proof"
+      - name: Run four named Vitest probes with the original pinned Node and npm
+        run: python3 -B control/.github/scripts/periodic-historical-web.py probe "$RUNNER_TEMP/proof"
       - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
-          name: experimental-periodic-fault-${{ github.run_id }}-${{ github.run_attempt }}
+          name: experimental-historical-web-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/proof
           if-no-files-found: error
           retention-days: 14
