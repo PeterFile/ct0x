@@ -177,6 +177,7 @@ func TestRunCoordinatorConfigurationRoutes(t *testing.T) {
 					"workspaces": 1, "projects": 1, "channels": 1,
 					"group_coordinator_bindings": 1, "group_coordinator_binding_revisions": 1,
 					"group_dispatch_policies": 1, "group_dispatch_policy_revisions": 2,
+					"decision_work_input_boundary": 1,
 				}
 				counts := make(map[string]int, len(tables))
 				for _, table := range tables {
@@ -188,6 +189,10 @@ func TestRunCoordinatorConfigurationRoutes(t *testing.T) {
 					if count != allowedCounts[table] {
 						t.Fatalf("unexpected durable state in %s: count=%d want=%d", table, count, allowedCounts[table])
 					}
+				}
+				var boundary int64
+				if err := raw.QueryRow("SELECT sequence FROM decision_work_input_boundary").Scan(&boundary); err != nil || boundary != 0 {
+					t.Fatalf("fresh fixture must install the immutable work input boundary at sequence 0: sequence=%d err=%v", boundary, err)
 				}
 				var linked int
 				if err := raw.QueryRow(`SELECT 1 FROM groups g
