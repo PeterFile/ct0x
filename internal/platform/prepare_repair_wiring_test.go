@@ -54,6 +54,10 @@ func newRepairPreparation(t *testing.T, summaries ...string) *repairPrepareFixtu
 	prepareRoleOK(t, err)
 	task, err := f.s.GetTask(ctx, f.group.ID, submission.TaskID)
 	prepareRoleOK(t, err)
+	if threadStateFixtureInstalled(t, f.prepareFixture) {
+		// Confirm state on the reviewed version before rejection advances it.
+		confirmFormalTaskState(t, f)
+	}
 	review, err := NewLocalUser(f.s).ReviewTask(ctx, f.group.ID, task.ID, TaskReviewInput{SubmissionID: submission.ID, ExpectedRevision: task.Revision, Outcome: domain.ReviewOutcomeRejected, Reason: "请在原授权目录修正report.txt，沿原Artifact和这个冻结版本继续；实际拒收理由到此结束。"}, "review-before-terminal")
 	prepareRoleOK(t, err)
 	var messageID string
@@ -514,8 +518,11 @@ func TestChatRepairRoleContextAndRealFilesKeepExactRejectedBase(t *testing.T) {
 	}
 	f.selectDelivery(t, materialized.Delivery.MessageID)
 	p := f.preparer(t)
-	coordinator, err := p.Prepare(context.Background(), f.pending)
-	prepareRoleOK(t, err)
+	coordinator, coordinatorPacket := stateCorrectionPrepare(t, p, f.trigger)
+	if coordinatorPacket.State != nil {
+		t.Fatal("repair coordinator inherited the reviewed parent's Task state")
+	}
+	assertEmptyStatePreparationStamp(t, coordinator.PreparedThreadState, f.trigger, true)
 	coordinatorResponsibility, err := repairPacketResponsibility(coordinator.Request.Prompt)
 	prepareRoleOK(t, err)
 	for _, text := range []string{`"repair_link":`, `"parent_review_id":"` + f.review.ID + `"`, `"version_id":"` + f.version.VersionID + `"`} {
@@ -525,7 +532,8 @@ func TestChatRepairRoleContextAndRealFilesKeepExactRejectedBase(t *testing.T) {
 	}
 	claimRun := func(prepared scheduler.PreparedExecution, pending store.PendingDelivery) store.TurnClaim {
 		t.Helper()
-		turn, err := f.s.ClaimTurn(context.Background(), store.ClaimTurnInput{GroupID: f.group.ID, DeliveryID: pending.Delivery.ID, MaxActive: 1, ResourceKeys: prepared.ResourceKeys})
+		turn, err := f.s.ClaimTurn(context.Background(), store.ClaimTurnInput{GroupID: f.group.ID, DeliveryID: pending.Delivery.ID, MaxActive: 1,
+			PreparedThreadState: prepared.PreparedThreadState, ResourceKeys: prepared.ResourceKeys})
 		prepareRoleOK(t, err)
 		return store.TurnClaim{GroupID: f.group.ID, TurnID: turn.ID, Token: turn.ClaimToken}
 	}
@@ -582,8 +590,11 @@ func TestChatRepairRoleContextAndRealFilesKeepExactRejectedBase(t *testing.T) {
 		t.Fatal("repair worker missing")
 	}
 	f.selectDelivery(t, workerDelivery.Delivery.MessageID)
-	worker, err := p.Prepare(context.Background(), f.pending)
-	prepareRoleOK(t, err)
+	worker, workerPacket := stateCorrectionPrepare(t, p, f.trigger)
+	if workerPacket.State != nil {
+		t.Fatal("repair worker inherited the reviewed parent's Task state")
+	}
+	assertEmptyStatePreparationStamp(t, worker.PreparedThreadState, f.trigger, true)
 	workerResponsibility, err := repairPacketResponsibility(worker.Request.Prompt)
 	prepareRoleOK(t, err)
 	if worker.Request.CWD != f.directory || !slices.Equal(worker.ResourceKeys, []string{receipt.WorkspaceScope.ResourceKey}) || !strings.Contains(workerResponsibility, `"repair_link":`) || !strings.Contains(workerResponsibility, f.version.VersionID) {

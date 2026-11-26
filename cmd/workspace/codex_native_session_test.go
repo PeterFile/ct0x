@@ -45,7 +45,7 @@ case "$*" in
 *) exit 99 ;;
 esac
 ` + "export AW_CODEX_INTAKE_FIXTURE=" + quote(root) + " HOME=" + quote(root) + " CODEX_HOME=" + quote(root) + "\n" +
-		"exec " + quote(bin) + " -test.run='^TestCodexIntakeAppServerFixture$'\n"
+		raceChildShellEnv + "exec " + quote(bin) + " -test.run='^TestCodexIntakeAppServerFixture$'\n"
 	if err := os.WriteFile(cli, []byte(script), 0700); err != nil {
 		t.Fatal(err)
 	}

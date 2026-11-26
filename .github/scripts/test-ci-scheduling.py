@@ -1192,7 +1192,7 @@ class GateTests(unittest.TestCase):
         other = job(workflow, "go-other")
         self.assertIn("go test -count=1 ./internal/coordination", other)
         self.assertIn("go test -count=1 -race ./internal/coordination", other)
-        self.assertIn('go test -race "${rest[@]}"', other)
+        self.assertIn('GOFLAGS="${GOFLAGS:+$GOFLAGS }-timeout=14m" go test -race "${rest[@]}"', other)
         self.assertIn("go vet ./...", job(workflow, "go-vet"))
         self.assertIn("go test -run '^$' -bench . -benchmem ./...", job(workflow, "go-benchmarks"))
         self.assertNotIn("npm ", workflow)
