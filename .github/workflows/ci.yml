@@ -4,7 +4,7 @@ on:
     inputs:
       kind:
         type: choice
-        options: [vet, python]
+        options: [vet, python, periodic]
         required: true
         description: Original failing command
       sha:
@@ -58,5 +58,67 @@ jobs:
         with:
           name: experimental-historical-${{ inputs.kind }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/proof
+          if-no-files-found: error
+          retention-days: 14
+
+  current-periodic:
+    if: ${{ inputs.kind == 'periodic' && inputs.sha == '18d11a3c0176fe98856aeeef6396e9ddfde0cca0' }}
+    name: Verify frozen periodic policy on actual master history
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    concurrency:
+      group: ci-periodic-fault-current-policy
+      cancel-in-progress: false
+    env:
+      FROZEN_POLICY: 'dba4c495089f5264b4fe734664721323bdebfa48'
+      FIXED_PRODUCT: ${{ inputs.sha }}
+    steps:
+      - name: Check out the immutable experiment driver
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Check out the frozen periodic policy and first-parent history
+        uses: actions/checkout@v7
+        with:
+          ref: 'dba4c495089f5264b4fe734664721323bdebfa48'
+          path: policy
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the product at the declared target
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          path: subject
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: subject/go.mod
+          cache: false
+      - name: Authenticate the successful Full baseline and both immutable trees
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B control/.github/scripts/periodic-current-probe.py authorize "$RUNNER_TEMP/periodic-check"
+      - name: Reproduce the controlled assertion and verify the precise adjacent boundary
+        run: python3 -B control/.github/scripts/periodic-current-probe.py replay "$RUNNER_TEMP/periodic-check"
+      - name: Authenticate the producing merged pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B control/.github/scripts/periodic-current-probe.py associate "$RUNNER_TEMP/periodic-check"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: periodic-current-policy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/periodic-check/*.json
+            ${{ runner.temp }}/periodic-check/*.jsonl
+            ${{ runner.temp }}/periodic-check/api-*/**
+            ${{ runner.temp }}/periodic-check/initial/**
+            ${{ runner.temp }}/periodic-check/localization/**
           if-no-files-found: error
           retention-days: 14

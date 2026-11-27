@@ -1,0 +1,15 @@
+package artifactfs
+
+import (
+    "bytes"
+    "os"
+    "testing"
+)
+
+func TestPeriodicFaultInjection(t *testing.T) {
+    data, err := os.ReadFile("../../.github/workflows/ci-full.yml")
+    if err != nil { t.Fatal(err) }
+    if bytes.Contains(data, []byte("  go-workspace:")) {
+        t.Fatal("periodic controlled assertion: separate workspace race job is present")
+    }
+}
