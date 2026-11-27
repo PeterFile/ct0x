@@ -29,6 +29,8 @@ WORKFLOW = ".github/workflows/merge-gate.yml"
 PUBLISHER = ".github/workflows/merge-conflict.yml"
 APP_ID = 15368
 MAX_ARTIFACT = 16 * 1024 * 1024
+MAX_POLICY_CACHE_ENTRIES = 256
+MAX_POLICY_CACHE_BYTES = 4 * 1024 * 1024
 
 
 class PolicyChange(ValueError):
@@ -285,11 +287,38 @@ def latest_run(api, pr, trusted_only=False):
     return max(candidates, key=lambda run: integer(run["id"])) if candidates else None
 
 
+def policy_contents(api, path, ref):
+    check(path in gate.POLICY_PATHS, "仅允许缓存受保护策略路径")
+    ref = sha(ref)
+    key = (ref, path)
+    cache = getattr(api, "_policy_contents_cache", {})
+    if key in cache:
+        data, blob = cache[key]
+        return {"type": "file", "encoding": "base64", "content": base64.b64encode(data).decode("ascii"),
+                "size": len(data), "sha": blob}
+    remote = api.get("contents/" + path + "?" + urlencode({"ref": ref}))
+    if not (isinstance(remote, dict) and remote.get("type") == "file" and remote.get("encoding") == "base64" and
+            isinstance(remote.get("content"), str) and type(remote.get("size")) is int and
+            0 <= remote["size"] <= MAX_POLICY_CACHE_BYTES and len(remote["content"]) <= 2 * MAX_POLICY_CACHE_BYTES):
+        return remote
+    try:
+        data = base64.b64decode(remote["content"])
+    except ValueError:
+        return remote
+    blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+    if (blob == remote.get("sha") and len(data) == remote["size"] and len(cache) < MAX_POLICY_CACHE_ENTRIES and
+            sum(len(value[0]) for value in cache.values()) + len(data) <= MAX_POLICY_CACHE_BYTES):
+        # Only verified immutable bytes are retained, scoped to this API client/process.
+        cache[key] = (data, blob)
+        api._policy_contents_cache = cache
+    return remote
+
+
 def policy_digest(api, ref):
     digest = hashlib.sha256()
     blobs = {}
     for path in gate.POLICY_PATHS:
-        remote = api.get("contents/" + path + "?" + urlencode({"ref": sha(ref)}))
+        remote = policy_contents(api, path, ref)
         check(remote.get("type") == "file" and remote.get("encoding") == "base64", "可信策略文件缺失/不是普通文件")
         data = base64.b64decode(remote["content"])
         blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
@@ -313,7 +342,7 @@ def trusted_policy(api, receipt, run, current_master):
     digest, blobs = policy_digest(api, ref)
     if run["event"] == "pull_request":
         for path, blob in blobs.items():
-            remote = api.get("contents/" + path + "?" + urlencode({"ref": sha(receipt["sha"])}))
+            remote = policy_contents(api, path, receipt["sha"])
             if remote.get("type") != "file" or remote.get("sha") != blob:
                 raise PolicyChange("候选更改 CI 策略；切换到受信默认分支控制器")
     check(receipt["policy_digest"] == digest, "回执策略摘要不属于其受信工作流提交")
@@ -466,7 +495,7 @@ def candidate_policy_changed(api, merge_sha, policy_sha):
     _, blobs = policy_digest(api, policy_sha)
     for path, blob in blobs.items():
         try:
-            candidate = api.get("contents/" + path + "?" + urlencode({"ref": sha(merge_sha)}))
+            candidate = policy_contents(api, path, merge_sha)
         except subprocess.CalledProcessError:
             return True
         if candidate.get("type") != "file" or candidate.get("sha") != blob:

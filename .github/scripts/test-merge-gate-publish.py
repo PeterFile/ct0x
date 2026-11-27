@@ -109,6 +109,78 @@ class PublisherTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.p.decode_artifact(archive(True), "sha256:" + hashlib.sha256(archive(True)).hexdigest())
 
+    def test_policy_contents_reuses_exact_verified_reads_but_live_state_stays_fresh(self):
+        api = self.api_fixture()
+        api.get = mock.Mock(wraps=api.get)
+        self.assertFalse(self.p.candidate_policy_changed(api, self.sha, self.base))
+        self.p.trusted_policy(api, self.receipt, self.run, self.base)
+        contents = [call.args[0] for call in api.get.call_args_list if call.args[0].startswith("contents/")]
+        self.assertEqual(len(contents), 2 * len(self.p.gate.POLICY_PATHS), "immutable policy reads must be reused")
+        self.assertEqual(len(contents), len(set(contents)))
+        before = self.p.snapshot(api, 7)
+        api.pr["draft"] = True
+        api.master = "f" * 40
+        after = self.p.snapshot(api, 7)
+        self.assertFalse(before[0]["draft"])
+        self.assertTrue(after[0]["draft"])
+        self.assertNotEqual(before[1], after[1])
+        self.run.update(status="queued", conclusion=None)
+        self.assertEqual(api.get("actions/runs/101")["status"], "queued")
+        self.run["status"] = "in_progress"
+        self.assertEqual(api.get("actions/runs/101")["status"], "in_progress")
+        self.assertEqual(api.get("actions/runs/101/attempts/2")["status"], "in_progress")
+
+    def test_policy_contents_never_caches_unknown_errors_or_unverified_data(self):
+        import base64
+        helper = getattr(self.p, "policy_contents", None)
+        self.assertIsNotNone(helper, "missing bounded exact-SHA protected contents cache")
+        path = self.p.gate.POLICY_PATHS[0]
+        data = b"immutable policy fixture\n"
+        blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+        valid = {"type": "file", "sha": blob, "size": len(data), "encoding": "base64", "content": base64.b64encode(data).decode()}
+        error = subprocess.CalledProcessError(1, ["gh", "api"], stderr=b"transient read failure")
+        for unknown in (None, {}, {**valid, "sha": "0" * 40}, {**valid, "size": None}, {**valid, "content": "a"}, error):
+            with self.subTest(unknown=unknown):
+                api = ContentsAPI([unknown, valid])
+                if isinstance(unknown, BaseException):
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        helper(api, path, self.base)
+                else:
+                    self.assertEqual(helper(api, path, self.base), unknown)
+                current = helper(api, path, self.base)
+                self.assertEqual(current["sha"], blob)
+                current["sha"] = "f" * 40
+                self.assertEqual(helper(api, path, self.base)["sha"], blob, "callers cannot mutate cached authority")
+                self.assertEqual(len(api.reads), 2)
+                for bad_path, bad_ref in (("pulls/7", self.base), (path, "master")):
+                    with self.assertRaises(ValueError):
+                        helper(api, bad_path, bad_ref)
+                self.assertEqual(len(api.reads), 2)
+
+    def test_policy_contents_cache_is_per_invocation_and_bounded_by_entries_and_bytes(self):
+        import base64
+        helper = getattr(self.p, "policy_contents", None)
+        self.assertIsNotNone(helper, "missing bounded exact-SHA protected contents cache")
+        path = self.p.gate.POLICY_PATHS[0]
+        data = b"small policy fixture\n"
+        blob = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+        valid = {"type": "file", "sha": blob, "size": len(data), "encoding": "base64", "content": base64.b64encode(data).decode()}
+        api = ContentsAPI([valid] * 3)
+        with mock.patch.object(self.p, "MAX_POLICY_CACHE_ENTRIES", 1):
+            helper(api, path, self.base)
+            helper(api, path, self.sha)
+            helper(api, path, self.base)
+            helper(api, path, self.sha)
+        self.assertEqual(len(api.reads), 3, "another exact SHA must not alias the cached commit")
+        fresh = ContentsAPI([valid] * 2)
+        with mock.patch.object(self.p, "MAX_POLICY_CACHE_BYTES", len(data) - 1):
+            helper(fresh, path, self.base)
+            helper(fresh, path, self.base)
+        self.assertEqual(len(fresh.reads), 2, "capacity overflow must use fresh reads, never unbounded caching")
+        independent = ContentsAPI([valid])
+        helper(independent, path, self.base)
+        self.assertEqual(len(independent.reads), 1, "new invocation must not reuse another client's state")
+
     def test_conflict_requires_live_confirmation_and_does_not_trust_old_merge(self):
         conflict = {**self.pr, "mergeable": False, "mergeable_state": "dirty", "merge_commit_sha": None}
         self.assertEqual(self.p.merge_state(conflict, self.base, None), "conflict")
@@ -672,6 +744,19 @@ with p.merge_lock(root) as lock:
         for command in ([], ["sh", "-c", "true"], expected + ["--admin"]):
             with self.assertRaises(ValueError):
                 self.p.validate_command(command, 7, self.head)
+
+
+class ContentsAPI:
+    def __init__(self, values):
+        self.values = iter(values)
+        self.reads = []
+
+    def get(self, endpoint):
+        self.reads.append(endpoint)
+        value = next(self.values)
+        if isinstance(value, BaseException):
+            raise value
+        return copy.deepcopy(value)
 
 
 class CheckAPI:

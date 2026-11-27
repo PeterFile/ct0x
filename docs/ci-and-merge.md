@@ -6,7 +6,7 @@
 
 稳态由 `.github/workflows/periodic-full.yml` 在获准启动后固定最新 master 执行周期 Full，操作及 push 恢复见 `docs/periodic-full.md`；发布候选通过 `.github/workflows/release-candidate.yml` dispatch 固定所选 SHA，配套 `.github/workflows/release-receipt.yml` 和 `docs/release-candidate.md`。这些配套流程以各自实际部署状态为准，不依赖兄弟草稿的合入顺序。本切片不修改 Full 的分片、算法、并发或预算。
 
-切换前的 Full 是协调约定，不是必需状态规则。已核对的规则集 `27715395` 只有禁止删除和非快进更新，没有必需 `Full CI`。本草稿仍按旧 Full、独立审查和共享锁约定引导合入。**每次实际合并都须用户单独确认**，CI 成功不代表合并授权。
+切换前的 Full 是协调约定，不是必需状态规则。已核对的规则集 `27715395` 只有禁止删除和非快进更新，没有必需 `Full CI`。本草稿仍按旧 Full、独立审查和共享锁约定引导合入。**本次升级授权范围内，每个 PR 的实际合并须用户单独确认**；这不是永久仓库规则。长期技术准入是精确树 Merge gate 与独立审查，CI 成功本身不代表合并授权。
 
 独立审查批准精确 PR head。CI 和锁检查该 head 在当前 base 上的合并树。head 变化时按现有约定审查新差异；仅 base 前移不强制重新独立审查同一 head。原审查若明确限定 base/tree，则必须继续满足其范围。
 
@@ -39,7 +39,7 @@
 
 发布器核对工作流 path/id、生产仓库、fork/分支、精确 run/attempt、全部显式 jobs、远端 artifact id/digest、真实双亲/tree 和实时 base/head。原生 run 的 `pull_requests[]` 可为空。确认冲突时 source 行失败，计算中/null、等待或未知为 pending；冲突恢复只有新鲜权威证明才能把同一行改为成功，不遗留第二个同名阻塞行。其他写入者的同名碰撞阻塞。
 
-策略变化先按实际 base/merge blobs 判定，不先解析候选 artifact/jobs。需要时由默认分支 `workflow_dispatch` 固定 PR/来源/base/head/merge/tree/policy SHA，用旧受信驱动在隔离只读 job 验证候选，同时执行候选 CI 自测。因此合法策略升级不要求永远与 master 字节相同。204 只表示派发调用被接受；意图不是已接受 run，未知写入先 API 对账，不直接重试。显式新的 `ci:refresh` 可在完整对账后重新请求。
+策略变化先按实际 base/merge blobs 判定，不先解析候选 artifact/jobs。需要时由默认分支 `workflow_dispatch` 固定 PR/来源/base/head/merge/tree/policy SHA，用旧受信驱动在隔离只读 job 验证候选，同时执行候选 CI 自测。因此合法策略升级不要求永远与 master 字节相同。同一发布进程仅对受保护路径按精确提交 SHA 缓存已校验 Git blob/大小的文件内容，最多 256 项、4MiB 解码数据；错误、未知或不匹配响应不缓存，超限恢复普通读取。PR、refs、选中 run/attempt、检查/成员集合及写入后 guard 均保持新鲜读取，不作速度保证。204 只表示派发调用被接受；意图不是已接受 run，未知写入先 API 对账，不直接重试。显式新的 `ci:refresh` 可在完整对账后重新请求。
 
 每次 CheckRun 写入确认后输出一条有界 `MERGE_CHECK` JSON 日志，含 check id/target/status/conclusion、PR/head/base/validated SHA/tree、publisher 和 validation run/attempt，不含凭据或原始 artifact。observer 须同时看 status 和 conclusion，按 `targets`、`failed_prs`、`pending_prs` 路由具体目标，不把兄弟 PR 的失败报成自身失败，也不把 pending 当失败告警。
 
@@ -57,7 +57,7 @@ python3 -B .github/scripts/merge-gate-publish.py premerge \
   --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT"
 ```
 
-用户单独确认本次合并后，增加 `--consume --review "$REVIEW_RECEIPT" --outcome "$NEW_OUTCOME" -- gh pr merge "$PR" --repo PeterFile/ct0x --merge --match-head-commit "$REVIEWED_HEAD"`。只接受这个 argv，不接受 shell/admin/额外参数。协调者用 `result: approved`、`independent: true`、实际 reviewer、完整 head、原始 `evidence_path`/`evidence_sha256` 封装已有独立批准，不得自批。base/tree 只在原审查限定时填写。
+取得本次合并授权后，增加 `--consume --review "$REVIEW_RECEIPT" --outcome "$NEW_OUTCOME" -- gh pr merge "$PR" --repo PeterFile/ct0x --merge --match-head-commit "$REVIEWED_HEAD"`。只接受这个 argv，不接受 shell/admin/额外参数。协调者用 `result: approved`、`independent: true`、实际 reviewer、完整 head、原始 `evidence_path`/`evidence_sha256` 封装已有独立批准，不得自批。base/tree 只在原审查限定时填写。
 
 工具通过 `git rev-parse --git-common-dir` 找到共享 `.local/merge.lock`，使用历史 mkdir 协议；检查与已授权 merge 操作必须同在锁内。关闭/已合入、draft、非 master、head 不符、冲突、来源不明或交集未验证均阻塞。锁内在消费前再次要求每个目标的最新相关 run/attempt 正是回执所列且明确 completed/success；发布器仍排队时也不能消费被较新失败取代的旧绿灯。入口回执 stale 或锁内 base 前移时，消费模式移除/添加 `ci:refresh` 请求同 head 的新原生树，退出且绝不 merge；不调用 update-branch，不重跑旧 `GITHUB_SHA` attempt 冒充刷新。
 
@@ -83,10 +83,10 @@ python3 -B .github/scripts/merge-gate.py inspect \
 
 ## 切换和回滚
 
-1. 按旧 Full、独立审查和锁约定引导本草稿，每次合并单独取得用户确认。
+1. 按旧 Full、独立审查和锁约定引导本草稿；本次升级授权中的每个 PR 合并单独取得用户确认。
 2. gate 实际合入 master 后，确认它稳定出现在至少 **三个真实 PR** 上，记录 source-head CheckRun、精确树回执和权限隔离证据，不以本地 mock 代替。
 3. 执行已授权的 Step6：保存原规则，只添加必需 **Merge gate**，不添加必需 Full 或其他规则。随后用故意失败草稿验证真正红灯及 `isRequired`，保留实测证据。严格 up-to-date A 不包含在这次授权中。
-4. 回滚只删除本次新增的必需 Merge gate 规则，恢复已保存的原规则，保留 deletion/non-fast-forward；不虚构此前启用了必需 Full。Full 调度的一行恢复由对应调度切片单独处理。
+4. 回滚以实时规则集为基准，只删除本次新增且绑定 Actions app `15368` 的必需 **Merge gate** 条目；若该项是规则中唯一条目，只移除空规则。保留并发变更、deletion/non-fast-forward 及其他检查；原始快照仅作比较证据，不整份覆盖实时规则。不虚构此前启用了必需 Full；Full 调度的一行恢复由对应调度切片单独处理。
 
 ## 发布
 
