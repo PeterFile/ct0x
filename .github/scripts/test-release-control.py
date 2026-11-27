@@ -530,12 +530,12 @@ class ConsumerAuthorityTests(unittest.TestCase):
                    {"status": "queued"}, {"head_sha": SHA}, {"run_attempt": 2}]
         for change in changes:
             self.api = queued_owner()
-            original, reads = self.api.request, []
+            original, seen_intent = self.api.request, []
             def changed(method, path, data=None, binary=False):
-                if path == self.api.prefix + "/actions/runs/10":
-                    reads.append(path)
-                    if len(reads) > 1:
-                        self.api.job_rows[-1].update(change)
+                if path == self.api.prefix + "/actions/artifacts/30/zip":
+                    seen_intent.append(True)
+                if seen_intent and path == self.api.prefix + "/actions/runs/10":
+                    self.api.job_rows[-1].update(change)
                 return original(method, path, data, binary)
             self.api.request = changed
             with self.subTest(change=change), self.assertRaises(ValueError):
