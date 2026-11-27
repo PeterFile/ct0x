@@ -1,0 +1,89 @@
+{
+  "provenance": {
+    "description": "Bounded projections of archived #273 REST responses; native step bodies and unrelated app/actor fields are omitted.",
+    "files": {
+      "pr-273-validate-attempt-1-jobs-terminal.json": "83605972b3281f9e2743b029ffb31473ccf0d2a423ac16fa8d10e77d08ae6f84",
+      "pr-273-gate-failure.json": "e7e9fa08a6faa8b257707e22b88ac3eaee813a7678c63fb947085396a94bdbb4",
+      "pr-273-initial-publisher-attempt.json": "cc2340240339daa12faa068c9f2ba39735ff624663771d22642415a23d585176",
+      "pr-273-final-publisher-attempt.json": "da8346a798c599fb2b496fa809930ab5a16f1a7a8a3c6f4bdc749ab65b6c0130"
+    }
+  },
+  "echo": {
+    "id": 140427397549,
+    "run_id": 45975830800,
+    "workflow_name": "Merge validation PR 273",
+    "head_branch": "codex/release-owner-queued-20261127",
+    "run_url": "https://api.github.com/repos/PeterFile/ct0x/actions/runs/45975830800",
+    "run_attempt": 1,
+    "node_id": "CR_kwDOVdNL7M8AAAAgsiAJrQ",
+    "head_sha": "e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48",
+    "url": "https://api.github.com/repos/PeterFile/ct0x/actions/jobs/140427397549",
+    "html_url": "https://github.com/PeterFile/ct0x/runs/140427397549",
+    "status": "completed",
+    "conclusion": "failure",
+    "created_at": "2026-11-27T09:42:09Z",
+    "started_at": "2026-11-27T09:42:09Z",
+    "completed_at": "2026-11-27T09:47:28Z",
+    "name": "Merge gate",
+    "steps": [],
+    "check_run_url": "https://api.github.com/repos/PeterFile/ct0x/check-runs/140427397549",
+    "labels": [],
+    "runner_id": null,
+    "runner_name": null,
+    "runner_group_id": null,
+    "runner_group_name": null
+  },
+  "check": {
+    "id": 140427397549,
+    "name": "Merge gate",
+    "node_id": "CR_kwDOVdNL7M8AAAAgsiAJrQ",
+    "head_sha": "e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48",
+    "external_id": "merge-gate:v2:PeterFile/ct0x:source:e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48",
+    "url": "https://api.github.com/repos/PeterFile/ct0x/check-runs/140427397549",
+    "html_url": "https://github.com/PeterFile/ct0x/runs/140427397549",
+    "status": "completed",
+    "conclusion": "failure",
+    "check_suite": {"id": 124381641049},
+    "app": {"id": 15368, "slug": "github-actions"}
+  },
+  "metadata": {
+    "schema": 1,
+    "repo": "PeterFile/ct0x",
+    "pr": 273,
+    "head": "e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48",
+    "result": "failure",
+    "reason_code": "source_head_intersection",
+    "membership": [{"base": "6901fb37234339e7565b582b3d5ee09e781d7ead", "base_ref": "master", "draft": false, "head": "e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48", "head_ref": "codex/release-owner-queued-20261127", "head_repo": "PeterFile/ct0x", "head_repo_id": 1439910892, "pr": 273}],
+    "targets": [{"base": "6901fb37234339e7565b582b3d5ee09e781d7ead", "base_ref": "master", "draft": false, "head": "e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48", "head_ref": "codex/release-owner-queued-20261127", "head_repo": "PeterFile/ct0x", "head_repo_id": 1439910892, "pr": 273, "merge_sha": "5f186aa68f46dbdd5cd9b883b95d85e39215cba8", "tree": "41b02b15ca9d9531b15016f325b343423d08817b", "verification": false, "result": "failure", "reason_code": "invalid_terminal_evidence", "authority": {"conclusion": "success", "event": "pull_request", "id": 45975830800, "run_attempt": 1, "status": "completed"}}],
+    "failed_prs": [273],
+    "pending_prs": [],
+    "publisher": {"run_attempt": "1", "run_id": "45976596595", "workflow": ".github/workflows/merge-conflict.yml", "workflow_sha": "6901fb37234339e7565b582b3d5ee09e781d7ead"}
+  },
+  "native_jobs": [
+    {"id": 140427185533, "name": "Merge plan", "started_at": "2026-11-27T09:41:42Z", "completed_at": "2026-11-27T09:42:04Z"},
+    {"id": 140427364258, "name": "Merge tests / ci", "started_at": "2026-11-27T09:42:06Z", "completed_at": "2026-11-27T09:46:51Z"},
+    {"id": 140427364259, "name": "Merge tests / identity-diff", "started_at": "2026-11-27T09:42:07Z", "completed_at": "2026-11-27T09:42:16Z"},
+    {"id": 140429601553, "name": "Merge evidence", "started_at": "2026-11-27T09:46:53Z", "completed_at": "2026-11-27T09:47:04Z"}
+  ],
+  "initial_publisher": {
+    "id": 45975830868,
+    "run_attempt": 1,
+    "head_sha": "e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48",
+    "check_suite_id": 124381641230
+  },
+  "publisher": {
+    "id": 45976596595,
+    "run_attempt": 1,
+    "path": ".github/workflows/merge-conflict.yml",
+    "workflow_id": 432409937,
+    "head_branch": "master",
+    "head_sha": "6901fb37234339e7565b582b3d5ee09e781d7ead",
+    "event": "workflow_run",
+    "status": "completed",
+    "conclusion": "success",
+    "check_suite_id": 124383663900,
+    "repository": {"id": 1439910892, "full_name": "PeterFile/ct0x"},
+    "head_repository": {"id": 1439910892, "full_name": "PeterFile/ct0x"},
+    "html_url": "https://github.com/PeterFile/ct0x/actions/runs/45976596595"
+  }
+}
