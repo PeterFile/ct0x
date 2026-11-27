@@ -172,11 +172,13 @@ class PublisherTests(unittest.TestCase):
             helper(api, path, self.base)
             helper(api, path, self.sha)
         self.assertEqual(len(api.reads), 3, "another exact SHA must not alias the cached commit")
-        fresh = ContentsAPI([valid] * 2)
-        with mock.patch.object(self.p, "MAX_POLICY_CACHE_BYTES", len(data) - 1):
+        fresh = ContentsAPI([valid] * 3)
+        with mock.patch.object(self.p, "MAX_POLICY_CACHE_BYTES", len(data)):
             helper(fresh, path, self.base)
+            helper(fresh, path, self.sha)
             helper(fresh, path, self.base)
-        self.assertEqual(len(fresh.reads), 2, "capacity overflow must use fresh reads, never unbounded caching")
+            helper(fresh, path, self.sha)
+        self.assertEqual(len(fresh.reads), 3, "total byte overflow must use fresh reads, never unbounded caching")
         independent = ContentsAPI([valid])
         helper(independent, path, self.base)
         self.assertEqual(len(independent.reads), 1, "new invocation must not reuse another client's state")
