@@ -74,7 +74,7 @@ jobs:
       group: ci-periodic-fault-current-policy
       cancel-in-progress: false
     env:
-      FROZEN_POLICY: 'dba4c495089f5264b4fe734664721323bdebfa48'
+      FROZEN_POLICY: 'f45f08de30f0046d86362ed186f16a22436afa3c'
       FIXED_PRODUCT: ${{ inputs.sha }}
     steps:
       - name: Check out the immutable experiment driver
@@ -86,7 +86,7 @@ jobs:
       - name: Check out the frozen periodic policy and first-parent history
         uses: actions/checkout@v7
         with:
-          ref: 'dba4c495089f5264b4fe734664721323bdebfa48'
+          ref: 'f45f08de30f0046d86362ed186f16a22436afa3c'
           path: policy
           fetch-depth: 0
           persist-credentials: false
@@ -104,6 +104,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -B control/.github/scripts/periodic-current-probe.py authorize "$RUNNER_TEMP/periodic-check"
+      - name: Check out the public release Full policy fixture
+        uses: actions/checkout@v7
+        with:
+          ref: '5f9b9e691fb3efac3e5e0812ef73c469c88f067e'
+          path: release-policy
+          sparse-checkout: .github
+          persist-credentials: false
+      - name: Exercise the periodic reader on the optional release policy layout
+        run: python3 -B control/.github/scripts/periodic-compat-sample.py "$RUNNER_TEMP/periodic-check"
       - name: Reproduce the controlled assertion and verify the precise adjacent boundary
         run: python3 -B control/.github/scripts/periodic-current-probe.py replay "$RUNNER_TEMP/periodic-check"
       - name: Authenticate the producing merged pull request
