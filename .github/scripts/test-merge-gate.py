@@ -259,6 +259,17 @@ class GateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.gate.finalize(plan, results, [])
 
+    def test_final_partial_retry_rejects_inherited_missing_and_unsuccessful_evidence_with_remediation(self):
+        identity = self.gate.native_identity(self.root, self.event, self.context)
+        plan = {**identity, "tasks": [{"unit": "identity-diff", "kind": "identity"}]}
+        results = {"plan": {"result": "success"}, "tests": {"result": "success"}}
+        inherited = {**identity, "run_attempt": "1", "unit": "identity-diff", "result": "success"}
+        for rows in ([], [inherited]):
+            with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, "Re-run all jobs"):
+                self.gate.finalize(plan, results, rows)
+        with self.assertRaisesRegex(ValueError, "Re-run all jobs"):
+            self.gate.finalize(plan, {**results, "plan": {"result": "skipped"}}, [inherited])
+
     def test_empty_diff_has_substantive_identity_unit(self):
         self.git("reset", "--hard", self.base)
         tree = self.git("rev-parse", "HEAD^{tree}")

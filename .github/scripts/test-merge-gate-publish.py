@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -26,6 +27,64 @@ def load():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def hosted_273_echo_rows():
+    # Portable projection of the two raw #273 responses. Native step bodies and app permissions are irrelevant here.
+    # Set MERGE_GATE_HOSTED_EVIDENCE_ROOT to replay the complete archived responses without editing the fixture.
+    location = os.environ.get("MERGE_GATE_HOSTED_EVIDENCE_ROOT")
+    if location:
+        root = Path(location)
+        return (json.loads((root / "pr-273-validate-attempt-1-jobs-terminal.json").read_text())["jobs"],
+                json.loads((root / "pr-273-gate-failure.json").read_text()))
+    head = "e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48"
+    base = "6901fb37234339e7565b582b3d5ee09e781d7ead"
+    ref = "codex/release-owner-queued-20261127"
+    api_root, html_root = f"https://api.github.com/repos/{REPO}", f"https://github.com/{REPO}"
+    jobs = [{"id": job_id, "name": name, "run_id": 45975830800, "run_attempt": 1,
+             "status": "completed", "conclusion": "success", "head_sha": head, "head_branch": ref,
+             "url": f"{api_root}/actions/jobs/{job_id}", "check_run_url": f"{api_root}/check-runs/{job_id}",
+             "html_url": f"{html_root}/actions/runs/45975830800/job/{job_id}", "runner_id": runner_id,
+             "runner_name": f"GitHub Actions {runner_id}", "runner_group_id": 0, "runner_group_name": "GitHub Actions",
+             "labels": ["ubuntu-latest"]}
+            for job_id, name, runner_id in ((140427185533, "Merge plan", 1000035189),
+                (140427364258, "Merge tests / ci", 1000035195),
+                (140427364259, "Merge tests / identity-diff", 1000035194),
+                (140429601553, "Merge evidence", 1000035201))]
+    echo = {"id": 140427397549, "run_id": 45975830800, "run_attempt": 1, "workflow_name": "Merge validation PR 273",
+            "head_sha": head, "head_branch": ref, "run_url": f"{api_root}/actions/runs/45975830800",
+            "node_id": "CR_kwDOVdNL7M8AAAAgsiAJrQ", "url": f"{api_root}/actions/jobs/140427397549",
+            "html_url": f"{html_root}/runs/140427397549", "check_run_url": f"{api_root}/check-runs/140427397549",
+            "status": "completed", "conclusion": "failure", "name": "Merge gate", "steps": [], "labels": [],
+            "runner_id": None, "runner_name": None, "runner_group_id": None, "runner_group_name": None,
+            "created_at": "2026-11-27T09:42:09Z", "started_at": "2026-11-27T09:42:09Z", "completed_at": "2026-11-27T09:47:28Z"}
+    member = {"pr": 273, "head": head, "base": base, "base_ref": "master", "draft": False,
+              "head_ref": ref, "head_repo": REPO, "head_repo_id": 1439910892}
+    metadata = {"schema": 1, "repo": REPO, "pr": 273, "head": head, "result": "failure",
+                "membership": [member], "targets": [member],
+                "publisher": {"workflow": ".github/workflows/merge-conflict.yml", "run_id": "45976596595",
+                              "run_attempt": "1", "workflow_sha": base}}
+    custom = {"id": echo["id"], "name": echo["name"], "node_id": echo["node_id"], "head_sha": head,
+              "url": echo["check_run_url"], "html_url": echo["html_url"], "status": "completed", "conclusion": "failure",
+              "external_id": f"merge-gate:v2:{REPO}:source:{head}", "app": {"id": 15368, "slug": "github-actions"},
+              "check_suite": {"id": 124381641049}, "output": {"title": "合并已阻塞", "summary": json.dumps(metadata)}}
+    return [*jobs[:3], echo, jobs[3]], custom
+
+
+def hosted_273_initial_publisher():
+    location = os.environ.get("MERGE_GATE_HOSTED_EVIDENCE_ROOT")
+    if location:
+        return json.loads((Path(location) / "pr-273-initial-publisher-attempt.json").read_text())
+    # Raw initial attempt projection: the source head is NOT the checked-out workflow SHA.
+    repo = {"id": 1439910892, "full_name": REPO}
+    associated_repo = {"id": repo["id"], "url": f"https://api.github.com/repos/{REPO}", "name": "ct0x"}
+    head, base = "e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48", "6901fb37234339e7565b582b3d5ee09e781d7ead"
+    ref = "codex/release-owner-queued-20261127"
+    return {"id": 45975830868, "run_attempt": 1, "path": ".github/workflows/merge-conflict.yml", "workflow_id": 432409937,
+            "event": "pull_request_target", "status": "completed", "conclusion": "success", "check_suite_id": 124381641230,
+            "head_sha": head, "head_branch": ref, "repository": repo, "head_repository": repo,
+            "pull_requests": [{"number": 273, "head": {"sha": head, "ref": ref, "repo": associated_repo},
+                               "base": {"sha": base, "ref": "master", "repo": associated_repo}}]}
 
 
 class PublisherTests(unittest.TestCase):
@@ -60,6 +119,311 @@ class PublisherTests(unittest.TestCase):
                       master=self.base, merge=self.merge, workflow_id=99)
         return self.p.validate_proof(**{**values, **changes})
 
+    def echo_fixture(self):
+        raw_jobs, custom = hosted_273_echo_rows()
+        echo = copy.deepcopy(next(row for row in raw_jobs if row["id"] == 140427397549))
+        echo.update(run_id=101, run_attempt=2, head_sha=self.head, head_branch=self.pr["head"]["ref"],
+                    run_url=f"https://api.github.com/repos/{REPO}/actions/runs/101")
+        self.run["check_suite_id"] = custom["check_suite"]["id"]
+        member = self.p.target_details(self.pr)
+        metadata = {"schema": 1, "repo": REPO, "pr": 7, "head": self.head, "membership": [member], "targets": [member],
+                    "publisher": {"workflow": self.p.PUBLISHER, "run_id": "201", "run_attempt": "1", "workflow_sha": self.base}}
+        custom.update(head_sha=self.head, external_id=self.p.external_id(self.pr), output={"summary": json.dumps(metadata)})
+        api = self.api_fixture()
+        original_get = api.get
+        api.get = mock.Mock(side_effect=lambda endpoint: copy.deepcopy(custom) if endpoint == "check-runs/140427397549" else original_get(endpoint))
+        self.jobs.append(echo)
+        return api, echo, custom
+
+    def test_authenticated_custom_check_echo_does_not_change_native_proof(self):
+        api, _, _ = self.echo_fixture()
+        original = copy.deepcopy(self.jobs)
+        try:
+            proven = self.p.proof(api, (self.pr, self.base, self.merge), 101, 2, HERE.parents[1])
+        except ValueError as error:
+            self.fail("authenticated CheckRun echo blocked native proof: " + str(error))
+        self.assertEqual(proven["identity"]["sha"], self.sha)
+        self.assertEqual(self.jobs, original)
+        self.assertEqual([call.args[0] for call in api.get.call_args_list].count("check-runs/140427397549"), 1)
+        self.assertEqual(api.writes, [])
+
+    def test_hosted_pr273_raw_shape_replays_five_rows_as_four_native_producers(self):
+        jobs, custom = hosted_273_echo_rows()
+        metadata = json.loads(custom["output"]["summary"])
+        member = metadata["membership"][0]
+        repo = {"id": member["head_repo_id"], "full_name": member["head_repo"]}
+        pr = {"number": 273, "state": "open", "merged": False, "draft": False,
+              "head": {"sha": member["head"], "ref": member["head_ref"], "repo": repo},
+              "base": {"sha": member["base"], "ref": member["base_ref"], "repo": repo}}
+        run = {"id": 45975830800, "run_attempt": 1, "check_suite_id": 124381641049,
+               "head_sha": member["head"], "head_branch": member["head_ref"]}
+        publisher = {"id": 45976596595, "run_attempt": 1, "path": self.p.PUBLISHER, "workflow_id": 432409937,
+                     "repository": repo, "head_sha": metadata["publisher"]["workflow_sha"], "event": "workflow_run",
+                     "status": "completed", "conclusion": "success"}
+        # Publisher run/artifact provenance is stubbed. Only the job/CheckRun responses are hosted evidence.
+        responses = {"check-runs/140427397549": custom, "actions/runs/45976596595": publisher,
+                     "actions/runs/45976596595/attempts/1": publisher,
+                     "actions/workflows/merge-conflict.yml": {"id": 432409937, "path": self.p.PUBLISHER},
+                     "git/ref/heads/master": {"object": {"sha": publisher["head_sha"]}}}
+        api = mock.Mock()
+        api.get.side_effect = lambda endpoint: copy.deepcopy(responses[endpoint])
+        normalize = getattr(self.p, "normalize_validation_jobs", None)
+        self.assertIsNotNone(normalize, "provider job echoes need authenticated boundary normalization")
+        original = copy.deepcopy(jobs)
+        native = normalize(api, jobs, pr, run)
+        self.assertEqual([row["id"] for row in native], [140427185533, 140427364258, 140427364259, 140429601553])
+        self.assertEqual([row["name"] for row in native], ["Merge plan", "Merge tests / ci", "Merge tests / identity-diff", "Merge evidence"])
+        self.assertTrue(all(row["status"] == "completed" and row["conclusion"] == "success" for row in native))
+        self.assertEqual(jobs, original)
+        api.write.assert_not_called()
+
+    def initial_pending_echo_fixture(self):
+        jobs, custom = hosted_273_echo_rows()
+        publisher = hosted_273_initial_publisher()
+        metadata = json.loads(custom["output"]["summary"])
+        pinned = "6901fb37234339e7565b582b3d5ee09e781d7ead"
+        location = os.environ.get("MERGE_GATE_HOSTED_EVIDENCE_ROOT")
+        if location:
+            log = (Path(location) / "pr-273-initial-publisher-job.log").read_text()
+            first = next(json.loads(line.split("MERGE_CHECK ", 1)[1]) for line in log.splitlines() if "MERGE_CHECK {" in line)
+            self.assertEqual((first["check_id"], first["status"], first["publisher_run_id"]), (custom["id"], "in_progress", str(publisher["id"])))
+            pinned = next(line.split("MERGE_TRUSTED_WORKFLOW_SHA: ", 1)[1] for line in log.splitlines() if "MERGE_TRUSTED_WORKFLOW_SHA: " in line)
+        # Reconstruct the first pending output from its logged write; never rewrite the archived run head to master.
+        metadata.update(result="pending", publisher={"workflow": self.p.PUBLISHER, "run_id": str(publisher["id"]),
+                                                    "run_attempt": str(publisher["run_attempt"]), "workflow_sha": pinned})
+        custom.update(status="in_progress", conclusion=None, output={"summary": json.dumps(metadata)})
+        echo = next(row for row in jobs if row["id"] == custom["id"])
+        echo.update(status="in_progress", conclusion=None, completed_at=None)
+        member = metadata["membership"][0]
+        repo = {"id": member["head_repo_id"], "full_name": member["head_repo"]}
+        pr = {"number": 273, "state": "open", "merged": False, "draft": False,
+              "head": {"sha": member["head"], "ref": member["head_ref"], "repo": repo},
+              "base": {"sha": member["base"], "ref": member["base_ref"], "repo": repo}}
+        run = {"id": 45975830800, "run_attempt": 1, "check_suite_id": custom["check_suite"]["id"],
+               "head_sha": member["head"], "head_branch": member["head_ref"]}
+        responses = {f"check-runs/{custom['id']}": custom, f"actions/runs/{publisher['id']}": publisher,
+                     f"actions/runs/{publisher['id']}/attempts/{publisher['run_attempt']}": publisher,
+                     "actions/workflows/merge-conflict.yml": {"id": publisher["workflow_id"], "path": self.p.PUBLISHER},
+                     "git/ref/heads/master": {"object": {"sha": pinned}},
+                     f"compare/{publisher['head_sha']}...{pinned}": {"status": "behind", "merge_base_commit": {"sha": pinned}}}
+        api = mock.Mock()
+        api.get.side_effect = lambda endpoint: copy.deepcopy(responses[endpoint])
+        return api, jobs, pr, run, responses, metadata
+
+    def test_initial_pr273_pending_echo_authenticates_base_workflow_not_run_source_head(self):
+        api, jobs, pr, run, responses, metadata = self.initial_pending_echo_fixture()
+        publisher = responses["actions/runs/45975830868/attempts/1"]
+        self.assertEqual(publisher["event"], "pull_request_target")
+        self.assertEqual(publisher["head_sha"], pr["head"]["sha"])
+        self.assertNotEqual(publisher["head_sha"], metadata["publisher"]["workflow_sha"])
+        self.assertNotEqual(publisher["check_suite_id"], run["check_suite_id"])
+        before = copy.deepcopy(jobs)
+        try:
+            native = self.p.normalize_validation_jobs(api, jobs, pr, run)
+        except ValueError as error:
+            self.fail("genuine first pending write cannot be classified: " + str(error))
+        self.assertEqual([row["id"] for row in native], [140427185533, 140427364258, 140427364259, 140429601553])
+        self.assertEqual(jobs, before)
+        api.write.assert_not_called()
+
+    def test_two_pending_echoes_remain_classifiable_after_source_membership_changes(self):
+        for change in ("joined", "left", "empty"):
+            with self.subTest(change=change):
+                api, jobs, pr, run, responses, metadata = self.initial_pending_echo_fixture()
+                publisher = responses["actions/runs/45975830868"]
+                publisher.update(status="in_progress", conclusion=None)
+                if change == "joined":
+                    pr["number"] = 274
+                    pr["head"]["ref"] = run["head_branch"] = "another-source-ref"
+                    pr["base"]["ref"] = "another-target"
+                    for job in jobs:
+                        job["head_branch"] = run["head_branch"]
+                elif change == "left":
+                    previous = {**metadata["membership"][0], "pr": 274, "head_ref": "old-ref", "base_ref": "old-target"}
+                    metadata["membership"].append(previous)
+                    metadata["targets"].append(copy.deepcopy(previous))
+                else:
+                    metadata.update(membership=[], targets=[])
+                first = responses["check-runs/140427397549"]
+                first["output"]["summary"] = json.dumps(metadata)
+                second = copy.deepcopy(first)
+                second.update(id=140427397550, node_id="CR_second_pending", url=first["url"].replace("140427397549", "140427397550"),
+                              html_url=first["html_url"].replace("140427397549", "140427397550"))
+                responses["check-runs/140427397550"] = second
+                echo = copy.deepcopy(next(row for row in jobs if row["id"] == first["id"]))
+                echo.update(id=second["id"], node_id=second["node_id"], check_run_url=second["url"], html_url=second["html_url"],
+                            url=echo["url"].replace("140427397549", "140427397550"))
+                jobs.append(echo)
+                try:
+                    native = self.p.normalize_validation_jobs(api, jobs, pr, run)
+                except ValueError as error:
+                    self.fail("source-head ownership must not require today's membership: " + str(error))
+                self.assertEqual(len(native), 4)
+                self.assertTrue(all(row["name"] != "Merge gate" for row in native))
+                api.write.assert_not_called()
+
+    def test_historical_echo_keeps_exact_attempt_identity_when_publisher_is_rerun(self):
+        api, jobs, pr, run, responses, metadata = self.initial_pending_echo_fixture()
+        responses["actions/runs/45975830868"] = {**responses["actions/runs/45975830868"], "run_attempt": 2, "status": "in_progress", "conclusion": None}
+        try:
+            native = self.p.normalize_validation_jobs(api, jobs, pr, run)
+        except ValueError as error:
+            self.fail("rerunning the publisher does not change its authenticated historical echo: " + str(error))
+        self.assertEqual(len(native), 4)
+        self.assertEqual(responses["actions/runs/45975830868/attempts/1"]["run_attempt"], 1)
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            self.p.verify_publisher_run(api, metadata["publisher"])
+        api.write.assert_not_called()
+
+    def test_pending_target_echo_requires_embedded_source_target_and_pinned_default_workflow(self):
+        for field in ("head", "source-ref", "source-id", "source-url", "target-ref", "target-sha", "target-id", "target-url",
+                      "no-pr", "duplicate-pr", "attempt", "workflow", "repository", "unpublished-policy"):
+            with self.subTest(field=field):
+                api, jobs, pr, run, responses, _ = self.initial_pending_echo_fixture()
+                publisher = responses["actions/runs/45975830868"]
+                associated = publisher["pull_requests"][0]
+                if field == "head":
+                    associated["head"]["sha"] = "f" * 40
+                elif field == "source-ref":
+                    associated["head"]["ref"] = "other"
+                elif field in ("source-id", "source-url"):
+                    associated["head"]["repo"] = {**associated["head"]["repo"], "id" if field == "source-id" else "url": 19 if field == "source-id" else "https://api.github.com/repos/other/ct0x"}
+                elif field.startswith("target-"):
+                    key = field.removeprefix("target-")
+                    if key in ("id", "url"):
+                        associated["base"]["repo"] = {**associated["base"]["repo"], key: 19 if key == "id" else "https://api.github.com/repos/other/ct0x"}
+                    else:
+                        associated["base"][key] = "other" if key == "ref" else "f" * 40
+                elif field == "no-pr":
+                    publisher["pull_requests"] = []
+                elif field == "duplicate-pr":
+                    publisher["pull_requests"].append(copy.deepcopy(associated))
+                elif field in ("attempt", "workflow", "repository"):
+                    key = {"attempt": "run_attempt", "workflow": "workflow_id", "repository": "repository"}[field]
+                    publisher[key] = {"run_attempt": 2, "workflow_id": 17, "repository": {"id": 19, "full_name": "other/ct0x"}}[key]
+                else:
+                    pinned = associated["base"]["sha"]
+                    responses["git/ref/heads/master"] = {"object": {"sha": "f" * 40}}
+                    responses[f"compare/{pinned}...{'f' * 40}"] = {"status": "diverged", "merge_base_commit": {"sha": "0" * 40}}
+                with self.assertRaises(ValueError):
+                    self.p.normalize_validation_jobs(api, jobs, pr, run)
+                api.write.assert_not_called()
+
+    def test_target_echo_classification_cannot_replace_final_publisher_proof(self):
+        api, _, pr, _, responses, metadata = self.initial_pending_echo_fixture()
+        custom = responses["check-runs/140427397549"]
+        validation = {"identity": {"head": pr["head"]["sha"]}}
+        metadata.update(result="success", targets=[{**metadata["targets"][0], "result": "success", "verification": True, "validation": validation}])
+        custom.update(status="completed", conclusion="success", output={"summary": json.dumps(metadata)})
+        api.pages.return_value = [custom]
+        with self.assertRaisesRegex(ValueError, "默认分支的工作流代码"):
+            self.p.verify_publisher(api, pr, validation)
+
+    def test_echo_normalization_leaves_no_echo_request_path_unchanged(self):
+        api = self.api_fixture()
+        api.get = mock.Mock(wraps=api.get)
+        self.p.proof(api, (self.pr, self.base, self.merge), 101, 2, HERE.parents[1])
+        reads = [call.args[0] for call in api.get.call_args_list]
+        self.assertFalse(any(path.startswith("check-runs/") or "merge-conflict.yml" in path or "runs/201" in path for path in reads))
+
+    def test_unauthenticated_or_runner_executed_echo_is_never_filtered(self):
+        cases = [("job", key, value) for key, value in (
+            ("id", 0), ("id", "140427397549"), ("name", "Other job"), ("name", "Merge plan"),
+            ("name", "Merge evidence"), ("name", "Merge tests / identity-diff"),
+            ("steps", [{"name": "Run code"}]), ("steps", None), ("labels", ["ubuntu-latest"]),
+            ("runner_id", 10), ("runner_id", 0), ("runner_name", "runner"), ("runner_group_id", 0), ("runner_group_name", "group"),
+            ("run_id", 102), ("run_attempt", 1), ("head_sha", self.base), ("head_branch", "other"),
+            ("check_run_url", "https://example.invalid/check-runs/140427397549"),
+            ("url", "https://api.github.com/repos/other/ct0x/actions/jobs/140427397549"),
+            ("html_url", f"https://github.com/{REPO}/actions/runs/101/job/140427397549"), ("node_id", "spoof"))]
+        cases += [("check", key, value) for key, value in (
+            ("id", 44), ("name", "Other check"), ("head_sha", self.base), ("external_id", "spoof"),
+            ("app", {"id": 3, "slug": "github-actions"}), ("app", {"id": 15368, "slug": "other"}),
+            ("url", "https://example.invalid/check-runs/140427397549"), ("node_id", "spoof"),
+            ("check_suite", {"id": 700}), ("output", {"summary": "{}"}))]
+        for kind, key, value in cases:
+            with self.subTest(kind=kind, field=key, value=value):
+                self.setUp()
+                api, echo, custom = self.echo_fixture()
+                (echo if kind == "job" else custom)[key] = value
+                with self.assertRaises((ValueError, KeyError, TypeError)):
+                    self.p.proof(api, (self.pr, self.base, self.merge), 101, 2, HERE.parents[1])
+                self.assertEqual(api.writes, [])
+
+    def test_echo_requires_available_check_and_exact_source_publisher_provenance(self):
+        for field in ("unavailable", "missing-runner-field", "metadata-repo", "metadata-head", "source-repo", "source-ref", "source-id",
+                      "publisher-path", "publisher-sha", "publisher-attempt", "publisher-event", "publisher-repo", "publisher-code"):
+            with self.subTest(field=field):
+                self.setUp()
+                api, echo, custom = self.echo_fixture()
+                metadata = json.loads(custom["output"]["summary"])
+                if field == "missing-runner-field":
+                    del echo["runner_id"]
+                elif field.startswith("metadata-"):
+                    metadata[field.removeprefix("metadata-")] = "wrong"
+                elif field.startswith("source-"):
+                    key = {"source-repo": "head_repo", "source-ref": "head_ref", "source-id": "head_repo_id"}[field]
+                    metadata["targets"][0][key] = "wrong"
+                elif field in ("publisher-path", "publisher-sha"):
+                    metadata["publisher"]["workflow" if field == "publisher-path" else "workflow_sha"] = "wrong"
+                custom["output"]["summary"] = json.dumps(metadata)
+                original_get = api.get.side_effect
+                def get(endpoint):
+                    if field == "unavailable" and endpoint == "check-runs/140427397549":
+                        raise subprocess.CalledProcessError(1, ["gh", "api"], stderr=b"not found")
+                    value = original_get(endpoint)
+                    if endpoint.startswith("actions/runs/201"):
+                        key = {"publisher-attempt": "run_attempt", "publisher-event": "event",
+                               "publisher-repo": "repository", "publisher-code": "head_sha"}.get(field)
+                        if key:
+                            value[key] = {"run_attempt": 2, "event": "push", "repository": {"full_name": "other/ct0x"},
+                                          "head_sha": "f" * 40}[key]
+                    return value
+                api.get.side_effect = get
+                with self.assertRaises((ValueError, KeyError, TypeError, subprocess.CalledProcessError)):
+                    self.p.proof(api, (self.pr, self.base, self.merge), 101, 2, HERE.parents[1])
+                self.assertEqual(api.writes, [])
+
+    def test_echo_classification_does_not_relax_terminal_publisher_or_latest_validation(self):
+        api, _, _ = self.echo_fixture()
+        original_get = api.get.side_effect
+        def get(endpoint):
+            value = original_get(endpoint)
+            if endpoint.startswith("actions/runs/201"):
+                value.update(status="in_progress", conclusion=None)
+            return value
+        api.get.side_effect = get
+        try:
+            validation = self.p.proof(api, (self.pr, self.base, self.merge), 101, 2, HERE.parents[1])
+        except ValueError as error:
+            self.fail("a running publisher's own echo is not a native producer: " + str(error))
+        self.p.reconcile(api, 7, HERE.parents[1], {"GITHUB_RUN_ID": "201", "GITHUB_RUN_ATTEMPT": "1"})
+        with self.assertRaises(ValueError):
+            self.p.verify_publisher(api, self.pr, validation)
+        api.runs.append({**self.run, "id": 102, "run_attempt": 1, "status": "completed", "conclusion": "failure"})
+        with self.assertRaises(ValueError):
+            self.p.verify_latest(api, (self.pr, self.base, self.merge), 101, 2)
+
+    def test_authenticated_echo_does_not_hide_missing_duplicate_extra_or_failed_native_jobs(self):
+        for kind in ("missing", "duplicate", "extra", "failed", "wrong-attempt", "id-collision", "duplicate-echo"):
+            with self.subTest(kind=kind):
+                self.setUp()
+                api, echo, _ = self.echo_fixture()
+                if kind == "missing":
+                    self.jobs.pop(0)
+                elif kind == "duplicate":
+                    self.jobs.append(copy.deepcopy(self.jobs[0]))
+                elif kind == "extra":
+                    self.jobs.append({**self.jobs[0], "name": "Unrelated job"})
+                elif kind in ("failed", "wrong-attempt"):
+                    self.jobs[0]["conclusion" if kind == "failed" else "run_attempt"] = "failure" if kind == "failed" else 1
+                elif kind == "id-collision":
+                    self.jobs[0]["id"] = echo["id"]
+                else:
+                    self.jobs.append(copy.deepcopy(echo))
+                with self.assertRaises(ValueError):
+                    self.p.proof(api, (self.pr, self.base, self.merge), 101, 2, HERE.parents[1])
+
     def test_empty_pull_requests_is_valid_but_fork_and_workflow_identity_are_not_optional(self):
         self.validate()
         for key, value in (("path", ".github/workflows/other.yml"), ("workflow_id", 98),
@@ -82,6 +446,17 @@ class PublisherTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(merge={**self.merge, "parents": [{"sha": self.head}, {"sha": self.base}]})
 
+    def test_partial_attempt_cannot_certify_missing_or_inherited_terminal_producers(self):
+        self.validate()
+        for kind in ("missing-plan", "inherited-plan", "inherited-unit"):
+            jobs = copy.deepcopy(self.jobs)
+            if kind == "missing-plan":
+                jobs = [job for job in jobs if job["name"] != "Merge plan"]
+            else:
+                jobs[0 if kind == "inherited-plan" else 1]["run_attempt"] = 1
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, "Re-run all jobs"):
+                self.validate(jobs=jobs)
+
     def test_consumption_rejects_closed_merged_draft_retarget_and_review_mismatch(self):
         self.p.validate_live(self.pr, self.head, consuming=True)
         for key, value in (("state", "closed"), ("merged", True), ("draft", True),
@@ -92,6 +467,29 @@ class PublisherTests(unittest.TestCase):
             self.p.validate_live(self.pr, self.base, consuming=True)
         with self.assertRaises(ValueError):
             self.validate(master="f" * 40)
+
+    def test_explicit_refresh_and_read_are_legal_on_blocked_pr(self):
+        self.pr["mergeable_state"] = "blocked"
+        api = self.api_fixture()
+        api.write = mock.Mock(wraps=api.write)
+        self.p.validate_live(self.pr, self.head)
+        self.assertEqual(self.validate()["head"], self.head)
+        try:
+            self.p.refresh(api, self.pr)
+        except ValueError as error:
+            self.fail("explicit refresh is not merge consumption: " + str(error))
+        api.write.assert_called_once_with("POST", "issues/7/labels", {"labels": ["ci:refresh"]})
+        self.assertEqual(api.writes, ["issues/7/labels"])
+
+    def test_blocked_refresh_preserves_old_closed_draft_retarget_and_conflict_guards(self):
+        self.pr["mergeable_state"] = "blocked"
+        for key, value in (("state", "closed"), ("merged", True), ("draft", True),
+                           ("base", {**self.pr["base"], "ref": "other"}), ("mergeable", False)):
+            with self.subTest(key=key):
+                api = self.api_fixture()
+                with self.assertRaises(ValueError):
+                    self.p.refresh(api, {**self.pr, key: value})
+                self.assertEqual(api.writes, [])
 
     def test_artifact_zip_digest_and_exact_single_data_member(self):
         def archive(extra=False):
@@ -191,20 +589,136 @@ class PublisherTests(unittest.TestCase):
         stale = {**self.merge, "parents": [{"sha": "f" * 40}, {"sha": self.head}]}
         self.assertEqual(self.p.merge_state(conflict, self.base, stale), "conflict")
 
-    def test_idempotent_single_check_updates_same_head_recovery_and_repairs_duplicates(self):
+    def test_idempotent_publication_preserves_history_and_converges_on_latest_row(self):
         api = CheckAPI()
         self.p.publish_check(api, self.pr, "failure", {"reason": "合并冲突"})
         self.p.publish_check(api, self.pr, "failure", {"reason": "合并冲突"})
         self.assertEqual(len(api.checks), 1)
+        original = copy.deepcopy(api.checks)
         self.p.publish_check(api, self.pr, "success", {"run_id": "101", "run_attempt": "2"})
-        self.assertEqual(len(api.checks), 1)
-        self.assertEqual(api.checks[0]["conclusion"], "success")
-        duplicate = copy.deepcopy(api.checks[0])
+        self.assertEqual(api.checks[:-1], original)
+        self.assertEqual(api.checks[-1]["conclusion"], "success")
+        duplicate = copy.deepcopy(api.checks[-1])
         duplicate["id"] = 22
         api.checks.append(duplicate)
+        original = copy.deepcopy(api.checks)
         self.p.publish_check(api, self.pr, "failure", {"reason": "合并冲突"})
-        self.assertEqual(len([row for row in api.checks if row["name"] == "Merge gate"]), 1)
+        self.assertEqual(api.checks[:-1], original)
+        self.assertEqual(api.checks[-1]["conclusion"], "failure")
+        self.assertTrue(all(method == "POST" for method, _, _ in api.mutations))
         self.assertFalse(any("contributor/" in endpoint for endpoint in api.writes))
+
+    def test_new_publisher_generation_creates_fresh_terminal_without_touching_prior_suite(self):
+        api = CheckAPI()
+        context = {"workflow": self.p.PUBLISHER, "run_id": "201", "run_attempt": "1"}
+        metadata = {"result": "success", "publisher": context}
+        first = self.p.publish_check(api, self.pr, "success", metadata)
+        original = copy.deepcopy(api.checks)
+        api.assigned_suite = 124355821449  # Observed assignment can differ from the native publisher suite.
+        second = self.p.publish_check(api, self.pr, "success", {**metadata, "publisher": {**context, "run_id": "202"}})
+        self.assertNotEqual(first["id"], second["id"], "same source head does not confer prior-generation ownership")
+        self.assertEqual(api.checks[:-1], original)
+        self.assertEqual(second["check_suite"]["id"], 124355821449)
+        self.assertTrue(all(method == "POST" for method, _, _ in api.mutations))
+        self.assertTrue(all("check_suite_id" not in data and "check_suite" not in data for _, _, data in api.mutations))
+
+    def test_completed_check_is_not_reopened_and_current_pending_blocks_old_success(self):
+        api = self.api_fixture()
+        context = {"GITHUB_RUN_ID": "201", "GITHUB_RUN_ATTEMPT": "1"}
+        self.p.reconcile(api, 7, HERE.parents[1], context)
+        original = copy.deepcopy(api.checks)
+        validation = json.loads(original[-1]["output"]["summary"])["validation"]
+        pending = {"result": "pending", "publisher": {"workflow": self.p.PUBLISHER, "run_id": "202", "run_attempt": "1"}}
+        latest = self.p.publish_check(api, self.pr, "pending", pending)
+        self.assertNotEqual(latest["id"], original[-1]["id"])
+        self.assertEqual(api.checks[:-1], original)
+        self.assertEqual(latest["status"], "in_progress")
+        with self.assertRaises(ValueError):
+            self.p.verify_publisher(api, self.pr, validation)
+        self.assertFalse(any(method == "PATCH" for method, _, _ in api.mutations))
+
+    def test_terminal_convergence_is_fresh_even_with_same_publisher_and_assigned_suite(self):
+        api = CheckAPI()
+        metadata = {"publisher": {"workflow": self.p.PUBLISHER, "run_id": "201", "run_attempt": "1"}}
+        pending = self.p.publish_check(api, self.pr, "pending", {**metadata, "result": "pending"})
+        success = self.p.publish_check(api, self.pr, "success", {**metadata, "result": "success"})
+        self.assertNotEqual(pending["id"], success["id"])
+        self.assertEqual(api.checks[0], pending)
+        self.assertEqual(success["status"], "completed")
+        self.assertEqual(success["conclusion"], "success")
+        before = copy.deepcopy(api.mutations)
+        self.assertEqual(self.p.publish_check(api, self.pr, "success", {**metadata, "result": "success"}), success)
+        self.assertEqual(api.mutations, before, "an exact retry must converge without another write")
+
+    def test_post_write_drift_invalidates_only_just_written_success_without_reopening(self):
+        api = CheckAPI()
+        metadata = {"result": "success", "publisher": {"workflow": self.p.PUBLISHER, "run_id": "201", "run_attempt": "1"},
+                    "targets": [{"pr": 7, "result": "success", "verification": True, "validation": {"old": True}}]}
+        calls = []
+        def guard():
+            calls.append(True)
+            return len(calls) == 1
+        with self.assertRaises(self.p.StateChanged):
+            self.p.publish_check(api, self.pr, "success", metadata, guard)
+        latest = api.checks[-1]
+        self.assertEqual(latest["status"], "completed")
+        self.assertEqual(latest["conclusion"], "failure")
+        stale = json.loads(latest["output"]["summary"])
+        self.assertEqual(stale["result"], "pending")
+        self.assertFalse(stale["targets"][0]["verification"])
+        self.assertNotIn("validation", stale["targets"][0])
+        self.assertTrue(all(data.get("status") != "in_progress" for method, _, data in api.mutations if method == "PATCH"))
+
+    def test_publisher_provenance_does_not_infer_custom_check_suite_from_native_job(self):
+        api = self.api_fixture()
+        api.assigned_suite = 124355821449
+        context = {"GITHUB_RUN_ID": "201", "GITHUB_RUN_ATTEMPT": "1"}
+        self.p.reconcile(api, 7, HERE.parents[1], context)
+        original = copy.deepcopy(api.checks)
+        original_get = api.get
+        def get(endpoint):
+            if endpoint in ("actions/runs/202", "actions/runs/202/attempts/1"):
+                return {**original_get(endpoint.replace("202", "201")), "id": 202, "check_suite_id": 124355822124}
+            return original_get(endpoint)
+        api.get = get
+        self.p.reconcile(api, 7, HERE.parents[1], {**context, "GITHUB_RUN_ID": "202"})
+        self.assertEqual(api.checks[:-1], original)
+        self.assertEqual(api.checks[-1]["check_suite"]["id"], 124355821449)
+        validation = json.loads(api.checks[-1]["output"]["summary"])["validation"]
+        verified = self.p.verify_publisher(api, self.pr, validation)
+        self.assertEqual(verified["publisher"]["run_id"], "202")
+
+    def test_post_write_drift_cannot_invalidate_a_newer_publishers_row(self):
+        api = CheckAPI()
+        metadata = {"publisher": {"workflow": self.p.PUBLISHER, "run_id": "201", "run_attempt": "1"}, "result": "success"}
+        calls, newer = [], []
+        def guard():
+            calls.append(True)
+            if len(calls) == 1:
+                return True
+            newer.append(api.write("POST", "check-runs", {"name": "Merge gate", "head_sha": self.head,
+                         "external_id": self.p.external_id(self.pr), "status": "in_progress",
+                         "output": {"title": "new generation", "summary": json.dumps({"result": "pending"})}}))
+            return False
+        with self.assertRaises(self.p.StateChanged):
+            self.p.publish_check(api, self.pr, "success", metadata, guard)
+        self.assertEqual(api.checks[-1], newer[0])
+        self.assertEqual(api.checks[0]["conclusion"], "failure")
+        self.assertEqual(api.mutations[-1][1], "check-runs/" + str(api.checks[0]["id"]))
+        with self.assertRaises(ValueError):
+            self.p.verify_publisher(api, self.pr, {})
+
+    def test_idempotent_read_drift_creates_blocker_without_mutating_historical_success(self):
+        api = CheckAPI()
+        metadata = {"publisher": {"workflow": self.p.PUBLISHER, "run_id": "201", "run_attempt": "1"}, "result": "success"}
+        original = self.p.publish_check(api, self.pr, "success", metadata)
+        guards = iter((True, False))
+        with self.assertRaises(self.p.StateChanged):
+            self.p.publish_check(api, self.pr, "success", metadata, guard=lambda: next(guards))
+        self.assertEqual(api.checks[0], original)
+        self.assertEqual(api.checks[-1]["status"], "completed")
+        self.assertEqual(api.checks[-1]["conclusion"], "failure")
+        self.assertTrue(all(method == "POST" for method, _, _ in api.mutations))
 
     def test_foreign_same_name_or_pr_collision_cannot_authorize_or_be_modified(self):
         api = CheckAPI()
@@ -252,14 +766,13 @@ class PublisherTests(unittest.TestCase):
         api.pr = original
         api.runs = [self.run]
         self.p.reconcile(api, 7, HERE.parents[1], context)
-        required = [row for row in api.checks if row["name"] == "Merge gate"]
-        self.assertEqual(len(required), 1)
-        self.assertEqual(required[0]["conclusion"], "success")
-        self.assertEqual(required[0]["head_sha"], self.head)
-        self.assertEqual(len(api.checks), 1)
+        self.assertEqual(api.checks[-1]["conclusion"], "success")
+        self.assertEqual(api.checks[-1]["head_sha"], self.head)
+        self.assertEqual(api.checks[0]["conclusion"], "failure", "historical terminal must remain unchanged")
         api.pr["mergeable"] = None
         self.p.reconcile(api, 7, HERE.parents[1], context)
-        self.assertEqual(next(row for row in api.checks if row["name"] == "Merge gate")["status"], "in_progress")
+        self.assertEqual(api.checks[-1]["status"], "in_progress")
+        self.assertIsNone(api.checks[-1].get("conclusion"))
 
     def test_terminal_failure_is_bound_to_exact_current_plan_not_only_shared_head(self):
         context = {"GITHUB_RUN_ID": "201", "GITHUB_RUN_ATTEMPT": "1"}
@@ -302,6 +815,25 @@ class PublisherTests(unittest.TestCase):
                 self.assertEqual(summary["result"], "pending")
                 self.assertEqual(summary["failed_prs"], [])
                 self.assertEqual(api.dispatches, 1)
+                if kind == "missing":
+                    self.assertIn("Re-run all jobs", summary["reason"])
+
+    def test_partial_without_current_receipt_cannot_reuse_old_success_and_explains_full_rerun(self):
+        api = self.api_fixture()
+        context = {"GITHUB_RUN_ID": "201", "GITHUB_RUN_ATTEMPT": "1"}
+        self.p.reconcile(api, 7, HERE.parents[1], context)
+        old = copy.deepcopy(api.checks)
+        original_pages = api.pages
+        def pages(endpoint, key):
+            values = original_pages(endpoint, key)
+            return [row for row in values if not row["name"].startswith("merge-gate-")] if key == "artifacts" else values
+        api.pages = pages
+        self.p.reconcile(api, 7, HERE.parents[1], {**context, "GITHUB_RUN_ID": "202"})
+        self.assertEqual(api.checks[:-1], old)
+        self.assertEqual(api.checks[-1]["conclusion"], "failure")
+        self.assertIn("Re-run all jobs", json.loads(api.checks[-1]["output"]["summary"])["reason"])
+        with self.assertRaises(ValueError):
+            self.p.verify_publisher(api, self.pr, {})
 
     def test_planning_failure_with_early_identity_is_red_only_for_its_exact_tree(self):
         self.run["conclusion"] = "failure"
@@ -409,12 +941,10 @@ class PublisherTests(unittest.TestCase):
         second = {**self.pr, "number": 8, "base": {**self.pr["base"], "ref": "stacked", "sha": "f" * 40}}
         self.p.publish_check(api, {**self.pr, "_check_sha": self.sha}, "success", {})
         self.p.publish_check(api, {**second, "_check_sha": "e" * 40}, "failure", {})
-        required = [row for row in api.checks if row["name"] == "Merge gate"]
-        self.assertEqual(len(required), 1)
-        self.assertEqual(required[0]["head_sha"], self.head)
-        self.assertEqual(required[0]["conclusion"], "failure")
+        self.assertTrue(all(row["head_sha"] == self.head for row in api.checks))
+        self.assertEqual(api.checks[-1]["conclusion"], "failure")
 
-    def test_prior_green_shared_head_new_target_blocks_and_close_recovers_one_source_row(self):
+    def test_prior_green_shared_head_new_target_blocks_and_close_recovers_current_generation(self):
         api = self.api_fixture()
         context = {"GITHUB_RUN_ID": "201", "GITHUB_RUN_ATTEMPT": "1"}
         self.p.reconcile(api, 7, HERE.parents[1], context)
@@ -424,23 +954,23 @@ class PublisherTests(unittest.TestCase):
         other["base"].update(ref="stacked", sha="f" * 40)
         api.extra_prs = [other]
         self.p.reconcile(api, 8, HERE.parents[1], context)
-        self.assertEqual(len(api.checks), 1)
-        self.assertEqual(api.checks[0]["id"], identifier)
-        self.assertEqual(api.checks[0]["status"], "in_progress")
-        metadata = json.loads(api.checks[0]["output"]["summary"])
+        self.assertGreater(api.checks[-1]["id"], identifier)
+        self.assertEqual(api.checks[0]["conclusion"], "success", "historical success is not the current generation")
+        self.assertEqual(api.checks[-1]["status"], "in_progress")
+        metadata = json.loads(api.checks[-1]["output"]["summary"])
         self.assertEqual(metadata["reason_code"], "source_head_intersection")
         self.assertEqual(metadata["result"], "pending")
         self.assertEqual(metadata["pending_prs"], [8])
         self.assertEqual([(target["pr"], target["result"]) for target in metadata["targets"]], [(7, "success"), (8, "pending")])
         other["base"]["ref"] = "retargeted"
         self.p.reconcile(api, 8, HERE.parents[1], context)
-        self.assertEqual(api.checks[0]["status"], "in_progress")
+        self.assertEqual(api.checks[-1]["status"], "in_progress")
         other["state"] = "closed"
         self.p.reconcile(api, 8, HERE.parents[1], context)
-        self.assertEqual(api.checks[0]["status"], "completed")
-        self.assertEqual(api.checks[0]["conclusion"], "success")
-        self.assertEqual(api.checks[0]["head_sha"], self.head)
-        self.assertEqual(len(api.checks), 1)
+        self.assertEqual(api.checks[-1]["status"], "completed")
+        self.assertEqual(api.checks[-1]["conclusion"], "success")
+        self.assertEqual(api.checks[-1]["head_sha"], self.head)
+        self.assertTrue(all(method == "POST" for method, _, _ in api.mutations))
 
     def test_new_target_during_publish_withdraws_previous_green_and_recomputes(self):
         api = self.api_fixture()
@@ -458,9 +988,8 @@ class PublisherTests(unittest.TestCase):
             return original_pages(endpoint, key)
         api.pages = pages
         self.p.reconcile(api, 7, HERE.parents[1], context)
-        self.assertEqual(len(api.checks), 1)
-        self.assertEqual(api.checks[0]["status"], "in_progress")
-        metadata = json.loads(api.checks[0]["output"]["summary"])
+        self.assertEqual(api.checks[-1]["status"], "in_progress")
+        metadata = json.loads(api.checks[-1]["output"]["summary"])
         self.assertEqual(metadata["reason_code"], "source_head_intersection")
         self.assertEqual(metadata["result"], "pending")
         self.assertEqual(metadata["pending_prs"], [8])
@@ -471,9 +1000,8 @@ class PublisherTests(unittest.TestCase):
         self.p.reconcile(api, 7, HERE.parents[1], context)
         api.pr["head"]["sha"] = "f" * 40
         self.p.reconcile(api, 7, HERE.parents[1], context)
-        self.assertEqual(len(api.checks), 1)
-        self.assertEqual(api.checks[0]["head_sha"], self.head)
-        self.assertEqual(api.checks[0]["status"], "in_progress")
+        self.assertTrue(all(row["head_sha"] == self.head for row in api.checks))
+        self.assertEqual(api.checks[-1]["status"], "in_progress")
 
     def test_pending_is_not_a_terminal_failure_and_ignores_mutable_repo_metadata(self):
         api = CheckAPI()
@@ -552,6 +1080,116 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(json.loads(outcome.read_text())["command_returncode"], 1)
             self.assertFalse((root / ".local/merge.lock").exists())
 
+    def test_blocked_premerge_never_prepares_or_sends_a_merge_at_any_locked_read(self):
+        for consuming, blocked_read in ((False, 1), (True, 1), (True, 2), (True, 3), (True, 4)):
+            with self.subTest(consuming=consuming, blocked_read=blocked_read), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                subprocess.run(["git", "init", "-q", str(root)], check=True)
+                api = self.api_fixture()
+                self.p.reconcile(api, 7, HERE.parents[1], {"GITHUB_RUN_ID": "201", "GITHUB_RUN_ATTEMPT": "1"})
+                api.writes.clear()
+                evidence, review, outcome = (root / name for name in ("review.txt", "review.json", "incident.json"))
+                evidence.write_text("Actual independent review fixture\n")
+                review.write_text(json.dumps({"result": "approved", "independent": True, "reviewer": "independent-fixture",
+                                              "head": self.head, "evidence_path": str(evidence),
+                                              "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}))
+                original_get, reads, sent = api.get, [], []
+                def get(endpoint):
+                    if endpoint == "pulls/7":
+                        reads.append(endpoint)
+                        self.assertTrue((root / ".local/merge.lock").is_dir())
+                        if len(reads) >= blocked_read:
+                            api.pr["mergeable_state"] = "blocked"
+                    return original_get(endpoint)
+                api.get = get
+                command = ["gh", "pr", "merge", "7", "--repo", REPO, "--merge", "--match-head-commit", self.head]
+                with self.assertRaisesRegex(ValueError, "blocked"):
+                    self.p.premerge(api, root, 7, self.head, 101, 2, consuming, command if consuming else [], review, outcome,
+                                    execute=lambda argv, cwd: sent.append(argv) or 1)
+                self.assertEqual(sent, [])
+                self.assertEqual(api.writes, [])
+                self.assertFalse(outcome.exists(), "blocked must not leave a merge write intent")
+                self.assertFalse((root / ".local/merge.lock").exists())
+
+    def test_premerge_cannot_consume_old_success_when_new_generation_arrives_under_held_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            api = self.api_fixture()
+            self.p.reconcile(api, 7, HERE.parents[1], {"GITHUB_RUN_ID": "201", "GITHUB_RUN_ATTEMPT": "1"})
+            original = copy.deepcopy(api.checks[0])
+            evidence, review, outcome = (root / name for name in ("review.txt", "review.json", "incident.json"))
+            evidence.write_text("Actual independent review fixture\n")
+            review.write_text(json.dumps({"result": "approved", "independent": True, "reviewer": "independent-fixture",
+                                          "head": self.head, "evidence_path": str(evidence),
+                                          "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}))
+            original_get, reads, sent = api.get, [], []
+            def get(endpoint):
+                if endpoint == "pulls/7":
+                    reads.append(endpoint)
+                    if len(reads) == 3:
+                        self.assertTrue((root / ".local/merge.lock").is_dir())
+                        api.write("POST", "check-runs", {"name": "Merge gate", "head_sha": self.head,
+                                  "external_id": self.p.external_id(self.pr), "status": "in_progress",
+                                  "output": {"title": "pending generation", "summary": json.dumps({"result": "pending"})}})
+                return original_get(endpoint)
+            api.get = get
+            command = ["gh", "pr", "merge", "7", "--repo", REPO, "--merge", "--match-head-commit", self.head]
+            with self.assertRaisesRegex(ValueError, "当前代次"):
+                self.p.premerge(api, root, 7, self.head, 101, 2, True, command, review, outcome,
+                                execute=lambda argv, cwd: sent.append(argv) or 1)
+            self.assertEqual(api.checks[0], original)
+            self.assertEqual(sent, [])
+            self.assertFalse(outcome.exists())
+            self.assertFalse((root / ".local/merge.lock").exists())
+
+    def test_actual_merge_child_output_is_bounded_decoded_and_durable_before_reconciliation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            api = self.api_fixture()
+            evidence, review, outcome = (root / name for name in ("review.txt", "review.json", "incident.json"))
+            evidence.write_text("Actual independent review fixture\n")
+            review.write_text(json.dumps({"result": "approved", "independent": True, "reviewer": "independent-fixture", "head": self.head,
+                                          "evidence_path": str(evidence), "evidence_sha256": hashlib.sha256(evidence.read_bytes()).hexdigest()}))
+            binary = root / "bin"
+            binary.mkdir()
+            child = binary / "gh"
+            child.write_text("#!" + sys.executable + "\nimport os,sys\n"
+                             "os.write(1,b'x'*70000+b'\\xff stdout tail')\n"
+                             "os.write(2,b'y'*70000+b'\\xfe stderr tail')\n"
+                             "sys.exit(1)\n")
+            child.chmod(0o700)
+            validation = {"identity": {key: self.receipt[key] for key in self.p.gate.IDENTITY}, "source": self.receipt["source"]}
+            command = ["gh", "pr", "merge", "7", "--repo", REPO, "--merge", "--match-head-commit", self.head]
+            original_get, observed = api.get, []
+            def get(endpoint):
+                if endpoint == "pulls/7" and outcome.exists():
+                    observed.append(json.loads(outcome.read_text()))
+                return original_get(endpoint)
+            api.get = get
+            console = io.StringIO()
+            with mock.patch.dict(os.environ, {"PATH": str(binary) + os.pathsep + os.environ["PATH"]}), redirect_stdout(console):
+                with self.assertRaises(self.p.UnknownMerge):
+                    with self.p.merge_lock(root):
+                        self.p.consume_operation(api, root, 7, self.head, validation, command, review, outcome)
+            self.assertEqual(len(observed), 1)
+            record = json.loads(outcome.read_text())
+            self.assertEqual(record["command_returncode"], 1)
+            for stream in ("stdout", "stderr"):
+                key = "command_" + stream
+                self.assertTrue(record.get(key, "").endswith("\ufffd " + stream + " tail"), "actual child output was lost")
+                self.assertLessEqual(len(record[key]), 65536)
+                self.assertIs(record[key + "_truncated"], True)
+                self.assertEqual(observed[0][key], record[key], "child output must survive a crash during remote reads")
+            self.assertEqual(console.getvalue(), "")
+            self.assertEqual(record["result"], "unknown")
+            self.assertTrue((root / ".local/merge.lock").is_dir())
+            api.pr.update(state="closed", merged=False)
+            load().reconcile_incident(api, root, outcome)
+            self.assertEqual(json.loads(outcome.read_text())["command_stderr"], record["command_stderr"])
+            self.assertFalse((root / ".local/merge.lock").exists())
+
     def test_unknown_submission_keeps_mkdir_lock_across_process_and_readonly_restart_reconciliation(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -590,6 +1228,27 @@ class PublisherTests(unittest.TestCase):
             with self.assertRaises((ValueError, OSError)):
                 fresh.reconcile_incident(api, root, outcome)
             self.assertTrue(lock.is_dir())
+
+    def test_legacy_incident_without_child_output_fields_keeps_readonly_terminal_reconciliation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            lock = self.p.shared_lock_path(root)
+            lock.mkdir(parents=True)
+            outcome = root / "legacy-incident.json"
+            owner = {"schema": 1, "token": "a" * 48, "inode": lock.stat().st_ino, "incident": str(outcome.resolve())}
+            self.p.durable_json(lock / "merge-gate-owner", owner, exclusive=True)
+            record = {"schema": 1, "result": "unknown", "submitted": True, "command_returncode": 1,
+                      "identity": {key: self.receipt[key] for key in self.p.gate.IDENTITY}, "source": self.receipt["source"],
+                      "lock": {"path": str(lock), "token": owner["token"], "inode": owner["inode"]}}
+            self.p.durable_json(outcome, record, exclusive=True)
+            api = self.api_fixture()
+            api.pr.update(state="closed", merged=False)
+            recovered = load().reconcile_incident(api, root, outcome)
+            self.assertEqual(recovered["result"], "not_merged")
+            self.assertNotIn("command_stdout", recovered)
+            self.assertFalse(lock.exists())
+            self.assertEqual(api.writes, [])
 
     def test_killed_before_send_recovers_only_dead_kernel_owner_and_unsubmitted_incident(self):
         script = r'''
@@ -729,14 +1388,14 @@ with p.merge_lock(root) as lock:
         newer = api.validations[103]["run"]
         newer["conclusion"] = "failure"
         self.p.reconcile(api, 7, HERE.parents[1], context)
-        summary = json.loads(api.checks[0]["output"]["summary"])
-        self.assertEqual(api.checks[0]["conclusion"], "failure")
+        summary = json.loads(api.checks[-1]["output"]["summary"])
+        self.assertEqual(api.checks[-1]["conclusion"], "failure")
         self.assertEqual(summary["failed_prs"], [8])
         self.assertEqual(summary["targets"][0]["result"], "success", "不能把兄弟目标的失败误归因给 PR 7")
         api.runs.remove(newer)
         other["base"]["sha"] = "3" * 40
         self.p.reconcile(api, 8, HERE.parents[1], context)
-        self.assertEqual(api.checks[0]["status"], "in_progress")
+        self.assertEqual(api.checks[-1]["status"], "in_progress")
 
     def test_no_options_and_unauthorized_command_fail_without_external_calls(self):
         result = subprocess.run(["python3", str(HERE / "merge-gate-publish.py"), "premerge"], capture_output=True)
@@ -765,6 +1424,8 @@ class CheckAPI:
     def __init__(self):
         self.checks = []
         self.writes = []
+        self.mutations = []
+        self.assigned_suite = 700
 
     def pages(self, endpoint, key):
         assert endpoint.startswith("commits/") and key == "check_runs"
@@ -773,8 +1434,10 @@ class CheckAPI:
 
     def write(self, method, endpoint, data):
         self.writes.append(endpoint)
+        self.mutations.append((method, endpoint, copy.deepcopy(data)))
         if method == "POST":
-            row = {**data, "id": max([9, *[r["id"] for r in self.checks]]) + 1, "app": {"id": 15368, "slug": "github-actions"}}
+            row = {**data, "id": max([9, *[r["id"] for r in self.checks]]) + 1, "app": {"id": 15368, "slug": "github-actions"},
+                   "check_suite": {"id": self.assigned_suite}}
             self.checks.append(row)
         else:
             row = next(row for row in self.checks if row["id"] == int(endpoint.rsplit("/", 1)[-1]))

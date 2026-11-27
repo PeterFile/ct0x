@@ -29,6 +29,7 @@ WORKFLOW = ".github/workflows/merge-gate.yml"
 PUBLISHER = ".github/workflows/merge-conflict.yml"
 APP_ID = 15368
 MAX_ARTIFACT = 16 * 1024 * 1024
+MAX_COMMAND_OUTPUT = 65536
 MAX_POLICY_CACHE_ENTRIES = 256
 MAX_POLICY_CACHE_BYTES = 4 * 1024 * 1024
 
@@ -130,6 +131,11 @@ def validate_live(pr, reviewed_head=None, consuming=False):
         check(pr["head"]["sha"] == sha(reviewed_head), "当前 head 不是已审查 head")
 
 
+def validate_unblocked(pr):
+    # Read/refresh operations keep validate_live's original readiness contract.
+    check(pr.get("mergeable_state") != "blocked", "GitHub 合并状态为 blocked；禁止准备合并意图或执行合并")
+
+
 def merge_state(pr, base, merge):
     valid = (merge is not None and merge.get("sha") == pr.get("merge_commit_sha") and
              [row.get("sha") for row in merge.get("parents", [])] == [base, pr["head"]["sha"]] and
@@ -168,9 +174,9 @@ def validate_proof(receipt, run, jobs, pr, master, merge, workflow_id):
           all(receipt.get(key) == value for key, value in expected.items()), "回执不属于此 PR/精确合并/run/attempt")
     check(isinstance(receipt.get("tasks"), list) and 0 < len(receipt["tasks"]) <= 256, "回执任务清单非法")
     expected_jobs = ["Merge plan", "Merge evidence", *["Merge tests / " + task["unit"] for task in receipt["tasks"]]]
-    check(len(jobs) == len(expected_jobs) and sorted(row["name"] for row in jobs) == sorted(expected_jobs), "显式工作任务缺失、重复或额外")
+    check(len(jobs) == len(expected_jobs) and sorted(row["name"] for row in jobs) == sorted(expected_jobs), "显式工作任务缺失、重复或额外" + gate.RERUN_ALL)
     check(all(row.get("status") == "completed" and row.get("conclusion") == "success" and
-              row.get("run_id") == run["id"] and row.get("run_attempt") == run["run_attempt"] for row in jobs), "任务取消/跳过/失败或尝试身份不符")
+              row.get("run_id") == run["id"] and row.get("run_attempt") == run["run_attempt"] for row in jobs), "任务取消/跳过/失败或尝试身份不符" + gate.RERUN_ALL)
     gate.finalize({**receipt, **expected}, {"plan": {"result": "success"}, "tests": {"result": "success"}}, receipt["evidence"])
     return expected
 
@@ -360,13 +366,14 @@ def proof(api, state, run_id, attempt, root):
     workflow = api.get("actions/workflows/merge-gate.yml")
     check(workflow["path"] == WORKFLOW and workflow["state"] == "active", "验证工作流未启用")
     artifacts = [row for row in api.pages(f"actions/runs/{run_id}/artifacts", "artifacts") if row["name"] == f"merge-gate-{run_id}-{attempt}"]
-    check(len(artifacts) == 1 and artifacts[0].get("expired") is False, "唯一回执 artifact 缺失/过期")
+    check(len(artifacts) == 1 and artifacts[0].get("expired") is False, "唯一回执 artifact 缺失/过期" + gate.RERUN_ALL)
     artifact = artifacts[0]
     check(artifact.get("workflow_run", {}).get("id") == run_id and artifact.get("size_in_bytes", MAX_ARTIFACT + 1) <= MAX_ARTIFACT, "artifact 远端运行身份/大小非法")
     receipt = decode_artifact(api.archive(artifact["id"]), artifact.get("digest"))
     if receipt.get("pr") != pr["number"] or receipt.get("source") != source_identity(pr):
         raise UnassignedRun("此原生运行属于同 head 的其他 PR/目标；需要受信精确树验证")
     jobs = api.pages(f"actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
+    jobs = normalize_validation_jobs(api, jobs, pr, exact)
     original = api.get("git/commits/" + sha(receipt["sha"]))
     # Establish the original external proof before deciding that it is merely stale.
     original_pr = {**pr, "base": {**pr["base"], "sha": receipt["base"]}, "merge_commit_sha": receipt["sha"], "mergeable": True}
@@ -395,7 +402,7 @@ def verify_failed_target(api, state, run):
     identity = [row for row in artifacts if row["name"] == f"merge-identity-{run_id}-{attempt}"]
     member, limit = ("merge-identity.json", 65536) if identity else ("merge-plan.json", MAX_ARTIFACT)
     artifacts = identity or [row for row in artifacts if row["name"] == f"merge-plan-{run_id}-{attempt}"]
-    check(len(artifacts) == 1 and artifacts[0].get("expired") is False, "失败运行缺少唯一精确初始身份/计划")
+    check(len(artifacts) == 1 and artifacts[0].get("expired") is False, "失败运行缺少唯一精确初始身份/计划" + gate.RERUN_ALL)
     artifact = artifacts[0]
     check(artifact.get("workflow_run", {}).get("id") == run_id and artifact.get("size_in_bytes", limit + 1) <= limit, "初始身份/计划远端运行身份/大小非法")
     plan = decode_artifact(api.archive(integer(artifact["id"])), artifact.get("digest"), member, limit)
@@ -428,6 +435,51 @@ def owned(row, pr):
             row.get("external_id") == external_id(pr) and row.get("head_sha") == check_sha(pr))
 
 
+def normalize_validation_jobs(api, jobs, pr, run):
+    """GitHub can echo an app-created CheckRun as a runnerless row in its assigned suite's jobs."""
+    native = []
+    for job in jobs:
+        # Expected native names are Merge plan, Merge evidence and Merge tests / <unit>, never Merge gate.
+        if job.get("name") != "Merge gate":
+            native.append(job)
+            continue
+        check(job.get("steps") == [] and job.get("labels") == [] and
+              all(key in job and job[key] is None for key in ("runner_id", "runner_name", "runner_group_id", "runner_group_name")),
+              "额外 Merge gate 任务有 runner/步骤或缺少空执行证明，不能过滤")
+        job_id = integer(job["id"])
+        api_root = f"https://api.github.com/repos/{REPO}"
+        check_url, html_url = f"{api_root}/check-runs/{job_id}", f"https://github.com/{REPO}/runs/{job_id}"
+        check(integer(job["run_id"]) == run["id"] and integer(job["run_attempt"]) == run["run_attempt"] and
+              job.get("head_sha") == run["head_sha"] == check_sha(pr) and job.get("head_branch") == run["head_branch"] and
+              job.get("run_url") == f"{api_root}/actions/runs/{run['id']}" and job.get("url") == f"{api_root}/actions/jobs/{job_id}" and
+              job.get("check_run_url") == check_url and job.get("html_url") == html_url and
+              sum(row.get("id") == job_id for row in jobs) == 1, "额外检查回显的运行、URL 或唯一身份不符")
+        custom = api.get(f"check-runs/{job_id}")
+        check(isinstance(custom, dict) and isinstance(custom.get("app"), dict) and owned(custom, pr) and
+              integer(custom["id"]) == job_id and custom.get("name") == "Merge gate" and custom.get("url") == check_url and
+              custom.get("html_url") == html_url and isinstance(job.get("node_id"), str) and job["node_id"] and
+              custom.get("node_id") == job["node_id"] and isinstance(custom.get("check_suite"), dict) and
+              custom["check_suite"].get("id") == integer(run.get("check_suite_id")), "无法认证自发布 CheckRun 回显的所有权/原生 suite 关联")
+        metadata = gate.verifier.decode(custom["output"]["summary"])
+        check(metadata.get("schema") == 1 and metadata.get("repo") == REPO and metadata.get("head") == check_sha(pr), "回显发布元数据身份不符")
+        # This check is source-head scoped; its historical projection need not contain today's PR/targets.
+        members, targets = metadata["membership"], metadata["targets"]
+        check(isinstance(members, list) and isinstance(targets, list) and len(members) == len(targets) and
+              all(isinstance(row, dict) for row in [*members, *targets]), "回显历史目标投影非法")
+        check(len({integer(row["pr"]) for row in members}) == len(members), "回显历史目标重复")
+        for member in members:
+            source = {key: member[key] for key in ("pr", "head", "head_ref", "head_repo_id", "head_repo", "base_ref")}
+            integer(source["head_repo_id"])
+            check(source["head"] == check_sha(pr) and re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", source["head_repo"]) and
+                  all(isinstance(source[key], str) and source[key] for key in ("head_ref", "base_ref")) and
+                  sum(all(row.get(key) == value for key, value in source.items()) for row in targets) == 1, "回显历史 PR/来源投影不一致")
+        sha(metadata["publisher"].get("workflow_sha"))
+        publisher = verify_publisher_run(api, metadata["publisher"], terminal=False, source_head=check_sha(pr))
+        check(publisher["status"] in ("in_progress", "completed"), "回显发布器没有实际执行身份")
+        # Classification only. The unchanged native proof and terminal publisher checks still authorize consumption.
+    return native
+
+
 def checks(api, pr):
     return [row for row in api.pages("commits/" + check_sha(pr) + "/check-runs?filter=all", "check_runs") if row["name"] == "Merge gate"]
 
@@ -437,7 +489,8 @@ def log_check(row, pr, metadata):
     publisher = metadata.get("publisher", {})
     record = {"event": "merge_check_published", "repo": REPO, "pr": pr["number"], "head": pr["head"]["sha"],
               "base": identity.get("base", pr["base"]["sha"]), "validated_sha": identity.get("sha"), "tree": identity.get("tree"),
-              "check_id": row["id"], "target_sha": row.get("head_sha", check_sha(pr)), "name": row.get("name", "Merge gate"),
+              "check_id": row["id"], "check_suite_id": row.get("check_suite", {}).get("id"),
+              "target_sha": row.get("head_sha", check_sha(pr)), "name": row.get("name", "Merge gate"),
               "status": row.get("status"), "conclusion": row.get("conclusion"),
               "publisher_run_id": publisher.get("run_id"), "publisher_run_attempt": publisher.get("run_attempt"),
               "validation_run_id": identity.get("run_id"), "validation_run_attempt": identity.get("run_attempt")}
@@ -457,9 +510,6 @@ def publish_check(api, pr, conclusion, metadata, guard=lambda: True):
     existing = checks(api, pr)
     check(all(owned(row, pr) for row in existing), "同名检查存在其他 PR/写入者，拒绝碰撞授权")
     existing.sort(key=lambda row: integer(row["id"]))
-    for duplicate in existing[1:]:
-        state_check(guard(), "发布前 PR/运行已变化")
-        api.write("PATCH", "check-runs/" + str(duplicate["id"]), {"name": "Merge reporter superseded", "status": "completed", "conclusion": "neutral"})
     output = {"title": {"success": "合并验证通过", "failure": "合并已阻塞", "pending": "等待合并验证"}[conclusion],
               "summary": json.dumps(metadata, sort_keys=True, ensure_ascii=True)}
     data = {"name": "Merge gate", "external_id": external_id(pr), "status": "in_progress" if conclusion == "pending" else "completed", "output": output}
@@ -469,17 +519,28 @@ def publish_check(api, pr, conclusion, metadata, guard=lambda: True):
     if identity:
         data["details_url"] = f"https://github.com/{REPO}/actions/runs/{identity['run_id']}/attempts/{identity['run_attempt']}"
     state_check(guard(), "发布前 PR/运行已变化")
-    if existing:
-        row = existing[0]
-        if not all(row.get(key) == value for key, value in data.items()):
-            row = api.write("PATCH", "check-runs/" + str(integer(row["id"])), data)
-            log_check(row, pr, metadata)
-    else:
+    row = existing[-1] if existing else None
+    unchanged = (row is not None and all(row.get(key) == value for key, value in data.items() if key != "output") and
+                 all(row.get("output", {}).get(key) == value for key, value in output.items()))
+    if not unchanged:
+        # POST returns the actual suite assignment. The native publisher job's suite is not a selector.
+        # Never mutate historical generations merely because their source head matches.
         row = api.write("POST", "check-runs", {**data, "head_sha": check_sha(pr)})
         log_check(row, pr, metadata)
     if not guard():
-        stale = {**metadata, "result": "pending", "reason": "发布期间身份变化，旧成功不可消费"}
-        row = api.write("PATCH", "check-runs/" + str(integer(row["id"])), {"status": "in_progress", "output": {"title": "等待并发变化后的验证", "summary": json.dumps(stale, ensure_ascii=True)}})
+        stale = {key: value for key, value in metadata.items() if key != "validation"}
+        stale.update(result="pending", reason_code="source_state_changed", reason="发布期间身份变化，旧成功不可消费")
+        if "targets" in stale:
+            stale["targets"] = [{**{key: value for key, value in target.items() if key != "validation"},
+                                 "result": "pending", "verification": False} for target in stale["targets"]]
+            stale.update(failed_prs=[], pending_prs=[target["pr"] for target in stale["targets"]])
+        withdrawn = {**data, "status": "completed", "conclusion": "failure",
+                     "output": {"title": "等待并发变化后的验证", "summary": json.dumps(stale, ensure_ascii=True)}}
+        if unchanged:
+            row = api.write("POST", "check-runs", {**withdrawn, "head_sha": check_sha(pr)})
+        else:
+            # Only this call's new row can be invalidated, and completed never becomes active again.
+            row = api.write("PATCH", "check-runs/" + str(integer(row["id"])), withdrawn)
         log_check(row, pr, stale)
         raise StateChanged("发布期间身份变化；已撤回成功")
     return row
@@ -602,7 +663,8 @@ def reconcile(api, number, root, context, retries=1):
     targets = source_targets(api, head)
     membership = [target_details(pr) for pr in targets]
     existing = checks(api, requested)
-    previous = [gate.verifier.decode(row["output"]["summary"]) for row in existing if owned(row, requested)]
+    owned_rows = [row for row in existing if owned(row, requested)]
+    previous = [gate.verifier.decode(max(owned_rows, key=lambda row: integer(row["id"]))["output"]["summary"])] if owned_rows else []
     if not targets and not existing:
         return None
     visible = targets[0] if targets else requested
@@ -762,27 +824,50 @@ def validate_command(command, number, reviewed_head):
 
 def verify_publisher(api, pr, validation):
     rows = checks(api, pr)
-    check(len(rows) == 1 and owned(rows[0], pr) and rows[0].get("status") == "completed" and rows[0].get("conclusion") == "success", "唯一可信 Merge gate 未明确成功")
-    metadata = gate.verifier.decode(rows[0]["output"]["summary"])
+    check(rows and all(owned(row, pr) for row in rows), "可信 Merge gate 缺失或同名检查写入者不符")
+    # Local generation selection does not prove GitHub's cross-suite ruleset rollup.
+    current = max(rows, key=lambda row: integer(row["id"]))
+    check(current.get("status") == "completed" and current.get("conclusion") == "success", "当前代次 Merge gate 未明确成功；历史成功不可消费")
+    metadata = gate.verifier.decode(current["output"]["summary"])
     target = [row for row in metadata.get("targets", []) if row.get("pr") == pr["number"]]
     check(metadata.get("repo") == REPO and metadata.get("head") == pr["head"]["sha"] and metadata.get("result") == "success" and
           len(target) == 1 and target[0].get("result") == "success" and target[0].get("verification") is True and
           target[0].get("validation") == validation, "远端已发布交集不包含此目标的精确已验证回执")
-    publisher = metadata["publisher"]
+    verify_publisher_run(api, metadata["publisher"])
+    return metadata
+
+
+def verify_publisher_run(api, publisher, terminal=True, source_head=None):
     check(publisher["workflow"] == PUBLISHER, "发布者路径不符")
     for field in ("run_id", "run_attempt"):
         check(re.fullmatch(r"[1-9][0-9]{0,63}", publisher[field]) is not None, "发布者运行身份非法")
     run = api.get(f"actions/runs/{publisher['run_id']}")
     exact = api.get(f"actions/runs/{publisher['run_id']}/attempts/{publisher['run_attempt']}")
     workflow = api.get("actions/workflows/merge-conflict.yml")
-    check(run["run_attempt"] == int(publisher["run_attempt"]) and exact["id"] == int(publisher["run_id"]) and
+    # A rerun cannot revoke a historical row's ownership; only terminal authority must still be latest.
+    attempt_valid = (run["run_attempt"] == int(publisher["run_attempt"]) if terminal else
+                     run["id"] == int(publisher["run_id"]) and integer(run["run_attempt"]) >= int(publisher["run_attempt"]))
+    check(attempt_valid and exact["id"] == int(publisher["run_id"]) and
           exact["run_attempt"] == int(publisher["run_attempt"]) and exact["path"] == PUBLISHER and exact["workflow_id"] == workflow["id"] and
           workflow["path"] == PUBLISHER and exact["repository"]["full_name"] == REPO and exact["event"] in ("pull_request_target", "workflow_run") and
-          exact["status"] == "completed" and exact["conclusion"] == "success", "发布器远端 provenance 不完整或尚未完成")
+          (not terminal or exact["status"] == "completed" and exact["conclusion"] == "success"), "发布器远端 provenance 不完整或尚未完成")
     master = sha(api.get("git/ref/heads/master")["object"]["sha"])
-    check(ancestor(api, sha(exact["head_sha"]), master) and
-          (publisher.get("workflow_sha") is None or publisher["workflow_sha"] == exact["head_sha"]), "发布器不是已发布默认分支的工作流代码")
-    return metadata
+    if not terminal and exact["event"] == "pull_request_target":
+        # REST exposes the event's source head, not the base-owned workflow/checkout commit.
+        policy = sha(publisher["workflow_sha"])
+        associated = [row for row in exact.get("pull_requests", [])
+                      if integer(row["number"]) and row["head"]["sha"] == exact["head_sha"] == sha(source_head) and
+                      row["head"]["ref"] == exact["head_branch"] and
+                      row["head"]["repo"]["id"] == integer(exact["head_repository"]["id"]) and
+                      row["head"]["repo"]["url"] == "https://api.github.com/repos/" + exact["head_repository"]["full_name"] and
+                      row["base"]["ref"] == "master" and row["base"]["sha"] == policy and
+                      row["base"]["repo"]["id"] == integer(exact["repository"]["id"]) and
+                      row["base"]["repo"]["url"] == "https://api.github.com/repos/" + REPO]
+        check(len(associated) == 1 and ancestor(api, policy, master), "回显发布器的嵌入来源/目标或固定 master 工作流身份不符")
+    else:
+        check(ancestor(api, sha(exact["head_sha"]), master) and
+              (publisher.get("workflow_sha") is None or publisher["workflow_sha"] == exact["head_sha"]), "发布器不是已发布默认分支的工作流代码")
+    return exact
 
 
 def refresh(api, pr):
@@ -803,10 +888,16 @@ def consume_operation(api, root, number, reviewed_head, validation, command, rev
           all(k not in approval or approval[k] == identity[k] for k in ("base", "tree")), "独立审查必须批准此 head；审查明确限定的 base/tree 也必须匹配，CI 不是独立审查")
     evidence = Path(approval["evidence_path"])
     check(evidence.is_file() and hashlib.sha256(evidence.read_bytes()).hexdigest() == approval["evidence_sha256"], "独立审查原始证据缺失或摘要不匹配；禁止自建批准代替实际审查")
+    current = snapshot(api, number)
+    validate_live(current[0], reviewed_head, consuming=True)
+    validate_unblocked(current[0])
+    check(merge_state(*current) == "ready" and current[1] == identity["base"] and
+          current[2]["sha"] == identity["sha"] and current[2]["tree"]["sha"] == identity["tree"] and
+          source_identity(current[0]) == validation["source"], "发送前精确合并身份已变化，未准备合并意图")
     lock = shared_lock_path(root)
     owner = gate.read_json(lock / "merge-gate-owner")
     record = {"schema": 1, "result": "unknown", "submitted": False, "identity": identity, "source": validation["source"],
-              "reviewer": approval["reviewer"], "command_returncode": None,
+              "reviewer": approval["reviewer"], "command_returncode": None, "command_stdout": None, "command_stderr": None,
               "lock": {"path": str(lock), **{key: owner[key] for key in ("token", "inode", "lease_inode") if key in owner}}}
     durable_json(outcome, record, exclusive=True)
     owner["incident"] = str(Path(outcome).resolve())
@@ -815,10 +906,19 @@ def consume_operation(api, root, number, reviewed_head, validation, command, rev
         record["submitted"] = True
         durable_json(outcome, record)
         try:
-            record["command_returncode"] = subprocess.run(command, cwd=root, capture_output=True).returncode if execute is None else execute(command, root)
+            if execute is None:
+                child = subprocess.run(command, cwd=root, capture_output=True)
+                record["command_returncode"] = child.returncode
+                for stream in ("stdout", "stderr"):
+                    data = getattr(child, stream)
+                    record["command_" + stream] = data[-MAX_COMMAND_OUTPUT:].decode("utf-8", errors="replace")
+                    record["command_" + stream + "_truncated"] = len(data) > MAX_COMMAND_OUTPUT
+            else:
+                record["command_returncode"] = execute(command, root)
         except (FileNotFoundError, PermissionError):
             record.update(result="not_submitted", submitted=False)
             raise ValueError("合并进程未启动，未发送远端操作")
+        durable_json(outcome, record)
         record.update(remote_outcome(api, record))
         check(record["result"] != "unknown", "远端仍未返回终态")
     except BaseException as error:
@@ -926,6 +1026,7 @@ def premerge(api, root, number, reviewed_head, run_id, attempt, consume, command
             verified.append((target_state, identity))
         current = snapshot(api, number)
         validate_live(current[0], reviewed_head, consuming=True)
+        validate_unblocked(current[0])
         if fingerprint(current) != fingerprint(state):
             if consume and current[1] != state[1]:
                 refresh(api, current[0])
@@ -935,9 +1036,13 @@ def premerge(api, root, number, reviewed_head, run_id, attempt, consume, command
         # Recompute each target's latest authority under the same held lock immediately before consumption.
         for target_state, identity in verified:
             final = snapshot(api, target_state[0]["number"])
+            validate_live(final[0], reviewed_head, consuming=final[0]["number"] == number)
+            if final[0]["number"] == number:
+                validate_unblocked(final[0])
             check(fingerprint(final) == fingerprint(target_state), "共享目标在消费前发生变化")
             verify_latest(api, final, receipt_integer(identity["run_id"]), receipt_integer(identity["run_attempt"]))
         check([target_details(pr) for pr in source_targets(api, reviewed_head)] == membership, "消费前共享目标成员变化")
+        verify_publisher(api, current[0], validation)
         if consume:
             check(review is not None and outcome is not None, "消费必须提供独立审查和结果回执路径")
             consume_operation(api, root, number, reviewed_head, validation, command, review, outcome, execute)

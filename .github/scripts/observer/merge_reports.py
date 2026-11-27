@@ -1,4 +1,4 @@
-"""Read-only intake of the trusted publisher's unique source-head Merge gate Check.
+"""Read-only intake of the trusted publisher's current source-head Merge gate Check.
 
 Call exclusively for publisher attempts in the existing receiver hot set. Matrix
 job names are candidates, never routing authority. Each PR is independently
@@ -303,6 +303,23 @@ def parse_check(observer, run, pr, check):
     return metadata
 
 
+def current_check(observer, head):
+    rows = pages(observer, observer.root + f"/commits/{head}/check-runs?filter=all", "check_runs")
+    require(all(isinstance(row, dict) for row in rows))
+    checks = [row for row in rows if row.get("name") == "Merge gate"]
+    for check in checks:
+        app = mapping(check.get("app"))
+        require(positive(check.get("id")) and check.get("head_sha") == head and
+                type(app.get("id")) is int and app["id"] == 15368 and app.get("slug") == "github-actions",
+                "同名 Merge gate 的数值身份、来源或写入者不符")
+        url(check.get("html_url"), observer.repo, f"runs/{check['id']}", check=True)
+        # Historical v1 remains single-row only; generations must share v2 ownership.
+        require(len(checks) == 1 or check.get("external_id") == f"merge-gate:v2:{observer.repo}:source:{head}",
+                "多代 Merge gate 没有唯一同源 v2 身份")
+    require(len({check["id"] for check in checks}) == len(checks), "Merge gate 代次数值身份重复，保持未知")
+    return max(checks, key=lambda check: check["id"]) if checks else None
+
+
 def discover(observer, run):
     key = f"merge-report:{observer.repo}:{run['id']}:{run['run_attempt']}"
     cached = observer.store.meta_get(key)
@@ -329,14 +346,11 @@ def discover(observer, run):
         require(pr["number"] == number)
         if pr["state"] != "open" or pr.get("merged", False) or pr.get("merged_at") is not None:
             continue
-        rows = pages(observer, observer.root + f"/commits/{pr['head']['sha']}/check-runs?filter=all", "check_runs")
-        require(all(isinstance(row, dict) for row in rows))
-        checks = [row for row in rows if row.get("name") == "Merge gate"]
-        require(len(checks) <= 1, "存在多个同名 Merge gate，拒绝重复或碰撞归属")
-        if checks:
-            metadata = parse_check(observer, run, pr, checks[0])
+        check = current_check(observer, pr["head"]["sha"])
+        if check is not None:
+            metadata = parse_check(observer, run, pr, check)
             if metadata is not None:
-                matches.append((pr, checks[0], metadata))
+                matches.append((pr, check, metadata))
     if matches and all("membership" in metadata for _, _, metadata in matches):
         # The same source-owned Check can appear under several live PRs. It is
         # one authenticated publication; distinct Checks remain ambiguous.
@@ -355,11 +369,9 @@ def matrix_check(observer, run, number):
     validate_pr(observer, candidate, repository, allow_closed=True)
     require(candidate["number"] == number)
     target = candidate["head"]["sha"]
-    rows = pages(observer, observer.root + f"/commits/{target}/check-runs?filter=all", "check_runs")
-    require(all(isinstance(row, dict) for row in rows))
-    checks = [row for row in rows if row.get("name") == "Merge gate"]
-    require(len(checks) == 1 and checks[0].get("head_sha") == target, "此来源提交没有唯一 Merge gate，保持未知")
-    claimed = check_metadata(checks[0])
+    check = current_check(observer, target)
+    require(check is not None, "此来源提交没有当前 Merge gate，保持未知")
+    claimed = check_metadata(check)
     require(positive(claimed.get("pr")))
     if "membership" in claimed:
         members = claimed["membership"]
@@ -375,9 +387,9 @@ def matrix_check(observer, run, number):
     else:
         pr = live_pr(observer, claimed["pr"], repository)
     require(pr["head"]["sha"] == target, "Check 指向的当前 PR 不属于作业候选来源提交")
-    metadata = parse_check(observer, run, pr, checks[0])
+    metadata = parse_check(observer, run, pr, check)
     require(metadata is not None, "此来源的 Merge gate 不属于本次 publisher run/attempt")
-    return pr, checks[0], metadata
+    return pr, check, metadata
 
 
 def branch(observer, ref):
@@ -549,6 +561,65 @@ def validation_receipt(observer, native, proof=None):
     return receipt
 
 
+def validation_jobs(observer, pr, native):
+    """Exclude only REST-authenticated custom Check echoes, never native work."""
+    jobs = pages(observer, observer.root + f"/actions/runs/{native['id']}/attempts/{native['run_attempt']}/jobs", "jobs")
+    require(all(isinstance(job, dict) for job in jobs))
+    counts = {}
+    for job in jobs:
+        if positive(job.get("id")):
+            counts[job["id"]] = counts.get(job["id"], 0) + 1
+    result = []
+    for job in jobs:
+        if job.get("name") != "Merge gate":
+            result.append(job)
+            continue
+        require(job.get("steps") == [] and job.get("labels") == [] and
+                all(key in job and job[key] is None for key in ("runner_id", "runner_name", "runner_group_id", "runner_group_name")),
+                "额外 Merge gate 作业没有完整的无 runner 空执行证明")
+        identity = job.get("id")
+        require(positive(identity) and counts[identity] == 1 and positive(job.get("run_id")) and job["run_id"] == native["id"] and
+                positive(job.get("run_attempt")) and job["run_attempt"] == native["run_attempt"] and
+                job.get("head_sha") == native["head_sha"] == pr["head"]["sha"] and job.get("head_branch") == native["head_branch"],
+                "检查回显没有唯一的精确运行和来源身份")
+        api_root = f"https://api.github.com/repos/{observer.repo}"
+        check_url = f"{api_root}/check-runs/{identity}"
+        html_url = f"https://github.com/{observer.repo}/runs/{identity}"
+        require(job.get("run_url") == f"{api_root}/actions/runs/{native['id']}" and
+                job.get("url") == f"{api_root}/actions/jobs/{identity}" and job.get("check_run_url") == check_url and
+                job.get("html_url") == html_url and isinstance(job.get("node_id"), str) and bool(job["node_id"]),
+                "检查回显的 API、页面或节点身份不完整")
+        check = mapping(observer.api.get(observer.root + f"/check-runs/{identity}"))
+        app, suite = mapping(check.get("app")), mapping(check.get("check_suite"))
+        require(positive(check.get("id")) and check["id"] == identity and check.get("name") == "Merge gate" and
+                check.get("head_sha") == pr["head"]["sha"] and
+                check.get("external_id") == f"merge-gate:v2:{observer.repo}:source:{pr['head']['sha']}" and
+                type(app.get("id")) is int and app["id"] == 15368 and app.get("slug") == "github-actions" and
+                check.get("url") == check_url and check.get("html_url") == html_url and check.get("node_id") == job["node_id"] and
+                positive(native.get("check_suite_id")) and positive(suite.get("id")) and suite["id"] == native["check_suite_id"],
+                "无法核实检查回显的同源 App、节点或原生 suite 关联")
+        metadata = check_metadata(check)
+        require(type(metadata.get("schema")) is int and metadata["schema"] == 1 and metadata.get("repo") == observer.repo and
+                metadata.get("head") == pr["head"]["sha"])
+        expected = {key: value for key, value in target_details(pr).items() if key not in ("base", "draft")}
+        for field in ("membership", "targets"):
+            rows = metadata.get(field)
+            require(isinstance(rows, list) and 0 < len(rows) <= 50000 and all(isinstance(row, dict) for row in rows) and
+                    sum(all(type(row.get(key)) is type(value) and row.get(key) == value for key, value in expected.items())
+                        for row in rows) == 1, "检查回显没有唯一匹配的 PR/source 身份")
+        publisher = mapping(metadata.get("publisher"))
+        require(publisher.get("workflow") == PUBLISHER and sha(publisher.get("workflow_sha")))
+        run_id, attempt = decimal(publisher.get("run_id")), decimal(publisher.get("run_attempt"))
+        issuer = mapping(observer.api.get(observer.root + f"/actions/runs/{run_id}"))
+        require(positive(issuer.get("run_attempt")) and issuer["run_attempt"] >= attempt)
+        if issuer["run_attempt"] > attempt:
+            issuer = mapping(observer.api.get(observer.root + f"/actions/runs/{run_id}/attempts/{attempt}"))
+        require(issuer.get("id") == run_id and issuer.get("run_attempt") == attempt and issuer.get("head_sha") == publisher["workflow_sha"])
+        publisher_run(observer, issuer)
+        # This authenticates classification only, not the Check's current verdict.
+    return result
+
+
 def verify_evidence(observer, pr, native, proof):
     receipt = validation_receipt(observer, native, proof)
     identity = proof["identity"]
@@ -570,7 +641,7 @@ def verify_evidence(observer, pr, native, proof):
                 "逐任务证据不属于此 PR/run/attempt/合并树")
         observed.append(row.get("unit"))
     require(all(isinstance(unit, str) for unit in observed) and sorted(observed) == sorted(units))
-    jobs = pages(observer, observer.root + f"/actions/runs/{native['id']}/attempts/{native['run_attempt']}/jobs", "jobs")
+    jobs = validation_jobs(observer, pr, native)
     expected = ["Merge plan", "Merge evidence", *["Merge tests / " + unit for unit in units]]
     require(len(jobs) == len(expected) and all(isinstance(job, dict) and isinstance(job.get("name"), str) for job in jobs) and
             sorted(job["name"] for job in jobs) == sorted(expected) and len({job.get("id") for job in jobs if positive(job.get("id"))}) == len(jobs))
@@ -663,7 +734,7 @@ def terminal_validation_failure(observer, pr, target, members):
     require(commit["tree"]["sha"] == target["tree"] and
             [parent["sha"] for parent in commit["parents"]] == [pr["base"]["sha"], pr["head"]["sha"]])
     latest_authority(observer, pr, target, exact, members)
-    jobs = pages(observer, observer.root + f"/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
+    jobs = validation_jobs(observer, pr, exact)
     require(jobs and all(mapping(job).get("status") == "completed" and reporter_origin(observer, exact, job, False) == "current"
                          for job in jobs) and any(job.get("conclusion") in ("failure", "cancelled", "timed_out", "action_required", "startup_failure") for job in jobs),
             "没有属于此 PR 精确 attempt 的真实失败作业")
@@ -750,6 +821,10 @@ def publish_target(observer, run, job, pr, check, metadata, deliver):
             authority = mapping(target["authority"])
             native = mapping(observer.api.get(observer.root + f"/actions/runs/{authority['id']}"))
             latest_authority(observer, pr, target, native, metadata["membership"])
+    latest = current_check(observer, pr["head"]["sha"])
+    require(latest is not None and latest["id"] == check["id"] and parse_check(observer, run, pr, latest) == metadata and
+            all(latest.get(key) == final_check.get(key) for key in ("head_sha", "external_id", "status", "conclusion")),
+            "Merge gate 当前代次在校验期间变化，禁止投递历史结果")
     require(author == observer.store.author(observer.repo, pr["number"]), "校验期间作者指派变化，重新核实首报回执后再投递")
     check_key = f"@merge-check-{check['id']}" + (f"-pr-{pr['number']}" if "membership" in metadata else "")
     key = Key(observer.repo, pr["head"]["sha"], run["id"], run["run_attempt"], check_key)
