@@ -5,6 +5,7 @@ job names are candidates, never routing authority. Each PR is independently
 verified, persisted and delivered; legacy discovery remains once per attempt.
 Native merge-gate job failures remain the existing observer path's responsibility.
 """
+from collections import Counter
 from datetime import datetime, timezone
 import hashlib
 import io
@@ -606,76 +607,77 @@ def validation_receipt(observer, native, proof=None):
     return receipt
 
 
+def authenticate_check_echo(observer, head, run, job, counts):
+    """Authenticate classification only, never the Check's current routing authority."""
+    require(job.get("steps") == [] and job.get("labels") == [] and
+            all(key in job and job[key] is None for key in ("runner_id", "runner_name", "runner_group_id", "runner_group_name")),
+            "额外 Merge gate 作业没有完整的无 runner 空执行证明")
+    identity = job.get("id")
+    require(positive(identity) and counts[identity] == 1 and positive(job.get("run_id")) and job["run_id"] == run["id"] and
+            positive(job.get("run_attempt")) and job["run_attempt"] == run["run_attempt"] and
+            job.get("head_sha") == run["head_sha"] == head and job.get("head_branch") == run["head_branch"],
+            "检查回显没有唯一的精确运行和来源身份")
+    api_root = f"https://api.github.com/repos/{observer.repo}"
+    check_url = f"{api_root}/check-runs/{identity}"
+    html_url = f"https://github.com/{observer.repo}/runs/{identity}"
+    require(job.get("run_url") == f"{api_root}/actions/runs/{run['id']}" and
+            job.get("url") == f"{api_root}/actions/jobs/{identity}" and job.get("check_run_url") == check_url and
+            job.get("html_url") == html_url and isinstance(job.get("node_id"), str) and bool(job["node_id"]),
+            "检查回显的 API、页面或节点身份不完整")
+    check = mapping(observer.api.get(observer.root + f"/check-runs/{identity}"))
+    app, suite = mapping(check.get("app")), mapping(check.get("check_suite"))
+    require(positive(check.get("id")) and check["id"] == identity and check.get("name") == "Merge gate" and
+            check.get("head_sha") == head and
+            check.get("external_id") == f"merge-gate:v2:{observer.repo}:source:{head}" and
+            type(app.get("id")) is int and app["id"] == 15368 and app.get("slug") == "github-actions" and
+            check.get("url") == check_url and check.get("html_url") == html_url and check.get("node_id") == job["node_id"] and
+            positive(run.get("check_suite_id")) and positive(suite.get("id")) and suite["id"] == run["check_suite_id"],
+            "无法核实检查回显的同源 App、节点或原生 suite 关联")
+    metadata = check_metadata(check)
+    require(type(metadata.get("schema")) is int and metadata["schema"] == 1 and metadata.get("repo") == observer.repo and
+            metadata.get("head") == head)
+    members, targets = metadata.get("membership"), metadata.get("targets")
+    require(isinstance(members, list) and isinstance(targets, list) and len(members) == len(targets) <= 50000 and
+            all(isinstance(row, dict) for row in [*members, *targets]))
+    if not members:
+        require(positive(metadata.get("pr")) and metadata.get("reason_code") == "source_head_intersection" and
+                metadata.get("result") == "pending" and metadata.get("failed_prs") == [] and metadata.get("pending_prs") == [] and
+                check.get("status") == "in_progress" and check.get("conclusion") is None,
+                "空历史交集必须是无失败或待定目标的 pending 发布投影")
+    numbers = [member.get("pr") for member in members]
+    require(all(positive(number) for number in numbers) and len(set(numbers)) == len(numbers))
+    # An old source-owned publication authenticates its own cohort, not today's PRs or refs.
+    for member in members:
+        require(member.get("head") == check["head_sha"] and sha(member.get("base")) and type(member.get("draft")) is bool and
+                set(member) == {"pr", "head", "head_ref", "head_repo_id", "head_repo", "base_ref", "base", "draft"})
+        repo_identity(dict(id=member.get("head_repo_id"), full_name=member.get("head_repo")))
+        require(all(isinstance(member.get(key), str) and 0 < len(member[key]) <= 1024 and
+                    not re.search(r"[\x00-\x20\x7f\ud800-\udfff]", member[key]) for key in ("head_ref", "base_ref")))
+        require(sum(all(type(row.get(key)) is type(value) and row.get(key) == value for key, value in member.items())
+                    for row in targets) == 1, "历史检查回显的 membership/target source 身份不一致")
+    publisher = mapping(metadata.get("publisher"))
+    require(publisher.get("workflow") == PUBLISHER and sha(publisher.get("workflow_sha")))
+    run_id, attempt = decimal(publisher.get("run_id")), decimal(publisher.get("run_attempt"))
+    issuer = mapping(observer.api.get(observer.root + f"/actions/runs/{run_id}"))
+    require(positive(issuer.get("id")) and issuer["id"] == run_id and
+            positive(issuer.get("run_attempt")) and issuer["run_attempt"] >= attempt)
+    if issuer["run_attempt"] > attempt:
+        issuer = mapping(observer.api.get(observer.root + f"/actions/runs/{run_id}/attempts/{attempt}"))
+    require(issuer.get("id") == run_id and issuer.get("run_attempt") == attempt)
+    publisher_run(observer, issuer, publisher["workflow_sha"], check["head_sha"])
+
+
 def validation_jobs(observer, pr, native):
     """Exclude only REST-authenticated custom Check echoes, never native work."""
     jobs = pages(observer, observer.root + f"/actions/runs/{native['id']}/attempts/{native['run_attempt']}/jobs", "jobs")
     require(all(isinstance(job, dict) for job in jobs))
-    counts = {}
-    for job in jobs:
-        if positive(job.get("id")):
-            counts[job["id"]] = counts.get(job["id"], 0) + 1
+    counts = Counter(job["id"] for job in jobs if positive(job.get("id")))
     result = []
     for job in jobs:
-        if job.get("name") != "Merge gate":
+        if job.get("name") == "Merge gate":
+            authenticate_check_echo(observer, pr["head"]["sha"], native, job, counts)
+        else:
             result.append(job)
-            continue
-        require(job.get("steps") == [] and job.get("labels") == [] and
-                all(key in job and job[key] is None for key in ("runner_id", "runner_name", "runner_group_id", "runner_group_name")),
-                "额外 Merge gate 作业没有完整的无 runner 空执行证明")
-        identity = job.get("id")
-        require(positive(identity) and counts[identity] == 1 and positive(job.get("run_id")) and job["run_id"] == native["id"] and
-                positive(job.get("run_attempt")) and job["run_attempt"] == native["run_attempt"] and
-                job.get("head_sha") == native["head_sha"] == pr["head"]["sha"] and job.get("head_branch") == native["head_branch"],
-                "检查回显没有唯一的精确运行和来源身份")
-        api_root = f"https://api.github.com/repos/{observer.repo}"
-        check_url = f"{api_root}/check-runs/{identity}"
-        html_url = f"https://github.com/{observer.repo}/runs/{identity}"
-        require(job.get("run_url") == f"{api_root}/actions/runs/{native['id']}" and
-                job.get("url") == f"{api_root}/actions/jobs/{identity}" and job.get("check_run_url") == check_url and
-                job.get("html_url") == html_url and isinstance(job.get("node_id"), str) and bool(job["node_id"]),
-                "检查回显的 API、页面或节点身份不完整")
-        check = mapping(observer.api.get(observer.root + f"/check-runs/{identity}"))
-        app, suite = mapping(check.get("app")), mapping(check.get("check_suite"))
-        require(positive(check.get("id")) and check["id"] == identity and check.get("name") == "Merge gate" and
-                check.get("head_sha") == pr["head"]["sha"] and
-                check.get("external_id") == f"merge-gate:v2:{observer.repo}:source:{pr['head']['sha']}" and
-                type(app.get("id")) is int and app["id"] == 15368 and app.get("slug") == "github-actions" and
-                check.get("url") == check_url and check.get("html_url") == html_url and check.get("node_id") == job["node_id"] and
-                positive(native.get("check_suite_id")) and positive(suite.get("id")) and suite["id"] == native["check_suite_id"],
-                "无法核实检查回显的同源 App、节点或原生 suite 关联")
-        metadata = check_metadata(check)
-        require(type(metadata.get("schema")) is int and metadata["schema"] == 1 and metadata.get("repo") == observer.repo and
-                metadata.get("head") == pr["head"]["sha"])
-        members, targets = metadata.get("membership"), metadata.get("targets")
-        require(isinstance(members, list) and isinstance(targets, list) and len(members) == len(targets) <= 50000 and
-                all(isinstance(row, dict) for row in [*members, *targets]))
-        if not members:
-            require(positive(metadata.get("pr")) and metadata.get("reason_code") == "source_head_intersection" and
-                    metadata.get("result") == "pending" and metadata.get("failed_prs") == [] and metadata.get("pending_prs") == [] and
-                    check.get("status") == "in_progress" and check.get("conclusion") is None,
-                    "空历史交集必须是无失败或待定目标的 pending 发布投影")
-        numbers = [member.get("pr") for member in members]
-        require(all(positive(number) for number in numbers) and len(set(numbers)) == len(numbers))
-        # An old source-owned publication authenticates its own cohort, not today's PRs or refs.
-        for member in members:
-            require(member.get("head") == check["head_sha"] and sha(member.get("base")) and type(member.get("draft")) is bool and
-                    set(member) == {"pr", "head", "head_ref", "head_repo_id", "head_repo", "base_ref", "base", "draft"})
-            repo_identity(dict(id=member.get("head_repo_id"), full_name=member.get("head_repo")))
-            require(all(isinstance(member.get(key), str) and 0 < len(member[key]) <= 1024 and
-                        not re.search(r"[\x00-\x20\x7f\ud800-\udfff]", member[key]) for key in ("head_ref", "base_ref")))
-            require(sum(all(type(row.get(key)) is type(value) and row.get(key) == value for key, value in member.items())
-                        for row in targets) == 1, "历史检查回显的 membership/target source 身份不一致")
-        publisher = mapping(metadata.get("publisher"))
-        require(publisher.get("workflow") == PUBLISHER and sha(publisher.get("workflow_sha")))
-        run_id, attempt = decimal(publisher.get("run_id")), decimal(publisher.get("run_attempt"))
-        issuer = mapping(observer.api.get(observer.root + f"/actions/runs/{run_id}"))
-        require(positive(issuer.get("id")) and issuer["id"] == run_id and
-                positive(issuer.get("run_attempt")) and issuer["run_attempt"] >= attempt)
-        if issuer["run_attempt"] > attempt:
-            issuer = mapping(observer.api.get(observer.root + f"/actions/runs/{run_id}/attempts/{attempt}"))
-        require(issuer.get("id") == run_id and issuer.get("run_attempt") == attempt)
-        publisher_run(observer, issuer, publisher["workflow_sha"], check["head_sha"])
-        # This authenticates classification only, not the Check's current verdict.
     return result
 
 
@@ -999,6 +1001,7 @@ def reconcile_publisher(observer, run, jobs, deliver=True):
         return False
     observer.store.problem(scope)
     groups, seen, conflicting_ids = {}, {}, set()
+    counts = Counter(job["id"] for job in jobs if isinstance(job, dict) and positive(job.get("id")))
     healthy = True
     for index, job in enumerate(jobs):
         observer.store.problem(scope + f":job:{index}")
@@ -1007,6 +1010,9 @@ def reconcile_publisher(observer, run, jobs, deliver=True):
             name = job.get("name")
             if name == "Resolve Merge PR identities":
                 continue  # Resolution is not a PR Check result or routing grant.
+            if name == "Merge gate":
+                authenticate_check_echo(observer, run["head_sha"], run, job, counts)
+                continue  # Authenticated projection, not a reporter or routing grant.
             require(isinstance(name, str))
             match = re.fullmatch(r"Trusted Merge report / PR ([1-9][0-9]{0,18})", name)
             require(match is not None or name == "Trusted Merge report", "发布作业名不是规范 PR candidate")

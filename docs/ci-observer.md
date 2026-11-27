@@ -138,6 +138,8 @@ Periodic/Release 首先交协调者。confirmed 归因支持单项旧格式和 `
 
 最终 `Merge gate` 走独立的 `merge_reports.py` 协议：验证默认分支发布者、原生 reporter 执行、GitHub Actions Check issuer/external ID、结构化 summary、当前 PR/head/base 和成功验证运行的真实合并树。每个矩阵 PR 独立处理；不能把 PR 自报绿色或普通原生 CI 失败当合并冲突。
 
+原生验证或 publisher 的 jobs 可能混入其 suite 承载的自发布 `Merge gate` CheckRun 回显。仅在精确 App/source、run/attempt/suite、唯一数字 ID、node/URL、显式空 steps/labels/runner 和独立 publisher 来源认证全部通过后，才将它排除于原生作业或 reporter 解释。认证缺失、伪造或真实额外作业仍保持未知。此归一化不授予路由权，不改变 pending/stale 或 ACK；最终结果仍须核对当前 Check 代次和最新目标验证权威。
+
 `merge_gate_failure` 表示新的合并检查调查；`merge_gate_result` 是检查状态更新。已有原生失败调查不重复派工。发布者成功本身不是被测合并树成功，最终 Merge Check 通过也不是 Release/验收通过。协议未匹配或某个 PR 证据异常时，该来源保持未知，不回滚合法兄弟来源。
 
 同一进程也调用 `rc_refs.py` 的标签兜底观察：首次完整快照建立不重放历史的 baseline；后续精确 tag/ref/object 经 API 核验后才可能产生协调者专用 `release_tag_forward`。标签事务使用独立 tag key，不借另一个 workflow run 的成功刷新来释放待办。
