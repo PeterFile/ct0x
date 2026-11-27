@@ -33,6 +33,8 @@ check = verifier.check
 prefix, collect, aggregate_canonical = receipts.prefix, receipts.collect, receipts.aggregate_canonical
 TIMING_LOCK = Lock()
 REQUIRED = {"preflight", "go-shards", "go-workspace", "go-other", "go-vet", "go-benchmarks"}
+# Frozen trial evidence: original package invocations >=540s of a 600s alarm.
+PACKAGE_BUDGET_SLOTS = {("platform", 3), ("store", 21), ("store", 40), ("store", 55)}
 
 
 def check_results(results):
@@ -82,13 +84,15 @@ def append_timing(path, context, profile, slot, invocation, partition=None):
 
 @contextmanager
 def observe_shards(context):
+    check(not any(profile == "store" and slot in shards.SLOW_STORE_SLOTS for profile, slot in PACKAGE_BUDGET_SLOTS),
+          "包预算风险槽与 C 独立慢槽分区重叠；拒绝改变 fanout 或重复分区")
     original, original_subsets = shards.log_events, shards.execution_subsets
     partitions = {}
 
     # Refine execution only; the planner's C topology and canonical slots stay fixed.
     def subsets(selected, profile, slot=None):
         parents = original_subsets(selected, profile, slot)
-        if (profile, slot) not in (("platform", 3), ("store", 21)):
+        if (profile, slot) not in PACKAGE_BUDGET_SLOTS:
             return parents
         selected = verifier.counter(selected)
         check(selected and all(count == 1 for count in selected.values()), "包预算选项为空或重复")
@@ -101,7 +105,7 @@ def observe_shards(context):
                 child = Counter({name: parent[name] for name in names[part::2]})
                 verifier.run_pattern(child)
                 partitions[profile, slot, f"run-{len(result)}"] = {
-                    "policy": "series6-package-budget-v1", "original_subset": index,
+                    "policy": "series7-package-budget-v1", "original_subset": index,
                     "original_selected": parent, "part": part, "parts": 2, "selected": child}
                 result.append(child)
         check(sum(result, Counter()) == selected, "包预算分区丢失或重复覆盖")
