@@ -1,0 +1,186 @@
+{
+  "schema": 1,
+  "migration_paths": ["internal/store/*migration*", "internal/store/*schema*", "internal/store/*.sql", "internal/store/store.go"],
+  "rules": [
+    {
+      "paths": [
+        "internal/store/",
+        "internal/platform/",
+        "internal/httpapi/",
+        "internal/coordination/",
+        "internal/provider/",
+        "internal/scheduler/",
+        "cmd/workspace/",
+        "extensions/pi-bridge/"
+      ],
+      "ordinary": {
+        "agentworkspace/cmd/workspace": [
+          "TestCoordinationCompositionSchedulerRoleReceipts"
+        ]
+      },
+      "tests": {
+        "agentworkspace/internal/store": [
+          "TestMissingAndCrossGroupReferences",
+          "TestQueueClaimRacesAcrossHandles",
+          "TestWorkspaceOperationRevocationClaimAndAttemptFences",
+          "TestWorkspaceOperationUnresolvedOutcomesAndRecovery",
+          "TestTaskWorkInputEffectKeys",
+          "TestTaskWorkInputMutationUncertainty",
+          "TestWorkerArtifactCrossGroupVersionAndCallerIsolation"
+        ],
+        "agentworkspace/internal/platform": [
+          "TestFreshTaskWorkB29NativeWireUncertaintyAndCancellation",
+          "TestWorkspaceGrantAliasesKeepUnknownAndCancelFences",
+          "TestMemberToolRuntimeDuplicateExecutionRetainsUnknownClaims",
+          "TestMemberToolRuntimeRevokeDrainsAfterCancellation",
+          "TestRoleRuntimeRevokeDrainKeepsFenceUntilCleanup",
+          "TestWorkspaceGrantRejectsUnsafeRootsAndForeignMembers",
+          "TestInvestigationOwnerManagementAllowsOriginalUserFollowup",
+          "TestInvestigationOwnerManagementMemberFollowupStaysUnmanaged"
+        ],
+        "agentworkspace/internal/httpapi": [
+          "TestDispatchExecutionHTTPDurableSafeReceiptsAndCancellation",
+          "TestDispatchRequestHTTPPreservesRealUnknownCancelAndResourceEvidence",
+          "TestTaskLifecycleHTTPReadIsolationAndForeignBodyPointers"
+        ],
+        "agentworkspace/internal/coordination": [
+          "TestIntentPassBindingBudgetAndRotation",
+          "TestIntentPassHeldAndGenerationConflict",
+          "TestIntentPassCommitUnknownAndOriginalGenerationReplay",
+          "TestIntentPassPreservesUnknownAndCancelResources",
+          "TestIntentPumpSchedulerPersistentFailurePrefixReaches51"
+        ],
+        "agentworkspace/cmd/workspace": [
+          "TestCoordinationCompositionUnknownCancelAndShutdownHoldClaims",
+          "TestCoordinationCompositionReporterAndOrdinaryProgress"
+        ]
+      }
+    },
+    {
+      "paths": [
+        "internal/store/*migration*",
+        "internal/store/*schema*",
+        "internal/store/*.sql",
+        "internal/store/store.go",
+        ".github/scripts/merge-gate-migrations.json",
+        ".github/scripts/merge-gate-migration.py"
+      ],
+      "tests": {
+        "agentworkspace/internal/store": [
+          "TestCoordinationAssignmentV13MigrationFrozenHistory",
+          "TestCoordinationAssignmentV13MigrationSourceHistoryBoundaries",
+          "TestCoordinationAssignmentResolutionV14FrozenHistoryAndFinalFK",
+          "TestMissingAndCrossGroupReferences"
+        ]
+      }
+    },
+    {
+      "id": "workspace-assignment-prerequisites",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/44088192148/job/134063669160", "https://github.com/PeterFile/ct0x/actions/runs/44166091468/job/134332419578"],
+      "paths": ["internal/workspacefs/", "internal/store/workspace*", "internal/platform/member_workspace*", "internal/httpapi/member_workspace*", "cmd/workspace/"],
+      "tests": {
+        "agentworkspace/cmd/workspace": ["TestCoordinationCompositionUnknownCancelAndShutdownHoldClaims"],
+        "agentworkspace/internal/httpapi": ["TestMemberWorkspaceJSONTransport"]
+      }
+    },
+    {
+      "id": "background-cancel-query",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/45512885246/job/138866224228"],
+      "paths": ["cmd/workspace/background_dispatch*", "internal/coordination/intent_*", "internal/scheduler/"],
+      "tests": {"agentworkspace/internal/coordination": ["TestIntentPassCancellationAndQueryFailure"]}
+    },
+    {
+      "id": "runtime-liveness",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/44407608694/job/135169463154", "https://github.com/PeterFile/ct0x/actions/runs/45809258224/job/139877220617"],
+      "paths": ["cmd/workspace/", "internal/coordination/", "internal/scheduler/", "internal/platform/", "internal/provider/", "internal/store/"],
+      "ordinary": {"agentworkspace/internal/coordination": ["TestIntentPumpSchedulerBeginBusyRecovery"]},
+      "tests": {
+        "agentworkspace/internal/platform": ["TestUnsupportedV30TaskWorkDoesNotStopScheduler"],
+        "agentworkspace/internal/httpapi": ["TestInvestigationNativeRoleWrites"]
+      }
+    },
+    {
+      "id": "repair-claim-preparation",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/44187640526/job/134408312591"],
+      "paths": ["cmd/workspace/", "internal/platform/*repair*", "internal/store/*repair*", "internal/store/*claim*", "internal/scheduler/"],
+      "tests": {"agentworkspace/internal/platform": ["TestChatRepairPreparationWaitsUnclaimedAndSchedulerContinues"]}
+    },
+    {
+      "id": "role-token-drain-revoke",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/45810094503/job/139907489207", "https://github.com/PeterFile/ct0x/actions/runs/45810094503/job/139907489229"],
+      "paths": ["cmd/workspace/", "internal/platform/member_capability*", "internal/platform/member_*runtime*", "internal/platform/prepare*", "internal/provider/"],
+      "tests": {"agentworkspace/internal/platform": ["TestBoundWorkDelegationTransport", "TestPrepareAdaptersShareOrdinaryRoleSubmissionReviewChain", "TestMemberCapabilityRoleCommandRevokeDrainsCallback"]}
+    },
+    {
+      "id": "native-known-unknown-and-admission",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/45810094503/job/139907489229", "https://github.com/PeterFile/ct0x/actions/runs/45810094503/job/139907489289"],
+      "paths": ["cmd/workspace/", "internal/platform/*investigation*", "internal/platform/*task_work*", "internal/store/*task_work*", "internal/provider/", "extensions/pi-bridge/"],
+      "tests": {"agentworkspace/internal/platform": [
+        "TestFreshTaskWorkB29NativeWireConfirmedInput",
+        "TestFreshTaskWorkB29NativeWireLaunchGatePolicyAfterAdmission",
+        "TestInvestigationOwnerManagementAllowsOriginalUserFollowup",
+        "TestInvestigationOwnerManagementOriginalUserReport",
+        "TestInvestigationOwnerManagementMemberFollowupStaysUnmanaged",
+        "TestInvestigationOwnerManagementUsesUnmanagedReportForMemberOrigin",
+        "TestInvestigationTaskWorkLaunchSQLiteFollowup",
+        "TestInvestigationTaskWorkLaunchSQLiteReport",
+        "TestInvestigationTaskWorkOwnerTransportV30Followup",
+        "TestPiInvestigationOwnerNativeFollowupAndAdmissionRefusal",
+        "TestPiInvestigationOwnerNativeSQLiteRoundTrip",
+        "TestPiTaskDecisionProposalExactAcceptedContinuation"
+      ]}
+    },
+    {
+      "id": "assignment-materialization-rollback",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/44166091468/job/134332420673", "https://github.com/PeterFile/ct0x/actions/runs/44166091468/job/134332420504"],
+      "paths": ["cmd/workspace/", "internal/coordination/", "internal/store/*assignment*", "internal/store/*workspace*", "internal/store/*artifact*", "internal/store/*chat*"],
+      "tests": {"agentworkspace/internal/store": ["TestWorkspaceOperationRevocationClaimAndAttemptFences", "TestWorkerArtifactSQLFailureIsAtomic", "TestWorkspaceOperationNoticeAndReceiptRollback"]}
+    },
+    {
+      "id": "ci-go-execution-envelope",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/44129165438/job/134213070394", "https://github.com/PeterFile/ct0x/actions/runs/45649656396/job/139330364349"],
+      "paths": [".github/workflows/ci*.yml", ".github/workflows/merge-gate.yml", ".github/scripts/ci-*.py", ".github/scripts/verify-store-shard.py", ".github/scripts/merge-gate.py", ".github/scripts/merge-gate-manifest.json"],
+      "ordinary": {"agentworkspace/cmd/workspace": ["TestRunExplanationParentCancelAfterSendKeepsExactJournal"]},
+      "tests": {
+        "agentworkspace/internal/httpapi": ["TestMemberMCPCodexMetadataCoordinatorDecision"],
+        "agentworkspace/internal/coordination": ["TestIntentPassCancellationAndQueryFailure"],
+        "agentworkspace/internal/platform": ["TestPiInvestigationOwnerNativeSQLiteRoundTrip"]
+      }
+    },
+    {
+      "id": "run-explanation-cancel-journal",
+      "paths": ["cmd/workspace/run_explanation*", "cmd/workspace/execution*", "internal/provider/"],
+      "ordinary": {"agentworkspace/cmd/workspace": ["TestRunExplanationParentCancelAfterSendKeepsExactJournal"]}
+    }
+  ],
+  "ci_suites": {
+    "release-core.py": ["release-test-evidence.py", "release-test-machine.py", "release-test-workflow.py"],
+    "periodic-full.py": ["test-periodic-clients.py", "test-periodic-diagnostics.py", "test-periodic-full.py", "test-periodic-history.py"]
+  },
+  "ci_tests": [
+    "test-ci-scheduling.py",
+    "test-store-shard.py",
+    "test-merge-gate.py",
+    "test-merge-gate-publish.py",
+    "test-merge-gate-workflow.py",
+    "test-merge-gate-migration.py"
+  ],
+  "ci_modules": {
+    "observer/observer.py": [
+      "test-ci-observer.py"
+    ],
+    "periodic-full.py": [
+      "test-periodic-full.py"
+    ],
+    "*release*.py": [
+      "test-release-*.py"
+    ],
+    "*experiment*.py": [
+      "test-experiment-*.py",
+      "test-full-trial.py"
+    ],
+    "full-trial.py": [
+      "test-full-trial.py"
+    ]
+  }
+}
