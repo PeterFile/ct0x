@@ -1,0 +1,457 @@
+{
+  "producer": {
+    "description": "Captured from actual #269 admit/check_owner and duplicate CLI via pickup-contracts/duplicate.py. No network or native delivery.",
+    "sources": {
+      "release-control.py": "304ae272555f377684c35f250c2d359eba1c24c4",
+      "release-duplicate.py": "e91c39ddb95d08ffd8b5532e68377688e0c2066b",
+      "test-release-control.py": "7823169dcca3898145c130bd71c2996a031bd6ba",
+      "release-candidate.yml": "4503c87b4acc386c217350d7b076043b1db8ad8d"
+    }
+  },
+  "responses": {
+    "/repos/owner/project/actions/workflows/34": {
+      "id": 34,
+      "path": ".github/workflows/release-candidate.yml"
+    },
+    "/repos/owner/project/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "commit": {
+        "tree": {
+          "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      }
+    },
+    "/repos/owner/project/commits/master": {
+      "sha": "cccccccccccccccccccccccccccccccccccccccc"
+    },
+    "/repos/owner/project/compare/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...cccccccccccccccccccccccccccccccccccccccc": {
+      "status": "ahead",
+      "merge_base_commit": {
+        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    "/repos/owner/project/compare/cccccccccccccccccccccccccccccccccccccccc...cccccccccccccccccccccccccccccccccccccccc": {
+      "status": "identical",
+      "merge_base_commit": {
+        "sha": "cccccccccccccccccccccccccccccccccccccccc"
+      }
+    },
+    "/repos/owner/project/actions/runs/11": {
+      "id": 11,
+      "run_attempt": 1,
+      "path": ".github/workflows/release-candidate.yml",
+      "event": "workflow_dispatch",
+      "head_branch": "master",
+      "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "head_commit": {
+        "id": "cccccccccccccccccccccccccccccccccccccccc",
+        "tree_id": "1111111111111111111111111111111111111111"
+      },
+      "repository": {
+        "full_name": "owner/project"
+      },
+      "head_repository": {
+        "full_name": "owner/project"
+      },
+      "run_started_at": "2026-11-26T15:56:47Z",
+      "status": "completed",
+      "conclusion": "failure",
+      "actor": {
+        "id": 42,
+        "login": "owner",
+        "type": "User"
+      },
+      "triggering_actor": {
+        "id": 42,
+        "login": "owner",
+        "type": "User"
+      },
+      "workflow_id": 34,
+      "html_url": "https://github.com/owner/project/actions/runs/11"
+    },
+    "/repos/owner/project/actions/runs/11/attempts/1": {
+      "id": 11,
+      "run_attempt": 1,
+      "path": ".github/workflows/release-candidate.yml",
+      "event": "workflow_dispatch",
+      "head_branch": "master",
+      "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "head_commit": {
+        "id": "cccccccccccccccccccccccccccccccccccccccc",
+        "tree_id": "1111111111111111111111111111111111111111"
+      },
+      "repository": {
+        "full_name": "owner/project"
+      },
+      "head_repository": {
+        "full_name": "owner/project"
+      },
+      "run_started_at": "2026-11-26T15:56:47Z",
+      "status": "completed",
+      "conclusion": "failure",
+      "actor": {
+        "id": 42,
+        "login": "owner",
+        "type": "User"
+      },
+      "triggering_actor": {
+        "id": 42,
+        "login": "owner",
+        "type": "User"
+      },
+      "workflow_id": 34,
+      "html_url": "https://github.com/owner/project/actions/runs/11"
+    },
+    "/repos/owner/project/actions/runs/10": {
+      "id": 10,
+      "run_attempt": 1,
+      "path": ".github/workflows/release-candidate.yml",
+      "event": "workflow_dispatch",
+      "head_branch": "master",
+      "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "head_commit": {
+        "id": "cccccccccccccccccccccccccccccccccccccccc",
+        "tree_id": "1111111111111111111111111111111111111111"
+      },
+      "repository": {
+        "full_name": "owner/project"
+      },
+      "head_repository": {
+        "full_name": "owner/project"
+      },
+      "run_started_at": "2026-11-26T15:56:47Z",
+      "status": "in_progress",
+      "conclusion": null,
+      "actor": {
+        "id": 42,
+        "login": "owner",
+        "type": "User"
+      },
+      "triggering_actor": {
+        "id": 42,
+        "login": "owner",
+        "type": "User"
+      },
+      "workflow_id": 34
+    },
+    "/repos/owner/project/actions/runs/10/attempts/1": {
+      "id": 10,
+      "run_attempt": 1,
+      "path": ".github/workflows/release-candidate.yml",
+      "event": "workflow_dispatch",
+      "head_branch": "master",
+      "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "head_commit": {
+        "id": "cccccccccccccccccccccccccccccccccccccccc",
+        "tree_id": "1111111111111111111111111111111111111111"
+      },
+      "repository": {
+        "full_name": "owner/project"
+      },
+      "head_repository": {
+        "full_name": "owner/project"
+      },
+      "run_started_at": "2026-11-26T15:56:47Z",
+      "status": "in_progress",
+      "conclusion": null,
+      "actor": {
+        "id": 42,
+        "login": "owner",
+        "type": "User"
+      },
+      "triggering_actor": {
+        "id": 42,
+        "login": "owner",
+        "type": "User"
+      },
+      "workflow_id": 34
+    },
+    "/repos/owner/project/git/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+      "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "tree": {
+        "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "parents": [
+        {
+          "sha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        }
+      ]
+    },
+    "/repos/owner/project/git/commits/cccccccccccccccccccccccccccccccccccccccc": {
+      "sha": "cccccccccccccccccccccccccccccccccccccccc",
+      "tree": {
+        "sha": "1111111111111111111111111111111111111111"
+      },
+      "parents": [
+        {
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    },
+    "/repos/owner/project/git/trees/1111111111111111111111111111111111111111?recursive=1": {
+      "sha": "1111111111111111111111111111111111111111",
+      "truncated": false,
+      "tree": [
+        {
+          "path": ".github/workflows/release-candidate.yml",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "afe63d85c820c81e317822d691ba2e4cbad3a6ec"
+        },
+        {
+          "path": ".github/workflows/release-receipt.yml",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "d80f2ea46b3390ef540951b6265119a72cde8ef0"
+        },
+        {
+          "path": ".github/scripts/release-core.py",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "ec45b8e5af12bb992d91f3a519afff1db3f05aa1"
+        },
+        {
+          "path": ".github/scripts/release-control.py",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "db62061104bf83d9c9e491bdfeacf98fad130815"
+        },
+        {
+          "path": ".github/scripts/release-machine.py",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "7bb3e4253133d9d5877513d5aa0d11c6df3b2528"
+        },
+        {
+          "path": ".github/workflows/ci-full.yml",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "ce20f0169ba2b9df382cc36e9c056b1594d1d87a"
+        },
+        {
+          "path": ".github/scripts/ci-plan.py",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "7f607ae109db2e0ab8576407e7bc7a48d5109883"
+        },
+        {
+          "path": ".github/scripts/ci-shards.py",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "96ab68e24dbff80e69f61d953331d3a62cfb1e2d"
+        },
+        {
+          "path": ".github/scripts/ci-gate.py",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "5728aad92567605542bc665dee5664c49cd83014"
+        },
+        {
+          "path": ".github/scripts/verify-store-shard.py",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "4db0312cbb15c159a7a303bf11185453bd63afa3"
+        },
+        {
+          "path": ".github/scripts/test-ci-scheduling.py",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "31e385963c989287a8c7366b1f529f794fea4b36"
+        },
+        {
+          "path": ".github/scripts/test-store-shard.py",
+          "type": "blob",
+          "mode": "100644",
+          "sha": "58bf3f2d5335da08e4642a2125da4a664a0a0efc"
+        }
+      ]
+    },
+    "/repos/owner/project/actions/runs/10/attempts/1/jobs": {
+      "total_count": 2,
+      "jobs": [
+        {
+          "id": 20,
+          "run_id": 10,
+          "run_attempt": 1,
+          "name": "Release normalize",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:56:52Z"
+        },
+        {
+          "id": 21,
+          "run_id": 10,
+          "run_attempt": 1,
+          "name": "Release admission aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "in_progress",
+          "conclusion": null,
+          "started_at": "2026-11-26T15:56:53Z",
+          "completed_at": null
+        }
+      ]
+    },
+    "/repos/owner/project/actions/runs/11/attempts/1/jobs": {
+      "total_count": 10,
+      "jobs": [
+        {
+          "id": 120,
+          "name": "Release normalize",
+          "run_id": 11,
+          "run_attempt": 1,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:57:15Z",
+          "html_url": "https://github.com/owner/project/actions/runs/11/job/120"
+        },
+        {
+          "id": 121,
+          "name": "Release admission aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "run_id": 11,
+          "run_attempt": 1,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "status": "completed",
+          "conclusion": "success",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:57:15Z",
+          "html_url": "https://github.com/owner/project/actions/runs/11/job/121"
+        },
+        {
+          "id": 122,
+          "name": "Release duplicate verdict",
+          "run_id": 11,
+          "run_attempt": 1,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "status": "completed",
+          "conclusion": "failure",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:57:15Z",
+          "html_url": "https://github.com/owner/project/actions/runs/11/job/122"
+        },
+        {
+          "id": 130,
+          "name": "Release Full",
+          "run_id": 11,
+          "run_attempt": 1,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "status": "completed",
+          "conclusion": "skipped",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:57:15Z",
+          "html_url": "https://github.com/owner/project/actions/runs/11/job/130"
+        },
+        {
+          "id": 131,
+          "name": "Release clients",
+          "run_id": 11,
+          "run_attempt": 1,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "status": "completed",
+          "conclusion": "skipped",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:57:15Z",
+          "html_url": "https://github.com/owner/project/actions/runs/11/job/131"
+        },
+        {
+          "id": 132,
+          "name": "Release candidate binary",
+          "run_id": 11,
+          "run_attempt": 1,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "status": "completed",
+          "conclusion": "skipped",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:57:15Z",
+          "html_url": "https://github.com/owner/project/actions/runs/11/job/132"
+        },
+        {
+          "id": 133,
+          "name": "Release machine evidence",
+          "run_id": 11,
+          "run_attempt": 1,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "status": "completed",
+          "conclusion": "skipped",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:57:15Z",
+          "html_url": "https://github.com/owner/project/actions/runs/11/job/133"
+        },
+        {
+          "id": 134,
+          "name": "Release Full evidence",
+          "run_id": 11,
+          "run_attempt": 1,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "status": "completed",
+          "conclusion": "skipped",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:57:15Z",
+          "html_url": "https://github.com/owner/project/actions/runs/11/job/134"
+        },
+        {
+          "id": 135,
+          "name": "Release candidate evidence",
+          "run_id": 11,
+          "run_attempt": 1,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "status": "completed",
+          "conclusion": "skipped",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:57:15Z",
+          "html_url": "https://github.com/owner/project/actions/runs/11/job/135"
+        },
+        {
+          "id": 136,
+          "name": "Release candidate verdict",
+          "run_id": 11,
+          "run_attempt": 1,
+          "head_sha": "cccccccccccccccccccccccccccccccccccccccc",
+          "status": "completed",
+          "conclusion": "skipped",
+          "started_at": "2026-11-26T15:56:48Z",
+          "completed_at": "2026-11-26T15:57:15Z",
+          "html_url": "https://github.com/owner/project/actions/runs/11/job/136"
+        }
+      ]
+    },
+    "/repos/owner/project/actions/runs/11/artifacts": {
+      "total_count": 1,
+      "artifacts": [
+        {
+          "id": 144,
+          "name": "release-intent-11-1",
+          "workflow_run": {
+            "id": 11,
+            "head_sha": "cccccccccccccccccccccccccccccccccccccccc"
+          },
+          "created_at": "2026-11-26T15:56:57Z",
+          "expired": false,
+          "digest": "sha256:a6cd258ece6e6609f00ea35371da382ac8b1d7402f6e3c80f9ca5f2991e914cf"
+        }
+      ]
+    },
+    "/repos/owner/project/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/statuses": [
+      {
+        "id": 40,
+        "context": "release-candidate/first-owner-v1",
+        "state": "success",
+        "description": "首个 owner 已登记；尚未验证候选",
+        "creator": {
+          "login": "github-actions[bot]",
+          "id": 41898282,
+          "type": "Bot"
+        },
+        "target_url": "https://github.com/owner/project/actions/runs/10",
+        "created_at": "2026-11-26T15:56:53.1Z"
+      }
+    ]
+  },
+  "archives": {
+    "/repos/owner/project/actions/artifacts/144/zip": "UEsDBBQAAAAAAOtRe12BC63f6QUAAOkFAAAMAAAAcmVjZWlwdC5qc29ueyJzY2hlbWEiOiAxLCAia2luZCI6ICJyZWxlYXNlLWludGVudCIsICJyZXBvIjogIm93bmVyL3Byb2plY3QiLCAic2hhIjogImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCAidHJlZSI6ICJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiIiwgInJ1bl9pZCI6IDExLCAicnVuX2F0dGVtcHQiOiAxLCAid29ya2Zsb3dfc2hhIjogImNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2MiLCAibWFzdGVyX3NoYSI6ICJjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjIiwgInBvbGljeV9zaGEiOiAiY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYyIsICJwb2xpY3kiOiAiY2FsbGVyLXBvbGljeS12MSIsICJoZWFkIjogImFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCAiYmFzZSI6ICJlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlZWVlIiwgImFsbG93X3JldHJ5IjogZmFsc2UsICJzb3VyY2VzIjogeyIuZ2l0aHViL3dvcmtmbG93cy9yZWxlYXNlLWNhbmRpZGF0ZS55bWwiOiAiYWZlNjNkODVjODIwYzgxZTMxNzgyMmQ2OTFiYTJlNGNiYWQzYTZlYyIsICIuZ2l0aHViL3dvcmtmbG93cy9yZWxlYXNlLXJlY2VpcHQueW1sIjogImQ4MGYyZWE0NmIzMzkwZWY1NDA5NTFiNjI2NTExOWE3MmNkZThlZjAiLCAiLmdpdGh1Yi9zY3JpcHRzL3JlbGVhc2UtY29yZS5weSI6ICJlYzQ1YjhlNWFmMTJiYjk5MmQ5MWYzYTUxOWFmZmYxZGIzZjA1YWExIiwgIi5naXRodWIvc2NyaXB0cy9yZWxlYXNlLWNvbnRyb2wucHkiOiAiZGI2MjA2MTEwNGJmODNkOWM5ZTQ5MWJkZmVhY2Y5OGZhZDEzMDgxNSIsICIuZ2l0aHViL3NjcmlwdHMvcmVsZWFzZS1tYWNoaW5lLnB5IjogIjdiYjNlNDI1MzEzM2Q5ZDU4Nzc1MTNkNWFhMGQxMWM2ZGYzYjI1MjgiLCAiLmdpdGh1Yi93b3JrZmxvd3MvY2ktZnVsbC55bWwiOiAiY2UyMGYwMTY5YmEyYjlkZjM4MmNjMzZlOWMwNTZiMTU5NGQxZDg3YSIsICIuZ2l0aHViL3NjcmlwdHMvY2ktcGxhbi5weSI6ICI3ZjYwN2FlMTA5ZGIyZTBhYjg1NzY0MDdlN2JjN2E0OGQ1MTA5ODgzIiwgIi5naXRodWIvc2NyaXB0cy9jaS1zaGFyZHMucHkiOiAiOTZhYjY4ZTI0ZGJmZjgwZTY5ZjYxZDk1MzMzMWQzYTYyY2ZiMWUyZCIsICIuZ2l0aHViL3NjcmlwdHMvY2ktZ2F0ZS5weSI6ICI1NzI4YWFkOTI1Njc2MDU1NDJiYzY2NWRlZTU2NjRjNDljZDgzMDE0IiwgIi5naXRodWIvc2NyaXB0cy92ZXJpZnktc3RvcmUtc2hhcmQucHkiOiAiNGRiMDMxMmNiYjE1YzE1OWE3YTMwM2JmMTExODU0NTNiZDYzYWZhMyIsICIuZ2l0aHViL3NjcmlwdHMvdGVzdC1jaS1zY2hlZHVsaW5nLnB5IjogIjMxZTM4NTk2M2M5ODkyODdhOGM3MzY2YjFmNTI5Zjc5NGZlYTRiMzYiLCAiLmdpdGh1Yi9zY3JpcHRzL3Rlc3Qtc3RvcmUtc2hhcmQucHkiOiAiNThiZjNmMmQ1MzM1ZGEwOGU0NjQyYTIxMjVkYTRhNjY0YTBhMGVmYyJ9fVBLAQIUAxQAAAAAAOtRe12BC63f6QUAAOkFAAAMAAAAAAAAAAAAAACAAQAAAAByZWNlaXB0Lmpzb25QSwUGAAAAAAEAAQA6AAAAEwYAAAAA"
+  },
+  "logs": {
+    "/repos/owner/project/actions/jobs/122/logs": "重复候选未放行；请查看原 owner：canonical owner 尚无成功终态\n"
+  }
+}
