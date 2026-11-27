@@ -1,0 +1,69 @@
+name: Trusted Merge publisher
+
+on:
+  pull_request_target:
+    types: [opened, reopened, closed, synchronize, ready_for_review, converted_to_draft, edited, labeled]
+  workflow_run:
+    workflows: [PR Merge validation]
+    types: [requested, in_progress, completed]
+
+permissions:
+  contents: read
+
+env:
+  MERGE_TRUSTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+
+jobs:
+  resolve:
+    name: Resolve Merge PR identities
+    if: ${{ github.repository == 'PeterFile/ct0x' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      count: ${{ steps.resolve.outputs.count }}
+    steps:
+      # workflow_sha is base/default-branch code, never a PR branch, merge, or artifact.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/merge-gate-publish.py resolve
+
+  report:
+    name: Trusted Merge report / PR ${{ matrix.pr }}
+    needs: resolve
+    if: ${{ needs.resolve.outputs.count != '0' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 7
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    # CheckRuns are commit-scoped: all targets sharing a source SHA use one serialized writer.
+    concurrency:
+      group: merge-publisher-${{ github.repository }}-${{ matrix.source_sha }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+      pull-requests: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Reconcile current live tree with base-owned Python only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_PR: ${{ matrix.pr }}
+          MERGE_SOURCE_SHA: ${{ matrix.source_sha }}
+        run: python3 -B .github/scripts/merge-gate-publish.py report --pr "$MERGE_PR"
