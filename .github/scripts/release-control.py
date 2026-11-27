@@ -234,12 +234,19 @@ def actor_identity(value):
     return identity, login, value["type"]
 
 
+def _require_run_state(run, attempt, *, completed):
+    check(type(completed) is bool, "completed 模式必须显式指定布尔值")
+    state = ("completed", "success") if completed else ("in_progress", None)
+    check(run.get("run_attempt") == attempt and (run.get("status"), run.get("conclusion")) == state,
+          "owner 不处于所需的原生状态，或 attempt 已过期")
+
+
 class AdmissionAPI(core.GitHub):
-    def authorize_retry(self, run_id, attempt):
+    def authorize_retry(self, run_id, attempt, *, completed=False):
         check(attempt > 1, "不是原生重跑 attempt")
         latest, current, original = self.run(run_id), self.run(run_id, attempt), self.run(run_id, 1)
-        check(latest.get("run_attempt") == attempt and latest.get("status") == "in_progress"
-              and current.get("status") == "in_progress", "原生重跑已停止或 attempt 过期")
+        _require_run_state(latest, attempt, completed=completed)
+        _require_run_state(current, attempt, completed=completed)
         core.native_candidate(current, self.repo)
         core.native_candidate(original, self.repo)
         fields = ("path", "event", "head_branch", "head_sha", "head_commit")
@@ -310,9 +317,10 @@ def read_intent(api, run_id, attempt, historical=False):
     return intent
 
 
-def guard(api, run_id, attempt):
-    latest = api.run(run_id)
-    check(latest.get("run_attempt") == attempt and latest.get("status") == "in_progress", "owner 已停止、取消或 attempt 过期")
+def guard(api, run_id, attempt, *, completed=False):
+    """Read-only provenance check; completed mode revalidates success, never starts work."""
+    _require_run_state(api.run(run_id), attempt, completed=completed)
+    _require_run_state(api.run(run_id, attempt), attempt, completed=completed)
     intent = read_intent(api, run_id, attempt)
     check(canonical_status(api, api.repo, intent["sha"]) == run_id, "当前 run 不是 canonical owner")
     jobs = api.jobs(run_id, attempt)
@@ -321,7 +329,11 @@ def guard(api, run_id, attempt):
         name = "Release admission"
     core.require_jobs(jobs, run_id, attempt, ["Release normalize", name])
     if attempt > 1:
-        api.authorize_retry(run_id, attempt)
+        if completed:
+            api.authorize_retry(run_id, attempt, completed=True)
+        else:
+            api.authorize_retry(run_id, attempt)
+    _require_run_state(api.run(run_id), attempt, completed=completed)
     return intent
 
 

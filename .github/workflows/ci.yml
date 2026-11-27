@@ -1,349 +1,111 @@
-name: Release validation probe
-run-name: Release probe / ${{ inputs.mode }} / ${{ inputs.sha }} / ${{ github.run_id }}-${{ github.run_attempt }} / Pi
+name: RC dispatch acceptance probe
+run-name: RC dispatch probe / ${{ inputs.sha }} / ${{ github.workflow_sha }} / ${{ github.run_id }}-${{ github.run_attempt }}
 
 on:
   workflow_dispatch:
     inputs:
       sha:
-        description: 实验目标的小写完整提交 SHA
+        description: 实验固定产品的完整小写 SHA
         required: true
         type: string
-        default: 18d11a3c0176fe98856aeeef6396e9ddfde0cca0
-      mode:
-        description: 仅构建二进制或运行只读证据门禁
-        required: true
-        type: choice
-        default: gate
-        options: [build, gate]
 
 permissions:
   contents: read
+  actions: read
 
 defaults:
   run:
     shell: bash
 
 env:
-  MODE: ${{ inputs.mode }}
   TARGET_SHA: ${{ inputs.sha }}
-  CONTROLLER: ${{ github.workflow_ref }}
   CONTROLLER_SHA: ${{ github.workflow_sha }}
+  CONTROLLER_REF: ${{ github.workflow_ref }}
   PYTHONDONTWRITEBYTECODE: '1'
 
 jobs:
-  build:
+  admission:
+    name: RC dispatch admission
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: 验证实验输入与控制器
-        run: |
-          set -euo pipefail
-          printf 'mode=%s target_sha=%s run_id=%s run_attempt=%s controller=Pi:%s controller_sha=%s ref=%s\n' \
-            "$MODE" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CONTROLLER" "$CONTROLLER_SHA" "$GITHUB_REF"
-          [[ "$GITHUB_EVENT_NAME" == workflow_dispatch &&
-             "$GITHUB_REF" == refs/heads/codex/ci-release-probe-20261126 &&
-             "$CONTROLLER" == "$GITHUB_REPOSITORY/.github/workflows/ci.yml@$GITHUB_REF" &&
-             "$GITHUB_SHA" == "$CONTROLLER_SHA" ]] || { echo '::error::拒绝非实验分支或错误控制器'; exit 1; }
-          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ &&
-             "$TARGET_SHA" == 18d11a3c0176fe98856aeeef6396e9ddfde0cca0 ]] || { echo '::error::目标必须是本实验固定的小写完整 SHA'; exit 1; }
-          [[ "$MODE" == build || "$MODE" == gate ]] || { echo '::error::模式必须为 build 或 gate'; exit 1; }
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.sha }}
-          path: target
-          fetch-depth: 0
-          clean: true
-          persist-credentials: false
-      - name: 验证干净目标、Git 树与当前 master 历史
-        working-directory: target
-        run: |
-          set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == "$TARGET_SHA" ]] || exit 1
-          tree="$(git rev-parse HEAD^{tree})"
-          [[ "$tree" == 6df8bf3ccb986f8f4088dc310e0257b3f6285d9a ]] || exit 1
-          worktree="$(git status --porcelain --untracked-files=all)"
-          [[ -z "$worktree" ]] || exit 1
-          master="$(git rev-parse refs/remotes/origin/master^{commit})"
-          git merge-base --is-ancestor "$TARGET_SHA" "$master"
-          printf 'target_sha=%s target_tree=%s origin_master=%s\n' "$TARGET_SHA" "$tree" "$master"
-      - uses: actions/setup-go@v7
-        if: ${{ inputs.mode == 'build' }}
-        with:
-          go-version-file: target/go.mod
-          cache: false
-      - name: 交叉编译并验证二进制来源
-        if: ${{ inputs.mode == 'build' }}
-        working-directory: target
-        env:
-          GOOS: darwin
-          GOARCH: amd64
-          GOAMD64: v1
-          CGO_ENABLED: '0'
-          GOFLAGS: -mod=readonly
-          GOENV: 'off'
-          GOWORK: 'off'
-          GOTOOLCHAIN: local
-        run: |
-          set -euo pipefail
-          out="$RUNNER_TEMP/release-probe-binary"
-          mkdir -p "$out"
-          go build -trimpath -buildvcs=true -o "$out/workspace-darwin-amd64" ./cmd/workspace
-          worktree="$(git status --porcelain --untracked-files=all)"
-          [[ -z "$worktree" ]] || exit 1
-          python3 - "$out/workspace-darwin-amd64" <<'PY'
-          import hashlib, json, os, pathlib, subprocess, sys
-          binary = pathlib.Path(sys.argv[1])
-          info = subprocess.check_output(["go", "version", "-m", str(binary)], text=True)
-          print(info, end="")
-          settings = [parts[1] for line in info.splitlines()
-                      if len(parts := line.split()) == 2 and parts[0] == "build"]
-          expected = {"vcs": "git", "vcs.revision": os.environ["TARGET_SHA"],
-                      "vcs.modified": "false", "GOOS": "darwin", "GOARCH": "amd64",
-                      "CGO_ENABLED": "0", "-trimpath": "true"}
-          for key, value in expected.items():
-              if [item.split("=", 1)[1] for item in settings if item.startswith(key + "=")] != [value]:
-                  raise SystemExit("二进制构建信息不匹配：" + key)
-          def git(ref):
-              return subprocess.check_output(["git", "rev-parse", ref], text=True).strip()
-          record = {"schema": 1, "mode": os.environ["MODE"], "controller": "Pi",
-                    "workflow_ref": os.environ["CONTROLLER"], "workflow_sha": os.environ["CONTROLLER_SHA"],
-                    "target_sha": git("HEAD"), "target_tree": git("HEAD^{tree}"),
-                    "origin_master": git("refs/remotes/origin/master^{commit}"),
-                    "run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
-                    "go_version": info.splitlines()[0].split()[-1], "build_settings": expected,
-                    "binary": binary.name, "sha256": hashlib.sha256(binary.read_bytes()).hexdigest()}
-          provenance = json.dumps(record, sort_keys=True, indent=2) + "\n"
-          binary.with_name("provenance.json").write_text(provenance, encoding="utf-8")
-          print(provenance, end="")
-          PY
-      - uses: actions/upload-artifact@v7
-        if: ${{ inputs.mode == 'build' }}
-        with:
-          name: release-probe-binary-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/release-probe-binary/
-          if-no-files-found: error
-          retention-days: 7
-
-  gate:
-    needs: build
-    if: ${{ inputs.mode == 'gate' }}
-    permissions:
-      contents: read
-      actions: read
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
+    concurrency:
+      group: rc-dispatch-probe-${{ inputs.sha }}-${{ github.workflow_sha }}
+      cancel-in-progress: false
+    outputs:
+      admitted: ${{ steps.admit.outputs.admitted }}
+      owner_run_id: ${{ steps.admit.outputs.owner_run_id }}
+      owner_job_id: ${{ steps.admit.outputs.owner_job_id }}
+      policy_sha: ${{ steps.pin.outputs.policy_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-          path: policy
-          fetch-depth: 0
+          path: controller
+          fetch-depth: 1
           clean: true
           persist-credentials: false
-      - name: 验证不可变实验工作流并确定候选父提交
-        id: policy
-        working-directory: policy
-        run: |
-          set -euo pipefail
-          {
-            set -x
-            printf 'mode=%s target_sha=%s run_id=%s run_attempt=%s controller=Pi:%s controller_sha=%s\n' \
-              "$MODE" "$TARGET_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$CONTROLLER" "$CONTROLLER_SHA"
-            printf 'external_log=%s/%s/actions/runs/%s/attempts/%s\n' \
-              "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
-            [[ "$GITHUB_REF" == refs/heads/codex/ci-release-probe-20261126 ]] || exit 1
-            [[ "$(git rev-parse HEAD)" == "$GITHUB_SHA" && "$GITHUB_SHA" == "$CONTROLLER_SHA" ]] || exit 1
-            worktree="$(git status --porcelain --untracked-files=all)"
-            [[ -z "$worktree" ]] || exit 1
-            git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/codex/ci-release-probe-20261126
-            candidate="$(git rev-parse HEAD^1)"
-            printf 'candidate_sha=%s controller_tree=%s\n' "$candidate" "$(git rev-parse HEAD^{tree})"
-            printf 'candidate=%s\n' "$candidate" >> "$GITHUB_OUTPUT"
-          } 2>&1 | tee "$RUNNER_TEMP/release-probe-gate.log"
-      # The driver replaces ci.yml; test its immutable first parent, not the driver.
+      - name: 固定控制器与受审策略
+        id: pin
+        run: python3 controller/.github/scripts/rc-dispatch-probe.py pin
       - uses: actions/checkout@v7
         with:
-          ref: ${{ steps.policy.outputs.candidate }}
+          repository: ${{ github.repository }}
+          ref: ${{ steps.pin.outputs.policy_sha }}
           path: policy
-          fetch-depth: 0
+          fetch-depth: 1
           clean: true
           persist-credentials: false
-      - name: 用真实跨主机字节验证候选 verifier 并注入身份故障
-        working-directory: policy
+      - name: 只读原生查询与实验准入
+        id: admit
         env:
-          CANDIDATE_SHA: ${{ steps.policy.outputs.candidate }}
           GH_TOKEN: ${{ github.token }}
-          GH_HOST: github.com
-          GH_PROMPT_DISABLED: '1'
-          GH_NO_UPDATE_NOTIFIER: '1'
-        run: |
-          set -euo pipefail
-          {
-            [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]] || exit 1
-            worktree="$(git status --porcelain --untracked-files=all)"
-            [[ -z "$worktree" ]] || exit 1
-            python3 - <<'PY'
-          import importlib.util, json, os, struct, subprocess, sys, tempfile
-          from pathlib import Path
-          sys.dont_write_bytecode = True
-          source = Path(".github/scripts/release-evidence.py").resolve()
-          spec = importlib.util.spec_from_file_location("probe_release_evidence", source)
-          evidence = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(evidence)
-          core, check = evidence.core, evidence.core.check
-          repo = "PeterFile/ct0x"
-          run_id, attempt, job_id, artifact_id = 45858696170, 1, 140043726219, 15136299634
-          sha = "18d11a3c0176fe98856aeeef6396e9ddfde0cca0"
-          tree = "6df8bf3ccb986f8f4088dc310e0257b3f6285d9a"
-          controller = "5d47236aff14966dbb83bc58fb673847535136bd"
-          zip_sha = "6b29482a5532652f504d129be230157f12e9b7afef71d2971b39d641e41b5c18"
-          binary_sha = "b82914bad4c7c5a33fd90caeb486f7430ea69419911613a26997e8beeabc8140"
-          legacy_sha = "b9c531b8cf7a0e6cc89fac73576dae330840c67e866e143cb2d8aa01a76c0204"
-          branch = "codex/ci-release-probe-20261126"
-          filename = "workspace-darwin-amd64"
-          prefix = "/repos/PeterFile/ct0x"
-          run_path = prefix + "/actions/runs/45858696170/attempts/1"
-          job_path = prefix + "/actions/jobs/140043726219"
-          artifact_path = prefix + "/actions/artifacts/15136299634"
-          commit_path = prefix + "/git/commits/18d11a3c0176fe98856aeeef6396e9ddfde0cca0"
-          zip_path = artifact_path + "/zip"
-          endpoints = {run_path, job_path, artifact_path, commit_path, zip_path}
-          def api(path, output=None):
-              check(path in endpoints and (output is None) == (path != zip_path), "拒绝非固定的只读 API 端点")
-              result = subprocess.run(["gh", "api", "--hostname", "github.com", "--method", "GET",
-                  "-H", "Accept: application/vnd.github+json", "-H", "X-GitHub-Api-Version: 2022-11-28", path],
-                  stdout=output if output is not None else subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-              check(result.returncode == 0, "固定 GitHub 只读 API 请求失败；不输出原始响应或下载 URL")
-              return None if output is not None else core.decode(result.stdout, 8 << 20)
-          native, job, artifact, commit = (api(path) for path in (run_path, job_path, artifact_path, commit_path))
-          check(core.number(native["id"]) == run_id and core.number(native["run_attempt"]) == attempt
-                and native.get("head_sha") == controller and native.get("head_branch") == branch
-                and native.get("path") == ".github/workflows/ci.yml" and native.get("event") == "workflow_dispatch"
-                and native.get("workflow_id") == 401975626
-                and native.get("display_title") == f"Release probe / build / {sha} / {run_id}-{attempt} / Pi"
-                and native.get("status") == "completed"
-                and native.get("conclusion") == "success", "旧构建的原生 run 身份或结果不符")
-          check(all(native.get(key, {}).get("full_name") == repo for key in ("repository", "head_repository")), "原生仓库不符")
-          repository_id = core.number(native["repository"]["id"])
-          check(core.number(native["head_repository"]["id"]) == repository_id, "拒绝 fork 构建")
-          check(core.number(job["id"]) == job_id and job.get("run_id") == run_id
-                and core.number(job["run_attempt"]) == attempt and job.get("head_sha") == controller
-                and job.get("name") == "build" and job.get("status") == "completed"
-                and job.get("conclusion") == "success", "旧构建的原生 job 身份或结果不符")
-          owner = artifact.get("workflow_run", {})
-          check(core.number(artifact["id"]) == artifact_id and artifact.get("name") == "release-probe-binary-45858696170-1"
-                and artifact.get("expired") is False and artifact.get("digest") == "sha256:" + zip_sha
-                and owner.get("id") == run_id and owner.get("head_sha") == controller and owner.get("head_branch") == branch
-                and owner.get("repository_id") == repository_id and owner.get("head_repository_id") == repository_id
-                and core.number(artifact["size_in_bytes"]) <= 160 << 20, "原生 artifact 元数据不符或已过期")
-          check(core.timestamp(job["started_at"]) <= core.timestamp(artifact["created_at"]) <= core.timestamp(job["completed_at"]),
-                "artifact 不在指定 attempt 的原生 job 窗口内")
-          check(commit.get("sha") == sha and commit.get("tree", {}).get("sha") == tree, "GitHub 原生目标提交或树不符")
-          print(json.dumps({"scope": "native-build-transport-only", "repo": repo, "run_id": run_id,
-              "run_attempt": attempt, "job_id": job_id, "artifact_id": artifact_id, "zip_sha256": zip_sha,
-              "sha": sha, "tree": tree, "workflow_sha": controller, "candidate_sha": os.environ["CANDIDATE_SHA"],
-              "verifier_sha256": core.file_hash(source)}, sort_keys=True), flush=True)
-          with tempfile.TemporaryDirectory(prefix="release-probe-remote-", dir=os.environ["RUNNER_TEMP"]) as directory:
-              root = Path(directory)
-              archive = root / "artifact.zip"
-              with archive.open("xb") as output:
-                  api(zip_path, output)
-              check(0 < archive.stat().st_size <= 160 << 20, "下载 ZIP 大小超限")
-              raw = archive.read_bytes()
-              check(core.hashed(raw) == zip_sha, "下载 ZIP 与已知原生摘要不符；禁止检查内容")
-              files = core.unpack(raw, artifact["digest"], {filename, "provenance.json"})
-              for name in (filename, "provenance.json"):
-                  with (root / name).open("xb") as output:
-                      output.write(files[name])
-              binary, provenance = files[filename], core.decode(files["provenance.json"])
-              check(core.hashed(binary) == binary_sha and len(binary) >= 32
-                    and struct.unpack_from("<II", binary) == (0xfeedfacf, 0x01000007)
-                    and struct.unpack_from("<I", binary, 12)[0] == 2, "真实二进制摘要或 Darwin x86_64 可执行格式不符")
-              expected_settings = {"vcs": "git", "vcs.revision": sha, "vcs.modified": "false", "GOOS": "darwin",
-                                   "GOARCH": "amd64", "CGO_ENABLED": "0", "-trimpath": "true"}
-              check(set(provenance) == {"schema", "mode", "controller", "workflow_ref", "workflow_sha", "target_sha",
-                  "target_tree", "origin_master", "run_id", "run_attempt", "go_version", "build_settings", "binary", "sha256"},
-                  "旧 provenance 字段不符；禁止输出额外内容")
-              check(type(provenance["schema"]) is int and provenance["schema"] == 1 and provenance["mode"] == "build"
-                    and provenance["controller"] == "Pi" and provenance["workflow_sha"] == native["head_sha"]
-                    and provenance["workflow_ref"] == repo + "/.github/workflows/ci.yml@refs/heads/" + branch
-                    and provenance["target_sha"] == commit["sha"] and provenance["target_tree"] == commit["tree"]["sha"]
-                    and provenance["run_id"] == str(native["id"]) and provenance["run_attempt"] == str(native["run_attempt"])
-                    and provenance["binary"] == filename and provenance["sha256"] == core.hashed(binary)
-                    and provenance["build_settings"] == expected_settings, "旧 provenance 与真实字节、原生构建身份不符")
-              core.sha(provenance["origin_master"])
-              core.exact(provenance["go_version"], r"go[0-9]+\.[0-9]+\.[0-9]+", "Go 版本元数据非法")
-              # Normalize only the old transport manifest; never patch the candidate verifier or bytes.
-              receipt = {"schema": 1, "kind": "release-target", "repo": repo, "sha": provenance["target_sha"],
-                  "tree": provenance["target_tree"], "run_id": int(provenance["run_id"]),
-                  "run_attempt": int(provenance["run_attempt"]), "workflow_sha": provenance["workflow_sha"],
-                  "artifact_sha256": provenance["sha256"], "goos": provenance["build_settings"]["GOOS"],
-                  "goarch": provenance["build_settings"]["GOARCH"], "cgo_enabled": False, "vcs_modified": False, "trimpath": True}
-              intent = {"repo": native["repository"]["full_name"], "sha": commit["sha"], "tree": commit["tree"]["sha"],
-                  "run_id": native["id"], "run_attempt": native["run_attempt"], "workflow_sha": native["head_sha"]}
-              evidence.verify_target(receipt.copy(), binary, intent.copy())
-              print(json.dumps({"verifier": "release-evidence.verify_target", "result": "accepted-real-crosshost-bytes",
-                  "transport_manifest": receipt, "binary_bytes": len(binary),
-                  "provenance_sha256": core.hashed(files["provenance.json"])}, sort_keys=True), flush=True)
-              mutations = [("sha", controller), ("artifact_sha256", legacy_sha), ("tree", "f" * 40),
-                  ("run_attempt", 2), ("run_id", run_id + 1), ("workflow_sha", sha), ("goos", "linux"),
-                  ("goarch", "arm64"), ("cgo_enabled", True), ("vcs_modified", True), ("trimpath", False)]
-              accepted = []
-              for field, value in mutations:
-                  try:
-                      evidence.verify_target(receipt | {field: value}, binary, intent.copy())
-                  except ValueError:
-                      result = "rejected"
-                  else:
-                      result = "unexpectedly-accepted"
-                      accepted.append(field)
-                  print(json.dumps({"verifier": "release-evidence.verify_target", "result": result,
-                      "injected_field": field, "injected_value": value, "expected_value": receipt[field],
-                      "actual_binary_sha256": binary_sha, "native_run_id": run_id, "native_attempt": attempt},
-                      sort_keys=True), flush=True)
-              check(not accepted, "实际 verifier 错误放行突变：" + ",".join(accepted))
-          print("remote_verifier_only=passed real_full=false real_tag=false private_machine_proofs=not_read_or_uploaded", flush=True)
-          PY
-            worktree="$(git status --porcelain --untracked-files=all)"
-            [[ -z "$worktree" ]] || exit 1
-          } 2>&1 | tee -a "$RUNNER_TEMP/release-probe-gate.log"
-      - name: 运行全部离线门禁并保存完整输出
-        working-directory: policy
-        env:
-          CANDIDATE_SHA: ${{ steps.policy.outputs.candidate }}
-        run: |
-          set -euo pipefail
-          {
-            set -x
-            [[ "$(git rev-parse HEAD)" == "$CANDIDATE_SHA" ]] || exit 1
-            worktree="$(git status --porcelain --untracked-files=all)"
-            [[ -z "$worktree" ]] || exit 1
-            printf 'candidate_sha=%s candidate_tree=%s\n' "$CANDIDATE_SHA" "$(git rev-parse HEAD^{tree})"
-            shopt -s nullglob
-            tests=(.github/scripts/test-release*.py)
-            status=0
-            if (( ${#tests[@]} == 0 )); then
-              echo '::error::候选父提交中没有 release 门禁测试'
-              status=1
-            fi
-            tests+=(.github/scripts/release-test-*.py .github/scripts/test-ci-scheduling.py .github/scripts/test-store-shard.py)
-            for test in "${tests[@]}"; do
-              python3 "$test" -v || status=1
-            done
-            if command -v actionlint >/dev/null 2>&1; then
-              actionlint || status=1
-            else
-              echo 'actionlint 不可用；未安装或下载额外工具'
-            fi
-            worktree="$(git status --porcelain --untracked-files=all)" || status=1
-            [[ -z "$worktree" ]] || status=1
-            printf 'gate_exit_status=%s\n' "$status"
-            exit "$status"
-          } 2>&1 | tee -a "$RUNNER_TEMP/release-probe-gate.log"
-      - uses: actions/upload-artifact@v7
-        if: ${{ always() }}
+        run: python3 controller/.github/scripts/rc-dispatch-probe.py admit
+      # This registration is not production status provenance or verified release evidence.
+      - name: 先持久化唯一实验 owner
+        if: ${{ steps.admit.outputs.admitted == 'true' }}
+        uses: actions/upload-artifact@v7
         with:
-          name: release-probe-gate-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/release-probe-gate.log
+          name: rc-dispatch-owner-${{ inputs.sha }}-${{ github.workflow_sha }}
+          path: ${{ runner.temp }}/rc-dispatch-probe/owner/owner.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: 保存本次准入或重复决策
+        uses: actions/upload-artifact@v7
+        with:
+          name: rc-dispatch-decision-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rc-dispatch-probe/decision.json
+          if-no-files-found: error
+          retention-days: 7
+
+  owner-proof:
+    name: RC dispatch owner proof
+    needs: admission
+    if: ${{ needs.admission.result == 'success' && needs.admission.outputs.admitted == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.admission.outputs.policy_sha }}
+          path: policy
+          fetch-depth: 1
+          clean: true
+          persist-credentials: false
+      - name: 重读原生 owner 并验证真实字节及拒绝路径
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 controller/.github/scripts/rc-dispatch-probe.py prove
+      - uses: actions/upload-artifact@v7
+        with:
+          name: rc-dispatch-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rc-dispatch-probe/proof.json
           if-no-files-found: error
           retention-days: 7
