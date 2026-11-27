@@ -1,0 +1,394 @@
+name: Release candidate
+run-name: RC ${{ inputs.sha || github.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 完整提交 SHA；必须可从当前远端 master 到达
+        type: string
+        required: true
+  push:
+    tags: ['rc/*']
+
+permissions:
+  contents: read
+  actions: read
+  statuses: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+
+jobs:
+  normalize:
+    name: Release normalize
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    outputs:
+      sha: ${{ steps.target.outputs.sha }}
+      tree: ${{ steps.target.outputs.tree }}
+      head: ${{ steps.target.outputs.head }}
+      base: ${{ steps.target.outputs.base }}
+      matrix: ${{ steps.target.outputs.matrix }}
+      workflow_sha: ${{ steps.target.outputs.workflow_sha }}
+      attempt: ${{ steps.target.outputs.attempt }}
+    steps:
+      # Authenticate remote master before executing any caller policy code.
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/heads/master
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Authenticate and pin immutable workflow source
+        working-directory: control
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          TAG_CREATED: ${{ github.event.created }}
+          TAG_DELETED: ${{ github.event.deleted }}
+          TAG_FORCED: ${{ github.event.forced }}
+          TAG_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::调用工作流必须绑定完整小写提交 SHA'
+            exit 1
+          fi
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            if [[ "$EVENT_REF" != refs/heads/master ]]; then
+              echo '::error::手动候选只能从 master 工作流触发'
+              exit 1
+            fi
+          elif [[ "$EVENT_NAME" == push ]]; then
+            tag_name=${EVENT_REF#refs/tags/rc/}
+            if [[ "$EVENT_REF" != refs/tags/rc/* || -z "$tag_name" || "$tag_name" == */* ||
+                  "$TAG_CREATED" != true || "$TAG_DELETED" != false || "$TAG_FORCED" != false ||
+                  "$TAG_BEFORE" != 0000000000000000000000000000000000000000 ]]; then
+              echo '::error::仅接受单段 rc/* 标签的新建事件，拒绝更新、删除和强制推送'
+              exit 1
+            fi
+          else
+            echo '::error::不支持的候选触发事件'
+            exit 1
+          fi
+          master_sha=$(git rev-parse --verify 'refs/remotes/origin/master^{commit}')
+          if [[ "$(git cat-file -t "$WORKFLOW_SHA")" != commit ]] ||
+             ! git merge-base --is-ancestor "$WORKFLOW_SHA" "$master_sha"; then
+            echo '::error::调用工作流提交不可从已认证的远端 master 到达'
+            exit 1
+          fi
+          git -c core.hooksPath=/dev/null checkout --detach "$WORKFLOW_SHA"
+          [[ "$(git rev-parse HEAD)" == "$WORKFLOW_SHA" ]]
+          [[ -z "$(git status --porcelain)" ]]
+      - name: Test release admission and evidence contracts without external execution
+        working-directory: control
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(.github/scripts/test-release-*.py .github/scripts/release-test-*.py)
+          [[ "${#tests[@]}" -gt 0 ]]
+          for test in "${tests[@]}"; do
+            python3 -B "$test"
+          done
+      - name: Normalize immutable candidate and trusted workflow sources
+        id: target
+        working-directory: control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/release-control.py normalize --output "$RUNNER_TEMP/release-intent"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-intent-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-intent/receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+  claim:
+    name: Release admission ${{ needs.normalize.outputs.sha }}
+    needs: normalize
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      statuses: write
+    concurrency:
+      group: release-candidate-claim-${{ needs.normalize.outputs.sha }}
+      cancel-in-progress: false
+    outputs:
+      admitted: ${{ steps.claim.outputs.admitted }}
+      attempt: ${{ steps.claim.outputs.attempt }}
+      owner_run_id: ${{ steps.claim.outputs.owner_run_id }}
+      owner_url: ${{ steps.claim.outputs.owner_url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.normalize.outputs.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - name: Reconcile canonical first owner under SHA lock
+        id: claim
+        working-directory: control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/release-control.py claim
+
+  duplicate:
+    name: Release duplicate verdict
+    needs: [normalize, claim]
+    if: >-
+      ${{ !cancelled() && needs.claim.result == 'success' &&
+          (needs.claim.outputs.admitted != 'true' || needs.claim.outputs.attempt != github.run_attempt) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.normalize.outputs.workflow_sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify canonical existing evidence without creating new evidence
+        working-directory: control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OWNER_RUN_ID: ${{ needs.claim.outputs.owner_run_id }}
+          CANDIDATE_SHA: ${{ needs.normalize.outputs.sha }}
+          CANDIDATE_TREE: ${{ needs.normalize.outputs.tree }}
+        run: python3 -B .github/scripts/release-duplicate.py
+
+  full:
+    name: Release Full
+    needs: [normalize, claim]
+    if: ${{ needs.claim.outputs.admitted == 'true' && needs.claim.outputs.attempt == github.run_attempt }}
+    uses: ./.github/workflows/ci-full.yml
+    with:
+      sha: ${{ needs.normalize.outputs.sha }}
+      tree: ${{ needs.normalize.outputs.tree }}
+      head: ${{ needs.normalize.outputs.head }}
+      base: ${{ needs.normalize.outputs.base }}
+      matrix: ${{ needs.normalize.outputs.matrix }}
+      policy_sha: ${{ needs.normalize.outputs.workflow_sha }}
+
+  clients:
+    name: Release clients
+    needs: [normalize, claim]
+    if: ${{ needs.claim.outputs.admitted == 'true' && needs.claim.outputs.attempt == github.run_attempt }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.normalize.outputs.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - name: Require current native admission
+        working-directory: control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/release-control.py guard
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.normalize.outputs.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: candidate/go.mod
+          cache-dependency-path: candidate/go.sum
+      - name: Ordinary workspace tests
+        working-directory: candidate
+        run: go test -count=1 ./cmd/workspace
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+          check-latest: true
+          cache: npm
+          cache-dependency-path: candidate/web/package-lock.json
+      - name: Web tests, typecheck and build
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          printf '{"mode":"full"}\n' > "$RUNNER_TEMP/release-clients.json"
+          python3 -B ../control/.github/scripts/ci-plan.py web "$RUNNER_TEMP/release-clients.json"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.13.0'
+          cache: npm
+          cache-dependency-path: candidate/extensions/pi-bridge/package-lock.json
+      - name: Pi bridge tests and typecheck
+        working-directory: candidate
+        run: python3 -B ../control/.github/scripts/ci-plan.py bridge "$RUNNER_TEMP/release-clients.json"
+
+  # The sole observer consumes this job's native successful completion and artifact IDs.
+  binary:
+    name: Release candidate binary
+    needs: [normalize, claim]
+    if: ${{ needs.claim.outputs.admitted == 'true' && needs.claim.outputs.attempt == github.run_attempt }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.normalize.outputs.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - name: Require current native admission
+        working-directory: control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/release-control.py guard
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.normalize.outputs.sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: candidate/go.mod
+          cache-dependency-path: candidate/go.sum
+      - name: Build one clean Darwin x86_64 candidate
+        working-directory: candidate
+        env:
+          GOOS: darwin
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+          GOWORK: 'off'
+          GOFLAGS: ''
+          CHECKOUT_SHA: ${{ needs.normalize.outputs.sha }}
+          CHECKOUT_TREE: ${{ needs.normalize.outputs.tree }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$CHECKOUT_SHA" ]]
+          [[ "$(git rev-parse 'HEAD^{tree}')" == "$CHECKOUT_TREE" ]]
+          [[ -z "$(git status --porcelain --untracked-files=all)" ]]
+          mkdir -p "$RUNNER_TEMP/release-target"
+          go build -trimpath -buildvcs=true -o "$RUNNER_TEMP/release-target/workspace" ./cmd/workspace
+      - name: Verify actual bytes and Go VCS build identity
+        working-directory: control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 -B .github/scripts/release-evidence.py binary --candidate ../candidate \
+            --binary "$RUNNER_TEMP/release-target/workspace" --output "$RUNNER_TEMP/release-target"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-target-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-target
+          if-no-files-found: error
+          retention-days: 90
+
+  # Native work starts on binary completion; this hosted job only collects its joined Full receipt.
+  machine:
+    name: Release machine evidence
+    needs: [normalize, claim, binary, full-evidence]
+    if: >-
+      ${{ needs.claim.outputs.admitted == 'true' && needs.claim.outputs.attempt == github.run_attempt &&
+          needs.binary.result == 'success' && needs.full-evidence.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.normalize.outputs.workflow_sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Collect bounded owner-authenticated native machine evidence
+        working-directory: control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/release-evidence.py collect --wait-seconds 6600 --output "$RUNNER_TEMP/release-machine-collected"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-machine-collected-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-machine-collected/receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+  # Notify the same observer through native completion; never create another watcher.
+  full-evidence:
+    name: Release Full evidence
+    needs: [normalize, claim, full, clients, binary]
+    if: ${{ needs.claim.outputs.admitted == 'true' && needs.claim.outputs.attempt == github.run_attempt }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.normalize.outputs.workflow_sha }}
+          path: control
+          persist-credentials: false
+      - name: Verify native Full attempt and independently rehash binary
+        working-directory: control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 -B .github/scripts/release-evidence.py full --output "$RUNNER_TEMP/release-full"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-full-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-full/receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+  materials:
+    name: Release candidate evidence
+    needs: [normalize, claim, full, clients, binary, full-evidence, machine]
+    if: ${{ !cancelled() && needs.claim.outputs.admitted == 'true' && needs.claim.outputs.attempt == github.run_attempt }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.normalize.outputs.workflow_sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Collect provisional native candidate materials
+        working-directory: control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          python3 -B .github/scripts/release-evidence.py materials --output "$RUNNER_TEMP/release-materials"
+          python3 -B .github/scripts/release-host-proof.py assess --materials "$RUNNER_TEMP/release-materials/receipt.json" \
+            --control . --workflow-sha "$GITHUB_WORKFLOW_SHA" --output "$RUNNER_TEMP/release-materials/decision.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-materials-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-materials
+          if-no-files-found: error
+          retention-days: 90
+
+  verdict:
+    name: Release candidate verdict
+    needs: [normalize, claim, materials]
+    if: ${{ !cancelled() && needs.claim.outputs.admitted == 'true' && needs.claim.outputs.attempt == github.run_attempt }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.normalize.outputs.workflow_sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Enforce remote machine proof
+        working-directory: control
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/release-host-proof.py enforce --control . --output "$RUNNER_TEMP/release-evidence"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-evidence-${{ needs.normalize.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-evidence/evidence.json
+          if-no-files-found: error
+          retention-days: 90

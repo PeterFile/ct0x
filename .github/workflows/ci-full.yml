@@ -18,6 +18,10 @@ on:
       matrix:
         type: string
         required: true
+      policy_sha:
+        type: string
+        required: false
+        default: ''
     outputs:
       verified:
         value: ${{ jobs.gate.outputs.verified }}
@@ -50,6 +54,45 @@ jobs:
       max-parallel: 7
       matrix: ${{ fromJSON(inputs.matrix) }}
     steps:
+      - &verify-policy-input
+        name: Verify immutable policy input
+        if: ${{ inputs.policy_sha != '' }}
+        env:
+          POLICY_SHA: ${{ inputs.policy_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$POLICY_SHA" =~ ^[0-9a-f]{40}$ || "$POLICY_SHA" != "$GITHUB_WORKFLOW_SHA" ]]; then
+            echo '::error::CI 策略必须是调用工作流的完整小写不可变 SHA'
+            exit 1
+          fi
+      - &checkout-policy
+        name: Checkout immutable CI policy
+        if: ${{ inputs.policy_sha != '' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.policy_sha }}
+          persist-credentials: false
+          path: .ci-policy
+          sparse-checkout: .github
+      # Move policy before product checkout so neither checkout can dirty or remove the other.
+      - &stage-policy
+        name: Stage verified CI policy
+        if: ${{ inputs.policy_sha != '' }}
+        env:
+          POLICY_SHA: ${{ inputs.policy_sha }}
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/.ci-policy"
+          target="$RUNNER_TEMP/ci-policy"
+          [[ -d "$source/.git" && ! -L "$source" && ! -e "$target" && ! -L "$target" ]] || exit 1
+          actual=$(git -C "$source" rev-parse HEAD)
+          status=$(git -C "$source" status --porcelain)
+          [[ "$actual" == "$POLICY_SHA" && -z "$status" ]] || exit 1
+          for file in ci-plan.py ci-shards.py ci-gate.py verify-store-shard.py test-ci-scheduling.py test-store-shard.py; do
+            [[ -f "$source/.github/scripts/$file" && ! -L "$source/.github/scripts/$file" ]] || exit 1
+          done
+          mv "$source" "$target"
+          printf 'CI_POLICY_ROOT=%s\n' "$target" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.sha }}
@@ -66,7 +109,7 @@ jobs:
           CHECKOUT_TREE: ${{ inputs.tree }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/ci-shards.py run "$SHARD_PROFILE" "$SHARD_WORKER" "$RUNNER_TEMP/shard-evidence" \
+          python3 "${CI_POLICY_ROOT:-.}"/.github/scripts/ci-shards.py run "$SHARD_PROFILE" "$SHARD_WORKER" "$RUNNER_TEMP/shard-evidence" \
             --run-id "$GITHUB_RUN_ID" --sha "$CHECKOUT_SHA" --tree "$CHECKOUT_TREE"
       - uses: actions/upload-artifact@v7
         with:
@@ -164,6 +207,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
+      - *verify-policy-input
+      - *checkout-policy
+      - *stage-policy
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.sha }}
@@ -174,6 +220,7 @@ jobs:
           cache-dependency-path: go.sum
       - run: go vet ./...
       - name: Test CI scheduling and shard gates
+        working-directory: ${{ env.CI_POLICY_ROOT || github.workspace }}
         run: |
           set -euo pipefail
           python3 .github/scripts/test-ci-scheduling.py -v
@@ -242,6 +289,9 @@ jobs:
       head: ${{ steps.evidence.outputs.head }}
       base: ${{ steps.evidence.outputs.base }}
     steps:
+      - *verify-policy-input
+      - *checkout-policy
+      - *stage-policy
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.sha }}
@@ -249,7 +299,7 @@ jobs:
       - name: Check required results
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 .github/scripts/ci-gate.py
+        run: python3 "${CI_POLICY_ROOT:-.}"/.github/scripts/ci-gate.py
       - uses: actions/download-artifact@v7
         with:
           pattern: '*-worker-v1-*'
@@ -264,7 +314,7 @@ jobs:
           BASE_SHA: ${{ inputs.base }}
         run: |
           set -euo pipefail
-          python3 .github/scripts/ci-shards.py aggregate "$RUNNER_TEMP/shard-workers" \
+          python3 "${CI_POLICY_ROOT:-.}"/.github/scripts/ci-shards.py aggregate "$RUNNER_TEMP/shard-workers" \
             --run-id "$GITHUB_RUN_ID" --sha "$CHECKOUT_SHA" --tree "$CHECKOUT_TREE"
           printf 'verified=true\nrun_id=%s\nsha=%s\ntree=%s\nhead=%s\nbase=%s\n' \
             "$GITHUB_RUN_ID" "$CHECKOUT_SHA" "$CHECKOUT_TREE" "$HEAD_SHA" "$BASE_SHA" >> "$GITHUB_OUTPUT"
