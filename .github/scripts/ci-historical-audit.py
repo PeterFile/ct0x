@@ -46,10 +46,18 @@ def valid_sha(value):
 
 
 def request(inputs, size):
-    check(isinstance(inputs, dict) and not inputs.keys() - {"policy_sha", "phase", "offset", "count"}, "输入字段非法")
+    check(isinstance(inputs, dict) and not inputs.keys() - {"policy_sha", "phase", "offset", "count", "focus_sha"}, "输入字段非法")
     check(valid_sha(inputs.get("policy_sha")), "policy_sha 必须为小写四十位 SHA")
     check(inputs.get("phase") in ("selector", "diagnostics", "both"), "phase 非法")
     result = {"policy_sha": inputs["policy_sha"], "phase": inputs["phase"]}
+    focus = inputs.get("focus_sha", "")
+    check(isinstance(focus, str), "focus_sha 必须为空或冻结清单内的小写四十位 SHA")
+    if focus:
+        check(valid_sha(focus), "focus_sha 必须为空或小写四十位 SHA")
+        cases = manifest((HERE / "ci-historical-cases.json").read_text(encoding="utf-8"))
+        check(focus in {row["sha"] for row in cases}, "focus_sha 不在冻结历史清单中")
+        check(inputs["phase"] == "selector" or focus in DIAGNOSTICS, "诊断 focus_sha 必须是已有固定诊断原件")
+        result["focus_sha"] = focus
     for key, default, low, high in (("offset", "0", 0, size - 1), ("count", "150", 1, 150)):
         value = inputs.get(key, default)
         if value == "":
@@ -78,6 +86,18 @@ def manifest(text):
             check(tuple(pair) not in runs, "原运行/尝试重复")
             runs.add(tuple(pair))
     return rows
+
+
+def select_sources(cases, options):
+    focus = options.get("focus_sha")
+    if focus:
+        focused = [row for row in cases if row["sha"] == focus]
+        check(len(focused) == 1, "focus_sha 未对应唯一冻结原件；不能忽略或回退到全清单")
+        check(options["phase"] == "selector" or focus in DIAGNOSTICS, "诊断 focus_sha 不是固定诊断原件")
+        return ([] if options["phase"] == "diagnostics" else focused,
+                set() if options["phase"] == "selector" else {focus})
+    selected = cases[options["offset"]:options["offset"] + options["count"]] if options["phase"] != "diagnostics" else []
+    return selected, set(DIAGNOSTICS) if options["phase"] != "selector" else set()
 
 
 def commit(raw, sha):
@@ -302,7 +322,7 @@ try:
         try:
             with p.module("merge-gate-migration").generated(root, p.HERE / "merge-gate-migrations.json") as flags:
                 with tempfile.TemporaryDirectory(prefix="audit-inventory-") as directory:
-                    compiled = p.inventory(root, "agentworkspace/internal/store", False, directory, flags)
+                    compiled = p.inventory(root, "agentworkspace/internal/store", request["tasks"][0]["race"], directory, flags)
             task, selected, slots = partition(compiled)
             receipt["partition"].update(compiled=dict(compiled), selected=dict(selected), slots=slots, confirmed=True)
         except Exception as error:
@@ -615,7 +635,15 @@ def candidate_task(inspection, kind, projected):
                task.get("kind") == "go" and task.get("package") == package and task.get("race") is (kind not in ("compile", "migration")))]
     check(matches, "实际策略没有选中目标执行单元")
     task = matches[0]
-    if kind == "ci":
+    full_effect = kind == "effect" and (selected.get("all_race") is True or package in selected.get("race_full", []))
+    if full_effect:
+        required = selected.get("race", {}).get(package, [])
+        check(package in selected.get("packages", []) and all(
+            row.get("profile") == "store" and type(row.get("worker")) is int and row["worker"] >= 0
+            and row.get("names") is None and row.get("required") == required
+            and row.get("bucket") is None and row.get("buckets") is None for row in matches)
+            and len({row["worker"] for row in matches}) == len(matches), "必须保留实际完整 Store race 分区及 required；不能改名或改槽")
+    elif kind == "ci":
         check(selected.get("ci") is True and len(matches) == 1, "CI 未被实际 selector 选中")
     elif kind == "vet":
         check(task.get("packages") == selected.get("packages") and package in task["packages"], "候选 vet 不含原故障包的完整实际范围")
@@ -632,7 +660,8 @@ def candidate_task(inspection, kind, projected):
         check(len(matches) == 1 and not selected.get("all_race") and package not in selected.get("race_full", [])
               and task.get("names") == names and task.get("required") == names and task.get("worker") is None,
               "必须保留实际 RACE 名称及 required 全集；不缩减或执行未知全套范围")
-    return {"task": task, "target_tasks": matches, "scope_selected": True, "unit_exercised": False,
+    return {"task": task, "target_tasks": matches, "partitioned": kind == "migration" or full_effect,
+            "scope_selected": True, "unit_exercised": False,
             "task_origin": "emitted-task" if selected["tasks"] else "target-projection-from-refused-inspect",
             "selector_status": inspection["status"], "full_plan_executable": inspection["status"] == "selected",
             "global_unresolved": selected["unresolved"], "caught_original_defect": False, "status": "unknown"}
@@ -990,8 +1019,13 @@ def diagnose(runner, frozen, policy, inspection=None):
             sources, missing = required_sources(runner, task)
             candidate.update(required_source=sources, missing_source_names=missing)
             # Static absence is metadata: the pinned worker may supply trusted generated tests.
-        worker = runner.worker(task, prefix)
+        worker_request = {"kind": "store-partition", "tasks": candidate["target_tasks"], "representative": EFFECT} if candidate["partitioned"] else task
+        worker = runner.worker(worker_request, prefix)
         candidate.update(worker=worker, api_invoked=worker["receipt"].get("api_invoked", False), unit_exercised=False)
+        if candidate["partitioned"]:
+            task = worker["receipt"]["task"]
+            check(task in candidate["target_tasks"], "worker 未执行实际发出的完整 Store race 分区")
+            candidate["task"] = task
         command = worker["command"]
         result["command"] = command
         check(worker.get("tracked_unchanged"), "worker 清理后的 SHA/tree/跟踪文件状态改变或证据缺失")
@@ -1053,7 +1087,7 @@ def diagnose(runner, frozen, policy, inspection=None):
                 matched = result["source_signature"]["matches"] if kind == "effect" else any(row["matches"] for row in result["source_signatures"])
                 if result["status"] == "red-reproduced" and not matched:
                     result["status"] = "original-assertion-unconfirmed"
-            if kind == "effect" and not summary["tests"][EFFECT]["run"]:
+            if kind == "effect" and not summary["tests"].get(EFFECT, {}).get("run"):
                 candidate["reason"] = "original-not-reached-by-actual-worker"
                 result["isolated_original"] = isolated_effect(runner, spec, prefix)
         if timed_out:
@@ -1119,9 +1153,8 @@ def run_audit(root):
         options = request(event.get("inputs"), len(cases))
         index.update(context=expected, controller=controller, request=options, manifest_count=len(cases),
                      manifest_sha256=hashlib.sha256(cases_path.read_bytes()).hexdigest())
-        selected = cases[options["offset"]:options["offset"] + options["count"]] if options["phase"] != "diagnostics" else []
+        selected, diagnostic_shas = select_sources(cases, options)
         selector_shas = {row["sha"] for row in selected}
-        diagnostic_shas = set(DIAGNOSTICS) if options["phase"] != "selector" else set()
         by_sha = {row["sha"]: row for row in cases}
         for sha in diagnostic_shas:
             check(sha in by_sha and [DIAGNOSTICS[sha]["run_id"], 1] in by_sha[sha]["runs"], "诊断原始 run/SHA 不在冻结清单")

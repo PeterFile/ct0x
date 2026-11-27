@@ -55,6 +55,70 @@ class AuditTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.a.request({"policy_sha": "a" * 40, "phase": "both", **change}, 113)
 
+    def test_focus_sha_validation_and_default_source_selection(self):
+        self.assertTrue(hasattr(self.a, "select_sources"), "Focused source selection is not implemented")
+        cases = self.a.manifest(SCRIPT.with_name("ci-historical-cases.json").read_text())
+        diagnostic = "7d70dc49ff1f3c3ae3876b2a519059c60d88ec3d"
+        selector_only = next(row["sha"] for row in cases if row["sha"] not in self.a.DIAGNOSTICS)
+        for phase in ("selector", "both", "diagnostics"):
+            inputs = {"policy_sha": "a" * 40, "phase": phase}
+            original = self.a.request(inputs, len(cases))
+            self.assertEqual(self.a.request({**inputs, "focus_sha": ""}, len(cases)), original)
+            selected, diagnostics = self.a.select_sources(cases, original)
+            self.assertEqual(selected, [] if phase == "diagnostics" else cases)
+            self.assertEqual(diagnostics, set() if phase == "selector" else set(self.a.DIAGNOSTICS))
+            options = self.a.request({**inputs, "focus_sha": diagnostic, "offset": "112", "count": "1"}, len(cases))
+            selected, diagnostics = self.a.select_sources(cases, options)
+            self.assertEqual([row["sha"] for row in selected], [] if phase == "diagnostics" else [diagnostic])
+            self.assertEqual(diagnostics, set() if phase == "selector" else {diagnostic})
+        self.a.request({"policy_sha": "a" * 40, "phase": "selector", "focus_sha": selector_only}, len(cases))
+        for phase in ("both", "diagnostics"):
+            with self.subTest(phase=phase), self.assertRaises(ValueError):
+                self.a.request({"policy_sha": "a" * 40, "phase": phase, "focus_sha": selector_only}, len(cases))
+        for invalid in ("0" * 40, diagnostic.upper(), diagnostic + "\n", " " + diagnostic, False, None):
+            with self.subTest(focus=invalid), self.assertRaises(ValueError):
+                self.a.request({"policy_sha": "a" * 40, "phase": "selector", "focus_sha": invalid}, len(cases))
+        with self.assertRaises(ValueError):
+            self.a.select_sources([row for row in cases if row["sha"] != diagnostic], options)
+        paged = self.a.request({"policy_sha": "a" * 40, "phase": "both", "offset": "7", "count": "2"}, len(cases))
+        self.assertEqual(self.a.select_sources(cases, paged), (cases[7:9], set(self.a.DIAGNOSTICS)))
+
+    def test_focused_audit_never_fetches_or_checks_out_unrelated_sources(self):
+        sha = "7d70dc49ff1f3c3ae3876b2a519059c60d88ec3d"
+        for phase in ("selector", "both", "diagnostics"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
+                runner = self.runner(Path(directory))
+                scripts = runner.root / "controller/.github/scripts"
+                scripts.mkdir(parents=True)
+                (scripts / "ci-historical-cases.json").write_bytes(SCRIPT.with_name("ci-historical-cases.json").read_bytes())
+                event = runner.root / "event.json"
+                event.write_text(json.dumps({"inputs": {"policy_sha": "a" * 40, "phase": phase, "focus_sha": sha,
+                                                         "offset": "112", "count": "1"}}))
+                def git(root, *args):
+                    return {("rev-parse", "HEAD"): ("b" * 40 + "\n").encode(), ("--version",): b"git fixture"}.get(args, b"")
+                with patch.object(self.a, "HERE", scripts), patch.object(self.a, "Runner", return_value=runner), \
+                        patch.object(self.a, "context", return_value={"sha": "b" * 40}), \
+                        patch.object(self.a, "public_run", return_value={}), \
+                        patch.object(self.a.platform, "platform", return_value="fixture"), \
+                        patch.object(self.a.subprocess, "run") as version, \
+                        patch.dict(os.environ, {"GITHUB_EVENT_PATH": str(event)}), \
+                        patch.object(runner, "identity", return_value={"sha": "b" * 40}), \
+                        patch.object(runner, "git", side_effect=git), \
+                        patch.object(runner, "prepare_policy", return_value={"sha": "a" * 40}), \
+                        patch.object(runner, "prefetch", return_value=[]) as fetch, \
+                        patch.object(runner, "checkout_source", return_value={"sha": sha}) as checkout, \
+                        patch.object(runner, "inspect", return_value={"status": "policy-refusal"}) as inspect, \
+                        patch.object(self.a, "diagnose", return_value={"status": "unknown"}) as diagnose:
+                    version.return_value.stdout = b"go version go1.26.0 linux/amd64"
+                    result = self.a.run_audit(runner.root)
+                self.assertEqual(fetch.call_args.args[0], [sha], result["errors"])
+                self.assertEqual(checkout.call_count, 1)
+                self.assertEqual(inspect.call_count, 1)
+                self.assertEqual(diagnose.call_count, 0 if phase == "selector" else 1)
+                self.assertEqual([row["sha"] for row in result["rows"]], [sha])
+                self.assertEqual(result["coverage"]["requested"], 1)
+                self.assertEqual(result["status"], "complete" if phase == "selector" else "infrastructure-error")
+
     def test_manifest_is_only_frozen_public_identity(self):
         self.assertEqual(self.a.manifest(json.dumps([CASE])), [CASE])
         for field, value in (("tree", "bad"), ("base", "e" * 40), ("parents", []),
@@ -316,7 +380,7 @@ class AuditTests(unittest.TestCase):
                 mismatch = self.a.diagnose(runner, case, {}, inspection)
             self.assertEqual(mismatch["isolated_original"]["status"], "unknown")
             source.write_text(source.read_text().replace("unrelated assertion", "expected conflict without a receipt"))
-            inspection["selection"]["all_race"] = True
+            inspection["selection"]["all_race"] = False
             task.update(names=None, worker=0)
             with patch.object(runner, "project", return_value=[task]), patch.object(runner, "record", return_value=command) as calls:
                 broad = self.a.diagnose(runner, case, {}, inspection)
@@ -418,16 +482,16 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(data["commands"], [])
             self.assertEqual(result["rc"], 1)
 
-    def producing_policy(self, runner, task, text, compiled=None):
+    def producing_policy(self, runner, task, text, compiled=None, rc=1):
         """A subprocess policy producer: no Go process, auth, or historical checkout changes."""
         scripts = runner.policy / ".github/scripts"
         scripts.mkdir(parents=True)
         source = scripts / "merge-gate.py"
         source.write_text(
             'from collections import Counter\nimport json, subprocess, sys, tempfile\nfrom pathlib import Path\n'
-            f'COMPILED = {repr(compiled or task["names"])}\nTEXT = {text!r}\n'
+            f'COMPILED = {repr(compiled or task["names"])}\nTEXT = {text!r}\nRC = {rc}\n'
             'def command(argv, root, **kwargs):\n'
-            '    return subprocess.run([sys.executable, "-B", "-c", "import sys; sys.stdout.write(" + repr(TEXT) + "); sys.exit(1)"], check=True, **kwargs)\n'
+            '    return subprocess.run([sys.executable, "-B", "-c", "import sys; sys.stdout.write(" + repr(TEXT) + "); sys.exit(" + str(RC) + ")"], check=True, **kwargs)\n'
             'def inventory(root, package, race, directory, flags):\n'
             '    assert json.loads(Path(flags[0].split("=", 1)[1]).read_text())["Replace"]\n'
             '    return Counter(COMPILED)\n'
@@ -446,6 +510,113 @@ class AuditTests(unittest.TestCase):
             '    finally:\n'
             '        generated.unlink()\n')
         return source
+
+    def partition_policy(self, runner, names, text, rc=1):
+        policy = self.producing_policy(runner, {"names": names}, text, names, rc)
+        # Deliberately reverse BATCHES: choose through the policy helper, not audit-side hash arithmetic.
+        policy.write_text(policy.read_text() +
+            '\nfrom contextlib import contextmanager\nfrom types import SimpleNamespace\nimport importlib.util\n'
+            f'_spec = importlib.util.spec_from_file_location("verifier", {str(SCRIPT.parent / "verify-store-shard.py")!r})\n'
+            'verifier = importlib.util.module_from_spec(_spec)\n_spec.loader.exec_module(verifier)\n'
+            'shards = SimpleNamespace(BATCHES={"store": tuple(reversed(tuple(tuple(range(i, i+4)) for i in range(0,64,4))))})\n'
+            '@contextmanager\ndef generated(root, authority):\n'
+            '    with tempfile.TemporaryDirectory() as directory:\n'
+            '        overlay = Path(directory) / "overlay.json"\n'
+            '        overlay.write_text(json.dumps({"Replace": {"legacy": "trusted"}}))\n'
+            '        yield ["-overlay=" + str(overlay)]\n'
+            'HERE = Path(__file__).parent\n'
+            'def module(name):\n    return SimpleNamespace(generated=generated)\n'
+            'def run_go(root, task):\n'
+            '    with generated(root, HERE / "merge-gate-migrations.json") as flags:\n'
+            '        compiled = inventory(root, task["package"], task["race"], root, flags)\n'
+            '        selected = sum((verifier.selection(compiled, slot, "store")[0] for slot in shards.BATCHES["store"][task["worker"]]), Counter())\n'
+            '        pattern = verifier.run_pattern(selected)\n'
+            '        with tempfile.TemporaryDirectory() as directory:\n'
+            '            with (Path(directory) / "go.json").open("wb") as output:\n'
+            '                command(["go", "test", *flags, "-count=1", *(["-race"] if task["race"] else []), "-json", "-run", pattern, task["package"]], root, stdout=output)\n')
+        return policy
+
+    def full_store_selection(self):
+        # Store projection captured in hosted run 45870675051/1; the full inspect remained refused.
+        names = ["TestMergeGateAllMigrationPrefixesUpgradeReopenReplay", "TestMergeGatePublishedMigrationAuthority",
+                 "TestMergeGatePublishedMigrationAuthorityRejectsMutation", "TestMissingAndCrossGroupReferences",
+                 "TestQueueClaimRacesAcrossHandles", self.a.EFFECT, "TestTaskWorkInputMutationUncertainty",
+                 "TestWorkerArtifactCrossGroupVersionAndCallerIsolation", "TestWorkspaceOperationRevocationClaimAndAttemptFences",
+                 "TestWorkspaceOperationUnresolvedOutcomesAndRecovery"]
+        tasks = [{"unit": f"race-agentworkspace-internal-store-{worker}", "kind": "go", "package": PACKAGE,
+                  "race": True, "profile": "store", "worker": worker, "bucket": None, "buckets": None,
+                  "names": None, "required": names} for worker in [1, 2, 9, 12, 14, 15, 0, 3, 4, 5, 6, 7, 8, 10, 11, 13]]
+        inspection = {"status": "policy-refusal", "selection": {"all_race": False, "packages": [PACKAGE],
+                      "race_full": ["agentworkspace/cmd/workspace", "agentworkspace/internal/coordination", PACKAGE],
+                      "race": {PACKAGE: names}, "tasks": [],
+                      "unresolved": [PACKAGE + ":TestMergeGateAllMigrationPrefixesUpgradeReopenReplay"]}}
+        return inspection, tasks
+
+    def test_full_store_race_uses_complete_pinned_partition_for_original_red_pass_and_other_red(self):
+        sha = "7d70dc49ff1f3c3ae3876b2a519059c60d88ec3d"
+        inspection, tasks = self.full_store_selection()
+        verifier_spec = importlib.util.spec_from_file_location("fixture_verifier", SCRIPT.parent / "verify-store-shard.py")
+        verifier = importlib.util.module_from_spec(verifier_spec)
+        verifier_spec.loader.exec_module(verifier)
+        slot = next(slot for slot in range(64) if verifier.selection({self.a.EFFECT: 1}, slot, "store")[0])
+        mate = next("TestPartitionMate" + str(i) for i in range(10000)
+                    if verifier.selection({"TestPartitionMate" + str(i): 1}, slot, "store")[0])
+        compiled = [*tasks[0]["required"], mate]
+        slots = next(slots for slots in (tuple(range(i, i + 4)) for i in range(0, 64, 4)) if slot in slots)
+        selected = sorted({name for slot in slots for name in verifier.selection(dict.fromkeys(compiled, 1), slot, "store")[0]})
+        for failed, output, rc, expected in (([self.a.EFFECT], "task_work_input_effect_test.go:75: expected conflict without a receipt", 1, "red-reproduced"),
+                                            ([], "", 0, "complete-no-red"),
+                                            ([self.a.EFFECT], "task_work_input_effect_test.go:76: unrelated assertion", 1, "original-assertion-unconfirmed"),
+                                            ([mate], "unrelated setup assertion", 1, "original-assertion-unconfirmed")):
+            with self.subTest(expected=expected, failed=failed), tempfile.TemporaryDirectory() as directory:
+                runner = self.runner(Path(directory))
+                source = runner.history / "internal/store/task_work_input_effect_test.go"
+                source.parent.mkdir(parents=True)
+                source.write_text(f'func {self.a.EFFECT}(t *testing.T) {{\n' + "\n" * 73 +
+                                  'conflict(f.s.HandBackWorkInputWithKey(ctx))\nt.Fatal("expected conflict without a receipt")\n}\n')
+                self.partition_policy(runner, compiled, self.trace(selected, failed, PACKAGE, output + "\n"), rc)
+                def git(root, *args):
+                    return {("rev-parse", "HEAD"): (sha + "\n").encode(),
+                            ("rev-parse", "HEAD^{tree}"): ("b" * 40 + "\n").encode()}.get(args, b"")
+                real_record = runner.record
+                def python_only(argv, *args):
+                    self.assertEqual(argv[0], sys.executable, "No redundant isolated Go probe")
+                    return real_record(argv, *args)
+                with patch.object(runner, "trusted_policy"), patch.object(runner, "project", return_value=tasks), \
+                        patch.object(runner, "git", side_effect=git), patch.object(runner, "record", side_effect=python_only):
+                    result = self.a.diagnose(runner, {"sha": sha}, {}, inspection)
+                self.assertEqual(result["status"], expected, result)
+                candidate = result["candidate"]
+                self.assertTrue(candidate["unit_exercised"])
+                self.assertEqual(candidate["caught_original_defect"], expected == "red-reproduced")
+                self.assertFalse(candidate["full_plan_executable"])
+                self.assertEqual(candidate["task"], next(task for task in tasks if task["worker"] == candidate["task"]["worker"]))
+                self.assertIsNone(candidate["task"]["names"])
+                receipt = candidate["worker"]["receipt"]
+                self.assertTrue(all(row["race"] for row in receipt["inventories"]), "Preflight must inventory the same race build")
+                self.assertEqual(receipt["partition"]["selected"], dict.fromkeys(selected, 1))
+                self.assertIn(mate, result["go_events"]["tests"])
+                self.assertNotIn("isolated_original", result)
+
+    def test_full_store_race_requires_actual_full_selection_and_unchanged_emitted_tasks(self):
+        inspection, tasks = self.full_store_selection()
+        # A named registry is not required when the real selector requests full-race coverage.
+        inspection["selection"]["race"] = {}
+        for task in tasks:
+            task["required"] = []
+        target = self.a.candidate_task(inspection, "effect", tasks)
+        self.assertEqual(target["target_tasks"], tasks)
+        for field, value in (("names", [self.a.EFFECT]), ("required", [self.a.EFFECT]), ("profile", "platform"),
+                             ("worker", None), ("worker", -1), ("bucket", 0)):
+            changed = copy.deepcopy(tasks)
+            changed[0][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                self.a.candidate_task(inspection, "effect", changed)
+        inspection["selection"]["race_full"] = []
+        with self.assertRaises(ValueError):
+            self.a.candidate_task(inspection, "effect", tasks)
+        inspection["selection"]["all_race"] = True
+        self.assertEqual(self.a.candidate_task(inspection, "effect", tasks)["target_tasks"], tasks)
 
     def test_missing_static_name_is_supplied_by_policy_harness_and_worker_cleans_up(self):
         sha = "7d70dc49ff1f3c3ae3876b2a519059c60d88ec3d"
@@ -553,29 +724,8 @@ class AuditTests(unittest.TestCase):
                       "names": None, "required": []} for worker in range(16)]
             inspection = {"status": "policy-refusal", "selection": {"packages": [PACKAGE], "ordinary_required": {},
                           "unresolved": [PACKAGE + ":TestLater"], "tasks": []}}
-            policy = self.producing_policy(runner, {"names": names}, self.trace(names[:1], names[:1], PACKAGE,
-                "queue_schema_test.go:126: upgrade changed message receipt: stable\n"), names)
-            # Deliberately reverse BATCHES; hard-coded hash/worker arithmetic must choose the wrong unit.
-            policy.write_text(policy.read_text() +
-                '\nfrom contextlib import contextmanager\nfrom types import SimpleNamespace\nimport importlib.util\n'
-                f'_spec = importlib.util.spec_from_file_location("verifier", {str(SCRIPT.parent / "verify-store-shard.py")!r})\n'
-                'verifier = importlib.util.module_from_spec(_spec)\n_spec.loader.exec_module(verifier)\n'
-                'shards = SimpleNamespace(BATCHES={"store": tuple(reversed(tuple(tuple(range(i, i+4)) for i in range(0,64,4))))})\n'
-                '@contextmanager\ndef generated(root, authority):\n'
-                '    with tempfile.TemporaryDirectory() as directory:\n'
-                '        overlay = Path(directory) / "overlay.json"\n'
-                '        overlay.write_text(json.dumps({"Replace": {"legacy": "trusted"}}))\n'
-                '        yield ["-overlay=" + str(overlay)]\n'
-                'HERE = Path(__file__).parent\n'
-                'def module(name):\n    return SimpleNamespace(generated=generated)\n'
-                'def run_go(root, task):\n'
-                '    with generated(root, HERE / "merge-gate-migrations.json") as flags:\n'
-                '        compiled = inventory(root, task["package"], False, root, flags)\n'
-                '        selected = sum((verifier.selection(compiled, slot, "store")[0] for slot in shards.BATCHES["store"][task["worker"]]), Counter())\n'
-                '        pattern = verifier.run_pattern(selected)\n'
-                '        with tempfile.TemporaryDirectory() as directory:\n'
-                '            with (Path(directory) / "go.json").open("wb") as output:\n'
-                '                command(["go", "test", *flags, "-count=1", "-json", "-run", pattern, task["package"]], root, stdout=output)\n')
+            policy = self.partition_policy(runner, names, self.trace(names[:1], names[:1], PACKAGE,
+                "queue_schema_test.go:126: upgrade changed message receipt: stable\n"))
             def git(root, *args):
                 return {("rev-parse", "HEAD"): (sha + "\n").encode(),
                         ("rev-parse", "HEAD^{tree}"): ("b" * 40 + "\n").encode()}.get(args, b"")

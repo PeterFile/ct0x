@@ -9,11 +9,16 @@ on:
         required: true
         type: string
       phase:
-        description: '审计阶段；diagnostics 始终核验八个固定历史原件'
+        description: '审计阶段；未指定 focus_sha 时 diagnostics 核验八个固定历史原件'
         required: true
         type: choice
         options: [selector, diagnostics, both]
         default: both
+      focus_sha:
+        description: '可选：仅审计冻结清单内该小写四十位 SHA；留空沿用原有 113 条/八诊断范围'
+        required: false
+        type: string
+        default: ''
       offset:
         description: 'selector 在冻结清单中的起始位置（0..112）'
         required: false
