@@ -1380,6 +1380,295 @@ class GoFailureScopeTests(unittest.TestCase):
                         'messages': ['执行准备工作区无效或已变更']})
 
 
+class DefaultPolicySourceTests(unittest.TestCase):
+    # Embedded #269 setup keeps the future-source cases executable on #267 alone.
+    policy_setup = '''      - &verify-policy-input
+        name: Verify immutable policy input
+        if: ${{ inputs.policy_sha != '' }}
+        env:
+          POLICY_SHA: ${{ inputs.policy_sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$POLICY_SHA" =~ ^[0-9a-f]{40}$ || "$POLICY_SHA" != "$GITHUB_WORKFLOW_SHA" ]]; then
+            echo '::error::CI 策略必须是调用工作流的完整小写不可变 SHA'
+            exit 1
+          fi
+      - &checkout-policy
+        name: Checkout immutable CI policy
+        if: ${{ inputs.policy_sha != '' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.policy_sha }}
+          persist-credentials: false
+          path: .ci-policy
+          sparse-checkout: .github
+      - &stage-policy
+        name: Stage verified CI policy
+        if: ${{ inputs.policy_sha != '' }}
+        env:
+          POLICY_SHA: ${{ inputs.policy_sha }}
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/.ci-policy"
+          target="$RUNNER_TEMP/ci-policy"
+          [[ -d "$source/.git" && ! -L "$source" && ! -e "$target" && ! -L "$target" ]] || exit 1
+          actual=$(git -C "$source" rev-parse HEAD)
+          status=$(git -C "$source" status --porcelain)
+          [[ "$actual" == "$POLICY_SHA" && -z "$status" ]] || exit 1
+          for file in ci-plan.py ci-shards.py ci-gate.py verify-store-shard.py test-ci-scheduling.py test-store-shard.py; do
+            [[ -f "$source/.github/scripts/$file" && ! -L "$source/.github/scripts/$file" ]] || exit 1
+          done
+          mv "$source" "$target"
+          printf 'CI_POLICY_ROOT=%s\\n' "$target" >> "$GITHUB_ENV"
+'''
+    checkout = '''      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+'''
+    shard_step = '''      - name: Run and verify logical slots
+        env:
+          SHARD_PROFILE: ${{ matrix.profile }}
+          SHARD_WORKER: ${{ matrix.worker }}
+          CHECKOUT_SHA: ${{ inputs.sha }}
+          CHECKOUT_TREE: ${{ inputs.tree }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ci-shards.py run "$SHARD_PROFILE" "$SHARD_WORKER" "$RUNNER_TEMP/shard-evidence" \\
+            --run-id "$GITHUB_RUN_ID" --sha "$CHECKOUT_SHA" --tree "$CHECKOUT_TREE"
+'''
+    python_step = '''      - name: Test CI scheduling and shard gates
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test-ci-scheduling.py -v
+          python3 .github/scripts/test-store-shard.py -v
+'''
+    python_log = '''FAIL: test_policy (__main__.WorkflowTests.test_policy)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/runner/work/workspace/workspace/.github/scripts/test-store-shard.py", line 4, in test_policy
+    self.assertEqual(1, 2)
+AssertionError: 1 != 2
+
+----------------------------------------------------------------------
+Ran 1 test in 0.001s
+
+FAILED (failures=1)
+'''
+    compile_log = '# agentworkspace/internal/store\ninternal/store/x.go:1: undefined: missing\nFAIL\tagentworkspace/internal/store\t[build failed]\n'
+
+    def workflow(self, optional):
+        inputs = ''.join('      ' + key + ':\n        type: string\n        required: true\n'
+                         for key in ('sha', 'tree', 'head', 'base', 'matrix'))
+        if optional:
+            inputs += "      policy_sha:\n        type: string\n        required: false\n        default: ''\n"
+        source = 'name: Full validation\non:\n  workflow_call:\n    inputs:\n' + inputs + '''defaults:
+  run:
+    shell: bash
+jobs:
+  go-shards:
+    name: Go ${{ matrix.profile }} worker ${{ matrix.worker }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      matrix: ${{ fromJSON(inputs.matrix) }}
+    steps:
+'''
+        source += (self.policy_setup if optional else '') + self.checkout + self.shard_step
+        source += '''  go-vet:
+    name: Go vet and CI gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+'''
+        source += (''.join('      - *' + anchor + '\n' for anchor in
+                           ('verify-policy-input', 'checkout-policy', 'stage-policy')) if optional else '')
+        source += self.checkout + '      - run: go vet ./...\n' + self.python_step
+        if optional:
+            source = source.replace('python3 .github/scripts/ci-shards.py run ',
+                                    'python3 "${CI_POLICY_ROOT:-.}"/.github/scripts/ci-shards.py run ')
+            source = source.replace('      - name: Test CI scheduling and shard gates\n',
+                                    '      - name: Test CI scheduling and shard gates\n        working-directory: ${{ env.CI_POLICY_ROOT || github.workspace }}\n')
+        return source
+
+    def put(self, api, path, text, value=None):
+        data = text.encode()
+        record = {'sha': hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest(),
+                  'encoding': 'base64', 'content': base64.b64encode(data).decode()}
+        api.rows[f'repos/{REPO}/contents/{path}?ref={value or api.run["head_sha"]}'] = record
+        return {'sha': value or api.run['head_sha'], 'path': path, 'blob': record['sha']}
+
+    def fixture(self, source, kind='periodic'):
+        api = FakeAPI(kind, trigger_sha=BASE if kind == 'periodic' else SHA)
+        self.put(api, '.github/workflows/ci-full.yml', source)
+        # A distinct control script must never masquerade as the product sharder.
+        if kind == 'periodic':
+            self.put(api, '.github/scripts/ci-shards.py', 'raise RuntimeError("not the target sharder")\n')
+        proof = self.put(api, '.github/scripts/ci-shards.py', (SCRIPTS / 'ci-shards.py').read_text(), SHA)
+        return api, POLICY.Evidence(api, REPO, lambda _: True), proof
+
+    def collect(self, api, evidence, name, step, log):
+        job = api.job('Full suite / ' + name, 501, 'failure')
+        job['steps'] = [{'name': step, 'number': 3, 'conclusion': 'failure'}]
+        api.jobs.append(job)
+        api.rows[f'repos/{REPO}/actions/runs/{RUN}/attempts/{ATTEMPT}/jobs?per_page=100&page=1']['total_count'] = len(api.jobs)
+        api.rows[f'repos/{REPO}/actions/jobs/501/logs'] = log.encode()
+        result = {'sha': SHA}
+        POLICY.collect_failures(evidence, api.run, result)
+        return result, job, job['steps'][0]
+
+    def test_legacy_and_default_shard_forms_bind_original_argv_recipe_and_target_blob(self):
+        for optional, binding in ((False, None), (True, None), (True, "''"), (True, '""')):
+            for kind in ('periodic', 'legacy'):
+                with self.subTest(optional=optional, caller=kind, binding=binding):
+                    api, evidence, proof = self.fixture(self.workflow(optional), kind)
+                    if binding is not None:
+                        caller, _ = POLICY.source_text(evidence, api.run['head_sha'], api.run['path'])
+                        owner = 'resolve' if kind == 'periodic' else 'feedback'
+                        line = '      matrix: ${{ needs.' + owner + '.outputs.matrix }}'
+                        self.put(api, api.run['path'], caller.replace(line, line + '\n      policy_sha: ' + binding))
+                    result, job, step = self.collect(api, evidence, 'Go store worker 1', 'Run and verify logical slots', self.compile_log)
+                    self.assertEqual(result['diagnostic_status'], 'available', result['unresolved_failures'])
+                    candidate, = result['failure_candidates']
+                    self.assertEqual(candidate['execution']['argv'], ['go', 'test', '-race', './internal/store'])
+                    self.assertEqual(candidate['execution']['proof'][-1], proof)
+                    recipes = candidate['sources'][0]['diagnostic']['recipes']
+                    self.assertEqual([row['original_argv'] for row in recipes], [
+                        ['go', 'test', '-count=1', '-race', '-json', '-list', '^(Test|Example|Fuzz)', './internal/store'],
+                        ['go', 'test', '-count=1', '-race', '-json', '-run', '<original-slot-pattern>', './internal/store']])
+                    native = POLICY.native_step(evidence, api.run, job, step)
+                    self.assertTrue(all(row['sha256'] == hashlib.sha256(native['step_text'].encode()).hexdigest() for row in recipes))
+                    self.assertTrue(all(row['command_status'] == 'source-alternatives' for row in recipes))
+                    mode = POLICY.go_execution(evidence, api.run, SHA, job, step)
+                    self.assertEqual((mode['mode'], mode['timeout_arg'], mode['timeout_seconds'], mode['job_timeout_seconds']), ('race', '10m', 600, 2400))
+                    self.assertEqual(mode['proof'][-1], proof)
+                    self.assertEqual(mode['command'], native['run'])
+                    self.assertEqual(mode['recipe'], native['recipe'])
+
+    def test_legacy_and_default_python_forms_require_the_actual_workspace_traceback(self):
+        for optional in (False, True):
+            for root in ('/home/runner/work/workspace/workspace', '/tmp/ci-policy', '/home/runner/work/workspace/workspace/control'):
+                with self.subTest(optional=optional, root=root):
+                    api, evidence, _ = self.fixture(self.workflow(optional))
+                    log = self.python_log.replace('/home/runner/work/workspace/workspace', root)
+                    result, _, _ = self.collect(api, evidence, 'Go vet and CI gates', 'Test CI scheduling and shard gates', log)
+                    if root == '/home/runner/work/workspace/workspace':
+                        candidate, = result['failure_candidates']
+                        self.assertEqual(result['diagnostic_status'], 'available')
+                        self.assertEqual(candidate['execution']['source_root'], root)
+                        self.assertEqual(candidate['recipe']['original_argv'], ['python3', '.github/scripts/test-store-shard.py', '-v'])
+                    else:
+                        self.assertEqual(result['failure_candidates'], [])
+                        self.assertEqual(result['diagnostic_status'], 'unknown')
+
+    def test_default_python_rejects_unproven_policy_binding_and_root_overrides(self):
+        source = self.workflow(True)
+        for label, changed in (
+            ('pinned-caller', source),
+            ('unknown-default', source.replace("        default: ''", '        default: ${{ inputs.policy }}')),
+            ('job-env', source.replace('    timeout-minutes: ', '    env:\n      CI_POLICY_ROOT: /tmp/policy\n    timeout-minutes: ')),
+            ('step-env', source.replace('        working-directory: ${{ env.CI_POLICY_ROOT || github.workspace }}',
+                                       '        env:\n          CI_POLICY_ROOT: /tmp/policy\n        working-directory: ${{ env.CI_POLICY_ROOT || github.workspace }}')),
+            ('different-root', source.replace('env.CI_POLICY_ROOT || github.workspace', 'env.OTHER_ROOT || github.workspace')),
+            ('unguarded-stage', source.replace("        if: ${{ inputs.policy_sha != '' }}", '        if: ${{ always() }}'))):
+            with self.subTest(case=label):
+                api, evidence, _ = self.fixture(changed)
+                if label == 'pinned-caller':
+                    caller, _ = POLICY.source_text(evidence, BASE, api.run['path'])
+                    self.put(api, api.run['path'], caller.replace('      matrix: ${{ needs.resolve.outputs.matrix }}',
+                             '      matrix: ${{ needs.resolve.outputs.matrix }}\n      policy_sha: ' + BASE))
+                result, _, _ = self.collect(api, evidence, 'Go vet and CI gates', 'Test CI scheduling and shard gates', self.python_log)
+                self.assertEqual(result['failure_candidates'], [])
+                self.assertEqual(result['diagnostic_status'], 'unknown')
+                self.assertTrue(result['unresolved_failures'][0]['reason'])
+
+    def test_unproven_sharder_content_modes_and_target_overrides_remain_unknown(self):
+        original = (SCRIPTS / 'ci-shards.py').read_text()
+        for label, changed in (
+            ('syntax', 'def run_slot(:\n'),
+            ('target-reassigned', original.replace('    target = "./internal/" + profile\n',
+                                                  '    target = "./internal/" + profile\n    target = "./internal/platform"\n')),
+            ('initial-mode', original.replace('"-list", "^(Test|Example|Fuzz)", target', '"-list", "^(Test|Example|Fuzz)", "./internal/platform"')),
+            ('unproven-blob', original)):
+            with self.subTest(case=label):
+                api, evidence, _ = self.fixture(self.workflow(True))
+                self.put(api, '.github/scripts/ci-shards.py', changed, SHA)
+                if label == 'unproven-blob':
+                    api.rows[f'repos/{REPO}/contents/.github/scripts/ci-shards.py?ref={SHA}']['sha'] = BASE
+                result, job, step = self.collect(api, evidence, 'Go store worker 1', 'Run and verify logical slots', self.compile_log)
+                self.assertEqual(result['failure_candidates'], [])
+                self.assertEqual(result['diagnostic_status'], 'unknown')
+                with self.assertRaises(ValueError):
+                    POLICY.go_execution(evidence, api.run, SHA, job, step)
+
+    def test_nonempty_unknown_and_injected_policy_sources_remain_unknown(self):
+        source = self.workflow(True)
+        cases = {
+            'nonempty-default': source.replace("        default: ''", '        default: ' + BASE),
+            'workflow-env': source.replace('defaults:\n', 'env:\n  CI_POLICY_ROOT: /tmp/policy\ndefaults:\n'),
+            'job-env': source.replace('    timeout-minutes: ', '    env:\n      CI_POLICY_ROOT: /tmp/policy\n    timeout-minutes: '),
+            'step-env': source.replace('        env:\n          SHARD_PROFILE:', '        env:\n          CI_POLICY_ROOT: /tmp/policy\n          SHARD_PROFILE:'),
+            'unguarded-stage': source.replace("        if: ${{ inputs.policy_sha != '' }}\n        env:\n          POLICY_SHA:", '        env:\n          POLICY_SHA:'),
+            'extra-root-writer': source.replace(self.checkout, '      - run: echo CI_POLICY_ROOT=/tmp/policy >> "$GITHUB_ENV"\n' + self.checkout),
+            'different-checkout': source.replace('          ref: ${{ inputs.sha }}', '          ref: ${{ inputs.policy_sha }}'),
+            'different-fallback': source.replace('${CI_POLICY_ROOT:-.}', '${CI_POLICY_ROOT:-other}'),
+            'wrapped-recipe': source.replace('          python3 "${CI_POLICY_ROOT:-.}"', '          env CI_POLICY_ROOT=/tmp/policy python3 "${CI_POLICY_ROOT:-.}"'),
+            'extra-argv': source.replace('--tree "$CHECKOUT_TREE"', '--tree "$CHECKOUT_TREE" --unexpected'),
+        }
+        for label in (*cases, 'pinned-caller', 'unknown-caller', 'renamed-caller'):
+            with self.subTest(case=label):
+                api, evidence, _ = self.fixture(cases.get(label, source))
+                if label.endswith('caller'):
+                    caller, _ = POLICY.source_text(evidence, BASE, api.run['path'])
+                    if label == 'renamed-caller':
+                        caller = caller.replace('    name: Full suite\n', '    name: Other suite\n')
+                    else:
+                        binding = BASE if label == 'pinned-caller' else '${{ inputs.unproven_policy }}'
+                        caller = caller.replace('      matrix: ${{ needs.resolve.outputs.matrix }}',
+                                                '      matrix: ${{ needs.resolve.outputs.matrix }}\n      policy_sha: ' + binding)
+                    self.put(api, api.run['path'], caller)
+                result, job, step = self.collect(api, evidence, 'Go store worker 1', 'Run and verify logical slots', self.compile_log)
+                self.assertEqual(result['failure_candidates'], [], result)
+                self.assertEqual(result['diagnostic_status'], 'unknown')
+                self.assertTrue(result['unresolved_failures'][0]['reason'])
+                with self.assertRaises(ValueError):
+                    POLICY.go_execution(evidence, api.run, SHA, job, step)
+        for source in (self.workflow(False), self.workflow(True)):
+            with self.subTest(case='malformed-shell', optional='policy_sha' in source):
+                api, evidence, _ = self.fixture(source.replace('--tree "$CHECKOUT_TREE"', '--tree "$CHECKOUT_TREE"; echo forged'))
+                result, _, _ = self.collect(api, evidence, 'Go store worker 1', 'Run and verify logical slots', self.compile_log)
+                self.assertEqual(result['failure_candidates'], [])
+
+    def test_mixed_default_forms_and_live_pair_keep_completed_failure_and_timeout(self):
+        for source in (self.workflow(False), self.workflow(True), (WORKFLOWS / 'ci-full.yml').read_text()):
+            with self.subTest(source='live' if 'gate:' in source else 'optional' if 'policy_sha:' in source else 'legacy'):
+                api, evidence, proof = self.fixture(source)
+                workspace = api.job('Full suite / Go workspace race', 502, 'failure')
+                workspace.update(completed_at='2026-11-26T00:20:00Z', steps=[{'name': 'Race test workspace package', 'number': 3, 'conclusion': 'failure'}])
+                api.jobs.append(workspace)
+                api.rows[f'repos/{REPO}/actions/jobs/502/logs'] = b'panic: test timed out after 20m\nFAIL\tagentworkspace/cmd/workspace\t1200.0s\n'
+                # The minimal fixture only owns the policy-sensitive jobs.
+                live = (WORKFLOWS / 'ci-full.yml').read_text()
+                if '  go-workspace:\n' not in source:
+                    source += '\n  go-workspace:\n' + POLICY.block(live, 'go-workspace')
+                self.put(api, '.github/workflows/ci-full.yml', source)
+                result, job, _ = self.collect(api, evidence, 'Go store worker 1', 'Run and verify logical slots',
+                                              '--- FAIL: TestCompleted (0.2s)\n    task_test.go:8: own assertion\nFAIL\tagentworkspace/internal/store\t0.2s\n')
+                job['completed_at'] = '2026-11-26T00:10:00Z'
+                POLICY.collect_failures(evidence, api.run, result)
+                self.assertEqual(result['diagnostic_status'], 'partial')
+                self.assertEqual(result['first_blocking_event']['id'], 501)
+                candidate, = result['failure_candidates']
+                self.assertEqual((candidate['test'], candidate['sources'][0]['id']), ('TestCompleted', 501))
+                self.assertEqual(candidate['execution']['proof'][-1], proof)
+                self.assertEqual(candidate['execution']['timeout_seconds'], 600)
+                self.assertEqual([row['sources'][0]['id'] for row in result['unresolved_failures']], [502])
+
+
 class ReviewedEvidenceTests(unittest.TestCase):
     def test_plain_named_go_signatures_do_not_borrow_peer_assertions(self):
         log = '--- FAIL: TestFirst (0.1s)\n    first_test.go:1: first assertion\n--- FAIL: TestSecond (0.1s)\n    second_test.go:2: second assertion\nFAIL\tagentworkspace/internal/store\t0.2s\n'

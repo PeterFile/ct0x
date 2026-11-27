@@ -788,6 +788,81 @@ def block(text, name, indent=2):
     return match[1]
 
 
+def default_policy_workspace(evidence, run, job, workflow, body, chunk):
+    """Prove only the reviewed empty-policy path; other policy sources stay unknown."""
+    def clean(value):
+        return '\n'.join(line for line in value.splitlines() if line.strip() and not line.lstrip().startswith('#'))
+
+    path = run['path'].partition('@')[0]
+    callers = {'.github/workflows/periodic-full.yml': ('resolve', '[resolve, preflight]',
+                "${{ needs.resolve.outputs.decision == 'run' }}", ('schedule', 'workflow_dispatch', 'push')),
+               '.github/workflows/ci.yml': ('feedback', 'feedback',
+                "${{ needs.feedback.outputs.mode == 'full' }}", ('push',))}
+    check(path in callers and run.get('head_branch') == 'master' and run.get('event') in callers[path][3],
+          'CI 策略默认目录缺少已知 master 调用源；其他策略源仍为 unknown')
+    source, _ = source_text(evidence, run['head_sha'], path)
+    owner, needs, condition, _ = callers[path]
+    expected = ('    name: Full suite\n    needs: ' + needs + '\n    if: ' + condition +
+                '\n    uses: ./.github/workflows/ci-full.yml\n    with:\n' +
+                ''.join('      ' + key + ': ${{ needs.' + owner + '.outputs.' + key + ' }}\n'
+                        for key in ('sha', 'tree', 'head', 'base', 'matrix')))
+    caller = clean(block(source, 'full'))
+    check(job['name'].split(' / ', 1)[0] == 'Full suite' and caller in
+          {clean(expected), clean(expected + "      policy_sha: ''\n"), clean(expected + '      policy_sha: ""\n')},
+          'CI 策略调用名称、产品输入或空 policy_sha 绑定未证明；策略源仍为 unknown')
+    header, job_header = workflow.split('\njobs:', 1)[0], body.split('\n    steps:', 1)[0]
+    declared = re.findall(r'^      policy_sha:\n((?:^        .*\n)+)', header, re.M)
+    check(len(declared) == 1 and clean(declared[0]) == "        type: string\n        required: false\n        default: ''",
+          'CI 策略 policy_sha 不是已知可选空默认值；策略源仍为 unknown')
+    check(not re.search(r'^\s*env:', header, re.M) and 'working-directory:' not in header and
+          re.findall(r'^\s*shell: (.+)$', header, re.M) == ['bash'] and
+          not re.search(r'^    (?:env|defaults):', job_header, re.M),
+          'CI 策略默认 workspace 存在未证明的环境或目录覆盖')
+    steps = re.findall(r'^      - (.*?)(?=^      - |\Z)', body, re.M | re.S)
+    check(steps.count(chunk) == 1, 'CI 策略原生步骤不唯一')
+    before = steps[:steps.index(chunk)]
+    is_shard = job['name'].rsplit(' / ', 1)[-1].startswith('Go ') and chunk.startswith('name: Run and verify logical slots\n')
+    check(len(before) == (5 if is_shard else 6), 'CI 策略默认目录前存在未证明的步骤')
+    for item, anchor, keys in zip(before, ('verify-policy-input', 'checkout-policy', 'stage-policy'),
+                                  (['name', 'if', 'env', 'run'], ['name', 'if', 'uses', 'with'], ['name', 'if', 'env', 'run'])):
+        definitions = re.findall(r'^      - (&' + anchor + r'\n.*?)(?=^      - |\Z)', workflow, re.M | re.S)
+        check(len(definitions) == 1 and workflow.count('&' + anchor) == 1, 'CI 策略条件步骤 anchor 未证明')
+        guarded = clean(definitions[0])
+        check(clean(item) in (guarded, '*' + anchor), 'CI 策略默认目录前不是已知条件步骤')
+        lines = guarded.splitlines()[1:]
+        check(all(line.startswith('        ') for line in lines) and
+              [line.strip().split(':', 1)[0] for line in lines if not line.startswith('         ')] == keys and
+              re.findall(r'^        if: (.+)$', guarded, re.M) == ["${{ inputs.policy_sha != '' }}"],
+              'CI 策略设置步骤没有被空 policy_sha 明确跳过')
+    setup = '''uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum'''
+    actual = clean('      - '.join(before[3:]))
+    check(actual == setup + ('' if is_shard else '\n      - run: go vet ./...'),
+          'CI 策略产品 checkout 或 workspace 前置步骤未证明')
+    if is_shard:
+        metadata = '''name: Run and verify logical slots
+        env:
+          SHARD_PROFILE: ${{ matrix.profile }}
+          SHARD_WORKER: ${{ matrix.worker }}
+          CHECKOUT_SHA: ${{ inputs.sha }}
+          CHECKOUT_TREE: ${{ inputs.tree }}'''
+        check(clean(chunk.split('        run:', 1)[0]) == metadata, 'CI 策略分片步骤存在未证明的环境或目录覆盖')
+    else:
+        expected = '''name: Test CI scheduling and shard gates
+        working-directory: ${{ env.CI_POLICY_ROOT || github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/test-ci-scheduling.py -v
+          python3 .github/scripts/test-store-shard.py -v'''
+        check(clean(chunk) == expected, 'CI 策略 Python 步骤不是已知 workspace 默认 recipe')
+
+
 def native_step(evidence, run, job, step):
     def named(body, key, actual):
         match = re.search(r"^    name: (.+)$", body, re.M)
@@ -841,16 +916,67 @@ def native_step(evidence, run, job, step):
     check(seconds <= 21600 and "runs-on: ubuntu-" in body, "原生诊断 runner/预算不受支持")
     directory = '.'
     for scope in (text.split('\njobs:', 1)[0], body.split('\n    steps:', 1)[0], chunk):
-        workdir = re.search(r'^\s*working-directory: ([A-Za-z0-9_./-]+)$', scope, re.M)
+        workdir = re.search(r'^\s*working-directory: (.+)$', scope, re.M)
         check(workdir or 'working-directory:' not in scope, '原生工作目录不是简单 literal')
         if workdir:
-            directory = workdir[1]
+            if workdir[1] == '${{ env.CI_POLICY_ROOT || github.workspace }}':
+                check(path == '.github/workflows/ci-full.yml' and key == 'go-vet', 'CI 策略目录 fallback 不属于已知 Full 步骤')
+                default_policy_workspace(evidence, run, job, text, body, chunk)
+                directory = '.'
+            else:
+                check(re.fullmatch(r'[A-Za-z0-9_./-]+', workdir[1]), '原生工作目录不是简单 literal')
+                directory = workdir[1]
     check(not directory.startswith("/") and ".." not in Path(directory).parts, "原生工作目录越界")
     slug = evidence.repo.split("/")[1]
     root = str(Path("/home/runner/work") / slug / slug / directory)
     return {"run": recipe, "step_text": chunk, "job_text": body, "workflow": text, "job_key": key,
             "proof": proofs, "source_root": root, "timeout_seconds": seconds,
             "recipe": {"sha256": digest(chunk.encode()), "job": key, "step": step["name"], "path": path}}
+
+
+def shard_source(evidence, run, target, job, native):
+    """Bind both Go phases to the same immutable, actually selected sharder."""
+    legacy = '.github/scripts/ci-shards.py'
+    fallback = '"${CI_POLICY_ROOT:-.}"/.github/scripts/ci-shards.py'
+    suffix = (' run "$SHARD_PROFILE" "$SHARD_WORKER" "$RUNNER_TEMP/shard-evidence" \\\n'
+              '  --run-id "$GITHUB_RUN_ID" --sha "$CHECKOUT_SHA" --tree "$CHECKOUT_TREE"')
+    recipes = ['set -euo pipefail\npython3 ' + path + suffix for path in (legacy, fallback)]
+    check(native['recipe']['path'] == '.github/workflows/ci-full.yml' and native['job_key'] == 'go-shards' and
+          native['run'] in recipes, '分片原始 shell recipe 不受支持；执行源仍为 unknown')
+    slug = evidence.repo.split('/')[1]
+    check(native['source_root'] == str(Path('/home/runner/work') / slug / slug), '分片原始目录不是产品 workspace')
+    if native['run'] == recipes[1]:
+        default_policy_workspace(evidence, run, job, native['workflow'], native['job_text'], native['step_text'])
+    profile = re.fullmatch(r'Go (store|platform|httpapi) worker [0-9]+', job['name'].rsplit(' / ', 1)[-1])
+    check(profile, '分片原生 profile 不受支持')
+    script, proof = source_text(evidence, target, '.github/scripts/ci-shards.py')
+    try:
+        parsed = ast.parse(script)
+    except SyntaxError as error:
+        raise ValueError('分片原始源码无法解析；执行模式仍为 unknown') from error
+    commands = []
+    for name, selector in (('run_worker', ['-list', '^(Test|Example|Fuzz)']), ('run_slot', ['-run', '<original-slot-pattern>'])):
+        functions = [node for node in parsed.body if isinstance(node, ast.FunctionDef) and node.name == name]
+        check(len(functions) == 1, '分片原生 Go 函数不唯一')
+        function = functions[0]
+        original = ast.get_source_segment(script, function)
+        targets = [node for node in ast.walk(function) if isinstance(node, ast.Name) and node.id == 'target' and isinstance(node.ctx, ast.Store)]
+        assignment = ast.parse('target = "./internal/" + profile').body[0]
+        check(len(targets) == 1 and any(ast.dump(node) == ast.dump(assignment) for node in function.body) and
+              'GOFLAGS' not in original and '-timeout' not in original, '分片原始目标、模式或预算不受支持')
+        calls = [node for node in ast.walk(function) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
+                 node.func.id == 'command' and node.args and isinstance(node.args[0], ast.List) and
+                 len(node.args[0].elts) >= 2 and all(isinstance(node.args[0].elts[index], ast.Constant) and
+                 node.args[0].elts[index].value == value for index, value in enumerate(('go', 'test')))]
+        check(len(calls) == 1, '分片 Go argv 不唯一')
+        argv, values = [], {'pattern': '<original-slot-pattern>', 'target': './internal/' + profile[1]}
+        for node in calls[0].args[0].elts:
+            check(isinstance(node, ast.Constant) and isinstance(node.value, str) or isinstance(node, ast.Name) and node.id in values,
+                  '分片 Go argv 包含未证明的动态值')
+            argv.append(node.value if isinstance(node, ast.Constant) else values[node.id])
+        check(argv == ['go', 'test', '-count=1', '-race', '-json', *selector, values['target']], '分片原始 Go 模式不受支持')
+        commands.append(argv)
+    return commands, proof
 
 
 def diagnostic_records(evidence, run, target, job, step, log, native):
@@ -864,16 +990,9 @@ def diagnostic_records(evidence, run, target, job, step, log, native):
                 check(argv[index + 1:index + 2] == ["tee"], "原生诊断 Go pipeline 不是已知 tee")
                 argv = argv[:index]
             commands.append(argv)
-    if "python3 .github/scripts/ci-shards.py run " in native["run"]:
-        script, proof = source_text(evidence, target, ".github/scripts/ci-shards.py")
-        functions = [node for node in ast.parse(script).body if isinstance(node, ast.FunctionDef) and node.name == "run_slot"]
-        profile = re.fullmatch(r"Go (store|platform|httpapi) worker [0-9]+", job["name"].rsplit(" / ", 1)[-1])
-        check(len(functions) == 1 and profile and 'target = "./internal/" + profile' in script, "分片原生命令无法解析")
-        lists = [node for node in ast.walk(functions[0]) if isinstance(node, ast.List) and len(node.elts) >= 2 and
-                 all(isinstance(node.elts[index], ast.Constant) and node.elts[index].value == value for index, value in enumerate(("go", "test")))]
-        check(len(lists) == 1, "分片 Go argv 不唯一")
-        values = {"pattern": "<original-slot-pattern>", "target": "./internal/" + profile[1]}
-        commands.append([node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else values[node.id] for node in lists[0].elts])
+    if native['job_key'] == 'go-shards' and step.get('name') == 'Run and verify logical slots':
+        original, proof = shard_source(evidence, run, target, job, native)
+        commands.extend(original)
         proofs.append(proof)
     rest = re.search(r'^\s*GOFLAGS="\$\{GOFLAGS:\+\$GOFLAGS \}-timeout=([^"\s]+)" go test -race "\$\{rest\[@\]\}"$', native['run'], re.M)
     if rest:
@@ -933,7 +1052,7 @@ def go_execution(evidence, run, target, job, step):
     """Derive only reviewed original modes; never invent a shorter replay package timeout."""
     name, step_name = job["name"].rsplit(" / ", 1)[-1], step.get("name")
     path, job_key, race, duration = ".github/workflows/ci-full.yml", None, True, "10m"
-    packages, excluded, extra = [], [], []
+    packages, excluded, proofs, native = [], [], [], None
     if name in ("Periodic Full preflight", "CI preflight and feedback"):
         check(step_name == "Ordinary test cmd package", "失败不在普通 cmd 步骤")
         path = run["path"].partition("@")[0]
@@ -956,13 +1075,12 @@ def go_execution(evidence, run, target, job, step):
     else:
         match = re.fullmatch(r"Go (store|platform|httpapi) worker [0-9]+", name)
         check(match and step_name == "Run and verify logical slots", "不是已知分片测试步骤")
-        job_key, command = "go-shards", "python3 .github/scripts/ci-shards.py run"
+        job_key = 'go-shards'
         packages = ["agentworkspace/internal/" + match[1]]
-        script, proof = source_text(evidence, target, ".github/scripts/ci-shards.py")
-        slot = re.search(r"^def run_slot\(.*?(?=^def |\Z)", script, re.M | re.S)
-        check(slot and '["go", "test", "-count=1", "-race", "-json", "-run", pattern, target]' in slot[0] and
-              "GOFLAGS" not in slot[0] and "-timeout" not in slot[0], "分片原始模式或预算不受支持")
-        extra.append(proof)
+        native = native_step(evidence, run, job, step)
+        _, proof = shard_source(evidence, run, target, job, native)
+        proofs = [*native['proof'], proof]
+        command = native['run']
     workflow, proof = source_text(evidence, run["head_sha"], path)
     job_text = block(workflow, job_key)
     selected = re.search(r"^      - name: " + re.escape(step_name) + r"\n(.*?)(?=^      - |\Z)", job_text, re.M | re.S)
@@ -984,15 +1102,18 @@ def go_execution(evidence, run, target, job, step):
                 duration = explicit[0]
         command = lines[0]
     else:
-        check(command in selected[1] and "GOFLAGS" not in selected[1], "分片原始模式或预算未知")
+        check('GOFLAGS' not in selected[1], '分片原始模式或预算未知')
     ceiling = re.search(r"^    timeout-minutes: ([1-9][0-9]*)$", job_text, re.M)
     check(ceiling or "timeout-minutes:" not in job_text, "原始作业预算是动态值")
     job_seconds = int(ceiling[1]) * 60 if ceiling else 21600
     check(0 < job_seconds <= 21600, "原始 hosted 作业预算超限")
     seconds = load("periodic-replay").duration(duration, job_seconds)
-    return {"mode": "race" if race else "ordinary", "timeout_seconds": seconds, "job_timeout_seconds": job_seconds,
-            "timeout_arg": duration, "setup_seconds": 300, "packages": packages, "excluded_packages": excluded,
-            "proof": [proof, *extra], "step": step_name, "command": command}
+    result = {"mode": "race" if race else "ordinary", "timeout_seconds": seconds, "job_timeout_seconds": job_seconds,
+              "timeout_arg": duration, "setup_seconds": 300, "packages": packages, "excluded_packages": excluded,
+              "proof": proofs or [proof], "step": step_name, "command": command}
+    if native is not None:
+        result['recipe'] = native['recipe']
+    return result
 
 
 def client_records(evidence, run, job, step, log, target=None):
