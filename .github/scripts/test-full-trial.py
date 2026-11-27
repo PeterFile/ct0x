@@ -17,6 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 from urllib.error import HTTPError, URLError
+import zipfile
 
 SCRIPTS = Path(__file__).resolve().parent
 
@@ -217,7 +218,7 @@ class ReceiptTests(unittest.TestCase):
         cls.driver = load("full-trial")
         cls.plan = load("full-trial-plan")
 
-    def fixture(self, root, scheme="c", parallel=12):
+    def fixture(self, root, scheme="c", parallel=12, flat_workspace=False):
         context = {"run_id": "42", "attempt": "1", "controller_sha": "c" * 40, "controller_tree": "d" * 40,
                    "checkout_sha": self.plan.PRODUCT_SHA, "checkout_tree": self.plan.PRODUCT_TREE,
                    "scheme": scheme, "repeat": 1, "shard_parallel": parallel}
@@ -256,9 +257,16 @@ class ReceiptTests(unittest.TestCase):
             proof = {field: {n: v for n, v in values.items() if n in selected} for field, values in race_proof.items()}
             receipt = {"schema": 1, "identity": context, "job": "go-workspace", "job_number": job_number,
                        "workspace": {"compiled": dict(inventories["workspace"]), "proof": proof}}
-            path = root / "workspace" / (self.driver.prefix(context) + f"-workspace-{job_number}") / "receipt.json"
-            path.parent.mkdir(parents=True)
-            path.write_text(json.dumps(receipt))
+            directory = root / "workspace"
+            if not flat_workspace:
+                directory /= self.driver.prefix(context) + f"-workspace-{job_number}"
+            # GitHub artifacts contain receipt.json at the archive root. A single
+            # match extracts directly; multiple matches get artifact directories.
+            artifact = io.BytesIO()
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.writestr("receipt.json", json.dumps(receipt))
+            with zipfile.ZipFile(artifact) as archive:
+                archive.extractall(directory)
         return plan
 
     def test_real_original_aggregate_accepts_reconstructed_a_b_c_only(self):
@@ -272,6 +280,120 @@ class ReceiptTests(unittest.TestCase):
                 self.assertEqual(workspace, workspace_proof_fixture(plan["inventories"]["workspace"]))
                 self.assertNotEqual(workspace, plan["workspace_ordinary"]["proof"])
                 self.assertEqual(plan["identity"]["checkout_sha"], self.plan.PRODUCT_SHA)
+
+    def test_single_workspace_download_accepts_flat_a_b(self):
+        for scheme, parallel in (("a", 7), ("b", 8), ("b", 12)):
+            with self.subTest(scheme=scheme, parallel=parallel), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                plan = self.fixture(root / "nested", scheme, parallel)
+                nested = self.driver.collect(plan, root / "nested/shards", root / "nested/workspace", plan["identity"])
+                self.fixture(root / "flat", scheme, parallel, flat_workspace=True)
+                try:
+                    flat = self.driver.collect(plan, root / "flat/shards", root / "flat/workspace", plan["identity"])
+                except ValueError as error:
+                    self.fail(f"GitHub single workspace artifact must accept flat receipt.json: {error}")
+                self.assertEqual(flat, nested)
+                self.assertEqual(len(flat[0]), 81)
+                self.assertEqual(flat[1], workspace_proof_fixture(plan["inventories"]["workspace"]))
+                result = self.driver.aggregate_canonical(*cli_fixture(plan, flat[0]))
+                self.assertEqual(sum(row["total"] for row in result.values()), 81)
+
+    def test_workspace_download_rejects_ambiguous_shapes_and_symlinks(self):
+        for scheme, parallel, flat in (("a", 7, False), ("a", 7, True), ("b", 12, False),
+                                      ("b", 12, True), ("c", 12, False)):
+            for problem in ("extra-file", "extra-directory", "mixed", "missing", "wrong-name", "receipt-directory",
+                            "receipt-link", "dangling-receipt-link", "root-link", "artifact-link"):
+                if flat and problem == "artifact-link":
+                    continue
+                with self.subTest(scheme=scheme, flat=flat, problem=problem), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    plan = self.fixture(root, scheme, parallel, flat_workspace=flat)
+                    workspace = root / "workspace"
+                    artifact = workspace / (self.driver.prefix(plan["identity"]) + "-workspace-0")
+                    path = (workspace if flat else artifact) / "receipt.json"
+                    if problem == "extra-file":
+                        (workspace / ".unexpected").write_text("extra")
+                    elif problem == "extra-directory":
+                        (workspace / "unexpected").mkdir()
+                    elif problem == "mixed":
+                        if flat:
+                            artifact.mkdir()
+                            shutil.copyfile(path, artifact / "receipt.json")
+                        else:
+                            shutil.copyfile(path, workspace / "receipt.json")
+                    elif problem == "missing":
+                        path.unlink()
+                    elif problem == "wrong-name":
+                        (path if flat else artifact).rename(workspace / "wrong-name")
+                    elif problem == "receipt-directory":
+                        path.unlink()
+                        path.mkdir()
+                    elif problem in ("receipt-link", "dangling-receipt-link"):
+                        target = root / "target-receipt"
+                        path.rename(target)
+                        path.symlink_to(target if problem == "receipt-link" else root / "missing-receipt")
+                    else:
+                        source = workspace if problem == "root-link" else artifact
+                        target = root / "target-directory"
+                        source.rename(target)
+                        source.symlink_to(target, target_is_directory=True)
+                    with self.assertRaises(ValueError):
+                        self.driver.collect(plan, root / "shards", workspace, plan["identity"])
+
+    def test_c_workspace_download_cannot_flatten_or_override_the_schedule(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan = self.fixture(root)
+            workspace = root / "flat"
+            workspace.mkdir()
+            shutil.copyfile(next((root / "workspace").glob("*/receipt.json")), workspace / "receipt.json")
+            for jobs in (list(range(4)), [0], [1], []):
+                invalid = copy.deepcopy(plan)
+                invalid["schedule"]["workspace"] = jobs
+                with self.subTest(jobs=jobs), self.assertRaises(ValueError):
+                    self.driver.collect(invalid, root / "shards", workspace, plan["identity"])
+
+    def test_workspace_download_preserves_identity_inventory_hash_and_lifecycle_checks(self):
+        for scheme, parallel, flat in (("a", 7, False), ("a", 7, True), ("b", 12, False),
+                                      ("b", 12, True), ("c", 12, False)):
+            with self.subTest(scheme=scheme, flat=flat), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                plan = self.fixture(root, scheme, parallel, flat_workspace=flat)
+                path = root / "workspace"
+                if not flat:
+                    path /= self.driver.prefix(plan["identity"]) + "-workspace-0"
+                path /= "receipt.json"
+                original = path.read_text()
+                identities = {"run_id": "43", "attempt": "2", "controller_sha": "9" * 40,
+                              "controller_tree": "8" * 40, "checkout_sha": "7" * 40, "checkout_tree": "6" * 40,
+                              "scheme": "b" if scheme != "b" else "a", "repeat": 2,
+                              "shard_parallel": 8 if parallel != 8 else 12}
+                mutations = [(field, lambda r, f=field, v=value: r["identity"].update({f: v}))
+                             for field, value in identities.items()]
+                mutations += [("job", lambda r: r.update(job="go-shards")),
+                              ("job_number", lambda r: r.update(job_number=1)),
+                              ("boolean_job_number", lambda r: r.update(job_number=False)),
+                              ("schema", lambda r: r.update(schema=True)),
+                              ("extra", lambda r: r.update(extra={})),
+                              ("missing_payload", lambda r: r.pop("workspace")),
+                              ("payload_shape", lambda r: r["workspace"].update(extra={})),
+                              ("compiled", lambda r: r["workspace"].update(compiled={"TestNotBuilt": 1})),
+                              ("proof_shape", lambda r: r["workspace"]["proof"].update(extra={})),
+                              ("selected", lambda r: [r["workspace"]["proof"][f].update(TestNotBuilt=1)
+                                                      for f in ("selected", "runs", "passes")]),
+                              ("runs", lambda r: r["workspace"]["proof"].update(runs={})),
+                              ("passes", lambda r: r["workspace"]["proof"].update(passes={})),
+                              ("skips", lambda r: r["workspace"]["proof"].update(skips={"TestNotBuilt": 1}))]
+                for name, mutate in mutations:
+                    receipt = json.loads(original)
+                    mutate(receipt)
+                    path.write_text(json.dumps(receipt))
+                    with self.subTest(mutation=name), self.assertRaises(ValueError):
+                        self.driver.collect(plan, root / "shards", root / "workspace", plan["identity"])
+                for raw in (original[:-1], original.replace('"schema": 1', '"schema": 1, "schema": 1', 1), "[]"):
+                    path.write_text(raw)
+                    with self.subTest(raw=raw[:40]), self.assertRaises(ValueError):
+                        self.driver.collect(plan, root / "shards", root / "workspace", plan["identity"])
 
     def test_real_aggregate_runs_from_another_shallow_checkout(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -101,10 +101,14 @@ def collect(plan, shard_directory, workspace_directory, expected):
         check(summary["selected"] == summary["runs"] == summary["passes"] == selected and not summary["skips"],
               "重建规范槽的完整并集不符")
     workspace_jobs = plan["schedule"]["workspace"]
-    shards.directory_entries(workspace_directory, [f"{prefix(expected)}-workspace-{i}" for i in workspace_jobs])
+    # A single matching artifact is extracted directly by download-artifact.
+    flat_workspace = len(workspace_jobs) == 1 and (workspace_directory / "receipt.json").is_file()
+    if not flat_workspace:
+        shards.directory_entries(workspace_directory, [f"{prefix(expected)}-workspace-{i}" for i in workspace_jobs])
     proofs = []
     for number in workspace_jobs:
-        payload = read_receipt(workspace_directory / f"{prefix(expected)}-workspace-{number}", expected, "go-workspace", number, "workspace")
+        directory = workspace_directory if flat_workspace else workspace_directory / f"{prefix(expected)}-workspace-{number}"
+        payload = read_receipt(directory, expected, "go-workspace", number, "workspace")
         check(isinstance(payload, dict) and set(payload) == {"compiled", "proof"} and
               verifier.counter(payload["compiled"]) == plan["inventories"]["workspace"], "workspace compiled 不符")
         selected = plan_module.workspace_selection(plan["inventories"]["workspace"], number, len(workspace_jobs))
