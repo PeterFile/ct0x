@@ -56,7 +56,7 @@ class SchedulingTests(unittest.TestCase):
         cls.shards = load("ci-shards")
 
     def inventories(self):
-        return {profile: Counter({f"TestVector{i}": 1 for i in range(200)})
+        return {profile: Counter({f"TestVector{i}": 1 for i in range(640 if profile == "store" else 200)})
                 for profile in ("platform", "store", "httpapi", "workspace")}
 
     def test_a_is_the_unchanged_baseline_not_lpt(self):
@@ -78,10 +78,7 @@ class SchedulingTests(unittest.TestCase):
         for scheme, parallel in [("a", 7), ("b", 8), ("b", 12), ("c", 12)]:
             self.plan.parameters(scheme, 3, parallel)
 
-    def test_lpt_uses_frozen_weights_and_deterministic_least_load_ties(self):
-        tasks = [("a", 8), ("b", 7), ("c", 6), ("d", 5), ("e", 4)]
-        self.assertEqual(self.plan.lpt(tasks, 2), [["a", "d", "e"], ["b", "c"]])
-        self.assertEqual(self.plan.lpt(list(reversed(tasks)), 2), self.plan.lpt(tasks, 2))
+    def test_b_uses_frozen_weights_and_covers_all_baseline_units(self):
         weights = self.plan.weights()
         self.assertEqual({p: len(values) for p, values in weights.items()}, {"store": 64, "platform": 9, "httpapi": 8})
         self.assertAlmostEqual(weights["store"][52], 155.79)
@@ -89,13 +86,44 @@ class SchedulingTests(unittest.TestCase):
         schedule = self.plan.schedule("b", 12, self.inventories())
         units = [unit for lane in schedule["shards"] for unit in lane]
         self.assertCountEqual(units, [dict(row, part=None) for row in self.legacy.shard_matrix()["include"]])
-        self.assertEqual(len(schedule["shards"]), 12)
+        self.assertEqual(len(schedule["shards"]), 24)
         self.assertEqual(schedule, self.plan.schedule("b", 12, {p: dict(reversed(list(v.items()))) for p, v in self.inventories().items()}))
+
+    def test_b_c_shard_matrix_items_each_have_one_unit(self):
+        inventories = self.inventories()
+        for scheme, jobs in (("b", 24), ("c", 41)):
+            for parallel in (8, 12):
+                with self.subTest(scheme=scheme, parallel=parallel):
+                    schedule = self.plan.schedule(scheme, parallel, inventories)
+                    self.assertEqual([len(item) for item in schedule["shards"]], [1] * jobs)
+
+    def test_b_c_matrix_order_uses_descending_frozen_weights_and_stable_ties(self):
+        inventories = self.inventories()
+        observed = json.loads((SCRIPTS / "full-trial-weights.json").read_text())["profiles"]
+        for scheme in ("b", "c"):
+            with self.subTest(scheme=scheme):
+                schedule = self.plan.schedule(scheme, 12, inventories)
+                order = []
+                for item in schedule["shards"]:
+                    for unit in item:
+                        profile, worker, part = unit["profile"], unit["worker"], unit["part"]
+                        if part is None:
+                            slots = [slot for slot in self.shards.BATCHES[profile][worker]
+                                     if scheme != "c" or profile != "store" or slot not in self.shards.SLOW_STORE_SLOTS]
+                            weight = sum(observed[profile][slot] for slot in slots)
+                        else:
+                            selected, _ = self.shards.verifier.selection(inventories["store"], worker, "store")
+                            parts = self.shards.execution_subsets(selected, "store", worker)
+                            weight = observed["store"][worker] / len(parts)
+                        order.append((-weight, json.dumps(unit, sort_keys=True, separators=(",", ":"))))
+                self.assertEqual(order, sorted(order))
+                reversed_inventories = {p: dict(reversed(list(v.items()))) for p, v in inventories.items()}
+                self.assertEqual(schedule, self.plan.schedule(scheme, 8, reversed_inventories))
 
     def test_c_slow_parts_are_on_distinct_job_runners_and_rebuild_all_slots(self):
         inventories = self.inventories()
         schedule = self.plan.schedule("c", 12, inventories)
-        seen, slow_jobs = Counter(), {}
+        seen, slow_jobs, slow_parts = Counter(), {}, {}
         for job, lane in enumerate(schedule["shards"]):
             for unit in lane:
                 profile = unit["profile"]
@@ -105,9 +133,12 @@ class SchedulingTests(unittest.TestCase):
                         seen[profile, slot] += 1
                     else:
                         slow_jobs.setdefault(slot, []).append(job)
+                        slow_parts.setdefault(slot, []).append(unit["part"])
         for slot in self.shards.SLOW_STORE_SLOTS:
             selected, _ = self.shards.verifier.selection(inventories["store"], slot, "store")
             parts = self.shards.execution_subsets(selected, "store", slot)
+            self.assertGreater(len(parts), 1, "the fixture must exercise independently verified slow subsets")
+            self.assertCountEqual(slow_parts[slot], range(len(parts)))
             self.assertEqual(len(slow_jobs[slot]), len(parts))
             self.assertEqual(len(set(slow_jobs[slot])), len(parts), "a canonical slow slot must span independent jobs")
             seen["store", slot] += 1
@@ -463,6 +494,34 @@ class ReceiptTests(unittest.TestCase):
             shutil.copytree(path.parent, root / "shards" / "duplicate")
             with self.assertRaises(ValueError):
                 self.driver.collect(plan, root / "shards", root / "workspace", plan["identity"])
+
+    def test_b_c_collect_and_original_aggregate_reject_missing_duplicate_coverage(self):
+        for scheme in ("b", "c"):
+            with self.subTest(scheme=scheme), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                plan = self.fixture(root, scheme)
+                canonical, _ = self.driver.collect(plan, root / "shards", root / "workspace", plan["identity"])
+                path = root / "shards" / (self.driver.prefix(plan["identity"]) + "-shard-0") / "receipt.json"
+                original = path.read_text()
+                for count in (0, 2):
+                    receipt = json.loads(original)
+                    summary = receipt["units"][0]["summaries"][0]
+                    name = next(iter(summary["selected"]))
+                    invalid = copy.deepcopy(canonical)
+                    slot = summary["slot"]
+                    profile = receipt["units"][0]["unit"]["profile"]
+                    for evidence in (summary, invalid[profile, slot]):
+                        for field in ("selected", "runs", "passes"):
+                            if count:
+                                evidence[field][name] = count
+                            else:
+                                evidence[field].pop(name)
+                    path.write_text(json.dumps(receipt))
+                    with self.subTest(count=count, aggregator="collect"), self.assertRaises(ValueError):
+                        self.driver.collect(plan, root / "shards", root / "workspace", plan["identity"])
+                    path.write_text(original)
+                    with self.subTest(count=count, aggregator="original"), self.assertRaises(subprocess.CalledProcessError):
+                        self.driver.aggregate_canonical(*cli_fixture(plan, invalid))
 
     def test_workspace_mode_receipts_reject_omissions_substitutions_and_bad_shapes(self):
         with tempfile.TemporaryDirectory() as directory:
