@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""Render the trial workflow, projecting unchanged tested Full sidecar job bodies."""
+import argparse
+import hashlib
+from pathlib import Path
+import re
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[2]
+PRODUCT_SHA = "18d11a3c0176fe98856aeeef6396e9ddfde0cca0"
+LEGACY = {
+    ".github/scripts/ci-plan.py": "a9f772e3bcdaad0ecd264c083cdb15ffa41f8616a1ceebb6c9526e5ba138b22a",
+    ".github/scripts/ci-shards.py": "ff857dab8d76c17d6d6b67e3d60ba173c1586ebacedf12e463bf28bc03f370cc",
+    ".github/scripts/ci-gate.py": "d73adf3a3e760910305557e41f8d749cd583b9d5be5b8bfa42bdc0e8a8dba753",
+    ".github/scripts/verify-store-shard.py": "b60ae0cd9bf217a61ee04ca1db744c0622f1b0ca83c4d8e94ca1e9e8fb619c5d",
+    ".github/scripts/test-ci-scheduling.py": "892bc4c943305bbf4dc897fad18519b3d0c1a05422923af49ef8ee3fd2bc9106",
+    ".github/scripts/test-store-shard.py": "fe9bb8c5a1457215c8d66078854dcad8bc37b354a98921504a0249a595c7a1b2",
+    ".github/workflows/ci.yml": "a08aa4fa8c314fb8fdf04373c176f50a3c20a584ee9da2669bfae867d0311ea7",
+    ".github/workflows/ci-full.yml": "765ffa72560982e54782093af9402450b0e756decd168352bdc587d0e5dad1cf",
+}
+DRIVER = 'python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py"'
+PREFIX = 'full-trial-${{ inputs.scheme }}-r${{ inputs.repeat }}-${{ github.run_id }}-${{ github.run_attempt }}'
+CHECKOUT = '''      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+'''
+CONTROLLER = '''      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          path: .trial-controller
+          sparse-checkout: /.github/
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Stage verified trial controller
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/.trial-controller"
+          target="$RUNNER_TEMP/trial-controller"
+          [[ -d "$source/.git" && ! -L "$source" && ! -e "$target" && ! -L "$target" ]] || exit 1
+          actual=$(git -C "$source" rev-parse HEAD)
+          [[ "$actual" == "$GITHUB_SHA" ]] || exit 1
+          mv "$source" "$target"
+'''
+IDENTITY = '''      - name: Verify immutable product and controller
+        run: python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py" identity
+'''
+GO = '''      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+'''
+
+
+def check_legacy(root=None):
+    root = Path(root) if root else ROOT
+    for path, expected in LEGACY.items():
+        if hashlib.sha256((root / path).read_bytes()).hexdigest() != expected:
+            raise ValueError("生产调度文件偏离固定基线：" + path)
+
+
+class SnapshotUnavailable(ValueError):
+    """The frozen Git object and a hash-verified local copy are both absent."""
+
+
+def snapshot(path):
+    try:
+        data = subprocess.run(["git", "-C", str(ROOT), "show", f"{PRODUCT_SHA}:{path}"],
+                              check=True, capture_output=True).stdout
+    except subprocess.CalledProcessError:
+        # A shallow checkout may still contain the exact declared source bytes.
+        try:
+            data = (ROOT / path).read_bytes()
+        except FileNotFoundError:
+            raise SnapshotUnavailable("缺少可验证的冻结源码：" + path) from None
+        if hashlib.sha256(data).hexdigest() != LEGACY[path]:
+            raise SnapshotUnavailable("缺少可验证的冻结源码：" + path) from None
+    if hashlib.sha256(data).hexdigest() != LEGACY[path]:
+        raise ValueError("不可变基线源码校验失败：" + path)
+    return data.decode()
+
+
+def job(source, name):
+    match = re.search(rf"^  {re.escape(name)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", source, re.M | re.S)
+    if not match:
+        raise ValueError("缺少基线 job：" + name)
+    return "  " + name + ":\n" + match[1].rstrip() + "\n"
+
+
+def sidecar(source, name):
+    block = job(source, name)
+    # Exact transformations only; new baseline shapes require a reviewed renderer update.
+    if block.count(CHECKOUT) != 1:
+        raise ValueError("基线 checkout 投影不明确")
+    block = block.replace(CHECKOUT, CONTROLLER + CHECKOUT + IDENTITY)
+    block = block.replace("    runs-on:", "    needs: preflight\n    runs-on:", 1)
+    block = block.replace("${{ inputs.tree }}", "${{ needs.preflight.outputs.tree }}")
+    block = block.replace("${{ inputs.head }}", "${{ inputs.sha }}")
+    block = block.replace("${{ inputs.base }}", "${{ needs.preflight.outputs.base }}")
+    if name == "go-vet":
+        block += '''      - name: Test trial evidence and workflow projection
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/trial-controller/.github/scripts/test-full-trial.py" -v
+          python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial-workflow.py" --check
+'''
+    if name == "go-benchmarks":
+        block = block.replace("name: go-benchmarks\n", "name: " + PREFIX + "-benchmarks\n")
+        block = block.split("  # Only the outer gate")[0].rstrip() + "\n"
+    return block + "\n"
+
+
+def download_plan():
+    return '''      - uses: actions/download-artifact@v7
+        with:
+          name: PREFIX-plan
+          path: ${{ runner.temp }}/trial-plan
+'''.replace("PREFIX", PREFIX)
+
+
+def uploads(kind):
+    return '''      - uses: actions/upload-artifact@v7
+        with:
+          name: PREFIX-KIND-${{ matrix.job_number }}
+          path: ${{ runner.temp }}/trial-receipt
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve compact timing even on failure
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: PREFIX-timing-KIND-${{ matrix.job_number }}
+          path: ${{ runner.temp }}/trial-timing.jsonl
+          if-no-files-found: error
+          retention-days: 7
+'''.replace("PREFIX", PREFIX).replace("KIND", kind)
+
+
+def render():
+    source = snapshot(".github/workflows/ci-full.yml")
+    header = '''# Generated by .github/scripts/full-trial-workflow.py; do not edit by hand.
+name: Full scheduling trial
+
+on:
+  workflow_call:
+    inputs:
+      sha:
+        type: string
+        required: true
+      scheme:
+        type: string
+        required: true
+      repeat:
+        type: number
+        required: true
+      shard_parallel:
+        type: number
+        required: true
+    outputs:
+      verified:
+        value: ${{ jobs.aggregate.outputs.verified }}
+      receipt:
+        value: ${{ jobs.aggregate.outputs.receipt }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  TRIAL_SHA: ${{ inputs.sha }}
+  TRIAL_SCHEME: ${{ inputs.scheme }}
+  TRIAL_REPEAT: ${{ inputs.repeat }}
+  TRIAL_PARALLEL: ${{ inputs.shard_parallel }}
+
+jobs:
+  preflight:
+    name: Trial preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      workspace: ${{ steps.plan.outputs.workspace }}
+      parallel: ${{ steps.plan.outputs.parallel }}
+      tree: ${{ steps.plan.outputs.tree }}
+      base: ${{ steps.plan.outputs.base }}
+    steps:
+'''
+    preflight = CONTROLLER + CHECKOUT.replace("          persist-credentials:", "          fetch-depth: 0\n          persist-credentials:") + IDENTITY + GO
+    preflight += '''      - name: Compiled inventories and ordinary workspace monolith
+        id: plan
+        run: python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py" preflight
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+          check-latest: true
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Web test, typecheck and build
+        run: python3 .github/scripts/ci-plan.py web "$RUNNER_TEMP/trial-client.json"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.13.0'
+          cache: npm
+          cache-dependency-path: extensions/pi-bridge/package-lock.json
+      - name: Pi bridge test and typecheck
+        run: python3 .github/scripts/ci-plan.py bridge "$RUNNER_TEMP/trial-client.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: PREFIX-plan
+          path: ${{ runner.temp }}/trial-plan
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve compact preflight timing
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: PREFIX-timing-preflight
+          path: ${{ runner.temp }}/trial-timing.jsonl
+          if-no-files-found: error
+          retention-days: 7
+
+'''.replace("PREFIX", PREFIX)
+    workers = ""
+    for kind, name, timeout, parallel, matrix in [
+        ("shard", "go-shards", 40, "${{ fromJSON(needs.preflight.outputs.parallel) }}", "matrix"),
+        ("workspace", "go-workspace", 25, "4", "workspace"),
+    ]:
+        workers += '''  JOB:
+    name: Trial KIND ${{ matrix.job_number }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: TIMEOUT
+    strategy:
+      fail-fast: false
+      max-parallel: PARALLEL
+      matrix: ${{ fromJSON(needs.preflight.outputs.MATRIX) }}
+    env:
+      TRIAL_JOB_NUMBER: ${{ matrix.job_number }}
+    steps:
+'''.replace("  JOB:", "  " + name + ":").replace("KIND", kind).replace("TIMEOUT", str(timeout)).replace("PARALLEL", parallel).replace("MATRIX", matrix)
+        workers += CONTROLLER + CHECKOUT + IDENTITY + GO + download_plan()
+        workers += '      - name: Execute and verify ' + kind + '\n        run: ' + DRIVER + ' ' + kind + '\n'
+        workers += uploads(kind) + "\n"
+    aggregate = '''  aggregate:
+    name: Trial final receipt
+    permissions:
+      contents: read
+      actions: read
+    needs: [preflight, go-shards, go-workspace, go-other, go-vet, go-benchmarks]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      verified: ${{ steps.receipt.outputs.verified }}
+      receipt: ${{ steps.receipt.outputs.receipt }}
+    steps:
+''' + CONTROLLER + CHECKOUT + IDENTITY + '''      - name: Require every same-attempt job to pass
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py" results
+''' + download_plan() + '''      - uses: actions/download-artifact@v7
+        with:
+          pattern: PREFIX-shard-*
+          path: ${{ runner.temp }}/trial-shards
+          merge-multiple: false
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: PREFIX-workspace-*
+          path: ${{ runner.temp }}/trial-workspace
+          merge-multiple: false
+      - name: Rebuild canonical receipts and run original aggregate
+        id: receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py" aggregate
+      - uses: actions/upload-artifact@v7
+        with:
+          name: PREFIX-final
+          path: ${{ runner.temp }}/trial-final.json
+          if-no-files-found: error
+          retention-days: 7
+'''.replace("PREFIX", PREFIX)
+    return header + preflight + workers + "".join(sidecar(source, name) for name in ("go-other", "go-vet", "go-benchmarks")) + aggregate
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true")
+    args = parser.parse_args()
+    path = ROOT / ".github/workflows/full-trial.yml"
+    expected = render()
+    if args.check:
+        if path.read_text() != expected:
+            raise SystemExit("试验 workflow 与固定基线投影不一致")
+    else:
+        path.write_text(expected)
