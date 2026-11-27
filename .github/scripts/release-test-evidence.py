@@ -168,7 +168,7 @@ class ReceiptTests(unittest.TestCase):
 
 
 class EndToEndTests(unittest.TestCase):
-    def setUp(self):
+    def setUp(self, attempt=ATTEMPT):
         import io
         import zipfile
         self.evidence = load("release-evidence")
@@ -184,11 +184,11 @@ class EndToEndTests(unittest.TestCase):
                 self.trees = {tree: self.blobs.copy() for tree in self.trees}
                 self.intent["sources"] = self.blobs.copy()
                 self.job_rows[1].update(status="completed", conclusion="success", completed_at="2026-11-26T15:56:54Z")
-                self.second_run = self.native | {"run_attempt": ATTEMPT, "run_started_at": "2026-11-26T16:00:00Z",
+                self.second_run = self.native | {"run_attempt": attempt, "run_started_at": "2026-11-26T16:00:00Z",
                     "referenced_workflows": [{"path": REPO + "/.github/workflows/ci-full.yml@refs/heads/master", "sha": fixtures.MASTER}]}
-                self.second_jobs = [row | {"id": row["id"] + 100, "run_attempt": ATTEMPT,
+                self.second_jobs = [row | {"id": row["id"] + 100, "run_attempt": attempt,
                     "started_at": "2026-11-26T16:00:01Z", "completed_at": "2026-11-26T16:00:04Z"} for row in self.job_rows]
-                self.intent.update(run_attempt=ATTEMPT, allow_retry=False)
+                self.intent.update(run_attempt=attempt, allow_retry=False)
                 self.runs[RUN] = self.second_run
                 # Intake arrives from a later master whose identical policy is not fetched locally.
                 self.master = "f" * 40
@@ -197,7 +197,7 @@ class EndToEndTests(unittest.TestCase):
                 self.trees["3" * 40] = self.blobs.copy()
                 self.runs[99] = self.native | {"id": 99, "path": core.INTAKE, "head_sha": self.master,
                     "head_commit": {"id": self.master, "tree_id": "3" * 40}, "status": "completed", "conclusion": "success",
-                    "display_title": "RC receipt 10 attempt 2", "created_at": "2026-11-26T16:01:00Z",
+                    "display_title": f"RC receipt 10 attempt {attempt}", "created_at": "2026-11-26T16:01:00Z",
                     "run_started_at": "2026-11-26T16:01:00Z"}
                 self.intake_jobs = [{"id": 999, "name": "Release receipt intake", "run_id": 99, "run_attempt": 1,
                     "started_at": "2026-11-26T16:01:00Z", "completed_at": "2026-11-26T16:01:10Z",
@@ -209,7 +209,7 @@ class EndToEndTests(unittest.TestCase):
                     if "/actions/runs/" in path and "/artifacts?" in path:
                         run_id = int(path.split("/actions/runs/")[1].split("/")[0])
                         return {"artifacts": copy.deepcopy(self.items.get(run_id, []))}
-                    if path in (self.prefix + "/actions/runs/10", self.prefix + "/actions/runs/10/attempts/2"):
+                    if path in (self.prefix + "/actions/runs/10", self.prefix + f"/actions/runs/10/attempts/{attempt}"):
                         return copy.deepcopy(self.runs[RUN])
                     if path in (self.prefix + "/actions/runs/99", self.prefix + "/actions/runs/99/attempts/1"):
                         return copy.deepcopy(self.runs[99])
@@ -247,14 +247,19 @@ class EndToEndTests(unittest.TestCase):
                 return artifact
         self.api = API()
         self.intent = self.api.intent
-        for attempt, time in ((1, "2026-11-26T15:56:51Z"), (ATTEMPT, "2026-11-26T16:00:03Z")):
-            self.api.upload(RUN, f"release-intent-{RUN}-{attempt}", {"receipt.json": core.encoded(self.intent | {"run_attempt": attempt})}, time=time)
+        intents = [(1, "2026-11-26T15:56:51Z"), (attempt, "2026-11-26T16:00:03Z")]
+        if attempt == 1:
+            self.api.native, self.api.job_rows = self.api.second_run, self.api.second_jobs
+            self.api.status_rows[0]["created_at"] = "2026-11-26T16:00:02Z"
+            intents = intents[1:]
+        for native_attempt, time in intents:
+            self.api.upload(RUN, f"release-intent-{RUN}-{native_attempt}", {"receipt.json": core.encoded(self.intent | {"run_attempt": native_attempt})}, time=time)
         matrix = core.load_script("ci-plan").shard_matrix()
         names = [f"Release Full / Go {item['profile']} worker {item['worker']}" for item in matrix["include"]]
         names += ["Release Full / " + name for name in ("Go ordinary and remaining race", "Go workspace race", "Go vet and CI gates", "Go benchmarks", "Full suite evidence")]
         names += ["Release clients", "Release candidate binary", "Release Full evidence", "Release machine evidence", "Release candidate evidence"]
         for index, name in enumerate(names):
-            job = {"id": index + 200, "name": name, "run_id": RUN, "run_attempt": ATTEMPT,
+            job = {"id": index + 200, "name": name, "run_id": RUN, "run_attempt": attempt,
                 "started_at": "2026-11-26T16:00:07Z", "completed_at": "2026-11-26T16:00:20Z",
                 "status": "completed", "conclusion": "success"}
             windows = {"Release Full evidence": ("16:00:21", "16:00:30"),
@@ -269,7 +274,7 @@ class EndToEndTests(unittest.TestCase):
             self.api.second_jobs.append(job)
         build = {key: self.intent[key] for key in ("repo", "sha", "tree", "run_id", "run_attempt", "workflow_sha")}
         build.update(schema=1, kind="release-target", artifact_sha256=core.hashed(BINARY), goos="darwin", goarch="amd64", cgo_enabled=False, vcs_modified=False, trimpath=True)
-        binary_artifact = self.api.upload(RUN, f"release-target-{RUN}-{ATTEMPT}", {"receipt.json": core.encoded(build), "workspace": BINARY}, 30)
+        binary_artifact = self.api.upload(RUN, f"release-target-{RUN}-{attempt}", {"receipt.json": core.encoded(build), "workspace": BINARY}, 30)
         shards = core.load_script("ci-shards")
         for item in matrix["include"]:
             profile, worker = item["profile"], item["worker"]
@@ -287,7 +292,9 @@ class EndToEndTests(unittest.TestCase):
         self.needs["full"]["outputs"] = {"verified": "true", "run_id": str(RUN), **{key: self.intent[key] for key in ("sha", "tree", "head", "base")}}
         # Native Full is prepared by each test, after exercising any mutations.
         machine = machine_receipt()
-        machine["workflow_sha"] = self.intent["workflow_sha"]
+        machine.update(workflow_sha=self.intent["workflow_sha"], run_attempt=attempt)
+        for lane in machine["lanes"]:
+            lane["run_attempt"] = attempt
         machine["target_artifact"] = self.evidence.artifact_fact(binary_artifact, core.hashed(core.encoded(build)))
         self.wrapper = {key: self.intent[key] for key in ("repo", "sha", "tree", "run_id", "run_attempt")} | {
             "schema": 1, "kind": "release-machine-intake", "machine": machine, **self.evidence.AWAITING,
@@ -296,12 +303,12 @@ class EndToEndTests(unittest.TestCase):
     def ready(self):
         core = self.evidence.core
         full = self.evidence.full_evidence(self.api, self.intent, self.needs)
-        self.api.upload(RUN, f"release-full-{RUN}-{ATTEMPT}", {"receipt.json": core.encoded(full)})
+        self.api.upload(RUN, f"release-full-{RUN}-{self.intent['run_attempt']}", {"receipt.json": core.encoded(full)})
         machine = self.wrapper["machine"]
         machine["full_binding"] = self.evidence.full_binding(self.api, self.intent)
         for lane in machine["lanes"]:
             lane["full_binding_sha256"] = core.hashed(core.encoded(machine["full_binding"]))
-        self.api.upload(99, f"release-machine-{RUN}-{ATTEMPT}-99", {"receipt.json": core.encoded(self.wrapper)})
+        self.api.upload(99, f"release-machine-{RUN}-{self.intent['run_attempt']}-99", {"receipt.json": core.encoded(self.wrapper)})
         return full
 
     def test_complete_native_attempt_produces_verdict_with_receipt_hashes(self):
@@ -425,6 +432,61 @@ class EndToEndTests(unittest.TestCase):
         self.api.runs[99]["triggering_actor"] = {"id": 43}
         with self.assertRaises(ValueError):
             self.evidence.verify_intake(self.api, self.api.runs[99], self.wrapper, intent, self.wrapper["machine"]["target_artifact"], HERE)
+class QueuedEvidenceTests(unittest.TestCase):
+    ready = EndToEndTests.ready
+
+    def setUp(self):
+        EndToEndTests.setUp(self, attempt=1)
+        self.api.runs[RUN]["status"] = "queued"
+
+    def activate(self, name):
+        job = next(row for row in self.api.job_rows if row["name"] == name)
+        job.update(status="in_progress", conclusion=None, completed_at=None,
+                   created_at=job["started_at"], head_sha=self.intent["workflow_sha"], head_branch="master")
+
+    def test_full_command_accepts_native_work_while_first_owner_summary_is_queued(self):
+        self.activate("Release Full evidence")
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            env = {"GITHUB_REPOSITORY": REPO, "GITHUB_RUN_ID": str(RUN), "GITHUB_RUN_ATTEMPT": "1",
+                   "NEEDS_JSON": json.dumps(self.needs)}
+            with patch.dict(os.environ, env), \
+                 patch.object(self.evidence.control, "AdmissionAPI", return_value=self.api), \
+                 patch.object(self.evidence.sys, "argv", ["release-evidence.py", "full", "--output", str(output)]):
+                try:
+                    self.evidence.main()
+                except ValueError as error:
+                    self.fail("Full evidence must use corroborated active admission: " + str(error))
+            receipt = self.evidence.core.decode((output / "receipt.json").read_bytes())
+        self.assertEqual((receipt["kind"], receipt["status"], receipt["run_attempt"]), ("release-full", "success", 1))
+        self.assertEqual(len(receipt["artifacts"]), len(self.evidence.core.load_script("ci-plan").shard_matrix()["include"]) + 1)
+
+    def test_collector_accepts_queued_owner_with_its_current_native_job(self):
+        self.ready()
+        self.activate("Release machine evidence")
+        try:
+            collected = self.evidence.collect(self.api, self.intent, HERE, 0)
+        except ValueError as error:
+            self.fail("collector must use corroborated queued-owner activity: " + str(error))
+        self.assertEqual(collected["machine"], self.wrapper["machine"])
+        self.assertEqual(collected["run_attempt"], 1)
+
+    def test_intake_accepts_queued_owner_without_relaxing_its_own_native_state(self):
+        self.ready()
+        self.activate("Release machine evidence")
+        self.api.runs[99].update(status="in_progress", conclusion=None)
+        event = {"sender": {"id": 42}, "repository": {"owner": {"id": 42}}}
+        with patch.dict(os.environ, {"GITHUB_REF": "refs/heads/master", "GITHUB_WORKFLOW_SHA": self.api.master}):
+            try:
+                result = self.evidence.intake(self.api, event, self.wrapper["machine"], 99, 1, HERE)
+            except ValueError as error:
+                self.fail("receipt intake must use corroborated candidate activity: " + str(error))
+            self.assertEqual(result["machine"], self.wrapper["machine"])
+            self.api.runs[99]["status"] = "queued"
+            with self.assertRaises(ValueError):
+                self.evidence.intake(self.api, event, self.wrapper["machine"], 99, 1, HERE)
+
+
 class FullBindingTests(unittest.TestCase):
     setUp = EndToEndTests.setUp
     ready = EndToEndTests.ready

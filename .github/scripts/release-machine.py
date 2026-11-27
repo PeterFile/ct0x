@@ -266,8 +266,6 @@ def source_manifest(harness=None):
 
 
 def ensure_active(api, run_id, attempt):
-    run = api.run(run_id)
-    check(run.get("run_attempt") == attempt and run.get("status") == "in_progress", "候选 owner 已取消、停止或 attempt 过期；不能开始新的外部执行")
     return control.guard(api, run_id, attempt)
 
 

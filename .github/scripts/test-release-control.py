@@ -312,6 +312,23 @@ class NativeAPI(load("release-control").AdmissionAPI):
         return stream.getvalue()
 
 
+def queued_owner(role="Release candidate binary"):
+    """Mirror the hosted first-attempt summary/job disagreement at the REST boundary."""
+    api = NativeAPI()
+    api.native["status"] = "queued"
+    api.job_rows[1].update(status="completed", conclusion="success", completed_at="2026-11-26T15:56:54Z")
+    api.job_rows.append({"id": 22, "run_id": 10, "run_attempt": 1, "name": role,
+        "workflow_name": "RC " + SHA, "head_branch": "master", "head_sha": MASTER,
+        "run_url": f"https://api.github.com/repos/{REPO}/actions/runs/10",
+        "url": f"https://api.github.com/repos/{REPO}/actions/jobs/22",
+        "html_url": f"https://github.com/{REPO}/actions/runs/10/job/22",
+        "status": "in_progress", "conclusion": None, "completed_at": None,
+        "created_at": "2026-11-26T15:56:54Z", "started_at": "2026-11-26T15:56:56Z",
+        "steps": [], "labels": ["ubuntu-latest"], "runner_id": 1, "runner_name": "offline-runner",
+        "runner_group_id": 0, "runner_group_name": "GitHub Actions"})
+    return api
+
+
 class ConsumerAuthorityTests(unittest.TestCase):
     def setUp(self):
         self.control, self.api = load("release-control"), NativeAPI()
@@ -405,6 +422,163 @@ class ConsumerAuthorityTests(unittest.TestCase):
             self.api.job_rows[1].update(status="completed", conclusion="success", completed_at="2026-11-26T15:56:54Z")
         run = self.api.second_run if attempt > 1 else self.api.native
         run.update(status="completed", conclusion="success")
+
+    def test_queued_first_owner_with_current_native_work_passes_active_guard(self):
+        roles = ["Release candidate binary", "Release clients", "Release Full evidence", "Release machine evidence",
+                 "Release candidate evidence", "Release candidate verdict", "Release Full / Go ordinary and remaining race",
+                 "Release Full / Go store worker 0"]
+        for role in roles:
+            self.api = queued_owner(role)
+            with self.subTest(role=role):
+                try:
+                    result = self.control.guard(self.api, 10, 1)
+                except ValueError as error:
+                    self.fail("authenticated native work must outweigh a queued first-owner summary: " + str(error))
+                self.assertEqual(result, self.api.intent)
+                self.assertTrue(all(method == "GET" for method, _ in self.api.calls))
+                self.assertEqual(self.api.posts, 0)
+
+    def test_queued_tag_jobs_bind_to_the_verified_native_commit_not_only_the_raw_tag_object(self):
+        for annotated in (False, True):
+            self.api = queued_owner()
+            self.tag_run()
+            self.api.job_rows[-1].update(head_sha=SHA, head_branch="rc/test")
+            if annotated:
+                outer = "f" * 40
+                self.api.native["head_sha"] = outer
+                self.api.tag_objects[outer] = {"sha": outer, "object": {"type": "commit", "sha": SHA}}
+            with self.subTest(annotated=annotated):
+                try:
+                    self.assertEqual(self.control.guard(self.api, 10, 1), self.api.intent)
+                except ValueError as error:
+                    self.fail("queued tag jobs must match the independently verified peeled native head: " + str(error))
+                self.api.job_rows[-1]["head_sha"] = MASTER
+                with self.assertRaises(ValueError):
+                    self.control.guard(self.api, 10, 1)
+
+    def test_queued_owner_rejects_missing_foreign_inherited_or_nonactive_job_evidence(self):
+        changes = [{"name": "Release duplicate verdict"}, {"name": "Release Full / untrusted role"},
+                   {"run_id": 11}, {"run_attempt": 2}, {"id": 0}, {"head_sha": SHA}, {"head_sha": None},
+                   {"head_branch": "other"}, {"status": "queued"}, {"status": "completed", "conclusion": "success"},
+                   {"conclusion": "cancelled"}, {"completed_at": "2026-11-26T15:56:57Z"},
+                   {"started_at": None}, {"started_at": "2026-11-26T15:56:46Z"},
+                   {"started_at": "2026-11-26T15:56:53Z", "created_at": "2026-11-26T15:56:53Z"},
+                   {"created_at": None}, {"created_at": "2026-11-26T15:56:46Z"},
+                   {"created_at": "2026-11-26T15:56:57Z"}]
+        for change in changes + [None]:
+            self.api = queued_owner()
+            if change is None:
+                self.api.job_rows.pop()
+            else:
+                self.api.job_rows[-1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 1)
+        self.assertEqual(self.api.posts, 0)
+
+    def test_queued_owner_cannot_bypass_canonical_source_or_terminal_admission_fences(self):
+        for change in ("source", "tree", "ancestry", "missing-owner", "failed-normalize", "failed-admission", "live-admission"):
+            self.api = queued_owner()
+            if change == "source":
+                self.api.intent["sources"] = {}
+            elif change == "tree":
+                self.api.intent["tree"] = "f" * 40
+            elif change == "ancestry":
+                self.api.reachable[MASTER].remove(SHA)
+            elif change == "missing-owner":
+                self.api.status_rows = []
+            elif change == "failed-normalize":
+                self.api.job_rows[0]["conclusion"] = "failure"
+            elif change == "failed-admission":
+                self.api.job_rows[1]["conclusion"] = "cancelled"
+            else:
+                self.api.job_rows[1].update(status="in_progress", conclusion=None, completed_at=None)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 1)
+            self.assertEqual(self.api.posts, 0)
+
+    def test_queued_witness_never_grants_completed_success_or_retry_authorization(self):
+        self.api = queued_owner()
+        with self.assertRaises(ValueError):
+            self.control.guard(self.api, 10, 1, completed=True)
+        self.prepare_retry()
+        self.api.second_run["status"] = "queued"
+        self.api.second_jobs.append(self.api.job_rows[-1] | {"id": 122, "run_attempt": 2,
+            "created_at": "2026-11-26T16:00:06Z", "started_at": "2026-11-26T16:00:07Z"})
+        for operation in (lambda: self.control.guard(self.api, 10, 2),
+                          lambda: self.api.authorize_retry(10, 2),
+                          lambda: self.control.admit(self.api, REPO, SHA, 10, 2, True)):
+            with self.assertRaises(ValueError):
+                operation()
+        self.assertEqual(self.api.posts, 0)
+
+    def test_queued_witness_does_not_override_terminal_cancelled_or_newer_native_attempt(self):
+        changes = [{"status": "completed", "conclusion": value} for value in ("success", "failure", "cancelled", None)]
+        changes += [{"status": "waiting"}, {"status": "queued", "conclusion": "cancelled"}, {"run_attempt": 2}]
+        for endpoint in ("", "/attempts/1"):
+            for change in changes:
+                self.api = queued_owner()
+                original = self.api.request
+                def changed(method, path, data=None, binary=False):
+                    result = original(method, path, data, binary)
+                    return result | change if path == self.api.prefix + "/actions/runs/10" + endpoint else result
+                self.api.request = changed
+                with self.subTest(endpoint=endpoint, change=change), self.assertRaises(ValueError):
+                    self.control.guard(self.api, 10, 1)
+
+    def test_queued_guard_refreshes_activity_before_returning_authorization(self):
+        changes = [{"status": "completed", "conclusion": "success", "completed_at": "2026-11-26T15:56:57Z"},
+                   {"status": "queued"}, {"head_sha": SHA}, {"run_attempt": 2}]
+        for change in changes:
+            self.api = queued_owner()
+            original, seen_intent = self.api.request, []
+            def changed(method, path, data=None, binary=False):
+                if path == self.api.prefix + "/actions/artifacts/30/zip":
+                    seen_intent.append(True)
+                if seen_intent and path == self.api.prefix + "/actions/runs/10":
+                    self.api.job_rows[-1].update(change)
+                return original(method, path, data, binary)
+            self.api.request = changed
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 1)
+
+    def test_queued_guard_rechecks_terminal_or_newer_state_after_final_activity_read(self):
+        for change in ({"status": "completed", "conclusion": "cancelled"}, {"run_attempt": 2}):
+            self.api = queued_owner()
+            original, seen_intent, reauthorizing = self.api.request, [], []
+            def changed(method, path, data=None, binary=False):
+                result = original(method, path, data, binary)
+                if path == self.api.prefix + "/actions/artifacts/30/zip":
+                    seen_intent.append(True)
+                if seen_intent and path == self.api.prefix + "/actions/runs/10":
+                    reauthorizing.append(True)
+                if reauthorizing and "/attempts/1/jobs?" in path:
+                    self.api.second_run = self.api.native | change
+                return result
+            self.api.request = changed
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 1)
+
+    def test_queued_guard_accepts_active_summary_skew_only_for_the_same_native_identity(self):
+        for endpoint in ("", "/attempts/1"):
+            self.api = queued_owner()
+            original = self.api.request
+            def active(method, path, data=None, binary=False):
+                result = original(method, path, data, binary)
+                return result | {"status": "in_progress"} if path == self.api.prefix + "/actions/runs/10" + endpoint else result
+            self.api.request = active
+            try:
+                self.assertEqual(self.control.guard(self.api, 10, 1), self.api.intent)
+            except ValueError as error:
+                self.fail("queued/in_progress summaries with the same native activity must be admissible: " + str(error))
+        for change in ({"head_sha": SHA}, {"head_branch": "other"}, {"run_started_at": "2026-11-26T15:56:46Z"}):
+            self.api = queued_owner()
+            original = self.api.request
+            def foreign(method, path, data=None, binary=False):
+                result = original(method, path, data, binary)
+                return result | change if path == self.api.prefix + "/actions/runs/10" else result
+            self.api.request = foreign
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.control.guard(self.api, 10, 1)
 
     def test_guard_explicitly_selects_active_or_successfully_completed_read_only_state(self):
         states = [("in_progress", None), ("completed", "success"), ("completed", None),

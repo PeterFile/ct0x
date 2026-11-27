@@ -350,8 +350,6 @@ def intake(api, event, value, intake_run, intake_attempt, root):
     signature = machine_signature(event.get("inputs", {}).get("machine_signature", ""))
     validate_machine(value, require_full=True)
     check(native_intake.get("display_title") == intake_title(value), "intake 原生标题与回执目标不符")
-    owner = api.run(value["run_id"])
-    check(owner.get("run_attempt") == value["run_attempt"] and owner.get("status") == "in_progress", "canonical owner 已停止或机器回执 attempt 过期")
     intent = control.guard(api, value["run_id"], value["run_attempt"])
     build, _, target_fact = target(api, intent)
     bind_machine(value, intent | {"artifact_sha256": build["artifact_sha256"]}, target_fact)
@@ -439,9 +437,7 @@ def collect(api, intent, root, seconds):
     check(control.guard(api, intent["run_id"], intent["run_attempt"]) == expected, "collector 初始 owner 身份改变")
     deadline = time.monotonic() + seconds
     while True:
-        current = api.run(intent["run_id"])
-        check(current.get("run_attempt") == intent["run_attempt"] and current.get("status") == "in_progress"
-              and current.get("conclusion") is None, "collector owner 已停止或 attempt 过期")
+        control.require_run_state(api, api.run(intent["run_id"]), intent["run_attempt"])
         candidates = find_intakes(api, intent, root, target_fact)
         if candidates:
             check(control.guard(api, intent["run_id"], intent["run_attempt"]) == expected, "收到回执时 canonical owner 改变")
