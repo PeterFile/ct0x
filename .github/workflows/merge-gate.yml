@@ -1,6 +1,6 @@
 name: PR Merge validation
 run-name: >-
-  ${{ github.event_name == 'workflow_dispatch' && format('Merge validation PR {0} head {1} base {2}', inputs.pr, inputs.head, inputs.base) || format('Merge validation PR {0}', github.event.pull_request.number) }}
+  ${{ github.event_name == 'workflow_dispatch' && format('Merge validation PR {0} head {1} base {2}', inputs.pr, inputs.head, inputs.base) || ((github.event.action == 'edited' && github.event.changes.base == null && (github.event.changes.title != null || github.event.changes.body != null) || github.event.action == 'labeled' && github.event.label.name != null && github.event.label.name != 'ci:refresh') && format('Merge metadata ignored PR {0} head {1} action {2}', github.event.pull_request.number, github.event.pull_request.head.sha, github.event.action) || format('Merge validation PR {0}', github.event.pull_request.number)) }}
 
 on:
   pull_request:
@@ -44,7 +44,7 @@ permissions:
 
 concurrency:
   group: >-
-    merge-validation-${{ github.event_name }}-${{ inputs.pr || github.event.pull_request.number }}-${{ (github.event.action == 'edited' && github.event.changes.base.ref.from == null || github.event.action == 'labeled' && github.event.label.name != 'ci:refresh') && github.run_id || 'current' }}
+    merge-validation-${{ github.event_name }}-${{ inputs.pr || github.event.pull_request.number }}-${{ (github.event.action == 'edited' && github.event.changes.base == null && (github.event.changes.title != null || github.event.changes.body != null) || github.event.action == 'labeled' && github.event.label.name != null && github.event.label.name != 'ci:refresh') && github.run_id || 'current' }}
   cancel-in-progress: true
 
 env:
@@ -61,8 +61,8 @@ jobs:
     name: Merge plan
     if: >-
       ${{ github.event_name == 'workflow_dispatch' ||
-          (github.event.action != 'edited' || github.event.changes.base.ref.from != null) &&
-          (github.event.action != 'labeled' || github.event.label.name == 'ci:refresh') }}
+          (github.event.action != 'edited' || github.event.changes.base != null || github.event.changes.title == null && github.event.changes.body == null) &&
+          (github.event.action != 'labeled' || github.event.label.name == null || github.event.label.name == 'ci:refresh') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:
@@ -80,6 +80,15 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: policy
           persist-credentials: false
+      - id: identity
+        name: Preserve true merge identity before fallible planning
+        run: python3 -B "$MERGE_POLICY_ROOT/.github/scripts/merge-gate.py" identity "$RUNNER_TEMP/merge-identity/merge-identity.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: merge-identity-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/merge-identity/merge-identity.json
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/setup-go@v7
         with:
           go-version-file: candidate/go.mod
@@ -150,8 +159,8 @@ jobs:
     needs: [plan, tests]
     if: >-
       ${{ always() && (github.event_name == 'workflow_dispatch' ||
-          (github.event.action != 'edited' || github.event.changes.base.ref.from != null) &&
-          (github.event.action != 'labeled' || github.event.label.name == 'ci:refresh')) }}
+          (github.event.action != 'edited' || github.event.changes.base != null || github.event.changes.title == null && github.event.changes.body == null) &&
+          (github.event.action != 'labeled' || github.event.label.name == null || github.event.label.name == 'ci:refresh')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

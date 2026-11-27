@@ -2,12 +2,9 @@ package store
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -15,29 +12,8 @@ import (
 
 // Every production prefix is a supported on-disk starting point, not a new empty database.
 func TestMergeGateAllMigrationPrefixesUpgradeReopenReplay(t *testing.T) {
-	// The trusted controller supplies its own immutable registry, not the candidate's replacement.
-	authority := os.Getenv("MERGE_GATE_MIGRATIONS_AUTHORITY")
-	if authority == "" {
-		authority = filepath.Join("..", "..", ".github", "scripts", "merge-gate-migrations.json")
-	}
-	data, err := os.ReadFile(authority)
-	if err != nil {
+	if err := mergeGateCheckCandidateRegistry(migrations); err != nil {
 		t.Fatal(err)
-	}
-	var published struct {
-		VersionCount int      `json:"version_count"`
-		SHA256       []string `json:"sha256"`
-	}
-	if err := json.Unmarshal(data, &published); err != nil {
-		t.Fatal(err)
-	}
-	if published.VersionCount == 0 || published.VersionCount != len(published.SHA256) || len(migrations) < published.VersionCount {
-		t.Fatal("published migration prefix is missing or shortened")
-	}
-	for i, want := range published.SHA256 {
-		if got := fmt.Sprintf("%x", sha256.Sum256([]byte(migrations[i]))); got != want {
-			t.Fatalf("published migration v%d changed before upgrade construction: %s != %s", i+1, got, want)
-		}
 	}
 	latest, err := Open(filepath.Join(t.TempDir(), "latest.db"))
 	if err != nil {

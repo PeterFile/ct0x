@@ -65,4 +65,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MERGE_PR: ${{ matrix.pr }}
+          MERGE_SOURCE_SHA: ${{ matrix.source_sha }}
         run: python3 -B .github/scripts/merge-gate-publish.py report --pr "$MERGE_PR"

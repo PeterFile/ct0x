@@ -2,7 +2,8 @@
 """Trusted base-side publisher; local consumption is explicit and stays under the shared mkdir lock."""
 import argparse
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+import fcntl
 import hashlib
 import importlib.util
 import io
@@ -11,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import time
@@ -45,9 +47,23 @@ class UnassignedRun(ValueError):
     pass
 
 
+class StateChanged(ValueError):
+    pass
+
+
+def state_check(condition, message):
+    if not condition:
+        raise StateChanged(message)
+
+
 def integer(value):
     check(type(value) is int and value > 0, "API 数字身份非法")
     return value
+
+
+def receipt_integer(value):
+    check(isinstance(value, str) and re.fullmatch(r"[1-9][0-9]{0,63}", value) is not None, "回执数字身份非法")
+    return int(value)
 
 
 def sha(value):
@@ -123,7 +139,7 @@ def merge_state(pr, base, merge):
     return "unknown"
 
 
-def validate_proof(receipt, run, jobs, pr, master, merge, workflow_id):
+def validate_run_identity(receipt, run, pr, workflow_id):
     validate_live(pr)
     check(run["path"] == WORKFLOW and run["workflow_id"] == workflow_id, "验证工作流路径/id 不符")
     check(run["repository"]["full_name"] == REPO and run["repository"]["id"] == pr["base"]["repo"]["id"], "验证运行不属于生产仓库")
@@ -137,6 +153,10 @@ def validate_proof(receipt, run, jobs, pr, master, merge, workflow_id):
               run["head_repository"]["full_name"] == REPO and run["head_branch"] == "master" and
               run["head_sha"] == sha(receipt.get("controller_sha")) and run["display_title"] == dispatch_title(pr), "控制器未运行在生产默认分支的精确策略提交")
     check(receipt.get("source") == source_identity(pr), "回执来源 PR/fork/分支不匹配")
+
+
+def validate_proof(receipt, run, jobs, pr, master, merge, workflow_id):
+    validate_run_identity(receipt, run, pr, workflow_id)
     check(run["status"] == "completed" and run["conclusion"] == "success", "验证运行没有明确成功")
     check(merge_state(pr, master, merge) == "ready", "没有匹配的双亲测试合并")
     expected = {"repo": REPO, "pr": pr["number"], "head": pr["head"]["sha"], "base": master,
@@ -153,12 +173,12 @@ def validate_proof(receipt, run, jobs, pr, master, merge, workflow_id):
     return expected
 
 
-def decode_artifact(data, digest):
-    check(len(data) <= MAX_ARTIFACT and isinstance(digest, str) and
+def decode_artifact(data, digest, member="merge-gate.json", limit=MAX_ARTIFACT):
+    check(len(data) <= limit and isinstance(digest, str) and
           digest == "sha256:" + hashlib.sha256(data).hexdigest(), "远端 artifact 摘要缺失或不匹配")
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         entries = archive.infolist()
-        check(len(entries) == 1 and entries[0].filename == "merge-gate.json" and entries[0].file_size <= MAX_ARTIFACT and not entries[0].is_dir(), "artifact 必须仅含有界 JSON 数据；禁止解压执行")
+        check(len(entries) == 1 and entries[0].filename == member and entries[0].file_size <= limit and not entries[0].is_dir(), "artifact 必须仅含指定的有界 JSON 数据；禁止解压执行")
         return gate.verifier.decode(archive.read(entries[0]).decode("utf-8"))
 
 
@@ -195,7 +215,7 @@ def stable_snapshot(api, number):
         second = snapshot(api, number)
         if fingerprint(first) == fingerprint(second) and (second[0].get("mergeable") is not None or attempt == 2):
             return second
-    raise ValueError("PR 持续变化，拒绝发布成功")
+    raise StateChanged("PR 持续变化，拒绝发布成功")
 
 
 def matching_prs(api, run, base_ref=None):
@@ -215,11 +235,28 @@ def dispatch_title(pr):
 
 
 def ignored_run(api, run):
-    if run["event"] != "pull_request" or run["status"] != "completed":
+    if run["event"] != "pull_request":
         return False
-    jobs = api.pages(f"actions/runs/{integer(run['id'])}/attempts/{integer(run['run_attempt'])}/jobs", "jobs")
-    # This excludes metadata-only runs, never treats skipped jobs as proof of success.
-    return bool(jobs) and all(row.get("status") == "completed" and row.get("conclusion") == "skipped" for row in jobs)
+    # Only the protected workflow's positive event marker excludes work, including pending metadata.
+    marker = re.fullmatch(r"Merge metadata ignored PR ([1-9][0-9]*) head ([0-9a-f]{40}) action (edited|labeled)", run.get("display_title", ""))
+    return marker is not None and marker[2] == run["head_sha"]
+
+
+def native_pr(api, run, multiple):
+    title = re.fullmatch(r"Merge validation PR ([1-9][0-9]*)", run.get("display_title", ""))
+    if title:
+        return int(title[1])
+    numbers = {pr["number"] for pr in run.get("pull_requests", [])}
+    if len(numbers) == 1:
+        return numbers.pop()
+    if multiple and run["status"] == "completed" and run["conclusion"] == "success":
+        artifacts = [row for row in api.pages(f"actions/runs/{integer(run['id'])}/artifacts", "artifacts")
+                     if row["name"] == f"merge-gate-{run['id']}-{run['run_attempt']}" and row.get("expired") is False]
+        if len(artifacts) == 1 and artifacts[0].get("workflow_run", {}).get("id") == run["id"]:
+            receipt = decode_artifact(api.archive(artifacts[0]["id"]), artifacts[0].get("digest"))
+            check(receipt.get("repo") == REPO and receipt.get("head") == run["head_sha"], "原生回执归属头不匹配")
+            return integer(receipt["pr"])
+    return None
 
 
 def latest_run(api, pr, trusted_only=False):
@@ -228,7 +265,18 @@ def latest_run(api, pr, trusted_only=False):
     native = [run for run in runs if run["event"] == "pull_request" and run["path"] == WORKFLOW and
               run["head_sha"] == pr["head"]["sha"] and run["head_branch"] == pr["head"]["ref"] and
               run["head_repository"]["id"] == pr["head"]["repo"]["id"] and run["head_repository"]["full_name"] == pr["head"]["repo"]["full_name"]]
-    native = [] if trusted_only else [run for run in native if not ignored_run(api, run)]
+    multiple = len(source_targets(api, pr["head"]["sha"])) > 1
+    if trusted_only:
+        native = []
+    else:
+        eligible = []
+        for run in native:
+            if ignored_run(api, run):
+                continue
+            owner = native_pr(api, run, multiple)
+            if owner is None or owner == pr["number"]:
+                eligible.append({**run, "_ambiguous": multiple and owner is None})
+        native = eligible
     query = urlencode({"event": "workflow_dispatch"})
     dispatched = api.pages("actions/workflows/merge-gate.yml/runs?" + query, "workflow_runs")
     dispatched = [run for run in dispatched if run["event"] == "workflow_dispatch" and run["path"] == WORKFLOW and
@@ -296,12 +344,46 @@ def proof(api, state, run_id, attempt, root):
     identity = validate_proof(receipt, exact, jobs, original_pr, receipt["base"], original, workflow["id"])
     current_master = sha(api.get("git/ref/heads/master")["object"]["sha"])
     trusted_policy(api, receipt, exact, current_master)
-    if receipt["base"] != base:
-        raise StaleBase("旧回执的真实 base 已过期，必须刷新原生合并检查")
+    if receipt["base"] != base or receipt["sha"] != merge["sha"] or receipt["tree"] != merge["tree"]["sha"]:
+        raise StaleBase("旧回执的真实 base/合并/tree 已过期，必须刷新原生合并检查")
     validate_proof(receipt, exact, jobs, pr, base, merge, workflow["id"])
     return {"identity": identity, "source": receipt["source"], "artifact_id": integer(artifact["id"]),
             "artifact_digest": artifact["digest"], "policy_digest": receipt["policy_digest"],
             "controller_sha": receipt.get("controller_sha", "")}
+
+
+def verify_failed_target(api, state, run):
+    """A failed source-head run is not a failure of every later merge tree."""
+    pr, base, merge = state
+    run_id, attempt = integer(run["id"]), integer(run["run_attempt"])
+    latest = api.get(f"actions/runs/{run_id}")
+    check(latest["run_attempt"] == attempt, "失败运行已重试，旧 attempt 不能归因")
+    exact = api.get(f"actions/runs/{run_id}/attempts/{attempt}")
+    check(all(exact.get(key) == run.get(key) for key in ("id", "run_attempt", "status", "conclusion", "event")), "失败运行终态/尝试已变化")
+    workflow = api.get("actions/workflows/merge-gate.yml")
+    check(workflow["path"] == WORKFLOW and workflow["state"] == "active", "验证工作流未启用")
+    artifacts = api.pages(f"actions/runs/{run_id}/artifacts", "artifacts")
+    identity = [row for row in artifacts if row["name"] == f"merge-identity-{run_id}-{attempt}"]
+    member, limit = ("merge-identity.json", 65536) if identity else ("merge-plan.json", MAX_ARTIFACT)
+    artifacts = identity or [row for row in artifacts if row["name"] == f"merge-plan-{run_id}-{attempt}"]
+    check(len(artifacts) == 1 and artifacts[0].get("expired") is False, "失败运行缺少唯一精确初始身份/计划")
+    artifact = artifacts[0]
+    check(artifact.get("workflow_run", {}).get("id") == run_id and artifact.get("size_in_bytes", limit + 1) <= limit, "初始身份/计划远端运行身份/大小非法")
+    plan = decode_artifact(api.archive(integer(artifact["id"])), artifact.get("digest"), member, limit)
+    if identity:
+        check(plan.get("schema") == 1 and plan.get("kind") == "merge-identity", "初始身份协议非法")
+    validate_run_identity(plan, exact, pr, workflow["id"])
+    expected = {"repo": REPO, "pr": pr["number"], "head": pr["head"]["sha"], "base": base,
+                "sha": merge["sha"], "tree": merge["tree"]["sha"], "run_id": str(run_id), "run_attempt": str(attempt)}
+    check(all(plan.get(key) == value for key, value in expected.items()), "失败计划不属于当前精确合并树")
+    original = api.get("git/commits/" + sha(plan["sha"]))
+    check(merge_state(pr, base, original) == "ready" and original["tree"]["sha"] == plan["tree"], "失败计划的真实双亲/tree 不符")
+    trusted_policy(api, plan, exact, sha(api.get("git/ref/heads/master")["object"]["sha"]))
+    jobs = api.pages(f"actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
+    planned = [job for job in jobs if job["name"] == "Merge plan"]
+    check(len(planned) == 1 and all(planned[0].get(key) == value for key, value in
+          {"run_id": run_id, "run_attempt": attempt, "status": "completed"}.items()) and
+          (bool(identity) or planned[0].get("conclusion") == "success"), "失败运行未完成可核验的初始身份/计划步骤")
 
 
 def external_id(pr):
@@ -347,7 +429,7 @@ def publish_check(api, pr, conclusion, metadata, guard=lambda: True):
     check(all(owned(row, pr) for row in existing), "同名检查存在其他 PR/写入者，拒绝碰撞授权")
     existing.sort(key=lambda row: integer(row["id"]))
     for duplicate in existing[1:]:
-        check(guard(), "发布前 PR/运行已变化")
+        state_check(guard(), "发布前 PR/运行已变化")
         api.write("PATCH", "check-runs/" + str(duplicate["id"]), {"name": "Merge reporter superseded", "status": "completed", "conclusion": "neutral"})
     output = {"title": {"success": "合并验证通过", "failure": "合并已阻塞", "pending": "等待合并验证"}[conclusion],
               "summary": json.dumps(metadata, sort_keys=True, ensure_ascii=True)}
@@ -357,7 +439,7 @@ def publish_check(api, pr, conclusion, metadata, guard=lambda: True):
     identity = metadata.get("validation", {}).get("identity", {})
     if identity:
         data["details_url"] = f"https://github.com/{REPO}/actions/runs/{identity['run_id']}/attempts/{identity['run_attempt']}"
-    check(guard(), "发布前 PR/运行已变化")
+    state_check(guard(), "发布前 PR/运行已变化")
     if existing:
         row = existing[0]
         if not all(row.get(key) == value for key, value in data.items()):
@@ -368,8 +450,9 @@ def publish_check(api, pr, conclusion, metadata, guard=lambda: True):
         log_check(row, pr, metadata)
     if not guard():
         stale = {**metadata, "result": "pending", "reason": "发布期间身份变化，旧成功不可消费"}
-        api.write("PATCH", "check-runs/" + str(integer(row["id"])), {"status": "in_progress", "output": {"title": "等待并发变化后的验证", "summary": json.dumps(stale, ensure_ascii=True)}})
-        raise ValueError("发布期间身份变化；已撤回成功")
+        row = api.write("PATCH", "check-runs/" + str(integer(row["id"])), {"status": "in_progress", "output": {"title": "等待并发变化后的验证", "summary": json.dumps(stale, ensure_ascii=True)}})
+        log_check(row, pr, stale)
+        raise StateChanged("发布期间身份变化；已撤回成功")
     return row
 
 
@@ -404,102 +487,149 @@ def target_details(pr):
             "head_repo": repository.get("full_name"), "base_ref": base["ref"], "base": base["sha"], "draft": pr.get("draft")}
 
 
-def reconcile(api, number, root, context):
-    requested = api.get(f"pulls/{integer(number)}")
-    targets = source_targets(api, requested["head"]["sha"])
-    if len(targets) == 1 and targets[0]["head"].get("repo") is not None:
-        return reconcile_single(api, targets[0]["number"], root, context)
-    details = [target_details(pr) for pr in targets]
-    metadata = {"schema": 1, "repo": REPO, "pr": number, "head": requested["head"]["sha"], "result": "pending",
-                "reason_code": "shared_head_multiple_targets" if len(targets) > 1 else "source_identity_unknown" if targets else "source_head_no_open_targets", "targets": details,
+def aggregate(pr, targets, membership, context):
+    result = "success" if targets and all(row["result"] == "success" for row in targets) else "failure" if any(row["result"] == "failure" for row in targets) else "pending"
+    metadata = {"schema": 1, "repo": REPO, "pr": pr["number"], "head": pr["head"]["sha"], "result": result,
+                "reason_code": "source_head_intersection", "membership": membership, "targets": targets,
+                "failed_prs": [row["pr"] for row in targets if row["result"] == "failure"],
+                "pending_prs": [row["pr"] for row in targets if row["result"] == "pending"],
                 "publisher": {"workflow": PUBLISHER, "run_id": context["GITHUB_RUN_ID"], "run_attempt": context["GITHUB_RUN_ATTEMPT"],
                               "workflow_sha": context.get("MERGE_TRUSTED_WORKFLOW_SHA")}}
-    if not targets and not checks(api, requested):
-        return None
-    return publish_check(api, requested, "pending", metadata,
-                         guard=lambda: [target_details(pr) for pr in source_targets(api, requested["head"]["sha"])] == details)
+    if len(targets) == 1:
+        for key in ("validation", "reason", "dispatch_requested", "dispatch_refresh_id"):
+            if key in targets[0]:
+                metadata[key] = targets[0][key]
+    return metadata
 
 
-def reconcile_single(api, number, root, context):
+def project_target(api, number, root, context, previous):
     state = stable_snapshot(api, number)
     pr, base, merge = state
+    state_check(context.get("MERGE_SOURCE_SHA", pr["head"]["sha"]) == pr["head"]["sha"], "PR 已离开此 source SHA 并发组")
     status = merge_state(pr, base, merge)
-    # Confirm the trusted policy/tree before inspecting any candidate protocol or jobs.
     policy_sha = sha(api.get("git/ref/heads/master")["object"]["sha"]) if status == "ready" else None
-    policy_changed = status == "ready" and candidate_policy_changed(api, merge["sha"], policy_sha)
-    source = {"head_repository": pr["head"]["repo"], "head_branch": pr["head"]["ref"], "head_sha": pr["head"]["sha"]}
-    multi_target = len(matching_prs(api, source)) > 1 if status == "ready" else False
-    trusted_only = policy_changed or multi_target
-    run = latest_run(api, pr, trusted_only)
-    metadata = {"schema": 1, "repo": REPO, "pr": number, "head": pr["head"]["sha"], "targets": [target_details(pr)],
-                "reason_code": "single_target_validation", "publisher": {"workflow": PUBLISHER, "run_id": context["GITHUB_RUN_ID"], "run_attempt": context["GITHUB_RUN_ATTEMPT"],
-                              "workflow_sha": context.get("MERGE_TRUSTED_WORKFLOW_SHA")}}
-    conclusion, dispatch = "pending", None
-    metadata["reason"] = "等待原生运行或 GitHub 计算测试合并"
-    previous = checks(api, pr)
-    previous_metadata = [gate.verifier.decode(row["output"]["summary"]) for row in previous if owned(row, pr)]
-    if trusted_only and (run is None or run["event"] != "workflow_dispatch"):
+    # Policy detection precedes candidate artifact/job parsing.
+    changed = status == "ready" and candidate_policy_changed(api, merge["sha"], policy_sha)
+    current_pr = {**pr, "base": {**pr["base"], "sha": base}}
+    run = latest_run(api, current_pr, trusted_only=changed) if status == "ready" else None
+    target = {**target_details(current_pr), "merge_sha": merge["sha"] if status == "ready" else None,
+              "tree": merge["tree"]["sha"] if status == "ready" else None, "verification": False, "result": "pending",
+              "reason_code": "awaiting_validation", "reason": "等待精确目标的合并计算或验证"}
+    dispatch = None
+    if run is not None:
+        target["authority"] = {field: run[field] for field in ("id", "run_attempt", "status", "conclusion", "event")}
+    if status == "conflict":
+        target.update(result="failure", reason_code="confirmed_conflict", reason="确认此目标存在合并冲突")
+    elif status == "ready" and (changed and run is None or run is not None and run.get("_ambiguous")):
         dispatch = dispatch_inputs(pr, base, merge, policy_sha)
-        metadata["dispatch_requested"] = dispatch
-        metadata["dispatch_refresh_id"] = context.get("MERGE_REFRESH_ID")
-        metadata["reason"] = "策略变更由默认分支只读控制器验证；不解析候选回执协议来决定派发"
-    elif status == "conflict":
-        conclusion, metadata["reason"] = "failure", "确认存在合并冲突；原生 pull_request 不会创建测试合并运行"
+        target.update(reason_code="trusted_controller_required", reason="由默认分支控制器验证精确 PR/目标，不依赖候选协议")
     elif status == "ready" and run is not None and run["status"] == "completed":
-        try:
-            metadata["validation"] = proof(api, state, run["id"], run["run_attempt"], root)
-            conclusion = "success"
-            metadata.pop("reason")
-        except (PolicyChange, UnassignedRun):
-            policy_sha = sha(api.get("git/ref/heads/master")["object"]["sha"])
-            dispatch = dispatch_inputs(pr, base, merge, policy_sha)
-            metadata["dispatch_requested"] = dispatch
-            metadata["reason"] = "策略变更由默认分支只读控制器验证；候选不能自证策略执行"
-        except StaleBase as error:
-            metadata["reason"] = str(error)
-        except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError, zipfile.BadZipFile) as error:
-            conclusion, metadata["reason"] = "failure", "终态验证证据失败：" + str(error)
-    metadata["result"] = conclusion
+        if run["conclusion"] != "success":
+            try:
+                verify_failed_target(api, state, run)
+                target.update(result="failure", reason_code="terminal_validation_unsuccessful", reason="此精确目标最新验证明确未成功")
+            except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError, zipfile.BadZipFile) as error:
+                dispatch = dispatch_inputs(pr, base, merge, policy_sha)
+                target.update(reason_code="trusted_controller_required", reason="失败归属尚未绑定当前合并树：" + str(error))
+        else:
+            try:
+                target["validation"] = proof(api, state, run["id"], run["run_attempt"], root)
+                target.update(result="success", verification=True, reason_code="exact_target_verified")
+                target.pop("reason")
+            except (PolicyChange, UnassignedRun, StaleBase) as error:
+                dispatch = dispatch_inputs(pr, base, merge, policy_sha)
+                target.update(reason_code="trusted_controller_required", reason=str(error))
+            except (ValueError, KeyError, TypeError, OSError, subprocess.CalledProcessError, zipfile.BadZipFile) as error:
+                target.update(result="failure", reason_code="invalid_terminal_evidence", reason="此目标终态证据无效：" + str(error))
 
     def guard():
         try:
-            targets = source_targets(api, pr["head"]["sha"])
-            if len(targets) != 1 or targets[0]["number"] != number or fingerprint(snapshot(api, number)) != fingerprint(state):
+            if fingerprint(snapshot(api, number)) != fingerprint(state):
                 return False
             if policy_sha is not None and api.get("git/ref/heads/master")["object"]["sha"] != policy_sha:
                 return False
-            current = latest_run(api, pr, trusted_only)
-            fields = ("id", "run_attempt", "status", "conclusion")
-            return current is None and run is None or current is not None and run is not None and all(current[f] == run[f] for f in fields)
+            current = latest_run(api, current_pr, trusted_only=changed) if status == "ready" else None
+            fields = ("id", "run_attempt", "status", "conclusion", "_ambiguous")
+            return current is None and run is None or current is not None and run is not None and all(current.get(field) == run.get(field) for field in fields)
         except (ValueError, KeyError, TypeError, subprocess.CalledProcessError):
             return False
 
-    requested = any(row.get("dispatch_requested") == dispatch for row in previous_metadata) if dispatch else False
-    # Keep an unresolved dispatch intent until an accepted run is observed. An intent is not success.
-    if not dispatch and conclusion == "pending":
-        for row in previous_metadata:
-            intent = row.get("dispatch_requested")
-            if intent and intent.get("head") == pr["head"]["sha"] and intent.get("base") == base:
-                metadata["dispatch_requested"] = intent
-    if requested and dispatch:
-        # An explicit fresh PR action permits retry only after the complete dispatch list was reconciled.
-        refresh_id = context.get("MERGE_REFRESH_ID")
-        previous_refreshes = [row.get("dispatch_refresh_id") for row in previous_metadata if row.get("dispatch_requested") == dispatch]
-        requested = refresh_id is None or refresh_id in previous_refreshes
-        if refresh_id is None and previous_refreshes:
-            metadata["dispatch_refresh_id"] = previous_refreshes[0]
-    result = publish_check(api, pr, conclusion, metadata, guard)
-    if dispatch and not requested:
-        check(guard(), "派发前 PR/master 已变化")
-        # Unknown POST outcome is not retried; workflow_run events reconcile an accepted dispatch.
-        api.write("POST", "actions/workflows/merge-gate.yml/dispatches", {"ref": "master", "inputs": dispatch})
-    return result
+    old = [row for metadata in previous for row in metadata.get("targets", [metadata]) if row.get("pr") == number]
+    requested = False
+    for row in old:
+        intent = row.get("dispatch_requested")
+        if intent and intent.get("head") == pr["head"]["sha"] and intent.get("base") == base and target["result"] == "pending":
+            target["dispatch_requested"] = intent
+            target["dispatch_refresh_id"] = row.get("dispatch_refresh_id")
+        if dispatch and intent == dispatch and (context.get("MERGE_REFRESH_ID") is None or context["MERGE_REFRESH_ID"] == row.get("dispatch_refresh_id")):
+            requested = True
+    return target, guard, None if requested else dispatch
+
+
+def reconcile(api, number, root, context, retries=1):
+    requested = api.get(f"pulls/{integer(number)}")
+    head = sha(context.get("MERGE_SOURCE_SHA", requested["head"]["sha"]))
+    requested = {**requested, "head": {**requested["head"], "sha": head}}
+    targets = source_targets(api, head)
+    membership = [target_details(pr) for pr in targets]
+    existing = checks(api, requested)
+    previous = [gate.verifier.decode(row["output"]["summary"]) for row in existing if owned(row, requested)]
+    if not targets and not existing:
+        return None
+    visible = targets[0] if targets else requested
+    entries = [{**target_details(pr), "result": "pending", "verification": False, "reason_code": "source_identity_unknown"} for pr in targets]
+    member_guard = lambda: [target_details(pr) for pr in source_targets(api, head)] == membership
+    try:
+        # Withdraw a previous green before evaluating a changed target set.
+        if any(row.get("result") == "success" and row.get("membership") != membership for row in previous):
+            pending = aggregate(visible, entries, membership, context)
+            pending["reason_code"] = "source_membership_changed"
+            publish_check(api, requested, "pending", pending, member_guard)
+        evaluations = []
+        for index, pr in enumerate(targets):
+            if pr["head"].get("repo") is not None:
+                entry, guard, dispatch = project_target(api, pr["number"], root, context, previous)
+                entries[index] = entry
+                evaluations.append((entry, guard, dispatch))
+        guard = lambda: member_guard() and all(item[1]() for item in evaluations)
+        metadata = aggregate(visible, entries, membership, context)
+        result = publish_check(api, visible, metadata["result"], metadata, guard)
+        for entry, target_guard, dispatch in evaluations:
+            if dispatch is None:
+                continue
+            state_check(member_guard() and target_guard(), "派发前精确目标已变化")
+            # Persist one intent at a time: later targets are not falsely marked as submitted.
+            entry["dispatch_requested"] = dispatch
+            entry["dispatch_refresh_id"] = context.get("MERGE_REFRESH_ID")
+            metadata = aggregate(visible, entries, membership, context)
+            result = publish_check(api, visible, metadata["result"], metadata, lambda: member_guard() and target_guard())
+            if not member_guard() or not target_guard():
+                entry.pop("dispatch_requested", None)
+                publish_check(api, visible, "pending", {**aggregate(visible, entries, membership, context), "result": "pending"})
+                raise StateChanged("派发前身份变化，未发送此写入")
+            # Unknown POST outcomes retain this target's intent and are never automatically retried.
+            api.write("POST", "actions/workflows/merge-gate.yml/dispatches", {"ref": "master", "inputs": dispatch})
+        return result
+    except StateChanged:
+        if retries:
+            return reconcile(api, number, root, context, retries - 1)
+        metadata = aggregate(requested, entries, membership, context)
+        metadata.update(result="pending", reason_code="source_state_changed")
+        return publish_check(api, requested, "pending", metadata)
 
 
 def shared_lock_path(root):
     common = Path(gate.git(root, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     check(common.name == ".git", "只支持共享 .git 的普通仓库/工作树锁")
     return common.parent / ".local/merge.lock"
+
+
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def durable_json(path, value, exclusive=False):
@@ -512,15 +642,60 @@ def durable_json(path, value, exclusive=False):
         os.fsync(output.fileno())
     if not exclusive:
         os.replace(temporary, path)
+    sync_directory(path.parent)
 
 
 def release_own_lock(lock, token, inode):
     owner = lock / "merge-gate-owner"
     check(lock.is_dir() and not lock.is_symlink() and lock.stat().st_ino == inode and owner.is_file() and
           not owner.is_symlink() and gate.read_json(owner)["token"] == token, "锁身份变化；绝不释放其他写入者的锁")
-    check({p.name for p in lock.iterdir()} == {owner.name}, "锁中出现非本工具文件，保留锁并阻塞")
+    metadata = gate.read_json(owner)
+    lease = lock / "merge-gate-lease"
+    expected = {owner.name}
+    if metadata.get("schema") == 2:
+        check(lease.is_file() and not lease.is_symlink() and lease.stat().st_ino == metadata["lease_inode"], "内核租约身份变化，保留锁")
+        expected.add(lease.name)
+    check({p.name for p in lock.iterdir()} == expected, "锁中出现非本工具文件，保留锁并阻塞")
     owner.unlink()
+    if lease.name in expected:
+        lease.unlink()
     lock.rmdir()
+    sync_directory(lock.parent)
+
+
+@contextmanager
+def lock_lease(lock, owner=None, create=False):
+    check(lock.is_dir() and not lock.is_symlink(), "共享锁目录身份非法")
+    lease = lock / "merge-gate-lease"
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+    descriptor = os.open(lease, flags | (os.O_CREAT | os.O_EXCL if create else 0), 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("共享锁拥有者仍活动；不能恢复或释放") from error
+        info = os.fstat(descriptor)
+        check(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and lease.stat().st_ino == info.st_ino, "内核租约文件身份非法")
+        if owner is not None:
+            check(owner.get("schema") == 2 and owner["inode"] == lock.stat().st_ino and owner["lease_inode"] == info.st_ino and
+                  gate.read_json(lock / "merge-gate-owner") == owner, "恢复期间锁身份变化")
+        yield info.st_ino
+    finally:
+        os.close(descriptor)
+
+
+def recover_unsent_lock(lock):
+    check(not lock.is_symlink(), "不能恢复符号链接锁")
+    owner = gate.read_json(lock / "merge-gate-owner")
+    check(owner.get("schema") == 2 and re.fullmatch(r"[0-9a-f]{48}", owner["token"]), "遗留/未知锁没有内核协议证明；保留锁")
+    with lock_lease(lock, owner):
+        if owner["incident"] is not None:
+            record = gate.read_json(owner["incident"])
+            check(record["lock"] == {"path": str(lock), **{key: owner[key] for key in ("token", "inode", "lease_inode")}} and
+                  record.get("submitted") is False, "已经可能发送或事故身份不符；仅允许只读远端对账")
+            record["result"] = "not_submitted"
+            durable_json(owner["incident"], record)
+        release_own_lock(lock, owner["token"], owner["inode"])
 
 
 @contextmanager
@@ -528,17 +703,27 @@ def merge_lock(root):
     lock = shared_lock_path(root)
     lock.parent.mkdir(exist_ok=True)
     check(not lock.parent.is_symlink(), "共享锁目录不能是符号链接")
-    lock.mkdir()
-    inode, token, keep = lock.stat().st_ino, secrets.token_hex(24), False
-    durable_json(lock / "merge-gate-owner", {"schema": 1, "token": token, "inode": inode, "incident": None}, exclusive=True)
     try:
-        yield lock
-    except UnknownMerge:
-        keep = True  # Persist across process exits; only external terminal proof can release it.
-        raise
-    finally:
-        if not keep:
-            release_own_lock(lock, token, inode)
+        lock.mkdir()
+    except FileExistsError:
+        try:
+            recover_unsent_lock(lock)
+        except (ValueError, OSError, KeyError, TypeError) as error:
+            raise FileExistsError("共享锁仍被占用或缺少可恢复证明：" + str(error)) from error
+        lock.mkdir()
+    sync_directory(lock.parent)
+    inode, token, keep = lock.stat().st_ino, secrets.token_hex(24), False
+    with lock_lease(lock, create=True) as lease_inode:
+        durable_json(lock / "merge-gate-owner", {"schema": 2, "token": token, "inode": inode,
+                     "lease_inode": lease_inode, "incident": None}, exclusive=True)
+        try:
+            yield lock
+        except UnknownMerge:
+            keep = True  # The directory survives; kernel lease alone never proves a submitted outcome.
+            raise
+        finally:
+            if not keep:
+                release_own_lock(lock, token, inode)
 
 
 def validate_command(command, number, reviewed_head):
@@ -550,8 +735,10 @@ def verify_publisher(api, pr, validation):
     rows = checks(api, pr)
     check(len(rows) == 1 and owned(rows[0], pr) and rows[0].get("status") == "completed" and rows[0].get("conclusion") == "success", "唯一可信 Merge gate 未明确成功")
     metadata = gate.verifier.decode(rows[0]["output"]["summary"])
-    check(metadata.get("repo") == REPO and metadata.get("pr") == pr["number"] and metadata.get("head") == pr["head"]["sha"] and
-          metadata.get("result") == "success" and metadata.get("validation") == validation, "远端已发布结果不属于此精确回执")
+    target = [row for row in metadata.get("targets", []) if row.get("pr") == pr["number"]]
+    check(metadata.get("repo") == REPO and metadata.get("head") == pr["head"]["sha"] and metadata.get("result") == "success" and
+          len(target) == 1 and target[0].get("result") == "success" and target[0].get("verification") is True and
+          target[0].get("validation") == validation, "远端已发布交集不包含此目标的精确已验证回执")
     publisher = metadata["publisher"]
     check(publisher["workflow"] == PUBLISHER, "发布者路径不符")
     for field in ("run_id", "run_attempt"):
@@ -566,6 +753,7 @@ def verify_publisher(api, pr, validation):
     master = sha(api.get("git/ref/heads/master")["object"]["sha"])
     check(ancestor(api, sha(exact["head_sha"]), master) and
           (publisher.get("workflow_sha") is None or publisher["workflow_sha"] == exact["head_sha"]), "发布器不是已发布默认分支的工作流代码")
+    return metadata
 
 
 def refresh(api, pr):
@@ -590,7 +778,7 @@ def consume_operation(api, root, number, reviewed_head, validation, command, rev
     owner = gate.read_json(lock / "merge-gate-owner")
     record = {"schema": 1, "result": "unknown", "submitted": False, "identity": identity, "source": validation["source"],
               "reviewer": approval["reviewer"], "command_returncode": None,
-              "lock": {"path": str(lock), "token": owner["token"], "inode": owner["inode"]}}
+              "lock": {"path": str(lock), **{key: owner[key] for key in ("token", "inode", "lease_inode") if key in owner}}}
     durable_json(outcome, record, exclusive=True)
     owner["incident"] = str(Path(outcome).resolve())
     durable_json(lock / "merge-gate-owner", owner)
@@ -641,18 +829,35 @@ def reconcile_incident(api, root, outcome):
     lock = shared_lock_path(root)
     ownership = record["lock"]
     check(str(lock) == ownership["path"], "事故回执不属于此共享工作树锁")
-    if lock.exists():
-        owner = gate.read_json(lock / "merge-gate-owner")
-        check(owner["token"] == ownership["token"] and owner["inode"] == ownership["inode"] and
-              owner["incident"] == str(Path(outcome).resolve()), "事故回执不能释放其他写入者的锁")
-    record.update(remote_outcome(api, record))
-    durable_json(outcome, record)
-    check(record["result"] in ("merged", "not_merged"), "结果仍未知；保持锁，不重试写操作")
-    if lock.exists():
-        release_own_lock(lock, ownership["token"], ownership["inode"])
+    owner = gate.read_json(lock / "merge-gate-owner") if lock.exists() else None
+    lease = lock_lease(lock, owner) if owner is not None and owner.get("schema") == 2 else nullcontext(None)
+    with lease as lease_inode:
+        if owner is not None:
+            check(owner["token"] == ownership["token"] and owner["inode"] == ownership["inode"] and
+                  owner["incident"] == str(Path(outcome).resolve()) and owner.get("lease_inode") == ownership.get("lease_inode"),
+                  "事故回执不能释放其他写入者的锁")
+        if record.get("submitted") is False and ownership.get("lease_inode") is not None and (owner is None or lease_inode is not None):
+            record["result"] = "not_submitted"
+        else:
+            record.update(remote_outcome(api, record))
+        durable_json(outcome, record)
+        check(record["result"] in ("merged", "not_merged", "not_submitted"), "结果仍未知；保持锁，不重试写操作")
+        if owner is not None:
+            release_own_lock(lock, ownership["token"], ownership["inode"])
     print(json.dumps({"result": record["result"], "identity": record["identity"], "lock_released": True}, sort_keys=True, ensure_ascii=True))
     return record
 
+
+
+def verify_latest(api, state, run_id, attempt):
+    pr, base, merge = state
+    master = sha(api.get("git/ref/heads/master")["object"]["sha"])
+    changed = candidate_policy_changed(api, merge["sha"], master)
+    run = latest_run(api, {**pr, "base": {**pr["base"], "sha": base}}, trusted_only=changed)
+    check(run is not None and not run.get("_ambiguous") and run["id"] == integer(run_id) and
+          run["run_attempt"] == integer(attempt) and run["status"] == "completed" and run["conclusion"] == "success",
+          "最新相关权威运行不是请求的成功 run/attempt，旧绿灯不可消费")
+    return run
 
 
 def premerge(api, root, number, reviewed_head, run_id, attempt, consume, command, review=None, outcome=None, execute=None):
@@ -664,7 +869,7 @@ def premerge(api, root, number, reviewed_head, run_id, attempt, consume, command
         state = snapshot(api, number)
         validate_live(state[0], reviewed_head, consuming=True)
         targets = source_targets(api, reviewed_head)
-        check(len(targets) == 1 and targets[0]["number"] == number, "同 source head 存在其他开放 PR/目标，禁止歧义消费")
+        check(any(pr["number"] == number for pr in targets), "当前开放目标集合不包含请求的 PR")
         try:
             validation = proof(api, state, run_id, attempt, root)
         except StaleBase:
@@ -673,7 +878,23 @@ def premerge(api, root, number, reviewed_head, run_id, attempt, consume, command
             if consume:
                 refresh(api, current[0])
             raise ValueError("回执 base 已过期；消费模式请求 ci:refresh，未修改 head、未合并；等待新检查并核对已有审查范围")
-        verify_publisher(api, state[0], validation)
+        verify_latest(api, state, run_id, attempt)
+        metadata = verify_publisher(api, state[0], validation)
+        membership = [target_details(pr) for pr in targets]
+        declared = metadata.get("targets", [])
+        check(metadata.get("membership") == membership and len(declared) == len(targets) and
+              {entry["pr"] for entry in declared} == {pr["number"] for pr in targets}, "共享 source 目标集合已变化，旧交集不可消费")
+        verified = []
+        for entry in declared:
+            check(entry.get("result") == "success" and entry.get("verification") is True, "其他目标未明确验证成功")
+            target_state = state if entry["pr"] == number else snapshot(api, entry["pr"])
+            identity = entry["validation"]["identity"]
+            fresh = validation if entry["pr"] == number else proof(api, target_state, receipt_integer(identity["run_id"]), receipt_integer(identity["run_attempt"]), root)
+            check(fresh == entry["validation"] and target_state[0]["head"]["sha"] == reviewed_head and
+                  entry["base"] == target_state[1] and entry["base_ref"] == target_state[0]["base"]["ref"] and
+                  entry["tree"] == fresh["identity"]["tree"], "共享交集中的目标回执已过期或被错配")
+            verify_latest(api, target_state, receipt_integer(identity["run_id"]), receipt_integer(identity["run_attempt"]))
+            verified.append((target_state, identity))
         current = snapshot(api, number)
         validate_live(current[0], reviewed_head, consuming=True)
         if fingerprint(current) != fingerprint(state):
@@ -681,7 +902,13 @@ def premerge(api, root, number, reviewed_head, run_id, attempt, consume, command
                 refresh(api, current[0])
             raise ValueError("PR/base 已变化，旧回执不可消费，未合并")
         targets = source_targets(api, reviewed_head)
-        check(len(targets) == 1 and targets[0]["number"] == number and merge_state(*current) == "ready", "目标歧义、合并状态未知或冲突")
+        check([target_details(pr) for pr in targets] == membership and merge_state(*current) == "ready", "目标集合、合并状态已变化或冲突")
+        # Recompute each target's latest authority under the same held lock immediately before consumption.
+        for target_state, identity in verified:
+            final = snapshot(api, target_state[0]["number"])
+            check(fingerprint(final) == fingerprint(target_state), "共享目标在消费前发生变化")
+            verify_latest(api, final, receipt_integer(identity["run_id"]), receipt_integer(identity["run_attempt"]))
+        check([target_details(pr) for pr in source_targets(api, reviewed_head)] == membership, "消费前共享目标成员变化")
         if consume:
             check(review is not None and outcome is not None, "消费必须提供独立审查和结果回执路径")
             consume_operation(api, root, number, reviewed_head, validation, command, review, outcome, execute)
@@ -691,9 +918,11 @@ def premerge(api, root, number, reviewed_head, run_id, attempt, consume, command
 
 def resolve_event(api, event, event_name):
     if event_name == "pull_request_target":
-        if event.get("action") == "edited" and event.get("changes", {}).get("base", {}).get("ref", {}).get("from") is None:
+        changes = event.get("changes", {})
+        if event.get("action") == "edited" and "base" not in changes and ("title" in changes or "body" in changes):
             return []
-        if event.get("action") == "labeled" and event.get("label", {}).get("name", "").casefold() != "ci:refresh":
+        label = event.get("label", {}).get("name")
+        if event.get("action") == "labeled" and isinstance(label, str) and label and label.casefold() != "ci:refresh":
             return []
         return [integer(event["number"])]
     source = api.get("actions/runs/" + str(integer(event["workflow_run"]["id"])))
