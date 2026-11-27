@@ -484,7 +484,15 @@ class RuntimeIntegrationTests(unittest.TestCase):
             self.assertEqual(module.reconcile(self.machine, REPO, 10, 1, go=self.args.go)["status"], "busy")
             raise subprocess.TimeoutExpired("synthetic-driver", 1)
         self.driver.side_effect = first
-        with self.assertRaises(subprocess.TimeoutExpired):
+        module = self.machine.core.load_script("release-reconcile")
+        original_load = self.machine.core.load_script
+        paths = {"driver_6c": self.args.agy}
+        def loaded(name):
+            return module if name == "release-reconcile" else original_load(name)
+        with patch.object(self.machine.core, "load_script", side_effect=loaded), \
+             patch.object(module.Lease, "native_inputs", return_value=(paths, {})), \
+             patch.object(self.machine, "source_manifest", return_value=(paths | {"driver_6a": self.args.agy, "seed_6b": self.args.agy}, {}, {})), \
+             self.assertRaises(subprocess.TimeoutExpired):
             self.machine.run(self.args, self.api)
         self.assertTrue((self.fixture.STATE_ROOT / "machine-active").exists())
         self.command.assert_not_called()

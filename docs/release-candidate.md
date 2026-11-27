@@ -85,6 +85,15 @@ python3 -B .github/scripts/release-machine.py finalize \
 
 POST 未知、机器中断或取消时保留注册表、锁、scratch 和原认领，只读对账，结清真实终态及资源后再恢复；禁止删状态重放。回滚时停止新候选与观察器交接，经审查恢复策略并保留证据；发布/部署回滚分别审批。新候选 artifact 保留 90 天，提前归档原始私有审计及 Full 证明。
 
+对 `release-machine.py` 已登记的失败或未知租约，执行下列命令。命令只读核验原始证据，可持久化该租约的精确结清记录并归档机器锁。
+原生执行前的已知失败可结清。真实失败的子阶段仅在子进程已回收、原始终态或无 Turn 的夹具已核验、工作区已关闭且无资源 claim 时可结清。
+退出码 `0` 表示 settled，机器可接纳下一个 SHA，但原 attempt 的防重记录及发布失败结论仍保留。`75` 表示 busy，`1` 表示 unknown。
+未能证明终态、仍为 unknown 或仍持有资源时，保留租约与锁。发布仍须通过本节的证据检查和单独审批。
+
+```bash
+python3 -B .github/scripts/release-reconcile.py reconcile --repo "$repo" --run-id "$run_id" --attempt "$attempt" --go "$go_path"
+```
+
 ## 6. 运行离线检查（Python、Git、actionlint 在 PATH）
 
 ```bash

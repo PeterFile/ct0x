@@ -331,17 +331,14 @@ def native_run(args, api, intent, claim, binary, paths, lease):
     check(Path(original["AGY"]).resolve(strict=True) == args.agy.resolve(strict=True), "6A 原始驱动的 AGY 绑定与本机授权 CLI 不符")
     ensure_active(api, args.run_id, args.attempt)
     # Prepare itself starts services. Persist this boundary before any driver call.
-    lease.external("6c-prepare")
-    driver([paths["driver_6c"], "prepare", "--binary", binary, "--workspace", source, "--revision", intent["sha"],
-            "--go", args.go, "--agy", args.agy, "--root", root_c], claim / "6c-prepare.stdout", claim / "6c-prepare.stderr")
+    lease.run("6c-prepare", [paths["driver_6c"], "prepare", "--binary", binary, "--workspace", source, "--revision", intent["sha"],
+              "--go", args.go, "--agy", args.agy, "--root", root_c], claim / "6c-prepare.stdout", claim / "6c-prepare.stderr")
     ensure_active(api, args.run_id, args.attempt)
-    # Cover both possibly started lanes, including a crash between submissions.
-    lease.external("6a-execute")
-    lease.external("6c-execute")
+    # Each submitted lane durably records its own start before invoking the child.
     with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(driver, [paths["driver_6a"], "--binary", binary, "--commit", intent["sha"], "--go", args.go,
+        futures = [executor.submit(lease.run, "6a-execute", [paths["driver_6a"], "--binary", binary, "--commit", intent["sha"], "--go", args.go,
                                             "--schema-version", args.schema_version, "--trial-dir", root_a], claim / "6a.stdout", claim / "6a.stderr"),
-                   executor.submit(driver, [paths["driver_6c"], "execute", "--root", root_c], claim / "6c.stdout", claim / "6c.stderr")]
+                   executor.submit(lease.run, "6c-execute", [paths["driver_6c"], "execute", "--root", root_c], claim / "6c.stdout", claim / "6c.stderr")]
         # Wait for both original processes, including on failure; never overlap 6B.
         errors = []
         for future in futures:
@@ -353,11 +350,10 @@ def native_run(args, api, intent, claim, binary, paths, lease):
     lease.stage("6c-audit")
     driver([paths["driver_6c"], "audit", "--root", root_c], claim / "6c-audit.json", claim / "6c-audit.stderr")
     ensure_active(api, args.run_id, args.attempt)
-    lease.external("6b-prepare")
-    driver([paths["prepare_6b"], "--binary", binary, "--root", root_b, "--seeder", seeder], claim / "6b-prepare.stdout", claim / "6b-prepare.stderr")
-    lease.external("6b-execute")
-    driver([paths["driver_6b"], "--worktree", source, "--binary", binary, "--revision", intent["sha"], "--root", root_b,
-            "--seeder", seeder, "--agy", args.agy], claim / "6b-audit.json", claim / "6b.stderr")
+    lease.run("6b-prepare", [paths["prepare_6b"], "--binary", binary, "--root", root_b, "--seeder", seeder],
+              claim / "6b-prepare.stdout", claim / "6b-prepare.stderr")
+    lease.run("6b-execute", [paths["driver_6b"], "--worktree", source, "--binary", binary, "--revision", intent["sha"], "--root", root_b,
+              "--seeder", seeder, "--agy", args.agy], claim / "6b-audit.json", claim / "6b.stderr")
     timeline_path = root_b / "b-cancellation.jsonl"
     timeline = [core.decode(line, 2 << 20) for line in timeline_path.read_bytes().splitlines() if line.strip()]
     if any(item["turn"]["state"] == "unknown" for item in timeline):

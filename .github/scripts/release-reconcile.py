@@ -3,6 +3,7 @@
 import argparse
 from contextlib import closing, contextmanager, ExitStack
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -14,13 +15,194 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
+from urllib.parse import unquote, urlsplit
 
 EXTERNAL = frozenset(("6c-prepare", "6a-execute", "6c-execute", "6b-prepare", "6b-execute"))
 STAGES = EXTERNAL | {"reserved", "record-inputs", "install-binary", "binary-before", "clean-snapshot", "seed-helper",
                      "agy-binding", "6c-audit", "unknown-race", "binary-after", "normalize", "complete"}
 DATABASES = ("acceptance-6a-release/data", "acceptance-6b-release/data",
              "acceptance-6c-release/acceptance-000/data", "acceptance-6c-release/acceptance-200/data")
+# A normal child exit and physical settlement are not a candidate success receipt.
+PHASES = {
+    "6c-prepare": ("driver_6c", "acceptance-6c-release", "6c-prepare.stdout", "6c-prepare.stderr"),
+    "6a-execute": ("driver_6a", "acceptance-6a-release", "6a.stdout", "6a.stderr"),
+    "6c-execute": ("driver_6c", "acceptance-6c-release", "6c.stdout", "6c.stderr"),
+    "6b-prepare": ("prepare_6b", "acceptance-6b-release", "6b-prepare.stdout", "6b-prepare.stderr"),
+    "6b-execute": ("driver_6b", "acceptance-6b-release", "6b-audit.json", "6b.stderr"),
+}
+
+
+def closed_ports(ports):
+    for port in ports:
+        result = subprocess.run(["/usr/sbin/lsof", "-nP", "-iTCP:" + str(port), "-sTCP:LISTEN"],
+                                stdin=subprocess.DEVNULL, capture_output=True, timeout=15)
+        check(result.returncode == 1 and not result.stdout.strip() and not result.stderr.strip(), "原始服务端口仍占用或不能验证")
+
+
+@contextmanager
+def sqlite_copies(finalizer, root, databases, *, scratch):
+    """Hold original workspace locks; let SQLite touch only bounded private copies."""
+    info = scratch.stat(follow_symlinks=False)
+    check(scratch == scratch.resolve(strict=True) and stat.S_ISDIR(info.st_mode)
+          and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700, "SQLite 检查需要原始作用域外的私有暂存目录")
+
+    def metadata(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_nlink,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def capture(directory, destination=None):
+        result = {}
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            name = "workspace.db" + suffix
+            try:
+                descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+            except FileNotFoundError:
+                check(bool(suffix), "缺少原始 SQLite 主文件")
+                result[suffix] = None
+                continue
+            with os.fdopen(descriptor, "rb") as source, ExitStack() as output:
+                before = os.fstat(source.fileno())
+                check(stat.S_ISREG(before.st_mode) and before.st_size <= 512 << 20, "原始 SQLite 文件类型或大小不符")
+                target = None
+                # SHM is a derived WAL index. Let SQLite rebuild it only in the private copy.
+                if destination is not None and suffix != "-shm":
+                    target = output.enter_context(os.fdopen(os.open(destination / name,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb"))
+                digest, size = hashlib.sha256(), 0
+                while chunk := source.read(1 << 20):
+                    if size == 0 and suffix == "-journal":
+                        # A nonzero header may reference a super-journal outside the copy; fail closed.
+                        check(not any(chunk[:8]), "原始 SQLite 可能有 hot rollback journal，保留未知状态")
+                    size += len(chunk)
+                    check(size <= 512 << 20, "原始 SQLite 文件读取期间变大")
+                    digest.update(chunk)
+                    if target is not None:
+                        target.write(chunk)
+                check(size == before.st_size and metadata(os.fstat(source.fileno())) == metadata(before)
+                      and metadata(os.stat(name, dir_fd=directory, follow_symlinks=False)) == metadata(before),
+                      "复制或复核期间原始 SQLite 文件改变")
+                result[suffix] = (metadata(before), digest.hexdigest())
+        return result
+
+    with ExitStack() as stack:
+        scopes = []
+        for path in databases:
+            missing = str(path.relative_to(root)) + "：原始 DB/OS 锁或 SQLite 文件不可验证"
+            try:
+                database = finalizer.raw_file(root, path, 512 << 20)
+                lock = finalizer.raw_file(root, path.with_name("workspace.lock"))
+                check(database == path and lock == path.with_name("workspace.lock"), missing)
+                stream = stack.enter_context(os.fdopen(os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb"))
+                lock_info = os.fstat(stream.fileno())
+                check(stat.S_ISREG(lock_info.st_mode) and lock_info.st_size <= 32 << 20, missing)
+                fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                directory = os.open(database.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                stack.callback(os.close, directory)
+                scopes.append((database, lock, stream, metadata(lock_info), directory, os.fstat(directory)))
+            except (ValueError, OSError):
+                raise Unproven(missing) from None
+        temporary = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=scratch, prefix=".settlement-sqlite-")))
+        copies, snapshots = {}, {}
+        for index, (database, _, _, _, directory, _) in enumerate(scopes):
+            destination = temporary / str(index)
+            destination.mkdir(mode=0o700)
+            snapshots[database] = capture(directory, destination)
+            copies[database] = destination / "workspace.db"
+
+        connect = sqlite3.connect
+        def copied_connect(database, *args, **kwargs):
+            name = os.fsdecode(database)
+            if name.startswith("file:"):
+                uri = urlsplit(name)
+                check(not uri.netloc and uri.query in ("", "mode=ro"), "原始 SQLite 连接参数不符")
+                path = Path(unquote(uri.path)).resolve(strict=True)
+                check(path in copies, "SQLite 检查越过本次已锁定数据库")
+                target = copies[path].as_uri() + ("?" + uri.query if uri.query else "")
+            else:
+                path = Path(name).resolve(strict=True)
+                check(path in copies, "SQLite 检查越过本次已锁定数据库")
+                target = copies[path]
+            return connect(target, *args, **kwargs)
+
+        # Original auditors share sqlite3 in this synchronous CLI. Preserve their original paths and receipts.
+        sqlite3.connect = copied_connect
+        try:
+            yield {database: snapshot[""][1] for database, snapshot in snapshots.items()}
+        finally:
+            sqlite3.connect = connect
+            for database, lock, stream, lock_info, directory, directory_info in scopes:
+                current = database.parent.stat(follow_symlinks=False)
+                check((current.st_dev, current.st_ino, current.st_mode) ==
+                      (directory_info.st_dev, directory_info.st_ino, directory_info.st_mode)
+                      and metadata(os.fstat(stream.fileno())) == lock_info
+                      and metadata(lock.stat(follow_symlinks=False)) == lock_info
+                      and capture(directory) == snapshots[database], "物理复核期间原始 SQLite 字节或 DB/OS 锁身份改变")
+
+
+def settled_database(machine, finalizer, original, root, *, prepare_only):
+    """Inspect original native termination, never the candidate's acceptance assertions."""
+    database = finalizer.raw_file(root, root / "data/workspace.db", 512 << 20)
+    logs = sorted(root.glob("workspace*.stdout.log"))
+    check(bool(logs), "缺少原始服务启动及端口证据")
+    ports = []
+    for path in logs:
+        raw = finalizer.raw_file(root, path).read_text()
+        found = re.findall(r"本地 HTTP 进程已启动： http://127\.0\.0\.1:([0-9]+)\b", raw)
+        check(len(found) == 1 and 1024 <= int(found[0]) <= 65535
+              and (not prepare_only or "执行已禁用" in raw), "原始服务启动作用域或执行模式不符")
+        ports.append(int(found[0]))
+    closed_ports(ports)
+    scratch = root.parent.parent if root.parent.name == "acceptance-6c-release" else root.parent
+    with sqlite_copies(finalizer, root, [database], scratch=scratch) as hashes, \
+         closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA query_only=ON")
+        db.execute("BEGIN")
+        check([tuple(row) for row in db.execute("PRAGMA quick_check")] == [("ok",)]
+              and not db.execute("PRAGMA foreign_key_check").fetchall()
+              and db.execute("SELECT COUNT(*) FROM resource_claims").fetchone()[0] == 0, "原始数据库不健康或资源 claim 未结清")
+        turns = db.execute("SELECT * FROM turns").fetchmany(1001)
+        deliveries = db.execute("SELECT * FROM deliveries").fetchmany(1001)
+        check(len(turns) <= 1000 and len(deliveries) == len(turns)
+              and (not turns if prepare_only else bool(turns)), "原始数据库存在未接纳投递、prepare 越界执行或缺少原生终态证据")
+        proofs = []
+        for turn in turns:
+            state, session, raw_receipt = turn["state"], turn["native_session_id"], turn["receipt_json"]
+            check(state in ("succeeded", "failed", "aborted") and turn["accepted_at"]
+                  and isinstance(session, str) and bool(session) and isinstance(raw_receipt, str) and len(raw_receipt) <= 1 << 20,
+                  "原始 Turn 仍活跃、取消中、unknown 或缺少有界终态回执")
+            receipt = json.loads(raw_receipt, object_pairs_hook=unique)
+            check(isinstance(receipt, dict) and session not in (turn["id"], "fixture", "native-session"), "原生回执或会话身份不符")
+            machine.terminal(receipt, session, {state})
+            check(type(receipt.get("exit_code")) is int and receipt.get("logs_truncated") is False, "原生 child 退出或输出证据不完整")
+            delivery = [row for row in deliveries if row["id"] == turn["delivery_id"]]
+            check(len(delivery) == 1 and delivery[0]["state"] == "accepted" and delivery[0]["turn_id"] == turn["id"]
+                  and delivery[0]["group_id"] == turn["group_id"] and delivery[0]["recipient_id"] == turn["member_id"]
+                  and delivery[0]["conversation_id"] == turn["conversation_id"], "原始 delivery、群组、成员或 Turn 身份不符")
+            runtime = root / "data/runtime" / turn["id"]
+            for field, name in (("stdout_path", "stdout.jsonl"), ("stderr_path", "stderr.log")):
+                check(finalizer.raw_file(root, Path(receipt[field])) == (runtime / name).resolve(strict=True), "原生输出不属于本次 Turn")
+            transcript = original["native_transcript"](root / "data", dict(turn), receipt)
+            check(bool(transcript), "缺少完整原生 transcript")
+            path = runtime / "gemini/aw-app/brain" / session / ".system_generated/logs/transcript_full.jsonl"
+            path = finalizer.raw_file(root, path)
+            protocol = runtime / "stdout.jsonl"
+            proofs.append(machine.native_proof(root, turn["id"], session, protocol, path,
+                                               machine.core.file_hash(protocol), machine.core.file_hash(path)))
+        if root.name == "acceptance-6a-release":
+            report = json.loads(finalizer.raw_file(root, root / "6a-receipt.json").read_bytes(), object_pairs_hook=unique)
+            entries = [report[name] for name in ("positive_turn", "negative_turn") if name in report]
+            check(report.get("loopback_closed") is True and report["workspace_shutdown"].get("graceful") is True
+                  and report["workspace_shutdown"].get("exit_code") == 0
+                  and {entry["id"] for entry in entries} == {turn["id"] for turn in turns}, "6A 原始服务退出或 Turn 清单不符")
+            for entry in entries:
+                turn = next(turn for turn in turns if turn["id"] == entry["id"])
+                check(all(entry[key] == turn[key] for key in entry if key in turn.keys())
+                      and entry["native_session_id"] == turn["native_session_id"]
+                      and entry["execution_receipt"] == original["redact_receipt"](json.loads(turn["receipt_json"])), "6A 原始终态回执与实际数据不符")
+    return {"sha256": hashes[database], "ports": ports, "proofs": proofs}
 
 
 class Unproven(ValueError):
@@ -188,12 +370,138 @@ class Lease:
         check(name in STAGES, "原始准备阶段记录不符")
         return name
 
-    def external(self, phase):
+    def external(self, phase, *, inputs=None):
         check(phase in EXTERNAL and not self.settled, "外部阶段非法或本次已结清")
         path = self.claim / ("lease-external-" + phase + ".json")
         check(not path.exists(), "同一外部阶段禁止重放")
         self.stage(phase)
-        save(path, self.base | {"stage": phase})
+        detail = {} if inputs is None else {"inputs": inputs, "started_ns": time.monotonic_ns()}
+        save(path, self.base | {"stage": phase} | detail)
+
+    def native_inputs(self):
+        machine = self.machine
+        machine.verify_control_files(self.intent)
+        check(read(self.claim / "intent.json") == self.intent, "原始 intent 与认领不符")
+        paths, _, bundle = machine.source_manifest(self.args.harness_root)
+        check(read(self.claim / "source-manifest.json") == bundle, "原始驱动或支持源码改变")
+        source, binary = self.claim / "source", self.claim / "workspace"
+        check(machine.core.git(source, "rev-parse", "HEAD") == self.intent["sha"]
+              and machine.core.git(source, "rev-parse", "HEAD^{tree}") == self.intent["tree"]
+              and not machine.core.git(source, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all"), "原始源码快照改变")
+        before = read(self.claim / "binary-before.json")
+        actual = machine.evidence.binary_identity(self.args.go, binary, self.intent, machine.native_environment())
+        check(actual == before, "原始执行二进制或构建身份改变")
+        return paths, {"artifact_sha256": actual["sha256"], "source_manifest_sha256": machine.core.file_hash(self.claim / "source-manifest.json")}
+
+    def snapshot(self, phase):
+        _, relative, stdout, stderr = PHASES[phase]
+        root = self.claim / relative
+        check(root.is_dir() and not root.is_symlink(), "外部阶段缺少原始数据作用域")
+        files = {}
+        for path in sorted(root.rglob("*")):
+            check(not path.is_symlink() and (path.is_file() or path.is_dir()), "原始阶段包含未知文件类型或链接")
+            if path.is_file():
+                check(path.stat().st_size <= 512 << 20 and len(files) < 10000, "原始阶段文件过大或过多")
+                files[str(path.relative_to(self.claim))] = self.machine.core.file_hash(path)
+        for name in (stdout, stderr):
+            path = self.claim / name
+            check(path.is_file() and not path.is_symlink(), "缺少原始 child 输出")
+            files[name] = self.machine.core.file_hash(path)
+        databases = {}
+        for name in files:
+            if Path(name).name == "workspace.db":
+                check(str(Path(name).parent) in DATABASES, "数据库不属于本次固定阶段")
+                path, lock = self.claim / name, self.claim / Path(name).parent / "workspace.lock"
+                info, lock_info = path.stat(), lock.stat()
+                databases[str(Path(name).parent)] = [info.st_dev, info.st_ino, lock_info.st_dev, lock_info.st_ino]
+        check(bool(databases), "缺少已启动阶段的原始数据库，不能推断外部终止")
+        return {"files": files, "databases": databases}
+
+    def run(self, phase, command, stdout, stderr):
+        paths, inputs = self.native_inputs()
+        driver, _, out, err = PHASES[phase]
+        check(Path(command[0]).resolve(strict=True) == paths[driver].resolve(strict=True)
+              and stdout == self.claim / out and stderr == self.claim / err, "阶段驱动或输出未绑定本次认领")
+        self.external(phase, inputs=inputs)
+        try:
+            self.machine.driver(command, stdout, stderr)
+        except subprocess.CalledProcessError as error:
+            # A signal/timeout is not evidence that Python cleanup or native reaping ran.
+            if type(error.returncode) is int and error.returncode >= 0:
+                try:
+                    self.finish(phase, error.returncode, inputs)
+                except (ValueError, KeyError, OSError, TypeError, sqlite3.Error, subprocess.SubprocessError):
+                    pass  # Preserve the child failure even if its physical proof is incomplete.
+            raise
+        else:
+            self.finish(phase, 0, inputs)
+
+    def finish(self, phase, code, inputs):
+        start = self.claim / ("lease-external-" + phase + ".json")
+        end = self.base | {"stage": phase, "start_sha256": self.machine.core.file_hash(start), "inputs": None,
+                           "exit_code": code, "direct_child_reaped": True, "ended_ns": time.monotonic_ns(), "scope": None}
+        try:
+            end["inputs"] = self.native_inputs()[1]
+            check(end["inputs"] == inputs, "外部执行期间原始输入改变")
+            end["scope"] = self.snapshot(phase)
+        finally:
+            # Keep actual child completion even when physical settlement cannot be proved.
+            save(self.claim / ("lease-end-" + phase + ".json"), end)
+
+    def partial_proof(self):
+        phases = self.phases()
+        for phase in phases:
+            check((self.claim / ("lease-end-" + phase + ".json")).is_file(),
+                  "complete.json 或 lease-end-" + phase + ".json：缺少原始 child 结束确认，外部终态未知")
+        check({path.name.removeprefix("lease-end-").removesuffix(".json") for path in self.claim.glob("lease-end-*.json")} == phases,
+              "阶段结束记录与实际开始清单不符")
+        paths, inputs = self.native_inputs()
+        records, ends, latest = {}, {}, {}
+        for phase in PHASES:
+            if phase not in phases:
+                continue
+            start = self.event("lease-external-" + phase + ".json")
+            path = self.claim / ("lease-end-" + phase + ".json")
+            end = self.event(path.name)
+            check(start.get("stage") == end.get("stage") == phase and start.get("inputs") == end.get("inputs") == inputs
+                  and end.get("start_sha256") == self.machine.core.file_hash(self.claim / ("lease-external-" + phase + ".json"))
+                  and type(start.get("started_ns")) is int and type(end.get("ended_ns")) is int
+                  and 0 < start["started_ns"] <= end["ended_ns"]
+                  and type(end.get("exit_code")) is int and end["exit_code"] >= 0 and end.get("direct_child_reaped") is True,
+                  "阶段开始、结束、输入或 child 终态未绑定原始认领")
+            records[phase], ends[phase] = (start, end), self.machine.core.file_hash(path)
+            latest[PHASES[phase][1]] = phase
+        check("6c-prepare" in phases, "缺少首个外部阶段的原始记录")
+        for phase in phases - {"6c-prepare"}:
+            prerequisites = {"6c-prepare"}
+            if phase.startswith("6b-"):
+                prerequisites |= {"6a-execute", "6c-execute"}
+            if phase == "6b-execute":
+                prerequisites.add("6b-prepare")
+            check(prerequisites <= phases and all(records[item][1]["exit_code"] == 0
+                  and records[item][1]["ended_ns"] <= records[phase][0]["started_ns"] for item in prerequisites), "外部阶段前置完成或时序不符")
+        check(all(not (self.claim / relative).exists() or relative in latest for _, relative, _, _ in PHASES.values()),
+              "未开始阶段存在未知原始工作，禁止忽略其作用域")
+        finalizer = self.machine.core.load_script("release-finalize")
+        databases = {}
+        with finalizer.originals(paths, "6a") as original:
+            for relative, phase in latest.items():
+                scope = records[phase][1]["scope"]
+                check(self.snapshot(phase) == scope, "原始阶段结束后数据、协议、transcript、输出或 DB/OS 锁身份改变")
+                expected = {name for name in DATABASES if name.startswith(relative + "/")}
+                actual = set(scope["databases"])
+                check(actual <= expected and (phase.endswith("prepare") and records[phase][1]["exit_code"] != 0 or actual == expected),
+                      "外部阶段数据库作用域不完整")
+                for name in sorted(actual):
+                    databases[name] = settled_database(self.machine, finalizer, original, (self.claim / name).parent,
+                                                       prepare_only=phase.endswith("prepare"))
+                check(self.snapshot(phase) == scope, "物理复核期间原始阶段字节改变")
+        check(self.native_inputs()[1] == inputs, "物理复核期间原始输入改变")
+        return {"external_phases": sorted(phases), "ends": ends, "databases": databases}
+
+    def settle_partial(self):
+        with mutex(self.machine, wait=True):
+            self.settle_locked("native-settled", self.partial_proof())
 
     def phases(self):
         result = set()
@@ -239,36 +547,35 @@ class Lease:
         digest = self.machine.core.file_hash(self.claim / "receipt.json")
         check(read(self.claim / "complete.json") == {"receipt_sha256": digest}, "complete.json：原始回执摘要不符")
         finalizer = self.machine.core.load_script("release-finalize")
-        try:
-            actual = finalizer.verify_local(self.args, None, self.intent, self.claim,
-                {"artifact_sha256": receipt["artifact_sha256"]}, receipt["target_artifact"])
-        except (ValueError, KeyError, OSError, subprocess.SubprocessError, sqlite3.Error):
-            raise Unproven("finalizer.verify_local：缺少通过原始源码、二进制、6A/B/C 协议与审计、unknown guard 的独立复核") from None
-        check(isinstance(actual, dict) and actual == receipt, "原始 finalizer 没有返回匹配的完整 native 回执")
+        paths = [self.claim / relative / "workspace.db" for relative in DATABASES]
         databases = {}
-        for relative in DATABASES:
-            missing = relative + "/workspace.db：必须无活跃或 unknown Turn、无资源 claim，且原生终态已结清"
+        with sqlite_copies(finalizer, self.claim, paths, scratch=self.claim) as hashes:
             try:
-                database = finalizer.raw_file(self.claim, self.claim / relative / "workspace.db", 512 << 20)
-                lock = finalizer.raw_file(self.claim, self.claim / relative / "workspace.lock")
-                with lock.open("rb") as stream, closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
-                    fcntl.flock(stream, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                    db.execute("PRAGMA query_only=ON")
-                    db.execute("BEGIN")
-                    check(db.execute("PRAGMA quick_check").fetchall() == [("ok",)]
-                          and not db.execute("PRAGMA foreign_key_check").fetchall()
-                          and db.execute("SELECT COUNT(*) FROM resource_claims").fetchone()[0] == 0, missing)
-                    turns = db.execute("SELECT state,native_session_id,receipt_json FROM turns").fetchmany(1001)
-                    check(0 < len(turns) <= 1000, missing)
-                    for state, session, raw in turns:
-                        check(state in ("succeeded", "failed", "aborted") and isinstance(session, str) and bool(session)
-                              and isinstance(raw, str) and len(raw) <= 1 << 20, missing)
-                        terminal = json.loads(raw, object_pairs_hook=unique)
-                        check(isinstance(terminal, dict), missing)
-                        self.machine.terminal(terminal, session, {state})
-                    databases[relative] = self.machine.core.file_hash(database)
-            except (ValueError, KeyError, OSError, sqlite3.Error):
-                raise Unproven(missing) from None
+                actual = finalizer.verify_local(self.args, None, self.intent, self.claim,
+                    {"artifact_sha256": receipt["artifact_sha256"]}, receipt["target_artifact"])
+            except (ValueError, KeyError, OSError, subprocess.SubprocessError, sqlite3.Error):
+                raise Unproven("finalizer.verify_local：缺少通过原始源码、二进制、6A/B/C 协议与审计、unknown guard 的独立复核") from None
+            check(isinstance(actual, dict) and actual == receipt, "原始 finalizer 没有返回匹配的完整 native 回执")
+            for relative, database in zip(DATABASES, paths):
+                missing = relative + "/workspace.db：必须无活跃或 unknown Turn、无资源 claim，且原生终态已结清"
+                try:
+                    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
+                        db.execute("PRAGMA query_only=ON")
+                        db.execute("BEGIN")
+                        check(db.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+                              and not db.execute("PRAGMA foreign_key_check").fetchall()
+                              and db.execute("SELECT COUNT(*) FROM resource_claims").fetchone()[0] == 0, missing)
+                        turns = db.execute("SELECT state,native_session_id,receipt_json FROM turns").fetchmany(1001)
+                        check(0 < len(turns) <= 1000, missing)
+                        for state, session, raw in turns:
+                            check(state in ("succeeded", "failed", "aborted") and isinstance(session, str) and bool(session)
+                                  and isinstance(raw, str) and len(raw) <= 1 << 20, missing)
+                            terminal = json.loads(raw, object_pairs_hook=unique)
+                            check(isinstance(terminal, dict), missing)
+                            self.machine.terminal(terminal, session, {state})
+                        databases[relative] = hashes[database]
+                except (ValueError, KeyError, OSError, sqlite3.Error):
+                    raise Unproven(missing) from None
         check(self.machine.core.file_hash(self.claim / "receipt.json") == digest, "复核期间原始完成回执改变")
         return {"receipt_sha256": digest, "databases": databases}
 
@@ -302,6 +609,11 @@ def execution(machine, args, intent):
             if not external:
                 with mutex(machine, wait=True):
                     lease.settle_locked("pre-native-failed", {"external_phases": []})
+            else:
+                try:
+                    lease.settle_partial()
+                except (ValueError, KeyError, OSError, TypeError, sqlite3.Error, subprocess.SubprocessError):
+                    pass  # Keep both the original failure and the unknown machine lock.
             raise
         else:
             if not lease.settled and not lease.phases():
@@ -328,7 +640,10 @@ def reconcile(machine, repo, run_id, attempt, *, go):
                 if not lease.archived():
                     phases = lease.phases()
                     if phases:
-                        lease.settle_locked("native-complete", lease.complete_proof())
+                        if (claim / "complete.json").exists():
+                            lease.settle_locked("native-complete", lease.complete_proof())
+                        else:
+                            lease.settle_locked("native-settled", lease.partial_proof())
                     else:
                         lease.settle_locked("pre-native-dead", {"external_phases": []})
         return owner | {"status": "settled"}
