@@ -429,6 +429,7 @@ class Runner:
         self.objects = self.root / "objects.git"
         self.history = self.root / "historical"
         self.policy = self.root / "policy"
+        self.expected_source = None
         sandbox = self.root / "sandbox"
         for directory in (self.output, sandbox / "home", sandbox / "tmp"):
             directory.mkdir(parents=True, exist_ok=True)
@@ -438,7 +439,7 @@ class Runner:
                     "PYTHONDONTWRITEBYTECODE": "1", "GOTOOLCHAIN": "local", "GOENV": "off", "GOFLAGS": "-mod=readonly",
                     "GOCACHE": str(sandbox / "go-build"), "GOMODCACHE": str(sandbox / "go-mod"), "GOPATH": str(sandbox / "go"),
                     "GOPROXY": "https://proxy.golang.org", "GOSUMDB": "sum.golang.org",
-                    "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", "GIT_NO_REPLACE_OBJECTS": "1",
+                    "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0",
                     "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_COUNT": "3",
                     "GIT_CONFIG_KEY_0": "core.hooksPath", "GIT_CONFIG_VALUE_0": "/dev/null",
                     "GIT_CONFIG_KEY_1": "credential.helper", "GIT_CONFIG_VALUE_1": "",
@@ -519,6 +520,7 @@ class Runner:
         return receipts
 
     def checkout_source(self, frozen):
+        self.expected_source = None
         sha = frozen["sha"]
         actual = self.identity(self.objects, sha)
         same_source(actual, frozen, sha)
@@ -531,6 +533,7 @@ class Runner:
         head = self.git(self.history, "rev-parse", "HEAD").decode().strip()
         same_source(actual, frozen, head)
         check(not self.git(self.history, "status", "--porcelain=v1", "--untracked-files=all"), "历史工作树不干净")
+        self.expected_source = {key: frozen[key] for key in ("sha", "tree")}
         return {**actual, "observed_head": head}
 
     def prepare_policy(self, sha):
@@ -561,10 +564,11 @@ class Runner:
         result = {"status": "unknown", "observed_source": frozen["observed_source"]}
         try:
             self.trusted_policy()
-            command = self.record([sys.executable, "-B", str(self.policy / ".github/scripts/merge-gate.py"), "inspect",
-                                   "--root", str(self.history), "--base", frozen["base"], "--sha", frozen["sha"]],
-                                  self.policy, Path("sources") / frozen["sha"] / "selector", 180)
+            command = self.historical_record([sys.executable, "-B", str(self.policy / ".github/scripts/merge-gate.py"), "inspect",
+                                              "--root", str(self.history), "--base", frozen["base"], "--sha", frozen["sha"]],
+                                             Path("sources") / frozen["sha"] / "selector", 180)
             result["command"] = command
+            check(command["source_unchanged"], "inspect 后历史 SHA/tree 或完整文件状态不符")
             check(not command["timeout"], "inspect 超时，基础设施/覆盖失败")
             result.update(selector((self.output / command["stdout"]).read_text(encoding="utf-8"), command["rc"]))
         except Exception as error:
@@ -623,17 +627,14 @@ class Runner:
         request = directory / "task.json"
         receipt = directory / "receipt.json"
         write_json(request, task)
-        before = self.source_status()
-        command = self.record([sys.executable, "-B", "-c", WORKER, str(self.policy / ".github/scripts/merge-gate.py"),
-                               str(self.history), str(request), str(receipt)], self.policy, directory.relative_to(self.output) / "worker", 900)
+        command = self.historical_record([sys.executable, "-B", "-c", WORKER, str(self.policy / ".github/scripts/merge-gate.py"),
+                                          str(self.history), str(request), str(receipt)], directory.relative_to(self.output) / "worker", 900)
         result = {"command": command, "directory": directory.relative_to(self.output).as_posix(),
                   "receipt": decode(receipt.read_text(encoding="utf-8")) if receipt.exists() else {"commands": [], "returned": False}}
-        result["source_before"] = before
-        try:
-            after = self.source_status()
-            result.update(source_after=after, tracked_unchanged=before == after and not after["tracked_status"])
-        except Exception as error:
-            result.update(tracked_unchanged=False, cleanup_error=f"{type(error).__name__}: {error}")
+        result.update(source_before=command["source_before"], source_after=command.get("source_after"),
+                      expected_source=command["expected_source"], tracked_unchanged=command["source_unchanged"])
+        if "cleanup_error" in command:
+            result["cleanup_error"] = command["cleanup_error"]
         result["harness_note"] = "仅由固定 policy 生成临时测试及 Go overlay；原样调用并等待其清理，审计不替换 overlay"
         actual = result["receipt"].get("task", task)
         check(actual in task["tasks"] if task["kind"] == "store-partition" else actual == task,
@@ -641,9 +642,41 @@ class Runner:
         return result
 
     def source_status(self):
-        return {"sha": self.git(self.history, "rev-parse", "HEAD").decode().strip(),
-                "tree": self.git(self.history, "rev-parse", "HEAD^{tree}").decode().strip(),
-                "tracked_status": self.git(self.history, "status", "--porcelain=v1", "--untracked-files=no").decode()}
+        sha = self.git(self.history, "rev-parse", "HEAD").decode().strip()
+        tree = self.git(self.history, "rev-parse", "HEAD^{tree}").decode().strip()
+        status = self.git(self.history, "status", "--porcelain=v1", "--untracked-files=all").decode()
+        return {"sha": sha, "tree": tree, "full_status": status,
+                "tracked_status": "".join(line for line in status.splitlines(keepends=True) if not line.startswith("?? "))}
+
+    def historical_record(self, argv, prefix, timeout):
+        # Check outside run_go's controlled generated-source/overlay lifetime, never inside its harness.
+        prefix = self.output / prefix
+        proof = {"expected_source": self.expected_source, "cwd": str(self.history), "source_unchanged": False,
+                 "directories": [str(path.resolve()) for path in (self.history, self.policy, self.root / "controller")]}
+        try:
+            roots = list(map(Path, proof["directories"]))
+            check(all(left != right and left not in right.parents and right not in left.parents
+                      for index, left in enumerate(roots) for right in roots[index + 1:]), "历史源码、策略和 controller 目录必须独立且互不嵌套")
+            check(self.expected_source and all(valid_sha(self.expected_source.get(key)) for key in ("sha", "tree")),
+                  "未绑定冻结清单的原始 SHA/tree；拒绝执行历史工作负载")
+            before = proof["source_before"] = self.source_status()
+            check({key: before[key] for key in ("sha", "tree")} == self.expected_source and not before["full_status"],
+                  "执行前历史 SHA/tree 与冻结清单不符或完整工作树不干净")
+            write_json(prefix.with_name(prefix.name + ".source.json"), proof)
+            command = self.record(argv, self.history, prefix.relative_to(self.output), timeout)
+            try:
+                after = proof["source_after"] = self.source_status()
+                proof["source_unchanged"] = before == after and not after["full_status"]
+            except Exception as error:
+                proof["cleanup_error"] = f"{type(error).__name__}: {error}"
+            command.update(proof)
+            write_json(prefix.with_name(prefix.name + ".command.json"), command)
+            return command
+        except Exception as error:
+            proof["error"] = f"{type(error).__name__}: {error}"
+            raise
+        finally:
+            write_json(prefix.with_name(prefix.name + ".source.json"), proof)
 
     def verify(self, verifier, original):
         prefix = original.parent.relative_to(self.output) / "verifier"
@@ -902,8 +935,9 @@ def effect_signature(runner, summary, spec):
 
 def isolated_effect(runner, spec, prefix):
     # No candidate unit is claimed here. Run exactly one unchanged original after a structural refusal.
-    command = runner.record(["go", "test", "-count=1", "-race", "-json", "-run", "^" + EFFECT + "$", "./internal/store"],
-                            runner.history, prefix / "isolated-original-probe" / "go-test", 900)
+    command = runner.historical_record(["go", "test", "-count=1", "-race", "-json", "-run", "^" + EFFECT + "$", "./internal/store"],
+                                       prefix / "isolated-original-probe" / "go-test", 900)
+    check(command["source_unchanged"], "原始 Go 探针后 SHA/tree 或完整文件状态不符")
     text = (runner.output / command["stdout"]).read_text(encoding="utf-8")
     summary = observations(text, "agentworkspace/internal/store", [EFFECT])
     signature = effect_signature(runner, summary, spec)
@@ -1039,7 +1073,8 @@ def isolated_class(runner, spec, sources, prefix):
     else:
         names = [row["test"] for row in sources]
         argv = ["go", "test", "-count=1", "-race", "-json", "-run", "^(" + "|".join(map(re.escape, names)) + ")$", "./internal/store"]
-    command = runner.record(argv, runner.history, prefix / "isolated-original-probe" / "go-test", 900)
+    command = runner.historical_record(argv, prefix / "isolated-original-probe" / "go-test", 900)
+    check(command["source_unchanged"], "原始探针后 SHA/tree 或完整文件状态不符")
     text = "\n".join((runner.output / command[key]).read_text(encoding="utf-8", errors="replace") for key in ("stdout", "stderr"))
     result = {"origin": "isolated-original-probe", "command": command, "status": "unknown", "candidate_unit_caught": False}
     if spec["kind"] == "ci":
@@ -1143,9 +1178,10 @@ def diagnose(runner, frozen, policy, inspection=None):
                                        status="selection-only" if known_selection else "unknown", unit_exercised=False)
             source = test_sources(runner.history, "internal/store", [CHILD])
             result["source"] = source
-            command = runner.record(["go", "test", "-count=1", "-race", "-json", "-run", "^" + CHILD + "$", "./internal/store"],
-                                    runner.history, prefix / "go-test", 900)
+            command = runner.historical_record(["go", "test", "-count=1", "-race", "-json", "-run", "^" + CHILD + "$", "./internal/store"],
+                                               prefix / "go-test", 900)
             result["command"] = command
+            check(command["source_unchanged"], "原始 skip 探针后 SHA/tree 或完整文件状态不符")
             text = (runner.output / command["stdout"]).read_text(encoding="utf-8")
             summary = observations(text, "agentworkspace/internal/store", [CHILD])
             result["go_events"] = summary

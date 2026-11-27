@@ -146,6 +146,125 @@ class AuditTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.a.same_source(actual, case, "f" * 40)
 
+    def test_worker_refuses_lost_or_dirty_original_before_any_execution(self):
+        for sha, tree, status in (("d" * 40, CASE["tree"], ""), (CASE["sha"], "d" * 40, ""),
+                                  (CASE["sha"], CASE["tree"], " M .github/workflows/ci.yml\n"),
+                                  (CASE["sha"], CASE["tree"], "?? untracked_test.go\n")):
+            with self.subTest(sha=sha, tree=tree, status=status), tempfile.TemporaryDirectory() as directory:
+                runner = self.runner(Path(directory))
+                runner.expected_source = {key: CASE[key] for key in ("sha", "tree")}
+                def git(root, *args):
+                    if args[:1] == ("status",):
+                        return status.encode() if "--untracked-files=all" in args or not status.startswith("??") else b""
+                    return ((sha if args == ("rev-parse", "HEAD") else tree) + "\n").encode()
+                with patch.object(runner, "trusted_policy"), patch.object(runner, "git", side_effect=git), \
+                        patch.object(runner, "record", return_value={"rc": 0}) as execute:
+                    with self.assertRaises(ValueError):
+                        runner.worker({"kind": "go"}, Path("guarded"))
+                execute.assert_not_called()
+                proof = json.loads((runner.output / "guarded/worker/worker.source.json").read_text())
+                self.assertEqual(proof["expected_source"], runner.expected_source)
+                self.assertEqual(proof["source_before"]["full_status"], status)
+
+    def test_historical_workloads_require_separate_non_nested_checkouts(self):
+        for location in ("policy", "policy/nested", "controller", "."):
+            with self.subTest(location=location), tempfile.TemporaryDirectory() as directory:
+                runner = self.runner(Path(directory))
+                runner.history = runner.root / location
+                runner.expected_source = {key: CASE[key] for key in ("sha", "tree")}
+                with patch.object(runner, "trusted_policy"), patch.object(runner, "git", return_value=b""), \
+                        patch.object(runner, "record", return_value={"rc": 0}) as execute:
+                    with self.assertRaisesRegex(ValueError, "目录"):
+                        runner.worker({"kind": "go"}, Path("guarded"))
+                execute.assert_not_called()
+
+    def test_clean_worker_and_python_probe_use_original_cwd_and_keep_full_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.runner(Path(directory))
+            self.assertIsNone(runner.expected_source)
+            for root, text in ((runner.history, "historical product"), (runner.root / "controller", "temporary controller")):
+                workflow = root / ".github/workflows/ci.yml"
+                workflow.parent.mkdir(parents=True)
+                workflow.write_text(text)
+            scripts = runner.policy / ".github/scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "merge-gate.py").write_text(
+                'from pathlib import Path\n'
+                'def command(*args, **kwargs):\n    raise AssertionError("No Go execution")\n'
+                'def run_go(root, task):\n'
+                '    assert Path.cwd() == root\n'
+                '    assert (Path.cwd() / ".github/workflows/ci.yml").read_text() == "historical product"\n'
+                '    return {"cwd": str(Path.cwd())}\n')
+            def git(root, *args):
+                if args[:1] == ("status",):
+                    return b""
+                return (CASE["sha" if args == ("rev-parse", "HEAD") else "tree"] + "\n").encode()
+            record = runner.record
+            def verify_preflight_persisted(argv, cwd, prefix, timeout):
+                proof_path = (runner.output / prefix).with_name(Path(prefix).name + ".source.json")
+                self.assertTrue(proof_path.exists(), "Before identity must be durable before starting the workload")
+                proof = json.loads(proof_path.read_text())
+                self.assertEqual(proof["source_before"]["sha"], CASE["sha"])
+                self.assertEqual(proof["source_before"]["full_status"], "")
+                self.assertNotIn("source_after", proof)
+                return record(argv, cwd, prefix, timeout)
+            with patch.object(runner, "trusted_policy"), patch.object(runner, "git", side_effect=git), \
+                    patch.object(runner, "identity", return_value={key: CASE[key] for key in ("sha", "tree", "parents")}), \
+                    patch.object(runner, "record", side_effect=verify_preflight_persisted):
+                runner.checkout_source(CASE)
+                self.assertEqual(runner.expected_source, {key: CASE[key] for key in ("sha", "tree")})
+                result = runner.worker({"kind": "go"}, Path("clean"))
+                self.assertEqual(result["command"]["rc"], 0, result)
+                self.assertTrue(result["tracked_unchanged"])
+                self.assertEqual(result["source_before"]["full_status"], "")
+                self.assertEqual(result["source_after"], result["source_before"])
+                self.assertEqual(result["receipt"]["detail"]["cwd"], str(runner.history))
+                probe = runner.historical_record([sys.executable, "-B", "-c",
+                    'from pathlib import Path; print(Path(".github/workflows/ci.yml").read_text())'], Path("probe"), 5)
+                self.assertEqual((runner.output / probe["stdout"]).read_text(), "historical product\n")
+                self.assertEqual(probe["source_before"], result["source_before"])
+                self.assertEqual(probe["source_after"], result["source_after"])
+                proof = json.loads((runner.output / "probe.source.json").read_text())
+                self.assertEqual(proof["expected_source"], runner.expected_source)
+                self.assertEqual(proof["cwd"], str(runner.history))
+                self.assertTrue(proof["source_unchanged"])
+                before = result["source_before"]
+                after = {**before, "full_status": "?? leftover_test.go\n"}
+                with patch.object(runner, "source_status", side_effect=[before, after]):
+                    dirty_after = runner.worker({"kind": "go"}, Path("post-dirty"))
+                self.assertFalse(dirty_after["tracked_unchanged"])
+                self.assertEqual(dirty_after["source_before"], before)
+                self.assertEqual(dirty_after["source_after"], after)
+                with patch.object(runner, "identity", return_value={"sha": CASE["sha"], "tree": "d" * 40, "parents": CASE["parents"]}):
+                    with self.assertRaises(ValueError):
+                        runner.checkout_source(CASE)
+                self.assertIsNone(runner.expected_source)
+
+    def test_isolated_go_python_skip_and_inspect_guard_lost_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.runner(Path(directory))
+            self.assertTrue(hasattr(runner, "historical_record"), "Shared original-workload guard is missing")
+            runner.expected_source = {key: CASE[key] for key in ("sha", "tree")}
+            def git(root, *args):
+                return b"" if args[:1] == ("status",) else ("d" * 40 + "\n").encode()
+            effect = self.a.DIAGNOSTICS["7d70dc49ff1f3c3ae3876b2a519059c60d88ec3d"]
+            ci = self.a.DIAGNOSTICS["85b488fa772dc1197241e730131aee5f2c8d365a"]
+            probes = [lambda: self.a.isolated_effect(runner, effect, Path("effect")),
+                      lambda: self.a.isolated_class(runner, ci, [], Path("python")),
+                      lambda: self.a.isolated_class(runner, {"kind": "migration"}, [{"test": "TestOriginal"}], Path("migration"))]
+            with patch.object(runner, "trusted_policy"), patch.object(runner, "git", side_effect=git), \
+                    patch.object(runner, "record", return_value={"rc": 0}) as execute, \
+                    patch.object(self.a, "python_signature", return_value={"source_matches": True}), \
+                    patch.object(self.a, "test_sources", return_value=[{"text": "original source"}]):
+                for probe in probes:
+                    with self.assertRaises(ValueError):
+                        probe()
+                skipped = self.a.diagnose(runner, {"sha": "eb02c8c2ad80571d0d46336b85a8eb851ca8ad4b"}, {})
+                self.assertEqual(skipped["status"], "unknown")
+                inspected = runner.inspect({**CASE, "observed_source": CASE})
+                self.assertEqual(inspected["status"], "unknown")
+            execute.assert_not_called()
+
     def test_policy_refusal_is_data_but_missing_json_is_failure(self):
         refused = {"unresolved": ["package:TestMissing"], "tasks": []}
         self.assertEqual(self.a.selector(json.dumps(refused), 1)["status"], "policy-refusal")
@@ -209,18 +328,18 @@ class AuditTests(unittest.TestCase):
             raw = runner.output / "go.json"
             raw.write_text(self.events())
             (runner.output / "stderr").write_text("")
-            command = {"rc": 0, "timeout": False, "stdout": "go.json", "stderr": "stderr"}
+            command = {"rc": 0, "timeout": False, "stdout": "go.json", "stderr": "stderr", "source_unchanged": True}
             frozen = {"sha": "eb02c8c2ad80571d0d46336b85a8eb851ca8ad4b"}
             for error, expected in (("unrelated malformed evidence", "unknown"),
                                     ("事件非法或包含失败/跳过", "red-reproduced")):
                 verdict = {"result": {"accepted": False, "exception": "ValueError", "error": error}}
-                with self.subTest(error=error), patch.object(runner, "record", return_value=command), \
+                with self.subTest(error=error), patch.object(runner, "historical_record", return_value=command), \
                         patch.object(runner, "verify", return_value=verdict):
                     result = self.a.diagnose(runner, frozen, {})
                     self.assertEqual(result["status"], expected)
                     self.assertIsNone(result["candidate"]["enforcement_point"])
             raw.write_text(self.events().replace('"Action": "pass"', '"Action": "fail"'))
-            with patch.object(runner, "record", return_value=command), patch.object(runner, "verify", return_value=verdict):
+            with patch.object(runner, "historical_record", return_value=command), patch.object(runner, "verify", return_value=verdict):
                 self.assertEqual(self.a.diagnose(runner, frozen, {})["status"], "unknown")
 
     def test_subprocesses_have_no_tokens_provider_config_or_child_override(self):
@@ -345,7 +464,7 @@ class AuditTests(unittest.TestCase):
             raw.write_text(self.trace(["TestTaskWorkInputEffectKeys"], ["TestTaskWorkInputEffectKeys"], PACKAGE,
                                      "task_work_input_effect_test.go:75: expected conflict without a receipt, got unexpected\n"))
             (runner.output / "stderr").write_text("")
-            command = {"rc": 1, "timeout": False, "stdout": "probe.json", "stderr": "stderr"}
+            command = {"rc": 1, "timeout": False, "stdout": "probe.json", "stderr": "stderr", "source_unchanged": True}
             worker = {"directory": ".", "command": command, "tracked_unchanged": True,
                       "receipt": {"api_invoked": True, "commands": [], "returned": False,
                                   "exception": "ValueError", "error": "必需名称不在实际编译测试清单中"}}
@@ -357,7 +476,7 @@ class AuditTests(unittest.TestCase):
                 order.append("probe")
                 return command
             with patch.object(runner, "project", return_value=[task]), patch.object(runner, "worker", side_effect=refused) as workers, \
-                    patch.object(runner, "record", side_effect=probe) as calls:
+                    patch.object(runner, "historical_record", side_effect=probe) as calls:
                 result = self.a.diagnose(runner, case, {}, inspection)
             self.assertEqual(order, ["worker", "probe"])
             self.assertEqual(workers.call_args.args[0], task)
@@ -370,19 +489,19 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(calls.call_count, 1)
             worker["receipt"].update(exception="CalledProcessError", error="old API incompatible with trusted harness")
             with patch.object(runner, "project", return_value=[task]), patch.object(runner, "worker", return_value=worker), \
-                    patch.object(runner, "record", return_value=command) as setup_probe:
+                    patch.object(runner, "historical_record", return_value=command) as setup_probe:
                 setup = self.a.diagnose(runner, case, {}, inspection)
             self.assertEqual(setup_probe.call_count, 1, setup)
             self.assertEqual(setup["candidate"]["status"], "structural-refusal")
             source.write_text(source.read_text().replace("expected conflict without a receipt", "unrelated assertion"))
             with patch.object(runner, "project", return_value=[task]), patch.object(runner, "worker", return_value=worker), \
-                    patch.object(runner, "record", return_value=command):
+                    patch.object(runner, "historical_record", return_value=command):
                 mismatch = self.a.diagnose(runner, case, {}, inspection)
             self.assertEqual(mismatch["isolated_original"]["status"], "unknown")
             source.write_text(source.read_text().replace("unrelated assertion", "expected conflict without a receipt"))
             inspection["selection"]["all_race"] = False
             task.update(names=None, worker=0)
-            with patch.object(runner, "project", return_value=[task]), patch.object(runner, "record", return_value=command) as calls:
+            with patch.object(runner, "project", return_value=[task]), patch.object(runner, "historical_record", return_value=command) as calls:
                 broad = self.a.diagnose(runner, case, {}, inspection)
             self.assertNotIn("isolated_original", broad, "Missing real selection must not become an execution refusal")
             self.assertEqual(broad["status"], "unknown")
@@ -575,6 +694,7 @@ class AuditTests(unittest.TestCase):
                 source.write_text(f'func {self.a.EFFECT}(t *testing.T) {{\n' + "\n" * 73 +
                                   'conflict(f.s.HandBackWorkInputWithKey(ctx))\nt.Fatal("expected conflict without a receipt")\n}\n')
                 self.partition_policy(runner, compiled, self.trace(selected, failed, PACKAGE, output + "\n"), rc)
+                runner.expected_source = {"sha": sha, "tree": "b" * 40}
                 def git(root, *args):
                     return {("rev-parse", "HEAD"): (sha + "\n").encode(),
                             ("rev-parse", "HEAD^{tree}"): ("b" * 40 + "\n").encode()}.get(args, b"")
@@ -633,6 +753,7 @@ class AuditTests(unittest.TestCase):
             text = self.trace(names, [self.a.EFFECT], PACKAGE,
                               "task_work_input_effect_test.go:75: expected conflict without a receipt\n")
             self.producing_policy(runner, task, text)
+            runner.expected_source = {"sha": sha, "tree": "b" * 40}
             def git(root, *args):
                 return {("rev-parse", "HEAD"): (sha + "\n").encode(),
                         ("rev-parse", "HEAD^{tree}"): ("b" * 40 + "\n").encode()}.get(args, b"")
@@ -726,6 +847,7 @@ class AuditTests(unittest.TestCase):
                           "unresolved": [PACKAGE + ":TestLater"], "tasks": []}}
             policy = self.partition_policy(runner, names, self.trace(names[:1], names[:1], PACKAGE,
                 "queue_schema_test.go:126: upgrade changed message receipt: stable\n"))
+            runner.expected_source = {"sha": sha, "tree": "b" * 40}
             def git(root, *args):
                 return {("rev-parse", "HEAD"): (sha + "\n").encode(),
                         ("rev-parse", "HEAD^{tree}"): ("b" * 40 + "\n").encode()}.get(args, b"")
@@ -845,6 +967,7 @@ class AuditTests(unittest.TestCase):
                 '    return paths\n')
             task = {"unit": "ci", "kind": "ci"}
             inspection = {"status": "selected", "selection": {"ci": True, "unresolved": [], "tasks": [task]}}
+            runner.expected_source = {"sha": sha, "tree": "b" * 40}
             def git(root, *args):
                 return {("rev-parse", "HEAD"): (sha + "\n").encode(),
                         ("rev-parse", "HEAD^{tree}"): ("b" * 40 + "\n").encode()}.get(args, b"")
