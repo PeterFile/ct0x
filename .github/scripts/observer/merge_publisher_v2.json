@@ -1,0 +1,428 @@
+{
+  "producer": {
+    "commit": "85336997a01f28f82019776738903c38855911ae",
+    "sha256": {
+      ".github/scripts/merge-gate-publish.py": "90cec519e806454d32ca9656f9771d3929900b6b894c33e9950a651cb2ba28f2",
+      ".github/workflows/merge-conflict.yml": "bb0a3d17d86abc1552d727fad3d36bdee06c5433792d69141e1825af6b092cf4",
+      ".github/workflows/merge-gate.yml": "86bea4bccca19225022b3aff44148b0c22eee95027dc2fc9eba3085c4612e538"
+    },
+    "capture": "Native reconcile/publish_check/log_check with in-memory API and fixed snapshot/run/proof, as in native_publisher_check.",
+    "verify": "OBSERVER_MERGE_PUBLISHER_ROOT=/path/to/pinned/producer python3 -B .github/scripts/observer/test_merge_reports.py",
+    "workflows": "Unmodified job-name, fail-fast and concurrency lines from the pinned workflows.",
+    "exchange_keys": "SHA-256 of json.dumps(request, sort_keys=True).encode(), where request is constructed in publisher_check."
+  },
+  "workflows": {
+    "merge-conflict.yml": "  resolve:\n    name: Resolve Merge PR identities\n  report:\n    name: Trusted Merge report / PR ${{ matrix.pr }}\n      fail-fast: false\n      group: merge-publisher-${{ github.repository }}-${{ matrix.source_sha }}\n",
+    "merge-gate.yml": "  plan:\n    name: Merge plan\n  tests:\n    name: Merge tests / ${{ matrix.unit }}\n  evidence:\n    name: Merge evidence\n"
+  },
+  "exchanges": {
+    "e3032bff0bf111f0345d89bdb1eca431043763498a97678f6644dba19b9d0832": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:000000000000000000000000000000000000006b",
+        "status": "completed",
+        "output": {
+          "title": "合并已阻塞",
+          "summary": "{\"head\": \"000000000000000000000000000000000000006b\", \"pr\": 7, \"publisher\": {\"run_attempt\": \"2\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason\": \"\\u786e\\u8ba4\\u5b58\\u5728\\u5408\\u5e76\\u51b2\\u7a81\\uff1b\\u539f\\u751f pull_request \\u4e0d\\u4f1a\\u521b\\u5efa\\u6d4b\\u8bd5\\u5408\\u5e76\\u8fd0\\u884c\", \"reason_code\": \"single_target_validation\", \"repo\": \"example/project\", \"result\": \"failure\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006b\", \"head_ref\": \"feature/pr-7\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 7}]}"
+        },
+        "conclusion": "failure",
+        "head_sha": "000000000000000000000000000000000000006b",
+        "id": 807,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/807"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 807,
+        "conclusion": "failure",
+        "event": "merge_check_published",
+        "head": "000000000000000000000000000000000000006b",
+        "name": "Merge gate",
+        "pr": 7,
+        "publisher_run_attempt": "2",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "completed",
+        "target_sha": "000000000000000000000000000000000000006b",
+        "tree": null,
+        "validated_sha": null,
+        "validation_run_attempt": null,
+        "validation_run_id": null
+      }
+    },
+    "5367b92c95089b4ccf39a8a2f55d710d1c70b0463de7c06711b217c58151af7c": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:000000000000000000000000000000000000006c",
+        "status": "completed",
+        "output": {
+          "title": "合并已阻塞",
+          "summary": "{\"head\": \"000000000000000000000000000000000000006c\", \"pr\": 8, \"publisher\": {\"run_attempt\": \"2\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason\": \"\\u786e\\u8ba4\\u5b58\\u5728\\u5408\\u5e76\\u51b2\\u7a81\\uff1b\\u539f\\u751f pull_request \\u4e0d\\u4f1a\\u521b\\u5efa\\u6d4b\\u8bd5\\u5408\\u5e76\\u8fd0\\u884c\", \"reason_code\": \"single_target_validation\", \"repo\": \"example/project\", \"result\": \"failure\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006c\", \"head_ref\": \"feature/pr-8\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 8}]}"
+        },
+        "conclusion": "failure",
+        "head_sha": "000000000000000000000000000000000000006c",
+        "id": 808,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/808"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 808,
+        "conclusion": "failure",
+        "event": "merge_check_published",
+        "head": "000000000000000000000000000000000000006c",
+        "name": "Merge gate",
+        "pr": 8,
+        "publisher_run_attempt": "2",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "completed",
+        "target_sha": "000000000000000000000000000000000000006c",
+        "tree": null,
+        "validated_sha": null,
+        "validation_run_attempt": null,
+        "validation_run_id": null
+      }
+    },
+    "d31bdefdd203d3c6f7b9bdd4815689c2534fb011e56f3d9328bfaa955dcadf33": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:000000000000000000000000000000000000006c",
+        "status": "completed",
+        "output": {
+          "title": "合并验证通过",
+          "summary": "{\"head\": \"000000000000000000000000000000000000006c\", \"pr\": 8, \"publisher\": {\"run_attempt\": \"2\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason_code\": \"single_target_validation\", \"repo\": \"example/project\", \"result\": \"success\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006c\", \"head_ref\": \"feature/pr-8\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 8}], \"validation\": {\"controller_sha\": \"\", \"identity\": {\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"head\": \"000000000000000000000000000000000000006c\", \"pr\": 8, \"repo\": \"example/project\", \"run_attempt\": \"1\", \"run_id\": \"108\", \"sha\": \"00000000000000000000000000000000000003f0\", \"tree\": \"00000000000000000000000000000000000007d8\"}, \"source\": {\"base_ref\": \"master\", \"ref\": \"feature/pr-8\", \"repo\": \"writer/project\", \"repo_id\": 456}}}"
+        },
+        "conclusion": "success",
+        "details_url": "https://github.com/example/project/actions/runs/108/attempts/1",
+        "head_sha": "000000000000000000000000000000000000006c",
+        "id": 808,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/808"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 808,
+        "conclusion": "success",
+        "event": "merge_check_published",
+        "head": "000000000000000000000000000000000000006c",
+        "name": "Merge gate",
+        "pr": 8,
+        "publisher_run_attempt": "2",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "completed",
+        "target_sha": "000000000000000000000000000000000000006c",
+        "tree": "00000000000000000000000000000000000007d8",
+        "validated_sha": "00000000000000000000000000000000000003f0",
+        "validation_run_attempt": "1",
+        "validation_run_id": "108"
+      }
+    },
+    "e094bda95e564f0671421eb76c66b79bf615f3e80cdb7a90ea095356cbdd6b91": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:000000000000000000000000000000000000006d",
+        "status": "completed",
+        "output": {
+          "title": "合并已阻塞",
+          "summary": "{\"head\": \"000000000000000000000000000000000000006d\", \"pr\": 9, \"publisher\": {\"run_attempt\": \"2\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason\": \"\\u786e\\u8ba4\\u5b58\\u5728\\u5408\\u5e76\\u51b2\\u7a81\\uff1b\\u539f\\u751f pull_request \\u4e0d\\u4f1a\\u521b\\u5efa\\u6d4b\\u8bd5\\u5408\\u5e76\\u8fd0\\u884c\", \"reason_code\": \"single_target_validation\", \"repo\": \"example/project\", \"result\": \"failure\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006d\", \"head_ref\": \"feature/pr-9\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 9}]}"
+        },
+        "conclusion": "failure",
+        "head_sha": "000000000000000000000000000000000000006d",
+        "id": 809,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/809"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 809,
+        "conclusion": "failure",
+        "event": "merge_check_published",
+        "head": "000000000000000000000000000000000000006d",
+        "name": "Merge gate",
+        "pr": 9,
+        "publisher_run_attempt": "2",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "completed",
+        "target_sha": "000000000000000000000000000000000000006d",
+        "tree": null,
+        "validated_sha": null,
+        "validation_run_attempt": null,
+        "validation_run_id": null
+      }
+    },
+    "c2c15c8f61e4ca0e0308bcf0f24fb13e8892be43dceb5596ac1d7d079e658d03": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:000000000000000000000000000000000000006e",
+        "status": "completed",
+        "output": {
+          "title": "合并已阻塞",
+          "summary": "{\"head\": \"000000000000000000000000000000000000006e\", \"pr\": 10, \"publisher\": {\"run_attempt\": \"2\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason\": \"\\u786e\\u8ba4\\u5b58\\u5728\\u5408\\u5e76\\u51b2\\u7a81\\uff1b\\u539f\\u751f pull_request \\u4e0d\\u4f1a\\u521b\\u5efa\\u6d4b\\u8bd5\\u5408\\u5e76\\u8fd0\\u884c\", \"reason_code\": \"single_target_validation\", \"repo\": \"example/project\", \"result\": \"failure\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006e\", \"head_ref\": \"feature/pr-10\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 10}]}"
+        },
+        "conclusion": "failure",
+        "head_sha": "000000000000000000000000000000000000006e",
+        "id": 810,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/810"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 810,
+        "conclusion": "failure",
+        "event": "merge_check_published",
+        "head": "000000000000000000000000000000000000006e",
+        "name": "Merge gate",
+        "pr": 10,
+        "publisher_run_attempt": "2",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "completed",
+        "target_sha": "000000000000000000000000000000000000006e",
+        "tree": null,
+        "validated_sha": null,
+        "validation_run_attempt": null,
+        "validation_run_id": null
+      }
+    },
+    "7a9943c7744536d8e5950d356795b9aedb30d5b25653115ad80c64db8445a3d4": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:000000000000000000000000000000000000006f",
+        "status": "completed",
+        "output": {
+          "title": "合并已阻塞",
+          "summary": "{\"head\": \"000000000000000000000000000000000000006f\", \"pr\": 11, \"publisher\": {\"run_attempt\": \"2\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason\": \"\\u786e\\u8ba4\\u5b58\\u5728\\u5408\\u5e76\\u51b2\\u7a81\\uff1b\\u539f\\u751f pull_request \\u4e0d\\u4f1a\\u521b\\u5efa\\u6d4b\\u8bd5\\u5408\\u5e76\\u8fd0\\u884c\", \"reason_code\": \"single_target_validation\", \"repo\": \"example/project\", \"result\": \"failure\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006f\", \"head_ref\": \"feature/pr-11\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 11}]}"
+        },
+        "conclusion": "failure",
+        "head_sha": "000000000000000000000000000000000000006f",
+        "id": 811,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/811"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 811,
+        "conclusion": "failure",
+        "event": "merge_check_published",
+        "head": "000000000000000000000000000000000000006f",
+        "name": "Merge gate",
+        "pr": 11,
+        "publisher_run_attempt": "2",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "completed",
+        "target_sha": "000000000000000000000000000000000000006f",
+        "tree": null,
+        "validated_sha": null,
+        "validation_run_attempt": null,
+        "validation_run_id": null
+      }
+    },
+    "2db9b037b8b2fcc82eeca6e3d1b82c9b510e57a0a25832e596a33622de7e3cee": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:0000000000000000000000000000000000000070",
+        "status": "completed",
+        "output": {
+          "title": "合并已阻塞",
+          "summary": "{\"head\": \"0000000000000000000000000000000000000070\", \"pr\": 12, \"publisher\": {\"run_attempt\": \"2\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason\": \"\\u786e\\u8ba4\\u5b58\\u5728\\u5408\\u5e76\\u51b2\\u7a81\\uff1b\\u539f\\u751f pull_request \\u4e0d\\u4f1a\\u521b\\u5efa\\u6d4b\\u8bd5\\u5408\\u5e76\\u8fd0\\u884c\", \"reason_code\": \"single_target_validation\", \"repo\": \"example/project\", \"result\": \"failure\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"0000000000000000000000000000000000000070\", \"head_ref\": \"feature/pr-12\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 12}]}"
+        },
+        "conclusion": "failure",
+        "head_sha": "0000000000000000000000000000000000000070",
+        "id": 812,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/812"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 812,
+        "conclusion": "failure",
+        "event": "merge_check_published",
+        "head": "0000000000000000000000000000000000000070",
+        "name": "Merge gate",
+        "pr": 12,
+        "publisher_run_attempt": "2",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "completed",
+        "target_sha": "0000000000000000000000000000000000000070",
+        "tree": null,
+        "validated_sha": null,
+        "validation_run_attempt": null,
+        "validation_run_id": null
+      }
+    },
+    "888ce73f42ece519a343d0b45b9ccd539d0c304b38668a6260da4de90e75cd2e": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:000000000000000000000000000000000000006c",
+        "status": "completed",
+        "output": {
+          "title": "合并已阻塞",
+          "summary": "{\"head\": \"000000000000000000000000000000000000006c\", \"pr\": 8, \"publisher\": {\"run_attempt\": \"3\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason\": \"\\u786e\\u8ba4\\u5b58\\u5728\\u5408\\u5e76\\u51b2\\u7a81\\uff1b\\u539f\\u751f pull_request \\u4e0d\\u4f1a\\u521b\\u5efa\\u6d4b\\u8bd5\\u5408\\u5e76\\u8fd0\\u884c\", \"reason_code\": \"single_target_validation\", \"repo\": \"example/project\", \"result\": \"failure\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006c\", \"head_ref\": \"feature/pr-8\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 8}]}"
+        },
+        "conclusion": "failure",
+        "head_sha": "000000000000000000000000000000000000006c",
+        "id": 808,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/808"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 808,
+        "conclusion": "failure",
+        "event": "merge_check_published",
+        "head": "000000000000000000000000000000000000006c",
+        "name": "Merge gate",
+        "pr": 8,
+        "publisher_run_attempt": "3",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "completed",
+        "target_sha": "000000000000000000000000000000000000006c",
+        "tree": null,
+        "validated_sha": null,
+        "validation_run_attempt": null,
+        "validation_run_id": null
+      }
+    },
+    "bf24466678005bce2165d14e2fe5ed04f6c94b0e3d320a1afc68cf39d6df225b": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:000000000000000000000000000000000000006b",
+        "status": "in_progress",
+        "output": {
+          "title": "等待合并验证",
+          "summary": "{\"head\": \"000000000000000000000000000000000000006b\", \"pr\": 7, \"publisher\": {\"run_attempt\": \"2\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason_code\": \"shared_head_multiple_targets\", \"repo\": \"example/project\", \"result\": \"pending\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006b\", \"head_ref\": \"feature/pr-7\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 7}, {\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"stacked\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006b\", \"head_ref\": \"feature/pr-7\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 9}]}"
+        },
+        "head_sha": "000000000000000000000000000000000000006b",
+        "id": 807,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/807"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 807,
+        "conclusion": null,
+        "event": "merge_check_published",
+        "head": "000000000000000000000000000000000000006b",
+        "name": "Merge gate",
+        "pr": 7,
+        "publisher_run_attempt": "2",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "in_progress",
+        "target_sha": "000000000000000000000000000000000000006b",
+        "tree": null,
+        "validated_sha": null,
+        "validation_run_attempt": null,
+        "validation_run_id": null
+      }
+    },
+    "9ebc510029197b1c88c4165fe91e9c43d4230de0f549891226c1d4d5f55496c2": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:000000000000000000000000000000000000006b",
+        "status": "completed",
+        "output": {
+          "title": "合并验证通过",
+          "summary": "{\"head\": \"000000000000000000000000000000000000006b\", \"pr\": 7, \"publisher\": {\"run_attempt\": \"2\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason_code\": \"single_target_validation\", \"repo\": \"example/project\", \"result\": \"success\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006b\", \"head_ref\": \"feature/pr-7\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 7}], \"validation\": {\"controller_sha\": \"\", \"identity\": {\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"head\": \"000000000000000000000000000000000000006b\", \"pr\": 7, \"repo\": \"example/project\", \"run_attempt\": \"1\", \"run_id\": \"107\", \"sha\": \"00000000000000000000000000000000000003ef\", \"tree\": \"00000000000000000000000000000000000007d7\"}, \"source\": {\"base_ref\": \"master\", \"ref\": \"feature/pr-7\", \"repo\": \"writer/project\", \"repo_id\": 456}}}"
+        },
+        "conclusion": "success",
+        "details_url": "https://github.com/example/project/actions/runs/107/attempts/1",
+        "head_sha": "000000000000000000000000000000000000006b",
+        "id": 807,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/807"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 807,
+        "conclusion": "success",
+        "event": "merge_check_published",
+        "head": "000000000000000000000000000000000000006b",
+        "name": "Merge gate",
+        "pr": 7,
+        "publisher_run_attempt": "2",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "completed",
+        "target_sha": "000000000000000000000000000000000000006b",
+        "tree": "00000000000000000000000000000000000007d7",
+        "validated_sha": "00000000000000000000000000000000000003ef",
+        "validation_run_attempt": "1",
+        "validation_run_id": "107"
+      }
+    },
+    "b07df4af077e9c539df13e2d4c0b741fd1e92fd8e8d30d4b02102dad0a396551": {
+      "check": {
+        "name": "Merge gate",
+        "external_id": "merge-gate:v2:example/project:source:000000000000000000000000000000000000006b",
+        "status": "completed",
+        "output": {
+          "title": "合并已阻塞",
+          "summary": "{\"head\": \"000000000000000000000000000000000000006b\", \"pr\": 8, \"publisher\": {\"run_attempt\": \"2\", \"run_id\": \"201\", \"workflow\": \".github/workflows/merge-conflict.yml\", \"workflow_sha\": \"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}, \"reason\": \"\\u786e\\u8ba4\\u5b58\\u5728\\u5408\\u5e76\\u51b2\\u7a81\\uff1b\\u539f\\u751f pull_request \\u4e0d\\u4f1a\\u521b\\u5efa\\u6d4b\\u8bd5\\u5408\\u5e76\\u8fd0\\u884c\", \"reason_code\": \"single_target_validation\", \"repo\": \"example/project\", \"result\": \"failure\", \"schema\": 1, \"targets\": [{\"base\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", \"base_ref\": \"master\", \"draft\": false, \"head\": \"000000000000000000000000000000000000006b\", \"head_ref\": \"feature/pr-7\", \"head_repo\": \"writer/project\", \"head_repo_id\": 456, \"pr\": 8}]}"
+        },
+        "conclusion": "failure",
+        "head_sha": "000000000000000000000000000000000000006b",
+        "id": 808,
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        },
+        "html_url": "https://github.com/example/project/runs/808"
+      },
+      "log": {
+        "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "check_id": 808,
+        "conclusion": "failure",
+        "event": "merge_check_published",
+        "head": "000000000000000000000000000000000000006b",
+        "name": "Merge gate",
+        "pr": 8,
+        "publisher_run_attempt": "2",
+        "publisher_run_id": "201",
+        "repo": "example/project",
+        "status": "completed",
+        "target_sha": "000000000000000000000000000000000000006b",
+        "tree": null,
+        "validated_sha": null,
+        "validation_run_attempt": null,
+        "validation_run_id": null
+      }
+    }
+  }
+}

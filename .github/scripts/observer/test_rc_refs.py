@@ -62,12 +62,12 @@ class World:
         self.overrides = {}
         self.relationship("ahead")
 
-    def relationship(self, status):
-        merge_base = TARGET if status in {"ahead", "identical"} else MASTER
+    def relationship(self, status, target=TARGET, master=MASTER):
+        merge_base = target if status in {"ahead", "identical"} else master
         if status == "diverged":
             merge_base = BLOB
-        self.routes[ROOT + f"/compare/{TARGET}...{MASTER}"] = {
-            "status": status, "base_commit": {"sha": TARGET},
+        self.routes[ROOT + f"/compare/{target}...{master}"] = {
+            "status": status, "base_commit": {"sha": target},
             "merge_base_commit": {"sha": merge_base},
             "ahead_by": int(status in {"ahead", "diverged"}),
             "behind_by": int(status in {"behind", "diverged"}),
@@ -232,15 +232,222 @@ class BaselineAndIdentity(Case):
 
     def test_known_outside_master_is_retained_and_retried_after_merge(self):
         self.baseline_then_add()
-        for status in ("behind", "diverged"):
-            self.world.relationship(status)
+        for status, master in (("behind", MASTER), ("diverged", TAG)):
+            self.world.routes[MASTER_REF]["object"]["sha"] = master
+            self.world.relationship(status, master=master)
             self.assertTrue(self.tick())
             self.assertEqual(self.candidate()["state"], "outside_master")
             self.assertEqual(self.payloads(), [])
         self.reopen()
-        self.world.relationship("ahead")
+        self.world.routes[MASTER_REF]["object"]["sha"] = TAG2
+        self.world.relationship("ahead", master=TAG2)
         self.assertTrue(self.tick())
         self.assertEqual(len(self.payloads()), 1)
+        self.assertEqual(self.payloads()[0]["master_sha"], TAG2)
+
+
+class ThroughputAndEvidence(Case):
+    def add_ten(self):
+        return [self.world.add(ref(f"r{index}")) for index in range(10)]
+
+    def test_ten_native_tags_steady_state_only_reads_identity_and_refs_after_restart(self):
+        self.assertTrue(self.tick())
+        items = self.add_ten()
+        self.world.native()
+        self.assertTrue(self.tick())
+        for restart in (False, True):
+            with self.subTest(restart=restart):
+                if restart:
+                    self.reopen()
+                self.world.calls.clear()
+                changes = self.store.db.total_changes
+                self.assertTrue(self.tick())
+                self.assertEqual([path for path, _ in self.world.calls], ["/user", REFS])
+                self.assertIsNotNone(self.world.calls[-1][1])
+                self.assertEqual(self.store.db.total_changes, changes)
+                self.assertEqual({self.candidate(item)["state"] for item in items}, {"native_workflow"})
+        self.assertEqual(self.payloads(), [])
+
+    def test_ten_new_native_tags_share_one_confirmed_target_tree_walk(self):
+        self.assertTrue(self.tick())
+        self.add_ten()
+        self.world.native()
+        self.world.calls.clear()
+        self.assertTrue(self.tick())
+        self.assertEqual(len(self.world.calls), 18)
+        for suffix in ("commits/" + TARGET, "trees/" + TREE, "trees/" + GH_TREE, "trees/" + WF_TREE):
+            self.assertEqual(sum(path == ROOT + "/git/" + suffix for path, _ in self.world.calls), 1)
+        self.assertEqual(self.payloads(), [])
+
+    def test_native_proof_survives_ref_deletion_and_is_reused_for_new_identities_only_at_same_target(self):
+        first = self.baseline_then_add()
+        self.world.native()
+        self.assertTrue(self.tick())
+        scope = f"rc-tag:{first['ref']}:{TARGET}"
+        self.store.problem(scope, "fixture crash before clearing a prior unknown")
+        self.world.refs = []
+        self.assertTrue(self.tick())
+        self.assertEqual(self.candidate(first)["state"], "native_workflow")
+        self.assertIsNone(self.store.db.execute("SELECT 1 FROM problems WHERE scope=?", (scope,)).fetchone())
+        self.reopen()
+        wrapped = self.world.add(ref("new", TAG, "tag"))
+        second = self.world.add(ref("second"))
+        self.world.routes[ROOT + "/git/tags/" + TAG] = {"sha": TAG, "object": {"type": "commit", "sha": TARGET}}
+        self.world.calls.clear()
+        self.assertTrue(self.tick())
+        for item in (wrapped, second):
+            self.assertEqual(self.candidate(item)["state"], "native_workflow")
+            self.assertIn(ref_path(item), [path for path, _ in self.world.calls])
+        self.assertFalse(any("/git/trees/" in path or "/git/commits/" in path for path, _ in self.world.calls))
+        self.assertIn(ROOT + "/git/tags/" + TAG, [path for path, _ in self.world.calls])
+        other, other_tree = "3" * 40, "4" * 40
+        replacement = ref("new", other)
+        self.world.refs = [second]
+        self.world.add(replacement)
+        self.world.routes[ROOT + "/git/commits/" + other] = {"sha": other, "tree": {"sha": other_tree}}
+        self.world.routes[ROOT + "/git/trees/" + other_tree] = {"sha": other_tree, "truncated": False, "tree": []}
+        self.world.relationship("ahead", target=other)
+        self.assertTrue(self.tick())
+        self.assertEqual([(p["tag"], p["tag_object"], p["sha"]) for p in self.payloads()],
+                         [(replacement["ref"], other, other)])
+        self.assertTrue(self.tick())
+        self.assertEqual(len(self.store.inbox(COORDINATOR)), 1)
+
+    def test_unknown_tree_proof_is_not_shared_and_verified_absence_does_not_drop_new_tags(self):
+        self.assertTrue(self.tick())
+        items = self.add_ten()
+        endpoint = ROOT + "/git/trees/" + WF_TREE
+        reads = 0
+
+        def recovering(path, etag):
+            nonlocal reads
+            reads += 1
+            return reply({}, 503) if reads <= 2 else reply(self.world.routes[path])
+
+        self.world.overrides[endpoint] = recovering
+        self.assertFalse(self.tick())
+        self.assertEqual(reads, 3)
+        self.assertEqual(self.candidate(items[0])["state"], "unknown")
+        self.assertEqual(len(self.payloads()), 9)
+        self.assertEqual(len(self.store.inbox(COORDINATOR)), 9)
+        self.reopen()
+        self.world.overrides.clear()
+        self.assertTrue(self.tick())
+        self.assertEqual({p["tag"] for p in self.payloads()}, {item["ref"] for item in items})
+        receipts = [row["receipt_id"] for row in self.store.inbox(COORDINATOR)]
+        self.assertEqual(len(receipts), 10)
+        self.assertTrue(self.tick())
+        self.assertEqual([row["receipt_id"] for row in self.store.inbox(COORDINATOR)], receipts)
+
+    def test_ten_outside_tags_only_recheck_ancestry_once_per_new_master(self):
+        self.assertTrue(self.tick())
+        items = self.add_ten()
+        self.world.relationship("diverged")
+        self.assertTrue(self.tick())
+        self.reopen()
+        self.world.calls.clear()
+        changes = self.store.db.total_changes
+        self.assertTrue(self.tick())
+        self.assertEqual([path for path, _ in self.world.calls], ["/user", REFS, MASTER_REF])
+        self.assertEqual(self.store.db.total_changes, changes)
+        self.world.routes[MASTER_REF]["object"]["sha"] = TAG2
+        self.world.relationship("diverged", master=TAG2)
+        self.world.calls.clear()
+        self.assertTrue(self.tick())
+        comparisons = [path for path, _ in self.world.calls if "/compare/" in path]
+        self.assertEqual(comparisons, [ROOT + f"/compare/{TARGET}...{TAG2}"])
+        self.assertFalse(any("/git/trees/" in path for path, _ in self.world.calls))
+        self.assertEqual({self.candidate(item)["state"] for item in items}, {"outside_master"})
+        self.assertEqual(self.payloads(), [])
+        self.world.routes[MASTER_REF]["object"]["sha"] = TAG
+        self.world.relationship("ahead", master=TAG)
+        self.world.calls.clear()
+        self.assertTrue(self.tick())
+        self.assertEqual([path for path, _ in self.world.calls if "/compare/" in path],
+                         [ROOT + f"/compare/{TARGET}...{TAG}"])
+        self.assertEqual(len(self.payloads()), 10)
+        self.assertEqual({p["master_sha"] for p in self.payloads()}, {TAG})
+        self.assertEqual({self.candidate(item)["state"] for item in items}, {"forwarded"})
+        self.assertTrue(self.tick())
+        self.assertEqual(len(self.store.inbox(COORDINATOR)), 10)
+
+    def test_legacy_outside_rows_without_master_evidence_recheck_once_then_cache(self):
+        self.world.relationship("diverged")
+        item = self.world.add()
+        with self.store.db:
+            self.store.db.execute("CREATE TABLE rc_ref_baselines(repo TEXT PRIMARY KEY,completed_at TEXT NOT NULL)")
+            self.store.db.execute("INSERT INTO rc_ref_baselines VALUES(?,?)", (REPO, "legacy"))
+            self.store.db.execute("""CREATE TABLE rc_ref_candidates (
+                repo TEXT NOT NULL, ref TEXT NOT NULL, tag_object TEXT NOT NULL,
+                object_type TEXT NOT NULL, state TEXT NOT NULL, sha TEXT, reason TEXT,
+                updated_at TEXT NOT NULL, PRIMARY KEY(repo,ref,tag_object))""")
+            self.store.db.execute("INSERT INTO rc_ref_candidates VALUES(?,?,?,?,?,?,NULL,?)",
+                                  (REPO, item["ref"], TARGET, "commit", "outside_master", TARGET, "legacy"))
+        self.assertTrue(self.tick())
+        self.assertEqual(self.candidate(item)["checked_master"], MASTER)
+        self.assertEqual(sum("/compare/" in path for path, _ in self.world.calls), 1)
+        self.reopen()
+        self.world.calls.clear()
+        self.assertTrue(self.tick())
+        self.assertEqual([path for path, _ in self.world.calls], ["/user", REFS, MASTER_REF])
+
+    def test_terminal_native_state_still_requires_live_auth_and_complete_refs(self):
+        item = self.baseline_then_add()
+        self.world.native()
+        self.assertTrue(self.tick())
+        before = self.candidate(item)
+        for endpoint in ("/user", REFS):
+            self.world.overrides[endpoint] = reply({}, 401)
+            self.world.calls.clear()
+            self.assertFalse(self.tick())
+            self.assertEqual(self.candidate(item), before)
+            self.assertFalse(any("/git/trees/" in path for path, _ in self.world.calls))
+            self.world.overrides.clear()
+        self.assertTrue(self.tick())
+        self.assertEqual(self.payloads(), [])
+
+    def test_shared_auth_is_repo_bound_and_never_reused_by_standalone_calls(self):
+        self.baseline_then_add()
+        self.world.native()
+        self.assertTrue(self.tick())
+        with Observer(self.store, API(self.store, self.world)) as observer:
+            identity = observer.api.get("/user", conditional=False)
+            context = {"repo": REPO, "identity": identity}
+            self.world.calls.clear()
+            self.assertTrue(reconcile_tags(observer, auth_context=context))
+            self.assertEqual([path for path, _ in self.world.calls], [REFS])
+            self.world.overrides[REFS] = reply({}, 403)
+            context = {"repo": REPO, "identity": observer.api.get("/user", conditional=False)}
+            self.assertFalse(reconcile_tags(observer, auth_context=context))
+            self.world.overrides.clear()
+            for invalid in ({"repo": "example/other", "identity": identity}, {},
+                            {"repo": REPO, "identity": {"id": True, "login": "operator"}}):
+                self.world.calls.clear()
+                self.assertFalse(reconcile_tags(observer, auth_context=invalid))
+                self.assertEqual(self.world.calls, [])
+            self.world.overrides["/user"] = reply({}, 401)
+            self.world.calls.clear()
+            self.assertFalse(reconcile_tags(observer))
+            self.assertEqual(self.world.calls, [("/user", None)])
+        self.assertEqual(self.payloads(), [])
+
+    def test_not_current_identity_is_not_rewritten_until_it_reappears(self):
+        item = self.baseline_then_add()
+        self.assertTrue(self.tick(deliver=False))
+        self.world.refs = []
+        self.assertTrue(self.tick())
+        before = self.candidate(item)
+        self.assertEqual(before["state"], "not_current")
+        self.world.calls.clear()
+        changes = self.store.db.total_changes
+        self.assertTrue(self.tick())
+        self.assertEqual(self.candidate(item), before)
+        self.assertEqual(self.store.db.total_changes, changes)
+        self.assertEqual([path for path, _ in self.world.calls], ["/user", REFS])
+        self.world.refs = [item]
+        self.assertTrue(self.tick())
+        self.assertEqual(len(self.payloads()), 1)
+        self.assertEqual(len(self.store.inbox(COORDINATOR)), 1)
 
 
 class UnknownAndCompleteness(Case):

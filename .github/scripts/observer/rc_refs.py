@@ -94,7 +94,9 @@ def schema(store):
         store.db.execute("""CREATE TABLE IF NOT EXISTS rc_ref_candidates (
             repo TEXT NOT NULL, ref TEXT NOT NULL, tag_object TEXT NOT NULL,
             object_type TEXT NOT NULL, state TEXT NOT NULL, sha TEXT, reason TEXT,
-            updated_at TEXT NOT NULL, PRIMARY KEY(repo,ref,tag_object))""")
+            updated_at TEXT NOT NULL, checked_master TEXT, PRIMARY KEY(repo,ref,tag_object))""")
+        if "checked_master" not in {row[1] for row in store.db.execute("PRAGMA table_info(rc_ref_candidates)")}:
+            store.db.execute("ALTER TABLE rc_ref_candidates ADD COLUMN checked_master TEXT")
 
 
 def remember(store, repo, refs):
@@ -106,18 +108,20 @@ def remember(store, repo, refs):
             old = store.db.execute("SELECT object_type FROM rc_ref_candidates WHERE repo=? AND ref=? AND tag_object=?",
                                    (repo, ref, obj)).fetchone()
             require(old is None or old[0] == kind, "同一候选标签 object 类型冲突，保持未知")
-            store.db.execute("INSERT OR IGNORE INTO rc_ref_candidates VALUES(?,?,?,?,?,NULL,NULL,?)",
-                             (repo, ref, obj, kind, "baseline" if baseline else "pending", now()))
+            if old is None:
+                store.db.execute("INSERT INTO rc_ref_candidates(repo,ref,tag_object,object_type,state,updated_at) "
+                                 "VALUES(?,?,?,?,?,?)",
+                                 (repo, ref, obj, kind, "baseline" if baseline else "pending", now()))
         if baseline:
             store.db.execute("INSERT INTO rc_ref_baselines VALUES(?,?)", (repo, now()))
     return baseline
 
 
-def state(store, row, value, reason=None, target=None):
+def state(store, row, value, reason=None, target=None, checked_master=None):
     with store.db:
-        result = store.db.execute("UPDATE rc_ref_candidates SET state=?,reason=?,sha=COALESCE(sha,?),updated_at=? "
+        result = store.db.execute("UPDATE rc_ref_candidates SET state=?,reason=?,sha=COALESCE(sha,?),updated_at=?,checked_master=? "
                                   "WHERE repo=? AND ref=? AND tag_object=? AND (? IS NULL OR sha IS NULL OR sha=?)",
-                                  (value, reason, target, now(), row["repo"], row["ref"], row["tag_object"], target, target))
+                                  (value, reason, target, now(), checked_master, row["repo"], row["ref"], row["tag_object"], target, target))
         require(result.rowcount == 1, "候选标签已绑定的目标 SHA 冲突，保持未知")
 
 
@@ -206,13 +210,25 @@ def native_absence(observer, target):
     raise Unknown("原生候选工作流路径未完成核实，保持未知")
 
 
-def inspect_candidate(observer, row):
+def inspected_master(observer, evidence):
+    if "master" not in evidence:
+        evidence["master"] = master_sha(observer)
+    return evidence["master"]
+
+
+def inspect_candidate(observer, row, evidence):
     current_ref(observer, row)
     target = peel(observer, row)
-    master = master_sha(observer)
-    if not on_master(observer, target, master):
+    master = inspected_master(observer, evidence)
+    pair = (target, master)
+    if pair not in evidence["ancestry"]:
+        evidence["ancestry"][pair] = on_master(observer, target, master)
+    if not evidence["ancestry"][pair]:
         return "outside_master", target, None
-    proof = native_absence(observer, target)
+    # Only complete immutable proofs are shared; Unknown never enters this map.
+    if target not in evidence["native"]:
+        evidence["native"][target] = native_absence(observer, target)
+    proof = evidence["native"][target]
     if proof is None:
         return "native_workflow", target, None
     # Revalidate mutable refs after immutable object/tree evidence, before fanout.
@@ -250,18 +266,26 @@ def source_delivery(store, key, coordinator, deliver):
     return True
 
 
-def reconcile_tags(observer, deliver=True):
+def reconcile_tags(observer, deliver=True, *, auth_context=None):
     """Return health; persist unknowns and only deliver individually verified tags.
 
     Call once per reconcile under the existing Observer receiver lock, even if
     workflow run discovery failed. No run identity is fabricated for tag intake.
+    A caller may share {"repo": repo, "identity": identity} freshly authenticated
+    in this reconcile only; never persist/reuse it. Standalone calls authenticate.
+    The complete repository refs source is always read, even with shared auth.
     """
     if observer.lock is None:
         raise RuntimeError("候选标签对账必须持有单接收进程锁")
     store = observer.store
     schema(store)
     try:
-        identity = observer.api.get("/user", conditional=False)
+        if auth_context is None:
+            identity = observer.api.get("/user", conditional=False)
+        else:
+            require(isinstance(auth_context, dict) and auth_context.get("repo") == observer.repo,
+                    "共享认证上下文不属于当前仓库，候选标签保持未知")
+            identity = auth_context.get("identity")
         require(isinstance(identity, dict) and type(identity.get("id")) is int and identity["id"] > 0
                 and isinstance(identity.get("login"), str) and bool(identity["login"].strip()),
                 "缺少已认证身份，候选标签保持未知")
@@ -276,13 +300,26 @@ def reconcile_tags(observer, deliver=True):
     healthy = True
     rows = store.db.execute("SELECT * FROM rc_ref_candidates WHERE repo=? AND state NOT IN ('baseline','forwarded') "
                             "ORDER BY ref,tag_object", (observer.repo,)).fetchall()
+    # A native file is immutable evidence, independent of later ref/master moves.
+    # Outside-master evidence, in contrast, is bound to the exact checked master.
+    evidence = dict(native={row["sha"]: None for row in rows
+                            if row["state"] == "native_workflow" and sha(row["sha"])},
+                    ancestry={(row["sha"], row["checked_master"]): False for row in rows
+                              if row["state"] == "outside_master" and sha(row["sha"]) and sha(row["checked_master"])})
     for row in rows:
         scope = f"rc-tag:{row['ref']}:{row['tag_object']}"
+        if row["state"] == "native_workflow" and sha(row["sha"]):
+            store.problem(scope)
+            continue
         try:
             if refs.get(row["ref"]) != (row["tag_object"], row["object_type"]):
-                state(store, row, "not_current", "当前完整 refs 快照不含此 ref/object；保留记录并等待恢复")
+                if row["state"] != "not_current":
+                    state(store, row, "not_current", "当前完整 refs 快照不含此 ref/object；保留记录并等待恢复")
+            elif (row["state"] == "outside_master" and sha(row["sha"]) and
+                  row["checked_master"] == inspected_master(observer, evidence)):
+                pass
             else:
-                outcome, target, payload = inspect_candidate(observer, row)
+                outcome, target, payload = inspect_candidate(observer, row, evidence)
                 if payload is not None:
                     key = Key(observer.repo, target, None, None, f"@tag:{row['ref']}:{row['tag_object']}")
                     # Bind the peeled target before publication, including the
@@ -291,7 +328,8 @@ def reconcile_tags(observer, deliver=True):
                     store.publish(key, ACTION, payload, [observer.coordinator])
                     if source_delivery(store, key, observer.coordinator, deliver):
                         outcome = "forwarded"
-                state(store, row, outcome, target=target)
+                state(store, row, outcome, target=target,
+                      checked_master=evidence["master"] if outcome == "outside_master" else None)
             store.problem(scope)
         except Unknown as error:
             state(store, row, "unknown", str(error))

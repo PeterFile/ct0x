@@ -74,6 +74,7 @@ function fakePi(dir, { id = 'session-a', entries = [], persist = true, mode = 'r
   const pi = {
     on(name, handler) { handlers.set(name, handler); },
     registerTool(tool) { tools.push(tool); },
+    appendEntry(customType, data) { entries.push({ type: 'custom', customType, data: structuredClone(data) }); },
     sendMessage(message, options) {
       messages.push({ message, options });
       if (persist) persistMessage(message);
@@ -114,7 +115,7 @@ function fakeIO(rows = [], { ignoreAbort = false, response } = {}) {
         finished = true;
         running--;
         options.signal?.removeEventListener('abort', abort);
-        callback(error, stdout ?? '', 'secret stderr must never be forwarded');
+        callback(error, stdout ?? '', error?.stderr ?? 'secret stderr must never be forwarded');
       }
       function abort() {
         call.killed = true;
@@ -138,7 +139,16 @@ function fakeIO(rows = [], { ignoreAbort = false, response } = {}) {
             row.acked_at ??= ackedAt;
             finish(null, '{"ok":true}');
           } else {
-            finish(null, JSON.stringify(io.rows));
+            let selected = [...new Map(io.rows.filter(row => row?.recipient === recipient && /^[a-f0-9]{64}$/.test(row.receipt_id)).map(row => [row.receipt_id, row])).values()];
+            if (args.includes('--receipt')) selected = selected.filter(row => row.receipt_id === args[args.indexOf('--receipt') + 1]);
+            if (args.includes('--pending')) {
+              selected = selected.filter(row => row.state === 'delivered' && row.acked_at == null);
+              selected.sort((a, b) => a.receipt_id.localeCompare(b.receipt_id));
+              if (args.includes('--after')) selected = selected.filter(row => row.receipt_id > args[args.indexOf('--after') + 1]);
+              selected = selected.slice(0, Number(args[args.indexOf('--limit') + 1]));
+            }
+            call.returnedRows = selected.length;
+            finish(null, JSON.stringify(selected));
           }
         } catch (error) { finish(error); }
       });
@@ -166,6 +176,15 @@ async function begin(pi, args = { receiptId }, context = pi.ctx, toolCallId = 'c
 }
 
 const ackCalls = io => io.calls.filter(call => call.args.includes('ack'));
+const inboxCalls = io => io.calls.filter(call => call.args.includes('inbox'));
+const dataFor = message => JSON.parse(message.content.slice(message.content.indexOf('\n{') + 1)).data;
+const idFor = number => number.toString(16).padStart(64, '0');
+
+async function waitDetails(pi, id) {
+  const tool = pi.tools.find(tool => tool.name === 'ci_observer_wait_details');
+  assert.ok(tool, 'explicit, nonblocking detail subscription tool');
+  return tool.execute('call_wait_fixture|fc_wait_fixture', { receiptId: id }, new AbortController().signal, undefined, pi.ctx);
+}
 
 test('factory is inert; startup derives identity, uses safe argv and queues a non-interrupting turn', async t => {
   assert.equal(typeof receiver, 'function');
@@ -186,7 +205,7 @@ test('factory is inert; startup derives identity, uses safe argv and queues a no
   assert.equal(call.args[0], '-B');
   assert.equal(call.args[1], join(here, 'observer.py'));
   assert.ok(isAbsolute(call.args[1]));
-  assert.deepEqual(call.args.slice(2), ['--db', f.db, 'inbox', '--recipient', 'session-a']);
+  assert.deepEqual(call.args.slice(2), ['--db', f.db, 'inbox', '--recipient', 'session-a', '--pending', '--limit', '64']);
   assert.equal(call.options.shell, false);
   assert.equal(call.options.killSignal, 'SIGKILL');
   assert.ok(call.options.timeout > 0 && call.options.timeout <= 30000);
@@ -547,20 +566,371 @@ test('malformed inbox fails closed and does not ack', async t => {
   assert.equal(ackCalls(io).length, 0);
 });
 
+test('fixture: 5000 acknowledged receipts never enter pending pages or begin lookups', async t => {
+  const f = fixture(t);
+  const pi = fakePi(f.dir);
+  const history = Array.from({ length: 5000 }, (_, index) => receipt('session-a', {
+    receipt_id: idFor(index + 1), state: 'acked', acked_at: ackedAt,
+    payload: { ...receipt().payload, body: 'x'.repeat(2000) },
+  }));
+  const io = fakeIO([...history, receipt(), receipt('someone-else', { receipt_id: secondId })]);
+  install(t, f, pi, io);
+  await pi.emit('session_start');
+  assert.equal(pi.messages.length, 1);
+  await begin(pi);
+  assert.ok(inboxCalls(io).every(call => call.args.includes('--pending') || call.args.includes('--receipt')));
+  assert.ok(inboxCalls(io).every(call => call.returnedRows <= 1));
+  assert.equal(inboxCalls(io).filter(call => call.args.includes('--pending')).length, 1);
+});
+
+test('fixture: pending pages advance with bounded chunks; lower-ID arrivals and resume neither starve nor replay', async t => {
+  const f = fixture(t);
+  const pi = fakePi(f.dir);
+  const rows = Array.from({ length: 173 }, (_, index) => receipt('session-a', {
+    receipt_id: idFor(index + 100), payload: { ...receipt().payload, run_id: index + 100 },
+  }));
+  let inserted = false;
+  const io = fakeIO(rows, { response: (_command, _recipient, call) => {
+    if (!inserted && call.args.includes('--after')) {
+      inserted = true;
+      io.rows.push(receipt('session-a', { receipt_id: idFor(1), payload: { ...receipt().payload, run_id: 1 } }));
+      writeFileSync(f.db, 'new lower-ID receipt committed during a sweep');
+      io.event();
+    }
+  } });
+  install(t, f, pi, io, { pageSize: 7, pagesPerScan: 2 });
+  await pi.emit('session_start');
+  await until(() => pi.messages.length === 174, 'all pending pages and concurrent lower-ID insert');
+  await pause(80);
+  assert.equal(new Set(pi.messages.map(item => item.message.details.receiptId)).size, 174);
+  assert.ok(inboxCalls(io).every(call => call.args.includes('--pending') && call.returnedRows <= 7));
+  assert.ok(inboxCalls(io).length < 60);
+  assert.equal(io.peak, 1);
+  await pi.emit('session_shutdown');
+  const resumed = fakePi(f.dir, { entries: structuredClone(pi.entries) });
+  install(t, f, resumed, io, { pageSize: 7, pagesPerScan: 2 });
+  const before = io.calls.length;
+  await resumed.emit('session_start', { reason: 'resume' });
+  await until(() => io.calls.length - before >= 25, 'resumed full pending sweep');
+  await pause(60);
+  assert.equal(resumed.messages.length, 0);
+});
+
+test('fixture: an oversized pending page shrinks its limit, never its scope or receipt cursor', async t => {
+  const f = fixture(t);
+  const pi = fakePi(f.dir);
+  const rows = Array.from({ length: 5 }, (_, index) => receipt('session-a', {
+    receipt_id: idFor(index + 1), payload: { ...receipt().payload, run_id: index + 1 },
+  }));
+  const io = fakeIO(rows, { response: (_verb, _recipient, call) => {
+    if (Number(call.args[call.args.indexOf('--limit') + 1]) > 2) throw Object.assign(new Error('bounded stdout overflow'), { code: 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' });
+  } });
+  install(t, f, pi, io, { pageSize: 8 });
+  await pi.emit('session_start');
+  await until(() => pi.messages.length === 5, 'bounded page size reduction');
+  assert.deepEqual(inboxCalls(io).slice(0, 3).map(call => call.args[call.args.indexOf('--limit') + 1]), ['8', '4', '2']);
+  assert.ok(inboxCalls(io).every(call => call.args.includes('--pending')));
+  assert.equal(new Set(pi.messages.map(item => item.message.details.receiptId)).size, 5);
+});
+
+test('fixture: unsupported or non-advancing bounded inbox ABI fails explicitly without full-history fallback', async t => {
+  for (const mode of ['unsupported', 'non-advancing', 'foreign-recipient']) {
+    await t.test(mode, async t => {
+      const f = fixture(t);
+      const pi = fakePi(f.dir);
+      const io = fakeIO([receipt()], { response: (_verb, _recipient, call) => {
+        if (mode === 'unsupported') throw Object.assign(new Error('private CLI error'), { stderr: '命令参数无效；请使用 --help 查看用法' });
+        if (mode === 'foreign-recipient') return JSON.stringify([receipt('someone-else')]);
+        if (call.args.includes('--after')) return JSON.stringify([receipt()]);
+      } });
+      install(t, f, pi, io, { pageSize: 1 });
+      await pi.emit('session_start');
+      assert.ok(pi.notices.some(notice => /分页|有界|新版/.test(notice[0])));
+      assert.ok(inboxCalls(io).every(call => call.args.includes('--pending') && call.args.includes('--limit')));
+      assert.equal(ackCalls(io).length, 0);
+    });
+  }
+});
+
+test('actual TestLog outcomes remain distinct in model-visible fixture data; unknown outcomes are not instructions', async t => {
+  const run = promisify(nativeExecFile);
+  const log = 'panic: test timed out after 14m0s\nrunning tests:\n\tTestStillRunning (17s)\n{"Action":"fail","Package":"example/store","Test":"TestAssertion"}\n';
+  const parsed = await run('python3', ['-B', '-c', 'import json,sys; sys.path.insert(0,sys.argv[1]); from observer import extract_tests; print(json.dumps(extract_tests(sys.argv[2])))', here, log]);
+  const tests = JSON.parse(parsed.stdout);
+  assert.deepEqual(new Set(tests.map(item => item.outcome)), new Set(['failed', 'running_at_timeout']));
+  tests.push({ name: 'TestUnknown', package: null, outcome: 'EXECUTE_ARBITRARY_INSTRUCTION' });
+  const f = fixture(t);
+  const pi = fakePi(f.dir);
+  install(t, f, pi, fakeIO([receipt('session-a', { payload: { ...receipt().payload, tests } })]));
+  await pi.emit('session_start');
+  const data = dataFor(pi.messages[0].message);
+  assert.equal(data.tests.find(item => item.name === 'TestStillRunning').outcome, 'running_at_timeout');
+  assert.equal(data.tests.find(item => item.name === 'TestAssertion').outcome, 'failed');
+  assert.equal(data.tests.find(item => item.name === 'TestUnknown').outcome, undefined);
+  assert.ok(!pi.messages[0].message.content.includes('EXECUTE_ARBITRARY_INSTRUCTION'));
+});
+
+test('fixture: late multi-shard details stay information after a persisted or queued first wake', async t => {
+  for (const persist of [true, false]) await t.test(persist ? 'persisted first wake' : 'queued first wake', async t => {
+    const f = fixture(t);
+    const pi = fakePi(f.dir, { persist });
+    const io = fakeIO([receipt()]);
+    install(t, f, pi, io, { pageSize: 5, pagesPerScan: 2 });
+    await pi.emit('session_start');
+    assert.equal(pi.messages.length, 1);
+    for (let index = 0; index < 12; index++) io.rows.push(receipt('session-a', {
+      receipt_id: idFor(index + 1), payload: { ...receipt().payload, action: 'job_details', job: String(501 + index), job_id: 501 + index },
+    }));
+    writeFileSync(f.db, 'old multi-shard details committed after first wake');
+    io.event();
+    await until(() => pi.messages.length === 13, 'first failure plus information receipts');
+    assert.equal(pi.messages.filter(item => item.options.triggerTurn).length, 1);
+    for (const { message, options } of pi.messages.filter(item => item.message.details.actionIdentity.action === 'job_details')) {
+      assert.equal(options.triggerTurn, false);
+      assert.match(message.content, /补报不计作向负责人再次派工/);
+      assert.ok(!message.content.includes('ci_observer_begin_receipt'));
+    }
+    assert.equal(ackCalls(io).length, 0);
+    if (persist) {
+      await begin(pi);
+      assert.equal((await waitDetails(pi, receiptId)).details.waiting, false);
+    } else await assert.rejects(waitDetails(pi, receiptId), /真实首报/);
+    assert.equal(pi.messages.filter(item => item.options.triggerTurn).length, 1);
+  });
+});
+
+test('fixture: an explicit durable detail wait resumes only its exact existing action once', async t => {
+  for (const abandoned of [false, true]) await t.test(abandoned ? 'abandoned branch' : 'active branch', async t => {
+    const f = fixture(t);
+    const pi = fakePi(f.dir);
+    const io = fakeIO([receipt()]);
+    install(t, f, pi, io);
+    await pi.emit('session_start');
+    await begin(pi);
+    await waitDetails(pi, receiptId);
+    await pi.emit('session_shutdown');
+    const resumed = fakePi(f.dir, { entries: structuredClone(pi.entries) });
+    install(t, f, resumed, io);
+    if (abandoned) resumed.manager.getBranch = () => resumed.entries.filter(entry => entry.customType !== 'ci-observer-details-wait');
+    await resumed.emit('session_start', { reason: 'resume' });
+    io.rows.push(receipt('session-a', { receipt_id: idFor(2), payload: { ...receipt().payload, action: 'job_details', run_id: 92 } }));
+    io.rows.push(receipt('session-a', { receipt_id: idFor(3), payload: { ...receipt().payload, action: 'job_details', job: '@target', detail_kind: 'target_binding', tested_sha: 'b'.repeat(40) } }));
+    io.rows.push(receipt('session-a', { receipt_id: idFor(4), payload: { ...receipt().payload, action: 'job_details', detail_kind: 'logs' } }));
+    writeFileSync(f.db, 'three detail receipts committed');
+    io.event();
+    await until(() => resumed.messages.length === 3, 'detail information and exact continuation');
+    assert.equal(resumed.messages.find(item => item.message.details.detailKind === 'target_binding').options.triggerTurn, false);
+    const wakes = resumed.messages.filter(item => item.options.triggerTurn);
+    assert.equal(wakes.length, abandoned ? 0 : 1);
+    if (!abandoned) {
+      assert.equal(wakes[0].message.details.continuationOf, receiptId);
+      assert.equal(wakes[0].message.details.actionIdentity.run_id, 91);
+      assert.ok(!wakes[0].message.content.includes('ci_observer_begin_receipt'));
+    }
+    await resumed.emit('session_shutdown');
+    const again = fakePi(f.dir, { entries: structuredClone(resumed.entries) });
+    install(t, f, again, io);
+    await again.emit('session_start', { reason: 'resume' });
+    assert.equal(again.messages.length, 0);
+  });
+});
+
+test('fixture: only the known Release Full ready action is enabled, not arbitrary future actions', async t => {
+  const f = fixture(t);
+  const pi = fakePi(f.dir);
+  const payload = {
+    ...receipt().payload, action: 'release_full_ready', workflow: '.github/workflows/release-candidate.yml',
+    provenance: 'release-intent', tested_sha: 'a'.repeat(40), target_unknown: false, conclusion: null,
+  };
+  const candidates = [payload, ...[
+    { action: 'gate_check' }, { action: 'arbitrary_target_update' }, { provenance: 'source_only' },
+    { workflow: '.github/workflows/merge-gate.yml' }, { target_unknown: true },
+    { tested_sha: 'b'.repeat(40) }, { conclusion: 'failure' }, { job: '@terminal' },
+  ].map(patch => ({ ...payload, ...patch }))];
+  const io = fakeIO(candidates.map((payload, index) => receipt('session-a', { receipt_id: idFor(index + 1), payload })));
+  install(t, f, pi, io);
+  await pi.emit('session_start');
+  assert.equal(pi.messages.length, 1);
+  assert.equal(pi.messages[0].message.details.actionIdentity.action, 'release_full_ready');
+  assert.equal(pi.messages[0].options.triggerTurn, true);
+});
+
+test('fixture: core attribution cause keys accept only the exact commit/PR namespace', async t => {
+  const f = fixture(t);
+  const pi = fakePi(f.dir);
+  const payload = { ...receipt().payload, action: 'attribution', commit: 'c'.repeat(40), pr: 22 };
+  payload.job = `@attribution:${payload.commit}:${payload.pr}`;
+  const io = fakeIO([
+    receipt('session-a', { payload }),
+    receipt('session-a', { receipt_id: secondId, payload: { ...payload, pr: 23 } }),
+  ]);
+  install(t, f, pi, io);
+  await pi.emit('session_start');
+  assert.equal(pi.messages.length, 1);
+  assert.equal(pi.messages[0].message.details.actionIdentity.job, payload.job);
+});
+
+test('fixture: ambiguous begin I/O re-reads the exact receipt before at most one idempotent resubmission', async t => {
+  for (const mode of ['committed-output-lost', 'committed-output-overflow', 'busy-before-commit', 'readback-unavailable', 'timeout', 'success-without-ack']) {
+    await t.test(mode, async t => {
+      const f = fixture(t);
+      const pi = fakePi(f.dir);
+      let writes = 0;
+      const io = fakeIO([receipt()], { response: (verb, _recipient, call) => {
+        if (verb === 'inbox' && call.args.includes('--receipt') && writes && mode === 'readback-unavailable') throw new Error('unknown outcome');
+        if (verb !== 'ack') return;
+        writes++;
+        if (mode.startsWith('committed-')) {
+          Object.assign(io.rows[0], { state: 'acked', acked_at: ackedAt });
+          throw Object.assign(new Error('output lost after commit'), { code: mode.endsWith('overflow') ? 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' : 'EIO' });
+        }
+        if (mode === 'success-without-ack') return '';
+        if (mode === 'timeout') throw Object.assign(new Error('timed out'), { killed: true });
+        if (writes === 1) throw new Error('sqlite busy before commit');
+      } });
+      install(t, f, pi, io);
+      await pi.emit('session_start');
+      const firstCall = io.calls.length;
+      if (['readback-unavailable', 'timeout', 'success-without-ack'].includes(mode)) await assert.rejects(begin(pi));
+      else assert.equal((await begin(pi)).details.ackedAt, ackedAt);
+      const commands = io.calls.slice(firstCall);
+      assert.ok(commands.filter(call => call.args.includes('inbox')).every(call => call.args.includes('--receipt') && !call.args.includes('--pending')));
+      const indices = commands.flatMap((call, index) => call.args.includes('ack') ? [index] : []);
+      assert.ok(indices.length >= 1 && indices.length <= 2);
+      if (indices.length === 2) assert.ok(commands.slice(indices[0] + 1, indices[1]).some(call => call.args.includes('--receipt') && call.args.includes('inbox')));
+      assert.equal(indices.length, mode.startsWith('committed-') || mode === 'readback-unavailable' ? 1 : 2);
+      assert.ok(commands.length <= 7);
+      if (mode.startsWith('committed-')) assert.equal(io.rows[0].acked_at, ackedAt);
+    });
+  }
+});
+
+test('real producer duplicate replay stays visible information with owner proof, no begin or restart wake', async t => {
+  const f = fixture(t);
+  rmSync(f.db);
+  const run = promisify(nativeExecFile);
+  const { stdout } = await run('python3', ['-B', '-c', `
+import json,sys
+sys.path.insert(0,sys.argv[1])
+from test_release_duplicates import Exchange,REPO
+from store import Store
+from github import API
+from observer import Observer
+s=Store(sys.argv[2]);s.configure(REPO,'session-a')
+w=Exchange();o=Observer(s,API(s,w));o.pump=lambda:None
+assert o.process(w.run,w.jobs,True)
+print(json.dumps(s.inbox('session-a')))
+s.close()
+`, here, f.db], { timeout: 10000 });
+  const rows = JSON.parse(stdout);
+  assert.equal(rows.length, 1);
+  const pi = fakePi(f.dir);
+  const io = fakeIO(rows);
+  install(t, f, pi, io);
+  await pi.emit('session_start');
+  assert.equal(pi.messages.length, 1);
+  const { message, options } = pi.messages[0];
+  const data = dataFor(message);
+  assert.equal(options.triggerTurn, false);
+  assert.equal(data.action, 'terminal');
+  assert.equal(data.conclusion, 'failure');
+  assert.equal(data.investigation, false);
+  assert.equal(data.release_duplicate.owner_run_id, 10);
+  assert.equal(data.release_duplicate.owner_url, 'https://github.com/owner/project/actions/runs/10');
+  assert.equal(data.release_duplicate.provenance, 'native-release-owner-v1');
+  assert.equal(data.release_duplicate.admission_job_id, 21);
+  assert.equal(data.release_duplicate.status_creator_id, 41898282);
+  assert.ok(!message.content.includes('ci_observer_begin_receipt'));
+  await assert.rejects(begin(pi, { receiptId: rows[0].receipt_id }), /不需要另行开始处理/);
+  assert.equal(ackCalls(io).length, 0);
+  await pi.emit('session_shutdown');
+  const resumed = fakePi(f.dir, { entries: structuredClone(pi.entries) });
+  install(t, f, resumed, io);
+  await resumed.emit('session_start');
+  assert.equal(resumed.messages.length, 0);
+
+  for (const change of [{ owner_url: 'https://github.com/other/project/actions/runs/10' },
+    { run_id: 12 }, { candidate_tree: 'f'.repeat(40) }, { provenance: 'unverified' }, { status_creator_id: 7 }, { owner_status: {} }]) {
+    const forged = structuredClone(rows[0]);
+    Object.assign(forged.payload.release_duplicate, change);
+    const other = fakePi(f.dir);
+    const badIO = fakeIO([forged]);
+    install(t, f, other, badIO);
+    await other.emit('session_start');
+    assert.equal(other.messages.length, 1, 'a fake duplicate cannot hide an ordinary terminal');
+    assert.equal(other.messages[0].options.triggerTurn, true);
+    assert.ok(other.messages[0].message.content.includes('ci_observer_begin_receipt'));
+    assert.equal(dataFor(other.messages[0].message).release_duplicate, undefined);
+    await other.emit('session_shutdown');
+  }
+});
+
 test('real offline Python ABI/OS watcher with fixture Pi API: workflow/tag delivery, ack, restart and quiescence', async t => {
   const f = fixture(t);
   rmSync(f.db);
   const run = promisify(nativeExecFile);
-  const seed = async code => run('python3', ['-B', '-c', `import sys\nsys.path.insert(0,sys.argv[1])\nfrom store import Store, Key\ns=Store(sys.argv[2])\n${code}\ns.close()`, here, f.db], { timeout: 10000 });
-  await seed("s.configure('example/project','session-a')");
+  const seed = async (code, timeoutMs = 10000) => run('python3', ['-B', '-c', `import sys\nsys.path.insert(0,sys.argv[1])\nfrom store import Store, Key\ns=Store(sys.argv[2])\n${code}\ns.close()`, here, f.db], { timeout: timeoutMs });
+  // The 10 s seed watchdog expired under load before receiver startup; only history setup gets 60 s.
+  const { stdout: historyOutput } = await seed(`
+s.configure('example/project','session-a')
+import json
+from store import now
+with s.db:
+    # Include the WITH-prefixed INSERT in the same transaction as both dependent tables.
+    s.db.execute('BEGIN IMMEDIATE')
+    s.db.execute("""
+        WITH RECURSIVE history(run_id) AS (
+            VALUES(1000) UNION ALL SELECT run_id+1 FROM history WHERE run_id<5999
+        )
+        INSERT INTO actions(id,repo,sha,run_id,attempt,job,kind,payload,created_at)
+        SELECT printf('%064x',run_id),:repo,:sha,run_id,1,'@terminal','terminal',
+               json_object('repo',:repo,'sha',:sha,'run_id',run_id,'attempt',1,
+                           'action','terminal','job','@terminal','body',:body),:stamp
+        FROM history
+    """, dict(repo='example/project',sha='${'a'.repeat(40)}',body='x'*1200,stamp=now()))
+    s.db.execute("""
+        INSERT INTO outbox(action_id,recipient,receipt_id,state,delivered_at,acked_at)
+        SELECT id,'session-a',id,'acked',created_at,created_at FROM actions
+    """)
+    s.db.execute("""
+        INSERT INTO inbox(receipt_id,recipient,payload,delivered_at,acked_at)
+        SELECT o.receipt_id,o.recipient,a.payload,o.delivered_at,o.acked_at
+        FROM outbox o JOIN actions a ON a.id=o.action_id
+    """)
+acked=s.db.execute("""
+    SELECT count(*) FROM actions a JOIN outbox o ON o.action_id=a.id
+    JOIN inbox i ON i.receipt_id=o.receipt_id
+    WHERE o.state='acked' AND o.acked_at IS NOT NULL AND i.acked_at=o.acked_at
+          AND i.delivered_at=o.delivered_at AND i.recipient=o.recipient AND o.recipient='session-a'
+""").fetchone()[0]
+print(json.dumps(dict(
+    counts={table:s.db.execute('SELECT count(*) FROM '+table).fetchone()[0] for table in ('actions','outbox','inbox')},
+    acked=acked,
+    payload_bytes=s.db.execute('SELECT sum(length(CAST(payload AS BLOB))) FROM inbox').fetchone()[0],
+    foreign_key_violations=len(s.db.execute('PRAGMA foreign_key_check').fetchall()),
+)))`, 60000);
+  const history = JSON.parse(historyOutput);
+  assert.deepEqual(history.counts, { actions: 5000, outbox: 5000, inbox: 5000 });
+  assert.equal(history.acked, 5000);
+  assert.equal(history.foreign_key_violations, 0);
+  assert.ok(history.payload_bytes > 4 * 1024 * 1024, 'acknowledged history exceeds the receiver output cap');
+  t.diagnostic(`Verified SQLite ACK history ${JSON.stringify(history)}`);
   const pi = fakePi(f.dir);
   let reads = 0;
+  let running = 0;
+  const commands = [];
   installReceiver(pi.pi, {
     env: { CI_OBSERVER_DB: f.db }, debounceMs: 30,
-    execFile(...args) { if (args[1].includes('inbox')) reads++; return nativeExecFile(...args); },
+    execFile(command, args, options, callback) {
+      commands.push(args);
+      if (args.includes('inbox')) reads++;
+      running++;
+      return nativeExecFile(command, args, options, (...result) => { running--; callback(...result); });
+    },
   });
   t.after(() => pi.emit('session_shutdown'));
   await pi.emit('session_start');
+  assert.deepEqual(pi.notices, [], 'real CLI must implement the bounded inbox ABI');
   await seed(`s.publish(Key('example/project','${'a'.repeat(40)}',91,2,'501'),'first_failure',{'job_id':501,'tests':[]},['session-a'])`);
   await pause(160);
   assert.equal(pi.messages.length, 0);
@@ -580,9 +950,11 @@ test('real offline Python ABI/OS watcher with fixture Pi API: workflow/tag deliv
   assert.equal(tagResult.details.actionIdentity.tag, tagPayload.tag);
   assert.equal(tagResult.details.toolCallId, 'call_fixture|fc_fixture');
   await pause(250);
+  await until(() => running === 0, 'real CLI commands settled before quiescence check', 5000);
   const settledReads = reads;
   await pause(300);
   assert.equal(reads, settledReads, 'CLI inbox reads must not recursively trigger themselves');
+  assert.ok(commands.filter(args => args.includes('inbox')).every(args => args.includes('--pending') || args.includes('--receipt')));
   await pi.emit('session_shutdown');
   const resumed = fakePi(f.dir, { entries: structuredClone(pi.entries) });
   installReceiver(resumed.pi, { env: { CI_OBSERVER_DB: f.db } });
