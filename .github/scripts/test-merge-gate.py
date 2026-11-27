@@ -367,6 +367,34 @@ class NamedJobTests(unittest.TestCase):
         self.assertEqual(weights, sorted(weights, reverse=True))
         self.assertLessEqual(max(weights), 300)
 
+    def test_concurrent_guard_weights_keep_exact_public_pass_observations(self):
+        budget = self.gate.load_weights()
+        key = "race:agentworkspace/internal/store"
+        provenance = budget["provenance"]
+        artifacts = {row["id"]: row for row in provenance["artifacts"]}
+        cases = (
+            ("TestTaskSubmissionConcurrentReplayAndCompetition", 11.96, 15146795956, 140095991478,
+             "store-12-run-0", "2026-11-26T18:36:22.352097001Z",
+             "sha256:1a4e431c46e860b0456dbc3034005e81c35ccb48548a3d2d20246b3a42589c60"),
+            ("TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead", 11.94, 15146851832, 140095991591,
+             "store-22-run-0", "2026-11-26T18:46:09.031847155Z",
+             "sha256:21d3c1ddbf60e8f24f3d88e76090098d96e7cceb8026cf2835c8a0aa22db2a11"),
+            ("TestThreadDecisionAcknowledgementIsExplicitAndDurable", 6.55, 15146645277, 140095991734,
+             "store-11-run-0", "2026-11-26T18:37:50.434344995Z",
+             "sha256:f03bf524e7cec8838c928261acc522f1c7b642ce023ce2748706f038f2dc6175"),
+        )
+        for name, seconds, artifact, job, invocation, time, digest in cases:
+            with self.subTest(name=name):
+                self.assertEqual(budget["weights"][key].get(name), seconds)
+                self.assertEqual(provenance["observations"][key][name],
+                                 {"artifact": artifact, "invocation": invocation, "time": time})
+                self.assertEqual(artifacts[artifact]["digest"], digest)
+                self.assertEqual(artifacts[artifact]["job_id"], job)
+                self.assertEqual(artifacts[artifact]["job_url"], provenance["run_url"].split("/attempts/")[0] + f"/job/{job}")
+        self.assertEqual({key: set(names) for key, names in budget["weights"].items()},
+                         {key: set(names) for key, names in provenance["observations"].items()})
+        self.assertEqual(provenance["run_conclusion"], "failure")
+
     def test_full_race_keeps_batches_and_has_no_duplicate_named_jobs(self):
         selected = self.selected()
         selected["race_full"] = ["agentworkspace/internal/platform"]
@@ -411,6 +439,108 @@ class NamedJobTests(unittest.TestCase):
         duplicate[1].update(names=["TestA"], required=["TestA"])
         with self.assertRaises(ValueError):
             gate.finalize({**plan, "tasks": duplicate}, needs, bad)
+
+
+class ConcurrentGuardTests(unittest.TestCase):
+    package = "agentworkspace/internal/store"
+    submission = "TestTaskSubmissionConcurrentReplayAndCompetition"
+    answer = "TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead"
+    acknowledgement = "TestThreadDecisionAcknowledgementIsExplicitAndDurable"
+
+    def setUp(self):
+        self.gate = load("merge-gate")
+        self.manifest = self.gate.load_manifest(HERE / "merge-gate-manifest.json")
+
+    def routed(self, path):
+        return {name for rule in self.manifest["rules"]
+                if any(self.gate.matches(path, pattern) for pattern in rule["paths"])
+                for name in rule.get("tests", {}).get(self.package, [])}
+
+    def selection(self, paths):
+        # Isolate policy routing with equal ordinary/race compiled inputs, not product execution.
+        directories = ("internal/store", "internal/platform", "internal/httpapi", "internal/coordination", "cmd/workspace")
+        packages = {"agentworkspace/" + directory: directory for directory in directories}
+        owners = {path: "agentworkspace/" + str(Path(path).parent) for path in paths if path.endswith(".go")}
+        files = {path: {package} for path, package in owners.items()}
+        mode = {"files": files, "reverse": {package: {package + ".test"} for package in packages},
+                "roots": {package: package + ".test" for package in packages},
+                "nodes": {package: {package} for package in packages}, "inputs": {package: set() for package in packages}}
+        graph = (packages, {}, files, set(), {False: mode, True: mode})
+        sha = "b" * 40
+        with mock.patch.object(self.gate, "git", return_value=sha), \
+                mock.patch.object(self.gate.routing, "changed_paths", return_value=paths), \
+                mock.patch.object(self.gate.routing, "git", return_value=b""), \
+                mock.patch.object(self.gate, "graph", return_value=graph):
+            selected = self.gate.select(HERE.parents[1], "a" * 40, sha, self.manifest)
+        return selected, self.gate.tasks(selected)
+
+    def test_submission_business_schema_and_lock_paths_route_named_race(self):
+        for path in ("internal/store/task_submission.go", "internal/store/task_submission_test.go",
+                     "internal/store/task_submission_scope_test.go", "internal/store/idempotency.go",
+                     "internal/store/migrations.go", "internal/store/migrations_task_successor_registration_test.go",
+                     "internal/store/task_schema_test.go", "internal/store/store.go"):
+            with self.subTest(path=path):
+                self.assertIn(self.submission, self.routed(path))
+
+    def test_thread_answer_ack_wake_and_entry_paths_route_named_race(self):
+        common = ("internal/store/decision_thread_answer.go", "internal/store/decision_thread_wake.go",
+                  "internal/store/decision_thread_ack.go", "internal/store/decision_thread_answer_http_test.go",
+                  "internal/store/decision_thread_ack_test.go", "internal/store/decision_thread_lifecycle_test.go",
+                  "internal/store/decision_answer.go", "internal/store/store.go",
+                  "internal/coordination/decision_answer.go", "internal/coordination/decision_answer_test.go")
+        paths = {
+            self.answer: common + ("internal/httpapi/decision_answer.go", "internal/httpapi/decision_answer_test.go",
+                                   "internal/platform/decision_answer.go"),
+            self.acknowledgement: common + ("internal/httpapi/member_thread_decision_ack.go",
+                                            "internal/platform/member_thread_decision_ack.go"),
+        }
+        for name, routes in paths.items():
+            for path in routes:
+                with self.subTest(name=name, path=path):
+                    self.assertIn(name, self.routed(path))
+
+    def test_six_historical_rows_select_top_level_race_without_full_store(self):
+        submission_paths = ["internal/store/migrations.go", "internal/store/migrations_task_successor_registration_test.go"]
+        answer_paths = ["internal/store/decision_thread_answer.go", "internal/store/decision_thread_wake.go",
+                        "internal/httpapi/decision_answer.go"]
+        ack_paths = ["internal/store/decision_thread_ack.go", "internal/store/decision_thread_lifecycle_test.go",
+                     "internal/store/decision_thread_answer.go", "internal/store/store.go"]
+        # Source-record obligations only; this does not replay the historical SQLite failures.
+        cases = [(45810094503, 139907489295, self.submission + suffix, submission_paths)
+                 for suffix in ("/same-key", "/different-keys", "/no-key", "")]
+        cases += [(44572131767, 135756059976, self.answer, answer_paths),
+                  (44572131767, 135756060028, self.acknowledgement, ack_paths)]
+        for run, job, observed, paths in cases:
+            with self.subTest(run=run, job=job, observed=observed):
+                name = observed.split("/", 1)[0]
+                evidence = f"https://github.com/PeterFile/ct0x/actions/runs/{run}/job/{job}"
+                selected, tasks = self.selection(paths)
+                self.assertIn(name, selected["race"].get(self.package, []))
+                self.assertTrue(any(evidence in rule.get("evidence", []) and name in rule.get("tests", {}).get(self.package, [])
+                                    for rule in self.manifest["rules"]))
+                race = [task for task in tasks if task.get("race") and task.get("package") == self.package]
+                self.assertTrue(race)
+                self.assertTrue(all(task["names"] is not None for task in race))
+                self.assertEqual(sum((self.gate.Counter(task["names"]) for task in race), self.gate.Counter()),
+                                 self.gate.Counter(selected["race"][self.package]))
+                self.assertTrue(all(task["required"] == task["names"] and task["worker"] is None for task in race))
+                self.assertEqual(selected["unresolved"], [])
+
+    def test_manifest_runs_three_guards_but_unrelated_docs_stay_light(self):
+        selected, tasks = self.selection([".github/scripts/merge-gate-manifest.json"])
+        names = {self.submission, self.answer, self.acknowledgement}
+        self.assertEqual(set(selected["race"].get(self.package, [])), names)
+        self.assertEqual({name for task in tasks if task.get("race") and task.get("package") == self.package
+                          for name in task["names"]}, names)
+        self.assertEqual(selected["race_full"], [])
+        for path in ("docs/design.md", "README.md"):
+            with self.subTest(path=path):
+                selected, tasks = self.selection([path])
+                self.assertEqual(selected["packages"], [])
+                self.assertEqual(selected["race"], {})
+                self.assertEqual(selected["ordinary_required"], {})
+                self.assertEqual(tasks, [{"unit": "identity-diff", "kind": "identity"}])
+                self.assertEqual(self.routed(path), set())
 
 
 class ManifestTests(unittest.TestCase):

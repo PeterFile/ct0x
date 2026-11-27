@@ -75,6 +75,50 @@
       }
     },
     {
+      "id": "task-submission-concurrency",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/45810094503/job/139907489295"],
+      "paths": [
+        "internal/store/task_submission*.go",
+        "internal/store/idempotency*.go",
+        "internal/store/*migration*",
+        "internal/store/*schema*",
+        "internal/store/*.sql",
+        "internal/store/store.go",
+        ".github/scripts/merge-gate-manifest.json"
+      ],
+      "tests": {"agentworkspace/internal/store": ["TestTaskSubmissionConcurrentReplayAndCompetition"]}
+    },
+    {
+      "id": "decision-thread-answer-concurrency",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/44572131767/job/135756059976"],
+      "paths": [
+        "internal/store/decision_thread_*.go",
+        "internal/store/decision_answer*.go",
+        "internal/store/store.go",
+        "internal/httpapi/decision_answer*.go",
+        "internal/coordination/decision_answer*.go",
+        "internal/platform/decision_answer*.go",
+        "internal/domain/decision_answer*.go",
+        ".github/scripts/merge-gate-manifest.json"
+      ],
+      "tests": {"agentworkspace/internal/store": ["TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead"]}
+    },
+    {
+      "id": "decision-thread-ack-concurrency",
+      "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/44572131767/job/135756060028"],
+      "paths": [
+        "internal/store/decision_thread_*.go",
+        "internal/store/decision_answer*.go",
+        "internal/store/store.go",
+        "internal/httpapi/member_thread_decision_ack*.go",
+        "internal/coordination/decision_answer*.go",
+        "internal/platform/member_thread_decision_ack*.go",
+        "internal/domain/decision_answer*.go",
+        ".github/scripts/merge-gate-manifest.json"
+      ],
+      "tests": {"agentworkspace/internal/store": ["TestThreadDecisionAcknowledgementIsExplicitAndDurable"]}
+    },
+    {
       "id": "workspace-assignment-prerequisites",
       "evidence": ["https://github.com/PeterFile/ct0x/actions/runs/44088192148/job/134063669160", "https://github.com/PeterFile/ct0x/actions/runs/44166091468/job/134332419578"],
       "paths": ["internal/workspacefs/", "internal/store/workspace*", "internal/platform/member_workspace*", "internal/httpapi/member_workspace*", "cmd/workspace/"],

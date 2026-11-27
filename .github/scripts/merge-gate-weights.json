@@ -21,6 +21,8 @@
       {"id": 15146957046, "name": "full-trial-a-r1-45873235028-1-timing-shard-9", "digest": "sha256:efc13998f6a731d7126214f5fbc00c144acffc631ab66349c7c5dcec32184c9c", "job_id": 140095991689, "url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/artifacts/15146957046", "job_url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/job/140095991689"},
       {"id": 15146889210, "name": "full-trial-a-r1-45873235028-1-timing-shard-22", "digest": "sha256:800a52a6a044f0a5e58964a6b05df6d45d8ea391e35f687e35dc2e0a44dbbb5f", "job_id": 140095993973, "url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/artifacts/15146889210", "job_url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/job/140095993973"},
       {"id": 15146851832, "name": "full-trial-a-r1-45873235028-1-timing-shard-15", "digest": "sha256:21d3c1ddbf60e8f24f3d88e76090098d96e7cceb8026cf2835c8a0aa22db2a11", "job_id": 140095991591, "url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/artifacts/15146851832", "job_url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/job/140095991591"},
+      {"id": 15146795956, "name": "full-trial-a-r1-45873235028-1-timing-shard-13", "digest": "sha256:1a4e431c46e860b0456dbc3034005e81c35ccb48548a3d2d20246b3a42589c60", "job_id": 140095991478, "url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/artifacts/15146795956", "job_url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/job/140095991478"},
+      {"id": 15146645277, "name": "full-trial-a-r1-45873235028-1-timing-shard-7", "digest": "sha256:f03bf524e7cec8838c928261acc522f1c7b642ce023ce2748706f038f2dc6175", "job_id": 140095991734, "url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/artifacts/15146645277", "job_url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/job/140095991734"},
       {"id": 15146064668, "name": "full-trial-a-r1-45873235028-1-timing-shard-21", "digest": "sha256:72c500c1ef2aa0b213f9ccd47e2292c4c99ce557fc7620f50cf1412a7f67276f", "job_id": 140095993943, "url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/artifacts/15146064668", "job_url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/job/140095993943"},
       {"id": 15145590196, "name": "full-trial-a-r1-45873235028-1-timing-shard-4", "digest": "sha256:f2d81674c4d61010974c9072affe16ed08ee00a5805128e874b4b3deb405208e", "job_id": 140095991436, "url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/artifacts/15145590196", "job_url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/job/140095991436"},
       {"id": 15145558258, "name": "full-trial-a-r1-45873235028-1-timing-shard-11", "digest": "sha256:c10e37a081c2ce5d69c87415a3eea3daf6bed680e790e3d3593997aab35364e5", "job_id": 140095991509, "url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/artifacts/15145558258", "job_url": "https://github.com/PeterFile/ct0x/actions/runs/45873235028/job/140095991509"},
@@ -65,7 +67,10 @@
         "TestQueueClaimRacesAcrossHandles": {"artifact": 15146064668, "invocation": "store-54-run-0", "time": "2026-11-26T19:03:14.350754645Z"},
         "TestWorkspaceOperationUnresolvedOutcomesAndRecovery": {"artifact": 15147210935, "invocation": "store-24-run-0", "time": "2026-11-26T18:50:45.114130753Z"},
         "TestTaskWorkInputMutationUncertainty": {"artifact": 15146957046, "invocation": "store-51-run-0", "time": "2026-11-26T18:49:52.145768874Z"},
-        "TestTaskWorkInputEffectKeys": {"artifact": 15146851832, "invocation": "store-21-run-0", "time": "2026-11-26T18:45:50.046280207Z"}
+        "TestTaskWorkInputEffectKeys": {"artifact": 15146851832, "invocation": "store-21-run-0", "time": "2026-11-26T18:45:50.046280207Z"},
+        "TestTaskSubmissionConcurrentReplayAndCompetition": {"artifact": 15146795956, "invocation": "store-12-run-0", "time": "2026-11-26T18:36:22.352097001Z"},
+        "TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead": {"artifact": 15146851832, "invocation": "store-22-run-0", "time": "2026-11-26T18:46:09.031847155Z"},
+        "TestThreadDecisionAcknowledgementIsExplicitAndDurable": {"artifact": 15146645277, "invocation": "store-11-run-0", "time": "2026-11-26T18:37:50.434344995Z"}
       },
       "race:agentworkspace/internal/httpapi": {
         "TestDispatchRequestHTTPPreservesRealUnknownCancelAndResourceEvidence": {"artifact": 15148265310, "invocation": "httpapi-6-run-0", "time": "2026-11-26T19:04:46.208390707Z"},
@@ -112,7 +117,10 @@
       "TestQueueClaimRacesAcrossHandles": 52.57,
       "TestWorkspaceOperationUnresolvedOutcomesAndRecovery": 54.6,
       "TestTaskWorkInputMutationUncertainty": 184.76,
-      "TestTaskWorkInputEffectKeys": 29.48
+      "TestTaskWorkInputEffectKeys": 29.48,
+      "TestTaskSubmissionConcurrentReplayAndCompetition": 11.96,
+      "TestThreadDecisionAnswerHTTPAliasesAndHistoricalRead": 11.94,
+      "TestThreadDecisionAcknowledgementIsExplicitAndDurable": 6.55
     },
     "race:agentworkspace/internal/httpapi": {
       "TestDispatchRequestHTTPPreservesRealUnknownCancelAndResourceEvidence": 9.65,
