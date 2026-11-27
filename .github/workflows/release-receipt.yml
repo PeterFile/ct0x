@@ -1,0 +1,46 @@
+name: Release machine receipt
+run-name: RC receipt ${{ fromJSON(inputs.receipt).run_id }} attempt ${{ fromJSON(inputs.receipt).run_attempt }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      receipt:
+        description: 仅接受本地重新审计后与同次 Full 绑定的三场景安全归一化回执
+        type: string
+        required: true
+      machine_signature:
+        description: 本机终审后由已加载且已审阅的可选公钥签署的 SSHSIG；未配置时留空
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+  statuses: read
+
+jobs:
+  intake:
+    name: Release receipt intake
+    if: ${{ github.ref == 'refs/heads/master' && github.actor_id == github.event.repository.owner.id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # Read bounded JSON from the native event file, never shell-interpolate inputs.
+      - name: Authenticate immutable owner ID and canonical run attempt
+        id: receipt
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 -B .github/scripts/release-evidence.py intake --output "$RUNNER_TEMP/release-intake"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-machine-${{ steps.receipt.outputs.owner_run_id }}-${{ steps.receipt.outputs.owner_attempt }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/release-intake/receipt.json
+          if-no-files-found: error
+          retention-days: 90
