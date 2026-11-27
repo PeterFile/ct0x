@@ -241,6 +241,47 @@ def _require_run_state(run, attempt, *, completed):
           "owner 不处于所需的原生状态，或 attempt 已过期")
 
 
+def require_run_state(api, run, attempt, *, completed=False):
+    """Corroborate only a first-attempt queued summary; retries stay strict."""
+    check(type(completed) is bool, "completed 模式必须显式指定布尔值")
+    if completed or attempt != 1 or run.get("status") != "queued":
+        _require_run_state(run, attempt, completed=completed)
+        return
+    check(run.get("run_attempt") == 1 and run.get("conclusion") is None, "queued owner 已停止或 attempt 过期")
+    core.native_candidate(run, api.repo)
+    run_id = core.number(run.get("id"))
+    jobs = api.jobs(run_id, 1)  # Fresh authenticated attempt jobs, never inherited/cached summaries.
+    current = api.run(run_id, 1)
+    core.native_candidate(current, api.repo)
+    fields = ("id", "run_attempt", "path", "event", "head_branch", "head_sha", "head_commit", "run_started_at")
+    check(all(run.get(key) == current.get(key) for key in fields)
+          and current.get("status") in ("queued", "in_progress") and current.get("conclusion") is None,
+          "queued owner 与原生当前 attempt 身份或状态不符")
+    admissions = [job["name"] for job in jobs if job["name"] == "Release admission"
+                  or re.fullmatch(r"Release admission [0-9a-f]{40}", job["name"])]
+    check(len(admissions) == 1, "queued owner 缺少唯一原生 admission")
+    producers = core.require_jobs(jobs, run_id, 1, ["Release normalize", admissions[0]])
+    boundary = core.timestamp(current.get("run_started_at"))
+    admitted = max(core.timestamp(job.get("completed_at")) for job in producers)
+    names = {"Release clients", "Release candidate binary", "Release Full evidence", "Release machine evidence",
+             "Release candidate evidence", "Release candidate verdict"}
+    names.update("Release Full / " + name for name in (
+        "Go ordinary and remaining race", "Go workspace race", "Go vet and CI gates", "Go benchmarks", "Full suite evidence"))
+    matrix = core.load_script("ci-plan").shard_matrix()
+    names.update(f"Release Full / Go {item['profile']} worker {item['worker']}" for item in matrix["include"])
+    head = native_head(api, current)["sha"]
+    check(any(job["name"] in names and job.get("status") == "in_progress" and job.get("conclusion") is None
+              and job.get("completed_at") is None and job.get("head_sha") in (current["head_sha"], head)
+              and job.get("head_branch") == current["head_branch"]
+              and boundary <= core.timestamp(job.get("created_at")) <= core.timestamp(job.get("started_at"))
+              and admitted <= core.timestamp(job.get("started_at")) for job in jobs),
+          "queued owner 缺少本次 admission 后同 head 的原生运行中作业")
+    latest = api.run(run_id)
+    check(all(latest.get(key) == current.get(key) for key in fields)
+          and latest.get("status") in ("queued", "in_progress") and latest.get("conclusion") is None,
+          "读取原生活动作业后 owner 已停止或 attempt 改变")
+
+
 class AdmissionAPI(core.GitHub):
     def authorize_retry(self, run_id, attempt, *, completed=False):
         check(attempt > 1, "不是原生重跑 attempt")
@@ -319,8 +360,8 @@ def read_intent(api, run_id, attempt, historical=False):
 
 def guard(api, run_id, attempt, *, completed=False):
     """Read-only provenance check; completed mode revalidates success, never starts work."""
-    _require_run_state(api.run(run_id), attempt, completed=completed)
-    _require_run_state(api.run(run_id, attempt), attempt, completed=completed)
+    require_run_state(api, api.run(run_id), attempt, completed=completed)
+    require_run_state(api, api.run(run_id, attempt), attempt, completed=completed)
     intent = read_intent(api, run_id, attempt)
     check(canonical_status(api, api.repo, intent["sha"]) == run_id, "当前 run 不是 canonical owner")
     jobs = api.jobs(run_id, attempt)
@@ -333,7 +374,7 @@ def guard(api, run_id, attempt, *, completed=False):
             api.authorize_retry(run_id, attempt, completed=True)
         else:
             api.authorize_retry(run_id, attempt)
-    _require_run_state(api.run(run_id), attempt, completed=completed)
+    require_run_state(api, api.run(run_id), attempt, completed=completed)
     return intent
 
 

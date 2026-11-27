@@ -391,6 +391,22 @@ class SubmissionTests(unittest.TestCase):
                 self.assertTrue((claim / "submission-result.json").is_file())
 
 
+class ActiveAdmissionTests(unittest.TestCase):
+    def test_native_machine_entry_uses_corroborated_first_owner_activity(self):
+        machine = load()
+        fixtures = machine.core.load_script("test-release-control")
+        api = fixtures.queued_owner("Release Full / Go ordinary and remaining race")
+        try:
+            self.assertEqual(machine.ensure_active(api, 10, 1), api.intent)
+        except ValueError as error:
+            self.fail("machine entry must accept authenticated queued-owner native activity: " + str(error))
+        api.job_rows.pop()
+        with self.assertRaises(ValueError):
+            machine.ensure_active(api, 10, 1)
+        self.assertTrue(all(method == "GET" for method, _ in api.calls))
+        self.assertEqual(api.posts, 0)
+
+
 class HostAdapterTests(unittest.TestCase):
     def test_source_manifest_uses_private_binding_and_verifies_auxiliary_bundle(self):
         machine = load()
