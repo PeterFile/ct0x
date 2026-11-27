@@ -647,8 +647,13 @@ def validation_jobs(observer, pr, native):
         require(type(metadata.get("schema")) is int and metadata["schema"] == 1 and metadata.get("repo") == observer.repo and
                 metadata.get("head") == pr["head"]["sha"])
         members, targets = metadata.get("membership"), metadata.get("targets")
-        require(isinstance(members, list) and isinstance(targets, list) and 0 < len(members) == len(targets) <= 50000 and
+        require(isinstance(members, list) and isinstance(targets, list) and len(members) == len(targets) <= 50000 and
                 all(isinstance(row, dict) for row in [*members, *targets]))
+        if not members:
+            require(positive(metadata.get("pr")) and metadata.get("reason_code") == "source_head_intersection" and
+                    metadata.get("result") == "pending" and metadata.get("failed_prs") == [] and metadata.get("pending_prs") == [] and
+                    check.get("status") == "in_progress" and check.get("conclusion") is None,
+                    "空历史交集必须是无失败或待定目标的 pending 发布投影")
         numbers = [member.get("pr") for member in members]
         require(all(positive(number) for number in numbers) and len(set(numbers)) == len(numbers))
         # An old source-owned publication authenticates its own cohort, not today's PRs or refs.

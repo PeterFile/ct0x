@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -28,7 +29,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from github import API, Reply, Unknown
 from observer import Observer
-from merge_reports import parse_check, reconcile_publisher, verify_evidence
+from merge_reports import parse_check, publish_target, reconcile_publisher, validation_jobs, verify_evidence
 from store import Store
 
 REPO = "PeterFile/ct0x"
@@ -1071,6 +1072,101 @@ class IntersectionProtocol(unittest.TestCase):
                 custom["output"]["summary"] = json.dumps(metadata)
             with self.subTest(changed=changed):
                 self.hosted_echo_replay(historical=True, mutate=mutate)
+
+    def empty_cohort_fixture(self, source_event=False):
+        path = producer_file()
+        if path is None:
+            self.skipTest("Authentic empty projection requires the publisher composer")
+        spec = importlib.util.spec_from_file_location("empty_cohort_publisher", path)
+        publisher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(publisher)
+        world, echo, custom, _, issuer = self.echo_fixture()
+        previous = copy.deepcopy(world.prs[7])
+        previous.update(number=8, state="closed")
+        previous["head"]["ref"] = "historical/sibling"
+        if source_event:
+            issuer.update(event="pull_request_target", head_sha=HEAD, head_branch=previous["head"]["ref"],
+                head_repository=previous["head"]["repo"], pull_requests=[dict(number=8,
+                    head=dict(sha=HEAD, ref=previous["head"]["ref"], repo=dict(id=previous["head"]["repo"]["id"],
+                        url="https://api.github.com/repos/" + previous["head"]["repo"]["full_name"])),
+                    base=dict(sha=BASE, ref="master", repo=dict(id=world.repo["id"], url="https://api.github.com/repos/" + REPO)))])
+        metadata = publisher.aggregate(previous, [], [], dict(GITHUB_RUN_ID=str(issuer["id"]),
+            GITHUB_RUN_ATTEMPT=str(issuer["run_attempt"]), MERGE_TRUSTED_WORKFLOW_SHA=BASE))
+        custom.update(status="in_progress", conclusion=None, output=dict(summary=json.dumps(metadata)))
+        echo.update(status="in_progress", conclusion=None, completed_at=None)
+        # Read-only transport: no observer store, SQLite, processes or external API.
+        api = SimpleNamespace(get=lambda path: json.loads(world(path).body),
+            document=lambda path: (json.loads(world(path).body), None), blob=lambda path, limit: world(path).body)
+        observer = SimpleNamespace(repo=REPO, root=ROOT, api=api)
+        return world, echo, custom, metadata, issuer, observer
+
+    def test_empty_historical_composer_projection_preserves_exact_native_proof(self):
+        for source_event in (False, True):
+            with self.subTest(source_event=source_event):
+                world, _, _, metadata, _, observer = self.empty_cohort_fixture(source_event)
+                self.assertEqual((metadata["membership"], metadata["targets"], metadata["result"], metadata["reason_code"]),
+                    ([], [], "pending", "source_head_intersection"))
+                pr, native = world.prs[7], world.native[101]
+                original = copy.deepcopy(world.jobs[101])
+                self.assertEqual(validation_jobs(observer, pr, native), [job for job in original if job["name"] != "Merge gate"])
+                verify_evidence(observer, pr, native, world.metadata["targets"][0]["validation"])
+                self.assertEqual(world.jobs[101], original)
+                self.assertIn(ROOT + "/actions/runs/200", world.calls)
+
+    def test_empty_historical_projection_rejects_malformed_or_terminal_states(self):
+        mutations = [("metadata", changes) for changes in (
+            dict(membership=[details(World().prs[7])]), dict(targets=[details(World().prs[7])]),
+            dict(membership=None), dict(targets=None), dict(membership={}), dict(targets={}),
+            dict(result="success"), dict(result="failure"), dict(result=None),
+            dict(reason_code="source_state_changed"), dict(reason_code=None),
+            dict(failed_prs=[8]), dict(pending_prs=[8]), dict(failed_prs=None), dict(pending_prs=None),
+            dict(pr=True), dict(pr=0), dict(pr=None))]
+        mutations += [("check", changes) for changes in (
+            dict(status="completed", conclusion="success"), dict(status="completed", conclusion="failure"),
+            dict(status="completed", conclusion=None), dict(status="queued"), dict(conclusion="success"), dict(conclusion="failure"))]
+        for kind, changes in mutations:
+            with self.subTest(kind=kind, changes=changes):
+                world, _, custom, metadata, _, observer = self.empty_cohort_fixture()
+                (metadata if kind == "metadata" else custom).update(changes)
+                custom["output"]["summary"] = json.dumps(metadata)
+                with self.assertRaises(Unknown):
+                    validation_jobs(observer, world.prs[7], world.native[101])
+        for conclusion in ("success", "failure"):
+            with self.subTest(terminal=conclusion):
+                world, _, custom, metadata, _, observer = self.empty_cohort_fixture()
+                custom.update(status="completed", conclusion=conclusion)
+                metadata["result"] = conclusion
+                custom["output"]["summary"] = json.dumps(metadata)
+                with self.assertRaises(Unknown):
+                    validation_jobs(observer, world.prs[7], world.native[101])
+
+    def test_empty_historical_projection_keeps_check_and_publisher_authentication(self):
+        mutations = [("job", key, value) for key, value in (
+            ("id", True), ("run_attempt", 1), ("node_id", "wrong"), ("steps", [dict(name="Run code")]), ("runner_id", 0))]
+        mutations += [("check", key, value) for key, value in (
+            ("app", dict(id=True, slug="github-actions")), ("app", dict(id=15368, slug="foreign")),
+            ("external_id", "wrong"), ("id", "140427397549"), ("node_id", "wrong"), ("check_suite", dict(id=True)))]
+        mutations += [("publisher", key, value) for key, value in (
+            ("workflow", NATIVE), ("workflow_sha", HEAD), ("run_id", "0"), ("run_attempt", "2"))]
+        mutations += [("issuer", key, value) for key, value in (
+            ("id", 201), ("event", "push"), ("pull_requests", []), ("head_branch", "wrong"))]
+        for kind, key, value in mutations:
+            with self.subTest(kind=kind, key=key):
+                world, echo, custom, metadata, issuer, observer = self.empty_cohort_fixture(source_event=True)
+                selected = dict(job=echo, check=custom, publisher=metadata["publisher"], issuer=issuer)[kind]
+                selected[key] = value
+                custom["output"]["summary"] = json.dumps(metadata)
+                with self.assertRaises(Unknown):
+                    validation_jobs(observer, world.prs[7], world.native[101])
+
+    def test_empty_historical_projection_never_authorizes_current_delivery(self):
+        for source_event in (False, True):
+            with self.subTest(source_event=source_event):
+                world, _, custom, metadata, issuer, observer = self.empty_cohort_fixture(source_event)
+                with self.assertRaises(Unknown):
+                    parse_check(observer, issuer, world.prs[7], custom)
+                with self.assertRaises(Unknown):
+                    publish_target(observer, issuer, world.reporters[0], world.prs[7], custom, metadata, deliver=True)
 
     def test_historical_same_source_cohort_does_not_need_current_pr_or_branch(self):
         for pending in (False, True):
