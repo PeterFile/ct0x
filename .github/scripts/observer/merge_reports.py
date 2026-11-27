@@ -130,14 +130,52 @@ def run_identity(observer, run, path, workflow_id, run_id, attempt, successful=T
         require(run.get("status") in ("in_progress", "completed"), "发布者尚未开始执行，保持待核实")
 
 
-def publisher_run(observer, run):
+def publisher_policy(observer, run, workflow_sha=None, source_head=None):
+    repository, head_repository = repo_identity(run.get("repository")), repo_identity(run.get("head_repository"))
+    linked = run.get("pull_requests", [])
+    require(isinstance(linked, list))
+    source_event = run.get("event") == "pull_request_target" and (
+        source_head == run["head_sha"] or run.get("head_branch") != "master" or head_repository != repository or
+        any(isinstance(item, dict) and isinstance(item.get("head"), dict) and item["head"].get("sha") == run["head_sha"] for item in linked))
+    if source_event:
+        require(source_head is None or source_head == run["head_sha"], "PR 事件来源与发布的 source head 不符")
+        associated = []
+        require(0 < len(linked) <= 50000)
+        for item in linked:
+            item = mapping(item)
+            head, base = mapping(item.get("head")), mapping(item.get("base"))
+            head_repo, base_repo = mapping(head.get("repo")), mapping(base.get("repo"))
+            require(positive(item.get("number")))
+            if (head.get("sha") == run["head_sha"] and head.get("ref") == run["head_branch"] and
+                    positive(head_repo.get("id")) and head_repo["id"] == head_repository[0] and
+                    head_repo.get("url") == f"https://api.github.com/repos/{head_repository[1]}" and
+                    base.get("ref") == "master" and sha(base.get("sha")) and
+                    positive(base_repo.get("id")) and base_repo["id"] == repository[0] and
+                    base_repo.get("url") == f"https://api.github.com/repos/{observer.repo}"):
+                associated.append(item)
+        require(len(associated) == 1, "发布者没有唯一绑定的 PR/source 与固定 master 工作流身份")
+        policy = associated[0]["base"]["sha"]
+    else:
+        # Preserve legacy base-head receipts; native source-head events use the bound base above.
+        require(head_repository == repository and run.get("head_branch") == "master")
+        policy = run["head_sha"]
+    require(workflow_sha is None or workflow_sha == policy, "发布者固定工作流 SHA 与事件证明不符")
+    master = branch(observer, "master")
+    if policy != master:
+        compared = mapping(observer.api.get(observer.root + f"/compare/{policy}...{master}"))
+        require(compared.get("status") in ("ahead", "identical") and
+                mapping(compared.get("merge_base_commit")).get("sha") == policy,
+                "发布者固定工作流不属于已发布默认分支，保持未知")
+    return policy
+
+
+def publisher_run(observer, run, workflow_sha=None, source_head=None):
     require(positive(run.get("id")) and positive(run.get("run_attempt")))
     identity = workflow(observer, "merge-conflict.yml")
     run_identity(observer, run, PUBLISHER, identity, run["id"], run["run_attempt"], successful=False)
     require(isinstance(run.get("event"), str) and run["event"] in {"pull_request_target", "workflow_run"}
             and isinstance(run.get("head_branch"), str) and bool(run["head_branch"])
-            and (run["event"] != "workflow_run" or run["head_branch"] == "master")
-            and repo_identity(run.get("head_repository")) == repo_identity(run["repository"]))
+            and (run["event"] != "workflow_run" or run["head_branch"] == "master"))
     current = mapping(observer.api.get(observer.root + f"/actions/runs/{run['id']}"))
     require(positive(current.get("run_attempt")) and current["run_attempt"] >= run["run_attempt"])
     run_identity(observer, current, PUBLISHER, identity, run["id"], current["run_attempt"], successful=False)
@@ -145,13 +183,9 @@ def publisher_run(observer, run):
         current = mapping(observer.api.get(observer.root + f"/actions/runs/{run['id']}/attempts/{run['run_attempt']}"))
         run_identity(observer, current, PUBLISHER, identity, run["id"], run["run_attempt"], successful=False)
     require(all(current.get(key) == run.get(key) for key in ("event", "head_sha", "head_branch", "run_started_at")) and
-            repo_identity(current.get("head_repository")) == repo_identity(run["repository"]))
-    master = branch(observer, "master")
-    if run["head_sha"] != master:
-        compared = mapping(observer.api.get(observer.root + f"/compare/{run['head_sha']}...{master}"))
-        require(compared.get("status") in ("ahead", "identical") and
-                mapping(compared.get("merge_base_commit")).get("sha") == run["head_sha"],
-                "发布者工作流代码不属于已发布默认分支，保持未知")
+            repo_identity(current.get("repository")) == repo_identity(run["repository"]) and
+            repo_identity(current.get("head_repository")) == repo_identity(run.get("head_repository")))
+    return publisher_policy(observer, run, workflow_sha, source_head)
 
 
 def timestamp(value):
@@ -288,11 +322,22 @@ def parse_check(observer, run, pr, check):
     else:
         require(metadata.get("reason_code") != "source_head_intersection", "交集缺少 membership，保持未知")
     publisher = mapping(metadata.get("publisher"))
-    require(publisher.get("workflow") == PUBLISHER and publisher.get("workflow_sha") in (None, run["head_sha"]),
-            "Check 发布者的工作流来源 SHA 不符")
+    require(publisher.get("workflow") == PUBLISHER)
+    source_event = run.get("event") == "pull_request_target" and run["head_sha"] == check["head_sha"]
+    if source_event:
+        require(sha(publisher.get("workflow_sha")), "原生 PR 事件缺少固定 master 工作流 SHA")
+    publisher_policy(observer, run, publisher.get("workflow_sha"), check["head_sha"])
     publisher_run, publisher_attempt = decimal(publisher.get("run_id")), decimal(publisher.get("run_attempt"))
     if (publisher_run, publisher_attempt) != (run["id"], run["run_attempt"]):
         return None
+    if source_event:
+        require(check.get("status") == "completed", "待定 PR 事件 Check 不能授权终态 reporter")
+        latest = mapping(observer.api.get(observer.root + f"/actions/runs/{run['id']}"))
+        run_identity(observer, latest, PUBLISHER, run["workflow_id"], run["id"], run["run_attempt"])
+        require(all(latest.get(key) == run.get(key) for key in ("event", "head_sha", "head_branch", "run_started_at")) and
+                repo_identity(latest.get("repository")) == repo_identity(run["repository"]) and
+                repo_identity(latest.get("head_repository")) == repo_identity(run["head_repository"]),
+                "当前 PR 事件 publisher 身份已变化，历史终态不可路由")
     if check.get("status") in ("in_progress", "queued"):
         require(check.get("conclusion") is None and metadata.get("result") == "pending")
     else:
@@ -601,21 +646,30 @@ def validation_jobs(observer, pr, native):
         metadata = check_metadata(check)
         require(type(metadata.get("schema")) is int and metadata["schema"] == 1 and metadata.get("repo") == observer.repo and
                 metadata.get("head") == pr["head"]["sha"])
-        expected = {key: value for key, value in target_details(pr).items() if key not in ("base", "draft")}
-        for field in ("membership", "targets"):
-            rows = metadata.get(field)
-            require(isinstance(rows, list) and 0 < len(rows) <= 50000 and all(isinstance(row, dict) for row in rows) and
-                    sum(all(type(row.get(key)) is type(value) and row.get(key) == value for key, value in expected.items())
-                        for row in rows) == 1, "检查回显没有唯一匹配的 PR/source 身份")
+        members, targets = metadata.get("membership"), metadata.get("targets")
+        require(isinstance(members, list) and isinstance(targets, list) and 0 < len(members) == len(targets) <= 50000 and
+                all(isinstance(row, dict) for row in [*members, *targets]))
+        numbers = [member.get("pr") for member in members]
+        require(all(positive(number) for number in numbers) and len(set(numbers)) == len(numbers))
+        # An old source-owned publication authenticates its own cohort, not today's PRs or refs.
+        for member in members:
+            require(member.get("head") == check["head_sha"] and sha(member.get("base")) and type(member.get("draft")) is bool and
+                    set(member) == {"pr", "head", "head_ref", "head_repo_id", "head_repo", "base_ref", "base", "draft"})
+            repo_identity(dict(id=member.get("head_repo_id"), full_name=member.get("head_repo")))
+            require(all(isinstance(member.get(key), str) and 0 < len(member[key]) <= 1024 and
+                        not re.search(r"[\x00-\x20\x7f\ud800-\udfff]", member[key]) for key in ("head_ref", "base_ref")))
+            require(sum(all(type(row.get(key)) is type(value) and row.get(key) == value for key, value in member.items())
+                        for row in targets) == 1, "历史检查回显的 membership/target source 身份不一致")
         publisher = mapping(metadata.get("publisher"))
         require(publisher.get("workflow") == PUBLISHER and sha(publisher.get("workflow_sha")))
         run_id, attempt = decimal(publisher.get("run_id")), decimal(publisher.get("run_attempt"))
         issuer = mapping(observer.api.get(observer.root + f"/actions/runs/{run_id}"))
-        require(positive(issuer.get("run_attempt")) and issuer["run_attempt"] >= attempt)
+        require(positive(issuer.get("id")) and issuer["id"] == run_id and
+                positive(issuer.get("run_attempt")) and issuer["run_attempt"] >= attempt)
         if issuer["run_attempt"] > attempt:
             issuer = mapping(observer.api.get(observer.root + f"/actions/runs/{run_id}/attempts/{attempt}"))
-        require(issuer.get("id") == run_id and issuer.get("run_attempt") == attempt and issuer.get("head_sha") == publisher["workflow_sha"])
-        publisher_run(observer, issuer)
+        require(issuer.get("id") == run_id and issuer.get("run_attempt") == attempt)
+        publisher_run(observer, issuer, publisher["workflow_sha"], check["head_sha"])
         # This authenticates classification only, not the Check's current verdict.
     return result
 
@@ -791,7 +845,8 @@ def payload_for(observer, run, job, pr, check, metadata):
         message = f"此 PR 的精确合并目标已验证通过；共享 source 必需检查总结果为{aggregate}；不代表发布或验收通过"
     if previous is not None or prior:
         message += "；仅更新必需检查状态，沿用既有调查，不重复派工"
-    payload = dict(workflow=PUBLISHER, workflow_sha=run["head_sha"], event=run["event"], pr=pr["number"], pr_url=pr["html_url"],
+    payload = dict(workflow=PUBLISHER, workflow_sha=metadata["publisher"].get("workflow_sha") or run["head_sha"],
+                   event=run["event"], pr=pr["number"], pr_url=pr["html_url"],
                    source_head=pr["head"]["sha"], tested_sha=identity["sha"] if identity else None,
                    tested_tree=identity["tree"] if identity else None, status="completed", conclusion=conclusion,
                    check_id=check["id"], check_sha=check["head_sha"], check_name="Merge gate", check_url=check["html_url"], check_conclusion=check.get("conclusion"),

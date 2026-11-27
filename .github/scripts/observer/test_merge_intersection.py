@@ -28,7 +28,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from github import API, Reply, Unknown
 from observer import Observer
-from merge_reports import reconcile_publisher, verify_evidence
+from merge_reports import parse_check, reconcile_publisher, verify_evidence
 from store import Store
 
 REPO = "PeterFile/ct0x"
@@ -79,6 +79,59 @@ def hosted_echo_rows():
     jobs.insert(3, echo)
     custom = dict(fixture["check"], output=dict(summary=json.dumps(fixture["metadata"])))
     return jobs, custom, fixture["initial_publisher"], fixture["publisher"]
+
+
+def hosted_pending_echo_rows():
+    jobs, custom, initial, final = hosted_echo_rows()
+    # The original summary was not archived. Reconstruct its pending member from
+    # the associated PR, validated initial state and MERGE_CHECK at log line 176.
+    record = dict(base="6901fb37234339e7565b582b3d5ee09e781d7ead", check_id=140427397549,
+        conclusion=None, event="merge_check_published", head="e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48",
+        name="Merge gate", pr=273, publisher_run_attempt="1", publisher_run_id="45975830868", repo=REPO,
+        status="in_progress", target_sha="e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48", tree=None,
+        validated_sha=None, validation_run_attempt=None, validation_run_id=None)
+    state = dict(baseRefOid=record["base"], headRefOid=record["head"], isDraft=False, number=273)
+    location = os.environ.get("OBSERVER_MERGE_EVIDENCE_ROOT")
+    if location is not None:
+        archived = {}
+        for name, digest in (
+            ("pr-273-initial-publisher-job.log", "2591180083224b4617e7bbe6a9633a944cdbf0e1c3780c3f569b274edaf1d42b"),
+            ("pr-273-live.json", "e1ec96d2e3ce8b6da7979d236955d057354cf356a85bda12ace191431a02b7ce")):
+            data = (Path(location) / name).read_bytes()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise AssertionError("Archived pending fixture digest mismatch: " + name)
+            archived[name] = data.decode()
+        records = [json.loads(line.split(" MERGE_CHECK ", 1)[1]) for line in
+            archived["pr-273-initial-publisher-job.log"].splitlines() if " MERGE_CHECK " in line]
+        assert records == [record]
+        state = json.loads(archived["pr-273-live.json"])
+    if "pull_requests" not in initial:
+        member, = json.loads(custom["output"]["summary"])["membership"]
+        repo = dict(id=member["head_repo_id"], full_name=member["head_repo"])
+        initial = dict(initial, path=PUBLISHER, workflow_id=final["workflow_id"], event="pull_request_target",
+            status="completed", conclusion="success", head_branch=member["head_ref"], repository=repo, head_repository=repo,
+            html_url=f"https://github.com/{REPO}/actions/runs/{initial['id']}", run_started_at="2026-11-27T09:41:40Z",
+            pull_requests=[dict(number=273, head=dict(sha=record["head"], ref=member["head_ref"],
+                repo=dict(id=repo["id"], url=f"https://api.github.com/repos/{REPO}")),
+                base=dict(sha=record["base"], ref="master", repo=dict(id=repo["id"], url=f"https://api.github.com/repos/{REPO}")))])
+    associated, = initial["pull_requests"]
+    assert initial["id"] == int(record["publisher_run_id"]) and initial["run_attempt"] == int(record["publisher_run_attempt"])
+    assert associated["number"] == state["number"] == record["pr"]
+    assert associated["head"]["sha"] == state["headRefOid"] == record["head"] == record["target_sha"] == initial["head_sha"]
+    assert associated["base"]["sha"] == state["baseRefOid"] == record["base"] != initial["head_sha"]
+    member = dict(pr=associated["number"], head=associated["head"]["sha"], head_ref=associated["head"]["ref"],
+        head_repo_id=associated["head"]["repo"]["id"], head_repo=initial["head_repository"]["full_name"],
+        base=associated["base"]["sha"], base_ref=associated["base"]["ref"], draft=state["isDraft"])
+    metadata = dict(schema=1, repo=REPO, pr=273, head=record["head"], result="pending", reason_code="source_head_intersection",
+        membership=[member], targets=[dict(member, result="pending", verification=False,
+            merge_sha=None, tree=None, reason_code="awaiting_validation")], failed_prs=[], pending_prs=[273],
+        publisher=dict(workflow=PUBLISHER, workflow_sha=record["base"], run_id=record["publisher_run_id"],
+            run_attempt=record["publisher_run_attempt"]))
+    custom.update(status=record["status"], conclusion=None, completed_at=None, output=dict(summary=json.dumps(metadata)))
+    for job in jobs:
+        if job["id"] == record["check_id"]:
+            job.update(status=record["status"], conclusion=None, completed_at=None)
+    return jobs, custom, initial, initial
 
 
 def producer_file():
@@ -937,12 +990,143 @@ class IntersectionProtocol(unittest.TestCase):
         self.ingest(world, check, publisher_only=True)
 
     def test_hosted_pr273_echo_replay_preserves_all_four_real_native_jobs(self):
-        jobs, custom, initial, issuer = hosted_echo_rows()
+        self.hosted_echo_replay()
+
+    def terminal_prt_world(self):
+        world = World()
+        closed = copy.deepcopy(world.prs[7])
+        closed.update(number=8, state="closed", html_url=f"https://github.com/{REPO}/pull/8")
+        closed["head"]["ref"] = "closed/sibling"
+        world.prs[8] = closed
+        repo_url = f"https://api.github.com/repos/{REPO}"
+        head_repo = closed["head"]["repo"]
+        world.publisher.update(event="pull_request_target", head_sha=HEAD, head_branch=closed["head"]["ref"],
+            head_repository=head_repo, pull_requests=[dict(number=8,
+                head=dict(sha=HEAD, ref=closed["head"]["ref"], repo=dict(id=head_repo["id"],
+                    url=f"https://api.github.com/repos/{head_repo['full_name']}")),
+                base=dict(sha=BASE, ref="master", repo=dict(id=world.repo["id"], url=repo_url)))])
+        world.reporters[0]["head_sha"] = HEAD
+        return world
+
+    def test_current_terminal_prt_closed_sibling_uses_existing_exact_proof(self):
+        world = self.terminal_prt_world()
+        def check(store, tick):
+            self.assertTrue(tick(), [dict(row) for row in store.db.execute("SELECT * FROM problems")])
+            action, = store.actions()
+            payload = action["payload"]
+            self.assertEqual((payload["pr"], payload["workflow_sha"], payload["source_head"]), (7, BASE, HEAD))
+            self.assertEqual((payload["tested_sha"], payload["tested_tree"], payload["validation_run_id"]), (MERGE, TREE, 101))
+            self.assertEqual(store.inbox("intersection-author-8"), [])
+            self.assertTrue(tick())
+            self.assertEqual(len(store.inbox("intersection-author-7")), 1)
+        self.ingest(world, check, publisher_only=True)
+
+    def test_current_terminal_prt_does_not_borrow_pending_stale_or_invalid_authority(self):
+        for changed in ("pending-check", "pending-run", "failed-run", "new-attempt", "failed-reporter", "wrong-policy",
+                "missing-association", "wrong-event-ref", "wrong-event-base", "bad-native-proof", "changed-live-target"):
+            world = self.terminal_prt_world()
+            if changed == "pending-check":
+                world.check.update(status="in_progress", conclusion=None)
+                world.metadata.update(result="pending", pending_prs=[7])
+                world.metadata["targets"][0].update(result="pending", verification=False)
+            elif changed == "pending-run":
+                world.publisher.update(status="in_progress", conclusion=None)
+            elif changed == "failed-run":
+                world.publisher["conclusion"] = "failure"
+            elif changed == "new-attempt":
+                current = dict(world.publisher, run_attempt=2)
+                world.overrides[ROOT + "/actions/runs/201"] = Reply(200, {}, json.dumps(current).encode())
+            elif changed == "failed-reporter":
+                world.reporters[0]["conclusion"] = "failure"
+            elif changed == "wrong-policy":
+                world.metadata["publisher"]["workflow_sha"] = HEAD
+            elif changed == "missing-association":
+                world.publisher["pull_requests"] = []
+            elif changed == "wrong-event-ref":
+                world.publisher["pull_requests"][0]["head"]["ref"] = "wrong"
+            elif changed == "wrong-event-base":
+                world.publisher["pull_requests"][0]["base"]["sha"] = OTHER
+            elif changed == "bad-native-proof":
+                world.jobs[101][1]["conclusion"] = "failure"
+            else:
+                world.prs[7]["head"]["ref"] = "changed"
+            with self.subTest(changed=changed):
+                self.ingest(world, lambda store, tick: (self.assertFalse(tick()), self.assertEqual(store.actions(), [])), publisher_only=True)
+
+    def test_historical_cohort_projection_still_requires_exact_unique_source_pairs(self):
+        for changed in ("duplicate", "missing", "extra", "source", "base"):
+            def mutate(custom, issuer, responses):
+                metadata = json.loads(custom["output"]["summary"])
+                if changed == "duplicate":
+                    metadata["membership"] *= 2
+                    metadata["targets"] *= 2
+                elif changed == "missing":
+                    metadata["targets"] = []
+                elif changed == "extra":
+                    metadata["targets"].append(copy.deepcopy(metadata["targets"][0]))
+                elif changed == "source":
+                    metadata["targets"][0]["head_ref"] = "wrong"
+                else:
+                    metadata["targets"][0]["base"] = OTHER
+                custom["output"]["summary"] = json.dumps(metadata)
+            with self.subTest(changed=changed):
+                self.hosted_echo_replay(historical=True, mutate=mutate)
+
+    def test_historical_same_source_cohort_does_not_need_current_pr_or_branch(self):
+        for pending in (False, True):
+            with self.subTest(pending=pending):
+                self.hosted_echo_replay(pending=pending, historical=True)
+
+    def test_archived_current_terminal_prt_projection_uses_pinned_master_policy(self):
+        self.hosted_echo_replay(pending=True, terminal=True)
+
+    def test_archived_initial_pending_echo_preserves_native_proof(self):
+        self.hosted_echo_replay(pending=True)
+
+    def test_archived_initial_pending_echo_uses_pinned_workflow_ancestor_not_pr_head(self):
+        self.hosted_echo_replay(pending=True, advanced_master=True)
+
+    def test_pending_echo_rejects_unbound_associations_and_workflow_identity(self):
+        mutations = [("issuer", path, value) for path, value in (
+            (("path",), NATIVE), (("workflow_id",), 1), (("run_attempt",), 2),
+            (("repository", "id"), 1), (("repository", "full_name"), "other/repo"),
+            (("head_repository", "id"), 1), (("head_repository", "full_name"), "other/repo"),
+            (("head_sha",), OTHER), (("head_branch",), "wrong"), (("event",), "push"),
+            (("pull_requests",), []), (("pull_requests", 0, "number"), True),
+            (("pull_requests", 0, "head", "sha"), OTHER), (("pull_requests", 0, "head", "ref"), "wrong"),
+            (("pull_requests", 0, "head", "repo", "id"), True), (("pull_requests", 0, "head", "repo", "url"), "https://api.github.com/repos/other/repo"),
+            (("pull_requests", 0, "base", "sha"), OTHER), (("pull_requests", 0, "base", "ref"), "stacked"),
+            (("pull_requests", 0, "base", "repo", "id"), 1), (("pull_requests", 0, "base", "repo", "url"), "https://api.github.com/repos/other/repo"))]
+        mutations += [("publisher", (key,), value) for key, value in (("workflow_sha", OTHER), ("run_attempt", "2"), ("run_id", "1"))]
+        for kind, path, value in mutations:
+            def mutate(custom, issuer, responses):
+                metadata = json.loads(custom["output"]["summary"])
+                owner = issuer if kind == "issuer" else metadata["publisher"]
+                for key in path[:-1]:
+                    owner = owner[key]
+                owner[path[-1]] = value
+                custom["output"]["summary"] = json.dumps(metadata)
+            with self.subTest(kind=kind, path=path):
+                self.hosted_echo_replay(pending=True, mutate=mutate)
+        def duplicate(custom, issuer, responses):
+            issuer["pull_requests"] *= 2
+        self.hosted_echo_replay(pending=True, mutate=duplicate)
+        def diverged(custom, issuer, responses):
+            endpoint = next(path for path in responses if path.startswith("/compare/"))
+            responses[endpoint]["status"] = "diverged"
+        self.hosted_echo_replay(pending=True, advanced_master=True, mutate=diverged)
+
+    def hosted_echo_replay(self, pending=False, advanced_master=False, mutate=None, historical=False, terminal=False):
+        jobs, custom, initial, issuer = hosted_pending_echo_rows() if pending else hosted_echo_rows()
         metadata = json.loads(custom["output"]["summary"])
         member, = metadata["membership"]
         target, = metadata["targets"]
+        # Pending metadata cannot supply a successful tested tree; keep the same
+        # independently constructed success receipt as the original replay.
+        if pending:
+            target = dict(merge_sha="5f186aa68f46dbdd5cd9b883b95d85e39215cba8", tree="41b02b15ca9d9531b15016f325b343423d08817b")
         repo = dict(id=member["head_repo_id"], full_name=REPO)
-        pr = dict(number=273, head=dict(sha=member["head"], ref=member["head_ref"], repo=repo),
+        pr = dict(number=273, draft=member["draft"], head=dict(sha=member["head"], ref=member["head_ref"], repo=repo),
             base=dict(sha=member["base"], ref=member["base_ref"], repo=repo))
         native = dict(id=45975830800, run_attempt=1, head_sha=member["head"], head_branch=member["head_ref"],
             check_suite_id=custom["check_suite"]["id"], run_started_at="2026-11-27T09:41:40Z")
@@ -965,20 +1149,58 @@ class IntersectionProtocol(unittest.TestCase):
             f"/check-runs/{custom['id']}": custom,
             f"/actions/runs/{issuer['id']}": issuer, f"/actions/runs/{issuer['id']}/attempts/1": issuer,
             "/actions/workflows/merge-conflict.yml": dict(id=issuer["workflow_id"], path=PUBLISHER, state="active"),
-            "/git/ref/heads/master": dict(ref="refs/heads/master", object=dict(type="commit", sha=issuer["head_sha"]))}
+            "/git/ref/heads/master": dict(ref="refs/heads/master", object=dict(type="commit",
+                sha=OTHER if advanced_master else metadata["publisher"]["workflow_sha"]))}
+        if advanced_master:
+            responses[f"/compare/{metadata['publisher']['workflow_sha']}...{OTHER}"] = dict(
+                status="ahead", merge_base_commit=dict(sha=metadata["publisher"]["workflow_sha"]))
+        if terminal:
+            # Project a terminal generation onto the archived, completed source event;
+            # the original logged publication was pending, not a hosted success.
+            metadata.update(result="success", pending_prs=[])
+            metadata["targets"][0].update(result="success", verification=True, reason_code="exact_target_verified",
+                merge_sha=identity["sha"], tree=identity["tree"], validation=dict(proof, source=source(pr), controller_sha=""),
+                authority=dict(id=native["id"], run_attempt=1, status="completed", conclusion="success", event="pull_request"))
+            custom.update(status="completed", conclusion="success", output=dict(summary=json.dumps(metadata)))
+        if historical:
+            previous = json.loads(custom["output"]["summary"])
+            for field in ("membership", "targets"):
+                for row in previous[field]:
+                    row.update(pr=272, head_ref="historical/sibling", base_ref="historical/target",
+                        head_repo_id=17, head_repo="former/ct0x")
+            previous.update(pr=272, failed_prs=[] if pending else [272], pending_prs=[272] if pending else [])
+            custom["output"]["summary"] = json.dumps(previous)
+        if mutate is not None:
+            mutate(custom, issuer, responses)
         calls = []
         def transport(path, etag=None):
             calls.append(path)
             if path == ROOT + "/actions/artifacts/42/zip":
                 return Reply(200, {}, data)
-            return Reply(200, {}, json.dumps(responses[path.removeprefix(ROOT)]).encode())
+            value = responses.get(path.removeprefix(ROOT))
+            return Reply(200 if value is not None else 404, {}, json.dumps(value).encode())
         with tempfile.TemporaryDirectory() as temporary, closing(Store(Path(temporary) / "observer.db")) as store:
             store.configure(REPO, COORDINATOR)
             observer = Observer(store, API(store, transport))
+            if mutate is not None:
+                with self.assertRaises(Unknown):
+                    verify_evidence(observer, pr, native, proof)
+                return
             try:
                 verify_evidence(observer, pr, native, proof)
             except Unknown as error:
                 self.fail("authenticated #273 CheckRun echo blocked exact native proof: " + str(error))
+            if terminal:
+                self.assertEqual(parse_check(observer, issuer, pr, custom), metadata)
+            elif pending and not historical:
+                # Ownership classification does not grant either the historical
+                # source-head reporter or a newer publisher routing authority.
+                with self.assertRaises(Unknown):
+                    parse_check(observer, issuer, pr, custom)
+                current = hosted_echo_rows()[3]
+                self.assertIsNone(parse_check(observer, current, pr, custom))
+            self.assertEqual(store.actions(), [])
+            self.assertEqual(store.events(), [])
         self.assertIn(ROOT + f"/actions/runs/{metadata['publisher']['run_id']}", calls)
         self.assertEqual([row["id"] for row in jobs if row["name"] != "Merge gate"],
             [140427185533, 140427364258, 140427364259, 140429601553])

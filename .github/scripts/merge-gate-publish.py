@@ -833,7 +833,7 @@ def verify_publisher(api, pr, validation):
     check(metadata.get("repo") == REPO and metadata.get("head") == pr["head"]["sha"] and metadata.get("result") == "success" and
           len(target) == 1 and target[0].get("result") == "success" and target[0].get("verification") is True and
           target[0].get("validation") == validation, "远端已发布交集不包含此目标的精确已验证回执")
-    verify_publisher_run(api, metadata["publisher"])
+    verify_publisher_run(api, metadata["publisher"], terminal=True, source_head=check_sha(pr))
     return metadata
 
 
@@ -852,7 +852,7 @@ def verify_publisher_run(api, publisher, terminal=True, source_head=None):
           workflow["path"] == PUBLISHER and exact["repository"]["full_name"] == REPO and exact["event"] in ("pull_request_target", "workflow_run") and
           (not terminal or exact["status"] == "completed" and exact["conclusion"] == "success"), "发布器远端 provenance 不完整或尚未完成")
     master = sha(api.get("git/ref/heads/master")["object"]["sha"])
-    if not terminal and exact["event"] == "pull_request_target":
+    if exact["event"] == "pull_request_target":
         # REST exposes the event's source head, not the base-owned workflow/checkout commit.
         policy = sha(publisher["workflow_sha"])
         associated = [row for row in exact.get("pull_requests", [])
@@ -863,7 +863,7 @@ def verify_publisher_run(api, publisher, terminal=True, source_head=None):
                       row["base"]["ref"] == "master" and row["base"]["sha"] == policy and
                       row["base"]["repo"]["id"] == integer(exact["repository"]["id"]) and
                       row["base"]["repo"]["url"] == "https://api.github.com/repos/" + REPO]
-        check(len(associated) == 1 and ancestor(api, policy, master), "回显发布器的嵌入来源/目标或固定 master 工作流身份不符")
+        check(len(associated) == 1 and ancestor(api, policy, master), "发布器的嵌入来源/目标或固定 master 工作流身份不符")
     else:
         check(ancestor(api, sha(exact["head_sha"]), master) and
               (publisher.get("workflow_sha") is None or publisher["workflow_sha"] == exact["head_sha"]), "发布器不是已发布默认分支的工作流代码")

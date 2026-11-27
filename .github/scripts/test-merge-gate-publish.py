@@ -309,15 +309,123 @@ class PublisherTests(unittest.TestCase):
                     self.p.normalize_validation_jobs(api, jobs, pr, run)
                 api.write.assert_not_called()
 
-    def test_target_echo_classification_cannot_replace_final_publisher_proof(self):
-        api, _, pr, _, responses, metadata = self.initial_pending_echo_fixture()
+    def terminal_target_fixture(self):
+        api, _, pr, native, responses, metadata = self.initial_pending_echo_fixture()
+        identity = {"repo": REPO, "pr": pr["number"], "head": pr["head"]["sha"], "base": pr["base"]["sha"],
+                    "sha": "5f186aa68f46dbdd5cd9b883b95d85e39215cba8", "tree": "41b02b15ca9d9531b15016f325b343423d08817b",
+                    "run_id": str(native["id"]), "run_attempt": str(native["run_attempt"])}
+        validation = {"identity": identity, "source": self.p.source_identity(pr), "artifact_id": 15186749227,
+                      "artifact_digest": "sha256:304e23ed9ce3dd3c91e9024bd19655691ee53d776d35d79f5156c5e80fcee0e3",
+                      "policy_digest": "c30fa340ff74b938607094be239d7334985d5394943677c65911ffa8aa62139c", "controller_sha": ""}
+        location = os.environ.get("MERGE_GATE_HOSTED_EVIDENCE_ROOT")
+        if location:
+            root = Path(location)
+            receipt = self.p.decode_artifact((root / "pr-273-validate-attempt-1-receipt.zip").read_bytes(), validation["artifact_digest"])
+            self.assertEqual({key: receipt[key] for key in identity}, identity)
+            self.assertEqual(receipt["source"], validation["source"])
+            self.assertEqual(receipt["policy_digest"], validation["policy_digest"])
+            artifacts = json.loads((root / "pr-273-validation-artifacts.json").read_text())["artifacts"]
+            artifact = next(row for row in artifacts if row["id"] == validation["artifact_id"])
+            self.assertEqual(artifact["digest"], validation["artifact_digest"])
+            self.assertEqual(artifact["workflow_run"]["id"], native["id"])
+        # Model a terminal publication with the archived successful PRT issuer and full native proof projection.
+        # The archived CheckRun itself failed; this success is a regression scenario, not hosted evidence.
+        target = {**self.p.target_details(pr), "merge_sha": identity["sha"], "tree": identity["tree"],
+                  "result": "success", "verification": True, "reason_code": "exact_target_verified", "validation": copy.deepcopy(validation)}
+        issuer = metadata["publisher"]
+        metadata = self.p.aggregate(pr, [target], metadata["membership"], {"GITHUB_RUN_ID": issuer["run_id"],
+                                    "GITHUB_RUN_ATTEMPT": issuer["run_attempt"], "MERGE_TRUSTED_WORKFLOW_SHA": issuer["workflow_sha"]})
         custom = responses["check-runs/140427397549"]
-        validation = {"identity": {"head": pr["head"]["sha"]}}
-        metadata.update(result="success", targets=[{**metadata["targets"][0], "result": "success", "verification": True, "validation": validation}])
         custom.update(status="completed", conclusion="success", output={"summary": json.dumps(metadata)})
-        api.pages.return_value = [custom]
-        with self.assertRaisesRegex(ValueError, "默认分支的工作流代码"):
-            self.p.verify_publisher(api, pr, validation)
+        api.pages.side_effect = lambda endpoint, key: copy.deepcopy([custom])
+        return api, pr, validation, responses, metadata
+
+    def test_terminal_target_publisher_accepts_archived_pr273_source_and_pinned_master_policy(self):
+        api, pr, validation, responses, metadata = self.terminal_target_fixture()
+        issuer = responses["actions/runs/45975830868/attempts/1"]
+        self.assertEqual((issuer["status"], issuer["conclusion"]), ("completed", "success"))
+        self.assertNotEqual(issuer["head_sha"], metadata["publisher"]["workflow_sha"])
+        before = copy.deepcopy(issuer)
+        try:
+            verified = self.p.verify_publisher(api, pr, validation)
+        except ValueError as error:
+            self.fail("completed PRT must prove its pinned base workflow, not default-branch source ancestry: " + str(error))
+        self.assertEqual(verified, metadata)
+        self.assertEqual(verified["targets"][0]["validation"], validation)
+        self.assertEqual(issuer, before)
+        api.write.assert_not_called()
+
+    def test_terminal_sibling_close_issuer_preserves_remaining_targets_exact_proof(self):
+        api, pr, validation, responses, _ = self.terminal_target_fixture()
+        # The closing sibling triggers the publisher; it is not the remaining validated target.
+        responses["actions/runs/45975830868"]["pull_requests"][0]["number"] = 274
+        try:
+            verified = self.p.verify_publisher(api, pr, validation)
+        except ValueError as error:
+            self.fail("same-source sibling event can publish the remaining exact projection: " + str(error))
+        self.assertEqual(verified["targets"][0]["pr"], 273)
+        self.assertEqual(verified["targets"][0]["validation"], validation)
+        api.write.assert_not_called()
+
+    def test_terminal_target_publisher_rejects_wrong_source_policy_ambiguity_or_issuer(self):
+        cases = [(("issuer", "pull_requests", 0, "head", "sha"), "f" * 40),
+                 (("issuer", "pull_requests", 0, "head", "ref"), "other"),
+                 (("issuer", "pull_requests", 0, "head", "repo", "id"), 19),
+                 (("issuer", "pull_requests", 0, "base", "sha"), "f" * 40),
+                 (("issuer", "pull_requests", 0, "base", "ref"), "other"),
+                 (("issuer", "pull_requests", 0, "base", "repo", "id"), 19),
+                 (("issuer", "pull_requests", 0, "base", "repo", "url"), "https://api.github.com/repos/other/ct0x"),
+                 (("issuer", "conclusion"), "failure"), (("issuer", "conclusion"), "cancelled"),
+                 (("issuer", "status"), "in_progress"), (("issuer", "run_attempt"), 2),
+                 (("issuer", "workflow_id"), 17), (("issuer", "path"), ".github/workflows/other.yml"),
+                 (("issuer", "repository", "full_name"), "other/ct0x"),
+                 (("issuer", "pull_requests"), []), (("metadata", "publisher", "workflow_sha"), "f" * 40),
+                 (("check", "app", "id"), 3), (("check", "external_id"), "spoof")]
+        cases += [((kind,), None) for kind in ("wrong-event-source", "ambiguous", "stale-issuer", "unpublished-policy")]
+        for path, value in cases:
+            with self.subTest(path=path, value=value):
+                api, pr, validation, responses, metadata = self.terminal_target_fixture()
+                issuer, custom = responses["actions/runs/45975830868"], responses["check-runs/140427397549"]
+                if path[0] == "wrong-event-source":
+                    issuer["head_sha"] = issuer["pull_requests"][0]["head"]["sha"] = "f" * 40
+                elif path[0] == "ambiguous":
+                    issuer["pull_requests"].append(copy.deepcopy(issuer["pull_requests"][0]))
+                elif path[0] == "stale-issuer":
+                    responses["actions/runs/45975830868"] = {**issuer, "run_attempt": 2}
+                elif path[0] == "unpublished-policy":
+                    pinned = metadata["publisher"]["workflow_sha"]
+                    responses["git/ref/heads/master"] = {"object": {"sha": "f" * 40}}
+                    responses[f"compare/{pinned}...{'f' * 40}"] = {"status": "diverged", "merge_base_commit": {"sha": "0" * 40}}
+                else:
+                    node = {"issuer": issuer, "check": custom, "metadata": metadata}
+                    for key in path[:-1]:
+                        node = node[key]
+                    node[path[-1]] = value
+                custom["output"]["summary"] = json.dumps(metadata)
+                with self.assertRaises(ValueError):
+                    self.p.verify_publisher(api, pr, validation)
+                api.write.assert_not_called()
+
+    def test_target_echo_classification_cannot_replace_final_publisher_proof(self):
+        for key in ("repo", "pr", "head", "base", "sha", "tree", "run_id", "run_attempt",
+                    "source", "artifact_id", "artifact_digest", "policy_digest", "verification", "missing", "duplicate"):
+            with self.subTest(key=key):
+                api, pr, validation, responses, metadata = self.terminal_target_fixture()
+                target = metadata["targets"][0]
+                if key in validation["identity"]:
+                    target["validation"]["identity"][key] = "wrong"
+                elif key in validation:
+                    target["validation"][key] = "wrong"
+                elif key == "verification":
+                    target["verification"] = False
+                elif key == "missing":
+                    metadata["targets"] = []
+                else:
+                    metadata["targets"].append(copy.deepcopy(target))
+                responses["check-runs/140427397549"]["output"]["summary"] = json.dumps(metadata)
+                with self.assertRaisesRegex(ValueError, "精确已验证回执"):
+                    self.p.verify_publisher(api, pr, validation)
+                api.write.assert_not_called()
 
     def test_echo_normalization_leaves_no_echo_request_path_unchanged(self):
         api = self.api_fixture()
