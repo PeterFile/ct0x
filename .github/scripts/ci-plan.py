@@ -22,6 +22,10 @@ CI_PATHS = {
     ".github/workflows/ci.yml", ".github/workflows/ci-full.yml",
     ".github/scripts/ci-plan.py", ".github/scripts/ci-shards.py", ".github/scripts/ci-gate.py",
     ".github/scripts/test-ci-scheduling.py", ".github/scripts/test-store-shard.py", ".github/scripts/verify-store-shard.py",
+    ".github/workflows/periodic-full.yml",
+    *(".github/scripts/" + name + ".py" for name in (
+        "periodic-full", "periodic-replay", "periodic-history", "periodic-clients", "periodic-diagnostics",
+        "test-periodic-full", "test-periodic-history", "test-periodic-clients", "test-periodic-diagnostics")),
 }
 
 

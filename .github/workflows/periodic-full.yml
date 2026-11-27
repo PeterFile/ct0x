@@ -1,0 +1,314 @@
+name: Periodic Full
+
+on:
+  schedule:
+    # UTC; edit this line to change the interval.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+# Actions keeps one running and one pending run; the newest pending replaces the old one.
+concurrency:
+  group: >-
+    ${{ github.ref == 'refs/heads/master' &&
+        (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' && vars.PERIODIC_FULL_ENABLED != 'false') &&
+        'main-master-periodic' || format('periodic-ignored-{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  resolve:
+    name: Resolve trusted master
+    if: >-
+      ${{ github.ref == 'refs/heads/master' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' && vars.PERIODIC_FULL_ENABLED != 'false') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      sha: ${{ steps.admit.outputs.sha }}
+      tree: ${{ steps.admit.outputs.tree }}
+      head: ${{ steps.admit.outputs.head }}
+      base: ${{ steps.admit.outputs.base }}
+      matrix: ${{ steps.admit.outputs.matrix }}
+      decision: ${{ steps.admit.outputs.decision }}
+    steps:
+      # No repository code runs with this token. Resolve only after concurrency admission.
+      - name: Resolve master once through authenticated API
+        id: master
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, re, subprocess
+          repo = os.environ['GITHUB_REPOSITORY']
+          if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', repo):
+              raise SystemExit('仓库身份非法')
+          data = subprocess.check_output(['gh', 'api', '--method', 'GET', f'repos/{repo}/git/ref/heads/master'])
+          ref = json.loads(data)
+          sha = ref.get('object', {}).get('sha')
+          if ref.get('ref') != 'refs/heads/master' or ref.get('object', {}).get('type') != 'commit' or not isinstance(sha, str) or not re.fullmatch('[0-9a-f]{40}', sha):
+              raise SystemExit('master API ref 身份非法')
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'master-ref.json').write_bytes(data)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'sha={sha}\n')
+          PY
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.master.outputs.sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Admit pinned target and search trusted Full evidence
+        id: admit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 control/.github/scripts/periodic-full.py admit --root control \
+            --ref "$RUNNER_TEMP/master-ref.json" --output "$RUNNER_TEMP/periodic-plan"
+          cp "$RUNNER_TEMP/master-ref.json" "$RUNNER_TEMP/periodic-plan/master-ref.json"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: periodic-full-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/periodic-plan
+          if-no-files-found: error
+          retention-days: 90
+
+  preflight:
+    name: Periodic Full preflight
+    needs: resolve
+    if: ${{ needs.resolve.outputs.decision == 'run' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      sha: ${{ steps.identity.outputs.sha }}
+      tree: ${{ steps.identity.outputs.tree }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: periodic-full-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/plan
+      - name: Check actual checkout before product commands
+        id: identity
+        working-directory: control
+        env:
+          CHECKOUT_SHA: ${{ needs.resolve.outputs.sha }}
+          CHECKOUT_TREE: ${{ needs.resolve.outputs.tree }}
+        run: |
+          set -euo pipefail
+          [[ "$(git rev-parse HEAD)" == "$CHECKOUT_SHA" ]] || exit 1
+          [[ "$(git rev-parse 'HEAD^{tree}')" == "$CHECKOUT_TREE" ]] || exit 1
+          printf 'sha=%s\ntree=%s\n' "$CHECKOUT_SHA" "$CHECKOUT_TREE" >> "$GITHUB_OUTPUT"
+          mkdir -p "$RUNNER_TEMP/periodic-home"
+          printf 'NPM_CONFIG_CACHE=%s/periodic-npm-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: control/go.mod
+          cache-dependency-path: control/go.sum
+      - name: Ordinary test cmd package
+        working-directory: control
+        run: |
+          set -euo pipefail
+          go_cache=$(GOTOOLCHAIN=local go env GOCACHE)
+          go_mod_cache=$(GOTOOLCHAIN=local go env GOMODCACHE)
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" GOCACHE="$go_cache" GOMODCACHE="$go_mod_cache" GOTOOLCHAIN=local GOWORK=off \
+            go test -count=1 ./cmd/workspace
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+          check-latest: true
+          cache: npm
+          cache-dependency-path: control/web/package-lock.json
+      - name: Web test, typecheck and build
+        working-directory: control
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" npm_config_cache="$NPM_CONFIG_CACHE" \
+            python3 "$GITHUB_WORKSPACE/control/.github/scripts/ci-plan.py" web "$RUNNER_TEMP/plan/full-plan.json"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.13.0'
+          cache: npm
+          cache-dependency-path: control/extensions/pi-bridge/package-lock.json
+      - name: Pi bridge test and typecheck
+        working-directory: control
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" npm_config_cache="$NPM_CONFIG_CACHE" \
+            python3 "$GITHUB_WORKSPACE/control/.github/scripts/ci-plan.py" bridge "$RUNNER_TEMP/plan/full-plan.json"
+
+  full:
+    name: Full suite
+    needs: [resolve, preflight]
+    if: ${{ needs.resolve.outputs.decision == 'run' }}
+    uses: ./.github/workflows/ci-full.yml
+    with:
+      sha: ${{ needs.resolve.outputs.sha }}
+      tree: ${{ needs.resolve.outputs.tree }}
+      head: ${{ needs.resolve.outputs.head }}
+      base: ${{ needs.resolve.outputs.base }}
+      matrix: ${{ needs.resolve.outputs.matrix }}
+
+  record:
+    name: Periodic Full evidence
+    needs: [resolve, preflight, full]
+    if: ${{ always() && needs.resolve.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      status: ${{ steps.receipt.outputs.status }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: periodic-full-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/periodic/initial
+      - name: Publish immediate result and failure job links
+        id: receipt
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 control/.github/scripts/periodic-full.py record --root control \
+            --bundle "$RUNNER_TEMP/periodic/initial" --output "$RUNNER_TEMP/periodic/initial"
+      # receipt.json and source API/log bytes stay immutable, even while replay is running.
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: periodic-full-initial-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/periodic/initial
+          if-no-files-found: error
+          retention-days: 90
+
+  replay:
+    name: Credential-free regression replay
+    needs: [resolve, record]
+    if: ${{ always() && needs.resolve.result == 'success' && needs.record.outputs.status == 'failure' }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-latest
+    # Independent replay budget; original Full package timeouts are not changed.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: periodic-full-initial-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/periodic/initial
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: control/go.mod
+          # Historical executions use private per-replay caches, never publish them.
+          cache: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+          check-latest: true
+      - name: Pin Web toolchain paths
+        id: web-tools
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, shutil
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              for key in ('node', 'npm'):
+                  out.write(f'{key}={pathlib.Path(shutil.which(key)).resolve()}\n')
+          PY
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.13.0'
+      - name: Pin bridge toolchain paths
+        id: bridge-tools
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, shutil
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              for key in ('node', 'npm'):
+                  out.write(f'{key}={pathlib.Path(shutil.which(key)).resolve()}\n')
+          PY
+      - name: Replay exact known test leaves without credentials
+        env:
+          PERIODIC_WEB_NODE: ${{ steps.web-tools.outputs.node }}
+          PERIODIC_WEB_NPM: ${{ steps.web-tools.outputs.npm }}
+          PERIODIC_BRIDGE_NODE: ${{ steps.bridge-tools.outputs.node }}
+          PERIODIC_BRIDGE_NPM: ${{ steps.bridge-tools.outputs.npm }}
+        run: |
+          python3 control/.github/scripts/periodic-replay.py "$RUNNER_TEMP/periodic/initial" \
+            control "$RUNNER_TEMP/periodic/localization"
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: periodic-full-localization-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/periodic/localization
+          if-no-files-found: error
+          retention-days: 90
+
+  finalize:
+    name: Periodic attribution evidence
+    needs: [resolve, record, replay]
+    if: ${{ always() && needs.resolve.result == 'success' && needs.record.outputs.status != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          path: control
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@v7
+        with:
+          name: periodic-full-initial-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/periodic/initial
+      - uses: actions/download-artifact@v7
+        if: ${{ needs.replay.result == 'success' }}
+        with:
+          name: periodic-full-localization-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/periodic/localization
+      - name: Recheck immutable evidence and authenticate exact merged PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/periodic/final"
+          python3 control/.github/scripts/periodic-full.py finish --root control \
+            --bundle "$RUNNER_TEMP/periodic/initial" --localization "$RUNNER_TEMP/periodic/localization" \
+            --output "$RUNNER_TEMP/periodic/final"
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: periodic-full-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/periodic/final-evidence
+          if-no-files-found: ignore
+          retention-days: 90
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: periodic-full-${{ github.run_id }}-${{ github.run_attempt }}
+          # This directory has receipt.json at the ZIP root; never overwrite an earlier attempt.
+          path: ${{ runner.temp }}/periodic/final
+          if-no-files-found: error
+          retention-days: 90
