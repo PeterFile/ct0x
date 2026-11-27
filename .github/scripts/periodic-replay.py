@@ -2,7 +2,9 @@
 """Bounded exact-test replay. This process never collects authenticated API evidence."""
 import argparse
 from collections import Counter
+from decimal import Decimal
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -17,12 +19,22 @@ import time
 SHA_RE = r"[0-9a-f]{40}"
 PACKAGE_RE = r"agentworkspace/(?:cmd/workspace|internal/[A-Za-z][A-Za-z0-9_]*)"
 TEST_RE = r"Test[A-Z_][A-Za-z0-9_]*"
-MAX_COMMITS, REPEATS, MAX_LOG = 32, 3, 16 * 1024 * 1024
+REPEATS, MAX_LOG = 3, 16 * 1024 * 1024
 
 
 def check(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def duration(value, limit=21600):
+    check(isinstance(value, str) and 0 < len(value) <= 64 and
+          re.fullmatch(r"(?:[0-9]+(?:\.[0-9]+)?(?:ns|us|µs|μs|ms|s|m|h))+", value), "Go timeout 必须为可信有限 duration literal")
+    units = {"h": 3600, "m": 60, "s": 1, "ms": Decimal("0.001"), "us": Decimal("0.000001"),
+             "µs": Decimal("0.000001"), "μs": Decimal("0.000001"), "ns": Decimal("0.000000001")}
+    seconds = sum(Decimal(number) * units[unit] for number, unit in re.findall(r"([0-9]+(?:\.[0-9]+)?)(ns|us|µs|μs|ms|s|m|h)", value))
+    check(0 < seconds <= limit, "Go timeout 超过原始 hosted 作业预算或禁用了超时")
+    return int(seconds) if seconds == int(seconds) else float(seconds)
 
 
 def clean_line(line):
@@ -34,69 +46,172 @@ def message(line):
     return match[1].strip() if match else None
 
 
-def failures(text):
-    """Only Go failure lifecycle/package records establish a named failure, never mentions."""
-    if re.search(r"panic:|timed out|deadline exceeded|i/o timeout|fatal error:|signal: killed|\[build failed\]", text, re.I):
-        return []
-    groups, json_rows, pending, messages = {}, [], [], []
+def unique_pairs(items):
+    result = {}
+    for key, value in items:
+        check(key not in result, "Go JSON 重复字段")
+        result[key] = value
+    return result
+
+
+def failure_records(text):
+    """Keep completed, scoped failures alongside separate package interruptions."""
+    problem = re.compile(r"panic:|timed out|deadline exceeded|i/o timeout|fatal error:|signal: killed|\[build failed\]", re.I)
+    groups, json_rows, pending, unbound, tainted, active = {}, [], {}, [], False, None
+    failed_packages, unknown_packages, reports = set(), set(), {}
+    verbose = False
+
+    def update(tests, name, action, implicit=False):
+        prior, root = tests.get(name), name.split("/", 1)[0]
+        parent_active = name == root or tests.get(root, {}).get("state") == "run"
+        if action == "run":
+            tests[name] = {"state": "run" if prior is None and parent_active else "invalid", "messages": set()}
+        elif prior and prior["state"] == "run":
+            prior["state"] = action if parent_active else "invalid"
+        else:
+            tests[name] = {"state": action if prior is None and implicit else "invalid", "messages": set()}
+
+    def incomplete(tests):
+        return any(value["state"] in ("run", "invalid", "fail") for value in tests.values())
+
+    def retain(package, tests, interrupted):
+        accounted = set()
+        if re.fullmatch(PACKAGE_RE, package):
+            roots = {}
+            for name, value in tests.items():
+                roots.setdefault(name.split("/", 1)[0], {})[name] = value
+            for root, scoped in sorted(roots.items()):
+                if not re.fullmatch(TEST_RE, root) or scoped.get(root, {}).get("state") != "fail" or any(
+                        value["state"] in ("run", "invalid") for value in scoped.values()):
+                    continue
+                names = sorted(name for name, value in scoped.items() if value["state"] == "fail")
+                diagnostics = sorted({value for name in names for value in scoped[name]["messages"]})
+                # A timeout does not prove an assertion; only its own completed scope can.
+                if interrupted and not diagnostics:
+                    continue
+                signature = {"tests": names, "messages": diagnostics}
+                groups[(package, root, tuple(names), tuple(diagnostics))] = {"package": package, "test": root, "signature": signature}
+                accounted.update(names)
+        if interrupted or any(value["state"] in ("run", "invalid", "fail") and name not in accounted
+                              for name, value in tests.items()):
+            unknown_packages.add(package)
+
     for raw in text.splitlines():
         line = clean_line(raw)
         if line.startswith("{"):
             try:
-                row = json.loads(line)
+                row = json.loads(line, object_pairs_hook=unique_pairs)
             except ValueError:
+                if '"Action"' in line:
+                    unbound.append({"package": None, "reason": "Go JSON 截断或字段重复"})
+                continue
+            if isinstance(row, dict) and row.get("Action") in ("build-output", "build-fail"):
+                if isinstance(row.get("ImportPath"), str) and re.fullmatch(PACKAGE_RE, row["ImportPath"]):
+                    if row["Action"] == "build-fail":
+                        unknown_packages.add(row["ImportPath"])
+                else:
+                    unbound.append({"package": None, "reason": "Go build 归属字段非法"})
                 continue
             if isinstance(row, dict) and "Action" in row:
-                json_rows.append(row)
+                if not isinstance(row.get("Package"), str) or "Test" in row and (not isinstance(row["Test"], str) or not row["Test"]):
+                    unbound.append({"package": None, "reason": "Go JSON 身份字段非法"})
+                else:
+                    if pending or tainted:
+                        if tainted or incomplete(pending):
+                            unbound.append({"package": None, "reason": "纯文本 Go 失败缺少包终止，不能借用 JSON 归属"})
+                        pending, tainted, active, reports, verbose = {}, False, None, {}, False
+                    json_rows.append(row)
             continue
-        failed = re.match(r"\s*--- FAIL: (Test[^\s]+) \([0-9.]+s\)$", line)
-        if failed:
-            pending.append(failed[1])
-        diagnostic = message(line)
-        if diagnostic:
-            messages.append(diagnostic)
-        package = re.fullmatch(r"FAIL\s+(" + PACKAGE_RE + r")\s+[0-9.]+s", line)
+        terminal = re.fullmatch(r"( *)--- (FAIL|PASS|SKIP): (Test[^\s]+) \([0-9.]+s\)", line)
+        marker = re.fullmatch(r"=== (RUN|PAUSE|CONT|NAME)\s+(Test[^\s]+)", line)
+        if not tainted:
+            if marker:
+                action, name = marker[1].lower(), marker[2]
+                reports = {}
+                if action == "run":
+                    verbose = True
+                    update(pending, name, action)
+                active = name if action != "pause" and pending.get(name, {}).get("state") == "run" else None
+            elif line == "=== NAME":
+                active, reports = None, {}
+            elif terminal:
+                indent, action, active = len(terminal[1]), terminal[2].lower(), terminal[3]
+                update(pending, active, action, implicit=not verbose)
+                reports = {depth: name for depth, name in reports.items() if depth < indent}
+                reports[indent] = active
+            diagnostic = message(line)
+            if diagnostic:
+                # Non-verbose Go buffers nested reports; indentation can return to the parent.
+                indent = len(line) - len(line.lstrip(" "))
+                depth = max((depth for depth in reports if depth < indent), default=None)
+                scope = reports[depth] if depth is not None else active
+                if scope in pending and pending[scope]["state"] != "invalid":
+                    pending[scope]["messages"].add(diagnostic)
+                elif problem.search(line):
+                    tainted = True
+            elif problem.search(line):
+                tainted = True
+        package = re.fullmatch(r"FAIL\s+([A-Za-z0-9_./-]+)\s+(?:[0-9.]+s|\[build failed\])", line)
         if package:
-            for name in pending:
-                root = name.split("/", 1)[0]
-                if re.fullmatch(TEST_RE, root):
-                    group = groups.setdefault((package[1], root), {"tests": set(), "messages": set()})
-                    group["tests"].add(name)
-                    group["messages"].update(messages)
-            pending, messages = [], []
-        elif line.startswith(("ok \t", "FAIL\t", "FAIL ")):
-            pending, messages = [], []
-    failed_packages = {row.get("Package") for row in json_rows if row.get("Action") == "fail" and not row.get("Test")}
+            value = package[1]
+            failed_packages.add(value)
+            retain(value, pending, tainted)
+            pending, tainted, active, reports, verbose = {}, False, None, {}, False
+        elif re.match(r"(?:ok|\?|FAIL)\s", line):
+            pending, tainted, active, reports, verbose = {}, False, None, {}, False
+        if terminal or marker or re.match(r"(?:ok|\?|FAIL)\s", line):
+            if json_rows and json_rows[-1] is not None:
+                json_rows.append(None)
+
+    scopes = {}
     for row in json_rows:
-        package, name = row.get("Package"), row.get("Test")
-        if not isinstance(package, str) or not re.fullmatch(PACKAGE_RE, package) or package not in failed_packages:
+        if row is None:
+            # Plain Go output starts a separate execution, never a JSON continuation.
+            unknown_packages.update(package for package, scope in scopes.items() if scope["tainted"] or incomplete(scope["tests"]))
+            scopes = {}
             continue
-        if not isinstance(name, str) or not re.fullmatch(TEST_RE, name.split("/", 1)[0]):
+        package, name, action = row["Package"], row.get("Test"), row["Action"]
+        if not re.fullmatch(PACKAGE_RE, package):
+            if action == "fail":
+                unknown_packages.add(package)
             continue
-        root = name.split("/", 1)[0]
-        if row.get("Action") == "fail":
-            group = groups.setdefault((package, root), {"tests": set(), "messages": set()})
-            group["tests"].add(name)
-    for row in json_rows:
-        package, name = row.get("Package"), row.get("Test")
-        if row.get("Action") != "output" or not isinstance(name, str) or not isinstance(row.get("Output"), str):
-            continue
-        group = groups.get((package, name.split("/", 1)[0]))
-        if group:
-            group["messages"].update(value for line in row["Output"].splitlines() if (value := message(line)))
-    return [{"package": package, "test": root,
-             "signature": {key: sorted(values) for key, values in signature.items()}}
-            for (package, root), signature in sorted(groups.items())]
+        if action == "start":
+            if package in scopes and (scopes[package]["tainted"] or incomplete(scopes[package]["tests"])):
+                unknown_packages.add(package)
+            scopes[package] = {"tests": {}, "tainted": False}
+        scope = scopes.setdefault(package, {"tests": {}, "tainted": False})
+        tests = scope["tests"]
+        if isinstance(row.get("Output"), str):
+            for line in row["Output"].splitlines():
+                diagnostic = message(line)
+                if not scope["tainted"] and diagnostic and action == "output" and tests.get(name, {}).get("state") == "run":
+                    tests[name]["messages"].add(diagnostic)
+                elif problem.search(line):
+                    scope["tainted"] = True
+        if not name and action in ("pass", "fail", "skip"):
+            if action == "fail":
+                failed_packages.add(package)
+                retain(package, tests, scope["tainted"])
+            scopes.pop(package)
+        elif name and not scope["tainted"] and action in ("run", "pass", "fail", "skip"):
+            update(tests, name, action)
+    for package, scope in scopes.items():
+        if scope["tainted"] or incomplete(scope["tests"]):
+            unknown_packages.add(package)
+    known = [value for _, value in sorted(groups.items())]
+    covered = {row["package"] for row in known}
+    unresolved = [{"package": value, "reason": "包超时、基础设施失败或缺少完整命名失败"} for value in sorted(failed_packages - covered | unknown_packages)]
+    if tainted or incomplete(pending):
+        unresolved.append({"package": None, "reason": "未绑定包的超时、基础设施诊断或缺少包终止的命名失败"})
+    return known, unresolved + unbound
+
+
+def failures(text):
+    return failure_records(text)[0]
 
 
 def rows(text, package):
-    def pairs(items):
-        result = {}
-        for key, value in items:
-            check(key not in result, "Go JSON 重复字段")
-            result[key] = value
-        return result
-    values = [json.loads(line, object_pairs_hook=pairs) for line in text.splitlines() if line]
+    values = [json.loads(line, object_pairs_hook=unique_pairs) for line in text.splitlines() if line]
     actions = {"start", "run", "pause", "cont", "pass", "fail", "skip", "output", "bench", "attr", "artifacts"}
     check(bool(values) and all(isinstance(row, dict) and row.get("Package") == package and row.get("Action") in actions
                               for row in values), "Go JSON 包身份或动作不符")
@@ -147,8 +262,8 @@ def assess(listing, list_code, text, code, candidate):
         if code == 0:
             check(events[-1]["Action"] == "pass" and not any(row["Action"] == "fail" for row in events), "通过证据不完整")
             return {"state": "pass"}
-        found = failures(text)
-        check(len(found) == 1 and found[0]["test"] == test and events[-1]["Action"] == "fail", "命名失败签名缺失、超时或有歧义")
+        found, unresolved = failure_records(text)
+        check(not unresolved and len(found) == 1 and found[0]["test"] == test and events[-1]["Action"] == "fail", "命名失败签名缺失、超时或有歧义")
         return {"state": "fail", "signature": found[0]["signature"]}
     except (ValueError, TypeError, KeyError) as error:
         return {"state": "unknown", "reason": str(error)}
@@ -158,40 +273,19 @@ def unknown(reason, **evidence):
     return {"status": "unknown", "reason": reason, **evidence}
 
 
-def localize(chain, candidate, probe):
-    evidence = {"chain": chain, "candidate": candidate, "probes": []}
-    if not 2 <= len(chain) <= MAX_COMMITS or len(set(chain)) != len(chain):
-        return unknown("首亲范围缺失或超过回放上限", **evidence)
-    states = []
-    for sha in chain:
-        results = [probe(sha, candidate) for _ in range(REPEATS)]
-        evidence["probes"].append({"sha": sha, "results": results})
-        state = results[0].get("state")
-        if state not in ("pass", "fail", "absent") or any(row.get("state") != state for row in results):
-            return unknown("测试不稳定、缺少执行证明或工具链/基础设施失败", **evidence)
-        if state == "fail" and any(row.get("signature") != candidate["signature"] for row in results):
-            return unknown("失败签名不一致", **evidence)
-        states.append(state)
-    if states[-1] != "fail" or states[0] == "fail":
-        return unknown("未在可信绿点与失败点之间复现转换", **evidence)
-    index = states.index("fail")
-    if any(state != "fail" for state in states[index:]):
-        return unknown("范围内存在多个转换", **evidence)
-    if states[index - 1] == "absent":
-        if any(state != "absent" for state in states[:index]):
-            return unknown("测试消失后重现，不能证明首次引入", **evidence)
-        absent = evidence["probes"][index - 1]["results"]
-        present = evidence["probes"][index]["results"]
-        if any(row.get("definition", {}).get("state") != "absent" for row in absent) or any(
-                row.get("definition", {}).get("state") != "present" for row in present):
-            return unknown("仅编译清单变化，未证明测试源码首次引入", **evidence)
-        transition = "new-test"
-    else:
-        if "absent" in states[:index]:
-            return unknown("绿点缺少同名测试，不能证明同一回归", **evidence)
-        transition = "regression"
-    return unknown("已重复复现，等待精确合并 PR 核验", localization="reproduced", transition=transition,
-                   good_sha=chain[index - 1], bad_sha=chain[-1], commit=chain[index], **evidence)
+def localize(chain, candidate, probe, *, remaining=None, prior=None):
+    return worker("periodic-history").locate(chain, candidate, probe, remaining=remaining, prior=prior)
+
+
+def first_parent_chain(root, initial):
+    baseline = initial.get("ancestor")
+    check(isinstance(baseline, dict), "无可信首亲绿点")
+    for endpoint in (initial, baseline):
+        check(isinstance(endpoint.get("sha"), str) and re.fullmatch(SHA_RE, endpoint["sha"]) and
+              git(root, "rev-parse", endpoint["sha"] + "^{tree}") == endpoint.get("tree"), "范围端点 SHA/tree 不符")
+    history = git(root, "rev-list", "--first-parent", initial["sha"]).splitlines()
+    check(baseline["sha"] in history, "可信绿点不在实际首亲链中或历史对象缺失")
+    return list(reversed(history[:history.index(baseline["sha"]) + 1]))
 
 
 def child_env(home):
@@ -203,11 +297,12 @@ def child_env(home):
             "GOMODCACHE": str(home / "go-mod")}
 
 
-def git(root, *args):
+def git(root, *args, strip=True):
     with tempfile.TemporaryDirectory(prefix="periodic-git-") as home:
-        return subprocess.check_output(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
+        text = subprocess.check_output(["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                                         "-C", str(root), *args], env=child_env(Path(home)), stderr=subprocess.PIPE,
-                                       timeout=30).decode().strip()
+                                       timeout=30).decode()
+        return text.strip() if strip else text
 
 
 def definition(root, sha, candidate):
@@ -217,7 +312,7 @@ def definition(root, sha, candidate):
     for path in paths:
         if not path.endswith("_test.go") or str(Path(path).parent) != directory:
             continue
-        source = git(root, "show", sha + ":" + path)
+        source = git(root, "show", sha + ":" + path, strip=False)
         check(len(source.encode()) <= MAX_LOG, "测试源码超过上限")
         files[path] = hashlib.sha256(source.encode()).hexdigest()
         if re.search(r"\b" + re.escape(candidate["test"]) + r"\b", source):
@@ -229,10 +324,11 @@ def definition(root, sha, candidate):
 
 
 class Probe:
-    def __init__(self, root, output, timeout=90, budget=1200):
+    def __init__(self, root, output, timeout=None, budget=12600):
         self.root, self.output, self.timeout = Path(root), Path(output), timeout
         self.output.mkdir(parents=True, exist_ok=True)
-        self.deadline, self.index = time.monotonic() + budget, 0
+        self.started, self.budget, self.index = time.monotonic(), budget, 0
+        self.deadline = self.started + budget
         self.definitions = {}
         self.home = tempfile.TemporaryDirectory(prefix="periodic-replay-home-")
         self.env = child_env(Path(self.home.name))
@@ -240,12 +336,15 @@ class Probe:
     def close(self):
         self.home.cleanup()
 
-    def execute(self, argv, cwd, label):
+    def execute(self, argv, cwd, label, timeout=None):
         path = self.output / f"{self.index:04d}-{label}.jsonl"
         result = {"argv": argv, "log": path.name}
-        remaining = min(self.timeout, self.deadline - time.monotonic())
+        limit = timeout if self.timeout is None else min(timeout, self.timeout)
+        remaining = min(limit, self.deadline - time.monotonic())
+        started = time.monotonic()
+        result.update(limit_seconds=max(0, remaining))
         if remaining <= 0:
-            return {**result, "state": "unknown", "reason": "回放总时间达到上限"}, ""
+            return {**result, "state": "unknown", "reason": "回放总时间达到上限", "elapsed_seconds": time.monotonic() - self.started}, ""
         with path.open("wb") as output:
             process = subprocess.Popen(argv, cwd=cwd, env=self.env, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
@@ -260,8 +359,13 @@ class Probe:
                     result["timed_out"] = True
                     break
                 time.sleep(0.1)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         with path.open("rb") as stream:
-            result.update(returncode=process.returncode, sha256=hashlib.file_digest(stream, "sha256").hexdigest())
+            result.update(returncode=process.returncode, sha256=hashlib.file_digest(stream, "sha256").hexdigest(),
+                          elapsed_seconds=time.monotonic() - started)
         if path.stat().st_size > MAX_LOG or result.get("timed_out"):
             return {**result, "state": "unknown", "reason": "回放超时或日志超过上限"}, ""
         return result, path.read_text(encoding="utf-8", errors="replace")
@@ -272,10 +376,16 @@ class Probe:
         check(isinstance(package, str) and re.fullmatch(PACKAGE_RE, package), "回放包非法")
         check(isinstance(test, str) and re.fullmatch(TEST_RE, test), "回放测试名非法")
         check(type(candidate.get("race")) is bool, "回放 race 类型非法")
+        mode = candidate.get("execution", {})
+        check(mode.get("mode") == ("race" if candidate["race"] else "ordinary") and
+              type(mode.get("timeout_seconds")) in (int, float) and
+              mode["timeout_seconds"] == duration(mode.get("timeout_arg"), mode.get("job_timeout_seconds", 21600)) and
+              type(mode.get("setup_seconds")) is int and mode["setup_seconds"] == 300, "原始测试模式或超时预算未证明")
         self.index += 1
         if time.monotonic() >= self.deadline:
-            return {"state": "unknown", "reason": "回放总时间达到上限"}
-        details = {"sha": sha, "tree": git(self.root, "rev-parse", sha + "^{tree}")}
+            return {"state": "unknown", "reason": "回放总时间达到上限", "sha": sha,
+                    "elapsed_seconds": time.monotonic() - self.started, "budget_seconds": self.budget}
+        details = {"sha": sha, "tree": git(self.root, "rev-parse", sha + "^{tree}"), "execution": mode}
         try:
             if sha not in self.definitions:
                 self.definitions[sha] = definition(self.root, sha, candidate)
@@ -289,13 +399,14 @@ class Probe:
                     pattern = "^" + test + "$"
                     flags = ["-race"] if candidate["race"] else []
                     listed, listing = self.execute(["go", "test", "-json", *flags, "-list", pattern,
-                                                    "./" + package.removeprefix("agentworkspace/")], checkout, "list")
+                                                    "./" + package.removeprefix("agentworkspace/")], checkout, "list", timeout=mode["setup_seconds"])
                     details["list"] = listed
                     check(not listed.get("state"), "列举测试失败")
                     if not inventory(listing, listed.get("returncode"), candidate):
                         return {**details, "state": "absent"}
-                    execution, text = self.execute(["go", "test", "-count=1", *flags, "-json", "-timeout=60s", "-run", pattern,
-                                                   "./" + package.removeprefix("agentworkspace/")], checkout, "run")
+                    execution, text = self.execute(["go", "test", "-count=1", *flags, "-json", "-timeout=" + mode["timeout_arg"], "-run", pattern,
+                                                   "./" + package.removeprefix("agentworkspace/")], checkout, "run",
+                                                   timeout=mode["timeout_seconds"] + mode["setup_seconds"])
                     details["run"] = execution
                     check(not execution.get("state"), "测试执行异常")
                     return {**details, **assess(listing, listed.get("returncode"), text, execution.get("returncode"), candidate)}
@@ -304,26 +415,61 @@ class Probe:
         except (ValueError, OSError, subprocess.SubprocessError) as error:
             return {**details, "state": "unknown", "reason": str(error)}
 
+
+def worker(name):
+    spec = importlib.util.spec_from_file_location(name.replace('-', '_'), Path(__file__).with_name(name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def candidate_id(candidate):
+    return hashlib.sha256(json.dumps(candidate, sort_keys=True).encode()).hexdigest()[:16]
+
+
 def replay(bundle, root, output):
     initial = json.loads((bundle / "receipt.json").read_text())
-    candidates = initial.get("failure_candidates", [])
-    baseline = initial.get("ancestor")
-    result = unknown("无可信绿点、失败日志缺失、多个失败签名或非 Go 作业")
-    if len(candidates) == 1 and baseline:
-        good, bad = baseline["sha"], initial["sha"]
-        chain = git(root, "rev-list", "--first-parent", "--max-count=33", bad).splitlines()
-        if good in chain:
-            chain = list(reversed(chain[:chain.index(good) + 1]))
-            check(git(root, "rev-parse", bad + "^{tree}") == initial["tree"], "失败点 tree 不符")
-            check(git(root, "rev-parse", good + "^{tree}") == baseline["tree"], "绿点 tree 不符")
-            runner = Probe(root, output)
+    candidates, baseline = initial.get("failure_candidates", []), initial.get("ancestor")
+    started = time.monotonic()
+    deadline, chain, reason = started + 12600, [], "无可信首亲绿点"
+    if baseline:
+        try:
+            chain = first_parent_chain(root, initial)
+        except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+            reason = str(error)
+    items, seen = [], set()
+    for candidate in candidates:
+        item_id = candidate_id(candidate)
+        check(item_id not in seen, "失败候选执行身份重复")
+        seen.add(item_id)
+        result = unknown(reason, candidate=candidate, probes=[], chain=chain)
+        remaining = deadline - time.monotonic()
+        if chain and remaining > 0:
+            directory = output / item_id
+            runner = None
             try:
-                result = localize(chain, candidates[0], runner)
+                if candidate.get('kind') == 'client':
+                    runner = worker('periodic-clients').ClientProbe(root, directory, timeout=300, budget=remaining)
+                elif candidate.get('kind') == 'diagnostic':
+                    runner = worker('periodic-diagnostics').DiagnosticProbe(root, directory, budget=remaining)
+                else:
+                    runner = Probe(root, directory, budget=remaining)
+                result = localize(chain, candidate, runner, remaining=lambda: deadline - time.monotonic())
+            except (ValueError, KeyError, OSError, TypeError, subprocess.SubprocessError) as error:
+                result = unknown("此测试回放无法完成：" + str(error), candidate=candidate, probes=[], chain=chain)
             finally:
-                runner.close()
-        else:
-            result = unknown("可信绿点不在有界首亲范围内")
-    result["initial_sha256"] = hashlib.sha256((bundle / "receipt.json").read_bytes()).hexdigest()
+                if runner:
+                    runner.close()
+        elif chain:
+            result = localize(chain, candidate, lambda *_: None, remaining=lambda: 0)
+        result.update(id=item_id, directory=item_id, elapsed_seconds=max(0, remaining - (deadline - time.monotonic())))
+        result.setdefault("good_sha", baseline["sha"] if baseline else None)
+        result.setdefault("bad_sha", initial["sha"])
+        result.setdefault("commit", None)
+        items.append(result)
+    result = {"schema": 1, "items": items, "unresolved": initial.get("unresolved_failures", []),
+              "elapsed_seconds": time.monotonic() - started, "budget_seconds": 12600,
+              "initial_sha256": hashlib.sha256((bundle / "receipt.json").read_bytes()).hexdigest()}
     (output / "localization.json").write_text(json.dumps(result, sort_keys=True) + "\n")
 
 

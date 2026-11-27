@@ -5,11 +5,6 @@ on:
     # UTC; edit this line to change the interval.
     - cron: '17 */6 * * *'
   workflow_dispatch:
-    inputs:
-      force:
-        description: '忽略同 SHA 成功证明并重新执行 Full'
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -18,7 +13,10 @@ permissions:
 
 # Actions keeps one running and one pending run; the newest pending replaces the old one.
 concurrency:
-  group: main-master-periodic
+  group: >-
+    ${{ github.ref == 'refs/heads/master' &&
+        (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' && vars.PERIODIC_FULL_ENABLED != 'false') &&
+        'main-master-periodic' || format('periodic-ignored-{0}-{1}', github.run_id, github.run_attempt) }}
   cancel-in-progress: false
 
 defaults:
@@ -28,7 +26,9 @@ defaults:
 jobs:
   resolve:
     name: Resolve trusted master
-    if: ${{ github.event_name == 'workflow_dispatch' || vars.PERIODIC_FULL_ENABLED != 'false' }}
+    if: >-
+      ${{ github.ref == 'refs/heads/master' &&
+          (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' && vars.PERIODIC_FULL_ENABLED != 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
@@ -70,7 +70,6 @@ jobs:
         id: admit
         env:
           GH_TOKEN: ${{ github.token }}
-          PERIODIC_FORCE: ${{ inputs.force || false }}
         run: |
           set -euo pipefail
           python3 control/.github/scripts/periodic-full.py admit --root control \
@@ -98,18 +97,13 @@ jobs:
           ref: ${{ needs.resolve.outputs.sha }}
           path: control
           persist-credentials: false
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.resolve.outputs.sha }}
-          path: target
-          persist-credentials: false
       - uses: actions/download-artifact@v7
         with:
           name: periodic-full-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/plan
       - name: Check actual checkout before product commands
         id: identity
-        working-directory: target
+        working-directory: control
         env:
           CHECKOUT_SHA: ${{ needs.resolve.outputs.sha }}
           CHECKOUT_TREE: ${{ needs.resolve.outputs.tree }}
@@ -119,34 +113,41 @@ jobs:
           [[ "$(git rev-parse 'HEAD^{tree}')" == "$CHECKOUT_TREE" ]] || exit 1
           printf 'sha=%s\ntree=%s\n' "$CHECKOUT_SHA" "$CHECKOUT_TREE" >> "$GITHUB_OUTPUT"
           mkdir -p "$RUNNER_TEMP/periodic-home"
+          printf 'NPM_CONFIG_CACHE=%s/periodic-npm-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v7
         with:
-          go-version-file: target/go.mod
-          cache-dependency-path: target/go.sum
+          go-version-file: control/go.mod
+          cache-dependency-path: control/go.sum
       - name: Ordinary test cmd package
-        working-directory: target
+        working-directory: control
         run: |
           set -euo pipefail
-          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" GOTOOLCHAIN=local GOWORK=off \
+          go_cache=$(GOTOOLCHAIN=local go env GOCACHE)
+          go_mod_cache=$(GOTOOLCHAIN=local go env GOMODCACHE)
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" GOCACHE="$go_cache" GOMODCACHE="$go_mod_cache" GOTOOLCHAIN=local GOWORK=off \
             go test -count=1 ./cmd/workspace
       - uses: actions/setup-node@v7
         with:
           node-version: '22.x'
           check-latest: true
+          cache: npm
+          cache-dependency-path: control/web/package-lock.json
       - name: Web test, typecheck and build
-        working-directory: target
+        working-directory: control
         run: |
           set -euo pipefail
-          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" \
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" npm_config_cache="$NPM_CONFIG_CACHE" \
             python3 "$GITHUB_WORKSPACE/control/.github/scripts/ci-plan.py" web "$RUNNER_TEMP/plan/full-plan.json"
       - uses: actions/setup-node@v7
         with:
           node-version: '24.13.0'
+          cache: npm
+          cache-dependency-path: control/extensions/pi-bridge/package-lock.json
       - name: Pi bridge test and typecheck
-        working-directory: target
+        working-directory: control
         run: |
           set -euo pipefail
-          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" \
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" npm_config_cache="$NPM_CONFIG_CACHE" \
             python3 "$GITHUB_WORKSPACE/control/.github/scripts/ci-plan.py" bridge "$RUNNER_TEMP/plan/full-plan.json"
 
   full:
@@ -205,17 +206,13 @@ jobs:
       contents: read
       actions: read
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Independent replay budget; original Full package timeouts are not changed.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.resolve.outputs.sha }}
           path: control
-          persist-credentials: false
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.resolve.outputs.sha }}
-          path: history
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/download-artifact@v7
@@ -224,12 +221,43 @@ jobs:
           path: ${{ runner.temp }}/periodic/initial
       - uses: actions/setup-go@v7
         with:
-          go-version-file: history/go.mod
+          go-version-file: control/go.mod
+          # Historical executions use private per-replay caches, never publish them.
           cache: false
-      - name: Replay only exact known package and named test with safe argv
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+          check-latest: true
+      - name: Pin Web toolchain paths
+        id: web-tools
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, shutil
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              for key in ('node', 'npm'):
+                  out.write(f'{key}={pathlib.Path(shutil.which(key)).resolve()}\n')
+          PY
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.13.0'
+      - name: Pin bridge toolchain paths
+        id: bridge-tools
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, shutil
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              for key in ('node', 'npm'):
+                  out.write(f'{key}={pathlib.Path(shutil.which(key)).resolve()}\n')
+          PY
+      - name: Replay exact known test leaves without credentials
+        env:
+          PERIODIC_WEB_NODE: ${{ steps.web-tools.outputs.node }}
+          PERIODIC_WEB_NPM: ${{ steps.web-tools.outputs.npm }}
+          PERIODIC_BRIDGE_NODE: ${{ steps.bridge-tools.outputs.node }}
+          PERIODIC_BRIDGE_NPM: ${{ steps.bridge-tools.outputs.npm }}
         run: |
           python3 control/.github/scripts/periodic-replay.py "$RUNNER_TEMP/periodic/initial" \
-            history "$RUNNER_TEMP/periodic/localization"
+            control "$RUNNER_TEMP/periodic/localization"
       - uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
@@ -266,13 +294,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/periodic/final"
-          cp -R "$RUNNER_TEMP/periodic/initial/." "$RUNNER_TEMP/periodic/final/"
-          if [[ -d "$RUNNER_TEMP/periodic/localization" ]]; then
-            cp -R "$RUNNER_TEMP/periodic/localization" "$RUNNER_TEMP/periodic/final/localization"
-          fi
           python3 control/.github/scripts/periodic-full.py finish --root control \
             --bundle "$RUNNER_TEMP/periodic/initial" --localization "$RUNNER_TEMP/periodic/localization" \
             --output "$RUNNER_TEMP/periodic/final"
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: periodic-full-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/periodic/final-evidence
+          if-no-files-found: ignore
+          retention-days: 90
       - uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
