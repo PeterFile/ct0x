@@ -146,6 +146,10 @@ class RoutingTests(unittest.TestCase):
             ".github/workflows/ci.yml", ".github/workflows/ci-full.yml",
             ".github/scripts/ci-plan.py", ".github/scripts/ci-shards.py", ".github/scripts/ci-gate.py",
             ".github/scripts/test-ci-scheduling.py", ".github/scripts/test-store-shard.py", ".github/scripts/verify-store-shard.py",
+            ".github/workflows/periodic-full.yml",
+            *(".github/scripts/" + name + ".py" for name in (
+                "periodic-full", "periodic-replay", "periodic-history", "periodic-clients", "periodic-diagnostics",
+                "test-periodic-full", "test-periodic-history", "test-periodic-clients", "test-periodic-diagnostics")),
         }
         self.assertEqual(self.plan.CI_PATHS, policies)
         for policy in policies:
@@ -394,6 +398,10 @@ class AdmissionTests(unittest.TestCase):
                                     ("ci:full", "full"), ("CI:FULL", "full"), ("bug", "ignore")):
                 events.append(("pull_request", pr("labeled", draft, label={"name": label}), expected))
             events.append(("pull_request", pr("edited", draft, changes={"base": {"ref": {"from": "release"}}}), "feedback"))
+            for opted_event in (pr("edited", draft, changes={"base": {"ref": {"from": "release"}}}),
+                                pr("labeled", draft, label={"name": "ci:refresh"})):
+                opted_event["pull_request"]["labels"] = [{"name": "CI:FULL"}]
+                events.append(("pull_request", opted_event, "full"))
             for fields in ({"title": {"from": "old"}}, {"body": {"from": "old"}}, {"base": {"sha": {"from": SHA}}}):
                 event = pr("edited", draft, changes=fields)
                 event["pull_request"]["labels"] = [{"name": "ci:full"}]
@@ -460,6 +468,7 @@ class AdmissionTests(unittest.TestCase):
                                   ([".github/scripts/ci-shards.py", "internal/scheduler/task.go"], True, True),
                                   ([".github/scripts/ci-plan.py", "web/src/a.ts"], True, False),
                                   ([".github/scripts/ci-gate.py", "extensions/pi-bridge/index.ts"], True, True),
+                                  ([".github/scripts/periodic-history.py"], True, False),
                                   ([".github/scripts/unknown.py"], True, True)]:
                 selected = {"mode": mode, **plan.classify(paths)}
                 values = {"steps.plan.outputs." + key: json.dumps(value) if type(value) is bool else value
@@ -479,7 +488,7 @@ class AdmissionTests(unittest.TestCase):
             result = subprocess.run(["bash", "-c", stub + script],
                                     env={**os.environ, "CI_TEST_FAIL": failure}, text=True, capture_output=True, timeout=5)
             self.assertEqual(result.returncode == 0, not failure, result.stderr)
-            self.assertEqual(result.stdout.splitlines(), commands[:1] if failure == commands[0] else commands)
+            self.assertEqual(result.stdout.splitlines(), commands[:commands.index(failure) + 1] if failure else commands)
         self.assertNotIn("unittest discover", block)
 
     def test_outer_gate_cannot_disappear_with_missing_preflight_outputs(self):
@@ -523,8 +532,18 @@ class AdmissionTests(unittest.TestCase):
         for action in ["opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft", "edited", "labeled"]:
             self.assertIn(action, self.workflow.split("permissions:", 1)[0])
         triggers = self.workflow.split("permissions:", 1)[0]
-        pr_trigger, push_trigger = triggers.split("  pull_request:", 1)[1].split("  push:", 1)
-        self.assertEqual(push_trigger.strip(), "branches:\n      - master")
+        def trigger_keys(text):
+            active = "\n".join(line.split("#", 1)[0].rstrip() for line in text.splitlines())
+            block = re.search(r"^on:\n(.*?)(?=^\S|\Z)", active, re.M | re.S)[1]
+            return set(re.findall(r"^  ([a-z_]+):", block, re.M))
+
+        self.assertEqual(trigger_keys(triggers), {"pull_request"})
+        rollback = "  # push: {branches: [master]}"
+        self.assertEqual(triggers.splitlines().count(rollback), 1)
+        restored = triggers.replace(rollback, rollback.replace("# ", "", 1))
+        self.assertEqual(trigger_keys(restored), {"pull_request", "push"})
+        self.assertIn("  push: {branches: [master]}", restored)
+        pr_trigger = triggers.split("  pull_request:", 1)[1].split(rollback, 1)[0]
         self.assertNotIn("merge_group:", triggers)
         self.assertNotIn("branches:", pr_trigger)
         self.assertNotRegex(triggers, r"(?m)^ +paths(?:-ignore)?:")
@@ -1285,6 +1304,32 @@ class GateTests(unittest.TestCase):
                 self.assertEqual((Path(directory) / "go-benchmarks.txt").read_text().splitlines(),
                                  ["BenchmarkAlloc-8 100 1.25 ns/op 16 B/op 2 allocs/op",
                                   "BenchmarkStream-8 5 2.5e+02 ns/op 1.00 MB/s 0 B/op 0 allocs/op"])
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_only_explicit_discovery_contract_omits_nested_periodic_suites(self):
+        expected = ["test_periodic_full", "test_periodic_history", "test_periodic_clients", "test_periodic_diagnostics"]
+        for value in (None, "", "0", "true", "01", "1"):
+            modules = []
+            loader = mock.Mock()
+            loader.loadTestsFromModule.side_effect = lambda module: modules.append(module.__name__) or unittest.TestSuite()
+            tests = unittest.TestSuite()
+            with self.subTest(value=value), mock.patch.dict(os.environ):
+                if value is None:
+                    os.environ.pop("CI_TESTS_DISCOVERED", None)
+                else:
+                    os.environ["CI_TESTS_DISCOVERED"] = value
+                self.assertIs(load_tests(loader, tests, None), tests)
+                self.assertEqual(modules, [] if value == "1" else expected)
+
+
+def load_tests(loader, tests, pattern):
+    # Only callers explicitly listing all four periodic suites may set this flag.
+    if os.environ.get("CI_TESTS_DISCOVERED") == "1":
+        return tests
+    for name in ("test-periodic-full", "test-periodic-history", "test-periodic-clients", "test-periodic-diagnostics"):
+        tests.addTests(loader.loadTestsFromModule(load(name)))
+    return tests
 
 
 if __name__ == "__main__":
