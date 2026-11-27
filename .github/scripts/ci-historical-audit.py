@@ -48,7 +48,7 @@ def valid_sha(value):
 def request(inputs, size):
     check(isinstance(inputs, dict) and not inputs.keys() - {"policy_sha", "phase", "offset", "count", "focus_sha"}, "输入字段非法")
     check(valid_sha(inputs.get("policy_sha")), "policy_sha 必须为小写四十位 SHA")
-    check(inputs.get("phase") in ("selector", "diagnostics", "both"), "phase 非法")
+    check(inputs.get("phase") in ("selector", "diagnostics", "both", "misses"), "phase 非法")
     result = {"policy_sha": inputs["policy_sha"], "phase": inputs["phase"]}
     focus = inputs.get("focus_sha", "")
     check(isinstance(focus, str), "focus_sha 必须为空或冻结清单内的小写四十位 SHA")
@@ -56,7 +56,10 @@ def request(inputs, size):
         check(valid_sha(focus), "focus_sha 必须为空或小写四十位 SHA")
         cases = manifest((HERE / "ci-historical-cases.json").read_text(encoding="utf-8"))
         check(focus in {row["sha"] for row in cases}, "focus_sha 不在冻结历史清单中")
-        check(inputs["phase"] == "selector" or focus in DIAGNOSTICS, "诊断 focus_sha 必须是已有固定诊断原件")
+        if inputs["phase"] == "misses":
+            check(focus in MISSES, "misses focus_sha 必须是三例固定历史漏选原件之一")
+        else:
+            check(inputs["phase"] == "selector" or focus in DIAGNOSTICS, "诊断 focus_sha 必须是已有固定诊断原件")
         result["focus_sha"] = focus
     for key, default, low, high in (("offset", "0", 0, size - 1), ("count", "150", 1, 150)):
         value = inputs.get(key, default)
@@ -90,6 +93,13 @@ def manifest(text):
 
 def select_sources(cases, options):
     focus = options.get("focus_sha")
+    if options["phase"] == "misses":
+        by_sha = {row["sha"]: row for row in cases}
+        if focus:
+            check(focus in MISSES, "misses focus_sha 必须是三例固定历史漏选原件之一")
+        shas = [focus] if focus else list(MISSES)
+        check(shas and all(sha in by_sha for sha in shas), "misses 原件不在冻结清单")
+        return [by_sha[sha] for sha in shas], set()
     if focus:
         focused = [row for row in cases if row["sha"] == focus]
         check(len(focused) == 1, "focus_sha 未对应唯一冻结原件；不能忽略或回退到全清单")
@@ -189,6 +199,8 @@ def finish(index):
     index["coverage"] = {"requested": len(rows), "exact": exact, "missing": len(rows) - exact}
     index["coverage_note"] = "missing 指缺少完整 checkout 身份证据；未执行/unknown 不代表 GitHub 对象不存在"
     known = {"not-requested", "selected", "policy-refusal", "red-reproduced", "complete-no-red"}
+    if index.get("request", {}).get("phase") == "misses":
+        known |= {"not-selected", "selected-but-unreached", "original-assertion-unconfirmed", "structural-refusal"}
     complete = bool(rows) and not index["errors"] and exact == len(rows) and all(
         row[phase]["status"] in known for row in rows for phase in ("selector", "diagnostic"))
     index["status"] = "complete" if complete else "infrastructure-error"
@@ -225,6 +237,56 @@ p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
 selected = json.load(open(sys.argv[2], encoding="utf-8"))
 print(json.dumps(p.tasks({**selected, "unresolved": []})))
+'''
+
+# Select the exact emitted unit containing one original test through the pinned planner helpers.
+SELECT = '''import importlib.util, json, sys
+from collections import Counter
+policy, task_file, representative, package = sys.argv[1:5]
+spec = importlib.util.spec_from_file_location("pinned_policy", policy)
+p = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(p)
+tasks = json.load(open(task_file, encoding="utf-8"))
+matches, reasons = [], []
+try:
+    for task in tasks:
+        if task.get("kind") != "go" or task.get("package") != package:
+            continue
+        if task.get("race") is not True:
+            reasons.append({"unit": task.get("unit"), "reason": "wrong-mode"})
+            continue
+        names, bucket, worker = task.get("names"), task.get("bucket"), task.get("worker")
+        if names is not None:
+            if bucket is not None or worker is not None:
+                raise ValueError("unsupported named shape")
+            if representative in names:
+                matches.append(task)
+            else:
+                reasons.append({"unit": task.get("unit"), "reason": "named-list-excludes-original"})
+        elif bucket is not None:
+            if worker is not None or task.get("buckets") != 8 or not hasattr(p, "bucket_selection"):
+                raise ValueError("unsupported bucket shape")
+            selected = p.bucket_selection(Counter({representative: 1}), bucket, task["buckets"])
+            if selected.get(representative) == 1:
+                matches.append(task)
+            else:
+                reasons.append({"unit": task.get("unit"), "reason": "bucket-excludes-original"})
+        elif worker is not None:
+            profile = task.get("profile")
+            if not isinstance(profile, str) or not hasattr(p, "shards") or not hasattr(p, "verifier"):
+                raise ValueError("unsupported partition shape")
+            slots = p.shards.BATCHES[profile][worker]
+            selected = sum((p.verifier.selection(Counter({representative: 1}), slot, profile)[0] for slot in slots), Counter())
+            if selected.get(representative) == 1:
+                matches.append(task)
+            else:
+                reasons.append({"unit": task.get("unit"), "reason": "partition-excludes-original"})
+        else:
+            matches.append(task)
+    print(json.dumps({"matches": matches, "reasons": reasons}))
+except Exception as error:
+    print(json.dumps({"exception": type(error).__name__, "error": str(error)}))
+    sys.exit(1)
 '''
 
 # Observe the real policy command boundary without replacing its commands, verifier, or return codes.
@@ -521,6 +583,40 @@ class Runner:
         check(command["rc"] == 0 and not command["timeout"], "固定策略无法投影目标任务；完整计划仍被拒绝")
         return decode((self.output / command["stdout"]).read_text(encoding="utf-8"))
 
+    def select_unit(self, tasks, package, representative, prefix):
+        self.trusted_policy()
+        directory = self.output / prefix
+        request = directory / "tasks.json"
+        write_json(request, tasks)
+        command = self.record([sys.executable, "-B", "-c", SELECT, str(self.policy / ".github/scripts/merge-gate.py"),
+                               str(request), representative, package], self.policy,
+                              directory.relative_to(self.output) / "select", 30)
+        result = {"command": command, "status": "unknown", "matches": [], "reasons": []}
+        if command["rc"] != 0 or command["timeout"]:
+            result.update(status="unsupported-worker-shape",
+                          error=(self.output / command["stderr"]).read_text(encoding="utf-8", errors="replace").strip()
+                          or "无法使用固定策略选择实际执行单元")
+            return result
+        data = decode((self.output / command["stdout"]).read_text(encoding="utf-8"))
+        check(isinstance(data, dict) and isinstance(data.get("matches"), list)
+              and all(isinstance(row, dict) for row in data["matches"])
+              and isinstance(data.get("reasons"), list)
+              and all(isinstance(row, dict) for row in data["reasons"]), "单元选择结果非法")
+        result.update(matches=data["matches"], reasons=data["reasons"])
+        if len(data["matches"]) == 1:
+            result["status"] = "selected"
+        elif len(data["matches"]) > 1:
+            result.update(status="unsupported-worker-shape", error="多个实际执行单元同时包含原测试")
+        elif any(row.get("reason") in ("bucket-excludes-original", "partition-excludes-original")
+                 for row in data["reasons"]):
+            result.update(status="unsupported-worker-shape", error="实际分区未覆盖原测试")
+        elif any(row.get("reason") == "wrong-mode" for row in data["reasons"]) and not any(
+                row.get("reason") == "named-list-excludes-original" for row in data["reasons"]):
+            result["status"] = "wrong-mode"
+        else:
+            result["status"] = "not-selected"
+        return result
+
     def worker(self, task, prefix):
         self.trusted_policy()
         directory = self.output / prefix / "worker"
@@ -621,6 +717,54 @@ DIAGNOSTICS = {
         "test": "WorkflowTests.test_remaining_package_exclusion_executes_actual_shell_without_go",
         "native_step": "Test Store shard gates", "literal": "AssertionError: False != True",
         "assertion": "self.assertEqual(result.returncode == 0, accepted, result.stderr)"},
+}
+MISSES = {
+    "5aa8203bda038d3ce08ef51bfef1e20ba8c5dca1": {
+        "pr": 162, "run_id": 44088192148, "run_attempt": 1, "job_id": 134063669160,
+        "package": "agentworkspace/cmd/workspace",
+        "test": "TestCoordinationCompositionUnknownCancelAndShutdownHoldClaims",
+        "case": "TestCoordinationCompositionUnknownCancelAndShutdownHoldClaims/shutdown",
+        "file": "cmd/workspace/coordination_composition_test.go",
+        "original_tests": ["TestCoordinationCompositionUnknownCancelAndShutdownHoldClaims",
+                           "TestCoordinationCompositionUnknownCancelAndShutdownHoldClaims/shutdown"],
+        "signatures": [
+            {"test": "TestCoordinationCompositionUnknownCancelAndShutdownHoldClaims/shutdown",
+             "file": "coordination_composition_test.go", "line": 528,
+             "literal": "race safety prerequisite did not reconcile the same original assignment generation/receipt: materialize=工作分配事务失败"},
+            {"test": "TestCoordinationCompositionUnknownCancelAndShutdownHoldClaims/shutdown",
+             "file": "coordination_composition_test.go", "line": 628,
+             "literal": "complete composition output:"},
+        ],
+        "evidence": "coordination_composition_test.go:528: race safety prerequisite did not reconcile the same original assignment generation/receipt: materialize=工作分配事务失败 | coordination_composition_test.go:628: complete composition output:",
+    },
+    "56d236dda96e1a5140031b6d7069917394a23d2f": {
+        "pr": 176, "run_id": 44235577412, "run_attempt": 1, "job_id": 134570782516,
+        "package": "agentworkspace/internal/platform",
+        "test": "TestChatRepairPreparationWaitsUnclaimedAndSchedulerContinues",
+        "case": "TestChatRepairPreparationWaitsUnclaimedAndSchedulerContinues",
+        "file": "internal/platform/prepare_repair_wiring_test.go",
+        "original_tests": ["TestChatRepairPreparationWaitsUnclaimedAndSchedulerContinues"],
+        "signatures": [
+            {"test": "TestChatRepairPreparationWaitsUnclaimedAndSchedulerContinues",
+             "file": "prepare_repair_wiring_test.go", "line": 254,
+             "literal": "database is locked (5) (SQLITE_BUSY)"},
+        ],
+        "evidence": "prepare_repair_wiring_test.go:254: database is locked (5) (SQLITE_BUSY)",
+    },
+    "4b87e75cfcaeaac19d7e1e8e1db076bf673651ba": {
+        "pr": 239, "run_id": 45512885246, "run_attempt": 1, "job_id": 138866224228,
+        "package": "agentworkspace/internal/coordination",
+        "test": "TestIntentPassCancellationAndQueryFailure",
+        "case": "TestIntentPassCancellationAndQueryFailure/cancel-between-items-and-resume",
+        "file": "internal/coordination/intent_pump_test.go",
+        "original_tests": ["TestIntentPassCancellationAndQueryFailure",
+                           "TestIntentPassCancellationAndQueryFailure/cancel-between-items-and-resume"],
+        "signatures": [
+            {"test": "TestIntentPassCancellationAndQueryFailure/cancel-between-items-and-resume",
+             "file": "intent_pump_test.go", "line": 789, "literal": "context deadline exceeded"},
+        ],
+        "evidence": "intent_pump_test.go:789: context deadline exceeded",
+    },
 }
 EFFECT = "TestTaskWorkInputEffectKeys"
 
@@ -772,10 +916,11 @@ def isolated_effect(runner, spec, prefix):
             "failure_kind": "timeout-infrastructure" if timeout else None, "candidate_unit_caught": False}
 
 
-def worker_observations(runner, worker, task):
-    names = task.get("names")
+def worker_observations(runner, worker, task, names=None):
     if names is None:
-        names = list(worker["receipt"].get("partition", {}).get("selected", {}))
+        names = task.get("names")
+        if names is None:
+            names = list(worker["receipt"].get("partition", {}).get("selected", {}))
     result = {"complete": False, "tests": {name: dict.fromkeys(("run", "pass", "fail", "skip"), 0) for name in names},
               "outputs": [], "test_events": {}, "commands": []}
     for command in worker["receipt"]["commands"]:
@@ -802,6 +947,27 @@ def worker_observations(runner, worker, task):
     if result["complete"]:
         result["package_result"] = "fail" if any(row["go_events"]["package_result"] == "fail" for row in result["commands"]) else "pass"
     return result
+
+
+def target_red(summary, worker_rc, task, target, signature, timed_out=False):
+    """Return the exact command with the target's terminal red; whole-group coverage may be partial."""
+    if timed_out or type(worker_rc) is not int or worker_rc != 1:
+        return None
+    for row in summary.get("commands", []):
+        command = row.get("command", {})
+        argv = command.get("argv", [])
+        events = row.get("go_events")
+        if not (argv[:2] == ["go", "test"] and "-race" in argv and "-json" in argv and "-run" in argv
+                and argv[-1] == task["package"] and type(command.get("rc")) is int and command["rc"] == 1
+                and not command.get("evidence_error") and isinstance(events, dict)):
+            continue
+        pattern = argv[argv.index("-run") + 1]
+        if re.fullmatch(pattern, target) is None:
+            continue
+        evidence = signature(events)
+        if evidence:
+            return {"command": command, "go_events": events, "evidence": evidence}
+    return None
 
 
 def migration_sources(runner, spec):
@@ -1080,13 +1246,28 @@ def diagnose(runner, frozen, policy, inspection=None):
             candidate["original_failed_tests"] = [name for name in originals if summary["tests"].get(name, {}).get("fail")]
             if kind == "effect":
                 result["source_signature"] = effect_signature(runner, summary, spec)
+                result["partial_coverage"] = not summary["complete"]
+                candidate["partial_coverage"] = not summary["complete"]
+                def effect_red(events):
+                    signature = effect_signature(runner, events, spec)
+                    return signature if signature["matches"] else None
+                target = target_red(summary, command["rc"], task, EFFECT, effect_red, timed_out)
+                if target:
+                    result.update(status="red-reproduced", target_evidence=target)
+                    candidate["target_command"] = target["command"]
+                elif summary["complete"]:
+                    result["status"] = named_outcome(summary, go_rc, command["rc"], originals)
+                    if result["status"] == "red-reproduced":
+                        # Complete aggregate coverage still needs per-command target evidence.
+                        result["status"] = "original-assertion-unconfirmed"
+                        candidate["reason"] = "target-command-evidence-unavailable"
             else:
                 result["source_signatures"] = original_signatures(summary, RACE_SIGNATURES)
-            if summary["complete"]:
-                result["status"] = named_outcome(summary, go_rc, command["rc"], originals)
-                matched = result["source_signature"]["matches"] if kind == "effect" else any(row["matches"] for row in result["source_signatures"])
-                if result["status"] == "red-reproduced" and not matched:
-                    result["status"] = "original-assertion-unconfirmed"
+                if summary["complete"]:
+                    result["status"] = named_outcome(summary, go_rc, command["rc"], originals)
+                    matched = any(row["matches"] for row in result["source_signatures"])
+                    if result["status"] == "red-reproduced" and not matched:
+                        result["status"] = "original-assertion-unconfirmed"
             if kind == "effect" and not summary["tests"].get(EFFECT, {}).get("run"):
                 candidate["reason"] = "original-not-reached-by-actual-worker"
                 result["isolated_original"] = isolated_effect(runner, spec, prefix)
@@ -1096,6 +1277,191 @@ def diagnose(runner, frozen, policy, inspection=None):
     except Exception as error:
         result["error"] = f"{type(error).__name__}: {error}"
     return result
+
+
+def miss_sources(runner, spec):
+    found = test_sources(runner.history, spec["package"].removeprefix("agentworkspace/"), [spec["test"]], strict=False)
+    matches = len(found) == 1 and Path(found[0]["file"]).name == Path(spec["file"]).name
+    return found, bool(matches)
+
+
+def miss_matchers(spec):
+    result = []
+    for signature in spec["signatures"]:
+        result.append({**signature, "test": re.escape(signature["test"])})
+        if "/" in signature["test"]:
+            result.append({**signature, "test": re.escape(signature["test"].split("/", 1)[0])})
+    return result
+
+
+def case_failed(summary, case):
+    if "/" in case:
+        event = summary.get("test_events", {}).get(case, {})
+        root = summary["tests"].get(case.split("/", 1)[0], {})
+        return event.get("run") == 1 and event.get("fail") == 1 and root.get("run") == 1 and root.get("fail") == 1
+    counts = summary["tests"].get(case, {})
+    return counts.get("run") == 1 and counts.get("fail") == 1
+
+
+def diagnose_miss(runner, frozen, policy, inspection=None):
+    spec = MISSES[frozen["sha"]]
+    result = {"status": "unknown", "origin": "pinned-emitted-unit",
+              "original_job": {"run_id": spec["run_id"], "run_attempt": spec["run_attempt"],
+                               "job_id": spec["job_id"], "pr": spec["pr"]},
+              "original_tests": spec["original_tests"], "evidence": spec["evidence"]}
+    prefix = Path("sources") / frozen["sha"] / "misses"
+    try:
+        check(policy is not None, "固定策略未知；拒绝执行漏选回放")
+        check(inspection is not None and inspection.get("status") in ("selected", "policy-refusal"),
+              "缺少实际 inspect 选择证据")
+        selected = inspection.get("selection", {})
+        origin = "emitted-task" if inspection["status"] == "selected" else "target-projection-from-refused-inspect"
+        tasks = selected.get("tasks", []) if inspection["status"] == "selected" else runner.project(inspection)
+        check(isinstance(tasks, list) and all(isinstance(task, dict) for task in tasks), "实际策略任务非法")
+        result.update(origin="pinned-emitted-unit" if origin == "emitted-task" else "pinned-projected-unit",
+                      task_origin=origin, selector_status=inspection["status"],
+                      full_plan_executable=inspection["status"] == "selected",
+                      global_unresolved=selected.get("unresolved", []))
+        sources, source_matches = miss_sources(runner, spec)
+        result.update(source=sources, source_matches=source_matches)
+        check(source_matches, "历史检出中缺少原测试源码或文件映射不符")
+        choice = runner.select_unit(tasks, spec["package"], spec["test"], prefix)
+        result["unit_selection"] = choice
+        result["candidate"] = {"status": "unknown", "caught_original_defect": False, "unit_exercised": False,
+                               "selected_but_unreached": False, "projected_unit": origin != "emitted-task",
+                               "task_origin": origin, "selector_status": inspection["status"],
+                               "full_plan_executable": inspection["status"] == "selected"}
+        if choice["status"] != "selected":
+            result["status"] = choice["status"]
+            result["candidate"].update(status=choice["status"], reason=choice.get("error") or choice["status"])
+            return result
+        task = choice["matches"][0]
+        result["candidate"]["task"] = task
+        worker = runner.worker(task, prefix)
+        result["candidate"]["worker"] = worker
+        result["command"] = worker["command"]
+        receipt = worker["receipt"]
+        result["candidate"]["api_invoked"] = receipt.get("api_invoked", False)
+        check(worker.get("tracked_unchanged"), "worker 清理后的 SHA/tree/跟踪文件状态改变或证据缺失")
+        check(receipt.get("task") == task, "worker 回执与实际执行单元不符")
+        returned = bool(receipt.get("returned"))
+        exception = receipt.get("exception", "")
+        if not returned and exception != "CalledProcessError":
+            status = ("unsupported-worker-shape" if exception in ("AttributeError", "TypeError")
+                      else "structural-refusal" if exception == "ValueError" else "worker-error")
+            result["candidate"].update(status=status, reason=receipt.get("error") or exception or "worker 未返回")
+            result["status"] = status
+            return result
+        go_commands = [row for row in receipt.get("commands", [])
+                       if row.get("argv", [])[:2] == ["go", "test"] and "-run" in row["argv"]]
+        result["candidate"]["actual_go_commands"] = go_commands
+        if not go_commands:
+            if returned:
+                result["candidate"].update(status="selected-but-unreached", selected_but_unreached=True,
+                                           reason="实际 worker 未产生 Go 测试命令")
+                result["status"] = "selected-but-unreached"
+            else:
+                status = ("unsupported-worker-shape" if exception in ("AttributeError", "TypeError")
+                          else "structural-refusal" if exception == "ValueError" else "worker-error")
+                result["candidate"].update(status=status, reason=receipt.get("error") or exception or "worker 未返回")
+                result["status"] = status
+            return result
+        native = all("-race" in row["argv"] and "-json" in row["argv"] and "-run" in row["argv"]
+                     and row["argv"][-1] == task["package"] for row in go_commands)
+        result["candidate"]["native_race"] = native
+        if not native:
+            result["candidate"].update(status="unsupported-worker-shape", reason="实际 worker 未使用原生 -race JSON 单元")
+            result["status"] = "unsupported-worker-shape"
+            return result
+        detail = receipt.get("detail") if isinstance(receipt.get("detail"), dict) else {}
+        compiled = detail.get("compiled")
+        selected_names = detail.get("selected")
+        patterns = [row["argv"][row["argv"].index("-run") + 1] for row in go_commands if "-run" in row["argv"]]
+        pattern_selected = any(re.fullmatch(pattern, spec["test"]) for pattern in patterns)
+        observed = set()
+        for row in go_commands:
+            path = runner.output / worker["directory"] / row.get("stdout", "missing.stdout")
+            text = path.read_text(encoding="utf-8") if "stdout" in row and not row.get("evidence_error") and path.is_file() else ""
+            for line in text.splitlines():
+                try:
+                    event = decode(line)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(event, dict) and event.get("Package") == task["package"] and event.get("Action") == "run":
+                    name = event.get("Test", "")
+                    if name and "/" not in name:
+                        observed.add(name)
+        result["candidate"]["compiled_contains_original"] = (isinstance(compiled, dict) and spec["test"] in compiled) or spec["test"] in observed
+        result["candidate"]["selected_contains_original"] = (spec["test"] in selected_names if isinstance(selected_names, dict)
+                                                             else pattern_selected)
+        if not result["candidate"]["selected_contains_original"]:
+            result["candidate"].update(status="selected-but-unreached", selected_but_unreached=True,
+                                       reason="实际 worker 选择未包含原测试")
+            result["status"] = "selected-but-unreached"
+            return result
+        partition_names = worker["receipt"].get("partition", {}).get("selected")
+        names = (list(task["names"]) if task.get("names") is not None else
+                 list(selected_names) if isinstance(selected_names, dict) else
+                 list(partition_names) if isinstance(partition_names, dict) else sorted(observed))
+        if not names:
+            result["candidate"].update(status="selected-but-unreached", selected_but_unreached=True,
+                                       reason="实际 worker 未产生原测试事件")
+            result["status"] = "selected-but-unreached"
+            return result
+        summary = worker_observations(runner, worker, task, names)
+        result["go_events"] = summary
+        result["candidate"]["unit_exercised"] = bool(summary["commands"])
+        result["candidate"]["tests_exercised"] = [name for name, counts in summary["tests"].items() if counts["run"]]
+        result["candidate"]["original_failed_tests"] = [name for name in spec["original_tests"]
+                                                        if summary.get("test_events", {}).get(name, {}).get("fail") == 1
+                                                        or summary["tests"].get(name, {}).get("fail") == 1]
+        signatures = original_signatures(summary, miss_matchers(spec))
+        result["source_signatures"] = signatures
+        matched = any(row["matches"] for row in signatures)
+        failed = case_failed(summary, spec["case"])
+        go_rc = 1 if any(row["rc"] == 1 for row in go_commands) else 0 if all(row["rc"] == 0 for row in go_commands) else None
+        result["candidate"].update(original_case_failed=failed, source_signature_matches=matched,
+                                   actual_go_rc=[row["rc"] for row in go_commands])
+        text = "\n".join((runner.output / worker["command"][key]).read_text(encoding="utf-8", errors="replace")
+                         for key in ("stdout", "stderr"))
+        timed_out = worker["command"]["timeout"] or "panic: test timed out after " in text
+        result["partial_coverage"] = not summary["complete"]
+        result["candidate"]["partial_coverage"] = not summary["complete"]
+        def miss_red(events):
+            here = original_signatures(events, miss_matchers(spec))
+            failed_here = case_failed(events, spec["case"])
+            return ({"source_signatures": here, "original_case_failed": failed_here}
+                    if failed_here and any(row["matches"] for row in here) else None)
+        target = target_red(summary, worker["command"]["rc"], task, spec["test"], miss_red, timed_out)
+        if target:
+            result.update(status="red-reproduced", target_evidence=target)
+            result["candidate"].update(status="red-reproduced", caught_original_defect=True,
+                                       target_command=target["command"])
+        elif timed_out:
+            result.update(status="unknown", failure_kind="timeout-infrastructure")
+            result["candidate"].update(status="unknown", reason="timeout-infrastructure")
+        elif summary["complete"] and summary["tests"].get(spec["test"], {}).get("skip") == 1:
+            result.update(status="selected-but-unreached")
+            result["candidate"].update(status="selected-but-unreached", selected_but_unreached=True,
+                                       reason="原测试被跳过")
+        elif summary["complete"] and go_rc == 0 and not any(
+                counts["fail"] for counts in summary["tests"].values()):
+            result.update(status="complete-no-red")
+            result["candidate"]["status"] = "complete-no-red"
+        elif summary["complete"] and go_rc == 1:
+            result.update(status="original-assertion-unconfirmed")
+            result["candidate"].update(status="original-assertion-unconfirmed",
+                                       reason="原测试未失败或诊断行/文件不匹配")
+        else:
+            result["candidate"].update(status="selected-but-unreached",
+                                       selected_but_unreached=not any(
+                                           counts["run"] for counts in summary["tests"].values()),
+                                       reason="Go JSON 覆盖不完整")
+            result["status"] = "unknown"
+        return result
+    except Exception as error:
+        result["error"] = f"{type(error).__name__}: {error}"
+        return result
 
 
 def context():
@@ -1153,16 +1519,23 @@ def run_audit(root):
         options = request(event.get("inputs"), len(cases))
         index.update(context=expected, controller=controller, request=options, manifest_count=len(cases),
                      manifest_sha256=hashlib.sha256(cases_path.read_bytes()).hexdigest())
+        if options["phase"] == "misses":
+            index["scope"] = "仅采集三例历史 Merge gate 漏选的实际/投影执行证据，不代表策略接受、Full 或产品就绪"
         selected, diagnostic_shas = select_sources(cases, options)
         selector_shas = {row["sha"] for row in selected}
+        exercise_shas = diagnostic_shas | (selector_shas if options["phase"] == "misses" else set())
         by_sha = {row["sha"]: row for row in cases}
         for sha in diagnostic_shas:
             check(sha in by_sha and [DIAGNOSTICS[sha]["run_id"], 1] in by_sha[sha]["runs"], "诊断原始 run/SHA 不在冻结清单")
+        if options["phase"] == "misses":
+            for sha in selector_shas:
+                check(sha in MISSES and [MISSES[sha]["run_id"], MISSES[sha]["run_attempt"]] in by_sha[sha]["runs"],
+                      "漏选原始 run/SHA 不在冻结清单")
         # Diagnostics remain independent of planner names and selector pagination.
         order = list(dict.fromkeys([sha for sha in DIAGNOSTICS if sha in diagnostic_shas] + [row["sha"] for row in selected]))
         index["rows"] = [{**by_sha[sha], "source_state": "pending",
                           "selector": {"status": "pending" if sha in selector_shas | diagnostic_shas else "not-requested"},
-                          "diagnostic": {"status": "pending" if sha in diagnostic_shas else "not-requested"}} for sha in order]
+                          "diagnostic": {"status": "pending" if sha in exercise_shas else "not-requested"}} for sha in order]
         write_json(path, index)
         index["api_run"] = public_run(expected)
         version = subprocess.run(["go", "version"], env=runner.env, capture_output=True, check=True, timeout=30).stdout.decode().strip()
@@ -1197,7 +1570,8 @@ def run_audit(root):
                     row["selector"] = runner.inspect(row) if policy is not None else {"status": "unknown", "error": "固定策略不可用"}
                     write_json(path, index)
                 if row["diagnostic"]["status"] == "pending":
-                    row["diagnostic"] = diagnose(runner, row, policy, row["selector"])
+                    row["diagnostic"] = (diagnose_miss(runner, row, policy, row["selector"])
+                                         if options["phase"] == "misses" else diagnose(runner, row, policy, row["selector"]))
                     write_json(path, index)
             write_json(source_dir / "row.json", row)
             write_json(path, index)

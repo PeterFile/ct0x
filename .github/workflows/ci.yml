@@ -9,13 +9,13 @@ on:
         required: true
         type: string
       phase:
-        description: '审计阶段；未指定 focus_sha 时 diagnostics 核验八个固定历史原件'
+        description: '审计阶段；misses 仅回放三例历史漏选，未指定 focus_sha 时 diagnostics 核验八个固定历史原件'
         required: true
         type: choice
-        options: [selector, diagnostics, both]
+        options: [selector, diagnostics, both, misses]
         default: both
       focus_sha:
-        description: '可选：仅审计冻结清单内该小写四十位 SHA；留空沿用原有 113 条/八诊断范围'
+        description: '可选：仅审计冻结清单内该小写四十位 SHA；misses 仅允许三例漏选之一；留空沿用原有 113 条/八诊断范围'
         required: false
         type: string
         default: ''
