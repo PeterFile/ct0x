@@ -1,137 +1,75 @@
-name: CI
+name: Full trial checkout probe
+run-name: 'Full trial checkout probe at ${{ inputs.sha }}'
 
 on:
-  pull_request:
-    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft, edited, labeled]
-  push:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      sha:
+        type: string
+        required: true
 
 permissions:
   contents: read
-
-# Relevant PR runs supersede older runs. Master keeps the running and latest pending run.
-# Irrelevant events get a private group, so they cannot supersede real CI.
-concurrency:
-  group: >-
-    ${{ format('{0}-{1}', github.workflow,
-        ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-         (github.event_name == 'pull_request' &&
-          (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-           (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-           (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
-        (github.event.pull_request.number || github.ref) || format('ignored-{0}', github.run_id)) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
     shell: bash
 
+env:
+  TRIAL_SHA: ${{ inputs.sha }}
+  TRIAL_SCHEME: a
+  TRIAL_REPEAT: '1'
+  TRIAL_PARALLEL: '7'
+  GOTOOLCHAIN: local
+  PYTHONDONTWRITEBYTECODE: '1'
+
 jobs:
-  feedback:
-    name: CI preflight and feedback
-    if: >-
-      ${{ (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-          (github.event_name == 'pull_request' &&
-           (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-            (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-            (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full')))) }}
+  probe:
     runs-on: ubuntu-latest
     timeout-minutes: 25
-    outputs:
-      mode: ${{ steps.plan.outputs.mode }}
-      sha: ${{ steps.plan.outputs.sha }}
-      tree: ${{ steps.plan.outputs.tree }}
-      head: ${{ steps.plan.outputs.head }}
-      base: ${{ steps.plan.outputs.base }}
-      run_id: ${{ steps.plan.outputs.run_id }}
-      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 2
+          path: .trial-controller
+          sparse-checkout: /.github/
+          sparse-checkout-cone-mode: false
           persist-credentials: false
-      - name: Route immutable merge and check full diff
-        id: plan
-        run: python3 .github/scripts/ci-plan.py plan "$RUNNER_TEMP/ci-plan.json"
+      - name: Stage verified trial controller
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/.trial-controller"
+          target="$RUNNER_TEMP/trial-controller"
+          [[ -d "$source/.git" && ! -L "$source" && ! -e "$target" && ! -L "$target" ]] || exit 1
+          actual=$(git -C "$source" rev-parse HEAD)
+          [[ "$actual" == "$GITHUB_SHA" ]] || exit 1
+          mv "$source" "$target"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+      - name: Verify immutable product and controller
+        run: python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py" identity
       - uses: actions/setup-go@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
-      # Ordinary cmd catches composition/liveness regressions before full fanout (#218).
-      - name: Ordinary test cmd package
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
-        run: go test -count=1 ./cmd/workspace
-      - name: Test CI scheduling and shard gates
-        if: ${{ steps.plan.outputs.mode == 'feedback' && steps.plan.outputs.ci == 'true' }}
+      - name: Verify clean checkout and original coordination gate
         run: |
           set -euo pipefail
-          python3 .github/scripts/test-ci-scheduling.py -v
-          python3 .github/scripts/test-store-shard.py -v
-      - name: Targeted Go feedback
-        run: python3 .github/scripts/ci-plan.py feedback "$RUNNER_TEMP/ci-plan.json"
-      - uses: actions/setup-node@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.web == 'true' }}
-        with:
-          node-version: '22.x'
-          check-latest: true
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - name: Web test, typecheck and build
-        run: python3 .github/scripts/ci-plan.py web "$RUNNER_TEMP/ci-plan.json"
-      - uses: actions/setup-node@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.bridge == 'true' }}
-        with:
-          node-version: '24.13.0'
-          cache: npm
-          cache-dependency-path: extensions/pi-bridge/package-lock.json
-      - name: Pi bridge test and typecheck
-        run: python3 .github/scripts/ci-plan.py bridge "$RUNNER_TEMP/ci-plan.json"
-
-  # Master is serialized by workflow concurrency; PR full runs are opt-in.
-  full:
-    name: Full suite
-    needs: feedback
-    if: ${{ needs.feedback.outputs.mode == 'full' }}
-    uses: ./.github/workflows/ci-full.yml
-    with:
-      sha: ${{ needs.feedback.outputs.sha }}
-      tree: ${{ needs.feedback.outputs.tree }}
-      head: ${{ needs.feedback.outputs.head }}
-      base: ${{ needs.feedback.outputs.base }}
-      matrix: ${{ needs.feedback.outputs.matrix }}
-
-  # Derive candidacy from the native event, not outputs that a failed preflight may never emit.
-  # Feedback/ignored events must never publish even a skipped check under the required name.
-  # Cancelled dependencies and an unexpectedly skipped full also need a non-required name.
-  merge-check:
-    name: >-
-      ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-           (github.event_name == 'pull_request' &&
-            (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-             (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-             (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
-          (github.event_name == 'push' || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full')) &&
-          needs.feedback.result != 'cancelled' && needs.full.result != 'cancelled' &&
-          (needs.feedback.result != 'success' || needs.full.result != 'skipped') && 'Full CI' || 'Feedback status' }}
-    needs: ["feedback", "full"]
-    if: >-
-      ${{ !cancelled() && (((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-           (github.event_name == 'pull_request' &&
-            (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-             (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-             (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
-          (github.event_name == 'push' || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full'))) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - name: Check same-run preflight and full evidence
-        env:
-          NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 .github/scripts/ci-gate.py outer
+          controller="$RUNNER_TEMP/trial-controller"
+          product_sha=$(git rev-parse HEAD)
+          product_tree=$(git rev-parse 'HEAD^{tree}')
+          controller_sha=$(git -C "$controller" rev-parse HEAD)
+          controller_tree=$(git -C "$controller" rev-parse 'HEAD^{tree}')
+          status=$(git status --porcelain=v1 --untracked-files=all)
+          printf 'product_sha=%s\nproduct_tree=%s\ncontroller_sha=%s\ncontroller_tree=%s\n' \
+            "$product_sha" "$product_tree" "$controller_sha" "$controller_tree"
+          printf 'product_git_status=%s\n' "${status:-clean}"
+          [[ "$TRIAL_SHA" == "18d11a3c0176fe98856aeeef6396e9ddfde0cca0" && "$product_sha" == "$TRIAL_SHA" ]] || exit 1
+          [[ "$product_tree" == "6df8bf3ccb986f8f4088dc310e0257b3f6285d9a" && "$controller_sha" == "$GITHUB_SHA" ]] || exit 1
+          [[ -z "$status" && ! -e .trial-controller && ! -L .trial-controller ]] || exit 1
+          for script in full-trial.py full-trial-plan.py full-trial-events.py full-trial-receipts.py full-trial-workflow.py test-full-trial.py; do
+            [[ -f "$controller/.github/scripts/$script" && ! -L "$controller/.github/scripts/$script" ]] || exit 1
+          done
+          go test -count=1 -run '^TestCoordinationDecideNoProductionCallsites$' -v ./internal/coordination
