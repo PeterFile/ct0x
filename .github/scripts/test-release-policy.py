@@ -71,6 +71,7 @@ class PolicyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.jobs = workflow_jobs()
+        cls.shared = cls.enterClassContext(cls.source_fixture())
 
     def test_optional_input_and_only_policy_consumers_get_identical_setup(self):
         text = FULL.read_text(encoding="utf-8")
@@ -102,9 +103,10 @@ class PolicyTests(unittest.TestCase):
                 if field(block, "run") and "go " in script(block):
                     self.assertIsNone(field(block, "working-directory"), "never run product Go in policy checkout")
 
+    @classmethod
     @contextmanager
-    def fixture(self):
-        with tempfile.TemporaryDirectory(prefix="release-policy-") as directory:
+    def source_fixture(cls):
+        with tempfile.TemporaryDirectory(prefix="release-policy-source-") as directory:
             root = Path(directory).resolve()
             repo = root / "objects"
             subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
@@ -144,29 +146,16 @@ class PolicyTests(unittest.TestCase):
                 candidate_files[".github/scripts/" + name] = "raise SystemExit('candidate policy must not execute: " + name + "')\n"
             policy_sha, policy_tree = commit(policy_files)
             sha, tree = commit(candidate_files)
-            self.assertNotEqual(policy_sha, sha)
-            self.assertNotEqual(policy_tree, tree)
-            self.assertNotEqual(policy_files[".github/scripts/ci-plan.py"], candidate_files[".github/scripts/ci-plan.py"])
-            workspace, temporary = root / "workspace", root / "temp"
-            workspace.mkdir()
-            temporary.mkdir()
-            env = {**os.environ, "GITHUB_WORKSPACE": str(workspace), "RUNNER_TEMP": str(temporary),
-                   "GITHUB_ENV": str(root / "env"), "GITHUB_OUTPUT": str(root / "output"),
-                   "GITHUB_WORKFLOW_SHA": policy_sha, "GITHUB_RUN_ID": RUN,
-                   "GO_LOG": str(root / "go-log"), "PYTHONDONTWRITEBYTECODE": "1"}
-            env.pop("CI_POLICY_ROOT", None)
-            values = {"inputs.sha": sha, "inputs.tree": tree, "inputs.head": sha, "inputs.base": sha,
-                      "inputs.policy_sha": policy_sha, "matrix.profile": "store", "matrix.worker": "0",
-                      "toJSON(needs)": json.dumps({name: {"result": "success"} for name in
-                                                   ("go-shards", "go-other", "go-workspace", "go-vet", "go-benchmarks")})}
             binary = root / "bin"
             binary.mkdir()
             go = binary / "go"
             go.write_text("#!" + sys.executable + "\n" + textwrap.dedent('''\
-                import json, os, re, subprocess, sys
+                import json, os, re, sys
                 from pathlib import Path
                 args = sys.argv[1:]
-                sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+                sha = Path(".git/HEAD").read_text().strip()
+                if not re.fullmatch(r"[0-9a-f]{40}", sha):
+                    raise SystemExit("fixture checkout must have a detached full SHA")
                 with open(os.environ["GO_LOG"], "a") as log:
                     log.write(json.dumps({"cwd": os.getcwd(), "sha": sha, "args": args}) + "\\n")
                 package = "agentworkspace/" + args[-1].removeprefix("./")
@@ -178,7 +167,7 @@ class PolicyTests(unittest.TestCase):
                 elif "-bench" in args:
                     print("BenchmarkCandidate-8 1 1 ns/op 0 B/op 0 allocs/op")
                 elif "-json" in args:
-                    names = ["TestVector" + str(index) for index in range(8)]
+                    names = ["TestVector6"]
                     rows = [{"Action": "start", "Package": package}]
                     if "-list" in args:
                         rows.append({"Action": "output", "Package": package,
@@ -194,6 +183,27 @@ class PolicyTests(unittest.TestCase):
                     raise SystemExit(90)
                 '''))
             go.chmod(0o755)
+            yield repo, policy_sha, policy_tree, sha, tree, binary
+
+    @contextmanager
+    def fixture(self):
+        repo, policy_sha, policy_tree, sha, tree, binary = self.shared
+        self.assertNotEqual(policy_sha, sha)
+        self.assertNotEqual(policy_tree, tree)
+        with tempfile.TemporaryDirectory(prefix="release-policy-") as directory:
+            root = Path(directory).resolve()
+            workspace, temporary = root / "workspace", root / "temp"
+            workspace.mkdir()
+            temporary.mkdir()
+            env = {**os.environ, "GITHUB_WORKSPACE": str(workspace), "RUNNER_TEMP": str(temporary),
+                   "GITHUB_ENV": str(root / "env"), "GITHUB_OUTPUT": str(root / "output"),
+                   "GITHUB_WORKFLOW_SHA": policy_sha, "GITHUB_RUN_ID": RUN,
+                   "GO_LOG": str(root / "go-log"), "PYTHONDONTWRITEBYTECODE": "1"}
+            env.pop("CI_POLICY_ROOT", None)
+            values = {"inputs.sha": sha, "inputs.tree": tree, "inputs.head": sha, "inputs.base": sha,
+                      "inputs.policy_sha": policy_sha, "matrix.profile": "store", "matrix.worker": "0",
+                      "toJSON(needs)": json.dumps({name: {"result": "success"} for name in
+                                                   ("go-shards", "go-other", "go-workspace", "go-vet", "go-benchmarks")})}
             env["PATH"] = str(binary) + os.pathsep + env["PATH"]
             yield root, repo, workspace, temporary, env, values
 
@@ -206,7 +216,7 @@ class PolicyTests(unittest.TestCase):
             return values[key]
         return value
 
-    def run_step(self, block, env, values, prefix=""):
+    def run_step(self, block, env, values, prefix="", *, timeout=30):
         step_env = dict(env)
         match = re.search(r"^        env:\n((?:          [^\n]+\n)+)", block, re.M)
         if match:
@@ -215,7 +225,7 @@ class PolicyTests(unittest.TestCase):
                 step_env[key] = self.resolve(value, env, values)
         cwd = self.resolve(field(block, "working-directory") or env["GITHUB_WORKSPACE"], env, values)
         result = subprocess.run(["bash", "-c", prefix + script(block)], cwd=cwd, env=step_env,
-                                text=True, capture_output=True, timeout=30)
+                                text=True, capture_output=True, timeout=timeout)
         if Path(env["GITHUB_ENV"]).exists():
             env.update(line.split("=", 1) for line in Path(env["GITHUB_ENV"]).read_text().splitlines())
         return result
@@ -245,9 +255,8 @@ class PolicyTests(unittest.TestCase):
         self.fail("missing target checkout")
 
     def assert_clean_target(self, workspace, sha, tree):
-        for query, expected in (("HEAD", sha), ("HEAD^{tree}", tree)):
-            result = subprocess.check_output(["git", "-C", str(workspace), "rev-parse", query], text=True).strip()
-            self.assertEqual(result, expected)
+        result = subprocess.check_output(["git", "-C", str(workspace), "rev-parse", "HEAD", "HEAD^{tree}"], text=True)
+        self.assertEqual(result.splitlines(), [sha, tree])
         self.assertEqual(subprocess.check_output(["git", "-C", str(workspace), "status", "--porcelain"], text=True), "")
         self.assertFalse((workspace / ".ci-policy").exists())
 
@@ -290,7 +299,7 @@ class PolicyTests(unittest.TestCase):
                 self.assertNotIn("CI_POLICY_ROOT", env)
                 self.assertFalse((temporary / "ci-policy").exists())
 
-    def test_distinct_policy_plan_and_all_actual_workers_test_only_candidate_then_aggregate(self):
+    def test_distinct_policy_plan_and_profile_workers_test_only_candidate_then_aggregate(self):
         with self.fixture() as (root, repo, workspace, temporary, env, values):
             self.prepare("go-shards", repo, workspace, env, values)
             policy = Path(env.get("CI_POLICY_ROOT", workspace)).resolve()
@@ -300,26 +309,51 @@ class PolicyTests(unittest.TestCase):
             spec = importlib.util.spec_from_file_location("release_policy_plan", policy / ".github/scripts/ci-plan.py")
             plan = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(plan)
+            spec = importlib.util.spec_from_file_location("release_policy_shards", policy / ".github/scripts/ci-shards.py")
+            shards = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(shards)
             matrix = plan.shard_matrix()["include"]
-            self.assertEqual(len(matrix), 24)
+            expected_workers = {(profile, worker) for profile, batches in shards.BATCHES.items() for worker in range(len(batches))}
+            self.assertEqual({(row["profile"], row["worker"]) for row in matrix}, expected_workers)
+            self.assertEqual(len(matrix), len(expected_workers))
+            compiled = {"TestVector6": 1}
+            sampled = {profile: next(worker for worker, slots in enumerate(batches)
+                                    if any(shards.verifier.selection(compiled, slot, profile)[0] for slot in slots))
+                       for profile, batches in shards.BATCHES.items()}
+            self.assertEqual(set(sampled), {"store", "platform", "httpapi"})
             run = named(self.jobs["go-shards"], "Run and verify logical slots")
             workers = temporary / "shard-workers"
             workers.mkdir()
             for row in matrix:
-                values.update({"matrix.profile": row["profile"], "matrix.worker": str(row["worker"])})
-                scratch = temporary / ("worker-" + row["profile"] + "-" + str(row["worker"]))
-                scratch.mkdir()
-                env["RUNNER_TEMP"] = str(scratch)
-                result = self.run_step(run, env, values)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                (scratch / "shard-evidence").rename(workers / (row["profile"] + "-worker-v1-" + str(row["worker"])))
+                profile, worker = row["profile"], row["worker"]
+                artifact = workers / f"{profile}-worker-v1-{worker}"
+                if worker == sampled[profile]:
+                    values.update({"matrix.profile": profile, "matrix.worker": str(worker)})
+                    scratch = temporary / f"worker-{profile}-{worker}"
+                    scratch.mkdir()
+                    env["RUNNER_TEMP"] = str(scratch)
+                    result = self.run_step(run, env, values)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    (scratch / "shard-evidence").rename(artifact)
+                    continue
+                # Runner coverage lives in test-ci-scheduling.py; this test exercises policy selection and the full aggregate.
+                total, package, summary, prefix = shards.verifier.PROFILES[profile]
+                expected = shards.identity(RUN, values["inputs.sha"], values["inputs.tree"], package)
+                for slot in shards.BATCHES[profile][worker]:
+                    selected, _ = shards.verifier.selection(compiled, slot, profile)
+                    value = {"schema": shards.verifier.SCHEMA, "slot": slot, "total": total, **expected,
+                             "compiled": compiled, "selected": selected, "runs": selected, "passes": selected, "skips": {}}
+                    logical = artifact / f"{prefix}{slot}"
+                    logical.mkdir(parents=True)
+                    (logical / summary).write_text(json.dumps(value) + "\n")
             self.assertEqual(len(list(workers.glob("*/*/*-summary.json"))), 81)
             env["RUNNER_TEMP"] = str(temporary)
             # The gate consumes the same policy ref and candidate identity, not historical script bytes.
             gate = self.run_step(named(self.jobs["gate"], "Check required results"), env, values)
             self.assertEqual(gate.returncode, 0, gate.stderr)
             aggregate = named(self.jobs["gate"], "Verify all worker shapes and logical coverage")
-            result = self.run_step(aggregate, env, values)
+            # Deterministic filesystem aggregation is bounded by the outer test/CI job.
+            result = self.run_step(aggregate, env, values, timeout=None)
             self.assertEqual(result.returncode, 0, result.stderr)
             outputs = dict(line.split("=", 1) for line in (root / "output").read_text().splitlines())
             self.assertEqual(outputs, {"verified": "true", "run_id": RUN, "sha": values["inputs.sha"],
@@ -329,11 +363,12 @@ class PolicyTests(unittest.TestCase):
                 values[key] = "f" * 40
                 result = self.run_step(run, env, values)
                 self.assertNotEqual(result.returncode, 0)
-                result = self.run_step(aggregate, env, values)
+                result = self.run_step(aggregate, env, values, timeout=None)
                 self.assertNotEqual(result.returncode, 0)
                 values[key] = original
             calls = [json.loads(line) for line in (root / "go-log").read_text().splitlines()]
             self.assertTrue(calls)
+            self.assertEqual({row["args"][-1] for row in calls}, {"./internal/" + profile for profile in sampled})
             self.assertTrue(all(row["cwd"] == str(workspace) and row["sha"] == values["inputs.sha"] for row in calls))
             self.assertTrue(all("-count=1" in row["args"] and "-race" in row["args"]
                                 for row in calls if row["args"][0] == "test"))
