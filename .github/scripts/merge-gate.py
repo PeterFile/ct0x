@@ -17,6 +17,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 IDENTITY = ("repo", "pr", "head", "base", "sha", "tree", "run_id", "run_attempt")
 SHA = r"[0-9a-f]{40}"
+RERUN_ALL = "；请选择 Re-run all jobs，必须重新取得同一 attempt 的全部生产者和终态证据"
 POLICY_PATHS = (
     ".github/workflows/merge-gate.yml", ".github/scripts/merge-gate.py",
     ".github/scripts/merge-gate-manifest.json", ".github/scripts/merge-gate-migrations.json",
@@ -345,9 +346,9 @@ def tasks(selected, budget=None):
 
 def finalize(plan, results, evidence):
     check(set(results) == {"plan", "tests"} and all(row.get("result") == "success" for row in results.values()),
-          "计划和全部测试任务必须明确成功；取消/跳过不算成功")
+          "计划和全部测试任务必须明确成功；取消/跳过不算成功" + RERUN_ALL)
     expected = {task["unit"] for task in plan["tasks"]}
-    check(len(evidence) == len(expected) and {row.get("unit") for row in evidence} == expected, "任务证据缺失、重复或多余")
+    check(len(evidence) == len(expected) and {row.get("unit") for row in evidence} == expected, "任务证据缺失、重复或多余" + RERUN_ALL)
     by_unit = {row["unit"]: row for row in evidence}
     groups = {}
     required = {False: plan.get("ordinary_required"), True: plan.get("race")}
@@ -359,7 +360,7 @@ def finalize(plan, results, evidence):
                     required[race].setdefault(task["package"], set()).update(task.get("required", []))
     for row in evidence:
         check(row.get("result") == "success" and all(row.get(field) == plan[field] for field in IDENTITY) and
-              row.get("source", {}) == plan.get("source", {}), "任务终态或运行/PR/合并/来源身份不符")
+              row.get("source", {}) == plan.get("source", {}), "任务终态或运行/PR/合并/来源身份不符" + RERUN_ALL)
     for task in plan["tasks"]:
         if task["kind"] != "go":
             continue
@@ -537,11 +538,12 @@ def _run_go(root, task, build_flags):
                 "runs": dict(observed_runs), "passes": dict(observed_passes), "skips": dict(observed_skips)}
 
 
-def run_task(root, plan, index, event, context):
+def run_task(root, plan, index, event, context, unit=None, kind=None):
     actual = native_identity(root, event, context)
-    check(all(plan[field] == actual[field] for field in IDENTITY) and plan.get("source") == actual["source"], "计划与实际 checkout/run/来源不符")
-    check(type(index) is int and index in range(len(plan["tasks"])), "任务编号非法")
+    check(all(plan[field] == actual[field] for field in IDENTITY) and plan.get("source") == actual["source"], "计划与实际 checkout/run/来源不符" + RERUN_ALL)
+    check(type(index) is int and index in range(len(plan["tasks"])), "任务编号非法" + RERUN_ALL)
     task = plan["tasks"][index]
+    check((unit is None or task["unit"] == unit) and (kind is None or task["kind"] == kind), "重建计划与所选矩阵单元不符" + RERUN_ALL)
     detail = {}
     if task["kind"] == "go":
         detail = run_go(root, task)
@@ -611,6 +613,8 @@ def main():
     run.add_argument("plan", type=Path)
     run.add_argument("index", type=int)
     run.add_argument("output", type=Path)
+    run.add_argument("--unit")
+    run.add_argument("--kind")
     final = subs.add_parser("final")
     final.add_argument("plan", type=Path)
     final.add_argument("evidence", type=Path)
@@ -639,12 +643,12 @@ def main():
         matrix = {"include": [{"index": index, "unit": task["unit"], "kind": task["kind"]}
                               for index, task in enumerate(plan["tasks"])]}
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-            output.write("matrix=" + json.dumps(matrix, ensure_ascii=True) + "\n")
+            output.write("matrix=" + json.dumps(matrix, ensure_ascii=True) + "\nrun_attempt=" + actual["run_attempt"] + "\n")
     else:
         plan = read_json(args.plan)
-        check(all(plan[field] == actual[field] for field in IDENTITY), "计划身份不匹配")
+        check(all(plan[field] == actual[field] for field in IDENTITY), "计划身份不匹配" + RERUN_ALL)
         if args.command == "run":
-            write_json(args.output, run_task(root, plan, args.index, event, os.environ))
+            write_json(args.output, run_task(root, plan, args.index, event, os.environ, args.unit, args.kind))
         else:
             evidence = [read_json(path) for path in sorted(args.evidence.glob("*/unit.json"))]
             write_json(args.output, finalize(plan, json.loads(os.environ["NEEDS_JSON"]), evidence))

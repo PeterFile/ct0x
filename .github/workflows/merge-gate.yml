@@ -67,6 +67,7 @@ jobs:
     timeout-minutes: 25
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      run_attempt: ${{ steps.plan.outputs.run_attempt }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -126,14 +127,23 @@ jobs:
           path: policy
           persist-credentials: false
       - uses: actions/download-artifact@v7
+        id: plan_artifact
+        if: ${{ needs.plan.outputs.run_attempt == github.run_attempt }}
+        continue-on-error: true
         with:
           name: merge-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/merge-plan
       - uses: actions/setup-go@v7
-        if: ${{ matrix.kind == 'go' || matrix.kind == 'ci' || matrix.kind == 'vet' }}
+        if: ${{ matrix.kind == 'go' || matrix.kind == 'ci' || matrix.kind == 'vet' || steps.plan_artifact.outcome != 'success' }}
         with:
           go-version-file: candidate/go.mod
           cache: false
+      - id: regenerate-plan
+        name: Rebuild only a missing current-attempt plan for this selected unit
+        if: ${{ steps.plan_artifact.outcome != 'success' }}
+        run: |
+          echo '::notice::当前 attempt 缺少计划，将从固定合并和策略提交重建所选单元的计划。单元结果不能代替完整验证，请选择 Re-run all jobs 取得合并资格。'
+          python3 -B "$MERGE_POLICY_ROOT/.github/scripts/merge-gate.py" plan "$RUNNER_TEMP/merge-plan/merge-plan.json"
       - uses: actions/setup-node@v7
         if: ${{ matrix.kind == 'web' }}
         with:
@@ -146,7 +156,9 @@ jobs:
       - name: Run selected unit with observed terminal evidence
         env:
           UNIT_INDEX: ${{ matrix.index }}
-        run: python3 -B "$MERGE_POLICY_ROOT/.github/scripts/merge-gate.py" run "$RUNNER_TEMP/merge-plan/merge-plan.json" "$UNIT_INDEX" "$RUNNER_TEMP/merge-unit/unit.json"
+          UNIT_NAME: ${{ matrix.unit }}
+          UNIT_KIND: ${{ matrix.kind }}
+        run: python3 -B "$MERGE_POLICY_ROOT/.github/scripts/merge-gate.py" run "$RUNNER_TEMP/merge-plan/merge-plan.json" "$UNIT_INDEX" "$RUNNER_TEMP/merge-unit/unit.json" --unit "$UNIT_NAME" --kind "$UNIT_KIND"
       - uses: actions/upload-artifact@v7
         with:
           name: merge-unit-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.index }}
@@ -176,18 +188,40 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: policy
           persist-credentials: false
+      - id: producers
+        name: Require current-attempt producers before collecting evidence
+        env:
+          PLAN_RUN_ATTEMPT: ${{ needs.plan.outputs.run_attempt }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          TESTS_RESULT: ${{ needs.tests.result }}
+        run: |
+          if [[ "$PLAN_RUN_ATTEMPT" != "$GITHUB_RUN_ATTEMPT" || "$PLAN_RESULT" != 'success' || "$TESTS_RESULT" != 'success' ]]; then
+            echo '::error::本次 attempt 没有全部成功的计划和测试生产者。部分重试仅证明实际重跑的单元，请选择 Re-run all jobs；不能继承旧 attempt 的成功。'
+            exit 1
+          fi
       - uses: actions/download-artifact@v7
+        id: plan_artifact
+        continue-on-error: true
         with:
           name: merge-plan-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/merge-plan
       - uses: actions/download-artifact@v7
+        id: unit_artifacts
+        continue-on-error: true
         with:
           pattern: merge-unit-${{ github.run_id }}-${{ github.run_attempt }}-*
           path: ${{ runner.temp }}/merge-units
       - name: Require every expected terminal success on this exact attempt
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 -B "$MERGE_POLICY_ROOT/.github/scripts/merge-gate.py" final "$RUNNER_TEMP/merge-plan/merge-plan.json" "$RUNNER_TEMP/merge-units" "$RUNNER_TEMP/merge-receipt/merge-gate.json"
+          PLAN_ARTIFACT_RESULT: ${{ steps.plan_artifact.outcome }}
+          UNIT_ARTIFACT_RESULT: ${{ steps.unit_artifacts.outcome }}
+        run: |
+          if [[ "$PLAN_ARTIFACT_RESULT" != 'success' || "$UNIT_ARTIFACT_RESULT" != 'success' || ! -f "$RUNNER_TEMP/merge-plan/merge-plan.json" ]]; then
+            echo '::error::当前 attempt 的计划或单元 artifact 缺失，不能生成成功回执，请选择 Re-run all jobs。'
+            exit 1
+          fi
+          python3 -B "$MERGE_POLICY_ROOT/.github/scripts/merge-gate.py" final "$RUNNER_TEMP/merge-plan/merge-plan.json" "$RUNNER_TEMP/merge-units" "$RUNNER_TEMP/merge-receipt/merge-gate.json"
       - uses: actions/upload-artifact@v7
         with:
           name: merge-gate-${{ github.run_id }}-${{ github.run_attempt }}

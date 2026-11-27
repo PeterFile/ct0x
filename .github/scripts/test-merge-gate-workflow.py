@@ -142,6 +142,9 @@ class WorkflowTests(unittest.TestCase):
                    "GITHUB_REPOSITORY": "PeterFile/ct0x", "GITHUB_SHA": base, "MERGE_WORKFLOW_SHA": base,
                    "GITHUB_RUN_ID": "101", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_OUTPUT": str(workspace / "outputs"),
                    "RUNNER_TEMP": str(scratch), "MERGE_POLICY_ROOT": str(ROOT), "UNIT_INDEX": "0",
+                   "UNIT_NAME": "identity-diff", "UNIT_KIND": "identity", "PLAN_RUN_ATTEMPT": "2",
+                   "PLAN_RESULT": "success", "TESTS_RESULT": "success",
+                   "PLAN_ARTIFACT_RESULT": "success", "UNIT_ARTIFACT_RESULT": "success",
                    "NEEDS_JSON": json.dumps({"plan": {"result": "success"}, "tests": {"result": "success"}})}
             def run_step(job, predicate):
                 step = next(step for step in workflow["jobs"][job]["steps"] if predicate(step))
@@ -159,6 +162,8 @@ class WorkflowTests(unittest.TestCase):
             unit_dir = scratch / "merge-units/merge-unit-101-2-0"
             unit_dir.mkdir(parents=True)
             shutil.copyfile(scratch / "merge-unit/unit.json", unit_dir / "unit.json")
+            producers = run_step("evidence", lambda step: step.get("id") == "producers")
+            self.assertEqual(producers.returncode, 0, producers.stderr)
             final = run_step("evidence", lambda step: "NEEDS_JSON" in step.get("env", {}))
             self.assertEqual(final.returncode, 0, final.stderr)
             receipt = json.loads((scratch / "merge-receipt/merge-gate.json").read_text())
@@ -167,6 +172,80 @@ class WorkflowTests(unittest.TestCase):
             env["NEEDS_JSON"] = json.dumps({"plan": {"result": "success"}, "tests": {"result": "skipped"}})
             rejected = run_step("evidence", lambda step: "NEEDS_JSON" in step.get("env", {}))
             self.assertNotEqual(rejected.returncode, 0)
+
+            # A partial attempt may diagnose one freshly executed unit, never certify inherited producers.
+            test_steps = workflow["jobs"]["tests"]["steps"]
+            regenerate = next((step for step in test_steps if step.get("id") == "regenerate-plan"), None)
+            self.assertIsNotNone(regenerate, "partial retries need intentional current-attempt planning, not a missing artifact error")
+            download = next(step for step in test_steps if step.get("id") == "plan_artifact")
+            self.assertIn("needs.plan.outputs.run_attempt", download["if"])
+            self.assertIn("github.run_attempt", download["if"])
+            self.assertIs(download["continue-on-error"], True)
+            self.assertIn("steps.plan_artifact.outcome != 'success'", regenerate["if"])
+            setup = next(step for step in test_steps if step.get("uses", "").startswith("actions/setup-go@"))
+            self.assertLess(test_steps.index(setup), test_steps.index(regenerate))
+            self.assertIn("steps.plan_artifact.outcome != 'success'", setup["if"], "even identity-only replanning needs Go discovery")
+            self.assertIn("run_attempt=2\n", (workspace / "outputs").read_text())
+            guard_steps = workflow["jobs"]["evidence"]["steps"]
+            producer = next(step for step in guard_steps if step.get("id") == "producers")
+            self.assertLess(guard_steps.index(producer), next(i for i, step in enumerate(guard_steps)
+                            if step.get("uses", "").startswith("actions/download-artifact@")))
+            native_pr = {"number": 7, "head": {"sha": head, "ref": "branch ; $()", "repo": {"id": 17, "full_name": "fork/ct0x"}},
+                         "base": {"sha": base, "ref": "stacked", "repo": {"full_name": "PeterFile/ct0x"}}}
+            for event_name in ("workflow_dispatch", "pull_request"):
+                with self.subTest(partial=event_name):
+                    partial = workspace / ("partial-" + event_name)
+                    partial.mkdir()
+                    env.update(GITHUB_EVENT_NAME=event_name, GITHUB_RUN_ATTEMPT="3", RUNNER_TEMP=str(partial),
+                               GITHUB_SHA=base if event_name == "workflow_dispatch" else merge,
+                               UNIT_NAME="identity-diff", UNIT_KIND="identity",
+                               NEEDS_JSON=json.dumps({"plan": {"result": "success"}, "tests": {"result": "success"}}))
+                    if event_name == "pull_request":
+                        event.write_text(json.dumps({"number": 7, "pull_request": native_pr}))
+                    self.assertFalse((partial / "merge-plan/merge-plan.json").exists())
+                    replanned = run_step("tests", lambda step: step.get("id") == "regenerate-plan")
+                    self.assertEqual(replanned.returncode, 0, replanned.stderr)
+                    self.assertIn("Re-run all jobs", replanned.stdout + replanned.stderr)
+                    current_plan = json.loads((partial / "merge-plan/merge-plan.json").read_text())
+                    self.assertEqual(current_plan["tasks"], plan["tasks"])
+                    self.assertEqual(current_plan["policy_digest"], plan["policy_digest"])
+                    self.assertEqual((current_plan["sha"], current_plan["tree"], current_plan["base"], current_plan["head"]),
+                                     (merge, tree, base, head))
+                    self.assertEqual(current_plan["run_attempt"], "3")
+                    self.assertEqual(plan["run_attempt"], "2", "an inherited receipt is never relabeled")
+                    selected = run_step("tests", lambda step: "UNIT_INDEX" in step.get("env", {}))
+                    self.assertEqual(selected.returncode, 0, selected.stderr)
+                    unit_path = partial / "merge-unit/unit.json"
+                    self.assertEqual(json.loads(unit_path.read_text())["run_attempt"], "3")
+                    for key, wrong in (("UNIT_NAME", "other-unit"), ("UNIT_KIND", "go")):
+                        unit_path.unlink(missing_ok=True)
+                        env[key] = wrong
+                        mismatch = run_step("tests", lambda step: "UNIT_INDEX" in step.get("env", {}))
+                        self.assertNotEqual(mismatch.returncode, 0)
+                        self.assertIn("Re-run all jobs", mismatch.stderr)
+                        self.assertFalse(unit_path.exists())
+                        env[key] = "identity-diff" if key == "UNIT_NAME" else "identity"
+                    blocked = run_step("evidence", lambda step: step.get("id") == "producers")
+                    self.assertNotEqual(blocked.returncode, 0)
+                    self.assertIn("Re-run all jobs", blocked.stdout + blocked.stderr)
+                    # Even bypassing the workflow guard cannot turn old or missing unit evidence into success.
+                    inherited = partial / "merge-units/merge-unit-101-3-0"
+                    inherited.mkdir(parents=True)
+                    old_unit = json.loads((unit_dir / "unit.json").read_text())
+                    old_unit.update(source=current_plan["source"])
+                    (inherited / "unit.json").write_text(json.dumps(old_unit))
+                    for missing in (False, True):
+                        if missing:
+                            (inherited / "unit.json").unlink()
+                        terminal = run_step("evidence", lambda step: "NEEDS_JSON" in step.get("env", {}))
+                        self.assertNotEqual(terminal.returncode, 0)
+                        self.assertIn("Re-run all jobs", terminal.stderr)
+                        self.assertFalse((partial / "merge-receipt/merge-gate.json").exists())
+                    env["PLAN_ARTIFACT_RESULT"] = "failure"
+                    lost_plan = run_step("evidence", lambda step: "NEEDS_JSON" in step.get("env", {}))
+                    self.assertNotEqual(lost_plan.returncode, 0)
+                    self.assertIn("Re-run all jobs", lost_plan.stdout + lost_plan.stderr)
+                    env["PLAN_ARTIFACT_RESULT"] = "success"
 
 
 if __name__ == "__main__":

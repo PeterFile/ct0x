@@ -6,6 +6,8 @@ and producer-test blob 8fe0d6e6ffdabb037537ab9e7d87e4e364cff79e. Ordinary
 behavior always runs without another checkout. When the publisher is in this
 checkout, or OBSERVER_MERGE_PRODUCER names its exact file, the same assertions
 also ingest its real reconcile output through its in-memory GitHub transport.
+The observer-native echo fixture projects archived #273 REST responses; set
+OBSERVER_MERGE_EVIDENCE_ROOT to replay the digest-pinned complete responses.
 """
 import copy
 from contextlib import closing, redirect_stdout
@@ -17,6 +19,7 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -24,9 +27,9 @@ import zipfile
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from github import API, Reply
+from github import API, Reply, Unknown
 from observer import Observer
-from merge_reports import reconcile_publisher
+from merge_reports import parse_check, publish_target, reconcile_publisher, validation_jobs, verify_evidence
 from store import Store
 
 REPO = "PeterFile/ct0x"
@@ -53,6 +56,83 @@ def archive(receipt):
     with zipfile.ZipFile(output, "w") as target:
         target.writestr(zipfile.ZipInfo("merge-gate.json"), json.dumps(receipt))
     return output.getvalue()
+
+
+def hosted_echo_rows():
+    fixture = json.loads(Path(__file__).with_name("merge_check_echo_v2.json").read_text())
+    location = os.environ.get("OBSERVER_MERGE_EVIDENCE_ROOT")
+    if location is not None:
+        if not location.strip():
+            raise AssertionError("OBSERVER_MERGE_EVIDENCE_ROOT must name the archived GitHub directory")
+        documents = {}
+        for name, digest in fixture["provenance"]["files"].items():
+            data = (Path(location) / name).read_bytes()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise AssertionError("Archived REST fixture digest mismatch: " + name)
+            documents[name] = json.loads(data)
+        return (documents["pr-273-validate-attempt-1-jobs-terminal.json"]["jobs"],
+                documents["pr-273-gate-failure.json"], documents["pr-273-initial-publisher-attempt.json"],
+                documents["pr-273-final-publisher-attempt.json"])
+    echo = fixture["echo"]
+    jobs = [dict(row, run_id=echo["run_id"], run_attempt=1, head_sha=echo["head_sha"],
+        status="completed", conclusion="success",
+        html_url=f"https://github.com/{REPO}/actions/runs/{echo['run_id']}/job/{row['id']}") for row in fixture["native_jobs"]]
+    jobs.insert(3, echo)
+    custom = dict(fixture["check"], output=dict(summary=json.dumps(fixture["metadata"])))
+    return jobs, custom, fixture["initial_publisher"], fixture["publisher"]
+
+
+def hosted_pending_echo_rows():
+    jobs, custom, initial, final = hosted_echo_rows()
+    # The original summary was not archived. Reconstruct its pending member from
+    # the associated PR, validated initial state and MERGE_CHECK at log line 176.
+    record = dict(base="6901fb37234339e7565b582b3d5ee09e781d7ead", check_id=140427397549,
+        conclusion=None, event="merge_check_published", head="e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48",
+        name="Merge gate", pr=273, publisher_run_attempt="1", publisher_run_id="45975830868", repo=REPO,
+        status="in_progress", target_sha="e65a27c9eb7f743e5b4ec7bc31cc48abc9e94c48", tree=None,
+        validated_sha=None, validation_run_attempt=None, validation_run_id=None)
+    state = dict(baseRefOid=record["base"], headRefOid=record["head"], isDraft=False, number=273)
+    location = os.environ.get("OBSERVER_MERGE_EVIDENCE_ROOT")
+    if location is not None:
+        archived = {}
+        for name, digest in (
+            ("pr-273-initial-publisher-job.log", "2591180083224b4617e7bbe6a9633a944cdbf0e1c3780c3f569b274edaf1d42b"),
+            ("pr-273-live.json", "e1ec96d2e3ce8b6da7979d236955d057354cf356a85bda12ace191431a02b7ce")):
+            data = (Path(location) / name).read_bytes()
+            if hashlib.sha256(data).hexdigest() != digest:
+                raise AssertionError("Archived pending fixture digest mismatch: " + name)
+            archived[name] = data.decode()
+        records = [json.loads(line.split(" MERGE_CHECK ", 1)[1]) for line in
+            archived["pr-273-initial-publisher-job.log"].splitlines() if " MERGE_CHECK " in line]
+        assert records == [record]
+        state = json.loads(archived["pr-273-live.json"])
+    if "pull_requests" not in initial:
+        member, = json.loads(custom["output"]["summary"])["membership"]
+        repo = dict(id=member["head_repo_id"], full_name=member["head_repo"])
+        initial = dict(initial, path=PUBLISHER, workflow_id=final["workflow_id"], event="pull_request_target",
+            status="completed", conclusion="success", head_branch=member["head_ref"], repository=repo, head_repository=repo,
+            html_url=f"https://github.com/{REPO}/actions/runs/{initial['id']}", run_started_at="2026-11-27T09:41:40Z",
+            pull_requests=[dict(number=273, head=dict(sha=record["head"], ref=member["head_ref"],
+                repo=dict(id=repo["id"], url=f"https://api.github.com/repos/{REPO}")),
+                base=dict(sha=record["base"], ref="master", repo=dict(id=repo["id"], url=f"https://api.github.com/repos/{REPO}")))])
+    associated, = initial["pull_requests"]
+    assert initial["id"] == int(record["publisher_run_id"]) and initial["run_attempt"] == int(record["publisher_run_attempt"])
+    assert associated["number"] == state["number"] == record["pr"]
+    assert associated["head"]["sha"] == state["headRefOid"] == record["head"] == record["target_sha"] == initial["head_sha"]
+    assert associated["base"]["sha"] == state["baseRefOid"] == record["base"] != initial["head_sha"]
+    member = dict(pr=associated["number"], head=associated["head"]["sha"], head_ref=associated["head"]["ref"],
+        head_repo_id=associated["head"]["repo"]["id"], head_repo=initial["head_repository"]["full_name"],
+        base=associated["base"]["sha"], base_ref=associated["base"]["ref"], draft=state["isDraft"])
+    metadata = dict(schema=1, repo=REPO, pr=273, head=record["head"], result="pending", reason_code="source_head_intersection",
+        membership=[member], targets=[dict(member, result="pending", verification=False,
+            merge_sha=None, tree=None, reason_code="awaiting_validation")], failed_prs=[], pending_prs=[273],
+        publisher=dict(workflow=PUBLISHER, workflow_sha=record["base"], run_id=record["publisher_run_id"],
+            run_attempt=record["publisher_run_attempt"]))
+    custom.update(status=record["status"], conclusion=None, completed_at=None, output=dict(summary=json.dumps(metadata)))
+    for job in jobs:
+        if job["id"] == record["check_id"]:
+            job.update(status=record["status"], conclusion=None, completed_at=None)
+    return jobs, custom, initial, initial
 
 
 def producer_file():
@@ -325,11 +405,11 @@ class IntersectionProtocol(unittest.TestCase):
                 store.configure(REPO, COORDINATOR)
                 for number in world.prs:
                     store.assign(REPO, number, f"intersection-author-{number}", f"local-assignment:{number}")
-                def tick():
+                def tick(deliver=True):
                     with Observer(store, API(store, world)) as observer:
                         if publisher_only:
-                            return reconcile_publisher(observer, world.publisher, world.reporters)
-                        return observer.reconcile(force=True)
+                            return reconcile_publisher(observer, world.publisher, world.reporters, deliver=deliver)
+                        return observer.reconcile(force=True, deliver=deliver)
                 assertions(store, tick)
 
     def native_notice(self, store, world, deliver=True):
@@ -807,6 +887,538 @@ class IntersectionProtocol(unittest.TestCase):
                     self.assertEqual(store.inbox("intersection-author-9"), [])
                     self.assertEqual(len(store.inbox("intersection-author-8")), 1)
                 self.ingest(world, check)
+
+    def echo_fixture(self, variant="single-success"):
+        world = World(variant)
+        rows, custom, _, _ = hosted_echo_rows()
+        echo = copy.deepcopy(next(row for row in rows if row["name"] == "Merge gate"))
+        native = world.native[101]
+        native["check_suite_id"] = custom["check_suite"]["id"]
+        echo.update(run_id=101, run_attempt=2, head_sha=HEAD, head_branch=native["head_branch"],
+            run_url=f"https://api.github.com/repos/{REPO}/actions/runs/101")
+        # An older publisher, not the currently reconciled reporter, owns this echo.
+        issuer = dict(world.publisher, id=200, html_url=f"https://github.com/{REPO}/actions/runs/200")
+        metadata = copy.deepcopy(world.metadata)
+        metadata["publisher"]["run_id"] = "200"
+        custom.update(head_sha=HEAD, external_id=f"merge-gate:v2:{REPO}:source:{HEAD}",
+            output=dict(summary=json.dumps(metadata)))
+        for endpoint in ("/actions/runs/200", "/actions/runs/200/attempts/1"):
+            world.overrides[ROOT + endpoint] = lambda: Reply(200, {}, json.dumps(issuer).encode())
+        world.overrides[ROOT + f"/check-runs/{echo['id']}"] = lambda: Reply(200, {}, json.dumps(custom).encode())
+        world.jobs[101].insert(1, echo)
+        return world, echo, custom, metadata, issuer
+
+    def test_authenticated_runnerless_echo_does_not_count_as_native_success_or_failure(self):
+        for variant in ("single-success", "single-validation-failure"):
+            world, echo, _, _, _ = self.echo_fixture(variant)
+            original = copy.deepcopy(world.jobs)
+            def check(store, tick):
+                self.assertTrue(tick(), [dict(row) for row in store.db.execute("SELECT * FROM problems")])
+                action, = store.actions()
+                self.assertEqual(action["payload"]["conclusion"], "success" if variant == "single-success" else "failure")
+                self.assertEqual(world.jobs, original)
+                self.assertIn(ROOT + f"/check-runs/{echo['id']}", world.calls)
+                self.assertIn(ROOT + "/actions/runs/200", world.calls)
+            with self.subTest(variant=variant):
+                self.ingest(world, check, publisher_only=True)
+
+    def test_runnerless_echo_never_hides_missing_duplicate_extra_or_unsuccessful_native_proof(self):
+        for changed in ("missing", "duplicate", "extra", "failure", "attempt", "id-collision", "duplicate-echo", "echo-only-failure"):
+            world, echo, _, _, _ = self.echo_fixture("single-validation-failure" if changed == "echo-only-failure" else "single-success")
+            jobs = world.jobs[101]
+            if changed == "missing":
+                jobs.pop()
+            elif changed in ("duplicate", "extra"):
+                jobs.append(dict(jobs[0], **({"name": "Unexpected native job", "id": 1234} if changed == "extra" else {})))
+            elif changed == "duplicate-echo":
+                jobs.append(copy.deepcopy(echo))
+            elif changed == "id-collision":
+                jobs[0]["id"] = echo["id"]
+            elif changed == "echo-only-failure":
+                for job in jobs:
+                    if job is not echo:
+                        job["conclusion"] = "success"
+            else:
+                jobs[0].update(**({"conclusion": "failure"} if changed == "failure" else {"run_attempt": 1}))
+            with self.subTest(changed=changed):
+                self.ingest(world, lambda store, tick: (self.assertFalse(tick()), self.assertEqual(store.actions(), [])), publisher_only=True)
+
+    def test_echo_requires_exact_runnerless_rest_suite_source_and_publisher_identity(self):
+        mutations = [("job", key, value) for key, value in (
+            ("id", "140427397549"), ("steps", [dict(name="Run code")]), ("steps", None), ("labels", ["ubuntu-latest"]),
+            ("runner_id", 0), ("runner_name", "runner"), ("runner_group_id", 0), ("runner_group_name", "group"),
+            ("run_id", 102), ("run_attempt", 1), ("head_sha", OTHER), ("head_branch", "other"),
+            ("run_url", "https://example.invalid/run"), ("url", "https://example.invalid/job"),
+            ("check_run_url", "https://example.invalid/check"), ("html_url", f"https://github.com/{REPO}/actions/runs/101/job/140427397549"),
+            ("node_id", "spoof"), ("name", "Merge plan"))]
+        mutations += [("check", key, value) for key, value in (
+            ("id", 44), ("name", "Other check"), ("head_sha", OTHER), ("external_id", "spoof"),
+            ("app", dict(id=True, slug="github-actions")), ("app", dict(id=15368, slug="foreign")),
+            ("url", "https://example.invalid/check"), ("html_url", "https://example.invalid/run"), ("node_id", "spoof"),
+            ("check_suite", dict(id=99)))]
+        mutations += [("metadata", key, value) for key, value in (("schema", True), ("repo", "other/repo"), ("head", OTHER))]
+        mutations += [("publisher", key, value) for key, value in (
+            ("workflow", NATIVE), ("workflow_sha", OTHER), ("run_id", "999"), ("run_attempt", "2"))]
+        mutations += [("issuer", key, value) for key, value in (
+            ("id", 201), ("event", "push"), ("repository", dict(id=1439910892, full_name="other/repo")), ("head_sha", OTHER))]
+        for kind, key, value in mutations:
+            world, echo, custom, metadata, issuer = self.echo_fixture()
+            selected = dict(job=echo, check=custom, metadata=metadata, publisher=metadata["publisher"], issuer=issuer)[kind]
+            selected[key] = value
+            custom["output"]["summary"] = json.dumps(metadata)
+            with self.subTest(kind=kind, key=key, value=value):
+                self.ingest(world, lambda store, tick: (self.assertFalse(tick()), self.assertEqual(store.actions(), [])), publisher_only=True)
+        for changed in ("missing-runner", "missing-suite", "missing-check", "source-repo", "source-id", "source-ref"):
+            world, echo, custom, metadata, _ = self.echo_fixture()
+            if changed == "missing-runner":
+                del echo["runner_id"]
+            elif changed == "missing-suite":
+                del world.native[101]["check_suite_id"]
+            elif changed == "missing-check":
+                world.overrides[ROOT + f"/check-runs/{echo['id']}"] = Reply(404, {}, b"{}")
+            else:
+                field = {"source-repo": "head_repo", "source-id": "head_repo_id", "source-ref": "head_ref"}[changed]
+                metadata["targets"][0][field] = "wrong"
+                custom["output"]["summary"] = json.dumps(metadata)
+            with self.subTest(changed=changed):
+                self.ingest(world, lambda store, tick: (self.assertFalse(tick()), self.assertEqual(store.actions(), [])), publisher_only=True)
+
+    def test_no_echo_has_no_additional_publisher_authentication_requests(self):
+        world = World()
+        def check(store, tick):
+            self.assertTrue(tick())
+            self.assertFalse(any("/actions/runs/200" in path or "/check-runs/140427397549" in path for path in world.calls))
+        self.ingest(world, check, publisher_only=True)
+
+    def test_hosted_pr273_echo_replay_preserves_all_four_real_native_jobs(self):
+        self.hosted_echo_replay()
+
+    def terminal_prt_world(self):
+        world = World()
+        closed = copy.deepcopy(world.prs[7])
+        closed.update(number=8, state="closed", html_url=f"https://github.com/{REPO}/pull/8")
+        closed["head"]["ref"] = "closed/sibling"
+        world.prs[8] = closed
+        repo_url = f"https://api.github.com/repos/{REPO}"
+        head_repo = closed["head"]["repo"]
+        world.publisher.update(event="pull_request_target", head_sha=HEAD, head_branch=closed["head"]["ref"],
+            head_repository=head_repo, pull_requests=[dict(number=8,
+                head=dict(sha=HEAD, ref=closed["head"]["ref"], repo=dict(id=head_repo["id"],
+                    url=f"https://api.github.com/repos/{head_repo['full_name']}")),
+                base=dict(sha=BASE, ref="master", repo=dict(id=world.repo["id"], url=repo_url)))])
+        world.reporters[0]["head_sha"] = HEAD
+        return world
+
+    def test_current_terminal_prt_closed_sibling_uses_existing_exact_proof(self):
+        world = self.terminal_prt_world()
+        def check(store, tick):
+            self.assertTrue(tick(), [dict(row) for row in store.db.execute("SELECT * FROM problems")])
+            action, = store.actions()
+            payload = action["payload"]
+            self.assertEqual((payload["pr"], payload["workflow_sha"], payload["source_head"]), (7, BASE, HEAD))
+            self.assertEqual((payload["tested_sha"], payload["tested_tree"], payload["validation_run_id"]), (MERGE, TREE, 101))
+            self.assertEqual(store.inbox("intersection-author-8"), [])
+            self.assertTrue(tick())
+            self.assertEqual(len(store.inbox("intersection-author-7")), 1)
+        self.ingest(world, check, publisher_only=True)
+
+    def test_current_terminal_prt_does_not_borrow_pending_stale_or_invalid_authority(self):
+        for changed in ("pending-check", "pending-run", "failed-run", "new-attempt", "failed-reporter", "wrong-policy",
+                "missing-association", "wrong-event-ref", "wrong-event-base", "bad-native-proof", "changed-live-target"):
+            world = self.terminal_prt_world()
+            if changed == "pending-check":
+                world.check.update(status="in_progress", conclusion=None)
+                world.metadata.update(result="pending", pending_prs=[7])
+                world.metadata["targets"][0].update(result="pending", verification=False)
+            elif changed == "pending-run":
+                world.publisher.update(status="in_progress", conclusion=None)
+            elif changed == "failed-run":
+                world.publisher["conclusion"] = "failure"
+            elif changed == "new-attempt":
+                current = dict(world.publisher, run_attempt=2)
+                world.overrides[ROOT + "/actions/runs/201"] = Reply(200, {}, json.dumps(current).encode())
+            elif changed == "failed-reporter":
+                world.reporters[0]["conclusion"] = "failure"
+            elif changed == "wrong-policy":
+                world.metadata["publisher"]["workflow_sha"] = HEAD
+            elif changed == "missing-association":
+                world.publisher["pull_requests"] = []
+            elif changed == "wrong-event-ref":
+                world.publisher["pull_requests"][0]["head"]["ref"] = "wrong"
+            elif changed == "wrong-event-base":
+                world.publisher["pull_requests"][0]["base"]["sha"] = OTHER
+            elif changed == "bad-native-proof":
+                world.jobs[101][1]["conclusion"] = "failure"
+            else:
+                world.prs[7]["head"]["ref"] = "changed"
+            with self.subTest(changed=changed):
+                self.ingest(world, lambda store, tick: (self.assertFalse(tick()), self.assertEqual(store.actions(), [])), publisher_only=True)
+
+    def test_historical_cohort_projection_still_requires_exact_unique_source_pairs(self):
+        for changed in ("duplicate", "missing", "extra", "source", "base"):
+            def mutate(custom, issuer, responses):
+                metadata = json.loads(custom["output"]["summary"])
+                if changed == "duplicate":
+                    metadata["membership"] *= 2
+                    metadata["targets"] *= 2
+                elif changed == "missing":
+                    metadata["targets"] = []
+                elif changed == "extra":
+                    metadata["targets"].append(copy.deepcopy(metadata["targets"][0]))
+                elif changed == "source":
+                    metadata["targets"][0]["head_ref"] = "wrong"
+                else:
+                    metadata["targets"][0]["base"] = OTHER
+                custom["output"]["summary"] = json.dumps(metadata)
+            with self.subTest(changed=changed):
+                self.hosted_echo_replay(historical=True, mutate=mutate)
+
+    def empty_cohort_fixture(self, source_event=False):
+        path = producer_file()
+        if path is None:
+            self.skipTest("Authentic empty projection requires the publisher composer")
+        spec = importlib.util.spec_from_file_location("empty_cohort_publisher", path)
+        publisher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(publisher)
+        world, echo, custom, _, issuer = self.echo_fixture()
+        previous = copy.deepcopy(world.prs[7])
+        previous.update(number=8, state="closed")
+        previous["head"]["ref"] = "historical/sibling"
+        if source_event:
+            issuer.update(event="pull_request_target", head_sha=HEAD, head_branch=previous["head"]["ref"],
+                head_repository=previous["head"]["repo"], pull_requests=[dict(number=8,
+                    head=dict(sha=HEAD, ref=previous["head"]["ref"], repo=dict(id=previous["head"]["repo"]["id"],
+                        url="https://api.github.com/repos/" + previous["head"]["repo"]["full_name"])),
+                    base=dict(sha=BASE, ref="master", repo=dict(id=world.repo["id"], url="https://api.github.com/repos/" + REPO)))])
+        metadata = publisher.aggregate(previous, [], [], dict(GITHUB_RUN_ID=str(issuer["id"]),
+            GITHUB_RUN_ATTEMPT=str(issuer["run_attempt"]), MERGE_TRUSTED_WORKFLOW_SHA=BASE))
+        custom.update(status="in_progress", conclusion=None, output=dict(summary=json.dumps(metadata)))
+        echo.update(status="in_progress", conclusion=None, completed_at=None)
+        # Read-only transport: no observer store, SQLite, processes or external API.
+        api = SimpleNamespace(get=lambda path: json.loads(world(path).body),
+            document=lambda path: (json.loads(world(path).body), None), blob=lambda path, limit: world(path).body)
+        observer = SimpleNamespace(repo=REPO, root=ROOT, api=api)
+        return world, echo, custom, metadata, issuer, observer
+
+    def test_empty_historical_composer_projection_preserves_exact_native_proof(self):
+        for source_event in (False, True):
+            with self.subTest(source_event=source_event):
+                world, _, _, metadata, _, observer = self.empty_cohort_fixture(source_event)
+                self.assertEqual((metadata["membership"], metadata["targets"], metadata["result"], metadata["reason_code"]),
+                    ([], [], "pending", "source_head_intersection"))
+                pr, native = world.prs[7], world.native[101]
+                original = copy.deepcopy(world.jobs[101])
+                self.assertEqual(validation_jobs(observer, pr, native), [job for job in original if job["name"] != "Merge gate"])
+                verify_evidence(observer, pr, native, world.metadata["targets"][0]["validation"])
+                self.assertEqual(world.jobs[101], original)
+                self.assertIn(ROOT + "/actions/runs/200", world.calls)
+
+    def test_empty_historical_projection_rejects_malformed_or_terminal_states(self):
+        mutations = [("metadata", changes) for changes in (
+            dict(membership=[details(World().prs[7])]), dict(targets=[details(World().prs[7])]),
+            dict(membership=None), dict(targets=None), dict(membership={}), dict(targets={}),
+            dict(result="success"), dict(result="failure"), dict(result=None),
+            dict(reason_code="source_state_changed"), dict(reason_code=None),
+            dict(failed_prs=[8]), dict(pending_prs=[8]), dict(failed_prs=None), dict(pending_prs=None),
+            dict(pr=True), dict(pr=0), dict(pr=None))]
+        mutations += [("check", changes) for changes in (
+            dict(status="completed", conclusion="success"), dict(status="completed", conclusion="failure"),
+            dict(status="completed", conclusion=None), dict(status="queued"), dict(conclusion="success"), dict(conclusion="failure"))]
+        for kind, changes in mutations:
+            with self.subTest(kind=kind, changes=changes):
+                world, _, custom, metadata, _, observer = self.empty_cohort_fixture()
+                (metadata if kind == "metadata" else custom).update(changes)
+                custom["output"]["summary"] = json.dumps(metadata)
+                with self.assertRaises(Unknown):
+                    validation_jobs(observer, world.prs[7], world.native[101])
+        for conclusion in ("success", "failure"):
+            with self.subTest(terminal=conclusion):
+                world, _, custom, metadata, _, observer = self.empty_cohort_fixture()
+                custom.update(status="completed", conclusion=conclusion)
+                metadata["result"] = conclusion
+                custom["output"]["summary"] = json.dumps(metadata)
+                with self.assertRaises(Unknown):
+                    validation_jobs(observer, world.prs[7], world.native[101])
+
+    def test_empty_historical_projection_keeps_check_and_publisher_authentication(self):
+        mutations = [("job", key, value) for key, value in (
+            ("id", True), ("run_attempt", 1), ("node_id", "wrong"), ("steps", [dict(name="Run code")]), ("runner_id", 0))]
+        mutations += [("check", key, value) for key, value in (
+            ("app", dict(id=True, slug="github-actions")), ("app", dict(id=15368, slug="foreign")),
+            ("external_id", "wrong"), ("id", "140427397549"), ("node_id", "wrong"), ("check_suite", dict(id=True)))]
+        mutations += [("publisher", key, value) for key, value in (
+            ("workflow", NATIVE), ("workflow_sha", HEAD), ("run_id", "0"), ("run_attempt", "2"))]
+        mutations += [("issuer", key, value) for key, value in (
+            ("id", 201), ("event", "push"), ("pull_requests", []), ("head_branch", "wrong"))]
+        for kind, key, value in mutations:
+            with self.subTest(kind=kind, key=key):
+                world, echo, custom, metadata, issuer, observer = self.empty_cohort_fixture(source_event=True)
+                selected = dict(job=echo, check=custom, publisher=metadata["publisher"], issuer=issuer)[kind]
+                selected[key] = value
+                custom["output"]["summary"] = json.dumps(metadata)
+                with self.assertRaises(Unknown):
+                    validation_jobs(observer, world.prs[7], world.native[101])
+
+    def test_empty_historical_projection_never_authorizes_current_delivery(self):
+        for source_event in (False, True):
+            with self.subTest(source_event=source_event):
+                world, _, custom, metadata, issuer, observer = self.empty_cohort_fixture(source_event)
+                with self.assertRaises(Unknown):
+                    parse_check(observer, issuer, world.prs[7], custom)
+                with self.assertRaises(Unknown):
+                    publish_target(observer, issuer, world.reporters[0], world.prs[7], custom, metadata, deliver=True)
+
+    def test_historical_same_source_cohort_does_not_need_current_pr_or_branch(self):
+        for pending in (False, True):
+            with self.subTest(pending=pending):
+                self.hosted_echo_replay(pending=pending, historical=True)
+
+    def test_archived_current_terminal_prt_projection_uses_pinned_master_policy(self):
+        self.hosted_echo_replay(pending=True, terminal=True)
+
+    def test_archived_initial_pending_echo_preserves_native_proof(self):
+        self.hosted_echo_replay(pending=True)
+
+    def test_archived_initial_pending_echo_uses_pinned_workflow_ancestor_not_pr_head(self):
+        self.hosted_echo_replay(pending=True, advanced_master=True)
+
+    def test_pending_echo_rejects_unbound_associations_and_workflow_identity(self):
+        mutations = [("issuer", path, value) for path, value in (
+            (("path",), NATIVE), (("workflow_id",), 1), (("run_attempt",), 2),
+            (("repository", "id"), 1), (("repository", "full_name"), "other/repo"),
+            (("head_repository", "id"), 1), (("head_repository", "full_name"), "other/repo"),
+            (("head_sha",), OTHER), (("head_branch",), "wrong"), (("event",), "push"),
+            (("pull_requests",), []), (("pull_requests", 0, "number"), True),
+            (("pull_requests", 0, "head", "sha"), OTHER), (("pull_requests", 0, "head", "ref"), "wrong"),
+            (("pull_requests", 0, "head", "repo", "id"), True), (("pull_requests", 0, "head", "repo", "url"), "https://api.github.com/repos/other/repo"),
+            (("pull_requests", 0, "base", "sha"), OTHER), (("pull_requests", 0, "base", "ref"), "stacked"),
+            (("pull_requests", 0, "base", "repo", "id"), 1), (("pull_requests", 0, "base", "repo", "url"), "https://api.github.com/repos/other/repo"))]
+        mutations += [("publisher", (key,), value) for key, value in (("workflow_sha", OTHER), ("run_attempt", "2"), ("run_id", "1"))]
+        for kind, path, value in mutations:
+            def mutate(custom, issuer, responses):
+                metadata = json.loads(custom["output"]["summary"])
+                owner = issuer if kind == "issuer" else metadata["publisher"]
+                for key in path[:-1]:
+                    owner = owner[key]
+                owner[path[-1]] = value
+                custom["output"]["summary"] = json.dumps(metadata)
+            with self.subTest(kind=kind, path=path):
+                self.hosted_echo_replay(pending=True, mutate=mutate)
+        def duplicate(custom, issuer, responses):
+            issuer["pull_requests"] *= 2
+        self.hosted_echo_replay(pending=True, mutate=duplicate)
+        def diverged(custom, issuer, responses):
+            endpoint = next(path for path in responses if path.startswith("/compare/"))
+            responses[endpoint]["status"] = "diverged"
+        self.hosted_echo_replay(pending=True, advanced_master=True, mutate=diverged)
+
+    def hosted_echo_replay(self, pending=False, advanced_master=False, mutate=None, historical=False, terminal=False):
+        jobs, custom, initial, issuer = hosted_pending_echo_rows() if pending else hosted_echo_rows()
+        metadata = json.loads(custom["output"]["summary"])
+        member, = metadata["membership"]
+        target, = metadata["targets"]
+        # Pending metadata cannot supply a successful tested tree; keep the same
+        # independently constructed success receipt as the original replay.
+        if pending:
+            target = dict(merge_sha="5f186aa68f46dbdd5cd9b883b95d85e39215cba8", tree="41b02b15ca9d9531b15016f325b343423d08817b")
+        repo = dict(id=member["head_repo_id"], full_name=REPO)
+        pr = dict(number=273, draft=member["draft"], head=dict(sha=member["head"], ref=member["head_ref"], repo=repo),
+            base=dict(sha=member["base"], ref=member["base_ref"], repo=repo))
+        native = dict(id=45975830800, run_attempt=1, head_sha=member["head"], head_branch=member["head_ref"],
+            check_suite_id=custom["check_suite"]["id"], run_started_at="2026-11-27T09:41:40Z")
+        self.assertNotEqual(native["check_suite_id"], initial["check_suite_id"])
+        self.assertNotEqual(native["check_suite_id"], issuer["check_suite_id"])
+        identity = dict(repo=REPO, pr=273, head=member["head"], base=member["base"], sha=target["merge_sha"],
+            tree=target["tree"], run_id=str(native["id"]), run_attempt="1")
+        units = ["ci", "identity-diff"]
+        receipt = dict(identity, schema=1, result="success", source=source(pr), policy_digest="e" * 64,
+            tasks=[dict(unit=unit) for unit in units], evidence=[dict(identity, source=source(pr), unit=unit, result="success") for unit in units])
+        # Only job/CheckRun/publisher responses are hosted evidence; the artifact is a synthetic bounded success receipt.
+        data = archive(receipt)
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        proof = dict(identity=identity, artifact_id=42, artifact_digest=digest, policy_digest="e" * 64)
+        artifact = dict(id=42, name=f"merge-gate-{native['id']}-1", expired=False, size_in_bytes=len(data), digest=digest,
+            workflow_run=dict(id=native["id"]))
+        responses = {
+            f"/actions/runs/{native['id']}/artifacts?per_page=100&page=1": dict(total_count=1, artifacts=[artifact]),
+            f"/actions/runs/{native['id']}/attempts/1/jobs?per_page=100&page=1": dict(total_count=len(jobs), jobs=jobs),
+            f"/check-runs/{custom['id']}": custom,
+            f"/actions/runs/{issuer['id']}": issuer, f"/actions/runs/{issuer['id']}/attempts/1": issuer,
+            "/actions/workflows/merge-conflict.yml": dict(id=issuer["workflow_id"], path=PUBLISHER, state="active"),
+            "/git/ref/heads/master": dict(ref="refs/heads/master", object=dict(type="commit",
+                sha=OTHER if advanced_master else metadata["publisher"]["workflow_sha"]))}
+        if advanced_master:
+            responses[f"/compare/{metadata['publisher']['workflow_sha']}...{OTHER}"] = dict(
+                status="ahead", merge_base_commit=dict(sha=metadata["publisher"]["workflow_sha"]))
+        if terminal:
+            # Project a terminal generation onto the archived, completed source event;
+            # the original logged publication was pending, not a hosted success.
+            metadata.update(result="success", pending_prs=[])
+            metadata["targets"][0].update(result="success", verification=True, reason_code="exact_target_verified",
+                merge_sha=identity["sha"], tree=identity["tree"], validation=dict(proof, source=source(pr), controller_sha=""),
+                authority=dict(id=native["id"], run_attempt=1, status="completed", conclusion="success", event="pull_request"))
+            custom.update(status="completed", conclusion="success", output=dict(summary=json.dumps(metadata)))
+        if historical:
+            previous = json.loads(custom["output"]["summary"])
+            for field in ("membership", "targets"):
+                for row in previous[field]:
+                    row.update(pr=272, head_ref="historical/sibling", base_ref="historical/target",
+                        head_repo_id=17, head_repo="former/ct0x")
+            previous.update(pr=272, failed_prs=[] if pending else [272], pending_prs=[272] if pending else [])
+            custom["output"]["summary"] = json.dumps(previous)
+        if mutate is not None:
+            mutate(custom, issuer, responses)
+        calls = []
+        def transport(path, etag=None):
+            calls.append(path)
+            if path == ROOT + "/actions/artifacts/42/zip":
+                return Reply(200, {}, data)
+            value = responses.get(path.removeprefix(ROOT))
+            return Reply(200 if value is not None else 404, {}, json.dumps(value).encode())
+        with tempfile.TemporaryDirectory() as temporary, closing(Store(Path(temporary) / "observer.db")) as store:
+            store.configure(REPO, COORDINATOR)
+            observer = Observer(store, API(store, transport))
+            if mutate is not None:
+                with self.assertRaises(Unknown):
+                    verify_evidence(observer, pr, native, proof)
+                return
+            try:
+                verify_evidence(observer, pr, native, proof)
+            except Unknown as error:
+                self.fail("authenticated #273 CheckRun echo blocked exact native proof: " + str(error))
+            if terminal:
+                self.assertEqual(parse_check(observer, issuer, pr, custom), metadata)
+            elif pending and not historical:
+                # Ownership classification does not grant either the historical
+                # source-head reporter or a newer publisher routing authority.
+                with self.assertRaises(Unknown):
+                    parse_check(observer, issuer, pr, custom)
+                current = hosted_echo_rows()[3]
+                self.assertIsNone(parse_check(observer, current, pr, custom))
+            self.assertEqual(store.actions(), [])
+            self.assertEqual(store.events(), [])
+        self.assertIn(ROOT + f"/actions/runs/{metadata['publisher']['run_id']}", calls)
+        self.assertEqual([row["id"] for row in jobs if row["name"] != "Merge gate"],
+            [140427185533, 140427364258, 140427364259, 140429601553])
+
+    def test_native_jobs_url_boundary_never_dispatches_echo_as_first_failure(self):
+        for real_failure in (False, True):
+            world, echo, _, _, _ = self.echo_fixture()
+            native = world.native[101]
+            native["pull_requests"] = [dict(number=7, head=dict(sha=HEAD))]
+            world.overrides[ROOT + "/actions/workflows/99"] = Reply(200, {}, json.dumps(dict(id=99, path=NATIVE)).encode())
+            if real_failure:
+                world.jobs[101][0]["conclusion"] = "failure"
+            def check(store, tick):
+                with Observer(store, API(store, world)) as observer:
+                    observer.pump = lambda: None
+                    context = observer.prepare(native, True)
+                    with self.assertRaisesRegex(Unknown, "部分作业身份无效"):
+                        observer.jobs(native, lambda batch: observer.notice(context, batch))
+                failures = [row for row in store.actions() if row["kind"] == "first_failure"]
+                self.assertEqual(len(failures), int(real_failure))
+                self.assertTrue(all(row["payload"]["job_id"] != echo["id"] for row in failures))
+            with self.subTest(real_failure=real_failure):
+                self.ingest(world, check, publisher_only=True)
+
+    def check_generations(self, world, rows):
+        world.overrides[ROOT + f"/commits/{HEAD}/check-runs?filter=all&per_page=100&page=1"] = Reply(
+            200, {}, json.dumps(dict(total_count=len(rows), check_runs=rows)).encode())
+
+    def test_current_generation_is_highest_numeric_owned_id_for_discovery_and_matrix(self):
+        for legacy in (False, True):
+            for reverse in (False, True):
+                world = World("single-conflict")
+                if legacy:
+                    world.reporters[0]["name"] = "Trusted Merge report"
+                old = dict(world.row(), id=9, html_url=f"https://github.com/{REPO}/runs/9", conclusion="success")
+                rows = [old, world.row()]
+                self.check_generations(world, rows[::-1] if reverse else rows)
+                def check(store, tick):
+                    self.assertTrue(tick())
+                    action, = store.actions()
+                    self.assertEqual((action["payload"]["check_id"], action["payload"]["conclusion"]), (10, "failure"))
+                    self.assertTrue(tick())
+                    self.assertEqual(len(store.inbox("intersection-author-7")), 1)
+                with self.subTest(legacy=legacy, reverse=reverse):
+                    self.ingest(world, check, publisher_only=True)
+
+    def test_current_generation_never_falls_back_to_historical_success(self):
+        for legacy in (False, True):
+            for changed in ("pending", "other-publisher", "malformed", "source-state-changed"):
+                world = World()
+                if legacy:
+                    world.reporters[0]["name"] = "Trusted Merge report"
+                old = dict(world.row(), id=9, html_url=f"https://github.com/{REPO}/runs/9")
+                current = world.row()
+                metadata = copy.deepcopy(world.metadata)
+                if changed == "other-publisher":
+                    metadata["publisher"]["run_id"] = "202"
+                elif changed == "malformed":
+                    current["output"]["summary"] = "not JSON"
+                else:
+                    metadata.update(result="pending", failed_prs=[], pending_prs=[7])
+                    metadata["targets"][0].update(result="pending", verification=False)
+                    if changed == "pending":
+                        current.update(status="in_progress", conclusion=None)
+                    else:
+                        metadata["reason_code"] = "source_state_changed"
+                        current.update(status="completed", conclusion="failure")
+                if changed != "malformed":
+                    current["output"]["summary"] = json.dumps(metadata)
+                self.check_generations(world, [old, current])
+                with self.subTest(legacy=legacy, changed=changed):
+                    self.ingest(world, lambda store, tick: (self.assertFalse(tick()), self.assertEqual(store.actions(), [])), publisher_only=True)
+
+    def test_generation_selection_rejects_foreign_malformed_duplicate_and_mixed_identities(self):
+        mutations = [dict(id=value) for value in (None, True, 0, "9", 9.0)]
+        mutations.append(dict(id=10, html_url=f"https://github.com/{REPO}/runs/10"))
+        mutations += [dict(app=value) for value in (None, dict(id=True, slug="github-actions"),
+            dict(id=9, slug="github-actions"), dict(id=15368, slug="foreign"))]
+        mutations += [dict(head_sha=OTHER), dict(external_id="foreign"),
+            dict(external_id=f"merge-gate:v1:{REPO}:pr:7:head:{HEAD}"), dict(html_url="https://example.invalid/runs/9")]
+        for legacy in (False, True):
+            for mutation in mutations:
+                world = World("single-conflict")
+                if legacy:
+                    world.reporters[0]["name"] = "Trusted Merge report"
+                old = dict(world.row(), id=9, html_url=f"https://github.com/{REPO}/runs/9")
+                old.update(mutation)
+                self.check_generations(world, [old, world.row()])
+                with self.subTest(legacy=legacy, mutation=mutation):
+                    self.ingest(world, lambda store, tick: (self.assertFalse(tick()), self.assertEqual(store.actions(), [])), publisher_only=True)
+
+    def test_generation_is_rechecked_before_delivery_even_when_old_row_is_unchanged(self):
+        for legacy in (False, True):
+            world = World("single-conflict")
+            if legacy:
+                world.reporters[0]["name"] = "Trusted Merge report"
+            original = world.row()
+            def moving():
+                newer = dict(original, id=11, html_url=f"https://github.com/{REPO}/runs/11")
+                metadata = json.loads(newer["output"]["summary"])
+                metadata["publisher"]["run_id"] = "202"
+                newer["output"] = dict(summary=json.dumps(metadata))
+                self.check_generations(world, [original, newer])
+                return Reply(200, {}, json.dumps(original).encode())
+            world.overrides[ROOT + "/check-runs/10"] = moving
+            with self.subTest(legacy=legacy):
+                self.ingest(world, lambda store, tick: (self.assertFalse(tick()), self.assertEqual(store.actions(), [])), publisher_only=True)
+
+    def test_queued_old_success_is_not_delivered_after_new_generation_appears(self):
+        world = World()
+        def check(store, tick):
+            self.assertTrue(tick(deliver=False))
+            self.assertEqual(store.inbox("intersection-author-7"), [])
+            newer = dict(world.row(), id=11, html_url=f"https://github.com/{REPO}/runs/11", status="in_progress", conclusion=None)
+            metadata = copy.deepcopy(world.metadata)
+            metadata.update(result="pending", pending_prs=[7])
+            metadata["targets"][0].update(result="pending", verification=False)
+            newer["output"] = dict(summary=json.dumps(metadata))
+            self.check_generations(world, [world.row(), newer])
+            self.assertFalse(tick())
+            self.assertEqual(store.inbox("intersection-author-7"), [])
+        self.ingest(world, check, publisher_only=True)
 
     def test_shared_target_does_not_use_the_other_targets_proof(self):
         world = World("shared-success")
