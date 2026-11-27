@@ -71,28 +71,54 @@ def identity(history=False):
     return context
 
 
-def append_timing(path, context, profile, slot, invocation):
+def append_timing(path, context, profile, slot, invocation, partition=None):
     records = events.compact(path, context, profile, slot, invocation)
     with TIMING_LOCK, (Path(os.environ["RUNNER_TEMP"]) / "trial-timing.jsonl").open("a", encoding="utf-8") as output:
         for record in records:
+            if partition is not None:
+                record["package_partition"] = partition
             output.write(json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n")
 
 
 @contextmanager
 def observe_shards(context):
-    original = shards.log_events
+    original, original_subsets = shards.log_events, shards.execution_subsets
+    partitions = {}
+
+    # Refine execution only; the planner's C topology and canonical slots stay fixed.
+    def subsets(selected, profile, slot=None):
+        parents = original_subsets(selected, profile, slot)
+        if (profile, slot) not in (("platform", 3), ("store", 21)):
+            return parents
+        selected = verifier.counter(selected)
+        check(selected and all(count == 1 for count in selected.values()), "包预算选项为空或重复")
+        result = []
+        for index, parent in enumerate(parents):
+            parent = verifier.counter(parent)
+            check(len(parent) >= 2, "包预算原子集不足两项；拒绝空分区")
+            names = sorted(parent)
+            for part in range(2):
+                child = Counter({name: parent[name] for name in names[part::2]})
+                verifier.run_pattern(child)
+                partitions[profile, slot, f"run-{len(result)}"] = {
+                    "policy": "series6-package-budget-v1", "original_subset": index,
+                    "original_selected": parent, "part": part, "parts": 2, "selected": child}
+                result.append(child)
+        check(sum(result, Counter()) == selected, "包预算分区丢失或重复覆盖")
+        return result
 
     def log(path, stream):
         original(path, stream)
         profile = context["profile"]
         slot = int(path.parent.name.removeprefix("slot-"))
-        append_timing(path, context, profile, slot, f"{profile}-{slot}-{path.stem}")
+        append_timing(path, context, profile, slot, f"{profile}-{slot}-{path.stem}",
+                      partitions.get((profile, slot, path.stem)))
 
-    shards.log_events = log
+    shards.log_events, shards.execution_subsets = log, subsets
     try:
         yield
     finally:
-        shards.log_events = original
+        shards.log_events, shards.execution_subsets = original, original_subsets
 
 
 def go_test_args(race):
