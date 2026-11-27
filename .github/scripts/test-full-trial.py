@@ -907,6 +907,57 @@ class WorkflowTests(unittest.TestCase):
             self.skipTest(str(error))
         self.assertEqual((SCRIPTS.parent / "workflows/full-trial.yml").read_text(), expected)
 
+    def test_controller_is_staged_outside_clean_product(self):
+        render = load("full-trial-workflow")
+        text = (SCRIPTS.parent / "workflows/full-trial.yml").read_text()
+        stages = []
+        for name in re.findall(r"^  ([\w-]+):$", text.split("jobs:\n", 1)[1], re.M):
+            block = render.job(text, name)
+            self.assertEqual(re.findall(r"^          ref: (.+)$", block, re.M),
+                             ["${{ github.sha }}", "${{ inputs.sha }}"], name)
+            self.assertIn("          sparse-checkout: /.github/\n          sparse-checkout-cone-mode: false\n", block)
+            self.assertLess(block.index("      - name: Stage verified trial controller\n"),
+                            block.index("          ref: ${{ inputs.sha }}"))
+            self.assertNotIn("python3 .trial-controller/", block)
+            self.assertIn('python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py" identity', block)
+            stage = re.search(r"^      - name: Stage verified trial controller\n        run: \|\n(.*?)(?=^      - |\Z)",
+                              block, re.M | re.S)
+            stages.append("\n".join(line[10:] for line in stage[1].splitlines()))
+        self.assertEqual(stages, [stages[0]] * 7)
+
+        def git(root, *args, data=None):
+            return subprocess.run(["git", "-C", str(root), *args], input=data, check=True,
+                                  capture_output=True, text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as directory:
+            product, runner = Path(directory) / "candidate checkout", Path(directory) / "runner temp"
+            source = product / ".trial-controller"
+            runner.mkdir()
+            for root, path, contents in ((product, "candidate.go", "package candidate\n"),
+                                         (source, ".github/scripts/full-trial.py", "# Controller fixture\n")):
+                root.mkdir(parents=True)
+                git(root, "init", "--quiet")
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(contents)
+                git(root, "add", ".")
+                identity = "Trial <trial@example.invalid> 1 +0000"
+                commit = f"tree {git(root, 'write-tree')}\nauthor {identity}\ncommitter {identity}\n\nfixture\n"
+                git(root, "update-ref", "HEAD", git(root, "hash-object", "-t", "commit", "-w", "--stdin", data=commit))
+            (source / "retained.go").write_text("package controller\n")
+            self.assertIn("?? .trial-controller/", git(product, "status", "--porcelain"))
+            environment = {**os.environ, "GITHUB_WORKSPACE": str(product), "RUNNER_TEMP": str(runner), "GITHUB_SHA": "0" * 40}
+            rejected = subprocess.run(["bash", "-c", stages[0]], cwd=product, env=environment, capture_output=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            environment["GITHUB_SHA"] = git(source, "rev-parse", "HEAD")
+            subprocess.run(["bash", "-c", stages[0]], cwd=product, env=environment, check=True, capture_output=True)
+            staged = runner / "trial-controller"
+            self.assertTrue((staged / ".github/scripts/full-trial.py").is_file())
+            self.assertTrue((staged / "retained.go").is_file())
+            self.assertEqual(git(staged, "rev-parse", "HEAD"), environment["GITHUB_SHA"])
+            self.assertFalse(source.exists())
+            self.assertEqual(git(product, "status", "--porcelain"), "")
+
     def test_snapshot_without_old_object_uses_only_verified_local_source(self):
         render = load("full-trial-workflow")
         path = ".github/workflows/ci-full.yml"

@@ -18,7 +18,7 @@ LEGACY = {
     ".github/workflows/ci.yml": "a08aa4fa8c314fb8fdf04373c176f50a3c20a584ee9da2669bfae867d0311ea7",
     ".github/workflows/ci-full.yml": "765ffa72560982e54782093af9402450b0e756decd168352bdc587d0e5dad1cf",
 }
-DRIVER = 'python3 .trial-controller/.github/scripts/full-trial.py'
+DRIVER = 'python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py"'
 PREFIX = 'full-trial-${{ inputs.scheme }}-r${{ inputs.repeat }}-${{ github.run_id }}-${{ github.run_attempt }}'
 CHECKOUT = '''      - uses: actions/checkout@v7
         with:
@@ -29,9 +29,21 @@ CONTROLLER = '''      - uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           path: .trial-controller
+          sparse-checkout: /.github/
+          sparse-checkout-cone-mode: false
           persist-credentials: false
-      - name: Verify immutable product and controller
-        run: python3 .trial-controller/.github/scripts/full-trial.py identity
+      - name: Stage verified trial controller
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/.trial-controller"
+          target="$RUNNER_TEMP/trial-controller"
+          [[ -d "$source/.git" && ! -L "$source" && ! -e "$target" && ! -L "$target" ]] || exit 1
+          actual=$(git -C "$source" rev-parse HEAD)
+          [[ "$actual" == "$GITHUB_SHA" ]] || exit 1
+          mv "$source" "$target"
+'''
+IDENTITY = '''      - name: Verify immutable product and controller
+        run: python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py" identity
 '''
 GO = '''      - uses: actions/setup-go@v7
         with:
@@ -80,7 +92,7 @@ def sidecar(source, name):
     # Exact transformations only; new baseline shapes require a reviewed renderer update.
     if block.count(CHECKOUT) != 1:
         raise ValueError("基线 checkout 投影不明确")
-    block = block.replace(CHECKOUT, CHECKOUT + CONTROLLER)
+    block = block.replace(CHECKOUT, CONTROLLER + CHECKOUT + IDENTITY)
     block = block.replace("    runs-on:", "    needs: preflight\n    runs-on:", 1)
     block = block.replace("${{ inputs.tree }}", "${{ needs.preflight.outputs.tree }}")
     block = block.replace("${{ inputs.head }}", "${{ inputs.sha }}")
@@ -89,8 +101,8 @@ def sidecar(source, name):
         block += '''      - name: Test trial evidence and workflow projection
         run: |
           set -euo pipefail
-          python3 .trial-controller/.github/scripts/test-full-trial.py -v
-          python3 .trial-controller/.github/scripts/full-trial-workflow.py --check
+          python3 "$RUNNER_TEMP/trial-controller/.github/scripts/test-full-trial.py" -v
+          python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial-workflow.py" --check
 '''
     if name == "go-benchmarks":
         block = block.replace("name: go-benchmarks\n", "name: " + PREFIX + "-benchmarks\n")
@@ -177,10 +189,10 @@ jobs:
       base: ${{ steps.plan.outputs.base }}
     steps:
 '''
-    preflight = CHECKOUT.replace("          persist-credentials:", "          fetch-depth: 0\n          persist-credentials:") + CONTROLLER + GO
+    preflight = CONTROLLER + CHECKOUT.replace("          persist-credentials:", "          fetch-depth: 0\n          persist-credentials:") + IDENTITY + GO
     preflight += '''      - name: Compiled inventories and ordinary workspace monolith
         id: plan
-        run: python3 .trial-controller/.github/scripts/full-trial.py preflight
+        run: python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py" preflight
       - uses: actions/setup-node@v7
         with:
           node-version: '22.x'
@@ -230,7 +242,7 @@ jobs:
       TRIAL_JOB_NUMBER: ${{ matrix.job_number }}
     steps:
 '''.replace("  JOB:", "  " + name + ":").replace("KIND", kind).replace("TIMEOUT", str(timeout)).replace("PARALLEL", parallel).replace("MATRIX", matrix)
-        workers += CHECKOUT + CONTROLLER + GO + download_plan()
+        workers += CONTROLLER + CHECKOUT + IDENTITY + GO + download_plan()
         workers += '      - name: Execute and verify ' + kind + '\n        run: ' + DRIVER + ' ' + kind + '\n'
         workers += uploads(kind) + "\n"
     aggregate = '''  aggregate:
@@ -246,10 +258,10 @@ jobs:
       verified: ${{ steps.receipt.outputs.verified }}
       receipt: ${{ steps.receipt.outputs.receipt }}
     steps:
-''' + CHECKOUT + CONTROLLER + '''      - name: Require every same-attempt job to pass
+''' + CONTROLLER + CHECKOUT + IDENTITY + '''      - name: Require every same-attempt job to pass
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
-        run: python3 .trial-controller/.github/scripts/full-trial.py results
+        run: python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py" results
 ''' + download_plan() + '''      - uses: actions/download-artifact@v7
         with:
           pattern: PREFIX-shard-*
@@ -264,7 +276,7 @@ jobs:
         id: receipt
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 .trial-controller/.github/scripts/full-trial.py aggregate
+        run: python3 "$RUNNER_TEMP/trial-controller/.github/scripts/full-trial.py" aggregate
       - uses: actions/upload-artifact@v7
         with:
           name: PREFIX-final
