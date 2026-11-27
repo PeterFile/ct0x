@@ -10,6 +10,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 import zipfile
@@ -437,7 +439,8 @@ class ObservationContracts(Case):
         reads = []
         def download(_path, _etag):
             reads.append(_path)
-            self.assertEqual(self.actions("first_failure"), [])
+            self.assertEqual(len(self.actions("first_failure")), 1)
+            self.assertEqual(self.store.outbox(), [])
             raise Unknown("fixture log timeout")
         self.world.overrides[ROOT + "/actions/jobs/501/logs"] = download
         self.tick()
@@ -1569,6 +1572,202 @@ store.close()
         self.assertTrue(self.store.inbox("coordinator-test"))
 
 
+class FirstNoticeCheckpoint(Case):
+    def test_first_action_is_committed_but_not_deliverable_before_log_io(self):
+        self.assign()
+        checkpoint = []
+        def download(_path, _consume, *, timeout):
+            self.assertFalse(self.store.db.in_transaction)
+            reader = Store(self.path, initialize=False)
+            try:
+                actions = [a for a in reader.actions() if a["kind"] == "first_failure"]
+                self.assertEqual(len(actions), 1)
+                checkpoint.append(actions[0])
+                self.assertEqual((actions[0]["job"], actions[0]["payload"]["source_head"], actions[0]["payload"]["pr"]), ("501", SHA, 12))
+                self.assertEqual(timeout, 5)
+                self.assertEqual(reader.outbox(), [])
+                reader.deliver((REPO, SHA, 91, 1), "coordinator-test", 12)
+                self.assertEqual(reader.inbox("coordinator-test"), [])
+                self.assertEqual(reader.inbox("author-test"), [])
+            finally:
+                reader.close()
+            raise Unknown("fixture log not yet available", status=404)
+        with patch.object(self.api, "lines", side_effect=download):
+            self.tick()
+        first = self.actions("first_failure")[0]
+        self.assertEqual((first["id"], first["created_at"]), (checkpoint[0]["id"], checkpoint[0]["created_at"]))
+        self.assertEqual(first["payload"]["tests"], [])
+        self.assertEqual(len(self.store.inbox("author-test")), 1)
+
+    def test_sigkill_at_first_log_read_recovers_the_same_winner_and_binding(self):
+        self.assign()
+        code = '''import os, signal, sys
+sys.path.insert(0, sys.argv[1])
+from github import API
+from observer import Observer
+from store import Store
+from test_observer import World
+s = Store(sys.argv[2], initialize=False)
+a = API(s, World())
+def stop(*args, **kwargs):
+ assert not s.db.in_transaction
+ assert len(s.actions()) == 1 and not s.outbox()
+ os.kill(os.getpid(), signal.SIGKILL)
+a.lines = stop
+with Observer(s, a) as observer:
+ observer.reconcile()
+'''
+        result = subprocess.run([sys.executable, "-B", "-c", code, str(Path(__file__).parent.resolve()), str(self.path)], capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, -signal.SIGKILL, result.stderr.decode())
+        self.store.close()
+        self.store = Store(self.path, initialize=False)
+        self.api = API(self.store, self.world)
+        original = self.actions("first_failure")[0]
+        binding = self.store.root_sha(REPO, 91, 1, SHA, None)
+        self.assertEqual(self.store.outbox(), [])
+        self.world.jobs[1].insert(0, job(502, when="2026-11-26T01:01:30Z"))
+        self.world.log = Reply(200, {}, b'--- FAIL: TestRecoveredWinner (0.1s)\n')
+        self.tick()
+        first = self.actions("first_failure")[0]
+        self.assertEqual((first["id"], first["created_at"], first["job"], first["sha"]),
+                         (original["id"], original["created_at"], "501", binding))
+        self.assertEqual(first["payload"]["pr"], original["payload"]["pr"])
+        before = {recipient: self.store.inbox(recipient) for recipient in ("author-test", "coordinator-test")}
+        self.tick()
+        for recipient, receipts in before.items():
+            self.assertEqual(self.store.inbox(recipient), receipts)
+            self.assertEqual(len([r for r in receipts if r["payload"]["action"] == "first_failure"]), 1)
+
+    def test_delayed_authenticated_named_stream_does_not_wait_for_a_slow_tail(self):
+        self.assign()
+        owner, budgets, elapsed = self, [], []
+        class Transport:
+            def __call__(self, path, etag=None):
+                return owner.world(path, etag)
+            def stream(self, path, consume, timeout, limit):
+                budgets.append(timeout)
+                started = time.monotonic()
+                try:
+                    return GhTransport().stream(path, consume, timeout, limit)
+                finally:
+                    elapsed.append(time.monotonic() - started)
+        self.api = API(self.store, Transport())
+        named = json.dumps({"Action": "fail", "Package": "agentworkspace/internal/preflight", "Test": "TestCIObserverRequiredFailureReceipt"})
+        script = "import time; time.sleep(1.1); print('HTTP/2.0 200 OK\\r\\n\\r\\n',flush=True); time.sleep(1.1); print(" + repr(named) + ",flush=True); time.sleep(30)"
+        with patch.object(GhTransport, "command", return_value=[sys.executable, "-B", "-c", script]):
+            self.tick()
+        self.assertEqual(budgets, [5])
+        self.assertLess(elapsed[0], 4.8, "first named evidence must not wait for the slow tail or the full five seconds")
+        first = self.actions("first_failure")[0]
+        for recipient in ("author-test", "coordinator-test"):
+            notice = next(r["payload"] for r in self.store.inbox(recipient) if r["payload"]["action"] == "first_failure")
+            self.assertEqual(notice["tests"], [{"name": "TestCIObserverRequiredFailureReceipt", "package": "agentworkspace/internal/preflight", "outcome": "failed"}])
+            self.assertEqual((notice["job_id"], notice["job_url"]), (501, job()["html_url"]))
+            self.assertTrue(notice["logs_pending"])
+        self.api = API(self.store, self.world)
+        self.world.log = Reply(200, {}, (named + "\n").encode())
+        self.tick()
+        self.tick()
+        self.assertEqual(self.actions("first_failure"), [first])
+        self.assertEqual(len(self.actions("job_details")), 1)
+
+    def test_partial_names_survive_unknown_rereads_and_delivered_history_is_frozen(self):
+        self.assign()
+        def partial(_path, consume, *, timeout):
+            self.assertEqual(timeout, 5)
+            consume('--- FAIL: TestAlreadyKnown (0.1s)')
+            return False
+        with patch.object(self.api, "lines", side_effect=partial):
+            self.tick()
+        receipt = self.store.inbox("author-test")[0]
+        self.store.ack("author-test", receipt["receipt_id"])
+        frozen = self.store.inbox("author-test")
+        first = self.actions("first_failure")[0]
+        self.store.close()
+        self.store = Store(self.path, initialize=False)
+        self.api = API(self.store, self.world)
+        self.world.log = reply({}, 404)
+        self.tick()
+        known = next(e["payload"] for e in self.store.events() if e["job"] == "501")
+        self.assertEqual(known["tests"][0]["name"], "TestAlreadyKnown")
+        self.assertEqual(self.store.inbox("author-test"), frozen)
+        self.world.log = Reply(200, {}, b'--- FAIL: TestAfterRetry (0.1s)\n')
+        self.tick()
+        self.tick()
+        self.assertEqual(self.actions("first_failure"), [first])
+        self.assertEqual(next(r for r in self.store.inbox("author-test") if r["receipt_id"] == receipt["receipt_id"]), frozen[0])
+        self.assertEqual({t["name"] for t in self.actions("job_details")[0]["payload"]["tests"]}, {"TestAlreadyKnown", "TestAfterRetry"})
+
+    def test_pending_recipient_gets_names_on_first_delivery_without_rewriting_the_action(self):
+        self.assign()
+        self.world.log = reply({}, 404)
+        self.tick(deliver=False)
+        original = self.actions("first_failure")[0]
+        ids = {r["receipt_id"] for r in self.store.outbox()}
+        self.world.log = Reply(200, {}, b'--- FAIL: TestBeforeActualDelivery (0.1s)\n')
+        lines = self.api.lines
+        def first_delivery(path, consume, *, timeout):
+            self.assertEqual(timeout, 5, "a queued but never delivered first receipt still uses the short first window")
+            return lines(path, consume, timeout=timeout)
+        with patch.object(self.api, "lines", side_effect=first_delivery):
+            self.tick()
+        self.assertEqual(self.actions("first_failure"), [original])
+        self.assertTrue(ids <= {r["receipt_id"] for r in self.store.outbox()})
+        for recipient in ("author-test", "coordinator-test"):
+            receipt = next(r for r in self.store.inbox(recipient) if r["payload"]["action"] == "first_failure")
+            self.assertIn(receipt["receipt_id"], ids)
+            self.assertEqual(receipt["payload"]["tests"][0]["name"], "TestBeforeActualDelivery")
+
+    def test_environment_failure_does_not_invent_a_test_from_an_incidental_name(self):
+        self.world.log = Reply(200, {}, b'go: dependency discovery failed; TestNeverExecuted was not run\n')
+        self.tick()
+        first = self.actions("first_failure")[0]["payload"]
+        self.assertEqual(first["tests"], [])
+        self.assertEqual((first["job_id"], first["job_url"]), (501, job()["html_url"]))
+        self.assertFalse(first["logs_pending"])
+
+    def test_already_delivered_ready_native_recovery_and_sqlite_ack_progress_before_log_returns(self):
+        import codex_receiver as receiver
+        from test_codex_receiver import ROOT as actor, QUEUE
+        self.store.close()
+        self.path = self.path.with_name("native-ready.sqlite")
+        self.store = Store(self.path)
+        self.store.configure(REPO, actor)
+        self.api = API(self.store, self.world)
+        rollout = self.path.parent / ("rollout-first-log-" + actor + ".jsonl")
+        rollout.write_text(json.dumps({"type": "session_meta", "payload": {"id": actor, "source": "cli", "thread_source": "user"}}) + "\n")
+        rollout.chmod(0o600)
+        receiver.register(self.store, actor, str(rollout))
+        payload = dict(workflow=RELEASE, workflow_sha=SHA, source_head=SHA, tested_sha=TARGET, target_unknown=False,
+                       provenance="release-intent", conclusion="success", job_id=602, job_url=f"https://github.com/{REPO}/actions/runs/92/job/602", pr=None)
+        identity = self.store.publish(Key(REPO, TARGET, 92, 1, "602"), "release_binary_ready", payload, [actor])
+        self.store.deliver_actions({identity: None}, actor)
+        ready = self.store.inbox(actor)[0]
+        sent = threading.Event()
+        def queue(_recipient, message):
+            if ready["receipt_id"] in message:
+                sent.set()
+            return QUEUE
+        def slow(_path, consume, *, timeout):
+            self.assertFalse(self.store.db.in_transaction)
+            self.assertTrue(sent.wait(2), "already prepared native readiness must not wait behind this log")
+            code = "import sys;sys.path.insert(0,sys.argv[1]);from store import Store;s=Store(sys.argv[2],initialize=False);s.db.execute('PRAGMA busy_timeout=0');s.ack(sys.argv[3],sys.argv[4]);s.close()"
+            ack = subprocess.run([sys.executable, "-B", "-c", code, str(Path(__file__).parent.resolve()), str(self.path), actor, ready["receipt_id"]], capture_output=True, timeout=3)
+            self.assertEqual(ack.returncode, 0, ack.stderr.decode())
+            consume('--- FAIL: TestAfterConcurrentAck (0.1s)')
+            return True
+        with patch.object(receiver, "_queue", side_effect=queue), patch.object(self.api, "lines", side_effect=slow):
+            self.tick()
+        self.assertIsNotNone(self.store.inbox(actor, receipt_id=ready["receipt_id"])[0]["acked_at"])
+        self.assertEqual(len(self.actions("first_failure")), 1)
+
+    def test_unverified_earlier_job_cannot_reserve_the_first_action(self):
+        self.world.jobs[1] = [dict(job(501, when="2026-11-26T01:01:30Z"), head_sha=GOOD), job(502)]
+        self.tick()
+        self.assertEqual([a["job"] for a in self.actions("first_failure")], ["502"])
+        self.assertFalse(any("/jobs/501/logs" in path for path, _ in self.world.calls))
+
+
 class EarlyMergeIdentity(Case):
     def identity_fixture(self, event="pull_request"):
         self.world.prs[12].update(state="open", merged=False)
@@ -1920,7 +2119,7 @@ class FinalReview(Case):
         def delayed(_path, consume, *, timeout, **_kwargs):
             self.assertFalse(self.store.db.in_transaction)
             budgets.append(timeout)
-            if timeout <= 1:
+            if timeout <= 5:
                 return False
             consume('--- FAIL: TestDeferredLog (0.1s)')
             return True
@@ -1934,8 +2133,8 @@ class FinalReview(Case):
         details = [a for a in self.actions("job_details") if a["job"] == "501"]
         self.assertEqual(len(details), 1)
         self.assertEqual(details[0]["payload"]["tests"][0]["name"], "TestDeferredLog")
-        self.assertEqual(budgets[0], 1)
-        self.assertGreater(budgets[1], 3.283)
+        self.assertEqual(budgets[0], 5)
+        self.assertEqual(budgets[1], 15)
         self.assertEqual(self.actions("first_failure"), [first])
 
     def test_12_failed_jobs_have_no_unsolicited_sibling_detail_fanout(self):

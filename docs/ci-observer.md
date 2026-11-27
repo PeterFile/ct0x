@@ -98,7 +98,11 @@ Release 的 ancillary duplicate 是一个严格例外。观察器同时核实以
 
 信息性 duplicate 不触发新调查、修复或 begin。Pi 可见但不唤醒模型，Codex 保存可查阅的信息投影但不主动入队。迟到的已核实证据沿用原 terminal receipt，旧本地首报和详情保留审计记录、退出可消费待办，不伪造 ACK。已返回的原生作业事实仍匹配已核实快照，而 API 暂时不可用时，保留信息终态并等待补证，不降级成新调查。owner 后来成功也不会重建 duplicate 调查。返回的证据冲突或异常仍保留普通失败。已经实际送出的历史消息不能撤回。
 
-首报先给该 job 一次最多 1 秒的流式日志读取机会。立即取得的 Go `--- FAIL:`/JSON 测试名随首报发送；超时、不可用或截断则保留 `logs_pending=true`，稍后独立补齐。不会在首次读取前遍历全部日志或下载 binary archive。每次后续对账还可推进一个其他失败 job 的日志。
+核实原生作业身份和当前首败赢家后，先提交稳定的 `first_failure` 动作与来源绑定，再读取网络日志。此时不建立 outbox，不能被其他来源的投递顺便发出；在此处崩溃，恢复仍沿用同一赢家、动作 ID 和创建时间。只有重新核实的合法收件人才能进入后续投递。
+
+首次仅给该赢家一次最多 **5 秒**的流式日志窗口。完整 HTTP 200 响应头之后解析到 Go `--- FAIL:`/JSON 具名失败或 timeout running 名称，即可停止慢下载，将已知名称、准确 outcome、job ID/URL 放入同一首次实际投递。不等整轮、完整慢日志或 binary archive；无真实具名证据的环境故障不编造测试名。停止、超时、404 或未知时保留已知字段及 `logs_pending=true`，后续读取预算仍为 **15 秒**，详情关联原动作，默认不另派调查。每次后续对账还可推进一个其他失败 job 的日志。
+
+读取前会推进已有的原生投递；外部 I/O 不持有 SQLite 写事务，其他已投递收件及其独立 ACK 可继续。当前赢家的读取最多占用上述窗口，不新增日志线程池，也不逐个等待所有失败 job。
 
 日志最多读取 64 MiB，单行最多 64 KiB，最多保留 1,000 个测试项，不保留原始输出。结果是有界提取，不保证完整测试清单。`outcome=failed` 才是明确失败；Go timeout 的 running tests 标成 `running_at_timeout`，不是断言失败。测试名、package 和日志文字始终是非可信数据，不执行其中的字符串。
 
@@ -140,7 +144,7 @@ Periodic/Release 首先交协调者。confirmed 归因支持单项旧格式和 `
 
 ## 消费、订阅和显式 ACK
 
-动作和各收件人的 outbox 在同一事务创建。receipt ID 由动作与收件人稳定派生；投递事务同时写 durable inbox 和 delivered 状态。每个收件人独立 ACK，协调者 ACK 不代替作者。
+通常动作和各收件人的 outbox 在同一事务创建；首败在日志读取前先提交无收件人的保留动作。首次建立 outbox 前可填入已核实的日志，但不改变动作 ID、来源键、已知身份绑定或创建时间；已有 outbox 后不改写原动作，仅可为尚未实际投递的收件人保存已核实的 payload 投影。已投递 payload、投递时间和 ACK 时间不回写。receipt ID 仍由动作与收件人稳定派生；投递事务同时写 durable inbox 和 delivered 状态。每个收件人独立 ACK，协调者 ACK 不代替作者。
 
 ```bash
 python3 -B "$OBSERVER" --db "$DB" inbox --recipient author-session --pending --limit 32

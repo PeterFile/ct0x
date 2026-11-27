@@ -376,6 +376,8 @@ class Store:
                         raise ValueError("同一作业或整轮终态冲突，保持未知")
                     if terminal and previous.get("logs_pending") is False:
                         payload = dict(payload, logs_pending=False, tests=previous.get("tests", []))
+                    elif terminal and previous.get("tests") and not payload.get("tests"):
+                        payload = dict(payload, tests=previous["tests"])
                     if payload == previous:
                         result.append(previous)
                         continue
@@ -387,6 +389,7 @@ class Store:
         payload = dict(payload, repo=key.repo, sha=key.sha, run_id=key.run_id, attempt=key.attempt,
                        action=kind, job=key.job)
         action_id = hashlib.sha256(encode([*key.values(), kind]).encode()).hexdigest()
+        recipients = sorted(set(recipients))
         with self.db:
             self.db.execute("INSERT OR IGNORE INTO actions VALUES(?,?,?,?,?,?,?,?,?)",
                             (action_id, *key.values(), kind, encode(payload), now()))
@@ -416,20 +419,25 @@ class Store:
                               and route.get("workflow") == payload.get("workflow") and route.get("event") == payload.get("event"))
             if previous.get("pr") != payload.get("pr") and not verified_route:
                 return action_id  # Unproved route changes never rewrite or fan out historical messages.
+            if kind == "first_failure" and recipients and previous != payload and not self.db.execute("SELECT 1 FROM outbox WHERE action_id=? LIMIT 1", (action_id,)).fetchone():
+                # Only an unqueued reservation can be filled; its ID, binding, and creation clock stay fixed.
+                self.db.execute("UPDATE actions SET payload=? WHERE id=?", (encode(payload), action_id))
+                previous = payload
             if cause:
                 owner, evidence = cause
                 self.db.execute("INSERT OR REPLACE INTO causes VALUES(?,?,?,?)", (*owner[:3], encode(evidence)))
-            for recipient in sorted(set(recipients)):
+            for recipient in recipients:
                 label(recipient)
                 if cause and recipient == owner[3]:
                     claimed = self.db.execute("INSERT OR IGNORE INTO cause_owners VALUES(?,?,?,?)", owner)
                     if not claimed.rowcount:
                         continue
                 receipt_id = hashlib.sha256(encode([action_id, recipient]).encode()).hexdigest()
-                if verified_route and recipient != self.config()[1]:
+                if verified_route and recipient != self.config()[1] or kind == "first_failure" and previous != payload:
                     delivered = self.db.execute("SELECT 1 FROM inbox WHERE receipt_id=?", (receipt_id,)).fetchone()
-                    if not delivered:
-                        self.db.execute("INSERT OR IGNORE INTO delivery_payloads VALUES(?,?,?)", (action_id, recipient, encode(payload)))
+                    queued = self.db.execute("SELECT state FROM outbox WHERE receipt_id=?", (receipt_id,)).fetchone()
+                    if not delivered and (queued is None or queued[0] == "pending"):
+                        self.db.execute("INSERT INTO delivery_payloads VALUES(?,?,?) ON CONFLICT(action_id,recipient) DO UPDATE SET payload=excluded.payload WHERE payload!=excluded.payload", (action_id, recipient, encode(payload)))
                 self.db.execute("INSERT OR IGNORE INTO outbox VALUES(?,?,?,'pending',NULL,NULL)", (action_id, recipient, receipt_id))
         return action_id
 

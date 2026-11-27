@@ -228,6 +228,10 @@ class TestLog:
                 for (name, package), outcome in sorted(self.tests.items()) if package or name not in named]
 
 
+class FirstNamesReady(Exception):
+    """Stop a streaming first read after authenticated named evidence is available."""
+
+
 def extract_tests(text):
     parser = TestLog()
     for line in text.splitlines():
@@ -700,25 +704,34 @@ class Observer:
                     context["run"]["path"] == RELEASE and self.full_lane(payload.get("job_name"), "Release Full") and
                     (summary.get("signature_schema") != 1 or not summary.get("complete")))
 
-    def read_logs(self, context, key, payload, timeout=1):
+    def read_logs(self, context, key, payload, timeout=5, first=False):
         if key.job in context["log_seen"] or not self.needs_logs(context, payload):
             return payload
         context["log_seen"].add(key.job)
         parser = TestLog()
         for item in payload.get("tests", []):
             parser.add(item["name"], item.get("package"), item.get("outcome", "failed"))
+        summary = payload.get("log_summary", {})
+        parser.timeout = bool(summary.get("timeout"))
+        parser.packages.update(summary.get("failed_packages", []))
+        def consume(line):
+            parser.feed(line)
+            if first and parser.tests and hasattr(getattr(self.api, "transport", None), "stream"):
+                raise FirstNamesReady
         scope = f"logs:{key.run_id}:{key.attempt}:{key.job}"
+        problem = "日志读取已停止、超时或截断；详情稍后补齐"
         try:
-            complete = self.api.lines(self.root + f"/actions/jobs/{key.job}/logs", parser.feed, timeout=timeout)
-            detail = dict(payload, logs_pending=not complete, tests=parser.result(),
-                          log_summary=dict(complete=complete, timeout=parser.timeout, failed_packages=sorted(parser.packages),
-                                           signature_schema=1, signatures=parser.signatures.result()))
-            context.setdefault("log_summaries", {})[key.job] = detail["log_summary"]
-            self.store.problem(scope, None if complete else "日志读取超时或截断；首报不等待，详情稍后补齐")
-            return self.store.event(key, detail)
+            complete = self.api.lines(self.root + f"/actions/jobs/{key.job}/logs", consume, timeout=timeout)
+        except FirstNamesReady:
+            complete = False
         except Unknown as error:
-            self.store.problem(scope, str(error))
-            return payload
+            complete, problem = False, str(error)
+        detail = dict(payload, logs_pending=not complete, tests=parser.result(),
+                      log_summary=dict(complete=complete, timeout=parser.timeout, failed_packages=sorted(parser.packages),
+                                       signature_schema=1, signatures=parser.signatures.result()))
+        context.setdefault("log_summaries", {})[key.job] = detail["log_summary"]
+        self.store.problem(scope, None if complete else problem)
+        return self.store.event(key, detail)
 
     def notice(self, context, jobs):
         from release_duplicates import classify
@@ -736,9 +749,16 @@ class Observer:
         if not failures:
             return
         key, payload = self.job_payload(context, failures[0])
-        payload = self.read_logs(context, key, payload, timeout=15 if old else 1)
+        delivery = self.store.db.execute("SELECT COUNT(*),COUNT(i.receipt_id) FROM outbox o LEFT JOIN inbox i ON i.receipt_id=o.receipt_id WHERE o.action_id=?", (old["id"],)).fetchone() if old else (0, 0)
+        prepared, delivered = bool(delivery[0]), bool(delivery[1])
+        # Reserve the verified winner durably, without any deliverable recipient, before log I/O.
+        if not self.store.publish(key, "first_failure", payload, []):
+            return
+        if key.job not in context["log_seen"] and self.needs_logs(context, payload):
+            self.pump()  # Previously prepared native deliveries must not wait behind this download.
+        payload = self.read_logs(context, key, payload, timeout=15 if delivered else 5, first=not delivered)
         identity = self.publish(context, key, "first_failure", payload)
-        if old and json.loads(old["payload"]).get("logs_pending") and not payload.get("logs_pending"):
+        if prepared and json.loads(old["payload"]).get("logs_pending") and not payload.get("logs_pending"):
             detail = dict(payload, update_of=identity, detail_kind="logs")
             self.publish(context, key, "job_details", detail)
 
