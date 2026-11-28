@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """Black-box Store/Platform/HTTPAPI shard gate regressions; never invokes Go."""
+from collections import Counter
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -855,6 +857,43 @@ class VerifierTests(unittest.TestCase):
             self.mutate(directory, slot, lambda summary: summary.update(selected=selected, runs=selected, passes=selected), "httpapi")
         self.assertEqual(combined, {name: 1 for name in HTTPAPI_SLOTS})
         self.reject(self.aggregate(directory, profile="httpapi"))
+
+
+class ExecutionSubsetTests(unittest.TestCase):
+    def test_package_alarm_refinement_preserves_parents_and_all_other_slots(self):
+        spec = importlib.util.spec_from_file_location("ci_shards", SCRIPT.with_name("ci-shards.py"))
+        shards = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shards)
+        refined_slots = {("platform", 3), ("store", 21), ("store", 40), ("store", 55)}
+        slow_store_slots = {6, 8, 38, 50, 51, 57, 62}
+        for profile, (total, _, _, _) in shards.verifier.PROFILES.items():
+            for slot in (None, *range(total)):
+                for count in (0, 1, 2, 3, 5, 6, 23, 24, 25, 45, 48, 49, 73):
+                    names = [f"TestVector{index:03d}" for index in range(count)]
+                    selected = Counter(reversed(names))
+                    groups = 1
+                    if profile == "platform":
+                        groups = max(1, (count + 23) // 24)
+                    elif profile == "store" and slot in slow_store_slots:
+                        groups = max(1, (count + 4) // 5)
+                    parents = [names[index::groups] for index in range(groups)]
+                    expected = []
+                    for parent in parents:
+                        children = [parent]
+                        if (profile, slot) in refined_slots and len(parent) > 1:
+                            children = [parent[::2], parent[1::2]]
+                        expected.extend(Counter(child) for child in children)
+                    with self.subTest(profile=profile, slot=slot, count=count):
+                        actual = shards.execution_subsets(selected, profile, slot)
+                        self.assertEqual(actual, expected)
+                        self.assertEqual(shards.execution_subsets(Counter(names), profile, slot), expected)
+                        self.assertEqual(selected, Counter(names))
+                        combined = Counter()
+                        for subset in actual:
+                            self.assertFalse(combined.keys() & subset.keys())
+                            self.assertTrue(subset or not selected)
+                            combined.update(subset)
+                        self.assertEqual(combined, selected)
 
 
 class WorkflowTests(unittest.TestCase):

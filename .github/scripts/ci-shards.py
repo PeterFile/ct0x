@@ -28,6 +28,8 @@ PLATFORM_RUN_LIMIT = 24
 STORE_SLOW_RUN_LIMIT = 5
 # Pairing A/B: run 44712299768. Preserve isolation for #225 slots and #240 package times >=330s.
 SLOW_STORE_SLOTS = {6, 8, 38, 50, 51, 57, 62}
+# Refine observed package-alarm slots only after their original partitioning.
+PACKAGE_ALARM_SLOTS = {("platform", 3), ("store", 21), ("store", 40), ("store", 55)}
 LOG_LOCK = Lock()
 
 
@@ -46,12 +48,22 @@ def execution_subsets(selected, profile, slot=None):
     elif profile == "store" and slot in SLOW_STORE_SLOTS:
         limit = STORE_SLOW_RUN_LIMIT
     else:
-        return [selected]
-    if len(selected) <= limit:
-        return [selected]
-    names = sorted(selected)
-    groups = (len(names) + limit - 1) // limit
-    return [Counter({name: selected[name] for name in names[index::groups]}) for index in range(groups)]
+        limit = None
+    subsets = [selected]
+    if limit is not None and len(selected) > limit:
+        names = sorted(selected)
+        groups = (len(names) + limit - 1) // limit
+        subsets = [Counter({name: selected[name] for name in names[index::groups]}) for index in range(groups)]
+    if (profile, slot) not in PACKAGE_ALARM_SLOTS:
+        return subsets
+    refined = []
+    for subset in subsets:
+        if len(subset) <= 1:
+            refined.append(subset)
+        else:
+            names = sorted(subset)
+            refined.extend(Counter({name: subset[name] for name in names[index::2]}) for index in range(2))
+    return refined
 
 
 def command(args, **kwargs):

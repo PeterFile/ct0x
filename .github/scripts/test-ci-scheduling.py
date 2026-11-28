@@ -962,6 +962,8 @@ class ShardBatchTests(unittest.TestCase):
 
     def test_workers_list_once_then_81_real_verified_uncached_logical_runs(self):
         names = [f"TestVector{index}" for index in range(180)]
+        # This fixed fixture adds one run per refined slot, independently of execution_subsets.
+        extra_run_slots = {("platform", 3), ("store", 21), ("store", 40), ("store", 55)}
         calls = []
 
         def go(command, **kwargs):
@@ -997,6 +999,7 @@ class ShardBatchTests(unittest.TestCase):
                     tests = [command for command in calls if command[:2] == ["go", "test"]]
                     expected_runs = sum(max(1, (len(self.verifier.selection(Counter(names), slot, profile)[0]) + 23) // 24)
                                         if profile == "platform" else 1 for slot in slots)
+                    expected_runs += sum((profile, slot) in extra_run_slots for slot in slots)
                     self.assertEqual(len(tests), expected_runs + 1)
                     self.assertEqual(sum("-list" in command for command in tests), 1)
                     for command in tests:
