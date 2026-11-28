@@ -65,7 +65,7 @@ The initial Source is the local IM. **Reply destination** means the authorized C
 
 Runtime is the composition root. It owns the process lock, SQLite writer/reader pools, private `0700` materialization directories, provider adapters, loopback HTTP/MCP server, startup, and ordered `wal_checkpoint(TRUNCATE)` shutdown. It contains no admission rules.
 
-Engine is the single writer of coordination aggregates through small role-scoped interfaces inside single-pass `BEGIN IMMEDIATE` Go transactions (relying on SQL PK/composite-FK/CHECK constraints, 9 partial unique indexes, and 10 single-table immutability triggers — zero cross-table JOIN triggers):
+Engine is the single writer of coordination aggregates through small role-scoped interfaces inside single-pass `BEGIN IMMEDIATE` Go transactions (relying on SQL PK/composite-FK/CHECK constraints, 9 partial unique indexes, and 10 single-table immutability triggers, with zero cross-table JOIN triggers):
 
 | Caller | Interface responsibilities |
 | --- | --- |

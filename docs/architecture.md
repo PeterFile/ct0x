@@ -61,7 +61,7 @@ Pi (`>= 1.5.2`) and Codex (`>= 0.172.0`) connect through a single Session-Bound 
 
 ## Startup configuration
 
-`cmd/workspace` converges from 24 experimental toggles to a single default startup profile with **8 operational flags** (runtime capability boundaries are governed by Project templates and `channel_policies`, not CLI feature flags):
+`cmd/workspace` converges from 28 startup flags (including 13 `--enable-*` experimental toggles) to a single default startup profile with **8 operational flags** (runtime capability boundaries are governed by Project templates and `channel_policies`, not CLI feature flags):
 
 | Flag | Default / Domain | Purpose |
 | --- | --- | --- |
@@ -96,7 +96,7 @@ Target routes (legacy Group routes are removed in the same Phase 4 cutover wave 
 
 ## Visual language
 
-The sole UI target is the single [Openbot-derived shell](openbot-shell.md) (Phase 4 retires legacy fallback layouts and unused reception defaults). It preserves PolyForm Noncommercial 1.0.0 attribution, NOTICE, and source mappings alongside the central CSS palette (`#131412` canvas, `#1b1c19` panel, `#eeede6` text, `#a5a69c` muted, `#34362f` line, `#dc7958` accent, `#9eaf87` success), keyboard navigation, visible focus, reduced motion, and narrow-screen usability.
+The sole UI target is the single [Openbot-derived shell](openbot-shell.md). Phase 4 retires legacy fallback layouts and unused reception defaults. This shell supersedes the earlier visual reference inspected on 2026-10-30 at [claude.dev](https://claude.dev/), which informed the restrained charcoal canvas, warm off-white text, vermilion highlights, monospaced navigation, thin rules, and editorial spacing under an original product identity without copying logos or illustrations. It preserves PolyForm Noncommercial 1.0.0 attribution, NOTICE, and source mappings alongside the central CSS palette (`#131412` canvas, `#1b1c19` panel, `#eeede6` text, `#a5a69c` muted, `#34362f` line, `#dc7958` accent, `#9eaf87` success), keyboard navigation, visible focus, reduced motion, and narrow-screen usability.
 
 The primary screen remains an IM with left navigation (`ProjectChannelNav`), central message timeline with selective quote/reply and composer (`Discussion`), and contextual server-backed panels (`ChannelPolicyPanel`, `Members`, `PendingDecisions`, `Tasks` with `Verification` and dependency rebind, and `UnknownReconcilePanel`). Never fabricate activity, read receipts, or unverified completion.
 

@@ -1,6 +1,6 @@
-# 架构收敛 Phase 0–5 施工路线与验收门槛
+# 架构收敛 Phase 0-5 施工路线与验收门槛
 
-> **过期与定位声明**：本文档仅作为架构收敛 **Phase 0–5 期间的临时施工路线与硬验收门槛清单**，不是长期产品或架构权威契约。长期目标契约与冻结依据见 [PRD](../../PRD.md)、[目标架构契约](../architecture.md)、[编排契约](../orchestration.md)、[提供方兼容性契约](../provider-compatibility.md) 与 [ADR-0001](../adr/0001-architecture-convergence.md)。架构收敛经 Phase 5 原子合入 `master` 后，本文档应归档或移除。
+> **过期与定位声明**：本文档仅作为架构收敛 **Phase 0-5 期间的临时施工路线与硬验收门槛清单**，不是长期产品或架构权威契约。长期目标契约与冻结依据见 [PRD](../../PRD.md)、[目标架构契约](../architecture.md)、[编排契约](../orchestration.md)、[提供方兼容性契约](../provider-compatibility.md) 与 [ADR-0001](../adr/0001-architecture-convergence.md)。架构收敛经 Phase 5 原子合入 `master` 后，本文档应归档或移除。
 >
 > **诚实双态声明**：截至基线 `origin/master`（`0188361`），主干当前实际运行代码仍为待替换的旧 `Group/Conversation` 实现、101 表 `v48` Schema 与双栈桥接层，尚未切至 39 表 `Project/Channel` 实现。
 
@@ -8,7 +8,7 @@
 
 ## 一、主干不断链集成策略
 
-为避免直接替换 `internal/store` 导致主干 CI 在 Phase 1–3 连续编译失败，或引入第二套并行新包导致长期双轨维护，本次收敛采用**单一集成分支 `arch-convergence` + 子阶段独立 git worktree + Phase 4 全绿后经 Phase 5 原子合入 `master`** 策略：
+为避免直接替换 `internal/store` 导致主干 CI 在 Phase 1-3 连续编译失败，或引入第二套并行新包导致长期双轨维护，本次收敛采用**单一集成分支 `arch-convergence` + 子阶段独立 git worktree + Phase 4 全绿后经 Phase 5 原子合入 `master`** 策略：
 
 ```mermaid
 flowchart LR
@@ -26,19 +26,19 @@ flowchart LR
   P5 -- "4 项硬门槛 100% 通过后原子合入 master" --> M1["master (target_v1 r2 正式落盘)"]
 ```
 
-- Phase 1–3 在 `arch-convergence` 上允许尚未触及的上层包暂不编入全仓构建，但必须划定各阶段包级验收范围。
+- Phase 1-3 在 `arch-convergence` 上允许尚未触及的上层包暂不编入全仓构建，但必须划定各阶段包级验收范围。
 - 每个子阶段须在独立 git worktree 推进，遵守 [AGENTS.md](../../AGENTS.md) 边界（不修改其他 worker 拥有路径，不提交 `.local/`、运行库或凭据）。
 
 ---
 
-## 二、Phase 0–5 施工清单
+## 二、Phase 0-5 施工清单
 
 | 阶段 | 前置依赖 | 主要编辑路径 | 核心交付与已冻结决策接线 | 机读验收命令与通过阈值 |
 | --- | --- | --- | --- | --- |
 | **Phase 0：基线对齐与双 CLI 解冻** | `origin/master`（`0188361`） | `internal/provider/`、`internal/store/native_session_pi.go`、`cmd/workspace/`、`web/src/` | 1. 从最新 `origin/master` 切出分支（偏好 3A）；<br>2. 移除精确补丁号硬锁改为按协议能力探测（支持 `Pi >= 1.5.2` 与 `Codex >= 0.172.0`）；<br>3. 删除实验性 `agy` 路径与死代码旧默认页模块；<br>4. 实测记录当前全仓逐包 normal 与 `-race` 耗时基线快照（供 Phase 5 校准） | `go test ./...` 退出码 `0`；全仓 Go/TS/HTML 源码检索不再存在旧精确补丁号白名单、实验性 `agy` 开关与已删死代码旧模块；零付费发现单测确认 `Pi >= 1.5.2` 与 `Codex >= 0.172.0` 就绪；基线 CSV 落盘于 `.local/progress/` |
 | **Phase 1：SQLite WAL 池与 39 表原子迁移** | Phase 0 合入 `master` 后切 `arch-convergence` | `internal/store/` | 1. `store.Open` 切至 `WAL + synchronous=FULL + foreign_keys=1 + busy_timeout=5000 + wal_autocheckpoint=1000 + _txlock=immediate` + 写 1 / 读 4 池 + 退出 `wal_checkpoint(TRUNCATE)`，支持 `--sqlite-sync=full\|normal`（偏好 1B）；<br>2. 落地 39 表 `target_v1` DDL（`user_version=100, r2`）；<br>3. 落地 `v22/v33/v35/v48 -> target_v1` 临时文件单事务原子迁移器与 100 源表全量去向审计 | 5 样本迁移校验器退出码 `0`：`integrity_check=="ok"`、`fk==0`、`user_version==100`、`user_tables==39`、`triggers==10`、`join_triggers==0`、`views==0`、全部 37 张业务表 SHA-256 100% 匹配、`unaccounted_source_tables==[]`；5 组 DDL 结构约束单测全绿；故障注入原库 SHA-256 不变且残留临时文件 `== 0`；`go test -race ./internal/store/...` `SQLITE_BUSY==0` |
 | **Phase 2：单遍 Go 事务、双层锁、分级对账与准备层解耦** | Phase 1 合入 `arch-convergence` | `internal/domain/`、`internal/store/`、`internal/coordination/`、`internal/scheduler/`、`internal/platform/` | 1. 全部写路径收敛为单遍 `BEGIN IMMEDIATE` Go 事务，删除重复 mega-SQL；<br>2. 编排器强制活跃轮次互斥 + 可变写排他 `resource_claims`；<br>3. 落地 `external_pid`/`external_pgid`/`external_process_started_at`/`external_boot_id` 采集与决策 1C 分级对账；<br>4. 落地决策 3C 临时成员退出冻结 `handover_pending` + 交接 `decisions`；<br>5. 落地依赖钉选人类改绑、任务取消/撤权不可恢复与聊天准备层对旧评估草稿表的彻底解耦 | `go test -race ./internal/domain/... ./internal/store/... ./internal/coordination/... ./internal/scheduler/... ./internal/platform/...` 退出码 `0`、`SQLITE_BUSY==0`；16 并发 barrier 竞态精确 `1 winner / 15 rejected`；真实 Pi/Codex `SIGKILL` 进程组对账通过（错误 `boot_id` 拒斥 `412`、Tier 1 `200`、Tier 2 未确认 `428` -> 哈希确认 `200`、`manual_sqlite_edits==0`）；自然聊天续办在零旧准入草稿表行下通过 |
-| **Phase 3：统一 Loopback MCP 与 24-LOC Pi 壳** | Phase 2 合入 `arch-convergence` | `internal/provider/`、`internal/httpapi/member_tools*`、`extensions/`、`cmd/workspace/testdata/` | 1. `POST /api/v1/member-tools/mcp`（Streamable HTTP `2025-06-18`）补齐全部协作工具（含 `propose_task_decision`、`delegate_work`、`handback_work`、`publish_run_explanation`、`load_skill` 快照绑定）；<br>2. 上线预绑定 `-32602` 伪造拒斥、显式 session 级 `idempotency_key` 与 write-unknown 熔断；<br>3. `//go:embed` 内嵌 24-LOC `pi_thin_mcp.mjs`（`-e builtin:mcp` 去 `--no-mcp`），删除整个 `extensions/pi-bridge/`（含其包内文档）、`cmd/workspace/testdata/` 旧桥夹具及 21 条旧路由；<br>4. 落地偏好 2B 临时只读 `PI_CODING_AGENT_DIR` 隔离 | `extensions/pi-bridge` 不存在；单测证明临时 `PI_CODING_AGENT_DIR` 符号链接隔离在运行前后原 `~/.pi/agent/auth.json` 等文件 mtime/SHA-256 零变动；实机 Pi 1.5.2 与 Codex 0.172.0 5/5 工具类全通；断 TCP 换 id 重放 `duplicate_rows==0 && receipt_identical==true`；18/18 伪造矩阵 `escalations==0 && cross_project_leaks==0` |
+| **Phase 3：统一 Loopback MCP 与 24-LOC Pi 壳** | Phase 2 合入 `arch-convergence` | `internal/provider/`、`internal/httpapi/member_tools*`、`extensions/`、`cmd/workspace/testdata/` | 1. `POST /api/v1/member-tools/mcp`（Streamable HTTP `2025-06-18`）补齐全部协作工具（含 `propose_task_decision`、`delegate_work`、`handback_work`、`publish_run_explanation`、`load_skill` 快照绑定）；<br>2. 上线预绑定 `-32602` 伪造拒斥、显式 session 级 `idempotency_key` 与 write-unknown 熔断；<br>3. `//go:embed` 内嵌 24-LOC `pi_thin_mcp.mjs`（`-e builtin:mcp` 去 `--no-mcp`），删除整个 `extensions/pi-bridge/`（含其包内文档）、`cmd/workspace/testdata/` 旧桥夹具及 27 条非 MCP 旧成员工具路由；<br>4. 落地偏好 2B 临时只读 `PI_CODING_AGENT_DIR` 隔离 | `extensions/pi-bridge` 不存在；单测证明临时 `PI_CODING_AGENT_DIR` 符号链接隔离在运行前后原 `~/.pi/agent/auth.json` 等文件 mtime/SHA-256 零变动；实机 Pi 1.5.2 与 Codex 0.172.0 5/5 工具类全通；断 TCP 换 id 重放 `duplicate_rows==0 && receipt_identical==true`；18/18 伪造矩阵 `escalations==0 && cross_project_leaks==0` |
 | **Phase 4：8 参数启动、新路由、删旧路由与前端单壳** | Phase 3 合入 `arch-convergence` | `cmd/workspace/`、`internal/httpapi/`、`web/src/`、`docs/group-background-dispatch-preview.md` | 1. `cmd/workspace` 收敛为 8 参数单一默认启动档案（`--listen` 默认 `127.0.0.1:7310`，含 `--sqlite-sync=full\|normal`），同步删除旧预览存根 `docs/group-background-dispatch-preview.md`；<br>2. 上线完整 `/api/v1/projects/{project}/channels/{channel}/*` 与 `/policy`、`/reconcile`、`/rebind` 路由，**同波次彻底删除全部旧群组路由、兼容 DTO 与对应旧测试**（决策 4A）；<br>3. 单壳 `OpenbotShell` 移除旧经典兼容布局回退分支并接入项目三档模板、频道策略覆盖与影子预览（决策 2C）、分级对账面板（决策 1C）、临时成员交接卡片（决策 3C）与 `Verification` 视图 | `workspace --help` 仅输出 8 个运维参数且默认 `127.0.0.1:7310`；全仓 Go/TS/HTML 源码检索零残留旧群组 API 路径与旧经典布局回退入口；**全仓** `go test -race ./...` 与 `cd web && npm run typecheck && npm test && npm run build` 均退出码 `0`；跨项目/跨频道隔离 `409/404/403` 零泄漏 |
 | **Phase 5：性能校准与 6 条真实闭环总验收** | Phase 4 全绿 | 验证脚本与发布回执（`.local/progress/`） | 1. 运行全仓 Go normal + `-race` 采集逐包耗时对比 `2026-11-26` CI 基线与 Phase 0 本地基线；<br>2. 仅以默认启动档案启动真实进程（默认端口 `127.0.0.1:7310`）+ 真实浏览器（Playwright）+ 真实 Pi 1.5.2 / Codex 0.172.0 跑通全部 6 条端到端闭环；<br>3. 生成发布机读总回执并原子合入 `master` | 全部 4 项硬验收门槛机读 JSON 断言 100% `passed`，`leaked_pids==[]` |
 

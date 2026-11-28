@@ -14,9 +14,9 @@
 基线 `18d11a3` 存在五重结构性负担：
 
 1. **存储与并发瓶颈**：SQLite 使用 Rollback Journal 与 `MaxOpenConns=1` 单连接阻塞读取，读与写互相阻塞。
-2. **Schema 与触发器膨胀**：`v48` 累计 `101` 张表（`100` 张用户表）、`298` 条外键、`260` 个索引、`318` 个触发器（`230,374 B`，占 DDL 总字节 `68.09%`，其中 `69` 个跨表 JOIN 验证触发器占 `173,999 B`、最高单个含 `77` 路 JOIN）与 `5` 个视图，并与 Go Store 内重复的 `15–20` 表 provenance mega-SQL 叠加，拉高 `-race` CI 耗时（`2026-11-26` CI 基线中单包 p95 达 `362.65–568.24s`，Full CI 墙钟 `56m09s`）。
+2. **Schema 与触发器膨胀**：`v48` 累计 `101` 张表（`100` 张用户表）、`298` 条外键、`260` 个索引、`318` 个触发器（`230,374 B`，占 DDL 总字节 `68.09%`，其中 `69` 个跨表 JOIN 验证触发器占 `173,999 B`、最高单个含 `77` 路 JOIN）与 `5` 个视图，并与 Go Store 内重复的 `15-20` 表 provenance mega-SQL 叠加，拉高 `-race` CI 耗时（`2026-11-26` CI 基线中单包 p95 达 `362.65-568.24s`，Full CI 墙钟 `56m09s`）。
 3. **双 CLI 协议分裂**：Pi 与 Codex 分别维护 `5,801` 行 TypeScript 扩展（`1,894` LOC 运行时 + `3,907` LOC 测试）与精确补丁号硬锁的 AppServer/旧 HTTP 成员路由两套协议栈。
-4. **启动入口膨胀**：`cmd/workspace` 积累 `24` 个互斥实验开关与外部预览旁路，缺乏单一默认启动档案。
+4. **启动入口膨胀**：`cmd/workspace` 积累 `28` 个启动参数（含 `13` 个 `--enable-*` 实验开关与外部预览旁路），缺乏单一默认启动档案。
 5. **崩溃恢复阻塞**：`unknown` 态冻结持有 `resource_claims` 后缺失正式对账 API 与分级确认协议，导致工作区写锁只能等待人工处置或永久滞留。
 
 本次收敛采用**独立集成分支 `arch-convergence` 一步收敛、主干不断链、零双轨长期滞留**路线，直接以 [target_v1 Schema](#四精确-39-表-target_v1user_version100-r2域模型与-100-源表盘点) 替代旧双轨演进。
@@ -48,7 +48,7 @@
 | **实验 2**（触发器 vs 单遍 Go 事务） | `54/54` 非法状态等价拒斥；16 并发 barrier 常规与 `-race` 精确 `1 winner / 15 rejected`，`busy=0`；生命周期写路径 p50 `135.59ms -> 24.23ms`（`-82.13%`, `5.59x`, `p=0.000155`），总耗时 `-80.56%`（`5.14x`, `p=0.000155`）；`-race` 总耗时 `-89.56%`（`9.57x`, `p=0.002165`），workload `-95.07%`（`20.27x`）；消融组 `A_drop2_same_go` 提速为 `0`（`+7.37%, p=0.885714`） | **Caveat**：实测对象仅为 `workspace_operation_lifecycle` 单条写路径，不可直接线性外推全仓所有 Go 包均获得相同降幅；Phase 5 必须以 Phase 0 全包实测基线做逐包校准 | 删除全部 `69` 个跨表 JOIN 触发器并与 Go 侧重复 mega-SQL 同步收敛为单遍 `BEGIN IMMEDIATE` PK 点查事务 |
 | **实验 3 + 三边界**（双 CLI 并发） | Pi `1.5.2` 与 Codex `0.172.0` 双话题并行零串台（`leaked_pids=[]`）；实证抓出 3 个静默丢数据边界：同文件无锁并发写 Pi `3/3` 丢失更新（加锁后 `100%` 保留）、Codex 同进程双 `turn/start` 静默合并同 `turnId`（跨进程 `-32600`）、Pi 并发恢复同 `--session` 以 `rc=0` 静默分叉 `parentId` 树 | 高载未影响语义边界结论 | 实施双层锁：数据库部分唯一索引强制 1 会话/话题成员至多 1 活跃轮次 + 可变写获取排他 `resource_claims` 至终态回执（放行同 `cwd` 只读并发） |
 | **实验 4**（统一 Loopback MCP） | Pi `1.5.2` 与 Codex `0.172.0` 均 `5/5` 工具类全通落库；纯回环开销 p50 `0.506ms`；断 TCP 换 JSON-RPC `id` 重放 `duplicate_rows=0, receipt_identical=true`；Pi 扩展运行时由 `1,894` LOC（含测试共 `5,801` LOC）压至 `24` LOC（`-98.73%`）；抓出 `--no-mcp` 会阻断 `registerMcpServer` | **Caveat**：`live_codex_forgery_attempt` 中模型自身拒绝发送伪造参数（`tool_calls_attempted=0`），防伪造边界由 `18/18` 直连 HTTP 矩阵与 Pi `3` 次实测拦截联合证明 | 统一收敛至 Loopback Streamable HTTP MCP（`2025-06-18`）+ 24-LOC 内嵌 `pi_thin_mcp.mjs`（`-e builtin:mcp` 去 `--no-mcp`）+ 显式 session 级 `idempotency_key` + 偏好 2B 临时只读 `PI_CODING_AGENT_DIR` |
-| **实验 5**（39 表迁移、DDL 实证、隔离与分级对账） | 5/5 样本无损升至 39 表 `user_version=100`（外接存储实测单库 `1.69–1.81s`，37 张业务表 SHA-256 100% 匹配，`unaccounted_source_tables==[]`，原库 SHA-256 零变动）；5/5 DDL 结构约束实证全绿；双项目隔离 `409/404/403` 零泄漏；真实 Pi（`PGID=31431`）与 Codex（`PGID=31437`）进程组 `SIGKILL` 冻结 `unknown` -> 错误 `boot_id` 拒斥 `412` -> Tier 1 一键释锁 `200`；未决写操作 Tier 2 拦截 `428` -> 哈希二次确认 `200` 释锁，`manual_sqlite_edits=0` | `leaked_pids=[]`；全部 59 项独立核验全绿 | 正式采纳 39 表 `target_v1` Schema、全表盘点原子迁移器与决策 1C 分级对账协议 |
+| **实验 5**（39 表迁移、DDL 实证、隔离与分级对账） | 5/5 样本无损升至 39 表 `user_version=100`（外接存储实测单库 `1.69-1.81s`，37 张业务表 SHA-256 100% 匹配，`unaccounted_source_tables==[]`，原库 SHA-256 零变动）；5/5 DDL 结构约束实证全绿；双项目隔离 `409/404/403` 零泄漏；真实 Pi（`PGID=31431`）与 Codex（`PGID=31437`）进程组 `SIGKILL` 冻结 `unknown` -> 错误 `boot_id` 拒斥 `412` -> Tier 1 一键释锁 `200`；未决写操作 Tier 2 拦截 `428` -> 哈希二次确认 `200` 释锁，`manual_sqlite_edits=0` | `leaked_pids=[]`；全部 59 项独立核验全绿 | 正式采纳 39 表 `target_v1` Schema、全表盘点原子迁移器与决策 1C 分级对账协议 |
 
 ---
 
