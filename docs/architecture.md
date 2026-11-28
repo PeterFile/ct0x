@@ -1,98 +1,104 @@
-# Local group collaboration
+# Target architecture: Project and Channel collaboration
 
-The product is a local, single-user collaboration workspace. [PRD.md](../PRD.md) is the product authority. The accepted target is `Workspace → Project → Channel`; current runtime and persistence remain `Group/Conversation`.
+> **Status & Dual-State Notice**: This document defines the **sole target engineering contract** for all subsequent development work under the converged 39-table `Workspace -> Project -> Channel` architecture (frozen decisions in [ADR-0001](adr/0001-architecture-convergence.md); phased execution plan in [architecture-convergence-roadmap.md](plans/architecture-convergence-roadmap.md)). On current `origin/master` (`0188361`), running runtime code remains the legacy `Group/Conversation` implementation until architecture convergence merges into `master`.
 
-An empty group can begin a discussion without a profile, task, Git repository, or external working directory. The backend is one Go process with SQLite. The web client is React with TypeScript and Vite, served locally by the backend in the packaged build.
+The product is a local, single-user collaboration workspace for Darwin and Linux. [PRD.md](../PRD.md) is the product authority. The converged domain hierarchy is `Workspace -> Project -> Channel`.
 
-The architecture direction selected on 2026-11-01 follows the pinned dsh-superagent-prototype's coordination model and uses an IM interface. [Conversation-led orchestration](orchestration.md) defines the mapping, role-scoped Engine, migration sequence, and compatibility rules. It distinguishes target design from implemented behavior. Existing storage and execution invariants below remain in force.
+An empty Channel can begin a discussion without a profile, Task, Git repository, or external working directory. The backend is one local Go process with embedded SQLite and no microservices or external queues. The web client is React with TypeScript and Vite, served locally by the backend in the packaged build via the single [Openbot-derived shell](openbot-shell.md).
+
+The coordination model adapts the pinned dsh-superagent-prototype architecture. [Conversation-led orchestration](orchestration.md) defines the domain mapping, Engine boundaries, two-tier crash reconciliation, and atomic schema migration rules.
 
 ## Boundaries
 
-- `internal/domain`: shared value types and explicit states.
-- `internal/store`: SQLite transactions, migrations, indexed bounded reads, identity and resource constraints.
-- `internal/provider`: CLI discovery, capability contracts, native/one-shot transport, execution receipts. No group-specific routing.
-- `internal/platform`: shared operations, actor binding, discussion routing, task lifecycle, artifacts, skills, and context.
-- `internal/coordination`: Engine for source intake, versioned admission, Mandates, Assignment bindings, follow-up ownership, and structured attention through one transactional module. Coordination storage and role-scoped primitives exist; opt-in `--enable-coordination-roles` wires `NewTrustedIntentPass` and bound coordinator/worker execution into the existing scheduler for registered Dispatch/Assignment work. The experimental natural-chat path has passed real-CLI text-loop acceptance with user-configured, capability-verified adapters: trusted `chat_intake/v1` assessment and versioned Policy/Mandate admission now produce goals, acceptance criteria, Tasks, and automatic Dispatch registration through the same Engine and scheduler; its [text-only boundaries](orchestration.md#experimental-text-scope) apply. Directory writes and Artifact publication are not connected to that text Submission path; provenance- and authorization-bound automatic rejection repair and Project migration remain unimplemented. It reuses the existing Store, queue, and scheduler, not a parallel execution system.
-- `internal/scheduler`: durable claims, fair inbox/work scheduling, cancellation, and recovery.
-- `internal/httpapi`, `cmd/workspace`: loopback HTTP, SSE, process lifecycle, and platform CLI entry.
-- `web`: design tokens, accessible interaction, and server-backed views.
+- `internal/domain`: shared value types, explicit states (`open`/`handover_pending`/`submitted`/`accepted`/`cancelled` Tasks, `unknown` Turns, `handover` Decisions), and zero-dual-track domain models.
+- `internal/store`: SQLite WAL writer/reader pools, 39-table `target_v1` schema (`user_version=100`), atomic `v48`-to-`target_v1` migration, indexed bounded reads, and single-pass `BEGIN IMMEDIATE` write transactions.
+- `internal/provider`: zero-paid-probe CLI discovery (`Pi >= 1.5.2`, `Codex >= 0.172.0` by protocol capability), per-run isolated `0700` `PI_CODING_AGENT_DIR` handling, embedded 24-LOC `pi_thin_mcp.mjs`, AppServer transport, and process-group/boot-id anti-PID-reuse evidence.
+- `internal/platform`: shared platform operations, server-bound actor/project/channel identity validation (`404`/`403`/`409`), discussion routing, three-tier Project policy templates with Channel/Thread overrides, task lifecycle, artifacts, skill snapshots, and bounded context assembly.
+- `internal/coordination`: unified transactional Engine for source intake, versioned Policy admission, immutable Mandates, Assignment handover, follow-up ownership, and structured attention without ephemeral scratchpad tables or process-level feature flags.
+- `internal/scheduler`: durable delivery/wakeup separation, fair inbox/work scheduling, two-layer concurrency locking (DB partial unique active-turn indexes + exclusive write `resource_claims`), cancellation, and crash recovery.
+- `internal/httpapi`, `cmd/workspace`: loopback-only HTTP/SSE server (`127.0.0.1:7310` default), single Session-Bound Loopback Streamable HTTP MCP endpoint (`POST /api/v1/member-tools/mcp`), two-tier crash reconciliation endpoint, and converged 8-flag default startup profile.
+- `web`: single-shell `OpenbotShell` (`ProjectChannelNav`, `ChannelPolicyPanel`, `Discussion`, `Members`, `PendingDecisions`, `Tasks`, `UnknownReconcilePanel`), central CSS tokens, and accessible server-backed panels.
+
+## Storage, schema, and concurrency
+
+SQLite operates in `WAL` mode with `synchronous=FULL` (with `--sqlite-sync=full|normal` escape hatch defaulting to `full`), `foreign_keys=1`, `busy_timeout=5000`, `wal_autocheckpoint=1000`, `_txlock=immediate`, writer pool `MaxOpenConns=1`, separate read-only pool (`mode=ro`, `query_only=1`, `MaxOpenConns=4`), and `PRAGMA wal_checkpoint(TRUNCATE)` on clean shutdown.
+
+The converged `target_v1` (`user_version=100`, revision `r2`) schema contains **39 strict tables**, **9 partial unique structural guard indexes**, **27 targeted covering indexes** (49 auto + 36 explicit = 85 indexes total), **10 single-table immutability/no-unrevoke triggers**, **0 multi-table JOIN triggers**, and **0 views**. It eliminates all dual-track shadow tables and cross-table validation triggers, enforcing multi-entity invariants inside single-pass `BEGIN IMMEDIATE` Go transactions.
+
+| Domain Group | Exact Target Tables (39) |
+| --- | --- |
+| Metadata & Top-Level Scopes (6) | `schema_meta`, `workspaces`, `projects`, `channels`, `channel_members`, `channel_policies` |
+| Explicit Resource & Artifact Grants (2) | `workspace_grants`, `artifact_read_grants` |
+| Threads, Messaging, Skills & Execution (10) | `threads`, `thread_state_revisions`, `messages`, `deliveries`, `wakeups`, `sessions`, `skill_snapshots`, `turns`, `turn_skill_bindings`, `run_explanations` |
+| Tasks, Mandates, Dependencies & Collaboration (12) | `tasks`, `task_thread_links`, `mandates`, `task_dependencies`, `task_lineage`, `assignments`, `attempts`, `task_work_inputs`, `task_constraint_impacts`, `submissions`, `verifications`, `reviews` |
+| Artifacts & Pending User Decisions (4) | `artifacts`, `artifact_versions`, `submission_artifacts`, `decisions` |
+| Resource Locking, Ops, Experiences, Idempotency & Audit (5) | `resource_claims`, `workspace_operations`, `project_experiences`, `idempotency_keys`, `audit_events` |
+
+Historical databases (`v1..v47` normalized to `v48` first, then `v48 -> target_v1`) migrate via a one-shot offline/startup atomic temp-file transaction gated by `PRAGMA integrity_check == ok`, `PRAGMA foreign_key_check == 0`, SHA-256 equivalence across all 37 business tables, and zero unaccounted non-empty source tables before `fsync` + atomic `rename`. See [ADR-0001](adr/0001-architecture-convergence.md) for the full 100-source-table disposition audit.
 
 ## Stable invariants
 
-Group membership and lifecycle ownership are distinct from the creator and working directory. Conversations belong to one group/member/topic. Ordinary discussion creates a Turn without a Task.
+`projects.root_path` is deliberately non-unique: multiple Projects may point to the same directory with isolated identities and independent grants. Opening a folder never grants filesystem permissions; `projects.default_policy_tier` defaults to `chat_only` (`read_only_collab` and `authorized_write` require explicit authorization, and Channel/Thread overrides live in versioned `channel_policies` with shadow preview approval for over-tier requests).
 
-A message and its recipient deliveries commit in one transaction before notification. Repeating an idempotency key with the same payload returns the same message; a different payload conflicts. Recipient membership is checked within the transaction. Queued, accepted by the CLI, terminal turn, submitted task, and accepted result are different states.
+Channel membership (`channel_members`) and lifecycle ownership are distinct from creator and working directory. Threads (`(project_id, channel_id, topic_key)`) and Tasks have true many-to-many links (`task_thread_links`); ordinary discussion creates a Turn without a Task. When a temporary member leaves (`status = 'left'`), active `assignments` become `cancelled` (preserving history), open Tasks freeze in `handover_pending`, and a `decisions(kind='handover')` card enters the user's global pending queue with an optional one-click coordinator handover suggestion or task cancellation (revoking the Mandate non-restorably).
 
-Only one active turn holds a conversation. Shared write resources are exclusive. A cancelling or unknown turn retains its resource claims until a trustworthy terminal or reconciliation result. A restarted process does not repeat an uncertain external start. Generation or claim tokens fence stale acknowledgements.
+A message (with optional inline `reply_to_message_id` / `quote_excerpt`) and its recipient deliveries commit in one transaction before notification; `deliveries` and `wakeups` remain strictly decoupled. Repeating an idempotency key with the same payload returns the same result; a different payload conflicts (`409`). Queued, accepted by CLI, terminal turn, submitted task, independent `verifications` outcome, and local-user `reviews` acceptance are distinct facts.
 
-Local user operations and member tools call the same platform methods. A member's actor is bound to the runtime session, never read from arbitrary request payloads. Cross-group history, artifacts, skills, and resources require explicit authorization.
+Two-layer concurrency protection prevents data loss: partial unique indexes (`idx_turns_active_session` and `idx_turns_active_thread_member`) allow at most one active turn per session and per `(project_id, channel_id, thread_id, member_id)`, while mutable directory writes acquire exclusive `resource_claims` until terminal receipt or formal reconciliation (read-only operations on the same `cwd` run concurrently).
 
-The UI does not interpret `installed` as `authenticated`, configuration presence as account proof, or process exit success as accepted deliverable. Capability flags default to unsupported. Every probe records timestamp, type, and sanitized evidence. Discovery has timeouts and never invokes a paid model request.
+A cancelling or `unknown` turn retains its capacity slot and `resource_claims` until a trustworthy terminal or formal two-tier reconciliation receipt (`412` on `external_pgid`/`started_at`/`boot_id` mismatch; Tier 1 one-click `200` for pure-text/read-only crashes; Tier 2 `428` blocking one-click release until secondary SHA-256 preimage vs disk observation confirmation returns `200` and appends `audit_events`).
 
-## Project compatibility migration
+Local user operations and member tools share platform semantics, with runtime `claim_token` hard-binding caller identity, `project_id`, `channel_id`, and grants. Cross-project mismatches return `404`, cross-scope capabilities return `403`, and duplicate intra-project channel names return `409`.
 
-These are accepted requirements, not enabled Project behavior. [Migration sequencing and rollback](orchestration.md#project-migration-and-rollback) retain the existing execution authority.
+## Unified Loopback MCP and provider execution
 
-A Project owns Channels and Tasks and may have no directory. A Thread is shared discussion within a Channel; Thread and Task are many-to-many. An Agent Session is a member's working context, distinct from both Task and provider-native session.
+Pi (`>= 1.5.2`) and Codex (`>= 0.172.0`) connect through a single Session-Bound Loopback Streamable HTTP MCP endpoint (`2025-06-18`) at `POST /api/v1/member-tools/mcp`, eliminating legacy multi-extension TypeScript bridges and per-operation HTTP member endpoints.
 
-The first slice creates one persistent local default Workspace and a distinct Project plus one Channel for each legacy Group. Project and Channel have independent stable IDs and an explicit Group-to-Channel-to-Project mapping. This is an import policy, not `Group = Project`; names, paths, providers, or owners must not merge old groups.
+- Go embeds a 24-LOC `pi_thin_mcp.mjs` shell via `//go:embed`, materializes it into a private `0700` directory with SHA-256 verification, and launches Pi with `-e builtin:mcp` (omitting `--no-mcp` so `registerMcpServer` stays active).
+- Before each Pi run, Go creates an isolated `0700` `PI_CODING_AGENT_DIR` containing read-only symlinks to host `auth.json`, `models.json`, and `settings.json`, plus an empty `mcp.json` (`{"mcpServers":{}}`) so host MCP servers never spawn in the background.
+- Forged scope arguments (`caller`, `project_id`, `channel_id`, `grants`, etc.) are rejected with JSON-RPC `-32602`; reconnect replays require explicit session-level `idempotency_key` with write-unknown circuit breaking.
+- See [provider-compatibility.md](provider-compatibility.md) for capability discovery, credential boundaries, and out-of-scope CLI exclusions (experimental `agy` ACP is removed in Phase 0).
 
-These initial Group-to-Channel and Channel-to-Project bindings are immutable. The first slice does not move groups or enable cross-Channel AgentInstance reuse. Workspace or Project membership never grants cross-group history, artifact, tool, or filesystem access; original group authorization and resource grants remain authoritative.
+## Startup configuration
 
-Append ownership and compatibility records; do not rename or rebuild legacy tables or replace the execution system. Preserve Group IDs, member identities, messages/topics, deliveries, Task versions, artifacts, idempotency records, grants, claims, provenance, and terminal/unknown evidence.
+`cmd/workspace` converges from 24 experimental toggles to a single default startup profile with **8 operational flags** (runtime capability boundaries are governed by Project templates and `channel_policies`, not CLI feature flags):
 
-Legacy API paths and DTOs, idempotency scope/key/payload, and same-Turn, claim-token, and generation fences remain in force until their respective migration is verified. Never reinterpret a legacy Group ID as a Project or Channel ID.
+| Flag | Default / Domain | Purpose |
+| --- | --- | --- |
+| `--listen` | `127.0.0.1:7310` | Loopback-only HTTP listen address |
+| `--data-dir` | User config `agent-workspace` (`0700`) | Private SQLite and runtime artifact root |
+| `--web-dir` | Embedded/dist default | Static web UI asset override |
+| `--dev-origin` | Empty | Explicit local development CORS/origin allowance |
+| `--max-active` | `4` (range `1..8`) | Global maximum concurrent active executions |
+| `--sqlite-sync` | `full` (`full\|normal`) | SQLite `synchronous` mode escape hatch (echoed in `/healthz`) |
+| `--pi-path` | `PATH` discovery | Optional explicit Pi executable path |
+| `--codex-path` | `PATH` discovery | Optional explicit Codex executable path |
 
 ## HTTP contract, version 1
 
-Use `/api/v1`, JSON snake_case, opaque string IDs, UTC RFC3339 timestamps, and errors shaped as `{ "error": { "code": "conflict", "message": "..." } }`. Every list responds with `{ "items": [], "next_cursor": "" }`; arrays are never null, and an empty cursor means the end. Bound all list queries with `limit` and an opaque `before` cursor (newest first, stable ordering by timestamp and ID); history increments may additionally accept `after`. Default limit is 50 and maximum 200. A mutation returns the created/updated object directly; creation uses 201. Mutation requests can supply `Idempotency-Key`; reusing a key with different input returns 409. Invalid inputs return 400 and missing or inaccessible records return 404.
+Use `/api/v1`, JSON snake_case, opaque string IDs, UTC RFC3339 timestamps, and errors shaped as `{ "error": { "code": "...", "message": "..." } }`. Lists return `{ "items": [], "next_cursor": "" }` bounded by `limit` (default 50, max 200) and opaque `before` cursors (`created_at, id` descending); mutations accept `Idempotency-Key` (`409` on payload mismatch). Enforce same-origin browser mutations and JSON bodies; never expose wildcard CORS or bind non-loopback by default.
 
-The default local address is `127.0.0.1:7310`, configurable by an explicit CLI flag. The frontend uses relative URLs and the development proxy targets this loopback port. Enforce same-origin browser mutations and JSON request bodies; do not expose wildcard CORS or bind to all interfaces by default. A local member tool transport needs a run-bound capability and must not inherit the user HTTP actor.
+Target routes (legacy Group routes are removed in the same Phase 4 cutover wave per Decision 4A):
 
-Time-based pagination is a display contract; provider and skill catalogues instead use stable IDs. SQL reads apply the cursor predicate and `LIMIT` before materializing rows. A timestamp/ID cursor is not a committed high-water mark. Durable incremental processing uses a separately defined committed sequence and a captured upper bound; a future `after` transport must preserve that distinction. A conversation is unique on `(group_id, member_id, topic_id)` with a non-null empty main topic; deliveries must match both their message topic/group and their conversation member/topic/group.
-
-The local-user Agent Run detail (`GET /api/v1/me/agent-runs/{run}?group_id={group}`) returns `timeline.items` newest first by `(created_at, id)` descending. `before` is scoped to that group and Run. For chronological display, reverse the combined pages, not each page separately.
-
-A timeline item of kind `dispatch_decision` has a `dispatch_decision` object with `decision_id` (the receipt ID), `request_id`, `task_id`, `kind` (`assign` or `decline`), `reason_preview` (a UTF-8 prefix of the recorded decision reason, at most 1024 bytes), and `truncated` (whether reason bytes were omitted). `worker_member_id` and `assignment_id` are present only for `assign`. This is a committed dispatch decision, not a Run outcome or proof of worker execution. A `submission` item continues to represent a committed Submission, not a Review, and includes those from generic member-bound Attempts.
-
-A `public_explanation` timeline item has ID `public_explanation:<run_id>` and a `public_explanation` object containing only `text`, the exact member-published statement (non-blank UTF-8, at most 1024 bytes, no NUL). It is optional and immutable, and is not a receipt, proof of tool execution, authorization, model reasoning, or a chat message. Native invocation code must supply the live server-bound `MemberToolScope` and authorized request key to `Engine.PublishAgentRunExplanation`; it must not derive the text from provider output. Only the same live claim, original key, and exact text can replay the statement through the write seam. `Engine.AgentRunExplanationSupported` checks for the append's table, not permission to publish. Pre-append databases keep their existing timeline without explanation items.
-
-Initial endpoints:
-
-| Route | Operations |
+| Domain | Target Routes |
 | --- | --- |
-| `/healthz` | GET process readiness |
-| `/api/v1/groups` | GET list, POST `{name, description?}` |
-| `/api/v1/groups/{group}/members` | GET list, POST `{name, role, provider_id?, model?, workspace?}` |
-| `/api/v1/groups/{group}/messages` | GET bounded history, POST `{content, recipient_ids?, topic_id?}` |
-| `/api/v1/groups/{group}/tasks` | GET, POST `{title, description, acceptance, assignee_id?, dependency_ids?, artifact_dependencies?}` |
-| `/api/v1/groups/{group}/tasks/{task}/artifact-dependencies` | GET immutable pins as `{items, next_cursor}` with `limit` and `before` |
-| `/api/v1/groups/{group}/artifacts` | GET versioned outputs, POST publish |
-| `/api/v1/groups/{group}/context` | GET knowledge and summaries |
-| `/api/v1/groups/{group}/history?q=...` | GET scoped search |
-| `/api/v1/providers` | GET independent installation/account/connectivity/capability states |
-| `/api/v1/skills` | GET metadata, explicit load reads body |
-| `/api/v1/events` | GET SSE notifications; reconnect always re-reads durable state |
+| System & Discovery | `GET /healthz` (echoes active `sqlite_sync`), `GET /api/v1/providers`, `GET /api/v1/skills`, `GET /api/v1/events` |
+| Projects & Channels | `GET/POST /api/v1/projects` (`default_policy_tier`), `GET /api/v1/projects/{project}`, `GET/POST /api/v1/projects/{project}/channels`, `GET /.../channels/{channel}`, `GET /.../channels/by-name/{name}` |
+| Members, Threads, Messages & History | `GET/POST/DELETE /.../channels/{channel}/members`, `GET /.../threads`, `GET /.../threads/{thread}/state`, `GET/POST /.../messages` (`reply_to_message_id`), `GET /.../history?q=...` |
+| Policy & Explicit Grants | `GET/PUT /.../channels/{channel}/policy`, `GET/POST/DELETE /.../channels/{channel}/workspace-grants`, `POST /.../channels/{channel}/artifact-read-grants` |
+| Tasks, Dependencies, Verification & Artifacts | `GET/POST /.../channels/{channel}/tasks`, `POST /.../tasks/{task}/cancel`, `POST /.../tasks/{task}/dependencies/{dep}/rebind`, `GET/POST /.../tasks/{task}/{attempts,work-inputs,submissions,verifications,reviews}`, `GET/POST /.../artifacts`, `GET /.../artifacts/{artifact}/versions/{version}/content` |
+| Cancellation & Tiered Reconciliation | `POST /api/v1/projects/{project}/attempts/{attempt}/cancel` (`202`, holds claims), `POST /api/v1/projects/{project}/attempts/{attempt}/reconcile` (`412` identity mismatch; Tier 1 `200`; Tier 2 `428` -> SHA-256 confirm `200`) |
+| Project Experiences | `GET/POST /api/v1/projects/{project}/project-experiences`, `POST /.../project-experiences/{experience}/retire` |
+| Personal Inbox & Run Observability | `GET /api/v1/me/pending-reviews`, `GET /api/v1/me/pending-decisions` (includes `handover`), `POST /api/v1/me/decisions/{decision}/answer`, `GET /api/v1/me/unknown-attempts`, `GET /api/v1/me/agent-runs`, `GET /api/v1/me/agent-runs/{run}` (timeline includes `dispatch_decision`, `submission`, and immutable `public_explanation` from `run_explanations`) |
+| Unified Member Tools | `POST /api/v1/member-tools/mcp` (Loopback Streamable HTTP MCP `2025-06-18`) |
 
-Initial Group fields: `id, name, description, created_at`. Member fields: `id, group_id, name, role, provider_id, model, creator_id, owner_id, status, workspace, created_at`. Message fields: `id, group_id, topic_id, sender_id, content, created_at, deliveries`. Local-user and some platform messages use `sender_id=user`; that label alone is not human permission. Member messages use the member ID. An empty topic denotes the main channel. Delivery fields: `id, message_id, conversation_id, recipient_id, state, turn_id, error, created_at`. Provider fields: `id, name, path, version, installation, account, connectivity, capabilities, evidence`.
-
-When creating an independent Task, the local user can explicitly pin up to 200 ArtifactVersions, at most one per prerequisite, in `artifact_dependencies`: `{dependency_id, submission_id, artifact_id, version_id, ready_when: "accepted"}`. `dependency_id` must also appear in `dependency_ids`; the same-group Task edge is required, not derived. The exact Submission must belong to that Task and contain the exact published version, whose `source_task_id` must be that Task. The pin does not follow the Artifact head. Registration is allowed while the Submission is current and awaiting Review, or when it already has an exact local-user acceptance. A rejected Submission cannot be used for a new pin.
-
-Starting a new attempt still requires every plain prerequisite to be accepted. A pin additionally requires a local-user Review accepting its exact Submission and task revision. Chat, head changes, and Review of a different Submission do not satisfy it, even if that Submission cites the same version. Pins cannot be edited or removed. They share the child Task's creation timestamp and are paginated by descending `dependency_id`, with cursors scoped to the exact group and Task. Task create, list, and detail responses are unchanged. Pins do not grant Artifact access or execution authority and are not inferred from intra-Task cooperation.
-
-The first provider implementation targets installed Pi and Codex. Capability tiers remain truthful: richer native protocols are separate slices, and PTY-only integrations do not claim machine collaboration. Live provider checks are recorded separately from fixture tests.
-
-Version and account probes cannot promote resume, append, tools, or compaction capabilities. Capability evidence is bound to the selected executable path, version, and transport. A member's selected workspace path does not by itself grant read/write access.
+`GET /api/v1/me/agent-runs/{run}` returns `timeline.items` newest first by `(created_at, id)` descending; `public_explanation:<turn_id>` carries an optional immutable member-published text (non-blank UTF-8, `<= 1024` bytes, no NUL) stored in `run_explanations`, distinct from receipts, authorization, or chat messages. `task_dependencies` pins exact `(pinned_submission_id, pinned_artifact_id, pinned_version_id)` tuples that do not follow artifact heads and require explicit `local-user` approval (`rebind_decision_id`) to rebind.
 
 ## Visual language
 
-The default UI is the [pinned OpenBot-derived shell](openbot-shell.md), superseding the early claude.dev direction below. That document records actual source reuse, attribution, NOTICE, and PolyForm Noncommercial 1.0.0 licensing. Applicable color and central-token constraints, keyboard navigation, visible focus, reduced motion, and narrow-screen usability remain in force.
+The sole UI target is the single [Openbot-derived shell](openbot-shell.md) (Phase 4 retires legacy fallback layouts and unused reception defaults). It preserves PolyForm Noncommercial 1.0.0 attribution, NOTICE, and source mappings alongside the central CSS palette (`#131412` canvas, `#1b1c19` panel, `#eeede6` text, `#a5a69c` muted, `#34362f` line, `#dc7958` accent, `#9eaf87` success), keyboard navigation, visible focus, reduced motion, and narrow-screen usability.
 
-Reference inspected on 2026-10-30: [claude.dev](https://claude.dev/). Borrow its restrained charcoal canvas, warm off-white text, vermilion highlights, monospaced navigation, thin rules, and generous editorial spacing. Create original product identity; do not copy logos or illustrations.
-
-Central CSS tokens own all colors, typography, spacing, borders, focus, status, and motion. Initial direction: canvas `#131412`, panel `#1b1c19`, text `#eeede6`, muted `#a5a69c`, line `#34362f`, accent `#dc7958`, success `#9eaf87`. Use a serif display accent, a readable sans UI stack, and a monospace metadata stack with local fallbacks. Support keyboard navigation, visible focus, reduced motion, and a usable narrow layout.
-
-The primary screen is an IM: conversations on the left, messages and a persistent composer in the center, and contextual details when opened. Members, Tasks, artifacts, skills, and connections use real server-backed panels rather than replacing the conversation with administrative pages. Empty, loading, disconnected, error, queued, and unknown states must be explicit. Never show fabricated activity or pretend a button succeeded.
+The primary screen remains an IM with left navigation (`ProjectChannelNav`), central message timeline with selective quote/reply and composer (`Discussion`), and contextual server-backed panels (`ChannelPolicyPanel`, `Members`, `PendingDecisions`, `Tasks` with `Verification` and dependency rebind, and `UnknownReconcilePanel`). Never fabricate activity, read receipts, or unverified completion.
 
 ## Verified design sources
 
@@ -105,8 +111,6 @@ The primary screen is an IM: conversations on the left, messages and a persisten
 
 ## Delivery and regression gates
 
-The development-model convention in `AGENTS.md` and this repository's independent-verification arrangements constrain repository development, not runtime product policy. Local Sol execution with external Terra verification is one development-validation configuration, not a mandatory CLI/model sequence or verifier node for product chats or Tasks.
+Independent code review applies to repository development. For a product Task, its acceptance agreement or a user-enabled Policy determines whether independent verification is required.
 
-Deliver independently reviewable contracts, storage, provider discovery, execution, UI, scheduler, resources, context, and acceptance slices. Aim for 300–500 effective lines per review; record justified exceptions. Each slice needs behavior-specific tests, independent review, and a rollback commit. Publish small PRs to the configured repository and merge only after independent review and the applicable checks pass.
-
-Required validation grows with the slice: Go tests and race detector, web type checks/unit tests/build, database reopen/recovery tests, real browser flows, and two real CLI executions. Benchmark durable message insertion and bounded history retrieval before optimization. Store raw evidence locally; do not replace evidence with successful mocks.
+Deliver independently reviewable slices inside isolated worktrees under [architecture-convergence-roadmap.md](plans/architecture-convergence-roadmap.md), with behavior-specific tests, zero `SQLITE_BUSY` under `-race`, and rollback safety. Do not commit `.local/`, databases, credentials, or mocks pretending to be real CLI/browser acceptance. Keep raw evidence under `.local/` and satisfy all four release gates (lossless 5-sample migration, zero `SQLITE_BUSY` & DDL structural parity, per-package `-race` speedup calibrated against Phase 0 local baseline, and 6 real Playwright + dual CLI end-to-end loops on the default `127.0.0.1:7310` startup profile).

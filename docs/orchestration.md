@@ -1,205 +1,123 @@
 # Conversation-led orchestration
 
-[PRD.md](../PRD.md) is the product authority for the accepted `Workspace → Project → Channel` target. This document retains the coordination direction selected on 2026-11-01 and defines its compatibility migration. Current runtime and persistence remain `Group/Conversation`, one Go process, SQLite, and the existing CLI adapters.
+> **Status & Dual-State Notice**: This document defines the **sole target orchestration contract** for the converged 39-table `Workspace -> Project -> Channel` architecture ([architecture.md](architecture.md), [ADR-0001](adr/0001-architecture-convergence.md)). On current `origin/master` (`0188361`), live runtime code still executes the legacy `Group/Conversation` implementation until [architecture-convergence-roadmap.md](plans/architecture-convergence-roadmap.md) Phase 5 merges into `master`.
 
-Coordination storage, local Source/admission, and group-bound coordinator configuration exist. With the opt-in `--enable-coordination-roles`, `NewTrustedIntentPass` is wired into the same scheduler to advance already recorded Dispatch requests and Assignments; the bound coordinator `decide_dispatch` → worker `submit_result` composition is implemented. Real local CLI text-result evidence establishes this explicitly admitted baseline only, not acceptance of the natural-chat candidate. Inspect remains diagnostic, not execution authorization; Project migration is not implemented.
+[PRD.md](../PRD.md) is the product authority. The orchestration Engine lives in one local Go process backed by SQLite WAL storage and unified Session-Bound Loopback MCP execution for `Pi >= 1.5.2` and `Codex >= 0.172.0`.
 
-The experimental natural-chat candidate, pending integration and product acceptance, connects ordinary chat → runtime-bound `chat_intake/v1` assessment on the same configured member/CLI and verified member-tool adapter → versioned Policy/Mandate admission through the same Engine → automatic Dispatch → the existing scheduler and coordinator/worker chain. Generic member capabilities cannot assess authorization; `RequestWork` and `RequestDispatch` remain local-user-only. `CreateMessage` still routes to the earliest active member when `recipient_ids` is omitted. The flows and interfaces below remain target contracts unless explicitly described as implemented.
-
-The principal reference is [dsh-superagent-prototype at 6337fc8](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/6337fc823ce20251c8de8085948165c81aaa701e). Its implementation provides a domain Engine, versioned admission policy, durable effects, persistent worker inputs, and source-specific replies. Its underlying Sessions, Inbox, Jobs, and Subagents are services of DeepSeek Harness; this repository does not independently implement that runtime. Our Go application adapts the orchestration responsibilities instead of embedding the DSH plugin.
+The principal reference is [dsh-superagent-prototype at 6337fc8](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/6337fc823ce20251c8de8085948165c81aaa701e). Its implementation provides a domain Engine, versioned admission policy, durable effects, persistent worker inputs, and source-specific replies. Its underlying Sessions, Inbox, Jobs, and Subagents are services of DeepSeek Harness; this repository does not independently implement that runtime. Our Go application adapts the orchestration responsibilities into single-pass `BEGIN IMMEDIATE` Go transactions on the 39-table `target_v1` schema instead of embedding the DSH plugin.
 
 ## Product and execution flow
 
-The conversation is the primary interface. Ordinary discussion can produce an Agent Turn without creating a Task. A request becomes authorized work only through a recorded admission decision. Follow-ups for existing work stay with that work unless its executor hands them back.
+The conversation is the primary interface. Ordinary discussion in a Channel Thread can produce an Agent Turn without creating a Task. A request becomes authorized work only through a recorded admission decision (`Mandate`). Follow-ups for existing work stay with that work unless its executor hands them back (`task_work_inputs` with `status='returned'`).
 
-Product CLI/model selection follows user configuration, task needs, verified adapter capabilities, and authorization. Permanent and temporary Agent responsibilities and collaboration are composed as needed. The coordinator/worker flow below is one composition, not a required Agent lineup for every Task or a claim of new runtime capabilities. Testing, technical review, or independent verification is not mandatory for every chat or Task; its necessity and timing, and the conditions for acceptance, follow the task's acceptance agreement or a user-enabled Policy. Pending verification alone does not bar rejection as agreed; acceptance must still satisfy the applicable conditions.
+Product CLI/model selection follows user configuration, task needs, verified adapter capabilities, and authorization. Permanent and temporary Agent responsibilities and collaboration are composed as needed without fixed model pairings. Testing, technical review, or independent verification (`verifications`) follows the task's acceptance agreement or a user-enabled `channel_policies` rule; pending verification alone does not bar rejection, while acceptance requires satisfying all agreed conditions.
 
 ```mermaid
 flowchart TD
     IM[Local IM Source] --> Intake[Engine: receive and classify]
-    Intake --> Discussion[Ordinary group discussion]
+    Intake --> Discussion[Ordinary Channel/Thread discussion]
     Intake --> Follow[Existing work's subscribed inputs]
-    Intake --> Gate[Deterministic Policy gate]
-    Gate --> Assess[Coordinator assessment]
-    Assess --> Decision[RoutingDecision and immutable Mandate]
-    Decision --> Task[Authorized Task and Assignment]
+    Intake --> Gate[Deterministic Policy gate: project template + channel_policies]
+    Gate --> Assess[Coordinator assessment or shadow preview]
+    Assess --> Decision[Immutable Mandate & task_thread_links]
+    Decision --> Task[Authorized Task & Assignment]
     Follow --> Task
-    Task --> Intent[Durable execution or notice intent]
-    Discussion --> Queue[Existing persistent delivery queue]
-    Intent --> Queue
-    Queue --> Runtime[Existing claim, Prepare and provider execution]
-    Runtime --> Receipt[Trusted execution receipt]
-    Receipt --> Report[Worker report or question]
-    Report --> Engine[Engine: apply report and route attention]
-    Engine --> Outbox[Reply intent and receipt]
+    Task --> Wake[Decoupled Delivery & Wakeup]
+    Discussion --> Wake
+    Wake --> Runtime[Two-layer lock + Loopback MCP execution]
+    Runtime --> Receipt[Trusted execution receipt & pgid/boot_id]
+    Receipt --> Report[Worker report, workspace_operations, or decision]
+    Report --> Engine[Engine: single-pass Go tx & constraint impacts]
+    Engine --> Outbox[Reply message & delivery]
     Outbox --> IM
-    Report --> Submission[Immutable Submission]
-    Submission --> Review[Separate local-user ReviewDecision]
-    Submission -. "Evidence per task agreement or user-enabled Policy" .-> Verify[Verification evidence]
+    Report --> Submission[Immutable Submission & ArtifactVersion]
+    Submission -. "Per task agreement or policy" .-> Verify[First-class Verification]
+    Submission --> Review[Separate local-user Review]
     Verify -. "Informs Review" .-> Review
 ```
 
-The initial Source is the local IM. **Reply destination** means the authorized response destination, called Channel in the pinned DSH reference; it is not the PRD's Project Channel. Local replies use the existing group/topic scope; Project Channel mapping is not yet implemented.
+The initial Source is the local IM. **Reply destination** means the authorized Channel and Thread response destination; GitHub and Feishu adapters may later implement the same contracts without altering core authorization boundaries.
 
-GitHub and Feishu adapters may later implement the same contracts; adding their descriptions or UI labels does not enable them or authorize external messages.
+## Policy tiers, handover, and crash reconciliation
 
-## Experimental text scope
-
-`GET/PUT /api/v1/groups/{group}/coordination/chat-policy?topic_id=...` reads or configures one group/topic's Policy and cumulative `max_admissions` budget per revision. PUT requires `Idempotency-Key` and `expected_revision`. Preparation requires `enabled=true`, `allow_preparation=true`, and `preparation_scope_kind=topic_summary`; the server fixes Task goals and acceptance to summarizing that topic's saved messages. GET exposes the canonical rule, configuration source, and `preparation_supported`; legacy free-text rules are not upgraded, and new PUTs cannot choose an authorization message ID. Disabling Policy does not cancel existing pending/inflight work.
-
-Runtime binds `source_kind/source_id` and `purpose=chat_intake/v1`; `authority_evidence_verified` reports source, responsibility, and scope checks, not error-free intent interpretation, itemized human approval, or acceptance. Platform `sender_id=user` is not human permission. Missing legacy evidence stays `unknown` without blocking existing Task/Submission access or Review.
-
-Chat `text_submission` carries no Artifact references; file tools, Artifact publication, and external actions are outside this path. `topic_summary` submissions require nonempty UTF-8 text of at most 8192 bytes; structural checks do not prove semantic quality.
-
-The opt-in automatic text route keeps one canonical work outcome per source. A separately verified discussion-only excerpt still restricts new work from descendant messages, without changing that outcome or creating another decision. Explicit current no-start wording is a veto, never a way to infer permission. A new automatic decline rechecks the exact active, same-group coordinator against the frozen provider and model and requires an empty workspace, but does not require an eligible worker. Saved decisions retain their original replay checks.
-
-**Ordinary discussion candidate.** When the local user omits recipients, the server targets the earliest active member if one exists. An explicit empty list publishes without delivery. The `@` and avatar controls select stable member IDs. The released runtime exposes legacy member-tool entry points. The structured Store interfaces (`ApplyChatDiscussion*` and `ReadChatDiscussionContext`) await their first production callers.
-
-In the structured Store path, each handoff starts from a recorded local-user chat command. Only the current owner can advance it after a persisted assessment for its server-bound `chat_intake/v1` claim, delivery, and candidate. The server binds the source, actor, group, topic, and return route. An identical authorized retry with the same key returns the original publication receipt.
-
-- Each originating message has at most one durable chain in its group and topic. The default allows two invitation hops and four targeted handoff deliveries, excluding the original user's deliveries. Invitations and replies stay visible in the topic. Each invitation queues a delivery to one active member and reserves a return delivery. The first structured publication snapshots the topic limits and reserved returns for the life of the chain. The Store rejects loops and forks. Legacy and structured sends share one directed and one public-only publication slot per assessed intake Turn. A legacy directed intake send requires verified local-user chat and a single active peer in the group.
-- A reply answers the exact invitation and returns to its inviter in the same topic. Nested replies unwind one hop at a time. If the inviter has left, the reply stays public without a delivery and ends the path. The root member can close the chain with a public answer after receiving the root reply or without inviting anyone. Messages, deliveries, and member Turn execution records are independent.
-- The Store accepts `create_member` in place of a recipient ID under trusted runtime creation policy. The caller must check live `send_message` and `create_member` grants for both reuse and creation. The Store first reuses an active, unvisited member in the same group with the exact role, server-bound provider and model, and an empty workspace. Otherwise, if capacity permits, it commits the new member, public-only join notice, and single targeted invitation together.
-- The timeline and exact message read expose verified IDs for the original question, the exact invitation each result answers, and the parent hop when recorded. The timeline links to rows already in its window. The handoff badge appears on summaries with a recorded invitation. An empty `expected_reply` refers to the invitation body. Members can read omitted bodies by message ID.
-- The timeline page and exact message read show `discussion_closure_reason` on a verified targeted invitation or reply at the head of its path. It appears for a recorded departure before claim or when the receiving Turn has a canonical terminal receipt and did not advance the path. Pending and `unknown` Turns retain their existing execution state. The existing poll refreshes the newest page; on a loaded targeted handoff, “刷新讨论状态” reads that message in place without resetting history.
-- When the Store verifies formal admission for the active invitation's receiving Turn, the route passes to the formal work owner (`work_admitted=true`). Incomplete admission proof suspends the directed route.
-- List and detail reads retain the Task ID in `discussion_work` on its exact originating invitation, even after the invitation moves into history. With a separately verified Assignment, the timeline also shows the Assignment ID and the assigned member's name or exact member ID. Visibility, delivery, execution, submission, and acceptance have independent records.
-
-SQLite migration v26 enables local-user `GET/PUT /api/v1/groups/{group}/coordination/discussion-policy?topic_id=...` for one exact group/topic. Earlier schemas keep the defaults and return 404 for settings. The browser's **任务 → 展开自然聊天工作配置 → 展开讨论策略** route omits `topic_id` and edits only the group's main topic. Unset topics report revision 0. The server accepts only integer `max_invite_hops` values of 0, 1, or 2 and derives twice that many `max_targeted_wakes` (0, 2, or 4). New structured chains use these budgets, including reserved returns.
-
-Zero blocks invitations on new chains, fresh legacy directed sends, and standalone generic `create_member` calls that would wake a new member via its welcome message. Exact-match standalone reuse and authorized keyed replays produce no new wake. Local users can still post publicly and direct messages with `@`.
-
-PUT requires `expected_revision` and `Idempotency-Key`. A new save appends an immutable revision when the expected revision matches the current one. Replaying the same key and payload returns the saved revision, even after later edits. A new save against a stale revision or reuse of a key with changed input conflicts. The editor rereads current settings after a save and retains the original input and key for unconfirmed retries on the same page.
-
-Discussion settings govern routing only. Natural-chat work uses separate, versioned Policy/Mandate admission through the Engine and automatic Dispatch on the existing scheduler, with [real-CLI text-loop evidence](../PRD.md) for configured, capability-verified adapters.
-
-A private native Pi 1.4.0 trial (`f232ef9`) ran five Turns with configured members before limits were editable, recording four targeted handoff deliveries, a public answer from the root member, and no Tasks. The evidence covers ordinary discussion on that candidate, separate from mainline and formal integration.
-
-In the earlier v26 settings smoke, the operator observed the zero-hop value after a manual browser reload. SQLite history records zero hops at revision 1. The screenshot shows version 2 at one hop and two wakes. Independent API writes and fresh reads confirmed zero hops and wakes in revision 3 and one hop and two wakes in revision 4, with the natural-chat work Policy disabled.
-
-The pinned [intake.ts](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/6337fc823ce20251c8de8085948165c81aaa701e/src/core/intake.ts) documents source and thread correlation. The pinned [notices.ts](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/6337fc823ce20251c8de8085948165c81aaa701e/src/app/notices.ts) documents how a result links to its question.
+1. **Three-tier Project policy & Channel/Thread overrides (`channel_policies`)**: `projects.default_policy_tier` defaults to `chat_only` (`read_only_collab` and `authorized_write` require explicit user selection). Channel-wide and Thread-scoped overrides live in `channel_policies` (protected by partial unique current-head and revision indexes), absorbing legacy coordinator bindings, dispatch allowlists, and policy revisions. Actions exceeding the active tier trigger an inline shadow preview card offering one-time or permanent Channel policy approval before proceeding.
+2. **Direct natural-chat admission without scratchpads**: Explicit conversational requests (or enabled scoped preauthorizations) admit directly through the Engine in a single transaction, creating `tasks`, `task_thread_links` (M:N), immutable `mandates`, `assignments`, `deliveries`, and `wakeups` without intermediate assessment/candidate scratchpad tables.
+3. **Temporary member departure & handover (`tasks.status = 'handover_pending'`)**: When a temporary `channel_members` row transitions to `status = 'left'`, active `assignments` transition to `cancelled` (retaining full assignment history), open Tasks freeze in `handover_pending`, and a `decisions(kind='handover')` item enters the user's global pending list (`POST /api/v1/me/decisions/{decision}/answer`), offering a one-click transfer suggestion when a Channel coordinator is bound, reassignment to another member, or Task cancellation (`tasks.status = 'cancelled'` with non-restorable `Mandate` revocation).
+4. **In-flight constraint changes, lineage, and dependency rebinding**: Constraint-bearing `task_work_inputs` record owner consumption or explicit return (`returned`) and emit `task_constraint_impacts`, marking affected delegations, submissions, and downstream pinned `task_dependencies` stale. Rejection/repair and successor chains record immutable `task_lineage(kind IN ('repair','successor'))` provenance; downstream pinned `ArtifactVersion` dependencies never silently follow artifact heads and require explicit `local-user` approval (`POST /.../dependencies/{dep}/rebind` with `rebind_decision_id`) to rebind.
+5. **Two-tier crash reconciliation (`POST /api/v1/projects/{project}/attempts/{attempt}/reconcile`)**: `turns` persists `external_pid`, `external_pgid`, `external_process_started_at`, and `external_boot_id` to defend against OS PID reuse (`412` mismatch keeps claims locked). Pure-text or read-only crashes with zero unresolved `workspace_operations` permit Tier 1 one-click lock release (`200`); crashes with `pending`, `unknown`, or `applied_sync_error` write operations return `428`, requiring preimage vs live disk SHA-256 comparison and explicit secondary confirmation (`200` + immutable `audit_events`) before releasing `resource_claims`.
 
 ## Domain mapping
 
-| Reference concept | Go application meaning | Required distinction |
+| Reference concept | Go application meaning (`target_v1`) | Required distinction |
 | --- | --- | --- |
-| Source / Trigger | A source-owned immutable event and its verified metadata; local message events reference the existing Message | A Trigger can also be a command or system fact. Do not duplicate message text or infer identity from its body. |
-| Thread | Shared topic within a target Project Channel; legacy identity is group/topic | Existing Conversation is private to one group/member/topic. It is not the shared Thread. |
-| Channel (DSH reference) | Reply destination for an authorized response | Not the target Project Channel, a Pi/Codex provider, a model, or a Session. |
-| Policy / Eval | Deterministic eligibility followed by a version-bound assessment of one Thread batch | Model judgment cannot bypass the gate, choose the caller, or grant permissions. |
-| Decision / Mandate | RoutingDecision plus immutable authority, origin, scope, strength, and policy revision | RoutingDecision is not the existing deliverable ReviewDecision. Scope text is not a filesystem grant. |
-| Ticket | An existing Task with explicit coordination and Mandate records | An ordinary or manually recorded Task does not automatically authorize execution. Do not create a second unrelated task system. |
-| Assignment | A durable executor binding for authorized work, independent of physical Turns | Current TaskAttempt is an immutable generation/evidence association, often bound to one Turn. It must not silently become a multi-turn Assignment. |
-| Subscription / Input | Work-to-Thread follow-up ownership and durable inputs | A subscription supplies context, not wider authority. Delivery remains the physical member-conversation delivery record. |
-| Report / Attention | Structured progress, outcome, or one concrete question | A report of readiness creates or points to a Submission; it never accepts its own result. |
-| Effect / Outbox | A durable intent and its independently tracked reply receipt | An intent is not proof of execution or external delivery. |
-
-During compatibility, coordinator bindings and execution conversations remain group-isolated. A coordinator is a server-bound role, not a member name or free-form responsibility string. This adapts the reference's one-repository main Session to multiple isolated groups. Worker roles remain bound to their Assignment and live execution scope.
-
-An Assignment may eventually span multiple Turns. That requires an explicit, reviewed association and generation check. Existing same-Turn submission fences continue to apply until that association is implemented; no adapter may weaken them merely to obtain continuity.
+| Source / Trigger | `messages` (`source_kind`, `command_source_id`) and verified source metadata | Never duplicate message text or infer user authority from message body text. |
+| Thread | Shared discussion entity `threads` (`UNIQUE(project_id, channel_id, topic_key)`) | Distinct from `sessions` (per-member native execution context) and linked M:N to Tasks via `task_thread_links`. |
+| Channel (DSH reference) | Authorized reply destination within a `Project` (`channels` + `threads`) | Distinct from provider adapters, models, and native `sessions`. |
+| Policy / Eval | Deterministic `projects.default_policy_tier` + versioned `channel_policies` | Model assessment never bypasses Policy gates, chooses the caller, or grants filesystem access. |
+| Decision / Mandate | Immutable `mandates` (incorporating routing reason & authority generation) | Distinct from deliverable `reviews` and directory `workspace_grants`. |
+| Ticket | `tasks` (`open`/`handover_pending`/`submitted`/`accepted`/`cancelled`) | An un-mandated Task does not authorize execution; there is only one Task system. |
+| Assignment | `assignments` (partial unique `WHERE status='active'` per Task) | Independent of individual `attempts` and physical `turns`; preserves handover history. |
+| Subscription / Input | `task_work_inputs` + `task_constraint_impacts` + `task_thread_links` | Provides scoped context without expanding `Mandate` authority; decoupled from `deliveries` and `wakeups`. |
+| Report / Attention | `submissions`, `verifications`, `decisions` (including `handover`), and `run_explanations` | Submission or Verification never substitutes for `local-user` `reviews` acceptance. |
+| Effect / Outbox | `deliveries` + `wakeups` + `workspace_operations` + `audit_events` | Persistence or wakeup scheduling never fabricates CLI acceptance or terminal receipts. |
 
 ## Modules and their interfaces
 
-Runtime is the composition root. It owns the process lock, Store, private roots, adapters, HTTP, startup, and ordered shutdown. It contains no admission rules.
+Runtime is the composition root. It owns the process lock, SQLite writer/reader pools, private `0700` materialization directories, provider adapters, loopback HTTP/MCP server, startup, and ordered `wal_checkpoint(TRUNCATE)` shutdown. It contains no admission rules.
 
-Engine is the only writer of the new coordination aggregates. Its small role-scoped interfaces receive commands and adapter facts. Intake, admission, follow-up ownership, work transitions, and replies are internal parts of the same module, rather than parallel orchestration services.
+Engine is the single writer of coordination aggregates through small role-scoped interfaces inside single-pass `BEGIN IMMEDIATE` Go transactions (relying on SQL PK/composite-FK/CHECK constraints, 9 partial unique indexes, and 10 single-table immutability triggers — zero cross-table JOIN triggers):
 
 | Caller | Interface responsibilities |
 | --- | --- |
-| Verified Source | Receive a source event, associate its Threads, report an external close |
-| Local user | Explicitly request or attach work, stop authorized work, resolve an attention request, review a concrete Submission |
-| Bound coordinator | Assess a current candidate, record a permitted decision, route work or a follow-up, send an allowed reply |
-| Bound worker | Report on its Assignment, acknowledge only evidenced inputs, submit a deliverable, request help, hand back an unrelated follow-up |
-| Runtime adapter | Report start, input delivery, terminal receipts, and reconciliation facts for its bound execution generation |
+| Verified Source | Record message/source provenance, associate `threads` and `thread_state_revisions`, report external close |
+| Local user | Request/attach work, cancel Tasks/revoke Mandates, resolve `decisions` (including `handover`), approve dependency `rebind`, execute tiered `reconcile`, submit `reviews` |
+| Bound coordinator | Assess candidate work within active `channel_policies`, admit/route work or follow-ups, issue allowed channel replies |
+| Bound worker | Report progress via Loopback MCP, consume or return `task_work_inputs`, perform claimed `workspace_operations`, publish `artifact_versions` & `submissions`, publish optional `run_explanations`, hand back unrelated follow-ups |
+| Runtime adapter | Acquire/renew claims, bind `skill_snapshots` via `turn_skill_bindings`, record `pgid`/`boot_id` start proof, deliver receipts, classify terminal vs `unknown` outcomes |
 
-The Store supplies a transactional seam through which one Engine command changes all affected records and queues its intents. Extract and reuse existing in-transaction helpers; do not call public Store operations that open a second transaction from inside an Engine transaction. File copies, model calls, native process launches, and network writes happen after commit.
-
-Policy is deterministic and versioned. Assessment proposes a decision under a captured Policy revision and candidate generation. A stale result cannot accept work after either changes. Explicit local-user requests, including contextually clear conversational requests, are an authorization source, not a requirement to submit an admission form. Work inferred from Agent discussion remains observational unless an enabled, scoped, versioned written local-user rule authorizes it; that rule can permit autonomous preparation without a new “start” per task. Trusted intake must carry the actual source and authority into the same Engine, not expose local-user-only `RequestWork` or `RequestDispatch` to ordinary members as a user-impersonation shortcut.
-
-In-flight constraint changes and Mandate revocation below remain target contracts; this candidate's chat Policy changes fence new admissions but do not implement those controls. A trusted Policy change invalidates stale evaluations and notifies the work it affects. An ended Task's coordination may resume only after its original Mandate is revalidated against the current Policy. A human stop persistently withdraws that Mandate: ordinary follow-up, attach, or retry cannot restore it; newly authorized work requires a new decision and Mandate. This authorization transition does not release an uncertain native Turn's resource claims.
-
-Assessor and Executor are different responsibilities. The assessor decides whether and where work belongs. The executor uses the existing scheduler, claim fencing, provider adapters, and receipts to perform it. There is one persistent execution queue, not an additional scheduler hidden behind Engine.
+File I/O, model invocations, native process launches, and network transport occur strictly outside SQLite transactions.
 
 ## Persistence and recovery contracts
 
-- Source event identity is stable and idempotent. Replaying an accepted event cannot create another Task, Mandate, Assignment, or acknowledgement.
-- A Thread has at most one current evaluation generation. Events that arrive while assessment runs remain available for the next batch.
-- Domain changes and their durable intents commit together. Workers run intents after commit with bounded scans and backoff. A generation comparison prevents an old completion from deleting a newer payload under the same effect key.
-- Effects are at-least-once scheduling. Local replies reuse the existing message transaction and idempotency receipt. Any external reply destination must supply its own idempotency or reconciliation behavior; the queue alone cannot promise external exactly-once delivery.
-- Existing deliveries remain the source of execution scheduling. Effects may create a stable delivery or a coordinator notice; they must not launch a second CLI for an already claimed or uncertain delivery.
-- Input queued, adapter accepted, demonstrably consumed, processed, and task accepted are distinct facts. Pi/Codex paths without trustworthy native-history evidence must not manufacture an input read receipt.
-- Human follow-up ownership is explicit. Context-only subscriptions neither widen a Mandate nor resume stopped work. A worker can hand back a message, but another owner must not lose it as a side effect.
-- A structured question is a single attention record with a stable identity. Routine progress updates do not wake every member or append repetitive IM notifications.
+- Source event identity and HTTP/MCP mutations share `idempotency_keys` (`operation, actor_id, scope_id, idempotency_key` + `payload_sha256`). Replaying an accepted key returns the original receipt; changed payload conflicts (`409`).
+- Message persistence, recipient delivery acknowledgement (`deliveries.acked_at`), and model wakeups (`wakeups`) are persisted independently.
+- Two-layer concurrency fences enforce at most one active `turn` per `session_id` and per `(project_id, channel_id, thread_id, member_id)`, plus exclusive `resource_claims` for mutable workspace writes held across `unknown` and `cancel_requested` states.
+- `thread_state_revisions` (`is_head = 1` partial unique guard, `invalidates_revision`, `covered_through_sequence`) and `project_experiences` (with inline retirement provenance and replacement version) preserve cross-month handover accuracy without growing context windows on irrelevant message noise.
+- Timestamps/ID cursors serve display pagination; committed `messages.sequence` and `workspace_operations.sequence` establish durable high-water marks.
 
-All migrations remain append-only. Existing durable messages, idempotency receipts, Task versions, artifact references, and claim evidence are retained. Timestamp/ID cursors remain display pagination; a durable message sequence, where available, is the basis for commit-position processing. No cursor is silently reinterpreted as another kind of acknowledgement.
+## Atomic schema migration and rollback
 
-## Project migration and rollback
+Instead of multi-slice dual-track compatibility tables or append-only trigger growth, historical SQLite databases upgrade atomically in one shot:
 
-Implement the [ownership contract](architecture.md#project-compatibility-migration) in separately reviewable slices. Each slice must close historical backfill and every corresponding new-write path transactionally before dependent APIs or UI are enabled. New and legacy entry points share transaction helpers and one authorization/idempotency authority, not a background synchronizer or a second Engine, Store, or queue.
-
-| Slice | Required closure |
-| --- | --- |
-| Group ownership | Backfill each Group into its distinct Project and Channel in the default Workspace. Legacy `CreateGroup` must create its Project and Channel in the same Group transaction; identical key/payload replay must reuse the saved mapping. Historical backfill alone is insufficient. |
-| Task ownership | Later, backfill Project and origin-Channel associations and maintain them in every Task insertion transaction, including RequestWork. Preserve legacy group/version/provenance authority; explicit Thread links grant no access. |
-| Member ownership | Later, map each old member independently and maintain every member-creation path in the same transaction. Do not merge same-name/provider members or enable cross-Channel instance reuse. |
-| Session compatibility | Later, backfill immutable explicit 1:1 Conversation-to-Session bindings and maintain every Conversation insertion in the same transaction. Preserve group/member/topic, delivery matching, uniqueness, and concurrency. This is neither a final product 1:1 rule nor evidence of native resume. |
-
-Mappings and migration version must commit atomically. Missing or inconsistent mappings fail closed; reads must not silently repair them, and background backfill must not expose partial ownership. Channel-independent Project Tasks require a later compatibility slice; do not simulate them with hidden Channels or Groups.
-
-Apply append-only, versioned SQLite migrations under the existing startup lock, before scheduler activity or new business writes. Do not rewrite old records or published migrations, rename/rebuild legacy tables, or weaken foreign keys, grants, claim, or provenance constraints. The existing schema gate makes an old binary reject a newer schema; API compatibility does not imply binary downgrade compatibility.
-
-Before migration, follow existing drain/receipt rules and take a consistent SQLite backup accounting for WAL. Record schema version, database hash, exact binary/source version and binary hash, and runtime/external execution state. Preserve unknown executions and claims.
-
-Restore that snapshot with its old binary only if no business writes or external effects occurred after the snapshot; retain the failed/new database as evidence. Otherwise preserve all subsequent facts and forward-repair/reconcile. Never erase unknown outcomes or claims, or force unsafe replay. There is no automatic downmigration; never delete migration rows to bypass the schema gate.
-
-Implementation acceptance covers empty and historical databases, atomic migration failure, reopen, idempotent replay and new-write closure, isolation including two same-name old groups, unknown/cancellation protection, Session exclusivity, resource locks, and late-receipt generation fences.
-
-Before altering established performance paths, record a comparable baseline for the exact base, environment, and data scale. Assess affected migration and creation costs; preserve bounded/indexed reads, transaction integrity, and unchanged hot paths where possible. Keep performance comparisons scoped to affected paths.
+1. **Pre-normalization**: Databases already at `user_version = 100` with `schema_meta.schema_family = 'target_v1'` pass idempotently with zero writes. Earlier `v1..v47` databases first upgrade to `v48` on a private temporary copy and verify `PRAGMA integrity_check == ok` and `PRAGMA foreign_key_check == 0`.
+2. **Temp-file single transaction**: On the same filesystem mount, create `workspace.db.migrating.<nonce>` (`0600`), apply the 39-table `target_v1` DDL, and populate all 37 business tables, `schema_meta`, and `audit_events(schema_migrated)` in one `BEGIN IMMEDIATE` transaction.
+3. **Four pre-rename gates**: Verify `PRAGMA integrity_check == ok`, `PRAGMA foreign_key_check == 0`, 100% SHA-256 content parity across all 37 business tables, and zero unaccounted non-empty `v48` source tables (`67` migrated + `33` explicitly retired = `100` source tables).
+4. **Atomic cutover & zero-contamination rollback**: Checkpoint WAL (`TRUNCATE`), close, `fsync` temp file, remove stale `-wal`/`-shm`, `os.Rename` over `workspace.db`, and `fsync` data directory. Any failure deletes the temp file and leaves the original database byte-for-byte untouched.
 
 ## Safety and compatibility retained from this application
 
 The reference is research code. Its product-specific choices do not replace these established contracts:
 
-1. A business stop requests cancellation; it does not prove that a native process or background operation stopped. Unknown and cancel-requested executions retain capacity and resource claims until an authoritative terminal or reconciliation receipt.
+1. A business stop requests cancellation; it does not prove that a native process or background operation stopped. Unknown and `cancel_requested` executions retain capacity and `resource_claims` until an authoritative terminal or formal two-tier reconciliation receipt.
 2. Restart does not blindly create a replacement execution for an uncertain start. A new Assignment or a recovery prompt cannot erase old external uncertainty.
-3. Task submission and acceptance remain separate. Worker readiness, a merged external Thread, native exit zero, or an ended Assignment cannot fabricate a local-user ReviewDecision.
-4. Group isolation, runtime-bound tool identity, same-transaction authorization fences, and explicit resource grants remain mandatory. Prompt scope is explanatory text, not an operating-system sandbox.
-5. CLI credentials remain with their original CLI. Installation, account state, connectivity, and supported capabilities remain independent evidence. A stable platform Session identifier does not imply native resume, steering, or compaction support.
-6. Bounded event/frame queues, SQL range scans, shutdown drain, and the existing skills allocation regression gate are preserved. No per-native-event durable-effect fan-out or unbounded history scan is introduced.
+3. Task submission and acceptance remain separate. Worker readiness, a merged external Thread, native exit zero, `verifications` outcome, or an ended Assignment cannot fabricate a `local-user` Review acceptance.
+4. Project/Channel isolation, server-bound Loopback MCP identity (`-32602` forgery rejection), same-transaction authorization fences, and explicit `workspace_grants` / `artifact_read_grants` remain mandatory. Prompt scope is explanatory text, not an operating-system sandbox.
+5. CLI credentials remain with their original CLI (`PI_CODING_AGENT_DIR` read-only symlink isolation for Pi; zero paid probes). Installation, account state, connectivity, and supported capabilities remain independent evidence. A stable platform Session identifier does not imply native resume, steering, or compaction support.
+6. Bounded event/frame queues, indexed range scans, clean WAL `TRUNCATE` shutdown drain, and skills snapshot pinning (`turn_skill_bindings`) are preserved. No unbounded history scan is introduced.
 
 In particular, do not adopt the reference's timeout-based worker-slot release while background subagents may still run, or its automatic restart of interrupted work, as substitutes for this application's receipts.
 
 ## IM interaction contract
 
-The UI uses a conversation list, a central chronological message timeline, and a composer that remains reachable. Members, Tasks, deliverables, search, and conversation details are contextual panels or drawers. They do not replace the conversation with a dashboard or a collection of administrative pages.
+The UI uses a left Project/Channel navigation list, a central chronological message timeline with selective quote/reply, and a persistent composer in the single `OpenbotShell`. Members, Tasks (`Verification` & dependency rebind), Channel policy (`ChannelPolicyPanel` & shadow preview), Pending Decisions (`PendingDecisions` including `handover`), Agent run logs, and two-tier crash reconciliation (`UnknownReconcilePanel`) are contextual views rather than administrative page replacements.
 
-The target everyday path is normal group conversation: Agents proactively respond and discuss with one another within relevance, authority, and budget bounds. When local-user says “可以开始开发了” or makes an equivalent explicit request, Agents interpret the conversation's decisions, tasks, and constraint changes to derive goals and acceptance criteria. The same Engine evaluates the trusted source and authority; within the intersection of the request/enabled preauthorization and resource grants, it records the source, Task and Mandate, and automatically registers Dispatch for the existing execution path. Actions and their basis, progress, and results return to the originating authorized group/topic.
+The everyday path is normal Channel conversation: Agents proactively respond and discuss within relevance, `channel_policies` bounds, and budget. When `local-user` confirms start in discussion, Engine evaluates trusted source and authority, creates the Task, immutable Mandate, Assignment, and wakeup within the intersection of the request/preauthorization and `workspace_grants`, and routes progress and deliverables back to the originating Channel/Thread without manual task-conversion forms or refreshes.
 
-Choosing a delivery mode, clicking “转为任务”, filling itemized authorization/dispatch forms, or manually refreshing must not be prerequisites. Unclear scope or a request beyond authority calls for one concrete question; Agent suggestions or consensus are not user permission. Enabled, scoped, versioned preauthorization still permits autonomous preparation. “Start” is not a required per-task button; keyword/regex matching or relabeling existing controls cannot replace contextual intent and authority assessment.
+Preserve drafts, pending/uncertain mutations, and idempotency keys across Channel or panel switches; bind `@` and avatar right-click recipients to stable `member_id` values rather than display text; keep message visibility separated from wakeups; and expose server-proven states only.
 
-Use the existing charcoal, warm-white, and vermilion tokens. Display the local author as the user and a member by its real known identity. Put technical identifiers and detailed execution evidence in expandable details. Keep source identity separate from the selected Agent provider.
+## Convergence acceptance
 
-Panel or conversation changes must preserve pending and uncertain mutations, their original input, and their idempotency keys. Hidden, unused reads may stop; shared roster data still needed by the active composer must remain available. Closing a panel must not cancel a submitted write or change the chosen recipients.
-
-Message visibility and wakeups stay separate. Default routing, explicitly public-only, and explicitly selected recipients retain their compatibility meanings as internal routing and optional low-frequency controls, not a required pre-send mode picker. To address a member, select an `@` suggestion in the composer or choose a recipient through the member avatar's right-click menu; both bind stable member IDs, not display names. Plain text containing the same name is not a structured mention and does not alter delivery or authority. Receipts distinguish saved, accepted by the CLI, terminal, submitted, and accepted result; no unproven read or typing indicator is shown.
-
-Task and attention cards require durable typed references and real actions. Their immutable event history is separate from any clearly labeled current-state projection. Until the backend supplies those references, show the actual Task in a contextual panel rather than inventing an event in the chat.
-
-Unread counts, last-message previews, coordinator badges, external-source labels, and activity indicators require authoritative data. Responsive IM navigation must preserve drafts, scroll position where possible, keyboard focus, and unknown-result recovery across conversation list, chat, and details views.
-
-## Incremental acceptance
-
-The opt-in, explicitly admitted Group execution path is an implemented baseline with real CLI text-result evidence, not completion of the group-chat experience or Project compatibility. The natural-chat backend and UI candidates still await integration and formal browser/real-CLI acceptance of semantic negatives, scoped preparation, separate Review, and restart. Earlier author smoke runs are not current release evidence. Unimplemented Project migration must not block the next text loop on existing Group/Conversation.
-
-Acceptance here is this repository's development validation, including independent checks of actual results and receipts; it does not require an independent-verifier model node in the product runtime.
-
-1. Retain the IM shell and the implemented trusted intent pass/coordinator/worker composition on the same queue and receipts. Preserve desktop, short-window, narrow-screen, keyboard, and delayed-response validation.
-2. **Next priority: verify normal group chat through a real local CLI text Submission and automatic return to the group.** Begin with ordinary discussion and proactive Agent replies and exchanges, without creating a Task or choosing a delivery mode. A contextual “可以开始开发了” or equivalent explicit local-user request must produce goals, acceptance criteria, trusted source/authority assessment, admitted Task/Mandate, and automatic Dispatch registration through the same Engine and existing scheduler. Actions and their basis, progress, and results must return to the authorized group/topic without conversion, itemized authorization/dispatch forms, or manual refresh. File writes and Artifact publication require separate implementation and acceptance; this text scenario does not prove them.
-3. Verify equivalent phrasings and enabled, versioned, scoped preauthorization for autonomous preparation; Agent consensus alone must not authorize work. Unclear scope or excess authority must produce one concrete question, not a generic form. Verify structured `@` and avatar right-click selection by stable member ID, plain-name text without routing effects, and compatibility routing semantics. Include structured reports, a concrete versioned Submission, any verification required by the task agreement or user-enabled Policy, and a separate local-user ReviewDecision. In-flight constraint changes and revocation remain unimplemented target gates beyond this text slice. Retain idempotency, group isolation, controlled restart, unknown/cancellation/resource-claim protection, and existing submission fences.
-4. Verify each Project/Channel and later Task/member/Session compatibility slice's integrity, isolation, and recovery before exposing dependent product operations. Hierarchy labels alone do not satisfy migration or real product acceptance.
-5. Extend provider continuity and external Sources one adapter at a time, only after their actual capabilities and authority are verified.
-
-Each slice is reviewed independently and tested through its module interface. A UI mockup, fixture, CI result, adapter smoke test, or merge alone does not establish real CLI collaboration or full product acceptance.
+Implementation proceeds through isolated worktrees along [architecture-convergence-roadmap.md](plans/architecture-convergence-roadmap.md) and merges to `master` only when all four release gates pass: (1) 5 historical samples lossless migration to 39 tables with zero silent drops; (2) zero `SQLITE_BUSY` across normal/`-race` concurrency and 5 DDL structural constraint proofs; (3) significant `-race` speedup calibrated against Phase 0 local per-package baseline with zero 600s timeouts; and (4) the single default startup profile (`127.0.0.1:7310`) passing all 6 real Playwright browser + dual CLI (`Pi >= 1.5.2`, `Codex >= 0.172.0`) end-to-end loops in [PRD.md](../PRD.md).
 
 ## Pinned design provenance
 
