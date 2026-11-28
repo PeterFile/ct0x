@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "role": "future",
+  "policy_sha": "4cf5ee0027fdef697749073330cdf7833cf3dd93",
+  "workflow_path": ".github/workflows/release-receipt.yml",
+  "workflow_id": 432540775
+}
