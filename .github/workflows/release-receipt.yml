@@ -1,46 +1,168 @@
-name: Release machine receipt
-run-name: RC receipt ${{ fromJSON(inputs.receipt).run_id }} attempt ${{ fromJSON(inputs.receipt).run_attempt }}
+# Branch-only overlay for the registered receipt path; never merge this file into production.
+# This caller has no release/receipt inputs or procedures and must not replace release-candidate.yml.
+name: 生产 Full 策略对照
+run-name: 生产 Full 对照 ${{ github.ref_name }} / 18d11a3c0176fe98856aeeef6396e9ddfde0cca0
 
 on:
   workflow_dispatch:
-    inputs:
-      receipt:
-        description: 仅接受本地重新审计后与同次 Full 绑定的三场景安全归一化回执
-        type: string
-        required: true
-      machine_signature:
-        description: 本机终审后由已加载且已审阅的可选公钥签署的 SSHSIG；未配置时留空
-        type: string
-        required: false
-        default: ''
 
 permissions:
   contents: read
-  actions: read
-  statuses: read
+
+concurrency:
+  group: production-full-comparison-${{ github.run_id }}-${{ github.run_attempt }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: '1'
+  GIT_OPTIONAL_LOCKS: '0'
 
 jobs:
-  intake:
-    name: Release receipt intake
-    if: ${{ github.ref == 'refs/heads/master' && github.actor_id == github.event.repository.owner.id }}
+  preflight:
+    name: 生产 Full 对照预检
+    if: >-
+      ${{ github.repository == 'PeterFile/ct0x' && github.event_name == 'workflow_dispatch' &&
+          github.run_attempt == 1 && github.ref_type == 'branch' &&
+          startsWith(github.ref, 'refs/heads/codex/ci-full-production-proof-') &&
+          github.workflow_ref == format('{0}/.github/workflows/release-receipt.yml@{1}', github.repository, github.ref) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 30
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      run_id: ${{ steps.plan.outputs.run_id }}
+      sha: ${{ steps.plan.outputs.sha }}
+      tree: ${{ steps.plan.outputs.tree }}
+      head: ${{ steps.plan.outputs.head }}
+      base: ${{ steps.plan.outputs.base }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v7
+      - &checkout-comparison-policy
+        name: 检出不可变包装策略
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.workflow_sha }}
-          fetch-depth: 0
+          fetch-depth: 2
           persist-credentials: false
-      # Read bounded JSON from the native event file, never shell-interpolate inputs.
-      - name: Authenticate immutable owner ID and canonical run attempt
-        id: receipt
+          path: .ci-comparison
+          sparse-checkout: .github
+      - &stage-comparison-policy
+        name: 将策略移出产品检出树
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          PYTHONDONTWRITEBYTECODE: '1'
-        run: python3 -B .github/scripts/release-evidence.py intake --output "$RUNNER_TEMP/release-intake"
+          POLICY_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/.ci-comparison"
+          target="$RUNNER_TEMP/comparison-policy"
+          [[ "$POLICY_SHA" =~ ^[0-9a-f]{40}$ && "$POLICY_SHA" == "$GITHUB_SHA" ]] || exit 1
+          [[ -d "$source/.git" && ! -L "$source" && ! -e "$target" && ! -L "$target" ]] || exit 1
+          [[ "$(git -C "$source" rev-parse HEAD)" == "$POLICY_SHA" ]] || exit 1
+          [[ -z "$(git -C "$source" status --porcelain=v1 --untracked-files=all)" ]] || exit 1
+          mv "$source" "$target"
+          printf 'COMPARISON_POLICY_ROOT=%s\n' "$target" >> "$GITHUB_ENV"
+      - &checkout-fixed-product
+        name: 检出固定产品
+        uses: actions/checkout@v7
+        with:
+          ref: 18d11a3c0176fe98856aeeef6396e9ddfde0cca0
+          fetch-depth: 2
+          persist-credentials: false
+      - name: 核对实际产品与精确策略并保存计划
+        id: plan
+        run: |
+          set -euo pipefail
+          python3 -B "$COMPARISON_POLICY_ROOT/.github/scripts/full-comparison.py" plan \
+            --output "$RUNNER_TEMP/comparison-plan"
+          mkdir -p "$RUNNER_TEMP/periodic-home"
+          printf 'NPM_CONFIG_CACHE=%s/periodic-npm-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v7
         with:
-          name: release-machine-${{ steps.receipt.outputs.owner_run_id }}-${{ steps.receipt.outputs.owner_attempt }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/release-intake/receipt.json
+          name: production-full-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/comparison-plan
+          if-no-files-found: error
+          retention-days: 90
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: 普通 workspace 测试
+        run: |
+          set -euo pipefail
+          go_cache=$(GOTOOLCHAIN=local go env GOCACHE)
+          go_mod_cache=$(GOTOOLCHAIN=local go env GOMODCACHE)
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" GOCACHE="$go_cache" GOMODCACHE="$go_mod_cache" GOTOOLCHAIN=local GOWORK=off \
+            go test -count=1 ./cmd/workspace
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.x'
+          check-latest: true
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Web 测试、类型检查和构建
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" npm_config_cache="$NPM_CONFIG_CACHE" \
+            python3 -B "$COMPARISON_POLICY_ROOT/.github/scripts/ci-plan.py" web "$RUNNER_TEMP/comparison-plan/full-plan.json"
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.13.0'
+          cache: npm
+          cache-dependency-path: extensions/pi-bridge/package-lock.json
+      - name: Pi bridge 测试和类型检查
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$RUNNER_TEMP/periodic-home" npm_config_cache="$NPM_CONFIG_CACHE" \
+            python3 -B "$COMPARISON_POLICY_ROOT/.github/scripts/ci-plan.py" bridge "$RUNNER_TEMP/comparison-plan/full-plan.json"
+      - name: 再次核对产品工作树
+        run: |
+          python3 -B - "$COMPARISON_POLICY_ROOT" <<'PY'
+          import importlib.util, pathlib, sys
+          path = pathlib.Path(sys.argv[1]) / '.github/scripts/full-comparison.py'
+          spec = importlib.util.spec_from_file_location('comparison', path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          module.product_identity(pathlib.Path.cwd())
+          PY
+
+  full:
+    name: Full suite
+    needs: preflight
+    if: ${{ needs.preflight.result == 'success' }}
+    uses: ./.github/workflows/ci-full.yml
+    with:
+      sha: ${{ needs.preflight.outputs.sha }}
+      tree: ${{ needs.preflight.outputs.tree }}
+      head: ${{ needs.preflight.outputs.head }}
+      base: ${{ needs.preflight.outputs.base }}
+      matrix: ${{ needs.preflight.outputs.matrix }}
+      policy_sha: ${{ github.workflow_sha }}
+
+  record:
+    name: 生产 Full 对照回执
+    needs: [preflight, full]
+    if: ${{ !cancelled() && needs.preflight.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - *checkout-comparison-policy
+      - *stage-comparison-policy
+      - *checkout-fixed-product
+      - uses: actions/download-artifact@v7
+        with:
+          name: production-full-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/comparison-plan
+      - name: 核对原生 Full 输出与原始父提交
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 -B "$COMPARISON_POLICY_ROOT/.github/scripts/full-comparison.py" record \
+            --plan "$RUNNER_TEMP/comparison-plan" --output "$RUNNER_TEMP/comparison-receipt"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: production-full-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/comparison-receipt
           if-no-files-found: error
           retention-days: 90
