@@ -47,11 +47,11 @@ jobs:
   go-shards:
     name: Go ${{ matrix.profile }} worker ${{ matrix.worker }}
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 35
     strategy:
       fail-fast: false
-      # Bound two suites to fourteen shard runners; clients already passed preflight.
-      max-parallel: 7
+      # B: 12 shard runners + 4 Full sidecars + 2 release sidecars <= 20.
+      max-parallel: 12
       matrix: ${{ fromJSON(inputs.matrix) }}
     steps:
       - &verify-policy-input
@@ -205,7 +205,7 @@ jobs:
   go-vet:
     name: Go vet and CI gates
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
       - *verify-policy-input
       - *checkout-policy
@@ -229,7 +229,7 @@ jobs:
   go-benchmarks:
     name: Go benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:

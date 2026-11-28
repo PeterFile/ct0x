@@ -3,6 +3,7 @@
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import importlib.util
 import io
 import itertools
@@ -577,20 +578,105 @@ class ShardBatchTests(unittest.TestCase):
             matrix = plan.shard_matrix()
         self.assertCountEqual(matrix["include"], [{"profile": profile, "worker": worker}
                                                  for profile, workers in batches.items() for worker in range(len(workers))])
-        expected_order = {"platform": list(range(6)),
-                          "store": [1, 2, 9, 12, 14, 15, 0, 3, 4, 5, 6, 7, 8, 10, 11, 13],
-                          "httpapi": list(range(2))}
+        # Literal B order from Series7 c49368f8 full-trial-plan.py and its fixed weights.
+        expected_order = [("store", 13), ("platform", 3), ("store", 10), ("store", 4),
+                          ("store", 2), ("platform", 1), ("store", 12), ("store", 8),
+                          ("store", 3), ("store", 5), ("platform", 4), ("platform", 2),
+                          ("store", 7), ("store", 15), ("store", 9), ("store", 1),
+                          ("httpapi", 1), ("store", 14), ("platform", 5), ("store", 0),
+                          ("store", 6), ("store", 11), ("httpapi", 0), ("platform", 0)]
         self.assertEqual(matrix, {"include": [{"profile": profile, "worker": worker}
-                                              for profile, order in expected_order.items() for worker in order]})
+                                              for profile, worker in expected_order]})
         self.assertEqual(len(matrix["include"]), 24)
-        self.assertEqual(matrix["include"][:2], [{"profile": "platform", "worker": 0}, {"profile": "platform", "worker": 1}])
+        self.assertEqual(matrix["include"][:2], [{"profile": "store", "worker": 13}, {"profile": "platform", "worker": 3}])
         self.assertIn(4, batches["platform"][0])
         self.assertIn(8, batches["platform"][1])
         workflow = (WORKFLOWS / "ci-full.yml").read_text()
         shards = job(workflow, "go-shards")
-        for text in ["matrix: ${{ fromJSON(inputs.matrix) }}", "max-parallel: 7", "fail-fast: false", "timeout-minutes: 40"]:
+        for text in ["matrix: ${{ fromJSON(inputs.matrix) }}", "max-parallel: 12", "fail-fast: false", "timeout-minutes: 35"]:
             self.assertIn(text, shards)
         self.assertIn("merge-multiple: false", job(workflow, "gate"))
+
+    def configured_matrix(self, **overrides):
+        plan = load("ci-plan")
+        spec = mock.Mock()
+        with mock.patch.object(plan.importlib.util, "spec_from_file_location", return_value=spec), \
+             mock.patch.object(plan.importlib.util, "module_from_spec", return_value=self.shards), \
+             mock.patch.multiple(self.shards, **overrides):
+            return plan.shard_matrix()
+
+    def test_fixed_observed_weights_and_original_trial_tie_break_are_host_independent(self):
+        # Hash the complete historical slot arrays, not weights recomputed by the planner.
+        raw = json.dumps(self.shards.SLOT_WEIGHTS, sort_keys=True, separators=(",", ":")).encode()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), "0d6f50cf7d7f77fea2a222b2454ec5644ac2a4402d58edadf4e351d31ccacf89")
+        tied = {}
+        for profile, workers in self.shards.BATCHES.items():
+            tied[profile] = [0] * self.verifier.PROFILES[profile][0]
+            for slots in workers:
+                for slot in slots:
+                    tied[profile][slot] = 4 / len(slots)
+        reversed_profiles = dict(reversed(list(self.shards.BATCHES.items())))
+        expected = [("httpapi", worker) for worker in (0, 1)]
+        expected += [("platform", worker) for worker in (0, 1, 2, 3, 4, 5)]
+        # The original canonical JSON key orders 10..15 before 1, not numeric order.
+        expected += [("store", worker) for worker in (0, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6, 7, 8, 9)]
+        with mock.patch.object(os, "sched_getaffinity", side_effect=AssertionError("host-dependent plan"), create=True):
+            actual = self.configured_matrix(BATCHES=reversed_profiles, SLOT_WEIGHTS=tied)
+        self.assertEqual(actual, {"include": [{"profile": profile, "worker": worker} for profile, worker in expected]})
+
+    def test_matrix_rejects_stale_weights_and_incomplete_or_colliding_membership(self):
+        weights = self.shards.SLOT_WEIGHTS
+        batches = self.shards.BATCHES
+        bad_weights = [{key: value for key, value in weights.items() if key != "store"},
+                       {**weights, "workspace": (1,)},
+                       {**weights, "store": weights["store"][:-1]},
+                       {**weights, "store": (*weights["store"], 1)}]
+        bad_weights.extend({**weights, "store": (value, *weights["store"][1:])}
+                           for value in (0, -1, True, "1", float("nan"), float("inf")))
+        bad_batches = [{key: value for key, value in batches.items() if key != "store"},
+                       {**batches, "workspace": ((0,),)},
+                       {**batches, "store": ((), *batches["store"])},
+                       {**batches, "store": batches["store"][:-1]},
+                       {**batches, "store": (*batches["store"], (0,))},
+                       {**batches, "store": ((0, True, 2, 3), *batches["store"][1:])},
+                       {**batches, "store": ((64, 1, 2, 3), *batches["store"][1:])}]
+        for invalid in bad_weights:
+            with self.subTest(weights=invalid), self.assertRaises(ValueError):
+                self.configured_matrix(SLOT_WEIGHTS=invalid)
+        for invalid in bad_batches:
+            with self.subTest(batches=invalid), self.assertRaises(ValueError):
+                self.configured_matrix(BATCHES=invalid)
+        changed_profiles = {**self.shards.verifier.PROFILES,
+                            "store": (65, *self.shards.verifier.PROFILES["store"][1:])}
+        with mock.patch.object(self.shards.verifier, "PROFILES", changed_profiles), self.assertRaises(ValueError):
+            self.configured_matrix()
+        # A supported layout change gets distinct worker identities, never a stale fixed range.
+        expanded = {**batches, "store": tuple((slot,) for slot in range(64))}
+        matrix = self.configured_matrix(BATCHES=expanded)["include"]
+        self.assertEqual(len(matrix), 72)
+        self.assertEqual(len({(item["profile"], item["worker"]) for item in matrix}), 72)
+        self.assertEqual({item["worker"] for item in matrix if item["profile"] == "store"}, set(range(64)))
+
+    def test_full_job_budgets_leave_runner_headroom_including_release_sidecars(self):
+        workflow = (WORKFLOWS / "ci-full.yml").read_text()
+        budgets = {"go-shards": 35, "go-other": 25, "go-workspace": 25,
+                   "go-vet": 15, "go-benchmarks": 15, "gate": 5}
+        self.assertEqual(set(re.findall(r"^  ([\w-]+):$", workflow.split("\njobs:\n", 1)[1], re.M)), set(budgets))
+        for name, minutes in budgets.items():
+            self.assertEqual(re.findall(r"^    timeout-minutes: (\d+)$", job(workflow, name), re.M), [str(minutes)])
+        cap = int(re.search(r"^      max-parallel: (\d+)$", job(workflow, "go-shards"), re.M)[1])
+        sidecars = {name for name in budgets if name != "go-shards" and "needs:" not in job(workflow, name)}
+        self.assertEqual(sidecars, {"go-other", "go-workspace", "go-vet", "go-benchmarks"})
+        release = (WORKFLOWS / "release-candidate.yml").read_text()
+        full = job(release, "full")
+        tenant_sidecars = {name for name in re.findall(r"^  ([\w-]+):$", release.split("\njobs:\n", 1)[1], re.M)
+                           if "runs-on:" in job(release, name) and
+                           "needs: [normalize, claim]" in job(release, name) and
+                           expression(job(release, name), "if") == expression(full, "if")}
+        self.assertEqual(tenant_sidecars, {"clients", "binary"})
+        self.assertEqual(cap, 12)
+        self.assertEqual(cap + len(sidecars) + len(tenant_sidecars), 18)
+        self.assertLessEqual(cap + len(sidecars) + len(tenant_sidecars), 20)
 
     def slot_names(self, profile, slot, count):
         names = []
@@ -962,6 +1048,8 @@ class ShardBatchTests(unittest.TestCase):
 
     def test_workers_list_once_then_81_real_verified_uncached_logical_runs(self):
         names = [f"TestVector{index}" for index in range(180)]
+        # This fixed fixture adds one run per refined slot, independently of execution_subsets.
+        extra_run_slots = {("platform", 3), ("store", 21), ("store", 40), ("store", 55)}
         calls = []
 
         def go(command, **kwargs):
@@ -997,6 +1085,7 @@ class ShardBatchTests(unittest.TestCase):
                     tests = [command for command in calls if command[:2] == ["go", "test"]]
                     expected_runs = sum(max(1, (len(self.verifier.selection(Counter(names), slot, profile)[0]) + 23) // 24)
                                         if profile == "platform" else 1 for slot in slots)
+                    expected_runs += sum((profile, slot) in extra_run_slots for slot in slots)
                     self.assertEqual(len(tests), expected_runs + 1)
                     self.assertEqual(sum("-list" in command for command in tests), 1)
                     for command in tests:
