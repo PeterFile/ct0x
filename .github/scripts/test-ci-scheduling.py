@@ -370,7 +370,7 @@ class AdmissionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.workflow = (WORKFLOWS / "ci.yml").read_text()
 
-    def test_relevance_is_shared_with_supersession_without_full_admission_queue(self):
+    def test_only_explicit_full_intent_admits_jobs_and_supersedes_runs(self):
         relevant = expression(job(self.workflow, "feedback"), "if")
         concurrency = self.workflow.split("jobs:", 1)[0]
         group = expression(concurrency, "group")
@@ -384,6 +384,9 @@ class AdmissionTests(unittest.TestCase):
         self.assertNotIn("concurrency:", (WORKFLOWS / "ci-full.yml").read_text())
         self.assertNotIn("queue:", self.workflow)
         self.assertNotIn("bucket", self.workflow)
+        self.assertEqual(set(re.findall(r"^  ([\w-]+):$", self.workflow.split("jobs:\n", 1)[1], re.M)),
+                         {"feedback", "full", "merge-check"})
+        full_condition = expression(full, "if")
         self.assertFalse(hasattr(load("ci-plan"), "bucket"))
         events = [("push", {"ref": "refs/heads/master"}, "full"),
                   ("push", {"ref": "refs/heads/feature"}, "ignore"),
@@ -391,18 +394,23 @@ class AdmissionTests(unittest.TestCase):
                   ("workflow_dispatch", {}, "ignore"), ("issues", {"action": "opened"}, "ignore")]
         for draft in (True, False):
             for action in ("opened", "reopened", "synchronize", "ready_for_review", "converted_to_draft"):
-                events.append(("pull_request", pr(action, draft), "feedback"))
+                events.append(("pull_request", pr(action, draft), "ignore"))
                 event = pr(action, draft)
                 event["pull_request"]["labels"] = [{"name": "CI:FULL"}]
                 events.append(("pull_request", event, "full"))
-            for label, expected in (("ci:refresh", "feedback"), ("CI:REFRESH", "feedback"),
+            for label, expected in (("ci:refresh", "ignore"), ("CI:REFRESH", "ignore"),
                                     ("ci:full", "full"), ("CI:FULL", "full"), ("bug", "ignore")):
                 events.append(("pull_request", pr("labeled", draft, label={"name": label}), expected))
-            events.append(("pull_request", pr("edited", draft, changes={"base": {"ref": {"from": "release"}}}), "feedback"))
+            events.append(("pull_request", pr("edited", draft, changes={"base": {"ref": {"from": "release"}}}), "ignore"))
             for opted_event in (pr("edited", draft, changes={"base": {"ref": {"from": "release"}}}),
-                                pr("labeled", draft, label={"name": "ci:refresh"})):
+                                pr("labeled", draft, label={"name": "ci:refresh"}),
+                                pr("labeled", draft, label={"name": "CI:REFRESH"})):
                 opted_event["pull_request"]["labels"] = [{"name": "CI:FULL"}]
                 events.append(("pull_request", opted_event, "full"))
+            for action in ("unlabeled", "closed"):
+                event = pr(action, draft, label={"name": "ci:full"})
+                event["pull_request"]["labels"] = [{"name": "ci:full"}]
+                events.append(("pull_request", event, "ignore"))
             for fields in ({"title": {"from": "old"}}, {"body": {"from": "old"}}, {"base": {"sha": {"from": SHA}}}):
                 event = pr("edited", draft, changes=fields)
                 event["pull_request"]["labels"] = [{"name": "ci:full"}]
@@ -418,35 +426,42 @@ class AdmissionTests(unittest.TestCase):
             with self.subTest(event_name=event_name, event=event):
                 self.assertEqual(native_expression(relevant, event_name, event), tier != "ignore")
                 self.assertEqual(native_expression(candidate, event_name, event), tier == "full")
+                self.assertEqual(scalar_expression(full_condition, {"needs.feedback.outputs.mode": "full" if tier == "full" else ""}),
+                                 tier == "full")
                 group1 = native_expression(group, event_name, event)
                 group2 = native_expression(group, event_name, event, run_id="999")
                 if tier == "ignore":
                     self.assertNotEqual(group1, group2)
-                    self.assertNotEqual(group1, native_expression(group, "pull_request", pr()))
+                    self.assertNotEqual(group1, native_expression(group, "pull_request", pr("labeled", label={"name": "ci:full"})))
                     self.assertNotEqual(group1, native_expression(group, "push", {"ref": "refs/heads/master"}))
                 else:
                     self.assertEqual(group1, group2)
                     self.assertEqual(native_expression(cancel, event_name, event), event_name == "pull_request")
                 values = {candidate: tier == "full", "needs.feedback.result": "success", "needs.full.result": "success"}
                 self.assertEqual(scalar_expression(name, values), "Full CI" if tier == "full" else "Feedback status")
-        pr_group = native_expression(group, "pull_request", pr())
+        opted_pr = pr()
+        opted_pr["pull_request"]["labels"] = [{"name": "ci:full"}]
+        pr_group = native_expression(group, "pull_request", opted_pr)
         for event_name, event, tier in events:
             if event_name == "pull_request" and tier != "ignore":
                 self.assertEqual(native_expression(group, event_name, event), pr_group)
         other = pr()
-        other["pull_request"]["number"] = 18
+        other["pull_request"].update(number=18, labels=[{"name": "ci:full"}])
         self.assertNotEqual(native_expression(group, "pull_request", other), pr_group)
         self.assertNotEqual(native_expression(group, "push", {"ref": "refs/heads/master"}), pr_group)
 
     def test_clients_and_cmd_are_preflight_not_repeated_after_admission(self):
         feedback = job(self.workflow, "feedback")
         self.assertIn("name: CI preflight and feedback", feedback)
-        positions = [feedback.index(text) for text in ["go test -count=1 ./cmd/workspace", "ci-plan.py feedback", "ci-plan.py web", "ci-plan.py bridge"]]
+        positions = [feedback.index(text) for text in ["ci-plan.py plan", "go test -count=1 ./cmd/workspace", "ci-plan.py web", "ci-plan.py bridge"]]
         self.assertEqual(positions, sorted(positions))
+        self.assertNotIn("Targeted Go feedback", feedback)
+        self.assertNotIn("ci-plan.py feedback", feedback)
+        self.assertNotIn("Test CI scheduling and shard gates", feedback)
+        self.assertNotRegex(feedback, r"(?m)^ +if:.*steps\.plan\.outputs\.")
+        self.assertIn("actions/setup-go@", feedback)
         self.assertIn("node-version: '22.x'", feedback)
         self.assertIn("node-version: '24.13.0'", feedback)
-        self.assertIn("steps.plan.outputs.mode == 'full' || steps.plan.outputs.web == 'true'", feedback)
-        self.assertIn("steps.plan.outputs.mode == 'full' || steps.plan.outputs.bridge == 'true'", feedback)
         self.assertIn("fetch-depth: 2", feedback)
         self.assertIn("ref: ${{ github.sha }}", feedback)
         full = (WORKFLOWS / "ci-full.yml").read_text()
@@ -455,42 +470,6 @@ class AdmissionTests(unittest.TestCase):
         for script in ["test-ci-scheduling.py", "test-store-shard.py"]:
             self.assertEqual(full.count("python3 .github/scripts/" + script + " -v"), 1)
         self.assertNotIn("unittest discover", feedback + full)
-
-    def test_ci_policy_feedback_runs_both_explicit_modules_and_fails_on_either(self):
-        feedback = job(self.workflow, "feedback")
-        block = step(feedback, "Test CI scheduling and shard gates")
-        condition = expression(block, "if")
-        self.assertEqual(condition, "steps.plan.outputs.mode == 'feedback' && steps.plan.outputs.ci == 'true'")
-        ordinary = expression(step(feedback, "Ordinary test cmd package"), "if")
-        plan = load("ci-plan")
-        for mode in ("feedback", "full"):
-            for paths, ci, go in [(["docs/a.md"], False, False), (["internal/scheduler/task.go"], False, True),
-                                  ([".github/workflows/ci.yml"], True, False),
-                                  ([".github/scripts/ci-shards.py", "internal/scheduler/task.go"], True, True),
-                                  ([".github/scripts/ci-plan.py", "web/src/a.ts"], True, False),
-                                  ([".github/scripts/ci-gate.py", "extensions/pi-bridge/index.ts"], True, True),
-                                  ([".github/scripts/periodic-history.py"], True, False),
-                                  ([".github/scripts/unknown.py"], True, True)]:
-                selected = {"mode": mode, **plan.classify(paths)}
-                values = {"steps.plan.outputs." + key: json.dumps(value) if type(value) is bool else value
-                          for key, value in selected.items()}
-                with self.subTest(mode=mode, paths=paths):
-                    self.assertEqual(scalar_expression(condition, values), mode == "feedback" and ci)
-                    self.assertEqual(scalar_expression(ordinary, values), mode == "full" or go)
-        script = textwrap.dedent(re.search(r"        run: \|\n(.*)", block, re.S)[1])
-        commands = [".github/scripts/test-ci-scheduling.py -v", ".github/scripts/test-store-shard.py -v"]
-        stub = '''python3() {
-          printf '%s\\n' "$*"
-          [[ "$*" != "$CI_TEST_FAIL" ]]
-        }
-        readonly -f python3
-        '''
-        for failure in ("", *commands):
-            result = subprocess.run(["bash", "-c", stub + script],
-                                    env={**os.environ, "CI_TEST_FAIL": failure}, text=True, capture_output=True, timeout=5)
-            self.assertEqual(result.returncode == 0, not failure, result.stderr)
-            self.assertEqual(result.stdout.splitlines(), commands[:commands.index(failure) + 1] if failure else commands)
-        self.assertNotIn("unittest discover", block)
 
     def test_outer_gate_cannot_disappear_with_missing_preflight_outputs(self):
         gate = job(self.workflow, "merge-check")

@@ -8,16 +8,17 @@ on:
 permissions:
   contents: read
 
-# Relevant PR runs supersede older runs. Master keeps the running and latest pending run.
-# Irrelevant events get a private group, so they cannot supersede real CI.
+# Opt-in PR Full runs supersede older runs. Restored master pushes keep running and latest pending.
+# Events without Full intent get a private group, so they cannot supersede real CI.
 concurrency:
   group: >-
     ${{ format('{0}-{1}', github.workflow,
-        ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-         (github.event_name == 'pull_request' &&
-          (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-           (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-           (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
+        (((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+          (github.event_name == 'pull_request' &&
+           (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
+            (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
+            (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
+         (github.event_name == 'push' || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full'))) &&
         (github.event.pull_request.number || github.ref) || format('ignored-{0}', github.run_id)) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -29,11 +30,12 @@ jobs:
   feedback:
     name: CI preflight and feedback
     if: >-
-      ${{ (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
-          (github.event_name == 'pull_request' &&
-           (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
-            (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
-            (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full')))) }}
+      ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+           (github.event_name == 'pull_request' &&
+            (contains(fromJSON('["opened","reopened","synchronize","ready_for_review","converted_to_draft"]'), github.event.action) ||
+             (github.event.action == 'edited' && github.event.changes.base.ref.from != null) ||
+             (github.event.action == 'labeled' && (github.event.label.name == 'ci:refresh' || github.event.label.name == 'ci:full'))))) &&
+          (github.event_name == 'push' || github.event.label.name == 'ci:full' || contains(github.event.pull_request.labels.*.name, 'ci:full')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
     outputs:
@@ -54,24 +56,13 @@ jobs:
         id: plan
         run: python3 .github/scripts/ci-plan.py plan "$RUNNER_TEMP/ci-plan.json"
       - uses: actions/setup-go@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
       # Ordinary cmd catches composition/liveness regressions before full fanout (#218).
       - name: Ordinary test cmd package
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.go == 'true' }}
         run: go test -count=1 ./cmd/workspace
-      - name: Test CI scheduling and shard gates
-        if: ${{ steps.plan.outputs.mode == 'feedback' && steps.plan.outputs.ci == 'true' }}
-        run: |
-          set -euo pipefail
-          python3 .github/scripts/test-ci-scheduling.py -v
-          python3 .github/scripts/test-store-shard.py -v
-      - name: Targeted Go feedback
-        run: python3 .github/scripts/ci-plan.py feedback "$RUNNER_TEMP/ci-plan.json"
       - uses: actions/setup-node@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.web == 'true' }}
         with:
           node-version: '22.x'
           check-latest: true
@@ -80,7 +71,6 @@ jobs:
       - name: Web test, typecheck and build
         run: python3 .github/scripts/ci-plan.py web "$RUNNER_TEMP/ci-plan.json"
       - uses: actions/setup-node@v7
-        if: ${{ steps.plan.outputs.mode == 'full' || steps.plan.outputs.bridge == 'true' }}
         with:
           node-version: '24.13.0'
           cache: npm
@@ -102,8 +92,8 @@ jobs:
       matrix: ${{ needs.feedback.outputs.matrix }}
 
   # Derive candidacy from the native event, not outputs that a failed preflight may never emit.
-  # Feedback/ignored events must never publish even a skipped check under the required name.
-  # Cancelled dependencies and an unexpectedly skipped full also need a non-required name.
+  # Ignored events must never publish even a skipped Full CI check.
+  # Cancelled dependencies and an unexpectedly skipped full also need the fallback name.
   merge-check:
     name: >-
       ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/master') ||
