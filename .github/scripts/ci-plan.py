@@ -3,6 +3,7 @@
 import argparse
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -117,12 +118,21 @@ def shard_matrix():
     spec = importlib.util.spec_from_file_location("ci_shards", Path(__file__).with_name("ci-shards.py"))
     shards = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(shards)
-    include = []
+    check(set(shards.BATCHES) == set(shards.SLOT_WEIGHTS) == set(shards.verifier.PROFILES),
+          "worker、逻辑槽与历史权重 profile 不完整")
+    weighted = []
     for profile, workers in shards.BATCHES.items():
-        order = range(len(workers))
-        if profile == "store":
-            order = sorted(order, key=lambda worker: not shards.SLOW_STORE_SLOTS.intersection(workers[worker]))
-        include.extend({"profile": profile, "worker": worker} for worker in order)
+        total = shards.verifier.PROFILES[profile][0]
+        weights = shards.SLOT_WEIGHTS[profile]
+        check(len(weights) == total and all(type(value) in (int, float) and math.isfinite(value) and value > 0 for value in weights),
+              "历史槽权重缺失或非法")
+        flat = [slot for slots in workers for slot in slots]
+        check(workers and all(workers) and all(type(slot) is int for slot in flat) and sorted(flat) == list(range(total)),
+              "worker 逻辑槽配置缺失、重复或非法")
+        weighted.extend(({"profile": profile, "worker": worker}, sum(weights[slot] for slot in slots))
+                        for worker, slots in enumerate(workers))
+    # Original B uses canonical JSON for ties; its constant part=null prefix does not change ordering.
+    include = [item for item, _ in sorted(weighted, key=lambda pair: (-pair[1], json.dumps(pair[0], sort_keys=True, separators=(",", ":"))))]
     return {"include": include}
 
 

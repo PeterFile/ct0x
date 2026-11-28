@@ -18,11 +18,29 @@ from types import SimpleNamespace
 _spec = importlib.util.spec_from_file_location("store_shard_verifier", Path(__file__).with_name("verify-store-shard.py"))
 verifier = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(verifier)
-# Admit the historically long Platform slots first; isolate slots 1 and 2.
+# Fixed worker identities and membership; scheduling order is independent.
 BATCHES = {
     "platform": ((4,), (8, 0), (1,), (3, 5), (6, 7), (2,)),
     "store": tuple(tuple(range(start, start + 4)) for start in range(0, 64, 4)),
     "httpapi": ((0, 1, 2, 3), (4, 5, 6, 7)),
+}
+# Historical canonical-slot package seconds from run 45801293592, frozen in
+# Series7 c49368f81e86c9cabe4609972c1681b8edf31d3c/full-trial-weights.json.
+# Excludes setup, compilation, listing and queueing; not a wall-clock budget.
+# Keep weights in the existing hash-allowed policy file, not a runtime input.
+SLOT_WEIGHTS = {
+    "store": (
+        185.711, 191.233, 196.708, 60.627, 76.623, 122.255, 343.473, 170.538,
+        388.512, 288.368, 250.969, 196.343, 318.317, 177.853, 249.814, 159.519,
+        346.392, 389.501, 164.722, 228.865, 149.421, 240.595, 227.268, 255.858,
+        251.492, 119.658, 81.733, 127.498, 253.233, 236.196, 154.887, 207.492,
+        358.339, 327.736, 231.528, 77.142, 79.12, 194.956, 334.223, 128.878,
+        573.042, 228.181, 248.161, 178.787, 171.316, 107.965, 95.946, 158.956,
+        118.594, 105.987, 466.053, 381.97, 155.79, 253.181, 360.727, 520.89,
+        82.947, 295.81, 66.064, 232.763, 226.558, 87.193, 333.369, 149.97,
+    ),
+    "platform": (768.005, 858.242, 648.419, 700.583, 356.399, 534.583, 486.402, 380.034, 345.546),
+    "httpapi": (99.378, 124.368, 190.805, 79.888, 184.529, 159.729, 122.063, 223.554),
 }
 PLATFORM_RUN_LIMIT = 24
 STORE_SLOW_RUN_LIMIT = 5

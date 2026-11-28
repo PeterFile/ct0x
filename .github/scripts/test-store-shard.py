@@ -860,6 +860,41 @@ class VerifierTests(unittest.TestCase):
 
 
 class ExecutionSubsetTests(unittest.TestCase):
+    def test_fixed_raw_worker_roles_preserve_complete_canonical_aggregate(self):
+        spec = importlib.util.spec_from_file_location("ci_shards", SCRIPT.with_name("ci-shards.py"))
+        shards = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shards)
+        # Independent raw-artifact fixture: no BATCHES or production selector generates it.
+        workers = {
+            "platform": ((4,), (8, 0), (1,), (3, 5), (6, 7), (2,)),
+            "store": ((0, 1, 2, 3), (4, 5, 6, 7), (8, 9, 10, 11), (12, 13, 14, 15),
+                      (16, 17, 18, 19), (20, 21, 22, 23), (24, 25, 26, 27), (28, 29, 30, 31),
+                      (32, 33, 34, 35), (36, 37, 38, 39), (40, 41, 42, 43), (44, 45, 46, 47),
+                      (48, 49, 50, 51), (52, 53, 54, 55), (56, 57, 58, 59), (60, 61, 62, 63)),
+            "httpapi": ((0, 1, 2, 3), (4, 5, 6, 7)),
+        }
+        profiles = {"store": (64, PACKAGE, SLOTS), "platform": (9, PLATFORM_PACKAGE, PLATFORM_SLOTS),
+                    "httpapi": (8, HTTPAPI_PACKAGE, HTTPAPI_SLOTS)}
+        expected = {}
+        with tempfile.TemporaryDirectory(prefix="fixed-worker-roles-") as temporary:
+            directory = Path(temporary)
+            for profile, batches in workers.items():
+                total, package, vectors = profiles[profile]
+                compiled = dict.fromkeys(vectors, 1)
+                common = {"schema": 1, "total": total, "run_id": IDENTITY[1], "checkout_sha": IDENTITY[3],
+                          "checkout_tree": IDENTITY[5], "package": package, "compiled": compiled, "skips": {}}
+                expected[profile] = {**common, "runs": compiled, "passes": compiled}
+                for worker, slots in enumerate(batches):
+                    for slot in slots:
+                        selected = {name: 1 for name, assigned in vectors.items() if assigned == slot}
+                        summary = {**common, "slot": slot, "selected": selected, "runs": selected, "passes": selected}
+                        path = directory / f"{profile}-worker-v1-{worker}" / f"{profile}-shard-v1-{slot}" / f"{profile}-summary.json"
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        path.write_text(json.dumps(summary), encoding="utf-8")
+            self.assertEqual(len(list(directory.iterdir())), 24)
+            self.assertEqual(len(list(directory.glob("*/*/*.json"))), 81)
+            self.assertEqual(shards.aggregate_workers(directory, IDENTITY[1], IDENTITY[3], IDENTITY[5]), expected)
+
     def test_package_alarm_refinement_preserves_parents_and_all_other_slots(self):
         spec = importlib.util.spec_from_file_location("ci_shards", SCRIPT.with_name("ci-shards.py"))
         shards = importlib.util.module_from_spec(spec)
@@ -925,7 +960,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_batched_workers_keep_real_uncached_runs_and_isolated_evidence(self):
         block = re.search(r"\n  go-shards:\n(.*?)(?=\n  go-other:)", self.workflow, re.S)[1]
-        for text in ["fail-fast: false", "timeout-minutes: 40", "max-parallel: 7", "actions/setup-go@v7",
+        for text in ["fail-fast: false", "timeout-minutes: 35", "max-parallel: 12", "actions/setup-go@v7",
                      "ci-shards.py run", "actions/upload-artifact@v7", "overwrite: true", "if-no-files-found: error",
                      "name: ${{ matrix.profile }}-worker-v1-${{ matrix.worker }}", "retention-days: 7"]:
             self.assertIn(text, block)
